@@ -1,0 +1,9 @@
+{
+  "name": "meminception-memory",
+  "version": "0.1.1",
+  "description": "MemInception hook integration for Claude Code.",
+  "author": {
+    "name": "MemInception Team"
+  },
+  "license": "Apache-2.0"
+}

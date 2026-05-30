@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "meminception": {
+      "command": "sh",
+      "args": ["-lc", "exec \"${MEMINCEPTION_MCP_COMMAND:-meminception}\" serve"]
+    }
+  }
+}

@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Node / Vite
+node_modules/
+admin-ui/node_modules/
+admin-ui/dist/
+admin-ui/.tmp-test/
+
+# Local runtime data
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.meminception/
+
+# Local agent/editor config
+.codex/
+.claude/
+.superpowers/
+.agents/
+.mcp.json
+.mcp.local.json
+AGENTS.local.md
+CLAUDE.local.md
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

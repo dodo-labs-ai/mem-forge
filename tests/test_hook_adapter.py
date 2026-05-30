@@ -1,0 +1,1522 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+
+def test_hook_adapter_returns_additional_context_for_prompt_hook(monkeypatch, capsys):
+    from meminception import hook_adapter
+
+    requests: list[tuple[str, dict]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        return {
+            "should_inject": True,
+            "context_markdown": "## MemInception Memory Context\n- Use MemoryStore.",
+            "memories": [{"id": "mem-1"}],
+            "recent_changes": [],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "sess-1",
+        "cwd": "/tmp/mem-inception",
+        "prompt": "What memory lifecycle decisions matter?",
+    }))
+
+    exit_code = hook_adapter.main(["context"])
+
+    assert exit_code == 0
+    assert requests[0][0] == "/api/hooks/context"
+    assert requests[0][1]["client"] == "codex"
+    assert requests[0][1]["hook"] == "UserPromptSubmit"
+    output = json.loads(capsys.readouterr().out)
+    assert output["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    assert "MemoryStore" in output["hookSpecificOutput"]["additionalContext"]
+
+
+def test_hook_adapter_submits_lifecycle_receipt_when_transcript_is_missing(monkeypatch, capsys):
+    from meminception import hook_adapter
+
+    requests: list[tuple[str, dict]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        return {"receipt_id": "agent-hook-receipt"}
+
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
+        "hook_event_name": "Stop",
+        "session_id": "sess-2",
+        "cwd": "/tmp/mem-inception",
+    }))
+
+    exit_code = hook_adapter.main(["submit-session"])
+
+    assert exit_code == 0
+    assert requests[0][0] == "/api/hooks/receipts"
+    payload = requests[0][1]
+    assert payload["client"] == "codex"
+    assert payload["hook"] == "Stop"
+    assert payload["metadata"]["has_transcript_path"] is False
+    assert "transcript_path" not in payload["metadata"]
+    assert "document_markdown" not in payload
+    assert "process_now" not in payload
+    assert capsys.readouterr().out == ""
+
+
+def test_hook_adapter_precompact_posts_window_when_transcript_exists(monkeypatch, tmp_path, capsys):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        '{"type":"user","message":"please remember this design"}\n'
+        '{"type":"assistant","message":"Done."}\n',
+        encoding="utf-8",
+    )
+    queue_db = tmp_path / "queue.sqlite"
+    requests: list[tuple[str, dict]] = []
+    spawned_workers: list[tuple[str, float]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        return {"receipt_id": "receipt-precompact"}
+
+    def fake_spawn_worker(*, api_url: str, timeout: float):
+        spawned_workers.append((api_url, timeout))
+
+    monkeypatch.setenv("MEMINCEPTION_AGENT_QUEUE_DB", str(queue_db))
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+    monkeypatch.setattr(hook_adapter, "_spawn_agent_window_worker", fake_spawn_worker)
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
+        "hook_event_name": "PreCompact",
+        "session_id": "sess-precompact",
+        "cwd": str(tmp_path),
+        "transcript_path": str(transcript),
+    }))
+
+    exit_code = hook_adapter.main(["submit-session"])
+
+    assert exit_code == 0
+    assert [request[0] for request in requests] == ["/api/hooks/receipts"]
+    assert spawned_workers == [("http://127.0.0.1:8765", 180.0)]
+    with sqlite3.connect(queue_db) as connection:
+        rows = connection.execute(
+            "SELECT capture_pending, captured_through, pending_trigger, transcript_path, session_id FROM session_cursor"
+        ).fetchall()
+    assert len(rows) == 1
+    capture_pending, captured_through, pending_trigger, tpath, sess = rows[0]
+    assert capture_pending == 1
+    assert captured_through == 0
+    assert pending_trigger == "REQUIRED_CAPTURE"
+    assert tpath == str(transcript)
+    assert sess == "sess-precompact"
+    assert requests[0][1]["hook"] == "PreCompact"
+    assert capsys.readouterr().out == ""
+
+
+def test_hook_adapter_reprocesses_appended_transcript_window(monkeypatch, tmp_path, capsys):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"tool","name":"apply_patch","input":"first edit"}\n', encoding="utf-8")
+    queue_db = tmp_path / "queue.sqlite"
+    requests: list[tuple[str, dict]] = []
+    spawned_workers: list[tuple[str, float]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        return {"ok": True}
+
+    def fake_spawn_worker(*, api_url: str, timeout: float):
+        spawned_workers.append((api_url, timeout))
+
+    monkeypatch.setenv("MEMINCEPTION_AGENT_QUEUE_DB", str(queue_db))
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+    monkeypatch.setattr(hook_adapter, "_spawn_agent_window_worker", fake_spawn_worker)
+
+    payload = {
+        "hook_event_name": "PreCompact",
+        "session_id": "sess-precompact",
+        "cwd": str(tmp_path),
+        "transcript_path": str(transcript),
+    }
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin(payload))
+    assert hook_adapter.main(["submit-session"]) == 0
+
+    transcript.write_text(
+        transcript.read_text(encoding="utf-8")
+        + '{"type":"tool","name":"exec_command","input":"pytest tests/test_hook_adapter.py -q"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin(payload))
+    assert hook_adapter.main(["submit-session"]) == 0
+
+    assert [request[0] for request in requests] == [
+        "/api/hooks/receipts",
+        "/api/hooks/receipts",
+    ]
+    assert spawned_workers == [
+        ("http://127.0.0.1:8765", 180.0),
+        ("http://127.0.0.1:8765", 180.0),
+    ]
+    with sqlite3.connect(queue_db) as connection:
+        rows = connection.execute(
+            "SELECT capture_pending, captured_through, transcript_path, session_id FROM session_cursor"
+        ).fetchall()
+    assert len(rows) == 1
+    capture_pending, captured_through, tpath, sess = rows[0]
+    assert capture_pending == 1
+    assert captured_through == 0
+    assert tpath == str(transcript)
+    assert sess == "sess-precompact"
+    assert capsys.readouterr().out == ""
+
+
+def test_hook_adapter_posts_receipt_when_window_queue_fails(monkeypatch, tmp_path, capsys):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"tool","name":"apply_patch","input":"edit"}\n', encoding="utf-8")
+    requests: list[tuple[str, dict]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        return {"ok": True}
+
+    def fail_request(*args, **kwargs):
+        raise OSError("queue unavailable")
+
+    monkeypatch.setattr(hook_adapter, "request_session_capture", fail_request)
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
+        "hook_event_name": "PreCompact",
+        "session_id": "sess-queue-fail",
+        "cwd": str(tmp_path),
+        "transcript_path": str(transcript),
+    }))
+
+    exit_code = hook_adapter.main(["submit-session"])
+
+    assert exit_code == 0
+    assert [request[0] for request in requests] == ["/api/hooks/receipts"]
+    assert requests[0][1]["metadata"]["has_transcript_path"] is True
+    assert capsys.readouterr().out == ""
+
+
+def test_hook_adapter_trivial_stop_does_not_post_window(monkeypatch, tmp_path, capsys):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"assistant","message":"ok"}\n', encoding="utf-8")
+    requests: list[tuple[str, dict]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        return {"ok": True}
+
+    monkeypatch.setenv("MEMINCEPTION_AGENT_QUEUE_DB", str(tmp_path / "queue.sqlite"))
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
+        "hook_event_name": "Stop",
+        "session_id": "sess-trivial",
+        "cwd": str(tmp_path),
+        "transcript_path": str(transcript),
+    }))
+
+    exit_code = hook_adapter.main(["submit-session"])
+
+    assert exit_code == 0
+    assert [request[0] for request in requests] == ["/api/hooks/receipts"]
+    assert requests[0][1]["hook"] == "Stop"
+    assert capsys.readouterr().out == ""
+
+
+def test_hook_adapter_stop_with_edit_and_test_signal_enqueues_window_worker(monkeypatch, tmp_path, capsys):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        '{"type":"tool","name":"apply_patch","input":"update src/meminception/hook_adapter.py"}\n'
+        '{"type":"tool","name":"exec_command","input":"pytest tests/test_hook_adapter.py -q"}\n'
+        '{"type":"assistant","message":"Implemented and tests pass."}\n',
+        encoding="utf-8",
+    )
+    requests: list[tuple[str, dict]] = []
+    spawned_workers: list[tuple[str, float]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        return {"receipt_id": "receipt-stop"}
+
+    def fake_spawn_worker(*, api_url: str, timeout: float):
+        spawned_workers.append((api_url, timeout))
+
+    monkeypatch.setenv("MEMINCEPTION_AGENT_QUEUE_DB", str(tmp_path / "queue.sqlite"))
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+    monkeypatch.setattr(hook_adapter, "_spawn_agent_window_worker", fake_spawn_worker, raising=False)
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
+        "hook_event_name": "Stop",
+        "session_id": "sess-stop",
+        "cwd": str(tmp_path),
+        "transcript_path": str(transcript),
+    }))
+
+    exit_code = hook_adapter.main(["submit-session"])
+
+    assert exit_code == 0
+    assert [request[0] for request in requests] == ["/api/hooks/receipts"]
+    assert spawned_workers == [("http://127.0.0.1:8765", 180.0)]
+    with sqlite3.connect(tmp_path / "queue.sqlite") as connection:
+        rows = connection.execute("SELECT capture_pending, pending_trigger, session_id FROM session_cursor").fetchall()
+    assert len(rows) == 1
+    capture_pending, pending_trigger, sess = rows[0]
+    assert capture_pending == 1
+    assert pending_trigger == "GATED_CAPTURE"
+    assert sess == "sess-stop"
+    assert capsys.readouterr().out == ""
+
+
+def test_gated_capture_scans_tail_without_materializing_full_delta(monkeypatch, tmp_path):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        "\n".join(
+            json.dumps({"type": "assistant", "message": f"line {index}"})
+            for index in range(20)
+        )
+        + "\n"
+        + json.dumps({"type": "tool", "name": "exec_command", "input": "pytest tests"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def fail_full_slice(*args, **kwargs):
+        raise AssertionError("gate must not materialize the whole transcript tail")
+
+    monkeypatch.setattr(hook_adapter, "_get_captured_through", lambda client, session_id: 0)
+    monkeypatch.setattr(hook_adapter, "_transcript_line_slice", fail_full_slice)
+
+    assert hook_adapter._should_request_capture(
+        "GATED_CAPTURE",
+        str(transcript),
+        client="codex",
+        payload={"session_id": "sess-stream-gate"},
+    ) is True
+
+
+def test_hook_adapter_context_wakes_pending_queue_without_changing_output(monkeypatch, tmp_path, capsys):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        '{"type":"tool","name":"apply_patch","input":"edit"}\n',
+        encoding="utf-8",
+    )
+    queue_db = tmp_path / "queue.sqlite"
+    hook_adapter.request_session_capture(
+        client="codex",
+        session_id="queued-session",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        trigger="REQUIRED_CAPTURE",
+        queue_db_path=queue_db,
+    )
+    requests: list[tuple[str, dict]] = []
+    spawned_workers: list[tuple[str, float]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        return {
+            "should_inject": True,
+            "context_markdown": "## MemInception Memory Context\n- Keep queue output quiet.",
+        }
+
+    def fake_spawn_worker(*, api_url: str, timeout: float):
+        spawned_workers.append((api_url, timeout))
+
+    monkeypatch.setenv("MEMINCEPTION_AGENT_QUEUE_DB", str(queue_db))
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+    monkeypatch.setattr(hook_adapter, "_spawn_agent_window_worker", fake_spawn_worker, raising=False)
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "sess-context",
+        "cwd": str(tmp_path),
+        "prompt": "continue",
+    }))
+
+    exit_code = hook_adapter.main(["context"])
+
+    assert exit_code == 0
+    assert [request[0] for request in requests] == ["/api/hooks/context"]
+    assert spawned_workers == [("http://127.0.0.1:8765", 180.0)]
+    output = json.loads(capsys.readouterr().out)
+    assert output["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    assert "Keep queue output quiet." in output["hookSpecificOutput"]["additionalContext"]
+
+
+def test_hook_adapter_worker_run_once_drains_pending_queue(monkeypatch, tmp_path, capsys):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        '{"type":"tool","name":"apply_patch","input":"edit"}\n',
+        encoding="utf-8",
+    )
+    queue_db = tmp_path / "queue.sqlite"
+    hook_adapter.request_session_capture(
+        client="codex",
+        session_id="queued-session",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        trigger="GATED_CAPTURE",
+        queue_db_path=queue_db,
+    )
+    requests: list[tuple[str, dict, float]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload, timeout))
+        return {"window_id": "queued-window"}
+
+    monkeypatch.setenv("MEMINCEPTION_AGENT_QUEUE_DB", str(queue_db))
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+
+    exit_code = hook_adapter.main([
+        "worker-run-once",
+        "--api-url",
+        "http://127.0.0.1:8765",
+        "--timeout",
+        "77",
+    ])
+
+    assert exit_code == 0
+    assert len(requests) == 1
+    path, payload, timeout = requests[0]
+    assert path == "/api/agent-sessions/windows"
+    assert payload["trigger"] == "GATED_CAPTURE"
+    assert payload["events"][0]["name"] == "apply_patch"
+    assert payload["process_now"] is False
+    assert payload["history_window"]["start"] == "0"
+    assert payload["history_window"]["end"] == "1"
+    assert timeout == 77.0
+    with sqlite3.connect(queue_db) as connection:
+        rows = connection.execute("SELECT capture_pending, captured_through FROM session_cursor").fetchall()
+    assert rows == [(0, 1)]
+    assert capsys.readouterr().out == ""
+
+
+def test_worker_normalizes_legacy_capture_trigger_names(monkeypatch, tmp_path):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"tool","name":"apply_patch","input":"edit"}\n', encoding="utf-8")
+    queue_db = tmp_path / "queue.sqlite"
+    hook_adapter.request_session_capture(
+        client="codex",
+        session_id="legacy-session",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        trigger="GATED_CAPTURE",
+        queue_db_path=queue_db,
+    )
+    with sqlite3.connect(queue_db) as connection:
+        connection.execute(
+            "UPDATE session_cursor SET pending_trigger = 'BOUNDARY' WHERE session_id = 'legacy-session'"
+        )
+    requests: list[tuple[str, dict]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        return {"ok": True}
+
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+
+    submitted = hook_adapter.run_agent_window_worker_once(
+        api_url="http://127.0.0.1:8765", timeout=5, queue_db_path=queue_db
+    )
+
+    assert submitted == 1
+    assert requests[0][1]["trigger"] == "REQUIRED_CAPTURE"
+
+
+def test_hook_adapter_worker_leaves_source_sync_to_service(monkeypatch, tmp_path, capsys):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        '{"type":"tool","name":"apply_patch","input":"edit"}\n',
+        encoding="utf-8",
+    )
+    queue_db = tmp_path / "queue.sqlite"
+    for index in range(2):
+        hook_adapter.request_session_capture(
+            client="codex",
+            session_id=f"queued-session-{index}",
+            transcript_path=str(transcript),
+            workspace=str(tmp_path),
+            trigger="GATED_CAPTURE",
+            queue_db_path=queue_db,
+        )
+    requests: list[tuple[str, dict]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        return {"ok": True}
+
+    monkeypatch.setenv("MEMINCEPTION_AGENT_QUEUE_DB", str(queue_db))
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+
+    submitted = hook_adapter.run_agent_window_worker_once(
+        api_url="http://127.0.0.1:8765",
+        timeout=77,
+    )
+
+    assert submitted == 2
+    assert [request[0] for request in requests] == [
+        "/api/agent-sessions/windows",
+        "/api/agent-sessions/windows",
+    ]
+    assert requests[0][1]["process_now"] is False
+    assert requests[1][1]["process_now"] is False
+    assert capsys.readouterr().out == ""
+
+
+def test_hook_adapter_worker_splits_large_window_without_advancing_past_upload(monkeypatch, tmp_path):
+    from meminception import hook_adapter
+
+    lines = [
+        json.dumps({"type": "tool", "name": f"tool-{index}", "input": "x" * 20})
+        for index in range(3)
+    ]
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    queue_db = tmp_path / "queue.sqlite"
+    hook_adapter.request_session_capture(
+        client="codex",
+        session_id="queued-session",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        trigger="REQUIRED_CAPTURE",
+        queue_db_path=queue_db,
+    )
+    requests: list[tuple[str, dict]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        return {"ok": True}
+
+    monkeypatch.setenv("MEMINCEPTION_AGENT_QUEUE_DB", str(queue_db))
+    monkeypatch.setattr(hook_adapter, "MAX_TRANSCRIPT_CHARS", len("\n".join(lines[:2])))
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+
+    submitted = hook_adapter.run_agent_window_worker_once(
+        api_url="http://127.0.0.1:8765",
+        timeout=77,
+    )
+
+    assert submitted == 1
+    payload = requests[0][1]
+    assert payload["history_window"]["start"] == "0"
+    uploaded_end = int(payload["history_window"]["end"])
+    assert 0 < uploaded_end < 3
+    assert payload["history_window"]["truncated"] is True
+    assert "tool-0" in payload["transcript_markdown"]
+    assert "tool-2" not in payload["transcript_markdown"]
+    with sqlite3.connect(queue_db) as connection:
+        row = connection.execute(
+            "SELECT captured_through, capture_pending FROM session_cursor"
+        ).fetchone()
+    assert row == (uploaded_end, 1)
+
+
+def test_hook_adapter_worker_records_window_submission_error(monkeypatch, tmp_path, capsys):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        '{"type":"tool","name":"apply_patch","input":"edit"}\n',
+        encoding="utf-8",
+    )
+    queue_db = tmp_path / "queue.sqlite"
+    hook_adapter.request_session_capture(
+        client="codex",
+        session_id="queued-session",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        trigger="GATED_CAPTURE",
+        queue_db_path=queue_db,
+    )
+
+    def fail_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        raise TimeoutError("timed out after 77 seconds")
+
+    monkeypatch.setenv("MEMINCEPTION_AGENT_QUEUE_DB", str(queue_db))
+    monkeypatch.setattr(hook_adapter, "_post_json", fail_post_json)
+
+    submitted = hook_adapter.run_agent_window_worker_once(
+        api_url="http://127.0.0.1:8765",
+        timeout=77,
+    )
+
+    assert submitted == 0
+    with sqlite3.connect(queue_db) as connection:
+        rows = connection.execute(
+            "SELECT capture_pending, captured_through, last_error, last_attempt_at, lease_until FROM session_cursor"
+        ).fetchall()
+    assert len(rows) == 1
+    capture_pending, captured_through, last_error, last_attempt_at, lease_until = rows[0]
+    assert capture_pending == 1
+    assert captured_through == 0
+    assert "TimeoutError: timed out after 77 seconds" in last_error
+    assert last_attempt_at
+    assert lease_until is None
+    assert capsys.readouterr().out == ""
+
+
+def test_hook_adapter_worker_keeps_pending_when_transcript_disappears(monkeypatch, tmp_path):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"tool","name":"apply_patch","input":"edit"}\n', encoding="utf-8")
+    queue_db = tmp_path / "queue.sqlite"
+    hook_adapter.request_session_capture(
+        client="codex",
+        session_id="queued-session",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        trigger="GATED_CAPTURE",
+        queue_db_path=queue_db,
+    )
+    transcript.unlink()
+    requests: list[tuple[str, dict]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        return {"ok": True}
+
+    monkeypatch.setenv("MEMINCEPTION_AGENT_QUEUE_DB", str(queue_db))
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+
+    submitted = hook_adapter.run_agent_window_worker_once(
+        api_url="http://127.0.0.1:8765",
+        timeout=77,
+    )
+
+    assert submitted == 0
+    assert requests == []
+    with sqlite3.connect(queue_db) as connection:
+        row = connection.execute(
+            "SELECT capture_pending, captured_through, last_error, lease_until FROM session_cursor"
+        ).fetchone()
+    assert row[0] == 1
+    assert row[1] == 0
+    assert "transcript unavailable" in row[2]
+    assert row[3] is None
+
+
+def test_request_session_capture_creates_session_cursor_schema(tmp_path):
+    from meminception import hook_adapter
+
+    queue_db = tmp_path / "queue.sqlite"
+    hook_adapter.request_session_capture(
+        client="codex",
+        session_id="queued-session",
+        transcript_path=str(tmp_path / "missing.jsonl"),
+        workspace=str(tmp_path),
+        trigger="GATED_CAPTURE",
+        queue_db_path=queue_db,
+    )
+
+    with sqlite3.connect(queue_db) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(session_cursor)")}
+        row = connection.execute(
+            "SELECT capture_pending, captured_through, pending_trigger, request_seq, lease_token FROM session_cursor"
+        ).fetchone()
+    assert {
+        "captured_through",
+        "capture_pending",
+        "pending_trigger",
+        "lease_until",
+        "lease_token",
+        "request_seq",
+        "last_error",
+    } <= columns
+    assert row == (1, 0, "GATED_CAPTURE", 1, None)
+
+
+def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
+    root = Path(__file__).resolve().parents[1]
+
+    codex_root = root / "integrations" / "codex" / "meminception-memory"
+    claude_root = root / "integrations" / "claude-code" / "meminception-memory"
+
+    assert (codex_root / ".codex-plugin" / "plugin.json").exists()
+    assert (codex_root / "hooks" / "hooks.json").exists()
+    assert (codex_root / "scripts" / "meminception_hook.py").exists()
+    assert (codex_root / "scripts" / "meminception_hook_adapter.py").exists()
+
+    assert (claude_root / ".claude-plugin" / "plugin.json").exists()
+    assert (claude_root / "hooks" / "hooks.json").exists()
+    assert (claude_root / "scripts" / "meminception_hook.py").exists()
+    assert (claude_root / "scripts" / "meminception_hook_adapter.py").exists()
+
+    codex_manifest = json.loads((codex_root / ".codex-plugin" / "plugin.json").read_text())
+    assert codex_manifest["hooks"] == "./hooks/hooks.json"
+
+    codex_hooks = json.loads((codex_root / "hooks" / "hooks.json").read_text())
+    claude_hooks = json.loads((claude_root / "hooks" / "hooks.json").read_text())
+
+    for hooks in (codex_hooks, claude_hooks):
+        assert "UserPromptSubmit" in hooks["hooks"]
+        assert "Stop" in hooks["hooks"]
+        commands = json.dumps(hooks)
+        assert "meminception_hook.py" in commands
+        assert "submit-session" in commands
+    assert "SubagentStop" in claude_hooks["hooks"]
+
+
+def test_plugin_wrapper_runs_from_repo_checkout_without_pythonpath():
+    root = Path(__file__).resolve().parents[1]
+    wrapper = root / "integrations" / "codex" / "meminception-memory" / "scripts" / "meminception_hook.py"
+
+    result = subprocess.run(
+        [sys.executable, str(wrapper), "context", "--api-url", ""],
+        input="{}",
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    output = json.loads(result.stdout)
+    assert output["continue"] is True
+    assert "MemInception hook skipped" in output["systemMessage"]
+
+
+def test_plugin_wrapper_runs_from_copied_package_without_pythonpath(tmp_path):
+    import shutil
+
+    root = Path(__file__).resolve().parents[1]
+    for client in ("codex", "claude-code"):
+        source_plugin = root / "integrations" / client / "meminception-memory"
+        copied_plugin = tmp_path / client / "meminception-memory"
+        shutil.copytree(source_plugin, copied_plugin)
+        wrapper = copied_plugin / "scripts" / "meminception_hook.py"
+
+        result = subprocess.run(
+            [sys.executable, str(wrapper), "context", "--api-url", ""],
+            input="{}",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+
+        assert result.returncode == 0
+        assert result.stderr == ""
+        output = json.loads(result.stdout)
+        assert output["continue"] is True
+        assert "MemInception hook skipped" in output["systemMessage"]
+
+
+def test_plugin_adapters_match_canonical_adapter():
+    root = Path(__file__).resolve().parents[1]
+    canonical = (root / "src" / "meminception" / "hook_adapter.py").read_text()
+
+    for adapter in (
+        root / "integrations" / "codex" / "meminception-memory" / "scripts" / "meminception_hook_adapter.py",
+        root / "integrations" / "claude-code" / "meminception-memory" / "scripts" / "meminception_hook_adapter.py",
+    ):
+        assert adapter.read_text() == canonical
+
+
+def test_malformed_timeout_env_fails_open(monkeypatch, capsys):
+    from meminception import hook_adapter
+
+    monkeypatch.setenv("MEMINCEPTION_HOOK_TIMEOUT_SECONDS", "not-a-number")
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({}))
+
+    exit_code = hook_adapter.main(["context", "--api-url", ""])
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["continue"] is True
+    assert "MemInception hook skipped" in output["systemMessage"]
+
+
+def test_http_error_body_is_not_echoed_into_hook_output(monkeypatch, capsys):
+    from meminception import hook_adapter
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        raise RuntimeError("/api/hooks/context returned HTTP 500: secret stack trace")
+
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({"hook_event_name": "UserPromptSubmit"}))
+
+    exit_code = hook_adapter.main(["context"])
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["continue"] is True
+    assert "secret stack trace" not in output["systemMessage"]
+    assert "MemInception hook skipped" in output["systemMessage"]
+
+
+def test_post_json_accepts_admin_api_url_with_or_without_api_suffix(monkeypatch):
+    from meminception import hook_adapter
+
+    urls: list[str] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def fake_urlopen(request, timeout: float):
+        urls.append(request.full_url)
+        return FakeResponse()
+
+    monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
+
+    hook_adapter._post_json("/api/hooks/context", {}, api_url="http://127.0.0.1:8766", timeout=1)
+    hook_adapter._post_json("/api/hooks/context", {}, api_url="http://127.0.0.1:8766/api", timeout=1)
+
+    assert urls == [
+        "http://127.0.0.1:8766/api/hooks/context",
+        "http://127.0.0.1:8766/api/hooks/context",
+    ]
+
+
+def test_post_json_includes_configured_bearer_token(monkeypatch):
+    from meminception import hook_adapter
+
+    auth_headers: list[str | None] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def fake_urlopen(request, timeout: float):
+        auth_headers.append(request.get_header("Authorization"))
+        return FakeResponse()
+
+    monkeypatch.setenv("MEMINCEPTION_API_TOKEN", "secret-token")
+    monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
+
+    hook_adapter._post_json("/api/hooks/context", {}, api_url="http://127.0.0.1:8766", timeout=1)
+
+    assert auth_headers == ["Bearer secret-token"]
+
+
+def test_session_window_payload_redacts_before_network_and_versions_contract(tmp_path):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps({
+            "type": "tool",
+            "name": "exec_command",
+            "input": "Authorization: Bearer raw-secret-token",
+        }) + "\n"
+        + json.dumps({
+            "type": "assistant",
+            "message": "api_key: raw-api-secret",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    payload = hook_adapter._session_window_payload(
+        client="codex",
+        session_id="sess-redact",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        from_line=0,
+        to_line=2,
+        trigger="GATED_CAPTURE",
+    )
+
+    serialized = json.dumps(payload)
+    assert "raw-secret-token" not in serialized
+    assert "raw-api-secret" not in serialized
+    assert "[REDACTED]" in serialized
+    assert payload["schema_version"] == "agent-session-window/v1"
+    assert payload["plugin_version"]
+    assert payload["receipt"]["metadata"]["uploaded_to_line"] == 2
+    assert payload["receipt"]["metadata"]["observed_to_line"] == 2
+
+
+def test_bounded_transcript_slice_never_advances_past_lines_read(tmp_path):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        '{"type":"tool","name":"one","input":"edit"}\n'
+        '{"type":"tool","name":"two","input":"test"}\n',
+        encoding="utf-8",
+    )
+
+    lines, effective_end, truncated = hook_adapter._bounded_transcript_line_slice(
+        str(transcript), 0, 3
+    )
+
+    assert len(lines) == 2
+    assert effective_end == 2
+    assert truncated is False
+
+
+def test_extract_transcript_events_understands_codex_payload_shape():
+    from meminception import hook_adapter
+
+    text = "\n".join([
+        json.dumps({
+            "timestamp": "2026-05-30T12:00:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "apply_patch",
+                "arguments": "{\"cmd\":\"edit docs\"}",
+            },
+        }),
+        json.dumps({
+            "timestamp": "2026-05-30T12:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "message": "Implemented the boundary fix.",
+            },
+        }),
+    ])
+
+    events = hook_adapter._extract_transcript_events(text)
+
+    assert events == [
+        {
+            "kind": "tool_call",
+            "actor": "assistant",
+            "source_type": "response_item",
+            "native_type": "function_call",
+            "name": "apply_patch",
+            "timestamp": "2026-05-30T12:00:00Z",
+            "text": "{\"cmd\":\"edit docs\"}",
+        },
+        {
+            "kind": "assistant_message",
+            "actor": "assistant",
+            "source_type": "event_msg",
+            "native_type": "agent_message",
+            "timestamp": "2026-05-30T12:00:01Z",
+            "text": "Implemented the boundary fix.",
+        },
+    ]
+
+
+def test_extract_transcript_events_understands_claude_nested_content_shape():
+    from meminception import hook_adapter
+
+    text = json.dumps({
+        "type": "assistant",
+        "timestamp": "2026-05-30T12:00:02Z",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "Bash",
+                    "input": {"command": "pytest tests/test_hook_adapter.py -q"},
+                },
+                {"type": "text", "text": "I will run the focused test."},
+            ],
+        },
+    })
+
+    events = hook_adapter._extract_transcript_events(text)
+
+    assert events == [
+        {
+            "kind": "tool_call",
+            "actor": "assistant",
+            "source_type": "assistant",
+            "native_type": "tool_use",
+            "name": "Bash",
+            "timestamp": "2026-05-30T12:00:02Z",
+            "text": "{\"command\":\"pytest tests/test_hook_adapter.py -q\"}",
+        }
+    ]
+
+
+def test_extract_transcript_events_keeps_recent_within_cap():
+    from meminception import hook_adapter
+
+    text = "\n".join(
+        json.dumps({"type": "tool", "name": f"tool-{i:03d}", "input": "x"})
+        for i in range(hook_adapter.MAX_EVENTS + 20)
+    )
+    events = hook_adapter._extract_transcript_events(text)
+
+    assert len(events) == hook_adapter.MAX_EVENTS
+    # The most recent events are kept, not the earliest, so the structured events
+    # line up with the tail the transcript text is taken from.
+    assert events[0]["name"] == "tool-020"
+    assert events[-1]["name"] == f"tool-{hook_adapter.MAX_EVENTS + 19:03d}"
+
+
+def test_session_window_payload_events_and_text_track_same_tail(tmp_path):
+    from meminception import hook_adapter
+
+    n = hook_adapter.MAX_EVENTS + 20
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        "\n".join(json.dumps({"type": "tool", "name": f"tool-{i:03d}", "input": "x"}) for i in range(n)) + "\n",
+        encoding="utf-8",
+    )
+
+    payload = hook_adapter._session_window_payload(
+        client="codex",
+        session_id="sess-tail",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        from_line=0,
+        to_line=n,
+        trigger="GATED_CAPTURE",
+    )
+
+    events = payload["events"]
+    assert len(events) == hook_adapter.MAX_EVENTS
+    assert events[0]["name"] == "tool-000"
+    assert events[-1]["name"] == f"tool-{hook_adapter.MAX_EVENTS - 1:03d}"
+    # The window is now a bounded prefix chunk over canonical evidence, so the
+    # bookmark stops at the last uploaded event instead of claiming the full tail.
+    assert f"tool-{hook_adapter.MAX_EVENTS - 1:03d}" in payload["transcript_markdown"]
+    assert f"tool-{hook_adapter.MAX_EVENTS:03d}" not in payload["transcript_markdown"]
+    assert payload["history_window"]["start"] == "0"
+    assert payload["history_window"]["end"] == str(hook_adapter.MAX_EVENTS)
+    assert payload["history_window"]["truncated"] is True
+
+
+def test_session_window_payload_filters_codex_bootstrap_before_budgeting(tmp_path):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "codex-long-bootstrap.jsonl"
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {"cwd": str(tmp_path)}}),
+        json.dumps({"type": "turn_context", "payload": {"huge": "startup"}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "task_started", "message": "boot"}}),
+        json.dumps({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "private developer instruction"}],
+            },
+        }),
+        json.dumps({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "# AGENTS.md instructions for /tmp\n<INSTRUCTIONS>\nnoise\n</INSTRUCTIONS>",
+                    }
+                ],
+            },
+        }),
+        json.dumps({
+            "timestamp": "2026-05-30T12:00:10Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "apply_patch",
+                "arguments": "{\"file\":\"src/meminception/hook_adapter.py\"}",
+            },
+        }),
+        json.dumps({
+            "timestamp": "2026-05-30T12:00:11Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "output": "Updated canonical evidence extraction.",
+            },
+        }),
+    ]
+    transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    payload = hook_adapter._session_window_payload(
+        client="codex",
+        session_id="sess-bootstrap",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        from_line=0,
+        to_line=len(lines),
+        trigger="REQUIRED_CAPTURE",
+    )
+
+    assert payload["history_window"]["start"] == "0"
+    assert payload["history_window"]["end"] == str(len(lines))
+    assert payload["events"] == [
+        {
+            "kind": "tool_call",
+            "actor": "assistant",
+            "source_type": "response_item",
+            "native_type": "function_call",
+            "name": "apply_patch",
+            "timestamp": "2026-05-30T12:00:10Z",
+            "text": "{\"file\":\"src/meminception/hook_adapter.py\"}",
+        },
+        {
+            "kind": "tool_result",
+            "actor": "tool",
+            "source_type": "response_item",
+            "native_type": "function_call_output",
+            "timestamp": "2026-05-30T12:00:11Z",
+            "text": "Updated canonical evidence extraction.",
+        },
+    ]
+    assert "session_meta" not in payload["transcript_markdown"]
+    assert "task_started" not in payload["transcript_markdown"]
+    assert "private developer instruction" not in payload["transcript_markdown"]
+    assert "AGENTS.md" not in payload["transcript_markdown"]
+    assert "apply_patch" in payload["transcript_markdown"]
+    assert payload["receipt"]["metadata"]["omissions"]["metadata_or_context"] == 5
+
+
+def test_session_window_payload_middle_truncates_oversized_evidence_line(monkeypatch, tmp_path):
+    from meminception import hook_adapter
+
+    monkeypatch.setattr(hook_adapter, "MAX_TRANSCRIPT_CHARS", 220)
+    transcript = tmp_path / "codex-huge-line.jsonl"
+    transcript.write_text(
+        json.dumps({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "output": "command started\n" + ("x" * 1000) + "\npytest passed",
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    payload = hook_adapter._session_window_payload(
+        client="codex",
+        session_id="sess-huge",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        from_line=0,
+        to_line=1,
+        trigger="REQUIRED_CAPTURE",
+    )
+
+    assert payload["history_window"]["end"] == "1"
+    assert payload["history_window"]["truncated"] is True
+    assert payload["events"][0]["kind"] == "tool_result"
+    assert "command started" in payload["events"][0]["text"]
+    assert "pytest passed" in payload["events"][0]["text"]
+    assert "truncated" in payload["events"][0]["text"]
+
+
+def test_session_window_payload_redacts_claude_nested_json_secret_before_network(tmp_path):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "claude-json-secret.jsonl"
+    transcript.write_text(
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "input": {
+                            "command": "pytest tests/test_hook_adapter.py -q",
+                            "api_key": "claude-json-api-key-value",
+                        },
+                    }
+                ]
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    payload = hook_adapter._session_window_payload(
+        client="claude-code",
+        session_id="sess-claude-json-secret",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        from_line=0,
+        to_line=1,
+        trigger="REQUIRED_CAPTURE",
+    )
+
+    serialized = json.dumps(payload)
+    assert "claude-json-api-key-value" not in serialized
+    assert "api_key" in serialized
+    assert "[REDACTED]" in serialized
+
+
+def test_worker_single_flight_skips_when_locked(monkeypatch, tmp_path):
+    from meminception import hook_adapter
+
+    if hook_adapter.fcntl is None:
+        pytest.skip("file locking unavailable on this platform")
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"tool","name":"apply_patch","input":"edit"}\n', encoding="utf-8")
+    queue_db = tmp_path / "queue.sqlite"
+    hook_adapter.request_session_capture(
+        client="codex",
+        session_id="sess-lock",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        trigger="GATED_CAPTURE",
+        queue_db_path=queue_db,
+    )
+
+    posts: list[str] = []
+
+    def fake_post_json(path, payload, *, api_url, timeout):
+        posts.append(path)
+        return {"ok": True}
+
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+
+    held = hook_adapter._acquire_worker_lock(queue_db)
+    assert held is not None and held is not hook_adapter._NULL_WORKER_LOCK
+    try:
+        skipped = hook_adapter.run_agent_window_worker_once(
+            api_url="http://127.0.0.1:8765", timeout=5, queue_db_path=queue_db
+        )
+    finally:
+        hook_adapter._release_worker_lock(held)
+
+    assert skipped == 0
+    assert posts == []  # nothing processed while another worker holds the lock
+
+    processed = hook_adapter.run_agent_window_worker_once(
+        api_url="http://127.0.0.1:8765", timeout=5, queue_db_path=queue_db
+    )
+    assert processed == 1
+    assert posts and posts[0] == "/api/agent-sessions/windows"
+
+
+def test_drain_does_not_spawn_when_no_pending(monkeypatch, tmp_path):
+    from meminception import hook_adapter
+
+    queue_db = tmp_path / "queue.sqlite"
+    monkeypatch.setenv("MEMINCEPTION_AGENT_QUEUE_DB", str(queue_db))
+    spawned: list = []
+    monkeypatch.setattr(
+        hook_adapter,
+        "_spawn_agent_window_worker",
+        lambda *, api_url, timeout: spawned.append((api_url, timeout)),
+    )
+
+    # No queue file yet: nothing pending, so no worker is spawned.
+    hook_adapter._drain_pending_agent_windows_if_present(api_url="http://127.0.0.1:8765", timeout=5)
+    assert spawned == []
+
+    # A session_cursor with capture_pending=0 also has nothing pending.
+    with sqlite3.connect(queue_db) as connection:
+        hook_adapter._ensure_session_cursor(connection)
+        connection.execute(
+            "INSERT INTO session_cursor (client, session_id, captured_through, capture_pending, created_at, updated_at) "
+            "VALUES ('codex', 's', 3, 0, 'now', 'now')"
+        )
+    hook_adapter._drain_pending_agent_windows_if_present(api_url="http://127.0.0.1:8765", timeout=5)
+    assert spawned == []
+
+
+def test_worker_keeps_pending_when_capture_requested_during_upload(monkeypatch, tmp_path, capsys):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"tool","name":"apply_patch","input":"edit"}\n', encoding="utf-8")
+    queue_db = tmp_path / "queue.sqlite"
+    hook_adapter.request_session_capture(
+        client="codex", session_id="sess", transcript_path=str(transcript),
+        workspace=str(tmp_path), trigger="GATED_CAPTURE", queue_db_path=queue_db,
+    )
+
+    def fake_post_json(path, payload, *, api_url, timeout):
+        if path == "/api/agent-sessions/windows":
+            # A hook fires during the in-flight upload, requesting another capture.
+            hook_adapter.request_session_capture(
+                client="codex", session_id="sess", transcript_path=str(transcript),
+                workspace=str(tmp_path), trigger="GATED_CAPTURE", queue_db_path=queue_db,
+            )
+        return {"ok": True}
+
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+
+    submitted = hook_adapter.run_agent_window_worker_once(
+        api_url="http://127.0.0.1:8765", timeout=5, queue_db_path=queue_db
+    )
+
+    assert submitted == 1
+    with sqlite3.connect(queue_db) as connection:
+        row = connection.execute("SELECT capture_pending, captured_through FROM session_cursor").fetchone()
+    # Bookmark advanced to the uploaded count, but the mid-upload request is preserved.
+    assert row == (1, 1)
+    assert capsys.readouterr().out == ""
+
+
+def test_worker_keeps_pending_when_request_timestamp_collides(monkeypatch, tmp_path, capsys):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"tool","name":"apply_patch","input":"edit"}\n', encoding="utf-8")
+    queue_db = tmp_path / "queue.sqlite"
+    constant_now = "2026-05-30T00:00:00+00:00"
+    monkeypatch.setattr(hook_adapter, "_now_iso", lambda: constant_now)
+    hook_adapter.request_session_capture(
+        client="codex", session_id="sess", transcript_path=str(transcript),
+        workspace=str(tmp_path), trigger="GATED_CAPTURE", queue_db_path=queue_db,
+    )
+
+    def fake_post_json(path, payload, *, api_url, timeout):
+        if path == "/api/agent-sessions/windows":
+            transcript.write_text(
+                '{"type":"tool","name":"apply_patch","input":"edit"}\n'
+                '{"type":"tool","name":"pytest","input":"tests"}\n',
+                encoding="utf-8",
+            )
+            hook_adapter.request_session_capture(
+                client="codex", session_id="sess", transcript_path=str(transcript),
+                workspace=str(tmp_path), trigger="GATED_CAPTURE", queue_db_path=queue_db,
+            )
+        return {"ok": True}
+
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+
+    submitted = hook_adapter.run_agent_window_worker_once(
+        api_url="http://127.0.0.1:8765", timeout=5, queue_db_path=queue_db
+    )
+
+    assert submitted == 1
+    with sqlite3.connect(queue_db) as connection:
+        row = connection.execute(
+            "SELECT capture_pending, captured_through, request_seq FROM session_cursor"
+        ).fetchone()
+    assert row == (1, 1, 2)
+    assert capsys.readouterr().out == ""
+
+
+def test_stale_worker_cannot_rewind_bookmark_after_lease_reclaim(monkeypatch, tmp_path):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript_lines(transcript, 10)
+    queue_db = tmp_path / "queue.sqlite"
+    hook_adapter.request_session_capture(
+        client="codex", session_id="sess", transcript_path=str(transcript),
+        workspace=str(tmp_path), trigger="GATED_CAPTURE", queue_db_path=queue_db,
+    )
+    calls = {"window_uploads": 0}
+
+    def fake_post_json(path, payload, *, api_url, timeout):
+        if path == "/api/agent-sessions/windows":
+            calls["window_uploads"] += 1
+            if calls["window_uploads"] == 1:
+                _write_transcript_lines(transcript, 20)
+                with sqlite3.connect(queue_db) as connection:
+                    connection.execute(
+                        "UPDATE session_cursor SET lease_until = ? WHERE client = ? AND session_id = ?",
+                        ("1970-01-01T00:00:00+00:00", "codex", "sess"),
+                    )
+                hook_adapter._process_session_captures(
+                    queue_db, api_url="http://127.0.0.1:8765", timeout=5, max_sessions=5
+                )
+        return {"ok": True}
+
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+
+    hook_adapter._process_session_captures(
+        queue_db, api_url="http://127.0.0.1:8765", timeout=5, max_sessions=5
+    )
+
+    with sqlite3.connect(queue_db) as connection:
+        row = connection.execute(
+            "SELECT captured_through, capture_pending FROM session_cursor"
+        ).fetchone()
+    assert row == (20, 0)
+
+
+def test_recover_does_not_overwrite_concurrent_required_capture_request(monkeypatch, tmp_path):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript_lines(transcript, 6)
+    queue_db = tmp_path / "queue.sqlite"
+    _seed_session_cursor(queue_db, transcript_path=str(transcript), captured_through=2, capture_pending=0)
+    requested = {"done": False}
+
+    def racing_line_count(path):
+        if not requested["done"]:
+            requested["done"] = True
+            hook_adapter.request_session_capture(
+                client="codex", session_id="sess", transcript_path=str(transcript),
+                workspace=str(tmp_path), trigger="REQUIRED_CAPTURE", queue_db_path=queue_db,
+            )
+        return 6
+
+    monkeypatch.setattr(hook_adapter, "_transcript_line_count", racing_line_count)
+
+    rearmed = hook_adapter._recover_incomplete_sessions(client="codex", queue_db_path=queue_db)
+
+    assert rearmed == 0
+    with sqlite3.connect(queue_db) as connection:
+        row = connection.execute(
+            "SELECT capture_pending, pending_trigger, captured_through, request_seq FROM session_cursor"
+        ).fetchone()
+    assert row == (1, "REQUIRED_CAPTURE", 2, 1)
+
+
+class _Stdin:
+    def __init__(self, payload: dict) -> None:
+        self._text = json.dumps(payload)
+
+    def read(self) -> str:
+        return self._text
+
+
+def _seed_session_cursor(queue_db, **fields):
+    from meminception import hook_adapter
+
+    columns = (
+        "client", "session_id", "transcript_path", "captured_through",
+        "capture_pending", "pending_trigger", "created_at", "updated_at",
+    )
+    values = {
+        "client": "codex",
+        "session_id": "sess",
+        "transcript_path": None,
+        "captured_through": 0,
+        "capture_pending": 0,
+        "pending_trigger": None,
+        "created_at": "now",
+        "updated_at": "now",
+    }
+    values.update(fields)
+    with sqlite3.connect(queue_db) as connection:
+        hook_adapter._ensure_session_cursor(connection)
+        placeholders = ", ".join("?" for _ in columns)
+        connection.execute(
+            f"INSERT INTO session_cursor ({', '.join(columns)}) VALUES ({placeholders})",
+            tuple(values[name] for name in columns),
+        )
+
+
+def _write_transcript_lines(path, count):
+    path.write_text("\n".join(f'{{"i":{index}}}' for index in range(count)) + "\n", encoding="utf-8")
+
+
+def test__is_recover_event_only_session_start():
+    from meminception import hook_adapter
+
+    assert hook_adapter._is_recover_event("SessionStart") is True
+    for event in ("Stop", "SubagentStop", "PreCompact", "UserPromptSubmit", "UnknownHook"):
+        assert hook_adapter._is_recover_event(event) is False
+
+
+def test_recover_rearms_session_with_uncaptured_tail(tmp_path):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript_lines(transcript, 6)
+    queue_db = tmp_path / "queue.sqlite"
+    _seed_session_cursor(queue_db, transcript_path=str(transcript), captured_through=2, capture_pending=0)
+
+    rearmed = hook_adapter._recover_incomplete_sessions(client="codex", queue_db_path=queue_db)
+
+    assert rearmed == 1
+    with sqlite3.connect(queue_db) as connection:
+        row = connection.execute(
+            "SELECT capture_pending, pending_trigger, captured_through FROM session_cursor"
+        ).fetchone()
+    assert row == (1, "RECOVER", 2)  # re-armed for the tail, bookmark left where it was
+
+
+def test_recover_skips_caught_up_session(tmp_path):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript_lines(transcript, 6)
+    queue_db = tmp_path / "queue.sqlite"
+    _seed_session_cursor(queue_db, transcript_path=str(transcript), captured_through=6, capture_pending=0)
+
+    rearmed = hook_adapter._recover_incomplete_sessions(client="codex", queue_db_path=queue_db)
+
+    assert rearmed == 0
+    with sqlite3.connect(queue_db) as connection:
+        assert connection.execute("SELECT capture_pending FROM session_cursor").fetchone() == (0,)
+
+
+def test_recover_skips_already_pending_session(tmp_path):
+    from meminception import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript_lines(transcript, 6)
+    queue_db = tmp_path / "queue.sqlite"
+    _seed_session_cursor(
+        queue_db, transcript_path=str(transcript), captured_through=2,
+        capture_pending=1, pending_trigger="REQUIRED_CAPTURE",
+    )
+
+    rearmed = hook_adapter._recover_incomplete_sessions(client="codex", queue_db_path=queue_db)
+
+    assert rearmed == 0
+    with sqlite3.connect(queue_db) as connection:
+        row = connection.execute("SELECT capture_pending, pending_trigger FROM session_cursor").fetchone()
+    assert row == (1, "REQUIRED_CAPTURE")  # a pending row is left untouched, its required capture preserved
+
+
+def test_recover_skips_missing_transcript(tmp_path):
+    from meminception import hook_adapter
+
+    queue_db = tmp_path / "queue.sqlite"
+    _seed_session_cursor(
+        queue_db, transcript_path=str(tmp_path / "gone.jsonl"), captured_through=2, capture_pending=0
+    )
+
+    rearmed = hook_adapter._recover_incomplete_sessions(client="codex", queue_db_path=queue_db)
+
+    assert rearmed == 0
+    with sqlite3.connect(queue_db) as connection:
+        assert connection.execute("SELECT capture_pending FROM session_cursor").fetchone() == (0,)
+
+
+def test_queue_uses_wal_mode(tmp_path):
+    from meminception import hook_adapter
+
+    queue_db = tmp_path / "queue.sqlite"
+    hook_adapter.request_session_capture(
+        client="codex", session_id="sess", transcript_path=str(tmp_path / "t.jsonl"),
+        workspace=str(tmp_path), trigger="GATED_CAPTURE", queue_db_path=queue_db,
+    )
+
+    with sqlite3.connect(queue_db) as connection:
+        mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode.lower() == "wal"
