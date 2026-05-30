@@ -1,13 +1,13 @@
 # Contributing
 
-Thanks for helping improve MemInception. The project is young, so the best
+Thanks for helping improve MemForge. The project is young, so the best
 contributions are small, well-tested, and easy to review.
 
 ## Development Setup
 
 ```bash
-git clone https://github.com/DoDoMan-TTT/mem-inception.git
-cd mem-inception
+git clone https://github.com/DoDoMan-TTT/mem-forge.git
+cd mem-forge
 uv sync --extra dev
 cd admin-ui && npm ci && cd ..
 ```

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from meminception.retrieval.document_index import DocumentVectorIndex
+from memforge.retrieval.document_index import DocumentVectorIndex
 
 
 class NumpyEmbeddingCollection:

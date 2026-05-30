@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
-from meminception.config import AppConfig
-from meminception.storage.database import Database
+from memforge.config import AppConfig
+from memforge.storage.database import Database
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -19,14 +19,14 @@ def _config(tmp_path: Path) -> AppConfig:
 
 
 def test_agent_session_window_prompt_uses_memory_quality_gate():
-    from meminception.agent_sessions import render_agent_session_window_prompt
+    from memforge.agent_sessions import render_agent_session_window_prompt
 
     prompt = render_agent_session_window_prompt(
         client="codex",
         session_id="sess-prompt",
         trigger="REQUIRED_CAPTURE",
-        workspace="/workspace/mem-inception",
-        repo="mem-inception",
+        workspace="/workspace/mem-forge",
+        repo="mem-forge",
         branch="main",
         history_window={"from": 0, "to": 2},
         events=[
@@ -45,7 +45,7 @@ def test_agent_session_window_prompt_uses_memory_quality_gate():
 
 
 def test_agent_session_document_submit_api_records_generated_source(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "api.db"))
@@ -65,8 +65,8 @@ def test_agent_session_document_submit_api_records_generated_source(tmp_path):
                     "client": "codex",
                     "session_id": "sess-api",
                     "trigger": "Stop",
-                    "workspace": "/workspace/mem-inception",
-                    "repo": "mem-inception",
+                    "workspace": "/workspace/mem-forge",
+                    "repo": "mem-forge",
                     "branch": "main",
                     "commit_sha": "abc123",
                     "history_window_kind": "session",
@@ -88,7 +88,7 @@ def test_agent_session_document_submit_api_records_generated_source(tmp_path):
 
 
 def test_agent_session_window_api_generates_package_and_discards_raw_window(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     class FakeWindowClient:
         async def generate_agent_session_package(self, prompt: str, **kwargs):
@@ -128,8 +128,8 @@ def test_agent_session_window_api_generates_package_and_discards_raw_window(tmp_
                     "client": "codex",
                     "session_id": "sess-window",
                     "trigger": "PreCompact",
-                    "workspace": "/workspace/mem-inception",
-                    "repo": "mem-inception",
+                    "workspace": "/workspace/mem-forge",
+                    "repo": "mem-forge",
                     "branch": "main",
                     "commit_sha": "abc123",
                     "history_window": {
@@ -170,13 +170,13 @@ def test_agent_session_window_api_generates_package_and_discards_raw_window(tmp_
 
 
 def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     class FakeWindowClient:
         async def generate_agent_session_package(self, prompt: str, **kwargs):
             assert "Canonical evidence" in prompt
             assert "apply_patch" in prompt
-            assert "Edited src/meminception/hook_adapter.py" in prompt
+            assert "Edited src/memforge/hook_adapter.py" in prompt
             assert "service-json-secret" not in prompt
             assert "session_meta" not in prompt
             assert "private developer bootstrap" not in prompt
@@ -207,7 +207,7 @@ def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_pa
                     "client": "codex",
                     "session_id": "sess-canonical",
                     "trigger": "REQUIRED_CAPTURE",
-                    "workspace": "/workspace/mem-inception",
+                    "workspace": "/workspace/mem-forge",
                     "events": [
                         {
                             "type": "session_meta",
@@ -217,7 +217,7 @@ def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_pa
                             "kind": "tool_call",
                             "actor": "assistant",
                             "name": "apply_patch",
-                            "text": "Edited src/meminception/hook_adapter.py",
+                            "text": "Edited src/memforge/hook_adapter.py",
                             "input": {"api_key": "service-json-secret"},
                         },
                     ],
@@ -241,7 +241,7 @@ def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_pa
 
 
 def test_agent_session_window_api_queues_service_owned_sync(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     class FakeWindowClient:
         async def generate_agent_session_package(self, prompt: str, **kwargs):
@@ -287,7 +287,7 @@ def test_agent_session_window_api_queues_service_owned_sync(tmp_path):
                     "client": "codex",
                     "session_id": "sess-window-sync",
                     "trigger": "PreCompact",
-                    "workspace": "/workspace/mem-inception",
+                    "workspace": "/workspace/mem-forge",
                     "events": [{"role": "tool", "name": "apply_patch", "summary": "Edited code."}],
                     "retention": "none",
                     "process_now": False,
@@ -305,7 +305,7 @@ def test_agent_session_window_api_queues_service_owned_sync(tmp_path):
 
 
 def test_agent_session_window_api_rejects_unknown_schema_version(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     class UnexpectedWindowClient:
         async def generate_agent_session_package(self, prompt: str, **kwargs):
@@ -331,7 +331,7 @@ def test_agent_session_window_api_rejects_unknown_schema_version(tmp_path):
                     "client": "codex",
                     "session_id": "sess-window-schema",
                     "trigger": "PreCompact",
-                    "workspace": "/workspace/mem-inception",
+                    "workspace": "/workspace/mem-forge",
                     "events": [{"role": "tool", "name": "apply_patch", "summary": "Edited code."}],
                     "retention": "none",
                     "process_now": False,
@@ -345,7 +345,7 @@ def test_agent_session_window_api_rejects_unknown_schema_version(tmp_path):
 
 
 def test_agent_session_window_api_accepts_no_output_without_creating_source(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     class NoOutputClient:
         async def generate_agent_session_package(self, prompt: str, **kwargs):
@@ -375,7 +375,7 @@ def test_agent_session_window_api_accepts_no_output_without_creating_source(tmp_
                     "client": "codex",
                     "session_id": "sess-window-trivial",
                     "trigger": "Stop",
-                    "workspace": "/workspace/mem-inception",
+                    "workspace": "/workspace/mem-forge",
                     "events": [{"role": "assistant", "text": "Sure, that function formats text."}],
                     "process_now": False,
                 },
@@ -395,7 +395,7 @@ def test_agent_session_window_api_accepts_no_output_without_creating_source(tmp_
 
 
 def test_agent_session_window_api_reports_missing_llm(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "api.db"))
@@ -415,7 +415,7 @@ def test_agent_session_window_api_reports_missing_llm(tmp_path):
                     "client": "codex",
                     "session_id": "sess-window-no-llm",
                     "trigger": "PreCompact",
-                    "workspace": "/workspace/mem-inception",
+                    "workspace": "/workspace/mem-forge",
                     "events": [{"role": "tool", "name": "apply_patch", "summary": "Edited code."}],
                     "process_now": False,
                 },
@@ -429,7 +429,7 @@ def test_agent_session_window_api_reports_missing_llm(tmp_path):
 
 def test_agent_session_window_api_keeps_windows_distinct_and_idempotent(tmp_path):
     """Windows of one session/trigger get distinct, idempotent doc_ids (no overwrite)."""
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     class EchoWindowClient:
         async def generate_agent_session_package(self, prompt: str, **kwargs):
@@ -455,8 +455,8 @@ def test_agent_session_window_api_keeps_windows_distinct_and_idempotent(tmp_path
             "client": "codex",
             "session_id": "sess-distinct",
             "trigger": "Stop",
-            "workspace": "/workspace/mem-inception",
-            "repo": "mem-inception",
+            "workspace": "/workspace/mem-forge",
+            "repo": "mem-forge",
             "events": events,
             "history_window": {"kind": "transcript_window"},
             "retention": "none",
@@ -494,7 +494,7 @@ def test_agent_session_window_api_keeps_windows_distinct_and_idempotent(tmp_path
 
 def test_agent_session_window_api_same_range_different_content_is_distinct(tmp_path):
     """A reused explicit event range with different content must not overwrite."""
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     class EchoWindowClient:
         async def generate_agent_session_package(self, prompt: str, **kwargs):
@@ -517,7 +517,7 @@ def test_agent_session_window_api_same_range_different_content_is_distinct(tmp_p
             "client": "codex",
             "session_id": "sess-range",
             "trigger": "PreCompact",
-            "workspace": "/workspace/mem-inception",
+            "workspace": "/workspace/mem-forge",
             "events": events,
             # Same explicit event-id boundary on every call.
             "history_window": {"kind": "boundary", "start_event_id": "evt-1", "end_event_id": "evt-9"},
@@ -553,7 +553,7 @@ def test_agent_session_window_api_same_range_different_content_is_distinct(tmp_p
 
 def test_agent_session_window_retry_identity_ignores_receipt_and_submission_date(tmp_path):
     """The same range/content retry keeps one doc even if receipt metadata changes."""
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     class EchoWindowClient:
         async def generate_agent_session_package(self, prompt: str, **kwargs):
@@ -576,7 +576,7 @@ def test_agent_session_window_retry_identity_ignores_receipt_and_submission_date
             "client": "codex",
             "session_id": "sess-retry",
             "trigger": "Stop",
-            "workspace": "/workspace/mem-inception",
+            "workspace": "/workspace/mem-forge",
             "events": [{"role": "tool", "name": "apply_patch", "summary": "same edit"}],
             "history_window": {"kind": "transcript_window", "start": "10", "end": "20"},
             "receipt": receipt,
@@ -605,7 +605,7 @@ def test_agent_session_window_retry_identity_ignores_receipt_and_submission_date
 
 def test_agent_session_window_api_records_no_output_receipt(tmp_path):
     """A no_output window still leaves a traceable receipt, not silence."""
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     class NoOutputClient:
         async def generate_agent_session_package(self, prompt: str, **kwargs):
@@ -629,7 +629,7 @@ def test_agent_session_window_api_records_no_output_receipt(tmp_path):
                     "client": "codex",
                     "session_id": "sess-noout-receipt",
                     "trigger": "Stop",
-                    "workspace": "/workspace/mem-inception",
+                    "workspace": "/workspace/mem-forge",
                     "events": [{"role": "assistant", "text": "Sure, that formats text."}],
                 },
             )
@@ -651,7 +651,7 @@ def test_agent_session_window_api_records_no_output_receipt(tmp_path):
 
 def test_agent_session_window_api_records_failed_receipt(tmp_path):
     """A Stage-1 failure leaves a `failed` receipt so the loss is recorded."""
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     class FailingClient:
         async def generate_agent_session_package(self, prompt: str, **kwargs):
@@ -673,7 +673,7 @@ def test_agent_session_window_api_records_failed_receipt(tmp_path):
                     "client": "codex",
                     "session_id": "sess-failed-receipt",
                     "trigger": "Stop",
-                    "workspace": "/workspace/mem-inception",
+                    "workspace": "/workspace/mem-forge",
                     "events": [{"role": "tool", "name": "apply_patch", "summary": "edit"}],
                 },
             )
@@ -693,7 +693,7 @@ def test_agent_session_window_api_records_failed_receipt(tmp_path):
 
 
 def test_hook_receipt_api_records_lineage_without_source_document(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "api.db"))
@@ -713,8 +713,8 @@ def test_hook_receipt_api_records_lineage_without_source_document(tmp_path):
                     "client": "codex",
                     "session_id": "sess-hook",
                     "hook": "Stop",
-                    "workspace": "/workspace/mem-inception",
-                    "repo": "mem-inception",
+                    "workspace": "/workspace/mem-forge",
+                    "repo": "mem-forge",
                     "branch": "main",
                     "commit_sha": "abc123",
                     "metadata": {"has_transcript_path": True},
@@ -747,7 +747,7 @@ def _make_receipt(
     source_id="src-agent-sessions",
     source_kind="generated_agent_window_summary",
 ):
-    from meminception.models import AgentSessionReceipt
+    from memforge.models import AgentSessionReceipt
 
     return AgentSessionReceipt(
         doc_id=doc_id,
@@ -755,7 +755,7 @@ def _make_receipt(
         client="codex",
         session_id=session_id,
         trigger="Stop",
-        workspace="/workspace/mem-inception",
+        workspace="/workspace/mem-forge",
         repo=None,
         branch=None,
         commit_sha=None,
@@ -813,7 +813,7 @@ def test_summarize_empty_session_returns_zero_fraction(tmp_path):
 
 
 def test_agent_session_completeness_endpoint(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "api.db"))
@@ -878,7 +878,7 @@ def test_summarize_agent_session_outcomes_ignores_explicit_document_metadata(tmp
 
 
 def test_package_write_is_atomic_no_temp_left(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     class FakeWindowClient:
         async def generate_agent_session_package(self, prompt: str, **kwargs):
@@ -907,7 +907,7 @@ def test_package_write_is_atomic_no_temp_left(tmp_path):
                     "client": "codex",
                     "session_id": "sess-atomic",
                     "trigger": "Stop",
-                    "workspace": "/workspace/mem-inception",
+                    "workspace": "/workspace/mem-forge",
                     "events": [{"role": "tool", "name": "apply_patch", "summary": "edit"}],
                     "transcript_markdown": "did some real work worth keeping",
                 },

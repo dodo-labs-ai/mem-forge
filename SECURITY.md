@@ -1,6 +1,6 @@
 # Security Policy
 
-MemInception handles source-system credentials, generated agent-session
+MemForge handles source-system credentials, generated agent-session
 evidence, and memory derived from private workspaces. Treat all of those as
 sensitive.
 
@@ -13,7 +13,7 @@ branch until versioned releases are introduced.
 
 Please do not open a public issue for suspected credential exposure,
 authentication bypass, or data leakage. Report privately through GitHub security
-advisories for `DoDoMan-TTT/mem-inception` once the repository is available.
+advisories for `DoDoMan-TTT/mem-forge` once the repository is available.
 
 Include:
 
@@ -26,7 +26,7 @@ Include:
 
 - Do not commit `.env`, local databases, transcript exports, Chroma data, or
   browser-cookie artifacts.
-- Prefer `MEMINCEPTION_*` environment variables for local secrets.
+- Prefer `MEMFORGE_*` environment variables for local secrets.
 - Agent adapters redact obvious bearer tokens, API keys, passwords, and nested
   JSON secret fields before upload, but the service also validates and redacts
   incoming windows because client-side redaction is not a security boundary.

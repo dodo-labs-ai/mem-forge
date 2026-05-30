@@ -6,8 +6,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from meminception.models import Memory, content_hash
-from meminception.storage.database import Database
+from memforge.models import Memory, content_hash
+from memforge.storage.database import Database
 
 
 @pytest.fixture

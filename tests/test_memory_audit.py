@@ -6,10 +6,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from meminception.memory.audit import MemoryAuditEvent, MemoryAuditLogger
-from meminception.memory.store import MemoryStore
-from meminception.models import Memory, content_hash
-from meminception.storage.database import Database
+from memforge.memory.audit import MemoryAuditEvent, MemoryAuditLogger
+from memforge.memory.store import MemoryStore
+from memforge.models import Memory, content_hash
+from memforge.storage.database import Database
 
 
 class RecordingCollection:

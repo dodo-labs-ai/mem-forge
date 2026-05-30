@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from meminception.llm.structured import MemoryCandidate, MemoryExtractionResponse, StructuredLlmError
-from meminception.pipeline.memory_extractor import MemoryExtractor
+from memforge.llm.structured import MemoryCandidate, MemoryExtractionResponse, StructuredLlmError
+from memforge.pipeline.memory_extractor import MemoryExtractor
 
 
 class RecordingStructuredMemoryClient:

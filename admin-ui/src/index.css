@@ -5,7 +5,7 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* MemInception admin theme on shadcn/ui primitives. */
+/* MemForge admin theme on shadcn/ui primitives. */
 @theme inline {
   --font-heading: var(--font-sans);
   --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
@@ -50,7 +50,7 @@
   --radius-3xl: calc(var(--radius) * 2.2);
   --radius-4xl: calc(var(--radius) * 2.6);
 
-  /* MemInception custom tokens (used alongside shadcn) */
+  /* MemForge custom tokens (used alongside shadcn) */
   --color-gene-knowledge: #3b82f6;
   --color-gene-work: #22c55e;
   --color-gene-conversation: #8b5cf6;

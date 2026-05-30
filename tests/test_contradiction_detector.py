@@ -11,12 +11,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from meminception.llm.structured import ContradictionDecision, ContradictionResponse, StructuredLlmError
-from meminception.memory.audit import AuditContext, MemoryAuditLogger
-from meminception.memory.store import MemoryStore
-from meminception.models import Memory, content_hash
-from meminception.pipeline.contradiction_detector import detect_cross_doc_contradictions
-from meminception.storage.database import Database
+from memforge.llm.structured import ContradictionDecision, ContradictionResponse, StructuredLlmError
+from memforge.memory.audit import AuditContext, MemoryAuditLogger
+from memforge.memory.store import MemoryStore
+from memforge.models import Memory, content_hash
+from memforge.pipeline.contradiction_detector import detect_cross_doc_contradictions
+from memforge.storage.database import Database
 
 
 # ---------------------------------------------------------------------------

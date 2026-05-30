@@ -6,9 +6,9 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from meminception.config import AppConfig
-from meminception.models import Memory, SyncState, content_hash
-from meminception.storage.database import Database
+from memforge.config import AppConfig
+from memforge.models import Memory, SyncState, content_hash
+from memforge.storage.database import Database
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -24,7 +24,7 @@ def _memory(
     content: str,
     *,
     tags: list[str] | None = None,
-    project_key: str | None = "mem-inception",
+    project_key: str | None = "mem-forge",
 ) -> Memory:
     now = datetime.now(timezone.utc)
     return Memory(
@@ -42,7 +42,7 @@ def _memory(
 
 
 def test_hook_context_skips_trivial_prompt(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "hooks.db"))
@@ -59,8 +59,8 @@ def test_hook_context_skips_trivial_prompt(tmp_path):
                 json={
                     "client": "codex",
                     "hook": "UserPromptSubmit",
-                    "workspace": "/workspace/mem-inception",
-                    "repo": "mem-inception",
+                    "workspace": "/workspace/mem-forge",
+                    "repo": "mem-forge",
                     "branch": "codex/agent-hook-integration",
                     "prompt": "format this sentence",
                 },
@@ -76,7 +76,7 @@ def test_hook_context_skips_trivial_prompt(tmp_path):
 
 
 def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "hooks.db"))
@@ -86,7 +86,7 @@ def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path):
         await database.insert_memory(
             _memory(
                 "mem-hook-1",
-                "MemInception lifecycle cleanup must route through MemoryStore so SQLite, FTS, and Chroma stay consistent.",
+                "MemForge lifecycle cleanup must route through MemoryStore so SQLite, FTS, and Chroma stay consistent.",
                 tags=["memory-lifecycle", "index-consistency"],
             )
         )
@@ -100,8 +100,8 @@ def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path):
                 json={
                     "client": "claude-code",
                     "hook": "UserPromptSubmit",
-                    "workspace": "/workspace/mem-inception",
-                    "repo": "mem-inception",
+                    "workspace": "/workspace/mem-forge",
+                    "repo": "mem-forge",
                     "branch": "codex/agent-hook-integration",
                     "prompt": "Before changing memory lifecycle consistency, what project decisions should I know?",
                     "max_memories": 3,
@@ -111,7 +111,7 @@ def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path):
         assert response.status_code == 200
         body = response.json()
         assert body["should_inject"] is True
-        assert "MemInception Memory Context" in body["context_markdown"]
+        assert "MemForge Memory Context" in body["context_markdown"]
         assert body["memories"][0]["id"] == "mem-hook-1"
         assert "MemoryStore" in body["context_markdown"]
     finally:
@@ -119,7 +119,7 @@ def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path):
 
 
 def test_hook_context_recent_changes_are_repo_scoped(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "hooks.db"))
@@ -129,15 +129,15 @@ def test_hook_context_recent_changes_are_repo_scoped(tmp_path):
         await database.insert_memory(
             _memory(
                 "mem-other-project",
-                "Other product lifecycle decision should not be injected into MemInception hooks.",
+                "Other product lifecycle decision should not be injected into MemForge hooks.",
                 project_key="other-product",
             )
         )
         await database.insert_memory(
             _memory(
                 "mem-hook-2",
-                "MemInception hook context must stay scoped to the active repo.",
-                project_key="mem-inception",
+                "MemForge hook context must stay scoped to the active repo.",
+                project_key="mem-forge",
             )
         )
 
@@ -150,8 +150,8 @@ def test_hook_context_recent_changes_are_repo_scoped(tmp_path):
                 json={
                     "client": "codex",
                     "hook": "SessionStart",
-                    "workspace": "/workspace/mem-inception",
-                    "repo": "mem-inception",
+                    "workspace": "/workspace/mem-forge",
+                    "repo": "mem-forge",
                     "branch": "codex/agent-hook-integration",
                     "max_memories": 1,
                 },
@@ -168,7 +168,7 @@ def test_hook_context_recent_changes_are_repo_scoped(tmp_path):
 
 
 def test_hook_context_reports_source_warnings_even_for_trivial_prompt(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "hooks.db"))
@@ -195,8 +195,8 @@ def test_hook_context_reports_source_warnings_even_for_trivial_prompt(tmp_path):
                 json={
                     "client": "codex",
                     "hook": "UserPromptSubmit",
-                    "workspace": "/workspace/mem-inception",
-                    "repo": "mem-inception",
+                    "workspace": "/workspace/mem-forge",
+                    "repo": "mem-forge",
                     "prompt": "format this sentence",
                 },
             )

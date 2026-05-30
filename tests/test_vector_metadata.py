@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from meminception.memory.index_payloads import embedding_vector_hash
-from meminception.retrieval.vector_metadata import upsert_with_stored_vector_hash
+from memforge.memory.index_payloads import embedding_vector_hash
+from memforge.retrieval.vector_metadata import upsert_with_stored_vector_hash
 
 
 class RoundTripCollection:

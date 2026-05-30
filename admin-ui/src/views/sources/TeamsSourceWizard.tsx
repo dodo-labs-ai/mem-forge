@@ -160,7 +160,7 @@ function AuthCheckStep({ onAuthenticated }: { onAuthenticated: () => void }) {
               <p className="text-sm text-muted-foreground">Run this from the project directory:</p>
               <div className="flex items-center gap-2 rounded-lg bg-muted p-3 font-mono text-sm">
                 <Terminal className="size-4 shrink-0 text-muted-foreground" />
-                <code>.venv/bin/meminception auth teams</code>
+                <code>.venv/bin/memforge auth teams</code>
               </div>
               <p className="text-xs text-muted-foreground">
                 Log into Teams in Chrome first, then run the command to extract your session.

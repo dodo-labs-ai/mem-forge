@@ -1,0 +1,25 @@
+{
+  "name": "memforge-memory",
+  "version": "0.1.1",
+  "description": "MemForge hook integration for Codex.",
+  "author": {
+    "name": "MemForge Team"
+  },
+  "license": "Apache-2.0",
+  "keywords": ["memory", "hooks", "codex", "memforge"],
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "MemForge Memory",
+    "shortDescription": "Connects Codex to MemForge hooks and MCP memory tools.",
+    "longDescription": "Connects Codex to a local MemForge instance. Hooks receive compact memory context and submit lifecycle receipts, while bundled MCP tools support explicit memory search, memory detail lookup, recent changes, and agent-session document submission.",
+    "developerName": "MemForge Team",
+    "category": "Productivity",
+    "capabilities": ["Hooks", "Read", "Write"],
+    "defaultPrompt": [
+      "Use MemForge memory before editing this repo.",
+      "Check recent memory changes for this project.",
+      "Submit a session summary to MemForge."
+    ]
+  }
+}

@@ -4,8 +4,8 @@ import stat
 
 import pytest
 
-from meminception.config import AppConfig
-from meminception.source_secrets import (
+from memforge.config import AppConfig
+from memforge.source_secrets import (
     SecretConfigurationError,
     decrypt_source_config_for_runtime,
     prepare_source_config_for_storage,
@@ -17,7 +17,7 @@ OTHER_SOURCE_KEY = "GFdRS9_z07biLN73Vrh9gBEl7nHhsp2zaLDSbYiaKSM="
 
 
 def _config(tmp_path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     cfg = AppConfig(base_dir=tmp_path / "mem")
     cfg.server.jwt_secret = "stable-test-secret"
     return cfg
@@ -52,7 +52,7 @@ def test_redaction_marks_undecryptable_secret_for_reentry(tmp_path, monkeypatch)
         {"base_url": "https://wiki.example.test", "pat": "pat-secret"},
     )
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", OTHER_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", OTHER_SOURCE_KEY)
     redacted = redact_source_config(stored, validate_encryption=True)
 
     assert "pat" not in redacted
@@ -108,10 +108,10 @@ def test_blank_pat_update_migrates_existing_plaintext_secret(tmp_path, monkeypat
 
 
 def test_missing_env_key_generates_local_source_secret_key(tmp_path, monkeypatch):
-    monkeypatch.delenv("MEMINCEPTION_SECRET_KEY", raising=False)
-    monkeypatch.delenv("MEMINCEPTION_BASE_DIR", raising=False)
-    monkeypatch.delenv("MEMINCEPTION_SECRET_KEY_FILE", raising=False)
-    monkeypatch.setenv("MEMINCEPTION_BASE_DIR", str(tmp_path / "mem"))
+    monkeypatch.delenv("MEMFORGE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("MEMFORGE_BASE_DIR", raising=False)
+    monkeypatch.delenv("MEMFORGE_SECRET_KEY_FILE", raising=False)
+    monkeypatch.setenv("MEMFORGE_BASE_DIR", str(tmp_path / "mem"))
 
     stored = prepare_source_config_for_storage(
         {"base_url": "https://wiki.example.test", "pat": "pat-secret"},
@@ -125,13 +125,13 @@ def test_missing_env_key_generates_local_source_secret_key(tmp_path, monkeypatch
 
 
 def test_decrypt_without_existing_local_key_does_not_generate_replacement(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     stored = prepare_source_config_for_storage(
         {"base_url": "https://wiki.example.test", "pat": "pat-secret"},
     )
 
-    monkeypatch.delenv("MEMINCEPTION_SECRET_KEY", raising=False)
-    monkeypatch.setenv("MEMINCEPTION_BASE_DIR", str(tmp_path / "mem"))
+    monkeypatch.delenv("MEMFORGE_SECRET_KEY", raising=False)
+    monkeypatch.setenv("MEMFORGE_BASE_DIR", str(tmp_path / "mem"))
 
     with pytest.raises(SecretConfigurationError, match="restore"):
         decrypt_source_config_for_runtime(stored)
@@ -140,8 +140,8 @@ def test_decrypt_without_existing_local_key_does_not_generate_replacement(tmp_pa
 
 
 def test_jwt_secret_is_not_used_as_source_secret_key(tmp_path, monkeypatch):
-    monkeypatch.delenv("MEMINCEPTION_SECRET_KEY", raising=False)
-    monkeypatch.setenv("MEMINCEPTION_BASE_DIR", str(tmp_path / "mem"))
+    monkeypatch.delenv("MEMFORGE_SECRET_KEY", raising=False)
+    monkeypatch.setenv("MEMFORGE_BASE_DIR", str(tmp_path / "mem"))
     cfg = AppConfig(base_dir=tmp_path / "mem")
     cfg.server.jwt_secret = "stable-test-secret"
 
@@ -156,7 +156,7 @@ def test_jwt_secret_is_not_used_as_source_secret_key(tmp_path, monkeypatch):
 
 
 def test_weak_source_secret_key_is_rejected(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", "weak-passphrase")
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", "weak-passphrase")
 
     with pytest.raises(SecretConfigurationError, match="Fernet key"):
         prepare_source_config_for_storage(

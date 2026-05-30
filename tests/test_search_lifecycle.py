@@ -6,11 +6,11 @@ from datetime import datetime, timezone
 
 import pytest
 
-from meminception.config import RetrievalConfig
-from meminception.models import Memory, content_hash
-from meminception.retrieval.query_analyzer import QueryAnalysis
-from meminception.retrieval.search import SearchEngine
-from meminception.storage.database import Database
+from memforge.config import RetrievalConfig
+from memforge.models import Memory, content_hash
+from memforge.retrieval.query_analyzer import QueryAnalysis
+from memforge.retrieval.search import SearchEngine
+from memforge.storage.database import Database
 
 
 class FakeCollection:
@@ -55,7 +55,7 @@ async def test_default_search_returns_only_active_memories(db, monkeypatch):
     async def fake_analyze_query(*args, **kwargs):
         return QueryAnalysis()
 
-    monkeypatch.setattr("meminception.retrieval.search.analyze_query", fake_analyze_query)
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     engine = SearchEngine(
         db=db,
@@ -82,7 +82,7 @@ async def test_include_superseded_includes_history_but_not_retired_or_pending(db
     async def fake_analyze_query(*args, **kwargs):
         return QueryAnalysis()
 
-    monkeypatch.setattr("meminception.retrieval.search.analyze_query", fake_analyze_query)
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     engine = SearchEngine(
         db=db,

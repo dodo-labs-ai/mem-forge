@@ -7,15 +7,15 @@ from typing import Any
 
 import pytest
 
-from meminception.memory.audit import AuditContext, MemoryAuditLogger
-from meminception.memory.review_service import (
+from memforge.memory.audit import AuditContext, MemoryAuditLogger
+from memforge.memory.review_service import (
     ReviewAlreadyResolved,
     ReviewError,
     ReviewService,
     ReviewStaleConflict,
 )
-from meminception.memory.store import MemoryStore
-from meminception.models import (
+from memforge.memory.store import MemoryStore
+from memforge.models import (
     Memory,
     MemoryReview,
     ReviewKind,
@@ -23,7 +23,7 @@ from meminception.models import (
     content_hash,
     generate_review_id,
 )
-from meminception.storage.database import Database
+from memforge.storage.database import Database
 
 
 # ---------------------------------------------------------------------------

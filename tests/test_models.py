@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from meminception.models import (
+from memforge.models import (
     Memory,
     MemoryStatus,
     RawMemory,

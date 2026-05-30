@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from meminception.config import AppConfig
-from meminception.models import SyncState
-from meminception.storage.database import Database
+from memforge.config import AppConfig
+from memforge.models import SyncState
+from memforge.storage.database import Database
 
 TEST_SOURCE_KEY = "VV4JjZLLr2BcgRnhV90gCnxzchn43M900VQy3dXJI30="
 
@@ -57,7 +57,7 @@ def _cookie(
 
 
 def test_cookie_header_post_filters_domain_path_and_secure_scope():
-    from meminception.auth.jira_auth import _cookie_header_from_jar
+    from memforge.auth.jira_auth import _cookie_header_from_jar
 
     jar = CookieJar()
     jar.set_cookie(_cookie("root", "ok", ".example.test", "/", secure=False))
@@ -87,10 +87,10 @@ def test_cookie_header_post_filters_domain_path_and_secure_scope():
 
 @pytest.mark.asyncio
 async def test_jira_auth_session_is_encrypted_redacted_and_shared_by_origin(db, monkeypatch):
-    from meminception.auth.jira_auth import JiraAuthSessionService
-    from meminception.source_secrets import decrypt_secret
+    from memforge.auth.jira_auth import JiraAuthSessionService
+    from memforge.source_secrets import decrypt_secret
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     service = JiraAuthSessionService(db, session_validator=lambda origin, cookie, tls_config=None: {"accountId": "user-123"})
 
     await service.store_validated_session(
@@ -130,7 +130,7 @@ async def test_jira_auth_session_is_encrypted_redacted_and_shared_by_origin(db, 
 
 @pytest.mark.asyncio
 async def test_jira_auth_session_missing_does_not_implicitly_read_browser_when_sync_disallows_refresh(db):
-    from meminception.auth.jira_auth import JiraAuthSessionMissingError, JiraAuthSessionService
+    from memforge.auth.jira_auth import JiraAuthSessionMissingError, JiraAuthSessionService
 
     def fail_extractor(origin, browser):
         raise AssertionError("sync should not read browser cookies implicitly")
@@ -143,9 +143,9 @@ async def test_jira_auth_session_missing_does_not_implicitly_read_browser_when_s
 
 @pytest.mark.asyncio
 async def test_jira_auth_session_refresh_failure_is_persisted_for_missing_session(db, monkeypatch):
-    from meminception.auth.jira_auth import JiraAuthSessionError, JiraAuthSessionService
+    from memforge.auth.jira_auth import JiraAuthSessionError, JiraAuthSessionService
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
 
     def fail_extractor(origin, browser):
         raise RuntimeError("Chrome profile is locked")
@@ -166,9 +166,9 @@ async def test_jira_auth_session_refresh_resets_matching_sources_only_after_prin
     tmp_path,
     monkeypatch,
 ):
-    from meminception.auth.jira_auth import JiraAuthSessionService, JiraPrincipalChangedError
+    from memforge.auth.jira_auth import JiraAuthSessionService, JiraPrincipalChangedError
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     service = JiraAuthSessionService(db, session_validator=lambda origin, cookie, tls_config=None: {"accountId": "old-user"})
     await service.store_validated_session(
         base_url="https://jira.example.test",
@@ -226,9 +226,9 @@ async def test_jira_auth_session_refresh_resets_matching_sources_only_after_prin
 def test_admin_allows_jira_browser_session_source_without_source_cookie(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     app = create_admin_app(config=_config(tmp_path))
 
     with TestClient(app) as client:
@@ -257,9 +257,9 @@ def test_admin_allows_jira_browser_session_source_without_source_cookie(tmp_path
 def test_admin_rejects_source_owned_jira_cookie(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     app = create_admin_app(config=_config(tmp_path))
 
     with TestClient(app) as client:
@@ -283,10 +283,10 @@ def test_admin_rejects_source_owned_jira_cookie(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_runtime_resolves_jira_browser_session_without_persisting_cookie(db, tmp_path, monkeypatch):
-    from meminception.auth.jira_auth import JiraAuthSessionService
-    from meminception import runtime
+    from memforge.auth.jira_auth import JiraAuthSessionService
+    from memforge import runtime
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     await JiraAuthSessionService(db).store_validated_session(
         base_url="https://jira.example.test",
         cookie_header="JSESSIONID=runtime",
@@ -341,10 +341,10 @@ async def test_runtime_resolves_jira_browser_session_without_persisting_cookie(d
 
 @pytest.mark.asyncio
 async def test_runtime_keeps_legacy_jira_pat_source_in_pat_mode(db, tmp_path, monkeypatch):
-    from meminception import runtime
-    from meminception.source_secrets import prepare_source_config_for_storage
+    from memforge import runtime
+    from memforge.source_secrets import prepare_source_config_for_storage
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     source = {
         "id": "src-legacy-pat",
         "type": "jira",
@@ -396,10 +396,10 @@ async def test_sync_service_marks_shared_jira_session_expired_when_sync_reports_
     tmp_path,
     monkeypatch,
 ):
-    from meminception.auth.jira_auth import JiraAuthSessionService
-    from meminception import runtime
+    from memforge.auth.jira_auth import JiraAuthSessionService
+    from memforge import runtime
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     await db.upsert_source(
         id="src-expired",
         type="jira",

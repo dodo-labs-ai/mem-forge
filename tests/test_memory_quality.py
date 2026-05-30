@@ -8,11 +8,11 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from meminception.config import AppConfig
-from meminception.memory.engine import MemoryEngine
-from meminception.memory.store import MemoryStore
-from meminception.models import DocumentRecord, Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
-from meminception.storage.database import Database
+from memforge.config import AppConfig
+from memforge.memory.engine import MemoryEngine
+from memforge.memory.store import MemoryStore
+from memforge.models import DocumentRecord, Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
+from memforge.storage.database import Database
 
 
 METADATA_CONTENT = (
@@ -106,7 +106,7 @@ def _raw(content: str, context: str) -> RawMemory:
 
 
 def _config(tmp_path: Path) -> AppConfig:
-    return AppConfig(base_dir=tmp_path / "meminception")
+    return AppConfig(base_dir=tmp_path / "memforge")
 
 
 async def _insert_document(
@@ -164,7 +164,7 @@ async def _fts_has_memory(db: Database, memory_id: str) -> bool:
 
 
 def test_classifier_skips_document_metadata_candidate():
-    from meminception.memory.quality import classify_memory_candidate
+    from memforge.memory.quality import classify_memory_candidate
 
     quality = classify_memory_candidate(_raw(METADATA_CONTENT, METADATA_CONTEXT))
 
@@ -173,7 +173,7 @@ def test_classifier_skips_document_metadata_candidate():
 
 
 def test_classifier_skips_reference_only_link_list_candidate():
-    from meminception.memory.quality import classify_memory_candidate
+    from memforge.memory.quality import classify_memory_candidate
 
     quality = classify_memory_candidate(_raw(LINK_CONTENT, LINK_CONTEXT))
 
@@ -182,7 +182,7 @@ def test_classifier_skips_reference_only_link_list_candidate():
 
 
 def test_classifier_skips_unresolved_design_question():
-    from meminception.memory.quality import classify_memory_candidate
+    from memforge.memory.quality import classify_memory_candidate
 
     quality = classify_memory_candidate(_raw(OPEN_QUESTION_CONTENT, OPEN_QUESTION_CONTEXT))
 
@@ -191,10 +191,10 @@ def test_classifier_skips_unresolved_design_question():
 
 
 def test_classifier_skips_memory_system_narration():
-    from meminception.memory.quality import classify_memory_candidate
+    from memforge.memory.quality import classify_memory_candidate
 
     quality = classify_memory_candidate(_raw(
-        "MemInception memories are loaded at SessionStart and used as warm context for l3-demo.",
+        "MemForge memories are loaded at SessionStart and used as warm context for l3-demo.",
         "",
     ))
 
@@ -203,7 +203,7 @@ def test_classifier_skips_memory_system_narration():
 
 
 def test_classifier_skips_candidate_citing_internal_memory_id():
-    from meminception.memory.quality import classify_memory_candidate
+    from memforge.memory.quality import classify_memory_candidate
 
     quality = classify_memory_candidate(_raw(
         "Prefer sum() over manual accumulator loops (project convention, mem-a2229a2c).",
@@ -215,7 +215,7 @@ def test_classifier_skips_candidate_citing_internal_memory_id():
 
 
 def test_classifier_keeps_conditional_ap_rule():
-    from meminception.memory.quality import classify_memory_candidate
+    from memforge.memory.quality import classify_memory_candidate
 
     quality = classify_memory_candidate(_raw(CONDITIONAL_RULE_CONTENT, CONDITIONAL_RULE_CONTEXT))
 
@@ -224,7 +224,7 @@ def test_classifier_keeps_conditional_ap_rule():
 
 
 def test_classifier_keeps_useful_memory_with_link_list_context():
-    from meminception.memory.quality import classify_memory_candidate
+    from memforge.memory.quality import classify_memory_candidate
 
     raw = _raw(
         "The on-demand AP group follows the Payroll Processing concept for out-of-sequence validation.",
@@ -307,7 +307,7 @@ async def test_reconciliation_skips_bad_replacement_candidate_instead_of_superse
             )
         ]
 
-    monkeypatch.setattr("meminception.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
 
     stats = await engine.reconcile_and_persist(
         doc_id=doc.doc_id,
@@ -342,7 +342,7 @@ async def test_reconciliation_action_failure_is_audited_without_fallback(db: Dat
             )
         ]
 
-    monkeypatch.setattr("meminception.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
 
     stats = await engine.reconcile_and_persist(
         doc_id=doc.doc_id,
@@ -478,7 +478,7 @@ async def test_store_source_cascade_cleans_indexes_for_retired_memories(db: Data
 
 
 def test_memory_extraction_prompt_rejects_metadata_and_preserves_modality():
-    from meminception.pipeline.memory_extractor import MEMORY_EXTRACTION_PROMPT
+    from memforge.pipeline.memory_extractor import MEMORY_EXTRACTION_PROMPT
 
     prompt = MEMORY_EXTRACTION_PROMPT.lower()
 
@@ -496,7 +496,7 @@ def test_memory_extraction_prompt_rejects_metadata_and_preserves_modality():
 
 
 def test_memory_change_extraction_prompt_rejects_operational_metadata_changes():
-    from meminception.pipeline.memory_extractor import MEMORY_CHANGE_EXTRACTION_PROMPT
+    from memforge.pipeline.memory_extractor import MEMORY_CHANGE_EXTRACTION_PROMPT
 
     prompt = MEMORY_CHANGE_EXTRACTION_PROMPT.lower()
 
@@ -513,7 +513,7 @@ def test_memory_change_extraction_prompt_rejects_operational_metadata_changes():
 
 
 def test_memory_extraction_prompt_preserves_weak_reference_relationships():
-    from meminception.pipeline.memory_extractor import MEMORY_EXTRACTION_PROMPT
+    from memforge.pipeline.memory_extractor import MEMORY_EXTRACTION_PROMPT
 
     prompt = MEMORY_EXTRACTION_PROMPT.lower()
 
@@ -524,7 +524,7 @@ def test_memory_extraction_prompt_preserves_weak_reference_relationships():
 
 @pytest.mark.asyncio
 async def test_admin_memory_detail_includes_pdf_uri(db: Database, tmp_path: Path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     doc = await _insert_document(db, doc_id="doc-pdf-uri", pdf_content_uri="/tmp/source.pdf")
     memory = await _insert_memory(
@@ -544,7 +544,7 @@ async def test_admin_memory_detail_includes_pdf_uri(db: Database, tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_admin_memory_list_search_accepts_hyphenated_jira_id(db: Database, tmp_path: Path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     doc = await _insert_document(db, doc_id="jira-PAY-176425")
     memory = await _insert_memory(
@@ -572,7 +572,7 @@ async def test_admin_memory_list_search_accepts_hyphenated_jira_id(db: Database,
 
 @pytest.mark.asyncio
 async def test_admin_memory_list_search_accepts_fts_operator_text(db: Database, tmp_path: Path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     await _insert_document(db, doc_id="jira-PAY-176426")
     await _insert_memory(
@@ -594,7 +594,7 @@ async def test_admin_memory_delete_cleans_search_indexes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     memory = await _insert_memory(
         db,
@@ -603,7 +603,7 @@ async def test_admin_memory_delete_cleans_search_indexes(
     )
     collection = FakeCollection()
     monkeypatch.setattr(
-        "meminception.retrieval.embeddings.get_chroma_collection",
+        "memforge.retrieval.embeddings.get_chroma_collection",
         lambda **kwargs: collection,
     )
 
@@ -624,7 +624,7 @@ async def test_admin_pending_review_status_cleans_search_indexes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     memory = await _insert_memory(
         db,
@@ -633,7 +633,7 @@ async def test_admin_pending_review_status_cleans_search_indexes(
     )
     collection = FakeCollection()
     monkeypatch.setattr(
-        "meminception.retrieval.embeddings.get_chroma_collection",
+        "memforge.retrieval.embeddings.get_chroma_collection",
         lambda **kwargs: collection,
     )
 

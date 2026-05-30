@@ -1,0 +1,53 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CODEX_PLUGIN_ROOT:-$PLUGIN_ROOT}/scripts/memforge_hook.py\" context --client codex",
+            "timeout": 10,
+            "statusMessage": "Loading MemForge context"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CODEX_PLUGIN_ROOT:-$PLUGIN_ROOT}/scripts/memforge_hook.py\" context --client codex",
+            "timeout": 10,
+            "statusMessage": "Checking MemForge memory"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CODEX_PLUGIN_ROOT:-$PLUGIN_ROOT}/scripts/memforge_hook.py\" submit-session --client codex",
+            "timeout": 15,
+            "statusMessage": "Submitting MemForge compaction receipt"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CODEX_PLUGIN_ROOT:-$PLUGIN_ROOT}/scripts/memforge_hook.py\" submit-session --client codex",
+            "timeout": 15,
+            "statusMessage": "Submitting MemForge session receipt"
+          }
+        ]
+      }
+    ]
+  }
+}

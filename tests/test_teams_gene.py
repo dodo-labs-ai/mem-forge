@@ -8,12 +8,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from meminception.genes.teams_gene import (
+from memforge.genes.teams_gene import (
     TeamsGene,
     _TeamsAPIClient,
     _group_into_blocks,
 )
-from meminception.models import ConfigFieldType
+from memforge.models import ConfigFieldType
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +253,7 @@ class TestFetch:
         ]
         gene._client.get_thread_messages = AsyncMock(return_value=thread_msgs)
 
-        from meminception.models import ContentItem
+        from memforge.models import ContentItem
         item = ContentItem(
             item_id="teams-conv#root",
             title="Test thread",
@@ -286,7 +286,7 @@ class TestNormalize:
         gene = TeamsGene(config={"channels": "T/C"}, source_id="test")
         gene._client = MagicMock()
 
-        from meminception.models import ContentItem, RawContent
+        from memforge.models import ContentItem, RawContent
 
         thread_data = {
             "conversation_type": "channel",
@@ -333,7 +333,7 @@ class TestNormalize:
         gene = TeamsGene(config={"channels": "T/C"}, source_id="test")
         gene._client = MagicMock()
 
-        from meminception.models import ContentItem, RawContent
+        from memforge.models import ContentItem, RawContent
 
         thread_data = {
             "conversation_type": "channel",
@@ -373,7 +373,7 @@ class TestContentHash:
         gene = TeamsGene(config={"channels": "T/C"}, source_id="test")
         gene._client = MagicMock()
 
-        from meminception.models import ContentItem, RawContent
+        from memforge.models import ContentItem, RawContent
 
         thread_data = {
             "conversation_type": "channel", "title": "Test", "channel_name": "ch",

@@ -8,10 +8,10 @@ from typing import Any
 
 import pytest
 
-from meminception.memory.health import MemoryIndexHealthChecker
-from meminception.memory.repair import MemoryIndexRepairer
-from meminception.models import DocumentMetadata, Memory, content_hash
-from meminception.storage.database import Database
+from memforge.memory.health import MemoryIndexHealthChecker
+from memforge.memory.repair import MemoryIndexRepairer
+from memforge.models import DocumentMetadata, Memory, content_hash
+from memforge.storage.database import Database
 
 
 class RepairableCollection:

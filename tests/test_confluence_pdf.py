@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from bs4 import BeautifulSoup
 
-from meminception.genes.confluence_pdf import default_chrome_renderer, export_confluence_page_pdf
+from memforge.genes.confluence_pdf import default_chrome_renderer, export_confluence_page_pdf
 
 COMPLETE_PDF = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n"
 
@@ -310,7 +310,7 @@ async def test_export_confluence_page_pdf_rejects_plain_http_same_host_asset(tmp
 
 @pytest.mark.asyncio
 async def test_export_confluence_page_pdf_stops_streaming_oversized_images(tmp_path, monkeypatch):
-    monkeypatch.setattr("meminception.genes.confluence_pdf.MAX_IMAGE_BYTES", 5)
+    monkeypatch.setattr("memforge.genes.confluence_pdf.MAX_IMAGE_BYTES", 5)
     client = RecordingClient()
     captured_html: dict[str, str] = {}
     chunks_yielded = 0
@@ -380,7 +380,7 @@ async def test_export_confluence_page_pdf_stops_streaming_oversized_images(tmp_p
 
 @pytest.mark.asyncio
 async def test_export_confluence_page_pdf_downloads_images_with_bounded_concurrency(tmp_path, monkeypatch):
-    monkeypatch.setattr("meminception.genes.confluence_pdf.IMAGE_DOWNLOAD_CONCURRENCY", 2)
+    monkeypatch.setattr("memforge.genes.confluence_pdf.IMAGE_DOWNLOAD_CONCURRENCY", 2)
     client = RecordingClient()
     captured_html: dict[str, str] = {}
     active_streams = 0
@@ -480,7 +480,7 @@ async def test_export_confluence_page_pdf_escapes_page_title(tmp_path):
 
 @pytest.mark.asyncio
 async def test_export_confluence_page_pdf_returns_none_when_renderer_missing(tmp_path, monkeypatch):
-    monkeypatch.setattr("meminception.genes.confluence_pdf._find_chrome", lambda: None)
+    monkeypatch.setattr("memforge.genes.confluence_pdf._find_chrome", lambda: None)
     client = RecordingClient()
 
     pdf = await export_confluence_page_pdf(
@@ -498,7 +498,7 @@ async def test_export_confluence_page_pdf_returns_none_when_renderer_missing(tmp
 
 @pytest.mark.asyncio
 async def test_export_confluence_page_pdf_times_out_slow_render(tmp_path, monkeypatch):
-    monkeypatch.setattr("meminception.genes.confluence_pdf.PDF_EXPORT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("memforge.genes.confluence_pdf.PDF_EXPORT_TIMEOUT_SECONDS", 0.01)
     client = RecordingClient()
 
     async def render_pdf(_html_path: Path) -> bytes:
@@ -538,9 +538,9 @@ async def test_default_chrome_renderer_keeps_sandbox_enabled_by_default(monkeypa
                 Path(str(arg).split("=", 1)[1]).write_bytes(COMPLETE_PDF)
         return FakeProcess()
 
-    monkeypatch.setattr("meminception.genes.confluence_pdf._find_chrome", lambda: "/usr/bin/chrome")
-    monkeypatch.setattr("meminception.genes.confluence_pdf.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
-    monkeypatch.delenv("MEMINCEPTION_CHROME_NO_SANDBOX", raising=False)
+    monkeypatch.setattr("memforge.genes.confluence_pdf._find_chrome", lambda: "/usr/bin/chrome")
+    monkeypatch.setattr("memforge.genes.confluence_pdf.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.delenv("MEMFORGE_CHROME_NO_SANDBOX", raising=False)
     html_path = tmp_path / "page.html"
     html_path.write_text("<html></html>", encoding="utf-8")
 
@@ -577,9 +577,9 @@ async def test_default_chrome_renderer_no_sandbox_requires_explicit_opt_in(monke
                 Path(str(arg).split("=", 1)[1]).write_bytes(COMPLETE_PDF)
         return FakeProcess()
 
-    monkeypatch.setattr("meminception.genes.confluence_pdf._find_chrome", lambda: "/usr/bin/chrome")
-    monkeypatch.setattr("meminception.genes.confluence_pdf.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
-    monkeypatch.setenv("MEMINCEPTION_CHROME_NO_SANDBOX", "1")
+    monkeypatch.setattr("memforge.genes.confluence_pdf._find_chrome", lambda: "/usr/bin/chrome")
+    monkeypatch.setattr("memforge.genes.confluence_pdf.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setenv("MEMFORGE_CHROME_NO_SANDBOX", "1")
     html_path = tmp_path / "page.html"
     html_path.write_text("<html></html>", encoding="utf-8")
 
@@ -628,8 +628,8 @@ async def test_default_chrome_renderer_waits_for_complete_pdf_before_accepting(m
         asyncio.create_task(finish_pdf())
         return FakeProcess()
 
-    monkeypatch.setattr("meminception.genes.confluence_pdf._find_chrome", lambda: "/usr/bin/chrome")
-    monkeypatch.setattr("meminception.genes.confluence_pdf.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr("memforge.genes.confluence_pdf._find_chrome", lambda: "/usr/bin/chrome")
+    monkeypatch.setattr("memforge.genes.confluence_pdf.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
     html_path = tmp_path / "page.html"
     html_path.write_text("<html></html>", encoding="utf-8")
 
@@ -661,8 +661,8 @@ async def test_default_chrome_renderer_kills_process_when_cancelled(monkeypatch,
     async def fake_create_subprocess_exec(*_args, **_kwargs):
         return FakeProcess()
 
-    monkeypatch.setattr("meminception.genes.confluence_pdf._find_chrome", lambda: "/usr/bin/chrome")
-    monkeypatch.setattr("meminception.genes.confluence_pdf.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr("memforge.genes.confluence_pdf._find_chrome", lambda: "/usr/bin/chrome")
+    monkeypatch.setattr("memforge.genes.confluence_pdf.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
     html_path = tmp_path / "page.html"
     html_path.write_text("<html></html>", encoding="utf-8")
 
