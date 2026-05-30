@@ -1,0 +1,773 @@
+import { useMemo, useState } from "react";
+import type { ReactNode } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { AlertCircle, Check, Loader2, RefreshCw } from "lucide-react";
+import client from "@/api/client";
+import type {
+  ConfigField,
+  DiscoveryPreviewResponse,
+  GeneConfigSchema,
+  JiraAuthSession,
+  Source,
+} from "@/api/types";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+
+type ConfigValue = string | number | boolean | string[] | null;
+type ConfigForm = Record<string, ConfigValue>;
+
+export function SourceConfigDialog({
+  open,
+  onOpenChange,
+  sourceType,
+  source,
+  onSaved,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  sourceType: string | null;
+  source?: Source | null;
+  onSaved?: () => void;
+}) {
+  const schemaQuery = useQuery<GeneConfigSchema>({
+    queryKey: ["gene-config-schema", sourceType],
+    queryFn: () =>
+      client.get(`/api/genes/${sourceType}/config-schema`).then((response) => response.data),
+    enabled: open && Boolean(sourceType),
+  });
+
+  if (!sourceType) return null;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="flex max-h-[90vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl">
+        {schemaQuery.isPending ? (
+          <div className="flex items-center justify-center gap-2 p-12 text-sm text-muted-foreground">
+            <Loader2 className="size-4 animate-spin" />
+            Loading source schema...
+          </div>
+        ) : schemaQuery.isError ? (
+          <div className="p-4">
+            <DialogHeader>
+              <DialogTitle>Configure source</DialogTitle>
+            </DialogHeader>
+            <div className="mt-4 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
+              Failed to load source configuration schema.
+            </div>
+          </div>
+        ) : !schemaQuery.data ? (
+          <div className="flex items-center justify-center gap-2 p-12 text-sm text-muted-foreground">
+            <Loader2 className="size-4 animate-spin" />
+            Loading source schema...
+          </div>
+        ) : (
+          <SourceConfigForm
+            key={`${source?.id ?? "new"}-${sourceType}`}
+            sourceType={sourceType}
+            source={source}
+            schema={schemaQuery.data}
+            onOpenChange={onOpenChange}
+            onSaved={onSaved}
+          />
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function SourceConfigForm({
+  sourceType,
+  source,
+  schema,
+  onOpenChange,
+  onSaved,
+}: {
+  sourceType: string;
+  source?: Source | null;
+  schema: GeneConfigSchema;
+  onOpenChange: (open: boolean) => void;
+  onSaved?: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const isEdit = Boolean(source);
+  const [name, setName] = useState(source?.name ?? "");
+  const [config, setConfig] = useState<ConfigForm>(() => ({
+    ...buildDefaultConfig(schema.fields),
+    ...initialSourceConfig(sourceType, (source?.config ?? {}) as ConfigForm),
+  }));
+  const authMode = stringValue(config.auth_mode) || "browser_cookie";
+  const jiraBaseUrl = stringValue(config.base_url).trim();
+
+  const jiraSessionQuery = useQuery<JiraAuthSession>({
+    queryKey: ["jira-session", jiraBaseUrl],
+    queryFn: () =>
+      client.get("/api/auth/jira-session", { params: { base_url: jiraBaseUrl } }).then((response) => response.data),
+    enabled: sourceType === "jira" && authMode === "browser_cookie" && jiraBaseUrl.startsWith("https://"),
+  });
+
+  const refreshJiraSession = useMutation({
+    mutationFn: ({ confirmPrincipalChange = false }: { confirmPrincipalChange?: boolean } = {}) =>
+      client.post("/api/auth/jira-session/refresh", {
+        base_url: jiraBaseUrl,
+        confirm_principal_change: confirmPrincipalChange,
+      }).then((response) => response.data as JiraAuthSession),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["jira-session", jiraBaseUrl] });
+      queryClient.invalidateQueries({ queryKey: ["sources"] });
+    },
+  });
+
+  const saveSource = useMutation({
+    mutationFn: (payload: { name: string; config: ConfigForm }) => {
+      if (source) {
+        return client.put(`/api/sources/${source.id}`, payload);
+      }
+      return client.post("/api/sources", {
+        type: sourceType,
+        ...payload,
+      });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["sources"] });
+      queryClient.invalidateQueries({ queryKey: ["stats"] });
+      onSaved?.();
+      onOpenChange(false);
+    },
+  });
+
+  const previewDiscovery = useMutation<DiscoveryPreviewResponse, unknown, void>({
+    mutationFn: () =>
+      client
+        .post(`/api/genes/${sourceType}/preview-discovery`, {
+          config: serializeConfig(schema.fields, config),
+        })
+        .then((response) => response.data as DiscoveryPreviewResponse),
+  });
+
+  const fieldsByGroup = useMemo(() => {
+    const fields = [...schema.fields].sort((a, b) => a.order - b.order);
+    return [...schema.groups]
+      .sort((a, b) => a.order - b.order)
+      .map((group) => ({
+        ...group,
+        fields: fields.filter((field) => field.group === group.key && !field.advanced && isFieldVisible(sourceType, field, config)),
+      }))
+      .filter((group) => group.fields.length > 0);
+  }, [config, schema, sourceType]);
+  const advancedFields = useMemo(
+    () => [...schema.fields]
+      .filter((field) => field.advanced && isFieldVisible(sourceType, field, config))
+      .sort((a, b) => a.order - b.order),
+    [config, schema, sourceType],
+  );
+
+  const canSave =
+    name.trim().length > 0 &&
+    requiredFieldsAreFilled(sourceType, schema.fields, config);
+
+  const previewReady = requiredFieldsAreFilled(sourceType, schema.fields, config);
+
+  const updateField = (field: ConfigField, value: ConfigValue) => {
+    setConfig((current) => ({ ...current, [field.key]: value }));
+  };
+
+  const handleSave = () => {
+    saveSource.mutate({
+      name: name.trim(),
+      config: serializeConfig(schema.fields, config),
+    });
+  };
+
+  return (
+    <>
+        <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
+          <DialogHeader>
+            <DialogTitle>
+              {isEdit ? "Configure source" : `Configure ${sourceType ?? "source"}`}
+            </DialogTitle>
+          </DialogHeader>
+
+          <Field label="Source name" required>
+            <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="Source name" />
+          </Field>
+
+          <div className="min-h-0 flex-1 space-y-5 overflow-y-auto pr-1">
+            {fieldsByGroup.map((group) => (
+              <section key={group.key} className="space-y-3">
+                <h3 className="text-sm font-semibold">{group.label}</h3>
+                <div className="space-y-3">
+                  {group.fields.map((field) => (
+                    <div key={field.key} className="space-y-3">
+                      <ConfigFieldInput
+                        field={field}
+                        value={config[field.key]}
+                        hasExistingSecret={Boolean(config[`${field.key}_configured`])}
+                        decryptFailed={Boolean(config[`${field.key}_decrypt_failed`])}
+                        required={isFieldRequired(sourceType, field, config)}
+                        onChange={(value) => updateField(field, value)}
+                      />
+                      {sourceType === "jira" && field.key === "auth_mode" && authMode === "browser_cookie" && (
+                        <JiraBrowserSessionPanel
+                          baseUrl={jiraBaseUrl}
+                          session={jiraSessionQuery.data}
+                          loading={jiraSessionQuery.isFetching}
+                          refreshPending={refreshJiraSession.isPending}
+                          error={refreshJiraSession.error ?? jiraSessionQuery.error}
+                          onRefresh={() => refreshJiraSession.mutate({ confirmPrincipalChange: false })}
+                          onConfirmPrincipalChange={() => refreshJiraSession.mutate({ confirmPrincipalChange: true })}
+                        />
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </section>
+            ))}
+            {advancedFields.length > 0 && (
+              <details className="space-y-3">
+                <summary className="cursor-pointer text-sm font-semibold">Advanced</summary>
+                <div className="space-y-3 pt-2">
+                  {advancedFields.map((field) => (
+                    <ConfigFieldInput
+                      key={field.key}
+                      field={field}
+                      value={config[field.key]}
+                      hasExistingSecret={Boolean(config[`${field.key}_configured`])}
+                      decryptFailed={Boolean(config[`${field.key}_decrypt_failed`])}
+                      required={isFieldRequired(sourceType, field, config)}
+                      onChange={(value) => updateField(field, value)}
+                    />
+                  ))}
+                </div>
+              </details>
+            )}
+
+            <DiscoveryPreviewPanel
+              ready={previewReady}
+              isPending={previewDiscovery.isPending}
+              error={previewDiscovery.isError ? previewDiscovery.error : null}
+              data={previewDiscovery.data}
+              onPreview={() => previewDiscovery.mutate()}
+            />
+          </div>
+
+          {saveSource.isError && (
+            <div className="rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
+              {extractSaveError(saveSource.error)}
+            </div>
+          )}
+        </div>
+
+        <DialogFooter className="mx-0 mb-0 flex-row justify-between rounded-none rounded-b-xl bg-background p-3 sm:justify-between">
+          <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button type="button" onClick={handleSave} disabled={!canSave || saveSource.isPending}>
+            {saveSource.isPending ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
+            {isEdit ? "Save Changes" : "Create Source"}
+          </Button>
+        </DialogFooter>
+    </>
+  );
+}
+
+function ConfigFieldInput({
+  field,
+  value,
+  hasExistingSecret,
+  decryptFailed,
+  required,
+  onChange,
+}: {
+  field: ConfigField;
+  value: ConfigValue | undefined;
+  hasExistingSecret?: boolean;
+  decryptFailed?: boolean;
+  required?: boolean;
+  onChange: (value: ConfigValue) => void;
+}) {
+  if (field.field_type === "boolean") {
+    return (
+      <label className="flex items-start gap-3 rounded-lg border p-3">
+        <input
+          type="checkbox"
+          className="mt-0.5 size-4"
+          checked={toBoolean(value)}
+          onChange={(event) => onChange(event.target.checked)}
+        />
+        <span>
+          <span className="block text-sm font-medium">
+            {field.label}
+            {required && <span className="text-destructive"> *</span>}
+          </span>
+          {field.help_text && <span className="mt-1 block text-xs text-muted-foreground">{field.help_text}</span>}
+        </span>
+      </label>
+    );
+  }
+
+  if (field.field_type === "select") {
+    const selected = stringValue(value || field.default || field.options[0] || "");
+    return (
+      <Field label={field.label} required={required} helpText={field.help_text}>
+        <Select<string>
+          value={optionValue(field, selected)}
+          onValueChange={(next) => onChange(optionFromValue(field, stringValue(next)))}
+        >
+          <SelectTrigger>
+            <SelectValue>{selected ? optionLabel(field, selected) : "Select..."}</SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            {field.options.map((option) => (
+              <SelectItem key={option} value={optionValue(field, option)}>
+                {optionLabel(field, option)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </Field>
+    );
+  }
+
+  if (field.field_type === "multi_select") {
+    const selected = new Set(listValue(value));
+    return (
+      <Field label={field.label} required={required} helpText={field.help_text}>
+        <div className="flex flex-wrap gap-2">
+          {field.options.map((option) => (
+            <label key={option} className="flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm">
+              <input
+                type="checkbox"
+                checked={selected.has(option)}
+                onChange={(event) => {
+                  const next = new Set(selected);
+                  if (event.target.checked) next.add(option);
+                  else next.delete(option);
+                  onChange([...next]);
+                }}
+              />
+              {option}
+            </label>
+          ))}
+        </div>
+      </Field>
+    );
+  }
+
+  const isInteger = field.field_type === "integer";
+  const isList = field.field_type === "tag_list";
+  const isSecret = field.field_type === "secret";
+
+  return (
+    <Field label={field.label} required={required} helpText={field.help_text}>
+      <Input
+        type={isInteger ? "number" : isSecret ? "password" : "text"}
+        value={isList ? listValue(value).join(", ") : stringValue(value)}
+        onChange={(event) => {
+          if (isInteger) {
+            onChange(event.target.value === "" ? "" : Number(event.target.value));
+          } else if (isList) {
+            onChange(event.target.value);
+          } else {
+            onChange(event.target.value);
+          }
+        }}
+        placeholder={isSecret && hasExistingSecret ? "Leave blank to keep existing token" : field.placeholder}
+      />
+      {isSecret && decryptFailed && (
+        <span className="block text-xs text-destructive">Stored token cannot be decrypted. Re-enter it.</span>
+      )}
+    </Field>
+  );
+}
+
+function JiraBrowserSessionPanel({
+  baseUrl,
+  session,
+  loading,
+  refreshPending,
+  error,
+  onRefresh,
+  onConfirmPrincipalChange,
+}: {
+  baseUrl: string;
+  session?: JiraAuthSession;
+  loading: boolean;
+  refreshPending: boolean;
+  error: unknown;
+  onRefresh: () => void;
+  onConfirmPrincipalChange: () => void;
+}) {
+  const disabled = !baseUrl.startsWith("https://") || refreshPending;
+  const status = session?.status ?? "missing";
+  const isActive = status === "active";
+  const statusLabel =
+    status === "active" ? "Active" :
+      status === "expired" ? "Expired" :
+        status === "failed" ? "Failed" :
+          "Missing";
+  const principal = session?.principal_name || session?.principal_id || "unknown user";
+  const errorText = error ? extractSaveError(error) : session?.last_error || "";
+  const principalChangeBlocked = isPrincipalChangeError(error);
+
+  return (
+    <div className="rounded-lg border p-3">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
+            <span>Browser session</span>
+            <span className={isActive ? "text-emerald-600" : "text-destructive"}>{statusLabel}</span>
+            {loading && <Loader2 className="size-3.5 animate-spin text-muted-foreground" />}
+          </div>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {isActive
+              ? `Signed in as ${principal}${session?.browser ? ` via ${session.browser}` : ""}`
+              : "Sign in to Jira in your browser, then refresh the local session."}
+          </p>
+          {session?.origin && (
+            <p className="mt-1 break-all text-xs text-muted-foreground">{session.origin}</p>
+          )}
+          {errorText && (
+            <div className="mt-2 flex items-start gap-2 rounded-md bg-destructive/10 p-2 text-xs text-destructive">
+              <AlertCircle className="mt-0.5 size-3 shrink-0" />
+              <span className="min-w-0 whitespace-normal break-words">
+                {errorText}
+              </span>
+            </div>
+          )}
+        </div>
+        <Button type="button" variant="outline" size="sm" onClick={onRefresh} disabled={disabled}>
+          {refreshPending ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+          Refresh Session
+        </Button>
+        {principalChangeBlocked && (
+          <Button type="button" size="sm" onClick={onConfirmPrincipalChange} disabled={disabled}>
+            {refreshPending ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
+            Confirm Change
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DiscoveryPreviewPanel({
+  ready,
+  isPending,
+  error,
+  data,
+  onPreview,
+}: {
+  ready: boolean;
+  isPending: boolean;
+  error: unknown;
+  data: DiscoveryPreviewResponse | undefined;
+  onPreview: () => void;
+}) {
+  return (
+    <section className="space-y-2">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold">Preview discovery</h3>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={onPreview}
+          disabled={!ready || isPending}
+        >
+          {isPending ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+          {data ? "Refresh" : "Preview"}
+        </Button>
+      </div>
+      {!ready ? (
+        <p className="text-xs text-muted-foreground">
+          Fill in the required fields above to preview discoverable items.
+        </p>
+      ) : !data && !error && !isPending ? (
+        <p className="text-xs text-muted-foreground">
+          Run a dry discovery against the configured source to verify the result set before saving.
+        </p>
+      ) : null}
+      {error != null && (
+        <div className="flex items-start gap-2 rounded-md bg-destructive/10 p-2 text-xs text-destructive">
+          <AlertCircle className="mt-0.5 size-3 shrink-0" />
+          <span className="min-w-0 whitespace-normal break-words">{extractSaveError(error)}</span>
+        </div>
+      )}
+      {data && (
+        <div className="rounded-lg border p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+            <span>
+              {data.count} item{data.count === 1 ? "" : "s"} discovered
+            </span>
+            {data.truncated && (
+              <span>Showing first {data.items.length} of {data.count}</span>
+            )}
+          </div>
+          {data.items.length === 0 ? (
+            <p className="mt-2 text-xs text-muted-foreground">No items matched the current configuration.</p>
+          ) : (
+            <ul className="mt-2 space-y-1.5">
+              {data.items.map((item) => (
+                <li key={item.item_id} className="text-xs">
+                  <a
+                    href={item.source_url}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    className="font-medium text-primary underline-offset-2 hover:underline break-all"
+                  >
+                    {item.title || item.source_url}
+                  </a>
+                  {item.last_modified && (
+                    <span className="ml-2 text-muted-foreground">{formatPreviewDate(item.last_modified)}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          {data.truncated && (
+            <p className="mt-2 text-[11px] text-muted-foreground">
+              Result set truncated by the server. The first {data.items.length} items are shown above.
+            </p>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function formatPreviewDate(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toISOString().slice(0, 10);
+}
+
+function Field({
+  label,
+  required = false,
+  helpText,
+  children,
+}: {
+  label: string;
+  required?: boolean;
+  helpText?: string;
+  children: ReactNode;
+}) {
+  return (
+    <label className="block space-y-1.5">
+      <span className="text-xs font-medium text-muted-foreground">
+        {label}
+        {required && <span className="text-destructive"> *</span>}
+      </span>
+      {children}
+      {helpText && <span className="block text-xs text-muted-foreground">{helpText}</span>}
+    </label>
+  );
+}
+
+function buildDefaultConfig(fields: ConfigField[]): ConfigForm {
+  return fields.reduce<ConfigForm>((acc, field) => {
+    if (field.default !== "") {
+      acc[field.key] = defaultValueForField(field);
+    }
+    return acc;
+  }, {});
+}
+
+function initialSourceConfig(sourceType: string, sourceConfig: ConfigForm): ConfigForm {
+  const next = { ...sourceConfig };
+  if (sourceType === "jira" && !next.auth_mode) {
+    if (next.pat_configured) next.auth_mode = "pat";
+    else if (next.jira_cookie_configured) next.auth_mode = "browser_cookie";
+  }
+  return next;
+}
+
+function defaultValueForField(field: ConfigField): ConfigValue {
+  if (field.field_type === "boolean") return field.default === "true";
+  if (field.field_type === "integer") return Number(field.default);
+  if (field.field_type === "tag_list" || field.field_type === "multi_select") {
+    return parseCommaList(field.default);
+  }
+  return field.default;
+}
+
+function serializeConfig(fields: ConfigField[], config: ConfigForm): ConfigForm {
+  return fields.reduce<ConfigForm>((acc, field) => {
+    const value = config[field.key];
+    if (field.field_type === "tag_list" || field.field_type === "multi_select") {
+      acc[field.key] = listValue(value);
+    } else if (field.field_type === "boolean") {
+      acc[field.key] = toBoolean(value);
+    } else if (field.field_type === "integer") {
+      acc[field.key] = value === "" || value == null ? null : Number(value);
+    } else if (field.field_type === "secret") {
+      const text = stringValue(value);
+      if (text.trim().length > 0 || !config[`${field.key}_configured`]) {
+        acc[field.key] = text;
+      }
+    } else {
+      acc[field.key] = stringValue(value);
+    }
+    return acc;
+  }, {});
+}
+
+function requiredFieldsAreFilled(sourceType: string, fields: ConfigField[], config: ConfigForm): boolean {
+  return fields.every((field) => {
+    if (!isFieldVisible(sourceType, field, config)) return true;
+    if (!isFieldRequired(sourceType, field, config)) return true;
+    const value = config[field.key];
+    if (field.field_type === "tag_list" || field.field_type === "multi_select") {
+      return listValue(value).length > 0;
+    }
+    if (field.field_type === "secret" && config[`${field.key}_configured`]) {
+      return true;
+    }
+    return stringValue(value).trim().length > 0;
+  });
+}
+
+function isFieldVisible(sourceType: string, field: ConfigField, config: ConfigForm): boolean {
+  if (sourceType === "jira") {
+    const authMode = stringValue(config.auth_mode) || "browser_cookie";
+    if (field.key === "jira_cookie") return false;
+    if (field.key === "pat") return authMode === "pat";
+    return true;
+  }
+  if (sourceType === "github_pages") {
+    const authMode = stringValue(config.auth_mode) || "github_pat";
+    const syncMode = stringValue(config.sync_mode) || "single_page";
+    if (field.field_type === "secret") return authMode !== "none";
+    if (GITHUB_PAGES_MODE_FIELDS.has(field.key)) {
+      return GITHUB_PAGES_VISIBILITY[syncMode]?.has(field.key) ?? false;
+    }
+    return true;
+  }
+  return true;
+}
+
+function isFieldRequired(sourceType: string, field: ConfigField, config: ConfigForm): boolean {
+  if (sourceType === "jira") {
+    const authMode = stringValue(config.auth_mode) || "browser_cookie";
+    if (field.key === "jira_cookie") return false;
+    if (field.key === "pat") return authMode === "pat";
+  }
+  if (sourceType === "github_pages") {
+    const syncMode = stringValue(config.sync_mode) || "single_page";
+    const authMode = stringValue(config.auth_mode) || "github_pat";
+    if (field.key === "pat") return authMode === "github_pat";
+    if (field.key === "page_url") return syncMode === "single_page";
+    if (field.key === "root_url") return syncMode === "subtree";
+    if (field.key === "pages") return syncMode === "explicit_list";
+  }
+  return field.required;
+}
+
+const GITHUB_PAGES_VISIBILITY: Record<string, Set<string>> = {
+  single_page: new Set(["page_url"]),
+  subtree: new Set(["root_url", "max_depth", "max_pages", "exclude_url_patterns"]),
+  explicit_list: new Set(["pages", "max_pages", "exclude_url_patterns"]),
+};
+
+const GITHUB_PAGES_MODE_FIELDS = new Set<string>([
+  "page_url",
+  "root_url",
+  "max_depth",
+  "max_pages",
+  "exclude_url_patterns",
+  "pages",
+]);
+
+function optionLabel(field: ConfigField, option: string): string {
+  if (field.key === "auth_mode") {
+    if (option === "browser_cookie") return "Browser session";
+    if (option === "pat") return "Personal access token";
+    if (option === "github_pat") return "Personal access token";
+    if (option === "none") return "No authentication";
+  }
+  if (field.key === "sync_mode") {
+    if (option === "single_page") return "Single page";
+    if (option === "subtree") return "Subtree";
+    if (option === "explicit_list") return "Explicit list";
+  }
+  return option;
+}
+
+function optionValue(field: ConfigField, option: string): string {
+  if (field.key === "auth_mode") {
+    if (option === "browser_cookie") return "browser_session";
+    if (option === "pat") return "personal_access_token";
+  }
+  return option;
+}
+
+function optionFromValue(field: ConfigField, value: string): string {
+  if (field.key === "auth_mode") {
+    if (value === "browser_session") return "browser_cookie";
+    if (value === "personal_access_token") return "pat";
+  }
+  return value;
+}
+
+function listValue(value: ConfigValue | undefined): string[] {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") return parseCommaList(value);
+  return [];
+}
+
+function parseCommaList(value: string): string[] {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function stringValue(value: ConfigValue | undefined): string {
+  if (Array.isArray(value)) return value.join(", ");
+  if (value == null) return "";
+  return String(value);
+}
+
+function extractSaveError(error: unknown): string {
+  const fallback = "Failed to save source configuration.";
+  if (!error) return fallback;
+  if (typeof error === "object" && error !== null && "response" in error) {
+    const response = (error as { response?: { data?: { detail?: unknown; error?: unknown } } }).response;
+    const detail = response?.data?.detail;
+    if (typeof detail === "string") return detail;
+    if (detail && typeof detail === "object" && "message" in detail) {
+      return String((detail as { message: unknown }).message);
+    }
+    if (typeof response?.data?.error === "string") return response.data.error;
+  }
+  if (error instanceof Error && error.message) return error.message;
+  return fallback;
+}
+
+function isPrincipalChangeError(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("response" in error)) return false;
+  const response = (error as { response?: { status?: number; data?: { detail?: unknown } } }).response;
+  if (response?.status !== 409) return false;
+  const detail = response.data?.detail;
+  if (detail && typeof detail === "object" && "message" in detail) {
+    return String((detail as { message: unknown }).message).includes("Confirm principal change");
+  }
+  return typeof detail === "string" && detail.includes("Confirm principal change");
+}
+
+function toBoolean(value: ConfigValue | undefined): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") return value === "true";
+  return Boolean(value);
+}

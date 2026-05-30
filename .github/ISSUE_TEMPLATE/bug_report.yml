@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible problem in MemInception
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include commands, payload shape, and relevant logs with secrets removed.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: 0.1.0 or commit SHA
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: Python, Node, OS, database/vector settings

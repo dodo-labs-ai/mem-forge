@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+import pytest
+
+from meminception.llm.structured import MemoryCandidate, MemoryExtractionResponse
+from meminception.pipeline.document_units import ExtractionContext, ExtractionUnit
+from meminception.pipeline.memory_extractor import MemoryExtractor
+
+
+class RecordingStructuredMemoryClient:
+    def __init__(self, response: MemoryExtractionResponse) -> None:
+        self.response = response
+        self.calls: list[dict] = []
+
+    async def extract_memories(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        model: str | None = None,
+    ) -> MemoryExtractionResponse:
+        self.calls.append({"prompt": prompt, "max_tokens": max_tokens, "model": model})
+        return self.response
+
+
+def _context() -> ExtractionContext:
+    unit = ExtractionUnit(
+        doc_id="doc-1",
+        unit_id="doc-1::tracking",
+        path_id="tracking",
+        content_fingerprint="abc123",
+        segmentation_version="v1",
+        unit_kind="content",
+        heading_path=("Guide", "Tracking"),
+        start_line=5,
+        end_line=12,
+        split_depth=2,
+        split_reason="chosen_depth",
+        unit_markdown="## Tracking\n\nTracking uses [UnifiedContextApi](../uca) for explicit API calls.",
+    )
+    return ExtractionContext(
+        document_title="Guide",
+        document_url="https://example.test/guide",
+        source_type="github_pages",
+        unit=unit,
+        document_outline="# Guide\n  ## Tracking\n  ## Terminology",
+        glossary_appendix="UnifiedContextApi (UCA) is a process tracking API.",
+        entities=["UnifiedContextApi"],
+    )
+
+
+def test_unit_memory_extraction_prompt_rejects_agent_session_operational_noise():
+    from meminception.pipeline.memory_extractor import UNIT_MEMORY_EXTRACTION_PROMPT
+
+    prompt = UNIT_MEMORY_EXTRACTION_PROMPT.lower()
+
+    assert "agent_session" in prompt
+    assert "validation commands" in prompt
+    assert "runtime notes" in prompt
+    assert "local paths" in prompt
+    assert "working-tree state" in prompt
+
+
+@pytest.mark.asyncio
+async def test_extract_unit_memories_trusts_unit_anchor_as_boundary_contract():
+    client = RecordingStructuredMemoryClient(
+        MemoryExtractionResponse(
+            memories=[
+                MemoryCandidate(
+                    content="Tracking uses UnifiedContextApi for explicit API calls.",
+                    memory_type="fact",
+                    confidence=0.9,
+                    entity_refs=["UnifiedContextApi"],
+                    tags=["tracking"],
+                    extraction_context="Tracking uses UnifiedContextApi for explicit API calls.",
+                    evidence_quote="Tracking uses UnifiedContextApi for explicit API calls.",
+                    evidence_anchor="unit",
+                ),
+                MemoryCandidate(
+                    content="Tracking uses UnifiedContextApi for explicit API calls.",
+                    memory_type="fact",
+                    confidence=0.9,
+                    entity_refs=["UnifiedContextApi"],
+                    tags=["tracking"],
+                    extraction_context="Tracking uses UnifiedContextApi for explicit API calls.",
+                    evidence_quote="Tracking uses UnifiedContextApi for explicit API calls.",
+                    evidence_anchor="glossary",
+                ),
+            ]
+        )
+    )
+    extractor = MemoryExtractor(structured_llm_client=client)
+
+    result = await extractor.extract_unit_memories(_context(), doc_type="reference")
+
+    assert [memory.content for memory in result.memories] == [
+        "Tracking uses UnifiedContextApi for explicit API calls."
+    ]
+    assert result.memories[0].evidence_anchor == "unit"
+    assert result.memories[0].extraction_context == "Tracking uses UnifiedContextApi for explicit API calls."
+    assert "glossary_appendix" in client.calls[0]["prompt"]
