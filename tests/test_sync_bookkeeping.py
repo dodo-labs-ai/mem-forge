@@ -5,9 +5,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from meminception.memory.audit import AuditContext, MemoryAuditLogger
-from meminception.memory.store import MemoryStore
-from meminception.models import (
+from memforge.memory.audit import AuditContext, MemoryAuditLogger
+from memforge.memory.store import MemoryStore
+from memforge.models import (
     ContentItem,
     DocumentMetadata,
     Entity,
@@ -21,10 +21,10 @@ from meminception.models import (
     SyncState,
     content_hash,
 )
-from meminception.pipeline.sync import GeneSyncOrchestrator
-from meminception.runtime import SyncService
-from meminception.config import AppConfig
-from meminception.storage.database import Database
+from memforge.pipeline.sync import GeneSyncOrchestrator
+from memforge.runtime import SyncService
+from memforge.config import AppConfig
+from memforge.storage.database import Database
 
 
 @pytest.fixture
@@ -1416,7 +1416,7 @@ async def test_document_vector_failure_happens_before_memory_mutations(db: Datab
     def fake_embed_texts(texts, *args, **kwargs):
         return [[0.1, 0.2, 0.3] for _ in texts]
 
-    monkeypatch.setattr("meminception.retrieval.embeddings.embed_texts", fake_embed_texts)
+    monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
 
     orchestrator = GeneSyncOrchestrator(
         db=db,
@@ -1459,7 +1459,7 @@ async def test_falsey_document_collection_still_receives_vector_upsert(db: Datab
     def fake_embed_texts(texts, *args, **kwargs):
         return [[0.1, 0.2, 0.3] for _ in texts]
 
-    monkeypatch.setattr("meminception.retrieval.embeddings.embed_texts", fake_embed_texts)
+    monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
 
     orchestrator = GeneSyncOrchestrator(
         db=db,
@@ -1500,7 +1500,7 @@ async def test_document_vector_text_is_independent_of_extracted_entity_names(db:
     def fake_embed_texts(texts, *args, **kwargs):
         return [[0.1, 0.2, 0.3] for _ in texts]
 
-    monkeypatch.setattr("meminception.retrieval.embeddings.embed_texts", fake_embed_texts)
+    monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
 
     orchestrator = GeneSyncOrchestrator(
         db=db,
@@ -1549,7 +1549,7 @@ async def test_unchanged_document_repairs_stale_vector_without_llm_reprocessing(
     def fake_embed_texts(texts, *args, **kwargs):
         return [[0.1, 0.2, 0.3] for _ in texts]
 
-    monkeypatch.setattr("meminception.retrieval.embeddings.embed_texts", fake_embed_texts)
+    monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
 
     orchestrator = GeneSyncOrchestrator(
         db=db,
@@ -1857,7 +1857,7 @@ async def test_unchanged_document_retries_stale_vector_repair_without_reprocessi
     def fake_embed_texts(texts, *args, **kwargs):
         return [[0.1, 0.2, 0.3] for _ in texts]
 
-    monkeypatch.setattr("meminception.retrieval.embeddings.embed_texts", fake_embed_texts)
+    monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
 
     orchestrator = GeneSyncOrchestrator(
         db=db,

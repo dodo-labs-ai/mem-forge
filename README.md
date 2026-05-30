@@ -1,9 +1,29 @@
-# MemInception
+# MemForge
 
-MemInception is an open-source memory layer for coding agents and development
+<p align="center">
+  <img src=".github/assets/memforge-banner.png" alt="MemForge - Agent memory layer" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/DoDoMan-TTT/mem-forge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DoDoMan-TTT/mem-forge/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Python 3.12+" src="https://img.shields.io/badge/python-3.12%2B-3776AB">
+  <img alt="License Apache 2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
+  <img alt="Status alpha" src="https://img.shields.io/badge/status-alpha-f59e0b">
+  <img alt="Code style Ruff" src="https://img.shields.io/badge/code%20style-ruff-111827">
+</p>
+
+*Provenance-backed memory for coding agents and development teams.*
+
+> **Status:** alpha. APIs, storage formats, and integration packaging may change
+> while the project settles.
+
+MemForge is an open-source memory layer for coding agents and development
 teams. It turns source documents, team systems, and long agent sessions into
 searchable, provenance-backed memories that can be reused through an MCP server,
 an admin API, and agent-client integrations.
+
+Naming convention: **MemForge** is the display name, `memforge` is the
+Python package and CLI, and `mem-forge` is the GitHub repository slug.
 
 The project is early, but the core shape is intentional: client adapters stay
 thin, the service owns extraction and lifecycle decisions, and every memory keeps
@@ -31,7 +51,7 @@ Built-in genes today: `confluence`, `jira`, `github_pages`, `teams`, and
 flowchart LR
   Agent["Agent client\nCodex / Claude Code"]
   Adapter["Thin adapter\nhooks + MCP"]
-  API["MemInception API"]
+  API["MemForge API"]
   Pipeline["Extraction pipeline\nquality + reconciliation"]
   Store["SQLite + FTS\nChroma vectors"]
   UI["Admin UI"]
@@ -58,13 +78,13 @@ Requirements:
 - `uv` recommended for Python dependency management
 
 ```bash
-git clone https://github.com/DoDoMan-TTT/mem-inception.git
-cd mem-inception
+git clone https://github.com/DoDoMan-TTT/mem-forge.git
+cd mem-forge
 
 uv sync --extra dev
 cp .env.example .env
-uv run meminception init
-uv run meminception api
+uv run memforge init
+uv run memforge api
 ```
 
 In another terminal:
@@ -87,8 +107,8 @@ The complete docs map is in [docs/README.md](docs/README.md).
 
 Installable examples live under:
 
-- [integrations/codex/meminception-memory](integrations/codex/meminception-memory)
-- [integrations/claude-code/meminception-memory](integrations/claude-code/meminception-memory)
+- [integrations/codex/memforge-memory](integrations/codex/memforge-memory)
+- [integrations/claude-code/memforge-memory](integrations/claude-code/memforge-memory)
 
 Both use the same adapter contract: hook payload in, compact memory context out,
 and redacted session windows uploaded to the service. See
@@ -98,7 +118,7 @@ client-side versus service-side boundary.
 ## Project Layout
 
 ```text
-src/meminception/        Python service, CLI, pipeline, genes, MCP server
+src/memforge/        Python service, CLI, pipeline, genes, MCP server
 admin-ui/               React admin console
 integrations/           Codex and Claude Code plugin packages
 docs/design/            Design notes for memory extraction and agent sessions
@@ -123,7 +143,7 @@ The same checks are wired in GitHub Actions. See
 
 ## Status
 
-MemInception is alpha software. The local/self-hosted path is the primary target
+MemForge is alpha software. The local/self-hosted path is the primary target
 today. The agent-session boundary is designed so the same adapters can point at
 a hosted service later without teaching the service to read local transcript
 files.

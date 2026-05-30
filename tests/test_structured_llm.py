@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from meminception.llm.structured import (
+from memforge.llm.structured import (
     ContradictionResponse,
     EntityValidationResponse,
     EnrichmentResponse,
@@ -149,7 +149,7 @@ async def test_litellm_structured_client_requires_response_schema(monkeypatch):
             '{"decisions":[{"memory_id":"mem-1","supported":true,"excerpt":"Exact text","reason":"match"}]}'
         )
 
-    monkeypatch.setattr("meminception.llm.structured.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
@@ -183,7 +183,7 @@ async def test_litellm_structured_client_requires_memory_extraction_schema(monke
             '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact","confidence":0.9}]}'
         )
 
-    monkeypatch.setattr("meminception.llm.structured.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
@@ -222,7 +222,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
             return CompletionResponse('{"ranking":[2,0,1]}')
         raise AssertionError(f"unexpected schema {schema}")
 
-    monkeypatch.setattr("meminception.llm.structured.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
@@ -255,7 +255,7 @@ async def test_litellm_structured_client_fails_closed_on_invalid_response_schema
         calls.append(kwargs)
         return CompletionResponse("{}")
 
-    monkeypatch.setattr("meminception.llm.structured.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
@@ -276,7 +276,7 @@ async def test_litellm_structured_client_fails_closed_when_litellm_rejects_schem
     async def fake_acompletion(**kwargs):
         raise Exception("response_format unsupported")
 
-    monkeypatch.setattr("meminception.llm.structured.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
@@ -295,7 +295,7 @@ async def test_litellm_structured_client_fails_closed_on_missing_content(monkeyp
     async def fake_acompletion(**kwargs):
         return CompletionResponse(None)
 
-    monkeypatch.setattr("meminception.llm.structured.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
@@ -314,7 +314,7 @@ async def test_litellm_structured_client_fails_closed_on_invalid_schema(monkeypa
     async def fake_acompletion(**kwargs):
         return CompletionResponse('[{"memory_id":"mem-1","supported":true}]')
 
-    monkeypatch.setattr("meminception.llm.structured.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
@@ -333,7 +333,7 @@ async def test_litellm_structured_client_fails_closed_when_decisions_missing(mon
     async def fake_acompletion(**kwargs):
         return CompletionResponse("{}")
 
-    monkeypatch.setattr("meminception.llm.structured.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
@@ -355,7 +355,7 @@ async def test_litellm_structured_client_passes_num_retries(monkeypatch):
         calls.append(kwargs)
         return CompletionResponse('{"memories":[]}')
 
-    monkeypatch.setattr("meminception.llm.structured.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
 
     # Default: transient gateway/connection blips are retried by litellm.
     default_client = LiteLlmStructuredClient(

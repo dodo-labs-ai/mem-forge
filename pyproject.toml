@@ -3,14 +3,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "meminception"
+name = "memforge"
 version = "0.1.0"
 description = "Auto-evolutionary agent memory layer for development teams"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [
-    { name = "MemInception Contributors" },
+    { name = "MemForge Contributors" },
 ]
 keywords = ["agent-memory", "mcp", "coding-agents", "knowledge-base", "llm"]
 classifiers = [
@@ -52,15 +52,15 @@ dev = [
     "ruff>=0.8",
 ]
 [project.scripts]
-meminception = "meminception.main:cli"
+memforge = "memforge.main:cli"
 
 [project.urls]
-Homepage = "https://github.com/DoDoMan-TTT/mem-inception"
-Repository = "https://github.com/DoDoMan-TTT/mem-inception"
-Issues = "https://github.com/DoDoMan-TTT/mem-inception/issues"
+Homepage = "https://github.com/DoDoMan-TTT/mem-forge"
+Repository = "https://github.com/DoDoMan-TTT/mem-forge"
+Issues = "https://github.com/DoDoMan-TTT/mem-forge/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/meminception"]
+packages = ["src/memforge"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

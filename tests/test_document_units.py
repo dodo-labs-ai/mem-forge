@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from meminception.pipeline.document_units import (
+from memforge.pipeline.document_units import (
     ExtractionContextPacker,
     UnitizationPolicy,
     unitize_markdown,

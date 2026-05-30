@@ -28,7 +28,7 @@ data/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
-.meminception/
+.memforge/
 
 # Local agent/editor config
 .codex/

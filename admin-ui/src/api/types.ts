@@ -1,4 +1,4 @@
-// API types for the MemInception admin UI
+// API types for the MemForge admin UI
 
 export interface Memory {
   id: string;

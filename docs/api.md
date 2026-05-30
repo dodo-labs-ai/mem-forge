@@ -3,7 +3,7 @@
 The Admin API is served by:
 
 ```bash
-uv run meminception api
+uv run memforge api
 ```
 
 Default base URL: `http://127.0.0.1:8765`.

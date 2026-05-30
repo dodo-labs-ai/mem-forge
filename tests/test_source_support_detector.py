@@ -7,12 +7,12 @@ from datetime import datetime, timezone
 
 import pytest
 
-from meminception.llm.structured import SourceSupportDecision, SourceSupportResponse, StructuredLlmError
-from meminception.memory.audit import AuditContext, MemoryAuditLogger
-from meminception.memory.store import MemoryStore
-from meminception.models import Memory, content_hash
-from meminception.pipeline.source_support_detector import SourceSupportDetector
-from meminception.storage.database import Database
+from memforge.llm.structured import SourceSupportDecision, SourceSupportResponse, StructuredLlmError
+from memforge.memory.audit import AuditContext, MemoryAuditLogger
+from memforge.memory.store import MemoryStore
+from memforge.models import Memory, content_hash
+from memforge.pipeline.source_support_detector import SourceSupportDetector
+from memforge.storage.database import Database
 
 
 @pytest.fixture
@@ -110,7 +110,7 @@ def _audited_memory_store(db: Database, collection: FakeCollection | None = None
 
 
 def test_source_support_prompt_requires_full_entailment_not_related_context():
-    from meminception.pipeline.source_support_detector import SOURCE_SUPPORT_PROMPT
+    from memforge.pipeline.source_support_detector import SOURCE_SUPPORT_PROMPT
 
     prompt = SOURCE_SUPPORT_PROMPT.lower()
 

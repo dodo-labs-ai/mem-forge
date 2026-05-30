@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from meminception.memory.entity_resolver import validate_alias, EntityResolver
-from meminception.models import Entity, canonicalize_entity_name
+from memforge.memory.entity_resolver import validate_alias, EntityResolver
+from memforge.models import Entity, canonicalize_entity_name
 
 
 # ---------------------------------------------------------------------------

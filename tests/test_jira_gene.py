@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
-from meminception.genes.jira_gene import JiraGene
-from meminception.models import ContentItem
+from memforge.genes.jira_gene import JiraGene
+from memforge.models import ContentItem
 
 
 def test_jira_schema_marks_tls_ca_bundle_as_advanced():
@@ -110,7 +110,7 @@ class AsyncNoop:
 @pytest.mark.asyncio
 async def test_authenticate_prepares_bearer_pat_client_without_remote_probe(monkeypatch):
     RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("meminception.genes.jira_gene.httpx.AsyncClient", RecordingAsyncClient)
+    monkeypatch.setattr("memforge.genes.jira_gene.httpx.AsyncClient", RecordingAsyncClient)
     gene = JiraGene(
         config={
             "base_url": "https://jira.example.test/",
@@ -134,7 +134,7 @@ async def test_authenticate_prepares_bearer_pat_client_without_remote_probe(monk
 @pytest.mark.asyncio
 async def test_authenticate_prepares_cookie_client_without_bearer_header(monkeypatch):
     RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("meminception.genes.jira_gene.httpx.AsyncClient", RecordingAsyncClient)
+    monkeypatch.setattr("memforge.genes.jira_gene.httpx.AsyncClient", RecordingAsyncClient)
     gene = JiraGene(
         config={
             "base_url": "https://jira.example.test/",
@@ -157,7 +157,7 @@ async def test_authenticate_prepares_cookie_client_without_bearer_header(monkeyp
 @pytest.mark.asyncio
 async def test_authenticate_uses_configured_jira_ca_bundle(monkeypatch, tmp_path):
     RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("meminception.genes.jira_gene.httpx.AsyncClient", RecordingAsyncClient)
+    monkeypatch.setattr("memforge.genes.jira_gene.httpx.AsyncClient", RecordingAsyncClient)
     ca_bundle = tmp_path / "sap-ca.pem"
     ca_bundle.write_text("test-ca", encoding="utf-8")
     gene = JiraGene(
@@ -211,7 +211,7 @@ async def test_authenticate_requires_jira_cookie_for_cookie_mode():
 
 @pytest.mark.asyncio
 async def test_cookie_mode_reports_expired_session_without_retry(monkeypatch):
-    monkeypatch.setattr("meminception.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
+    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
 
     class ExpiredCookieClient(RecordingAsyncClient):
         async def request(self, method: str, url: str, **kwargs):
@@ -239,7 +239,7 @@ async def test_cookie_mode_reports_expired_session_without_retry(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pat_zero_quota_rate_limit_fails_fast(monkeypatch):
-    monkeypatch.setattr("meminception.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
+    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
     gene = JiraGene(
         config={"base_url": "https://jira.example.test", "projects": ["PAY"], "auth_mode": "pat", "pat": "jira-pat"},
         source_id="src-jira",
@@ -256,7 +256,7 @@ async def test_pat_zero_quota_rate_limit_fails_fast(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_cookie_zero_quota_rate_limit_reports_cookie_context(monkeypatch):
-    monkeypatch.setattr("meminception.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
+    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
     gene = JiraGene(
         config={
             "base_url": "https://jira.example.test",
@@ -376,7 +376,7 @@ async def test_discover_hydrates_search_result_so_fetch_uses_no_per_issue_reques
 
 @pytest.mark.asyncio
 async def test_discover_paces_paginated_jira_search_requests(monkeypatch):
-    import meminception.genes.atlassian_auth as atlassian_auth
+    import memforge.genes.atlassian_auth as atlassian_auth
 
     now = 1000.0
     sleeps: list[float] = []
@@ -493,7 +493,7 @@ async def test_fetch_tops_up_truncated_hydrated_comments_through_limiter():
 
 @pytest.mark.asyncio
 async def test_atlassian_limiter_paces_after_request_exception(monkeypatch):
-    import meminception.genes.atlassian_auth as atlassian_auth
+    import memforge.genes.atlassian_auth as atlassian_auth
 
     now = 1000.0
     sleeps: list[float] = []
@@ -524,7 +524,7 @@ async def test_atlassian_limiter_paces_after_request_exception(monkeypatch):
 
 
 def test_atlassian_limiter_is_shared_by_base_host():
-    from meminception.genes.atlassian_auth import atlassian_request_limiter, release_atlassian_request_limiter
+    from memforge.genes.atlassian_auth import atlassian_request_limiter, release_atlassian_request_limiter
 
     first = atlassian_request_limiter("https://jira.example.test", min_interval_seconds=0.75, owner_id="src-one")
     second = atlassian_request_limiter(
@@ -540,7 +540,7 @@ def test_atlassian_limiter_is_shared_by_base_host():
 
 @pytest.mark.asyncio
 async def test_releasing_limiter_owner_removes_strict_interval(monkeypatch):
-    import meminception.genes.atlassian_auth as atlassian_auth
+    import memforge.genes.atlassian_auth as atlassian_auth
 
     now = 2500.0
     sleeps: list[float] = []
@@ -584,7 +584,7 @@ async def test_releasing_limiter_owner_removes_strict_interval(monkeypatch):
 
 
 def test_releasing_last_limiter_owner_drops_cached_origin():
-    import meminception.genes.atlassian_auth as atlassian_auth
+    import memforge.genes.atlassian_auth as atlassian_auth
 
     first = atlassian_auth.atlassian_request_limiter(
         "https://drop-jira.example.test",
@@ -610,7 +610,7 @@ def test_releasing_last_limiter_owner_drops_cached_origin():
 
 @pytest.mark.asyncio
 async def test_atlassian_limiter_uses_strictest_interval_for_same_host(monkeypatch):
-    import meminception.genes.atlassian_auth as atlassian_auth
+    import memforge.genes.atlassian_auth as atlassian_auth
 
     now = 2000.0
     sleeps: list[float] = []
@@ -648,7 +648,7 @@ async def test_atlassian_limiter_uses_strictest_interval_for_same_host(monkeypat
 
 @pytest.mark.asyncio
 async def test_request_limiter_honors_retry_after_on_degraded_response(monkeypatch):
-    import meminception.genes.atlassian_auth as atlassian_auth
+    import memforge.genes.atlassian_auth as atlassian_auth
 
     now = 3000.0
     sleeps: list[float] = []
@@ -727,7 +727,7 @@ async def _async_json_response(payload: dict) -> JsonResponse:
 
 @pytest.mark.asyncio
 async def test_discover_retries_jira_rate_limit(monkeypatch):
-    monkeypatch.setattr("meminception.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
+    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
     gene = JiraGene(
         config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
         source_id="src-jira",
@@ -748,7 +748,7 @@ async def test_discover_retries_jira_rate_limit(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_discover_reports_jira_rate_limit_after_retries(monkeypatch):
-    monkeypatch.setattr("meminception.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
+    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
     gene = JiraGene(
         config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
         source_id="src-jira",
@@ -810,7 +810,7 @@ async def test_fetch_respects_include_comments_config():
 
 @pytest.mark.asyncio
 async def test_fetch_reports_comment_rate_limit_when_comments_are_enabled(monkeypatch):
-    monkeypatch.setattr("meminception.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
+    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
     gene = JiraGene(
         config={"base_url": "https://jira.example.test", "projects": ["PAY"], "include_comments": True},
         source_id="src-jira",

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
-from meminception.genes.confluence_gene import ConfluenceGene
+from memforge.genes.confluence_gene import ConfluenceGene
 
 
 def test_confluence_schema_marks_tls_ca_bundle_as_advanced():
@@ -136,7 +136,7 @@ def _page(page_id: str, title: str, when: str) -> dict:
 @pytest.mark.asyncio
 async def test_authenticate_uses_bearer_pat_and_normalizes_ui_confluence_wiki_url(monkeypatch):
     RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("meminception.genes.confluence_gene.httpx.AsyncClient", RecordingAsyncClient)
+    monkeypatch.setattr("memforge.genes.confluence_gene.httpx.AsyncClient", RecordingAsyncClient)
 
     gene = ConfluenceGene(
         config={
@@ -159,7 +159,7 @@ async def test_authenticate_uses_bearer_pat_and_normalizes_ui_confluence_wiki_ur
 @pytest.mark.asyncio
 async def test_authenticate_uses_configured_confluence_ca_bundle(monkeypatch, tmp_path):
     RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("meminception.genes.confluence_gene.httpx.AsyncClient", RecordingAsyncClient)
+    monkeypatch.setattr("memforge.genes.confluence_gene.httpx.AsyncClient", RecordingAsyncClient)
     ca_bundle = tmp_path / "sap-ca.pem"
     ca_bundle.write_text("test-ca", encoding="utf-8")
 
@@ -203,7 +203,7 @@ async def test_authenticate_requires_confluence_pat():
 @pytest.mark.asyncio
 async def test_authenticate_closes_confluence_client_when_pat_validation_fails(monkeypatch):
     RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("meminception.genes.confluence_gene.httpx.AsyncClient", FailingAuthClient)
+    monkeypatch.setattr("memforge.genes.confluence_gene.httpx.AsyncClient", FailingAuthClient)
     gene = ConfluenceGene(
         config={
             "base_url": "https://wiki.example.test",
@@ -250,7 +250,7 @@ async def test_page_tree_discovery_retries_confluence_rate_limit(monkeypatch):
     async def fake_sleep(delay: float) -> None:
         sleep_calls.append(delay)
 
-    monkeypatch.setattr("meminception.genes.atlassian_auth.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", fake_sleep)
     client = RateLimitedThenSuccessClient()
     gene = ConfluenceGene(
         config={
@@ -281,7 +281,7 @@ async def test_page_tree_discovery_reports_confluence_rate_limit_after_retries(m
     async def fake_sleep(_delay: float) -> None:
         return None
 
-    monkeypatch.setattr("meminception.genes.atlassian_auth.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", fake_sleep)
     client = AlwaysRateLimitedClient()
     gene = ConfluenceGene(
         config={

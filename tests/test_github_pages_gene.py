@@ -6,9 +6,9 @@ from datetime import datetime, timezone
 import pytest
 import requests
 
-from meminception.genes import GENE_REGISTRY
-from meminception.genes.github_pages_gene import GitHubPagesGene
-from meminception.models import RawContent
+from memforge.genes import GENE_REGISTRY
+from memforge.genes.github_pages_gene import GitHubPagesGene
+from memforge.models import RawContent
 
 
 class HtmlResponse:
@@ -180,7 +180,7 @@ def test_github_pages_gene_is_registered_and_schema_is_practical():
 @pytest.mark.asyncio
 async def test_single_page_discovery_uses_canonical_url_metadata(monkeypatch):
     RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("meminception.genes.github_pages_gene._RequestsAsyncClient", RecordingAsyncClient)
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RecordingAsyncClient)
 
     gene = GitHubPagesGene(
         config={
@@ -209,7 +209,7 @@ async def test_single_page_discovery_uses_canonical_url_metadata(monkeypatch):
 @pytest.mark.asyncio
 async def test_github_pat_authentication_uses_bearer_header(monkeypatch):
     RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("meminception.genes.github_pages_gene._RequestsAsyncClient", RecordingAsyncClient)
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RecordingAsyncClient)
 
     gene = GitHubPagesGene(
         config={
@@ -230,7 +230,7 @@ async def test_github_pat_authentication_uses_bearer_header(monkeypatch):
 @pytest.mark.asyncio
 async def test_github_pat_discovers_and_fetches_repository_markdown_for_page_url(monkeypatch):
     RepoApiClient.instances.clear()
-    monkeypatch.setattr("meminception.genes.github_pages_gene._RequestsAsyncClient", RepoApiClient)
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RepoApiClient)
 
     gene = GitHubPagesGene(
         config={
@@ -258,7 +258,7 @@ async def test_github_pat_discovers_and_fetches_repository_markdown_for_page_url
 @pytest.mark.asyncio
 async def test_github_pat_decodes_encoded_page_url_when_matching_repository_markdown(monkeypatch):
     RunbooksRepoApiClient.instances.clear()
-    monkeypatch.setattr("meminception.genes.github_pages_gene._RequestsAsyncClient", RunbooksRepoApiClient)
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RunbooksRepoApiClient)
 
     gene = GitHubPagesGene(
         config={
@@ -285,7 +285,7 @@ async def test_github_pat_decodes_encoded_page_url_when_matching_repository_mark
 @pytest.mark.asyncio
 async def test_github_pat_subtree_discovers_repository_markdown_without_crawling_pages(monkeypatch):
     RunbooksRepoApiClient.instances.clear()
-    monkeypatch.setattr("meminception.genes.github_pages_gene._RequestsAsyncClient", RunbooksRepoApiClient)
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RunbooksRepoApiClient)
 
     gene = GitHubPagesGene(
         config={
@@ -315,7 +315,7 @@ async def test_github_pat_subtree_discovers_repository_markdown_without_crawling
 @pytest.mark.asyncio
 async def test_github_pat_subtree_honors_max_pages(monkeypatch):
     RunbooksRepoApiClient.instances.clear()
-    monkeypatch.setattr("meminception.genes.github_pages_gene._RequestsAsyncClient", RunbooksRepoApiClient)
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RunbooksRepoApiClient)
 
     gene = GitHubPagesGene(
         config={
@@ -352,7 +352,7 @@ async def test_github_pat_authentication_requires_pat():
 @pytest.mark.asyncio
 async def test_subtree_discovery_prefers_sitemap_and_filters_to_root(monkeypatch):
     RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("meminception.genes.github_pages_gene._RequestsAsyncClient", SitemapClient)
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", SitemapClient)
 
     gene = GitHubPagesGene(
         config={

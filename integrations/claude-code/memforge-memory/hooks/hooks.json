@@ -1,0 +1,65 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}/scripts/memforge_hook.py\" context --client claude-code",
+            "timeout": 10,
+            "statusMessage": "Loading MemForge context"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}/scripts/memforge_hook.py\" context --client claude-code",
+            "timeout": 10,
+            "statusMessage": "Checking MemForge memory"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}/scripts/memforge_hook.py\" submit-session --client claude-code",
+            "timeout": 15,
+            "statusMessage": "Submitting MemForge compaction receipt"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}/scripts/memforge_hook.py\" submit-session --client claude-code",
+            "timeout": 15,
+            "statusMessage": "Submitting MemForge session receipt"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}/scripts/memforge_hook.py\" submit-session --client claude-code",
+            "timeout": 15,
+            "statusMessage": "Submitting MemForge subagent receipt"
+          }
+        ]
+      }
+    ]
+  }
+}

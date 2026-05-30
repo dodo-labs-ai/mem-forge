@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 
-from meminception.config import load_config
-from meminception.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
-from meminception.runtime import get_effective_llm_config
-from meminception.storage.database import Database
+from memforge.config import load_config
+from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
+from memforge.runtime import get_effective_llm_config
+from memforge.storage.database import Database
 
 
 PROMPT = """You are verifying whether a source document directly supports existing team memories.
@@ -44,7 +44,7 @@ async def main() -> None:
         await db.close()
 
     if not llm.enrichment_api_key:
-        raise RuntimeError("MEMINCEPTION_ENRICHMENT_API_KEY or DB enrichment_api_key is required")
+        raise RuntimeError("MEMFORGE_ENRICHMENT_API_KEY or DB enrichment_api_key is required")
 
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(

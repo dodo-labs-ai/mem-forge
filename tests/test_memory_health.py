@@ -7,10 +7,10 @@ from typing import Any
 
 import pytest
 
-from meminception.memory.health import MemoryIndexHealthChecker
-from meminception.memory.index_payloads import embedding_vector_hash
-from meminception.models import Memory, content_hash
-from meminception.storage.database import Database
+from memforge.memory.health import MemoryIndexHealthChecker
+from memforge.memory.index_payloads import embedding_vector_hash
+from memforge.models import Memory, content_hash
+from memforge.storage.database import Database
 
 
 class InspectableCollection:

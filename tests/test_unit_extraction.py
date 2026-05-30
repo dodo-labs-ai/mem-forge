@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from meminception.llm.structured import MemoryCandidate, MemoryExtractionResponse
-from meminception.pipeline.document_units import ExtractionContext, ExtractionUnit
-from meminception.pipeline.memory_extractor import MemoryExtractor
+from memforge.llm.structured import MemoryCandidate, MemoryExtractionResponse
+from memforge.pipeline.document_units import ExtractionContext, ExtractionUnit
+from memforge.pipeline.memory_extractor import MemoryExtractor
 
 
 class RecordingStructuredMemoryClient:
@@ -50,7 +50,7 @@ def _context() -> ExtractionContext:
 
 
 def test_unit_memory_extraction_prompt_rejects_agent_session_operational_noise():
-    from meminception.pipeline.memory_extractor import UNIT_MEMORY_EXTRACTION_PROMPT
+    from memforge.pipeline.memory_extractor import UNIT_MEMORY_EXTRACTION_PROMPT
 
     prompt = UNIT_MEMORY_EXTRACTION_PROMPT.lower()
 

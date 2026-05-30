@@ -7,13 +7,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from meminception.memory.engine import MemoryEngine
-from meminception.memory.audit import MemoryAuditLogger
-from meminception.memory.store import MemoryStore
-from meminception.llm.structured import ReconciliationDecision, ReconciliationResponse, StructuredLlmError
-from meminception.models import Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
-from meminception.pipeline.reconciler import _parse_decisions, reconcile_memories
-from meminception.storage.database import Database
+from memforge.memory.engine import MemoryEngine
+from memforge.memory.audit import MemoryAuditLogger
+from memforge.memory.store import MemoryStore
+from memforge.llm.structured import ReconciliationDecision, ReconciliationResponse, StructuredLlmError
+from memforge.models import Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
+from memforge.pipeline.reconciler import _parse_decisions, reconcile_memories
+from memforge.storage.database import Database
 
 
 class FakeCollection:
@@ -259,7 +259,7 @@ async def test_flagged_supersede_inserts_challenger_pending_review_and_keeps_inc
             )
         ]
 
-    monkeypatch.setattr("meminception.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
 
     stats = await engine.reconcile_and_persist(
         doc_id="doc-runbook",
@@ -304,7 +304,7 @@ async def test_reconcile_delete_removes_only_updated_document_support(db, monkey
             )
         ]
 
-    monkeypatch.setattr("meminception.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
 
     stats = await engine.reconcile_and_persist(
         doc_id="doc-runbook",
@@ -347,7 +347,7 @@ async def test_reconcile_delete_retires_memory_when_current_doc_is_only_support(
             )
         ]
 
-    monkeypatch.setattr("meminception.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
 
     stats = await engine.reconcile_and_persist(
         doc_id="doc-runbook",
@@ -400,7 +400,7 @@ async def test_high_corroboration_delete_removes_current_support_when_other_supp
             )
         ]
 
-    monkeypatch.setattr("meminception.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
 
     stats = await engine.reconcile_and_persist(
         doc_id="doc-runbook",
@@ -443,7 +443,7 @@ async def test_diff_guided_reconciliation_context_is_passed_to_reconciler(db, mo
             )
         ]
 
-    monkeypatch.setattr("meminception.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
 
     stats = await engine.reconcile_and_persist(
         doc_id="doc-runbook",
@@ -490,7 +490,7 @@ async def test_reconciliation_decisions_are_audited_before_mutation(db, monkeypa
             )
         ]
 
-    monkeypatch.setattr("meminception.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
 
     await engine.reconcile_and_persist(
         doc_id="doc-runbook",
@@ -549,7 +549,7 @@ async def test_reconciliation_rejects_update_without_current_doc_extracted_suppo
             )
         ]
 
-    monkeypatch.setattr("meminception.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
 
     stats = await engine.reconcile_and_persist(
         doc_id="doc-current",
@@ -599,7 +599,7 @@ async def test_reconciliation_rejects_delete_for_corroborated_only_current_doc_s
             )
         ]
 
-    monkeypatch.setattr("meminception.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
 
     stats = await engine.reconcile_and_persist(
         doc_id="doc-current",
@@ -653,7 +653,7 @@ async def test_reconciliation_routes_supersede_with_other_support_to_review(db, 
             )
         ]
 
-    monkeypatch.setattr("meminception.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
 
     stats = await engine.reconcile_and_persist(
         doc_id="doc-current",
@@ -708,7 +708,7 @@ async def test_reconciliation_routes_update_with_other_extracted_support_to_revi
             )
         ]
 
-    monkeypatch.setattr("meminception.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
 
     stats = await engine.reconcile_and_persist(
         doc_id="doc-current",

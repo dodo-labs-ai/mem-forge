@@ -1,13 +1,13 @@
 # Quickstart
 
-This guide starts a local MemInception service, opens the admin UI, and shows
+This guide starts a local MemForge service, opens the admin UI, and shows
 where agent-client integrations plug in.
 
 ## 1. Install Dependencies
 
 ```bash
-git clone https://github.com/DoDoMan-TTT/mem-inception.git
-cd mem-inception
+git clone https://github.com/DoDoMan-TTT/mem-forge.git
+cd mem-forge
 uv sync --extra dev
 cd admin-ui && npm ci && cd ..
 ```
@@ -21,22 +21,22 @@ cp .env.example .env
 Set the LLM and embedding API keys your environment uses:
 
 ```bash
-export MEMINCEPTION_ENRICHMENT_API_KEY=...
-export MEMINCEPTION_EMBEDDING_API_KEY=...
+export MEMFORGE_ENRICHMENT_API_KEY=...
+export MEMFORGE_EMBEDDING_API_KEY=...
 ```
 
-By default, local runtime data lives under `.meminception/` when you use the
+By default, local runtime data lives under `.memforge/` when you use the
 example environment file. That folder is ignored by git.
 
 ## 3. Initialize And Start The API
 
 ```bash
-uv run meminception init
-uv run meminception api
+uv run memforge init
+uv run memforge api
 ```
 
 The API listens on `http://127.0.0.1:8765` unless
-`MEMINCEPTION_ADMIN_API_PORT` changes it.
+`MEMFORGE_ADMIN_API_PORT` changes it.
 
 ## 4. Start The Admin UI
 
@@ -51,24 +51,24 @@ database.
 
 ## 5. Start MCP Tools
 
-Agent clients can call MemInception through MCP:
+Agent clients can call MemForge through MCP:
 
 ```bash
-uv run meminception serve
+uv run memforge serve
 ```
 
 The integration packages under `integrations/` register this command by default.
 For a development checkout, set:
 
 ```bash
-export MEMINCEPTION_MCP_COMMAND="uv run meminception"
+export MEMFORGE_MCP_COMMAND="uv run memforge"
 ```
 
 ## 6. Run A One-Off Sync
 
 ```bash
-uv run meminception sync
+uv run memforge sync
 ```
 
-Use `uv run meminception sync --source "Source name"` to sync one configured
+Use `uv run memforge sync --source "Source name"` to sync one configured
 source.

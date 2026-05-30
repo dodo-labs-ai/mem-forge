@@ -1,6 +1,6 @@
 # Code Of Conduct
 
-MemInception should be a useful place to build and discuss agent memory systems.
+MemForge should be a useful place to build and discuss agent memory systems.
 Be direct, kind, and technical. Assume good intent, but do not excuse behavior
 that makes collaboration harder for others.
 

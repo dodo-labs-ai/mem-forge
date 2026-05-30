@@ -16,21 +16,21 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from meminception.llm.structured import (
+from memforge.llm.structured import (
     ContradictionDecision,
     ContradictionResponse,
     LiteLlmStructuredClient,
     StructuredLlmConfig,
     StructuredLlmError,
 )
-from meminception.memory.store import MemoryStore
-from meminception.models import Memory, RawMemory, content_hash
-from meminception.pipeline.contradiction_detector import detect_cross_doc_contradictions
-from meminception.storage.database import Database
+from memforge.memory.store import MemoryStore
+from memforge.models import Memory, RawMemory, content_hash
+from memforge.pipeline.contradiction_detector import detect_cross_doc_contradictions
+from memforge.storage.database import Database
 
 LLM_BASE_URL = os.environ.get(
-    "MEMINCEPTION_E2E_ANTHROPIC_BASE_URL",
-    os.environ.get("MEMINCEPTION_ENRICHMENT_BASE_URL", "http://localhost:6655/anthropic"),
+    "MEMFORGE_E2E_ANTHROPIC_BASE_URL",
+    os.environ.get("MEMFORGE_ENRICHMENT_BASE_URL", "http://localhost:6655/anthropic"),
 )
 
 
@@ -45,8 +45,8 @@ def _read_local_env_key() -> str:
             continue
         name, value = line.split("=", 1)
         if name.strip() in {
-            "MEMINCEPTION_E2E_ANTHROPIC_API_KEY",
-            "MEMINCEPTION_ENRICHMENT_API_KEY",
+            "MEMFORGE_E2E_ANTHROPIC_API_KEY",
+            "MEMFORGE_ENRICHMENT_API_KEY",
             "ANTHROPIC_API_KEY",
         }:
             return value.strip().strip("\"'")
@@ -55,8 +55,8 @@ def _read_local_env_key() -> str:
 
 def _llm_api_key() -> str:
     return (
-        os.environ.get("MEMINCEPTION_E2E_ANTHROPIC_API_KEY")
-        or os.environ.get("MEMINCEPTION_ENRICHMENT_API_KEY")
+        os.environ.get("MEMFORGE_E2E_ANTHROPIC_API_KEY")
+        or os.environ.get("MEMFORGE_ENRICHMENT_API_KEY")
         or os.environ.get("ANTHROPIC_API_KEY")
         or _read_local_env_key()
     )
@@ -458,7 +458,7 @@ class TestProcessMemoriesIntegration:
         mock_store = AsyncMock()
         mock_store.deduplicate_and_insert = AsyncMock(return_value="inserted")
 
-        from meminception.memory.engine import MemoryEngine
+        from memforge.memory.engine import MemoryEngine
 
         engine = MemoryEngine(
             db=db,

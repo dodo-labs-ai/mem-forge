@@ -10,8 +10,8 @@ import pytest
 from rich.logging import RichHandler
 from fastapi.testclient import TestClient
 
-from meminception.config import AppConfig
-from meminception.storage.database import Database
+from memforge.config import AppConfig
+from memforge.storage.database import Database
 
 TEST_SOURCE_KEY = "VV4JjZLLr2BcgRnhV90gCnxzchn43M900VQy3dXJI30="
 
@@ -49,7 +49,7 @@ async def db(tmp_path):
 @pytest.mark.asyncio
 async def test_sync_runtime_wires_structured_llm_client_into_memory_engine(db, tmp_path, monkeypatch):
     """Normal sync startup must enable structured reconciliation and contradiction detection."""
-    from meminception import runtime
+    from memforge import runtime
 
     captured = {}
 
@@ -71,7 +71,7 @@ async def test_sync_runtime_wires_structured_llm_client_into_memory_engine(db, t
 @pytest.mark.asyncio
 async def test_sync_runtime_bounds_structured_request_timeout(db, tmp_path, monkeypatch):
     """Long-running sync model calls should fail as document errors, not hang forever."""
-    from meminception import runtime
+    from memforge import runtime
 
     configs = []
 
@@ -91,8 +91,8 @@ async def test_sync_runtime_bounds_structured_request_timeout(db, tmp_path, monk
 
 @pytest.mark.asyncio
 async def test_build_sync_runtime_wires_litellm_structured_source_support_client(db, tmp_path, monkeypatch):
-    from meminception.config import AppConfig
-    from meminception.runtime import build_sync_runtime
+    from memforge.config import AppConfig
+    from memforge.runtime import build_sync_runtime
 
     captured = {}
 
@@ -104,8 +104,8 @@ async def test_build_sync_runtime_wires_litellm_structured_source_support_client
         async def verify_source_support(self, prompt: str):
             raise AssertionError("not called during runtime construction")
 
-    monkeypatch.setattr("meminception.runtime.LiteLlmStructuredClient", RecordingStructuredClient)
-    monkeypatch.setattr("meminception.runtime.get_chroma_collection", lambda **kwargs: FakeCollection())
+    monkeypatch.setattr("memforge.runtime.LiteLlmStructuredClient", RecordingStructuredClient)
+    monkeypatch.setattr("memforge.runtime.get_chroma_collection", lambda **kwargs: FakeCollection())
 
     config = AppConfig()
     config.base_dir = tmp_path
@@ -130,8 +130,8 @@ async def test_build_sync_runtime_wires_litellm_structured_source_support_client
 
 def test_enrichment_and_extraction_clients_bound_request_timeout(monkeypatch):
     """Document LLM clients should use the configured request timeout."""
-    from meminception.pipeline.enricher import Enricher
-    from meminception.pipeline.memory_extractor import MemoryExtractor
+    from memforge.pipeline.enricher import Enricher
+    from memforge.pipeline.memory_extractor import MemoryExtractor
 
     enricher = Enricher(api_key="test-key", request_timeout_s=42.0)
     extractor = MemoryExtractor(api_key="test-key", request_timeout_s=42.0)
@@ -142,7 +142,7 @@ def test_enrichment_and_extraction_clients_bound_request_timeout(monkeypatch):
 
 def test_admin_app_lifespan_owns_database_and_sync_service(tmp_path):
     """The API startup path should open/close DB resources through FastAPI lifespan."""
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
     app = create_admin_app(config=cfg)
@@ -159,8 +159,8 @@ def test_admin_app_lifespan_owns_database_and_sync_service(tmp_path):
 async def test_health_reports_recent_audit_failures_as_warning(db, tmp_path):
     from datetime import datetime, timezone
 
-    from meminception.memory.audit import MemoryAuditEvent
-    from meminception.server.admin_api import create_admin_app
+    from memforge.memory.audit import MemoryAuditEvent
+    from memforge.server.admin_api import create_admin_app
 
     await db.insert_memory_audit_event(
         MemoryAuditEvent(
@@ -192,8 +192,8 @@ async def test_health_reports_recent_audit_failures_as_warning(db, tmp_path):
 async def test_health_ignores_old_audit_failures(db, tmp_path):
     from datetime import datetime, timedelta, timezone
 
-    from meminception.memory.audit import MemoryAuditEvent
-    from meminception.server.admin_api import create_admin_app
+    from memforge.memory.audit import MemoryAuditEvent
+    from memforge.server.admin_api import create_admin_app
 
     await db.insert_memory_audit_event(
         MemoryAuditEvent(
@@ -217,8 +217,8 @@ async def test_health_ignores_old_audit_failures(db, tmp_path):
 
 
 def test_admin_app_scheduler_registers_expiry_maintenance(tmp_path):
-    from meminception.scheduler import EXPIRY_JOB_ID
-    from meminception.server.admin_api import create_admin_app
+    from memforge.scheduler import EXPIRY_JOB_ID
+    from memforge.server.admin_api import create_admin_app
 
     app = create_admin_app(config=_config(tmp_path))
 
@@ -227,7 +227,7 @@ def test_admin_app_scheduler_registers_expiry_maintenance(tmp_path):
 
 
 def test_gene_config_schema_marks_advanced_source_fields(tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     app = create_admin_app(config=_config(tmp_path))
 
@@ -243,9 +243,9 @@ def test_gene_config_schema_marks_advanced_source_fields(tmp_path):
 def test_admin_source_create_encrypts_and_redacts_pat(tmp_path, monkeypatch):
     import sqlite3
 
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     cfg = _config(tmp_path)
     app = create_admin_app(config=cfg)
 
@@ -286,9 +286,9 @@ def test_admin_source_create_encrypts_and_redacts_pat(tmp_path, monkeypatch):
 def test_admin_source_update_preserves_encrypted_pat_when_blank(tmp_path, monkeypatch):
     import sqlite3
 
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     cfg = _config(tmp_path)
     app = create_admin_app(config=cfg)
 
@@ -344,9 +344,9 @@ def test_admin_source_update_preserves_encrypted_pat_when_blank(tmp_path, monkey
 
 
 def test_admin_source_save_rejects_missing_tls_ca_bundle(tmp_path, monkeypatch):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     cfg = _config(tmp_path)
     app = create_admin_app(config=cfg)
 
@@ -370,9 +370,9 @@ def test_admin_source_save_rejects_missing_tls_ca_bundle(tmp_path, monkeypatch):
 
 
 def test_admin_source_save_rejects_insecure_atlassian_base_url(tmp_path, monkeypatch):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     cfg = _config(tmp_path)
     app = create_admin_app(config=cfg)
 
@@ -395,9 +395,9 @@ def test_admin_source_save_rejects_insecure_atlassian_base_url(tmp_path, monkeyp
 
 
 def test_admin_source_save_rejects_pat_without_base_url(tmp_path, monkeypatch):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     cfg = _config(tmp_path)
     app = create_admin_app(config=cfg)
 
@@ -440,9 +440,9 @@ def test_admin_source_create_rejects_missing_atlassian_pat(
     tmp_path,
     monkeypatch,
 ):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     app = create_admin_app(config=_config(tmp_path))
 
     with TestClient(app) as client:
@@ -460,9 +460,9 @@ def test_admin_source_create_rejects_missing_atlassian_pat(
 
 
 def test_admin_source_create_allows_jira_browser_session_without_source_cookie(tmp_path, monkeypatch):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     app = create_admin_app(config=_config(tmp_path))
 
     with TestClient(app) as client:
@@ -483,9 +483,9 @@ def test_admin_source_create_allows_jira_browser_session_without_source_cookie(t
 
 
 def test_admin_source_create_rejects_missing_required_source_scope(tmp_path, monkeypatch):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     app = create_admin_app(config=_config(tmp_path))
 
     with TestClient(app) as client:
@@ -506,9 +506,9 @@ def test_admin_source_create_rejects_missing_required_source_scope(tmp_path, mon
 
 
 def test_admin_source_create_ignores_forged_jira_cookie_configured_flag(tmp_path, monkeypatch):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     app = create_admin_app(config=_config(tmp_path))
 
     with TestClient(app) as client:
@@ -534,9 +534,9 @@ def test_admin_source_create_ignores_forged_jira_cookie_configured_flag(tmp_path
 
 
 def test_admin_source_create_rejects_forged_jira_pat_configured_flag(tmp_path, monkeypatch):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     app = create_admin_app(config=_config(tmp_path))
 
     with TestClient(app) as client:
@@ -560,7 +560,7 @@ def test_admin_source_create_rejects_forged_jira_pat_configured_flag(tmp_path, m
 
 @pytest.mark.asyncio
 async def test_admin_sources_exposes_failed_and_partial_sync_status(db, tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     await db.upsert_source(
         id="src-failed-visible",
@@ -617,7 +617,7 @@ async def test_admin_sources_exposes_failed_and_partial_sync_status(db, tmp_path
 
 @pytest.mark.asyncio
 async def test_admin_sources_exposes_running_stored_counts_separately(db, tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     source_id = "src-running-counts"
     await db.upsert_source(
@@ -718,7 +718,7 @@ async def test_admin_sources_exposes_running_stored_counts_separately(db, tmp_pa
 
 
 def test_source_secret_field_policy_is_gene_driven_for_known_sources():
-    from meminception.server.admin_api import _source_secret_fields, _validate_source_config
+    from memforge.server.admin_api import _source_secret_fields, _validate_source_config
 
     assert _source_secret_fields("confluence") == ("pat",)
     assert _source_secret_fields("github_pages") == ("pat",)
@@ -733,9 +733,9 @@ def test_source_secret_field_policy_is_gene_driven_for_known_sources():
 async def test_unknown_source_type_still_redacts_and_encrypts_secret_fields(db, tmp_path, monkeypatch):
     import sqlite3
 
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     cfg = _config(tmp_path)
     source_id = "src-removed-gene"
     await db.upsert_source(
@@ -783,11 +783,11 @@ async def test_unknown_source_type_still_redacts_and_encrypts_secret_fields(db, 
 async def test_pat_source_noop_update_preserves_sync_cursor(db, tmp_path, monkeypatch, submitted_pat):
     from datetime import datetime, timezone
 
-    from meminception.models import SyncState
-    from meminception.server.admin_api import create_admin_app
-    from meminception.source_secrets import prepare_source_config_for_storage
+    from memforge.models import SyncState
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_secrets import prepare_source_config_for_storage
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     cfg = _config(tmp_path)
     source_id = "src-confluence"
     source_config = prepare_source_config_for_storage(
@@ -850,11 +850,11 @@ async def test_pat_source_noop_update_preserves_sync_cursor(db, tmp_path, monkey
 async def test_pat_replacement_preserves_jira_sync_cursor_when_scope_is_unchanged(db, tmp_path, monkeypatch):
     from datetime import datetime, timezone
 
-    from meminception.models import SyncState
-    from meminception.server.admin_api import create_admin_app
-    from meminception.source_secrets import prepare_source_config_for_storage
+    from memforge.models import SyncState
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_secrets import prepare_source_config_for_storage
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     source_id = "src-jira-pat-refresh"
     scope_config = {
         "base_url": "https://jira.example.test",
@@ -918,11 +918,11 @@ async def test_pat_replacement_preserves_jira_sync_cursor_when_scope_is_unchange
 async def test_jira_pat_replacement_resets_sync_cursor_when_secret_changes(db, tmp_path, monkeypatch):
     from datetime import datetime, timezone
 
-    from meminception.models import SyncState
-    from meminception.server.admin_api import create_admin_app
-    from meminception.source_secrets import prepare_source_config_for_storage
+    from memforge.models import SyncState
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_secrets import prepare_source_config_for_storage
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     source_id = "src-jira-pat-principal-change"
     scope_config = {
         "base_url": "https://jira.example.test",
@@ -985,11 +985,11 @@ async def test_jira_pat_replacement_resets_sync_cursor_when_secret_changes(db, t
 async def test_jira_auth_mode_change_resets_sync_cursor(db, tmp_path, monkeypatch):
     from datetime import datetime, timezone
 
-    from meminception.models import SyncState
-    from meminception.server.admin_api import create_admin_app
-    from meminception.source_secrets import prepare_source_config_for_storage
+    from memforge.models import SyncState
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_secrets import prepare_source_config_for_storage
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     source_id = "src-jira-auth-mode-change"
     pat_scope_config = {
         "base_url": "https://jira.example.test",
@@ -1057,11 +1057,11 @@ async def test_jira_auth_mode_change_resets_sync_cursor(db, tmp_path, monkeypatc
 
 @pytest.mark.asyncio
 async def test_source_base_url_update_releases_old_atlassian_limiter(db, tmp_path, monkeypatch):
-    from meminception.server import admin_api
-    from meminception.server.admin_api import create_admin_app
-    from meminception.source_secrets import prepare_source_config_for_storage
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_secrets import prepare_source_config_for_storage
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     released: list[tuple[str, str]] = []
     monkeypatch.setattr(
         admin_api,
@@ -1109,8 +1109,8 @@ async def test_source_base_url_update_releases_old_atlassian_limiter(db, tmp_pat
 async def test_non_secret_source_noop_update_preserves_sync_cursor(db, tmp_path):
     from datetime import datetime, timezone
 
-    from meminception.models import SyncState
-    from meminception.server.admin_api import create_admin_app
+    from memforge.models import SyncState
+    from memforge.server.admin_api import create_admin_app
 
     source_id = "src-agent-sessions"
     source_config = {"documents_dir": str(tmp_path / "sessions")}
@@ -1148,8 +1148,8 @@ async def test_non_secret_source_noop_update_preserves_sync_cursor(db, tmp_path)
 
 @pytest.mark.asyncio
 async def test_run_source_sync_leaves_authentication_to_orchestrator(monkeypatch, tmp_path):
-    from meminception import runtime
-    from meminception.models import SyncState
+    from memforge import runtime
+    from memforge.models import SyncState
 
     class FakeGene:
         def __init__(self) -> None:
@@ -1181,10 +1181,10 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(monkeypatch
 
 @pytest.mark.asyncio
 async def test_run_source_sync_decrypts_gene_declared_secret_fields(monkeypatch, tmp_path):
-    from meminception import runtime
-    from meminception.genes import GENE_REGISTRY
-    from meminception.genes.base import Gene
-    from meminception.models import (
+    from memforge import runtime
+    from memforge.genes import GENE_REGISTRY
+    from memforge.genes.base import Gene
+    from memforge.models import (
         ConfigField,
         ConfigFieldType,
         ConfigGroup,
@@ -1195,7 +1195,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(monkeypatch,
         RawContent,
         SyncState,
     )
-    from meminception.source_secrets import prepare_source_config_for_storage
+    from memforge.source_secrets import prepare_source_config_for_storage
 
     class ApiKeyGene(Gene):
         @classmethod
@@ -1246,7 +1246,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(monkeypatch,
             self.gene = gene
             return SyncState(source=source_id, last_sync_status="success")
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     monkeypatch.setitem(GENE_REGISTRY, "api_key_gene", ApiKeyGene)
     source_config = prepare_source_config_for_storage(
         {"api_key": "runtime-secret"},
@@ -1274,9 +1274,9 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(monkeypatch,
 async def test_gene_discovery_preview_runs_configured_gene_without_saving_source(db, tmp_path, monkeypatch):
     from datetime import datetime, timezone
 
-    from meminception.genes import GENE_REGISTRY
-    from meminception.genes.base import Gene
-    from meminception.models import (
+    from memforge.genes import GENE_REGISTRY
+    from memforge.genes.base import Gene
+    from memforge.models import (
         ConfigField,
         ConfigFieldType,
         ConfigGroup,
@@ -1286,7 +1286,7 @@ async def test_gene_discovery_preview_runs_configured_gene_without_saving_source
         NormalizedContent,
         RawContent,
     )
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     class PreviewGene(Gene):
         @classmethod
@@ -1354,7 +1354,7 @@ async def test_gene_discovery_preview_runs_configured_gene_without_saving_source
 
 @pytest.mark.asyncio
 async def test_github_pages_source_config_requires_scope_url_for_selected_mode(db, tmp_path):
-    from meminception.server.admin_api import create_admin_app
+    from memforge.server.admin_api import create_admin_app
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
@@ -1423,11 +1423,11 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
 async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path, monkeypatch):
     from datetime import datetime, timezone
 
-    from meminception.models import SyncState
-    from meminception.server.admin_api import create_admin_app
-    from meminception.source_secrets import prepare_source_config_for_storage
+    from memforge.models import SyncState
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_secrets import prepare_source_config_for_storage
 
-    monkeypatch.setenv("MEMINCEPTION_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     source_id = "src-jira-rescope"
     old_config = {
         "base_url": "https://jira.example",
@@ -1492,8 +1492,8 @@ async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path,
 async def test_force_resync_resets_cursor_and_starts_source_sync(db, tmp_path):
     from datetime import datetime, timezone
 
-    from meminception.models import SyncState
-    from meminception.server.admin_api import create_admin_app
+    from memforge.models import SyncState
+    from memforge.server.admin_api import create_admin_app
 
     source_id = "src-force-resync"
     await db.upsert_source(
@@ -1553,7 +1553,7 @@ async def test_force_resync_resets_cursor_and_starts_source_sync(db, tmp_path):
 
 
 def test_schedule_trigger_uses_configured_daily_time():
-    from meminception.scheduler import build_schedule_trigger
+    from memforge.scheduler import build_schedule_trigger
 
     trigger = build_schedule_trigger({
         "enabled": True,
@@ -1569,12 +1569,12 @@ def test_schedule_trigger_uses_configured_daily_time():
 
 
 def test_config_env_overrides_startup_runtime_values(monkeypatch, tmp_path):
-    from meminception.config import load_config
+    from memforge.config import load_config
 
-    monkeypatch.setenv("MEMINCEPTION_BASE_DIR", str(tmp_path / "env-base"))
-    monkeypatch.setenv("MEMINCEPTION_ENRICHMENT_BASE_URL", "http://localhost:6655/anthropic")
-    monkeypatch.setenv("MEMINCEPTION_EMBEDDING_BASE_URL", "http://localhost:6655/openai/v1")
-    monkeypatch.setenv("MEMINCEPTION_ADMIN_API_PORT", "9876")
+    monkeypatch.setenv("MEMFORGE_BASE_DIR", str(tmp_path / "env-base"))
+    monkeypatch.setenv("MEMFORGE_ENRICHMENT_BASE_URL", "http://localhost:6655/anthropic")
+    monkeypatch.setenv("MEMFORGE_EMBEDDING_BASE_URL", "http://localhost:6655/openai/v1")
+    monkeypatch.setenv("MEMFORGE_ADMIN_API_PORT", "9876")
 
     cfg = load_config(base_dir=tmp_path / "ignored")
 
@@ -1585,7 +1585,7 @@ def test_config_env_overrides_startup_runtime_values(monkeypatch, tmp_path):
 
 
 def test_cli_logging_uses_stderr_for_stdio_safety():
-    from meminception.main import setup_logging
+    from memforge.main import setup_logging
 
     root = logging.getLogger()
     previous_handlers = root.handlers[:]
