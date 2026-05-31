@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 
+from memforge.config import AppConfig
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.review_service import (
     ReviewAlreadyResolved,
@@ -16,6 +19,7 @@ from memforge.memory.review_service import (
 )
 from memforge.memory.store import MemoryStore
 from memforge.models import (
+    DocumentRecord,
     Memory,
     MemoryReview,
     ReviewKind,
@@ -102,6 +106,10 @@ def review_service(db, memory_store) -> ReviewService:
     return ReviewService(db=db, memory_store=memory_store)
 
 
+def _config(tmp_path: Path) -> AppConfig:
+    return AppConfig(base_dir=tmp_path / "memforge")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -116,6 +124,37 @@ async def _insert_doc(db: Database, doc_id: str, source: str = "src-1") -> None:
         (doc_id, source, f"http://test/{doc_id}", doc_id, "TEST", now, "1", f"hash-{doc_id}", now),
     )
     await db.db.commit()
+
+
+async def _upsert_doc_with_artifacts(
+    db: Database,
+    tmp_path: Path,
+    doc_id: str,
+    *,
+    normalized_content_uri: str | None,
+    pdf_content_uri: str | None = None,
+) -> None:
+    now = datetime.now(timezone.utc)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            source="src-confluence",
+            source_url=f"http://test/{doc_id}",
+            title=doc_id,
+            space_or_project="TEST",
+            author=None,
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash=f"hash-{doc_id}",
+            token_count=100,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=normalized_content_uri,
+            pdf_content_uri=pdf_content_uri,
+            last_synced=now,
+        )
+    )
 
 
 def _memory(mem_id: str, content: str, *, status: str = "active", confidence: float = 0.9) -> Memory:
@@ -292,6 +331,58 @@ class TestReviewCrud:
         assert purged is True
         assert await db.get_memory(related.id) is None
         assert await db.list_memory_review_related_challengers(review.id) == []
+
+    @pytest.mark.asyncio
+    async def test_review_detail_uses_service_readable_artifact_urls_only(
+        self,
+        db,
+        chroma,
+        tmp_path,
+    ):
+        from memforge.server.admin_api import create_admin_app
+
+        incumbent, challenger, review = await _seed_supersede_review(db, chroma, suffix="urls")
+        docs_dir = Path(_config(tmp_path).storage.docs_path)
+        docs_dir.mkdir(parents=True)
+        incumbent_md = docs_dir / "incumbent.md"
+        incumbent_md.write_text("# Incumbent evidence", encoding="utf-8")
+        await _upsert_doc_with_artifacts(
+            db,
+            tmp_path,
+            "doc-review-incumbent",
+            normalized_content_uri=str(incumbent_md),
+        )
+        await _upsert_doc_with_artifacts(
+            db,
+            tmp_path,
+            "doc-review-challenger",
+            normalized_content_uri="/tmp/missing-review-source.md",
+        )
+        await db.add_memory_source(
+            incumbent.id,
+            "doc-review-incumbent",
+            "confluence",
+            excerpt="incumbent source",
+        )
+        await db.add_memory_source(
+            challenger.id,
+            "doc-review-challenger",
+            "confluence",
+            excerpt="challenger source",
+        )
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            response = client.get(f"/api/memory-reviews/{review.id}")
+
+        assert response.status_code == 200
+        payload = response.json()
+        incumbent_source = payload["incumbent"]["sources"][0]
+        challenger_source = payload["challenger"]["sources"][0]
+        assert incumbent_source["content_url"] == "/api/documents/doc-review-incumbent/content"
+        assert challenger_source["content_url"] is None
+        assert "file_uri" not in incumbent_source
+        assert "pdf_uri" not in incumbent_source
 
 
 # ---------------------------------------------------------------------------

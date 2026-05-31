@@ -914,7 +914,11 @@ def _dt_iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
 
 
-def _memory_source_detail(ms: Any, doc: Any | None) -> MemorySourceDetail:
+def _memory_source_detail(
+    ms: Any,
+    doc: Any | None,
+    config: AppConfig | None = None,
+) -> MemorySourceDetail:
     return MemorySourceDetail(
         doc_id=ms.doc_id,
         source_type=ms.source_type,
@@ -922,8 +926,8 @@ def _memory_source_detail(ms: Any, doc: Any | None) -> MemorySourceDetail:
         support_kind=ms.support_kind,
         doc_title=doc.title if doc else None,
         source_url=doc.source_url if doc else None,
-        content_url=document_content_url(doc),
-        pdf_url=document_pdf_url(doc),
+        content_url=document_content_url(doc, config),
+        pdf_url=document_pdf_url(doc, config),
         added_at=_dt_iso(ms.added_at),
     )
 
@@ -999,13 +1003,17 @@ def _review_to_response(
     )
 
 
-async def _build_memory_summary(db: Database, memory: Memory) -> MemoryReviewMemorySummary:
+async def _build_memory_summary(
+    db: Database,
+    memory: Memory,
+    config: AppConfig | None = None,
+) -> MemoryReviewMemorySummary:
     """Hydrate a memory with provenance and entity refs for the review detail view."""
     raw_sources = await db.get_memory_sources(memory.id)
     sources: list[MemorySourceDetail] = []
     for ms in raw_sources:
         doc = await db.get_document(ms.doc_id)
-        sources.append(_memory_source_detail(ms, doc))
+        sources.append(_memory_source_detail(ms, doc, config))
 
     entity_ids = await db.get_memory_entity_ids(memory.id)
     entity_names: list[str] = []
@@ -1586,7 +1594,11 @@ def create_admin_app(
         return {"data": [m.model_dump() for m in memories], "total": total}
 
     @memory_router.get("/{memory_id}", response_model=MemoryDetailResponse)
-    async def get_memory(memory_id: str, db: Database = Depends(get_db)):
+    async def get_memory(
+        memory_id: str,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
         """Get full memory detail including provenance (linked source documents)."""
         mem = await db.get_memory(memory_id)
         if not mem:
@@ -1597,7 +1609,7 @@ def create_admin_app(
         source_details: list[MemorySourceDetail] = []
         for ms in raw_sources:
             doc = await db.get_document(ms.doc_id)
-            source_details.append(_memory_source_detail(ms, doc))
+            source_details.append(_memory_source_detail(ms, doc, config))
 
         # Fetch linked entity names
         entity_ids = await db.get_memory_entity_ids(memory_id)
@@ -2924,6 +2936,7 @@ def create_admin_app(
     async def get_memory_review(
         review_id: str,
         db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
     ):
         review = await db.get_memory_review(review_id)
         if review is None:
@@ -2932,14 +2945,14 @@ def create_admin_app(
         incumbent = await db.get_memory(review.incumbent_memory_id)
         challenger = await db.get_memory(review.challenger_memory_id)
         base = _review_to_response(review, incumbent=incumbent, challenger=challenger)
-        incumbent_summary = await _build_memory_summary(db, incumbent) if incumbent else None
-        challenger_summary = await _build_memory_summary(db, challenger) if challenger else None
+        incumbent_summary = await _build_memory_summary(db, incumbent, config) if incumbent else None
+        challenger_summary = await _build_memory_summary(db, challenger, config) if challenger else None
         related_challengers: list[MemoryReviewMemorySummary] = []
         for related in await db.list_memory_review_related_challengers(review.id):
             related_memory = await db.get_memory(related.challenger_memory_id)
             if related_memory is None:
                 continue
-            related_challengers.append(await _build_memory_summary(db, related_memory))
+            related_challengers.append(await _build_memory_summary(db, related_memory, config))
         return MemoryReviewDetailResponse(
             **base.model_dump(),
             incumbent=incumbent_summary,
@@ -2983,10 +2996,10 @@ def create_admin_app(
         assert review is not None
         base = _review_to_response(review, incumbent=result.incumbent, challenger=result.challenger)
         incumbent_summary = (
-            await _build_memory_summary(db, result.incumbent) if result.incumbent else None
+            await _build_memory_summary(db, result.incumbent, config) if result.incumbent else None
         )
         challenger_summary = (
-            await _build_memory_summary(db, result.challenger) if result.challenger else None
+            await _build_memory_summary(db, result.challenger, config) if result.challenger else None
         )
         return MemoryReviewDetailResponse(
             **base.model_dump(),
@@ -3031,10 +3044,10 @@ def create_admin_app(
         assert review is not None
         base = _review_to_response(review, incumbent=result.incumbent, challenger=result.challenger)
         incumbent_summary = (
-            await _build_memory_summary(db, result.incumbent) if result.incumbent else None
+            await _build_memory_summary(db, result.incumbent, config) if result.incumbent else None
         )
         challenger_summary = (
-            await _build_memory_summary(db, result.challenger) if result.challenger else None
+            await _build_memory_summary(db, result.challenger, config) if result.challenger else None
         )
         return MemoryReviewDetailResponse(
             **base.model_dump(),
@@ -3059,10 +3072,10 @@ def create_admin_app(
         review = result.review
         base = _review_to_response(review, incumbent=result.incumbent, challenger=result.challenger)
         incumbent_summary = (
-            await _build_memory_summary(db, result.incumbent) if result.incumbent else None
+            await _build_memory_summary(db, result.incumbent, config) if result.incumbent else None
         )
         challenger_summary = (
-            await _build_memory_summary(db, result.challenger) if result.challenger else None
+            await _build_memory_summary(db, result.challenger, config) if result.challenger else None
         )
         return MemoryReviewDetailResponse(
             **base.model_dump(),

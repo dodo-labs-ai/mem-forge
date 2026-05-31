@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from memforge.config import RetrievalConfig
+from memforge.config import AppConfig, RetrievalConfig
 from memforge.llm.structured import StructuredLlmError
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SearchResult
@@ -111,6 +111,7 @@ class SearchEngine:
         config: RetrievalConfig,
         document_collection: Any | None = None,
         structured_llm_client: Any | None = None,
+        artifact_config: AppConfig | None = None,
     ) -> None:
         self._db = db
         self._mem_collection = memory_collection
@@ -119,6 +120,7 @@ class SearchEngine:
         self._config = config
         self._embed_cache = EmbeddingCache(max_size=config.embedding_cache_size)
         self._structured_llm_client = structured_llm_client
+        self._artifact_config = artifact_config
 
     # ==================================================================
     # Public API
@@ -822,8 +824,8 @@ class SearchEngine:
                     doc = await self._db.get_document(primary.doc_id)
                     if doc:
                         source_doc_title = doc.title
-                        content_url = document_content_url(doc)
-                        pdf_url = document_pdf_url(doc)
+                        content_url = document_content_url(doc, self._artifact_config)
+                        pdf_url = document_pdf_url(doc, self._artifact_config)
                         source_url = doc.source_url
             except Exception:
                 logger.exception("Failed to fetch sources for memory %s", mid)
@@ -930,8 +932,8 @@ class SearchEngine:
                 doc = await self._db.get_document(doc_id)
                 if doc:
                     title = doc.title
-                    content_url = document_content_url(doc)
-                    pdf_url = document_pdf_url(doc)
+                    content_url = document_content_url(doc, self._artifact_config)
+                    pdf_url = document_pdf_url(doc, self._artifact_config)
                     source_url = doc.source_url
                     source_type = doc.source
             except Exception:
