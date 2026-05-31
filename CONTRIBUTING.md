@@ -27,6 +27,9 @@ make ui-test
 make ui-build
 ```
 
+These Makefile targets are maintainer shortcuts for the underlying `uv` and
+`npm` commands. The public quickstart uses Docker Compose instead.
+
 For agent-session changes, also run the focused Python tests:
 
 ```bash
