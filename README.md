@@ -131,12 +131,15 @@ tests/                  Python tests
 Common commands:
 
 ```bash
-make install
-make lint
-make test
-make ui-lint
-make ui-test
-make ui-build
+uv sync --extra dev
+uv run ruff check src tests
+uv run pytest -q
+
+cd admin-ui
+npm ci
+npm run lint
+npm test
+npm run build
 ```
 
 The same checks are wired in GitHub Actions. See
