@@ -13,17 +13,21 @@ import json
 import logging
 import os
 import re
+import tempfile
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, urlparse
 
+import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Resource, TextContent, Tool
 
 from memforge.config import AppConfig
 from memforge.models import MemoryType
-from memforge.provenance import document_content_url, document_pdf_url, select_document_artifact
+from memforge.provenance import document_content_url, document_pdf_url
 from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -281,6 +285,7 @@ def create_mcp_server(
                 embed_cfg=embed_cfg,
                 config=config.retrieval,
                 structured_llm_client=structured_llm_client,
+                artifact_config=config,
             )
         return _search_engine
 
@@ -303,7 +308,7 @@ def create_mcp_server(
                 include_superseded=args.get("include_superseded", False),
                 top_k=args.get("top_k", config.retrieval.default_top_k),
             )
-            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+            return [TextContent(type="text", text=json.dumps(_json_ready(result), indent=2))]
 
         except Exception as e:
             logger.warning("Search failed: %s", e, exc_info=True)
@@ -334,8 +339,8 @@ def create_mcp_server(
             if doc:
                 entry["title"] = doc.title
                 entry["source_url"] = doc.source_url
-                entry["content_url"] = document_content_url(doc)
-                entry["pdf_url"] = document_pdf_url(doc)
+                entry["content_url"] = document_content_url(doc, config)
+                entry["pdf_url"] = document_pdf_url(doc, config)
             provenance.append(entry)
 
         # Get linked entities
@@ -389,47 +394,73 @@ def create_mcp_server(
                 "supported_modes": ["text", "file", "base64"],
             }))]
 
-        target = _parse_resource_url(url)
+        max_bytes_result = _positive_int_arg(args, "max_bytes", 2_000_000)
+        if isinstance(max_bytes_result, dict):
+            return [TextContent(type="text", text=json.dumps(max_bytes_result))]
+        max_bytes = max_bytes_result
+
+        max_chars_result = _positive_int_arg(args, "max_chars", 120_000)
+        if isinstance(max_chars_result, dict):
+            return [TextContent(type="text", text=json.dumps(max_chars_result))]
+        max_chars = max_chars_result
+
+        api_base_url = _resource_api_base_url(config)
+        target = _parse_resource_url(url, api_base_url)
         if target is None:
             return [TextContent(type="text", text=json.dumps({
                 "error": "unsupported resource URL",
-                "hint": "Use a MemForge /api/documents/{doc_id}/content, /pdf, or /artifacts/{kind} URL.",
+                "hint": (
+                    "Use a relative MemForge /api/documents/{doc_id}/content, /pdf, "
+                    "or /artifacts/{kind} URL, or an absolute URL under MEMFORGE_API_URL."
+                ),
             }))]
 
-        doc_id, kind = target
-        doc = await db.get_document(doc_id)
-        if doc is None:
-            return [TextContent(type="text", text=json.dumps({"error": f"document not found: {doc_id}"}))]
-
-        artifact = select_document_artifact(doc, kind, config)
-        if artifact is None:
+        headers = _resource_headers()
+        try:
+            if mode == "file":
+                fetched = await _fetch_resource_file_from_api(target.request_url, headers, target)
+            else:
+                fetched = await _fetch_resource_from_api(
+                    target.request_url,
+                    headers,
+                    max_bytes=max_bytes,
+                )
+        except httpx.HTTPError as exc:
             return [TextContent(type="text", text=json.dumps({
-                "error": f"artifact not found: {kind}",
-                "doc_id": doc_id,
-            }))]
+                "error": "resource fetch failed",
+                "url": target.relative_url,
+                "detail": str(exc),
+            }, indent=2))]
+
+        status_code = int(fetched.get("status_code") or 0)
+        response_headers = {
+            str(k).lower(): str(v)
+            for k, v in dict(fetched.get("headers") or {}).items()
+        }
+        data = bytes(fetched.get("content") or b"")
+        if status_code >= 300:
+            return [TextContent(type="text", text=json.dumps({
+                "error": "resource fetch failed",
+                "status_code": status_code,
+                "url": target.relative_url,
+                "detail": data.decode("utf-8", errors="replace")[:1000],
+            }, indent=2))]
+
+        content_type = response_headers.get("content-type", "application/octet-stream")
+        filename = _resource_filename(response_headers, target)
+        size_bytes = _response_size_bytes(response_headers, fetched, len(data))
 
         metadata = {
-            "doc_id": doc.doc_id,
-            "title": doc.title,
-            "source_url": doc.source_url,
-            "kind": artifact.kind,
-            "content_type": artifact.media_type,
-            "filename": artifact.filename,
-            "size_bytes": artifact.size_bytes,
-            "url": artifact.url,
+            "doc_id": target.doc_id,
+            "kind": target.kind,
+            "content_type": content_type,
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "url": target.relative_url,
             "mode": mode,
         }
 
-        if mode == "file":
-            local_path = _cache_artifact_file(doc.doc_id, artifact.kind, artifact.path)
-            return [TextContent(type="text", text=json.dumps({
-                **metadata,
-                "local_path": str(local_path),
-                "cleanup": "temporary-cache",
-            }, indent=2))]
-
-        max_bytes = int(args.get("max_bytes") or 2_000_000)
-        if artifact.size_bytes > max_bytes:
+        if fetched.get("exceeded_max_bytes") or (mode != "file" and size_bytes > max_bytes):
             return [TextContent(type="text", text=json.dumps({
                 **metadata,
                 "error": "artifact exceeds max_bytes",
@@ -437,21 +468,27 @@ def create_mcp_server(
                 "max_bytes": max_bytes,
             }, indent=2))]
 
-        data = artifact.path.read_bytes()
+        if mode == "file":
+            local_path = Path(str(fetched.get("local_path") or ""))
+            return [TextContent(type="text", text=json.dumps({
+                **metadata,
+                "local_path": str(local_path),
+                "cleanup": "temporary-cache",
+            }, indent=2))]
+
         if mode == "base64":
             return [TextContent(type="text", text=json.dumps({
                 **metadata,
                 "data_base64": base64.b64encode(data).decode("ascii"),
             }, indent=2))]
 
-        if not _is_text_content_type(artifact.media_type):
+        if not _is_text_content_type(content_type):
             return [TextContent(type="text", text=json.dumps({
                 **metadata,
                 "error": "artifact is not text",
                 "hint": "Use mode=file or mode=base64 for binary artifacts.",
             }, indent=2))]
 
-        max_chars = int(args.get("max_chars") or 120_000)
         text = data.decode("utf-8", errors="replace")
         truncated = len(text) > max_chars
         return [TextContent(type="text", text=json.dumps({
@@ -503,10 +540,10 @@ def create_mcp_server(
                 except Exception as e:
                     sync_result = {"status": "failed", "error_message": str(e)}
 
-            return [TextContent(type="text", text=json.dumps({
+            return [TextContent(type="text", text=json.dumps(_json_ready({
                 **result,
                 "sync": sync_result,
-            }, indent=2, default=str))]
+            }), indent=2))]
         except ValueError as e:
             return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
@@ -682,17 +719,211 @@ def create_mcp_server(
     return server
 
 
-def _parse_resource_url(url: str) -> tuple[str, str] | None:
-    """Parse a MemForge artifact URL into (doc_id, kind)."""
-    path = urlparse(url).path if "://" in url else url
+@dataclass(frozen=True)
+class _ResourceTarget:
+    doc_id: str
+    kind: str
+    relative_url: str
+    request_url: str
+
+
+def _json_ready(value: Any) -> Any:
+    """Convert dataclasses and datetimes into JSON-native values."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return _json_ready(asdict(value))
+    if isinstance(value, dict):
+        return {k: _json_ready(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _resource_api_base_url(config: AppConfig) -> str:
+    return (
+        os.getenv("MEMFORGE_API_URL")
+        or f"http://127.0.0.1:{config.server.admin_api_port}"
+    ).rstrip("/")
+
+
+def _parse_resource_url(url: str, api_base_url: str) -> _ResourceTarget | None:
+    """Parse a MemForge artifact URL and reject foreign absolute origins."""
+    parsed = urlparse(url)
+    base = urlparse(api_base_url)
+
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme not in {"http", "https"}:
+            return None
+        if parsed.scheme != base.scheme or parsed.netloc != base.netloc:
+            return None
+        path = parsed.path
+    else:
+        path = url
+
+    if not path.startswith("/"):
+        path = f"/{path}"
+
     parts = [unquote(part) for part in path.strip("/").split("/") if part]
+    if any(part in {".", ".."} or "/" in part or "\\" in part for part in parts):
+        return None
+
     if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "content":
-        return parts[2], "content"
+        return _ResourceTarget(parts[2], "content", path, f"{api_base_url}{path}")
     if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "pdf":
-        return parts[2], "pdf"
+        return _ResourceTarget(parts[2], "pdf", path, f"{api_base_url}{path}")
     if len(parts) == 5 and parts[:2] == ["api", "documents"] and parts[3] == "artifacts":
-        return parts[2], parts[4]
+        return _ResourceTarget(parts[2], parts[4], path, f"{api_base_url}{path}")
     return None
+
+
+def _positive_int_arg(args: dict, name: str, default: int) -> int | dict[str, object]:
+    raw_value = args.get(name, default)
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return {
+            "error": f"invalid {name}",
+            "detail": f"{name} must be a positive integer.",
+        }
+    if value <= 0:
+        return {
+            "error": f"invalid {name}",
+            "detail": f"{name} must be a positive integer.",
+        }
+    return value
+
+
+def _resource_headers() -> dict[str, str]:
+    token = os.getenv("MEMFORGE_API_TOKEN")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+async def _fetch_resource_from_api(
+    url: str,
+    headers: dict[str, str],
+    *,
+    max_bytes: int | None = None,
+) -> dict[str, object]:
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as client:
+        async with client.stream("GET", url, headers=headers) as response:
+            chunks: list[bytes] = []
+            observed_size = 0
+            exceeded_max_bytes = False
+            async for chunk in response.aiter_bytes():
+                if max_bytes is not None and response.status_code < 300:
+                    if observed_size + len(chunk) > max_bytes:
+                        remaining = max(max_bytes - observed_size, 0)
+                        if remaining:
+                            chunks.append(chunk[:remaining])
+                        observed_size += len(chunk)
+                        exceeded_max_bytes = True
+                        break
+                chunks.append(chunk)
+                observed_size += len(chunk)
+                if response.status_code >= 300 and observed_size >= 1000:
+                    break
+    return {
+        "status_code": response.status_code,
+        "headers": dict(response.headers),
+        "content": b"".join(chunks),
+        "observed_size_bytes": observed_size,
+        "exceeded_max_bytes": exceeded_max_bytes,
+    }
+
+
+async def _fetch_resource_file_from_api(
+    url: str,
+    headers: dict[str, str],
+    target: _ResourceTarget,
+) -> dict[str, object]:
+    tmp_path: Path | None = None
+    try:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as client:
+            async with client.stream("GET", url, headers=headers) as response:
+                if response.status_code >= 300:
+                    detail = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        remaining = 1000 - len(detail)
+                        if remaining <= 0:
+                            break
+                        detail.extend(chunk[:remaining])
+                    return {
+                        "status_code": response.status_code,
+                        "headers": dict(response.headers),
+                        "content": bytes(detail),
+                        "observed_size_bytes": len(detail),
+                        "exceeded_max_bytes": False,
+                    }
+
+                cache_root = _artifact_cache_root()
+                filename = _resource_filename(
+                    {str(k).lower(): str(v) for k, v in response.headers.items()},
+                    target,
+                )
+                digest = hashlib.sha256()
+                observed_size = 0
+                safe_doc = _safe_cache_component(target.doc_id) or "document"
+                safe_kind = _safe_cache_component(target.kind) or "artifact"
+                with tempfile.NamedTemporaryFile(
+                    "wb",
+                    dir=cache_root,
+                    prefix=f".{safe_doc}-{safe_kind}-",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    tmp_path = Path(handle.name)
+                    async for chunk in response.aiter_bytes():
+                        digest.update(chunk)
+                        observed_size += len(chunk)
+                        handle.write(chunk)
+    except Exception:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+    final_path = _cache_artifact_path(target.doc_id, target.kind, filename, digest.hexdigest()[:16])
+    if final_path.exists():
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+    elif tmp_path is not None:
+        tmp_path.chmod(0o600)
+        tmp_path.replace(final_path)
+
+    return {
+        "status_code": response.status_code,
+        "headers": dict(response.headers),
+        "content": b"",
+        "local_path": str(final_path),
+        "observed_size_bytes": observed_size,
+        "exceeded_max_bytes": False,
+    }
+
+
+def _response_size_bytes(
+    headers: dict[str, str],
+    fetched: dict[str, object],
+    fallback: int,
+) -> int:
+    content_length = headers.get("content-length")
+    if content_length is not None:
+        try:
+            return int(content_length)
+        except ValueError:
+            pass
+    observed = fetched.get("observed_size_bytes")
+    if isinstance(observed, int):
+        return observed
+    return fallback
+
+
+def _resource_filename(headers: dict[str, str], target: _ResourceTarget) -> str:
+    disposition = headers.get("content-disposition", "")
+    match = re.search(r'filename="?([^";]+)"?', disposition)
+    if match:
+        return match.group(1)
+    suffix = ".pdf" if target.kind == "pdf" else ".md" if target.kind == "content" else ".bin"
+    return f"{target.doc_id}-{target.kind}{suffix}"
 
 
 def _is_text_content_type(media_type: str) -> bool:
@@ -704,26 +935,25 @@ def _is_text_content_type(media_type: str) -> bool:
     }
 
 
-def _cache_artifact_file(doc_id: str, kind: str, source_path: Path) -> Path:
+def _artifact_cache_root() -> Path:
     cache_root = Path(
         os.getenv("MEMFORGE_ARTIFACT_CACHE_DIR")
         or (Path.home() / ".memforge-agent" / "artifacts")
     ).expanduser()
     cache_root.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha256(
-        f"{doc_id}:{kind}:{source_path}:{source_path.stat().st_mtime_ns}".encode("utf-8")
-    ).hexdigest()[:16]
-    safe_doc = re.sub(r"[^A-Za-z0-9_.-]+", "-", doc_id).strip("-") or "document"
-    suffix = source_path.suffix or ".bin"
-    target = cache_root / f"{safe_doc}-{kind}-{digest}{suffix}"
-    if target.exists():
-        return target
+    return cache_root
 
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_bytes(source_path.read_bytes())
-    tmp.chmod(0o600)
-    tmp.replace(target)
-    return target
+
+def _safe_cache_component(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
+
+
+def _cache_artifact_path(doc_id: str, kind: str, filename: str, digest: str) -> Path:
+    cache_root = _artifact_cache_root()
+    safe_doc = _safe_cache_component(doc_id) or "document"
+    safe_kind = _safe_cache_component(kind) or "artifact"
+    suffix = Path(filename).suffix or ".bin"
+    return cache_root / f"{safe_doc}-{safe_kind}-{digest}{suffix}"
 
 
 # ---------------------------------------------------------------------------

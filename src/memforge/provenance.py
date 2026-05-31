@@ -17,16 +17,24 @@ def document_content_uri(doc: DocumentRecord | None) -> str | None:
     return doc.normalized_content_uri or doc.raw_content_uri
 
 
-def document_content_url(doc: DocumentRecord | None) -> str | None:
+def document_content_url(doc: DocumentRecord | None, config: AppConfig | None = None) -> str | None:
     """Return a service URL for the stored content artifact, if present."""
-    if doc is None or document_content_uri(doc) is None:
+    if doc is None:
+        return None
+    if config is not None and select_document_artifact(doc, "content", config) is None:
+        return None
+    if config is None and document_content_uri(doc) is None:
         return None
     return f"/api/documents/{quote(doc.doc_id, safe='')}/content"
 
 
-def document_pdf_url(doc: DocumentRecord | None) -> str | None:
+def document_pdf_url(doc: DocumentRecord | None, config: AppConfig | None = None) -> str | None:
     """Return a service URL for the stored PDF artifact, if present."""
-    if doc is None or doc.pdf_content_uri is None:
+    if doc is None:
+        return None
+    if config is not None and select_document_artifact(doc, "pdf", config) is None:
+        return None
+    if config is None and doc.pdf_content_uri is None:
         return None
     return f"/api/documents/{quote(doc.doc_id, safe='')}/pdf"
 

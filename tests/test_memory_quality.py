@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -552,6 +554,7 @@ async def test_admin_memory_detail_exposes_service_artifact_urls_only(db: Databa
 
     assert response.status_code == 200
     source = response.json()["sources"][0]
+    assert source["content_url"] is None
     assert source["pdf_url"] == "/api/documents/doc-pdf-uri/pdf"
     assert "file_uri" not in source
     assert "pdf_uri" not in source
@@ -587,6 +590,9 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
         manifest = client.get("/api/documents/doc-artifact-url/artifacts")
         markdown_artifact = client.get("/api/documents/doc-artifact-url/artifacts/normalized_markdown")
         pdf_artifact = client.get("/api/documents/doc-artifact-url/artifacts/pdf")
+        pdf_head = client.head("/api/documents/doc-artifact-url/artifacts/pdf")
+        missing_artifact = client.get("/api/documents/doc-artifact-url/artifacts/raw_source")
+        missing_document = client.get("/api/documents/missing-doc/artifacts")
         content = client.get("/api/documents/doc-artifact-url/content")
         pdf = client.get("/api/documents/doc-artifact-url/pdf")
 
@@ -606,10 +612,45 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
     assert markdown_artifact.text == "# Source\n\nDurable memory evidence."
     assert pdf_artifact.status_code == 200
     assert pdf_artifact.content == b"%PDF-1.4\n%memforge\n"
+    assert pdf_head.status_code == 200
+    assert missing_artifact.status_code == 404
+    assert missing_document.status_code == 404
     assert content.status_code == 200
     assert content.text == "# Source\n\nDurable memory evidence."
     assert pdf.status_code == 200
     assert pdf.content == b"%PDF-1.4\n%memforge\n"
+
+
+@pytest.mark.asyncio
+async def test_admin_document_content_alias_falls_back_to_raw_source(db: Database, tmp_path: Path):
+    from memforge.server.admin_api import create_admin_app
+
+    docs_dir = tmp_path / "memforge" / "documents"
+    docs_dir.mkdir(parents=True)
+    raw_source = docs_dir / "source.html"
+    raw_source.write_text("<h1>Raw source</h1>", encoding="utf-8")
+
+    await _insert_document(
+        db,
+        doc_id="doc-raw-artifact-url",
+        raw_content_uri=str(raw_source),
+        normalized_content_uri=None,
+    )
+
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        manifest = client.get("/api/documents/doc-raw-artifact-url/artifacts")
+        raw_artifact = client.get("/api/documents/doc-raw-artifact-url/artifacts/raw_source")
+        content = client.get("/api/documents/doc-raw-artifact-url/content")
+
+    assert manifest.status_code == 200
+    artifacts = manifest.json()["artifacts"]
+    assert "normalized_markdown" not in artifacts
+    assert artifacts["raw_source"]["url"] == "/api/documents/doc-raw-artifact-url/artifacts/raw_source"
+    assert raw_artifact.status_code == 200
+    assert raw_artifact.text == "<h1>Raw source</h1>"
+    assert content.status_code == 200
+    assert content.text == "<h1>Raw source</h1>"
 
 
 @pytest.mark.asyncio
@@ -655,6 +696,82 @@ async def test_mcp_get_memory_omits_storage_uris_from_provenance(db: Database, t
     assert "pdf_uri" not in source
 
 
+def test_mcp_json_ready_serializes_search_results_as_fields():
+    from memforge.models import SearchResult
+    from memforge.server.mcp_server import _json_ready
+
+    payload = _json_ready({
+        "results": [
+            SearchResult(
+                memory_id="mem-artifact",
+                memory_type="fact",
+                summary="Artifact URLs are structured.",
+                confidence=0.9,
+                relevance_score=1.0,
+                source_doc_id="doc-artifact",
+                content_url="/api/documents/doc-artifact/content",
+                pdf_url="/api/documents/doc-artifact/pdf",
+            )
+        ]
+    })
+
+    result = payload["results"][0]
+    assert result["memory_id"] == "mem-artifact"
+    assert result["content_url"] == "/api/documents/doc-artifact/content"
+    assert result["pdf_url"] == "/api/documents/doc-artifact/pdf"
+
+
+@pytest.mark.asyncio
+async def test_mcp_fetch_resource_file_streams_to_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from memforge.server import mcp_server
+
+    real_async_client = httpx.AsyncClient
+
+    def transport_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "http://memforge.test/api/documents/doc-stream/pdf"
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/pdf",
+                "content-disposition": 'attachment; filename="stream.pdf"',
+            },
+            content=b"%PDF-1.4\n%streamed\n",
+        )
+
+    transport = httpx.MockTransport(transport_handler)
+
+    def client_factory(*, timeout: float, follow_redirects: bool) -> httpx.AsyncClient:
+        assert follow_redirects is False
+        return real_async_client(
+            transport=transport,
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+        )
+
+    monkeypatch.setenv("MEMFORGE_ARTIFACT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", client_factory)
+
+    result = await mcp_server._fetch_resource_file_from_api(
+        "http://memforge.test/api/documents/doc-stream/pdf",
+        {},
+        mcp_server._ResourceTarget(
+            doc_id="doc-stream",
+            kind="pdf",
+            relative_url="/api/documents/doc-stream/pdf",
+            request_url="http://memforge.test/api/documents/doc-stream/pdf",
+        ),
+    )
+
+    local_path = Path(str(result["local_path"]))
+    assert result["status_code"] == 200
+    assert result["observed_size_bytes"] == len(b"%PDF-1.4\n%streamed\n")
+    assert local_path.parent == tmp_path
+    assert local_path.read_bytes() == b"%PDF-1.4\n%streamed\n"
+
+
 @pytest.mark.asyncio
 async def test_mcp_get_resource_reads_text_and_file_artifacts(
     db: Database,
@@ -667,20 +784,54 @@ async def test_mcp_get_resource_reads_text_and_file_artifacts(
 
     artifact_cache = tmp_path / "artifact-cache"
     monkeypatch.setenv("MEMFORGE_ARTIFACT_CACHE_DIR", str(artifact_cache))
+    fetch_calls: list[tuple[str, dict[str, str], int | None]] = []
 
-    docs_dir = tmp_path / "memforge" / "documents"
-    docs_dir.mkdir(parents=True)
-    source_md = docs_dir / "source.md"
-    source_pdf = docs_dir / "source.pdf"
-    source_md.write_text("# Source\n\nDurable memory evidence.", encoding="utf-8")
-    source_pdf.write_bytes(b"%PDF-1.4\n%memforge\n")
+    async def fake_fetch(
+        url: str,
+        headers: dict[str, str],
+        *,
+        max_bytes: int | None = None,
+    ):
+        fetch_calls.append((url, headers, max_bytes))
+        parsed = urlparse(url)
+        if parsed.path == "/api/documents/doc-resource-read/content":
+            return {
+                "status_code": 200,
+                "headers": {
+                    "content-type": "text/markdown; charset=utf-8",
+                    "content-disposition": 'attachment; filename="source.md"',
+                },
+                "content": b"# Source\n\nDurable memory evidence.",
+            }
+        return {"status_code": 404, "headers": {}, "content": b""}
 
-    await _insert_document(
-        db,
-        doc_id="doc-resource-read",
-        normalized_content_uri=str(source_md),
-        pdf_content_uri=str(source_pdf),
-    )
+    async def fake_file_fetch(
+        url: str,
+        headers: dict[str, str],
+        target,
+    ):
+        fetch_calls.append((url, headers, None))
+        parsed = urlparse(url)
+        if parsed.path == "/api/documents/doc-resource-read/pdf":
+            local_path = artifact_cache / "source.pdf"
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(b"%PDF-1.4\n%memforge\n")
+            return {
+                "status_code": 200,
+                "headers": {
+                    "content-type": "application/pdf",
+                    "content-disposition": 'attachment; filename="source.pdf"',
+                },
+                "content": b"",
+                "local_path": str(local_path),
+                "observed_size_bytes": local_path.stat().st_size,
+            }
+        return {"status_code": 404, "headers": {}, "content": b""}
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "http://memforge.test")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setattr("memforge.server.mcp_server._fetch_resource_from_api", fake_fetch)
+    monkeypatch.setattr("memforge.server.mcp_server._fetch_resource_file_from_api", fake_file_fetch)
 
     server = create_mcp_server(db, _config(tmp_path))
     handler = server.request_handlers[CallToolRequest]
@@ -696,7 +847,13 @@ async def test_mcp_get_resource_reads_text_and_file_artifacts(
     ))
     text_payload = json.loads(text_result.root.content[0].text)
     assert text_payload["text"] == "# Source\n\nDurable memory evidence."
-    assert text_payload["kind"] == "normalized_markdown"
+    assert text_payload["kind"] == "content"
+    assert text_payload["url"] == "/api/documents/doc-resource-read/content"
+    assert fetch_calls[-1] == (
+        "http://memforge.test/api/documents/doc-resource-read/content",
+        {"Authorization": "Bearer token-123"},
+        2_000_000,
+    )
 
     file_result = await handler(CallToolRequest(
         params=CallToolRequestParams(
@@ -712,6 +869,166 @@ async def test_mcp_get_resource_reads_text_and_file_artifacts(
     assert local_path.is_file()
     assert local_path.read_bytes() == b"%PDF-1.4\n%memforge\n"
     assert artifact_cache in local_path.parents
+    assert fetch_calls[-1] == (
+        "http://memforge.test/api/documents/doc-resource-read/pdf",
+        {"Authorization": "Bearer token-123"},
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_resource_rejects_foreign_urls_and_bad_limits(
+    db: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mcp.types import CallToolRequest, CallToolRequestParams
+
+    from memforge.server.mcp_server import create_mcp_server
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "http://memforge.test")
+    server = create_mcp_server(db, _config(tmp_path))
+    handler = server.request_handlers[CallToolRequest]
+
+    foreign_result = await handler(CallToolRequest(
+        params=CallToolRequestParams(
+            name="get_resource",
+            arguments={
+                "url": "https://example.invalid/api/documents/doc-resource-read/content",
+            },
+        ),
+    ))
+    foreign_payload = json.loads(foreign_result.root.content[0].text)
+    assert foreign_payload["error"] == "unsupported resource URL"
+
+    dot_segment_result = await handler(CallToolRequest(
+        params=CallToolRequestParams(
+            name="get_resource",
+            arguments={
+                "url": "/api/documents/../content",
+            },
+        ),
+    ))
+    dot_segment_payload = json.loads(dot_segment_result.root.content[0].text)
+    assert dot_segment_payload["error"] == "unsupported resource URL"
+
+    encoded_slash_result = await handler(CallToolRequest(
+        params=CallToolRequestParams(
+            name="get_resource",
+            arguments={
+                "url": "/api/documents/doc-resource-read/artifacts/a%2Fb",
+            },
+        ),
+    ))
+    encoded_slash_payload = json.loads(encoded_slash_result.root.content[0].text)
+    assert encoded_slash_payload["error"] == "unsupported resource URL"
+
+    bad_limit_result = await handler(CallToolRequest(
+        params=CallToolRequestParams(
+            name="get_resource",
+            arguments={
+                "url": "/api/documents/doc-resource-read/content",
+                "max_bytes": 0,
+            },
+        ),
+    ))
+    bad_limit_payload = json.loads(bad_limit_result.root.content[0].text)
+    assert bad_limit_payload["error"] == "invalid max_bytes"
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_resource_handles_base64_truncation_and_binary_text_errors(
+    db: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mcp.types import CallToolRequest, CallToolRequestParams
+
+    from memforge.server.mcp_server import create_mcp_server
+
+    async def fake_fetch(
+        url: str,
+        headers: dict[str, str],
+        *,
+        max_bytes: int | None = None,
+    ):
+        parsed = urlparse(url)
+        if parsed.path.endswith("/content"):
+            if max_bytes is not None and max_bytes < len(b"abcdef"):
+                return {
+                    "status_code": 200,
+                    "headers": {"content-type": "text/markdown; charset=utf-8"},
+                    "content": b"abc",
+                    "observed_size_bytes": len(b"abcdef"),
+                    "exceeded_max_bytes": True,
+                }
+            return {
+                "status_code": 200,
+                "headers": {"content-type": "text/markdown; charset=utf-8"},
+                "content": b"abcdef",
+            }
+        if parsed.path.endswith("/pdf"):
+            return {
+                "status_code": 200,
+                "headers": {"content-type": "application/pdf"},
+                "content": b"%PDF-1.4\n%memforge\n",
+            }
+        return {"status_code": 404, "headers": {}, "content": b""}
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "http://memforge.test")
+    monkeypatch.setattr("memforge.server.mcp_server._fetch_resource_from_api", fake_fetch)
+    server = create_mcp_server(db, _config(tmp_path))
+    handler = server.request_handlers[CallToolRequest]
+
+    base64_result = await handler(CallToolRequest(
+        params=CallToolRequestParams(
+            name="get_resource",
+            arguments={
+                "url": "/api/documents/doc-resource-read/content",
+                "mode": "base64",
+            },
+        ),
+    ))
+    base64_payload = json.loads(base64_result.root.content[0].text)
+    assert base64_payload["data_base64"] == "YWJjZGVm"
+
+    truncate_result = await handler(CallToolRequest(
+        params=CallToolRequestParams(
+            name="get_resource",
+            arguments={
+                "url": "/api/documents/doc-resource-read/content",
+                "mode": "text",
+                "max_chars": 3,
+            },
+        ),
+    ))
+    truncate_payload = json.loads(truncate_result.root.content[0].text)
+    assert truncate_payload["text"] == "abc"
+    assert truncate_payload["truncated"] is True
+
+    binary_text_result = await handler(CallToolRequest(
+        params=CallToolRequestParams(
+            name="get_resource",
+            arguments={
+                "url": "/api/documents/doc-resource-read/pdf",
+                "mode": "text",
+            },
+        ),
+    ))
+    binary_text_payload = json.loads(binary_text_result.root.content[0].text)
+    assert binary_text_payload["error"] == "artifact is not text"
+
+    max_bytes_result = await handler(CallToolRequest(
+        params=CallToolRequestParams(
+            name="get_resource",
+            arguments={
+                "url": "/api/documents/doc-resource-read/content",
+                "max_bytes": 3,
+            },
+        ),
+    ))
+    max_bytes_payload = json.loads(max_bytes_result.root.content[0].text)
+    assert max_bytes_payload["error"] == "artifact exceeds max_bytes"
 
 
 @pytest.mark.asyncio
