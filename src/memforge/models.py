@@ -476,6 +476,8 @@ class SearchResult:
     source_type: str | None = None
     file_uri: str | None = None
     pdf_uri: str | None = None
+    content_url: str | None = None
+    pdf_url: str | None = None
     source_url: str | None = None
     # Metadata
     corroborated_by: int = 1

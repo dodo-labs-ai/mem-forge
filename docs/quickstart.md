@@ -23,6 +23,12 @@ The API is also available directly at `http://localhost:8765`.
 Runtime data is stored in the `memforge-data` Docker volume. Remove that volume
 only when you intentionally want a clean local instance.
 
+When Codex or another host-side agent queries a Docker-hosted MemForge, memory
+search works over HTTP as usual. For backing source artifacts, prefer
+`content_url` and `pdf_url` from provenance; those URLs are served by the API.
+Legacy `file_uri` and `pdf_uri` values are the service's storage paths and may
+point inside the container.
+
 ## 2. Configure Models And Secrets
 
 Copy the example environment file when you want to set LLM and embedding API
