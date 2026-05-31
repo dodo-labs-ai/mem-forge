@@ -18,6 +18,8 @@ Default base URL: `http://127.0.0.1:8765`.
 | Sources | `POST /api/sources/{source_id}/sync` | Queue or run a source sync |
 | Memories | `GET /api/memories` | Search and filter memories |
 | Memories | `GET /api/memories/{memory_id}` | Inspect memory detail and provenance |
+| Documents | `GET /api/documents/{doc_id}/artifacts` | List service-readable source artifacts |
+| Documents | `GET /api/documents/{doc_id}/artifacts/{kind}` | Fetch an explicit artifact such as `normalized_markdown`, `raw_source`, or `pdf` |
 | Documents | `GET /api/documents/{doc_id}/content` | Fetch normalized source content from service storage |
 | Documents | `GET /api/documents/{doc_id}/pdf` | Fetch a stored PDF rendition when available |
 | Review | `GET /api/review` | List review queue items |

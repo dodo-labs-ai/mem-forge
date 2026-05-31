@@ -207,5 +207,5 @@ class Enricher:
     def _fallback_result() -> EnrichmentResult:
         """Return empty enrichment result when LLM is unavailable or fails."""
         return EnrichmentResult(
-            summary="Enrichment failed. Document content available via file_uri.",
+            summary="Enrichment failed. Document content remains available through source artifacts.",
         )
