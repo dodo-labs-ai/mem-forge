@@ -17,17 +17,18 @@
 > **Status:** alpha. APIs, storage formats, and integration packaging may change
 > while the project settles.
 
-MemForge is an open-source memory layer for coding agents and development
-teams. It turns source documents, team systems, and long agent sessions into
-searchable, provenance-backed memories that can be reused through an MCP server,
-an admin API, and agent-client integrations.
+MemForge is a self-evolving memory layer for AI agents. It turns scattered team
+knowledge into structured, source-traced memories that agents can search,
+verify, and reuse.
 
-Naming convention: **MemForge** is the display name, `memforge` is the
-Python package and CLI, and `mem-forge` is the GitHub repository slug.
+It connects to the systems teams already use, such as Confluence or SAP Wiki,
+Jira, GitHub Pages, Microsoft Teams, and long coding-agent sessions. On each
+sync, MemForge extracts durable facts, decisions, procedures, and conventions
+while preserving source evidence and history.
 
-The project is early, but the core shape is intentional: client adapters stay
-thin, the service owns extraction and lifecycle decisions, and every memory keeps
-enough source evidence to be reviewed or retired later.
+AI coding assistants often start each session blind to institutional context.
+MemForge bridges that gap through an MCP server, admin API, and agent-client
+integrations, with review flows for superseded facts and contradictions.
 
 ## What It Does
 
