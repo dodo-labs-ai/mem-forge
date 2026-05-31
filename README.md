@@ -74,30 +74,18 @@ portable across local and future hosted deployments.
 
 Requirements:
 
-- Python 3.12 or newer
-- Node.js 20 or newer for the admin UI
-- `uv` recommended for Python dependency management
+- Docker with a current Compose v2
 
 ```bash
 git clone https://github.com/dodoman-sun/mem-forge.git
 cd mem-forge
 
-uv sync --extra dev
-cp .env.example .env
-uv run memforge init
-uv run memforge api
+docker compose up --build
 ```
 
-In another terminal:
-
-```bash
-cd admin-ui
-npm ci
-npm run dev
-```
-
-Open `http://localhost:5174`. The UI proxies API calls to
-`http://localhost:8765`.
+Open `http://localhost:5174`. The compose stack starts the MemForge API, serves
+the admin UI, and keeps local data in the `memforge-data` Docker volume. Copy
+`.env.example` to `.env` when you want to set model keys or local overrides.
 
 For detailed setup, configuration, and first-source examples, see
 [docs/quickstart.md](docs/quickstart.md).
@@ -128,10 +116,31 @@ tests/                  Python tests
 
 ## Development
 
+Requirements:
+
+- Python 3.12 or newer
+- Node.js 20 or newer
+- `uv` recommended for Python dependency management
+
 Common commands:
 
 ```bash
 uv sync --extra dev
+cp .env.example .env
+uv run memforge api
+```
+
+In another terminal:
+
+```bash
+cd admin-ui
+npm ci
+npm run dev
+```
+
+Before opening a pull request:
+
+```bash
 uv run ruff check src tests
 uv run pytest -q
 

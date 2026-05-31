@@ -1,0 +1,43 @@
+name: memforge
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      MEMFORGE_BASE_DIR: /data
+      MEMFORGE_ADMIN_API_PORT: 8765
+      MEMFORGE_CORS_ORIGINS: http://localhost:5174,http://127.0.0.1:5174
+    ports:
+      - "8765:8765"
+    volumes:
+      - memforge-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=5)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  admin-ui:
+    build:
+      context: .
+      dockerfile: admin-ui/Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "5174:8080"
+
+volumes:
+  memforge-data:
