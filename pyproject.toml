@@ -55,9 +55,9 @@ dev = [
 memforge = "memforge.main:cli"
 
 [project.urls]
-Homepage = "https://github.com/DoDoMan-TTT/mem-forge"
-Repository = "https://github.com/DoDoMan-TTT/mem-forge"
-Issues = "https://github.com/DoDoMan-TTT/mem-forge/issues"
+Homepage = "https://github.com/dodoman-sun/mem-forge"
+Repository = "https://github.com/dodoman-sun/mem-forge"
+Issues = "https://github.com/dodoman-sun/mem-forge/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/memforge"]

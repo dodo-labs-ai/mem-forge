@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/DoDoMan-TTT/mem-forge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DoDoMan-TTT/mem-forge/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/dodoman-sun/mem-forge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/dodoman-sun/mem-forge/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Python 3.12+" src="https://img.shields.io/badge/python-3.12%2B-3776AB">
   <img alt="License Apache 2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
   <img alt="Status alpha" src="https://img.shields.io/badge/status-alpha-f59e0b">
@@ -78,7 +78,7 @@ Requirements:
 - `uv` recommended for Python dependency management
 
 ```bash
-git clone https://github.com/DoDoMan-TTT/mem-forge.git
+git clone https://github.com/dodoman-sun/mem-forge.git
 cd mem-forge
 
 uv sync --extra dev

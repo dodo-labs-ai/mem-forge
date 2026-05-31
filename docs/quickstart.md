@@ -6,7 +6,7 @@ where agent-client integrations plug in.
 ## 1. Install Dependencies
 
 ```bash
-git clone https://github.com/DoDoMan-TTT/mem-forge.git
+git clone https://github.com/dodoman-sun/mem-forge.git
 cd mem-forge
 uv sync --extra dev
 cd admin-ui && npm ci && cd ..
