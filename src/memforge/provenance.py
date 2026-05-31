@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
@@ -28,6 +29,81 @@ def document_pdf_url(doc: DocumentRecord | None) -> str | None:
     if doc is None or doc.pdf_content_uri is None:
         return None
     return f"/api/documents/{quote(doc.doc_id, safe='')}/pdf"
+
+
+@dataclass(frozen=True)
+class DocumentArtifact:
+    kind: str
+    path: Path
+    media_type: str
+    url: str
+
+    @property
+    def filename(self) -> str:
+        return self.path.name
+
+    @property
+    def size_bytes(self) -> int:
+        return self.path.stat().st_size
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "url": self.url,
+            "content_type": self.media_type,
+            "filename": self.filename,
+            "size_bytes": self.size_bytes,
+        }
+
+
+def list_document_artifacts(doc: DocumentRecord, config: AppConfig) -> dict[str, DocumentArtifact]:
+    """Return available source artifacts keyed by explicit artifact kind."""
+    artifacts: dict[str, DocumentArtifact] = {}
+
+    normalized_path = resolve_document_artifact_path(doc.normalized_content_uri, config)
+    if normalized_path is not None:
+        artifacts["normalized_markdown"] = DocumentArtifact(
+            kind="normalized_markdown",
+            path=normalized_path,
+            media_type="text/markdown; charset=utf-8",
+            url=_document_artifact_url(doc.doc_id, "normalized_markdown"),
+        )
+
+    raw_path = resolve_document_artifact_path(doc.raw_content_uri, config)
+    if raw_path is not None:
+        artifacts["raw_source"] = DocumentArtifact(
+            kind="raw_source",
+            path=raw_path,
+            media_type=doc.raw_content_type or "application/octet-stream",
+            url=_document_artifact_url(doc.doc_id, "raw_source"),
+        )
+
+    pdf_path = resolve_document_artifact_path(doc.pdf_content_uri, config)
+    if pdf_path is not None:
+        artifacts["pdf"] = DocumentArtifact(
+            kind="pdf",
+            path=pdf_path,
+            media_type="application/pdf",
+            url=_document_artifact_url(doc.doc_id, "pdf"),
+        )
+
+    return artifacts
+
+
+def select_document_artifact(
+    doc: DocumentRecord,
+    kind: str,
+    config: AppConfig,
+) -> DocumentArtifact | None:
+    """Select an artifact by explicit kind, with a content alias for text fallback."""
+    artifacts = list_document_artifacts(doc, config)
+    if kind == "content":
+        return artifacts.get("normalized_markdown") or artifacts.get("raw_source")
+    return artifacts.get(kind)
+
+
+def _document_artifact_url(doc_id: str, kind: str) -> str:
+    return f"/api/documents/{quote(doc_id, safe='')}/artifacts/{quote(kind, safe='')}"
 
 
 def resolve_document_artifact_path(uri: str | None, config: AppConfig) -> Path | None:

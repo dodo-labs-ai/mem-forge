@@ -7,9 +7,15 @@ is planned for Phase 2.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
+import os
+import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -17,7 +23,7 @@ from mcp.types import Resource, TextContent, Tool
 
 from memforge.config import AppConfig
 from memforge.models import MemoryType
-from memforge.provenance import document_content_uri, document_content_url, document_pdf_url
+from memforge.provenance import document_content_url, document_pdf_url, select_document_artifact
 from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -100,9 +106,10 @@ def create_mcp_server(
             Tool(
                 name="get_memory",
                 description=(
-                    "Fetch the full detail of a single memory by its ID. "
-                    "Returns the memory content, provenance (source documents with titles and URIs), "
-                    "entity links, confidence, corroboration count, and all metadata fields."
+                    "Fetch the full detail of a single memory by its ID when you need complete provenance, "
+                    "all source documents, excerpts, entity links, confidence, corroboration, contradictions, "
+                    "or lifecycle metadata. If a search result's primary source is enough, you may skip this "
+                    "and call get_resource directly on the search result's content_url or pdf_url."
                 ),
                 inputSchema={
                     "type": "object",
@@ -113,6 +120,48 @@ def create_mcp_server(
                         },
                     },
                     "required": ["memory_id"],
+                },
+            ),
+            Tool(
+                name="get_resource",
+                description=(
+                    "Fetch a MemForge source artifact from a content_url or pdf_url returned by search or "
+                    "get_memory; use get_resource directly from search when the primary source is enough. "
+                    "Agents should call get_memory first when they need complete provenance, all supporting sources, "
+                    "contradiction context, or stronger evidence before choosing which resource to read. "
+                    "This tool only accepts MemForge document artifact URLs, not arbitrary web URLs."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": (
+                                "A MemForge artifact URL such as /api/documents/{doc_id}/content, "
+                                "/api/documents/{doc_id}/pdf, or /api/documents/{doc_id}/artifacts/{kind}."
+                            ),
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["text", "file", "base64"],
+                            "default": "text",
+                            "description": (
+                                "Return text inline, save to a local cache file, or return base64 bytes. "
+                                "Use file for PDFs when the agent runtime can read local files."
+                            ),
+                        },
+                        "max_chars": {
+                            "type": "integer",
+                            "default": 120000,
+                            "description": "Maximum characters returned in text mode.",
+                        },
+                        "max_bytes": {
+                            "type": "integer",
+                            "default": 2000000,
+                            "description": "Maximum bytes read for text/base64 modes.",
+                        },
+                    },
+                    "required": ["url"],
                 },
             ),
             Tool(
@@ -184,6 +233,8 @@ def create_mcp_server(
             return await _handle_search(arguments)
         elif name == "get_memory":
             return await _handle_get_memory(arguments)
+        elif name == "get_resource":
+            return await _handle_get_resource(arguments)
         elif name == "list_recent_changes":
             return await _handle_recent_changes(arguments)
         elif name == "submit_agent_session_document":
@@ -283,8 +334,6 @@ def create_mcp_server(
             if doc:
                 entry["title"] = doc.title
                 entry["source_url"] = doc.source_url
-                entry["file_uri"] = document_content_uri(doc)
-                entry["pdf_uri"] = doc.pdf_content_uri
                 entry["content_url"] = document_content_url(doc)
                 entry["pdf_url"] = document_pdf_url(doc)
             provenance.append(entry)
@@ -329,6 +378,87 @@ def create_mcp_server(
         }
 
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    async def _handle_get_resource(args: dict) -> list[TextContent]:
+        """Fetch a source artifact from a MemForge document artifact URL."""
+        url = str(args.get("url") or "").strip()
+        mode = str(args.get("mode") or "text").strip().lower()
+        if mode not in {"text", "file", "base64"}:
+            return [TextContent(type="text", text=json.dumps({
+                "error": f"unsupported mode: {mode}",
+                "supported_modes": ["text", "file", "base64"],
+            }))]
+
+        target = _parse_resource_url(url)
+        if target is None:
+            return [TextContent(type="text", text=json.dumps({
+                "error": "unsupported resource URL",
+                "hint": "Use a MemForge /api/documents/{doc_id}/content, /pdf, or /artifacts/{kind} URL.",
+            }))]
+
+        doc_id, kind = target
+        doc = await db.get_document(doc_id)
+        if doc is None:
+            return [TextContent(type="text", text=json.dumps({"error": f"document not found: {doc_id}"}))]
+
+        artifact = select_document_artifact(doc, kind, config)
+        if artifact is None:
+            return [TextContent(type="text", text=json.dumps({
+                "error": f"artifact not found: {kind}",
+                "doc_id": doc_id,
+            }))]
+
+        metadata = {
+            "doc_id": doc.doc_id,
+            "title": doc.title,
+            "source_url": doc.source_url,
+            "kind": artifact.kind,
+            "content_type": artifact.media_type,
+            "filename": artifact.filename,
+            "size_bytes": artifact.size_bytes,
+            "url": artifact.url,
+            "mode": mode,
+        }
+
+        if mode == "file":
+            local_path = _cache_artifact_file(doc.doc_id, artifact.kind, artifact.path)
+            return [TextContent(type="text", text=json.dumps({
+                **metadata,
+                "local_path": str(local_path),
+                "cleanup": "temporary-cache",
+            }, indent=2))]
+
+        max_bytes = int(args.get("max_bytes") or 2_000_000)
+        if artifact.size_bytes > max_bytes:
+            return [TextContent(type="text", text=json.dumps({
+                **metadata,
+                "error": "artifact exceeds max_bytes",
+                "hint": "Use mode=file for large or binary artifacts.",
+                "max_bytes": max_bytes,
+            }, indent=2))]
+
+        data = artifact.path.read_bytes()
+        if mode == "base64":
+            return [TextContent(type="text", text=json.dumps({
+                **metadata,
+                "data_base64": base64.b64encode(data).decode("ascii"),
+            }, indent=2))]
+
+        if not _is_text_content_type(artifact.media_type):
+            return [TextContent(type="text", text=json.dumps({
+                **metadata,
+                "error": "artifact is not text",
+                "hint": "Use mode=file or mode=base64 for binary artifacts.",
+            }, indent=2))]
+
+        max_chars = int(args.get("max_chars") or 120_000)
+        text = data.decode("utf-8", errors="replace")
+        truncated = len(text) > max_chars
+        return [TextContent(type="text", text=json.dumps({
+            **metadata,
+            "text": text[:max_chars],
+            "truncated": truncated,
+        }, indent=2))]
 
     async def _handle_submit_agent_session_document(args: dict) -> list[TextContent]:
         """Store a generated agent session document and optionally sync it."""
@@ -550,6 +680,50 @@ def create_mcp_server(
         return json.dumps({"error": f"Unknown resource: {uri}"})
 
     return server
+
+
+def _parse_resource_url(url: str) -> tuple[str, str] | None:
+    """Parse a MemForge artifact URL into (doc_id, kind)."""
+    path = urlparse(url).path if "://" in url else url
+    parts = [unquote(part) for part in path.strip("/").split("/") if part]
+    if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "content":
+        return parts[2], "content"
+    if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "pdf":
+        return parts[2], "pdf"
+    if len(parts) == 5 and parts[:2] == ["api", "documents"] and parts[3] == "artifacts":
+        return parts[2], parts[4]
+    return None
+
+
+def _is_text_content_type(media_type: str) -> bool:
+    normalized = media_type.split(";", 1)[0].strip().lower()
+    return normalized.startswith("text/") or normalized in {
+        "application/json",
+        "application/xml",
+        "application/xhtml+xml",
+    }
+
+
+def _cache_artifact_file(doc_id: str, kind: str, source_path: Path) -> Path:
+    cache_root = Path(
+        os.getenv("MEMFORGE_ARTIFACT_CACHE_DIR")
+        or (Path.home() / ".memforge-agent" / "artifacts")
+    ).expanduser()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(
+        f"{doc_id}:{kind}:{source_path}:{source_path.stat().st_mtime_ns}".encode("utf-8")
+    ).hexdigest()[:16]
+    safe_doc = re.sub(r"[^A-Za-z0-9_.-]+", "-", doc_id).strip("-") or "document"
+    suffix = source_path.suffix or ".bin"
+    target = cache_root / f"{safe_doc}-{kind}-{digest}{suffix}"
+    if target.exists():
+        return target
+
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_bytes(source_path.read_bytes())
+    tmp.chmod(0o600)
+    tmp.replace(target)
+    return target
 
 
 # ---------------------------------------------------------------------------

@@ -25,9 +25,8 @@ only when you intentionally want a clean local instance.
 
 When Codex or another host-side agent queries a Docker-hosted MemForge, memory
 search works over HTTP as usual. For backing source artifacts, prefer
-`content_url` and `pdf_url` from provenance; those URLs are served by the API.
-Legacy `file_uri` and `pdf_uri` values are the service's storage paths and may
-point inside the container.
+`content_url` and `pdf_url` from provenance; those URLs are served by the API
+and work even when the service storage lives inside a Docker volume.
 
 ## 2. Configure Models And Secrets
 

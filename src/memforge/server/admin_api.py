@@ -53,10 +53,10 @@ from memforge.models import (
     canonicalize_entity_name,
 )
 from memforge.provenance import (
-    document_content_uri,
     document_content_url,
     document_pdf_url,
-    resolve_document_artifact_path,
+    list_document_artifacts,
+    select_document_artifact,
 )
 from memforge.runtime import SyncAlreadyRunningError, SyncService
 from memforge.scheduler import SyncScheduler
@@ -188,8 +188,6 @@ class MemorySourceDetail(BaseModel):
     support_kind: str = "extracted"
     doc_title: str | None = None
     source_url: str | None = None
-    file_uri: str | None = None
-    pdf_uri: str | None = None
     content_url: str | None = None
     pdf_url: str | None = None
     added_at: str | None = None
@@ -924,8 +922,6 @@ def _memory_source_detail(ms: Any, doc: Any | None) -> MemorySourceDetail:
         support_kind=ms.support_kind,
         doc_title=doc.title if doc else None,
         source_url=doc.source_url if doc else None,
-        file_uri=document_content_uri(doc),
-        pdf_uri=doc.pdf_content_uri if doc else None,
         content_url=document_content_url(doc),
         pdf_url=document_pdf_url(doc),
         added_at=_dt_iso(ms.added_at),
@@ -1455,7 +1451,52 @@ def create_admin_app(
     # 1b. Source Document Artifacts
     # ===================================================================
 
-    @document_router.get("/{doc_id}/content")
+    @document_router.get("/{doc_id}/artifacts")
+    async def list_document_artifact_manifest(
+        doc_id: str,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
+        """List service-readable artifacts for a stored source document."""
+        doc = await db.get_document(doc_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        artifacts = list_document_artifacts(doc, config)
+        return {
+            "doc_id": doc.doc_id,
+            "title": doc.title,
+            "source_type": doc.source,
+            "source_url": doc.source_url,
+            "artifacts": {
+                kind: artifact.metadata()
+                for kind, artifact in artifacts.items()
+            },
+        }
+
+    @document_router.api_route("/{doc_id}/artifacts/{kind}", methods=["GET", "HEAD"])
+    async def get_document_artifact(
+        doc_id: str,
+        kind: str,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
+        """Serve an explicit source artifact kind through the API."""
+        doc = await db.get_document(doc_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        artifact = select_document_artifact(doc, kind, config)
+        if artifact is None:
+            raise HTTPException(status_code=404, detail="Document artifact not found")
+
+        return FileResponse(
+            artifact.path,
+            media_type=artifact.media_type,
+            filename=artifact.filename,
+        )
+
+    @document_router.api_route("/{doc_id}/content", methods=["GET", "HEAD"])
     async def get_document_content(
         doc_id: str,
         db: Database = Depends(get_db),
@@ -1466,18 +1507,17 @@ def create_admin_app(
         if doc is None:
             raise HTTPException(status_code=404, detail="Document not found")
 
-        path = resolve_document_artifact_path(document_content_uri(doc), config)
-        if path is None:
+        artifact = select_document_artifact(doc, "content", config)
+        if artifact is None:
             raise HTTPException(status_code=404, detail="Document content artifact not found")
 
-        media_type = (
-            "text/markdown; charset=utf-8"
-            if path.suffix.lower() in {".md", ".markdown"}
-            else (doc.raw_content_type or "application/octet-stream")
+        return FileResponse(
+            artifact.path,
+            media_type=artifact.media_type,
+            filename=artifact.filename,
         )
-        return FileResponse(path, media_type=media_type, filename=path.name)
 
-    @document_router.get("/{doc_id}/pdf")
+    @document_router.api_route("/{doc_id}/pdf", methods=["GET", "HEAD"])
     async def get_document_pdf(
         doc_id: str,
         db: Database = Depends(get_db),
@@ -1488,11 +1528,15 @@ def create_admin_app(
         if doc is None:
             raise HTTPException(status_code=404, detail="Document not found")
 
-        path = resolve_document_artifact_path(doc.pdf_content_uri, config)
-        if path is None:
+        artifact = select_document_artifact(doc, "pdf", config)
+        if artifact is None:
             raise HTTPException(status_code=404, detail="Document PDF artifact not found")
 
-        return FileResponse(path, media_type="application/pdf", filename=path.name)
+        return FileResponse(
+            artifact.path,
+            media_type=artifact.media_type,
+            filename=artifact.filename,
+        )
 
     # ===================================================================
     # 2. Memory Endpoints
@@ -1548,7 +1592,7 @@ def create_admin_app(
         if not mem:
             raise HTTPException(status_code=404, detail="Memory not found")
 
-        # Fetch provenance: memory_sources with document titles and file URIs
+        # Fetch provenance: memory_sources with document titles and artifact URLs.
         raw_sources = await db.get_memory_sources(memory_id)
         source_details: list[MemorySourceDetail] = []
         for ms in raw_sources:

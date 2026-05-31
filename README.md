@@ -62,7 +62,7 @@ flowchart LR
   API --> Pipeline
   Pipeline --> Store
   UI --> API
-  Agent -->|"search / get_memory"| API
+  Agent -->|"search / get_memory / get_resource"| API
 ```
 
 Client adapters collect bounded, redacted evidence windows and upload them to
@@ -86,9 +86,9 @@ docker compose up --build
 Open `http://localhost:5174`. The compose stack starts the MemForge API, serves
 the admin UI, and keeps local data in the `memforge-data` Docker volume. Copy
 `.env.example` to `.env` when you want to set model keys or local overrides.
-When an agent needs backing source content from a Docker-hosted service, use the
-returned `content_url` / `pdf_url` provenance links; `file_uri` / `pdf_uri` are
-storage-local paths retained for local debugging and compatibility.
+When an agent needs backing source content from a Docker-hosted service, it can
+read the returned `content_url` / `pdf_url` provenance links through MemForge's
+artifact endpoints instead of depending on service-local filesystem paths.
 
 For detailed setup, configuration, and first-source examples, see
 [docs/quickstart.md](docs/quickstart.md).

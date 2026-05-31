@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -525,7 +526,7 @@ def test_memory_extraction_prompt_preserves_weak_reference_relationships():
 
 
 @pytest.mark.asyncio
-async def test_admin_memory_detail_includes_pdf_uri(db: Database, tmp_path: Path):
+async def test_admin_memory_detail_exposes_service_artifact_urls_only(db: Database, tmp_path: Path):
     from memforge.server.admin_api import create_admin_app
 
     docs_dir = tmp_path / "memforge" / "documents"
@@ -551,8 +552,9 @@ async def test_admin_memory_detail_includes_pdf_uri(db: Database, tmp_path: Path
 
     assert response.status_code == 200
     source = response.json()["sources"][0]
-    assert source["pdf_uri"] == str(source_pdf)
     assert source["pdf_url"] == "/api/documents/doc-pdf-uri/pdf"
+    assert "file_uri" not in source
+    assert "pdf_uri" not in source
 
 
 @pytest.mark.asyncio
@@ -582,6 +584,9 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
         detail = client.get(f"/api/memories/{memory.id}")
+        manifest = client.get("/api/documents/doc-artifact-url/artifacts")
+        markdown_artifact = client.get("/api/documents/doc-artifact-url/artifacts/normalized_markdown")
+        pdf_artifact = client.get("/api/documents/doc-artifact-url/artifacts/pdf")
         content = client.get("/api/documents/doc-artifact-url/content")
         pdf = client.get("/api/documents/doc-artifact-url/pdf")
 
@@ -589,10 +594,149 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
     source = detail.json()["sources"][0]
     assert source["content_url"] == "/api/documents/doc-artifact-url/content"
     assert source["pdf_url"] == "/api/documents/doc-artifact-url/pdf"
+    assert "file_uri" not in source
+    assert "pdf_uri" not in source
+    assert manifest.status_code == 200
+    artifacts = manifest.json()["artifacts"]
+    assert artifacts["normalized_markdown"]["url"] == (
+        "/api/documents/doc-artifact-url/artifacts/normalized_markdown"
+    )
+    assert artifacts["pdf"]["url"] == "/api/documents/doc-artifact-url/artifacts/pdf"
+    assert markdown_artifact.status_code == 200
+    assert markdown_artifact.text == "# Source\n\nDurable memory evidence."
+    assert pdf_artifact.status_code == 200
+    assert pdf_artifact.content == b"%PDF-1.4\n%memforge\n"
     assert content.status_code == 200
     assert content.text == "# Source\n\nDurable memory evidence."
     assert pdf.status_code == 200
     assert pdf.content == b"%PDF-1.4\n%memforge\n"
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_memory_omits_storage_uris_from_provenance(db: Database, tmp_path: Path):
+    from mcp.types import CallToolRequest, CallToolRequestParams
+
+    from memforge.server.mcp_server import create_mcp_server
+
+    docs_dir = tmp_path / "memforge" / "documents"
+    docs_dir.mkdir(parents=True)
+    source_md = docs_dir / "source.md"
+    source_pdf = docs_dir / "source.pdf"
+    source_md.write_text("# Source\n\nDurable memory evidence.", encoding="utf-8")
+    source_pdf.write_bytes(b"%PDF-1.4\n%memforge\n")
+
+    doc = await _insert_document(
+        db,
+        doc_id="doc-mcp-artifact-url",
+        normalized_content_uri=str(source_md),
+        pdf_content_uri=str(source_pdf),
+    )
+    memory = await _insert_memory(
+        db,
+        mem_id="mem-mcp-artifact-url",
+        content="MCP provenance uses service artifact URLs instead of storage paths.",
+    )
+    await db.add_memory_source(memory.id, doc.doc_id, "confluence", excerpt="source excerpt")
+
+    server = create_mcp_server(db, _config(tmp_path))
+    handler = server.request_handlers[CallToolRequest]
+    result = await handler(CallToolRequest(
+        params=CallToolRequestParams(
+            name="get_memory",
+            arguments={"memory_id": memory.id},
+        ),
+    ))
+
+    payload = json.loads(result.root.content[0].text)
+    source = payload["provenance"][0]
+    assert source["content_url"] == "/api/documents/doc-mcp-artifact-url/content"
+    assert source["pdf_url"] == "/api/documents/doc-mcp-artifact-url/pdf"
+    assert "file_uri" not in source
+    assert "pdf_uri" not in source
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_resource_reads_text_and_file_artifacts(
+    db: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mcp.types import CallToolRequest, CallToolRequestParams
+
+    from memforge.server.mcp_server import create_mcp_server
+
+    artifact_cache = tmp_path / "artifact-cache"
+    monkeypatch.setenv("MEMFORGE_ARTIFACT_CACHE_DIR", str(artifact_cache))
+
+    docs_dir = tmp_path / "memforge" / "documents"
+    docs_dir.mkdir(parents=True)
+    source_md = docs_dir / "source.md"
+    source_pdf = docs_dir / "source.pdf"
+    source_md.write_text("# Source\n\nDurable memory evidence.", encoding="utf-8")
+    source_pdf.write_bytes(b"%PDF-1.4\n%memforge\n")
+
+    await _insert_document(
+        db,
+        doc_id="doc-resource-read",
+        normalized_content_uri=str(source_md),
+        pdf_content_uri=str(source_pdf),
+    )
+
+    server = create_mcp_server(db, _config(tmp_path))
+    handler = server.request_handlers[CallToolRequest]
+
+    text_result = await handler(CallToolRequest(
+        params=CallToolRequestParams(
+            name="get_resource",
+            arguments={
+                "url": "/api/documents/doc-resource-read/content",
+                "mode": "text",
+            },
+        ),
+    ))
+    text_payload = json.loads(text_result.root.content[0].text)
+    assert text_payload["text"] == "# Source\n\nDurable memory evidence."
+    assert text_payload["kind"] == "normalized_markdown"
+
+    file_result = await handler(CallToolRequest(
+        params=CallToolRequestParams(
+            name="get_resource",
+            arguments={
+                "url": "/api/documents/doc-resource-read/pdf",
+                "mode": "file",
+            },
+        ),
+    ))
+    file_payload = json.loads(file_result.root.content[0].text)
+    local_path = Path(file_payload["local_path"])
+    assert local_path.is_file()
+    assert local_path.read_bytes() == b"%PDF-1.4\n%memforge\n"
+    assert artifact_cache in local_path.parents
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_guide_agentic_get_memory_or_get_resource_choice(db: Database, tmp_path: Path):
+    from mcp.types import ListToolsRequest
+
+    from memforge.server.mcp_server import create_mcp_server
+
+    server = create_mcp_server(db, _config(tmp_path))
+    handler = server.request_handlers[ListToolsRequest]
+    result = await handler(ListToolsRequest())
+
+    tools = {tool.name: tool for tool in result.root.tools}
+    assert "get_memory" in tools
+    assert "get_resource" in tools
+    get_memory_description = tools["get_memory"].description or ""
+    get_resource_description = tools["get_resource"].description or ""
+    assert "complete provenance" in get_memory_description
+    assert "use get_resource directly from search" in get_resource_description
+    assert "call get_memory first" in get_resource_description
+    assert tools["get_resource"].inputSchema["properties"]["mode"]["enum"] == [
+        "text",
+        "file",
+        "base64",
+    ]
 
 
 @pytest.mark.asyncio

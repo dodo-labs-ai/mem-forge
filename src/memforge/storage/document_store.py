@@ -41,7 +41,7 @@ class LocalDocumentStore:
         content_type: str,
         extension: str | None = None,
     ) -> str:
-        """Store raw document content. Returns the file URI."""
+        """Store raw document content. Returns the stored file path."""
         source_dir = self._source_dir(source_name)
         source_dir.mkdir(parents=True, exist_ok=True)
         if extension:
@@ -62,7 +62,7 @@ class LocalDocumentStore:
         title: str,
         markdown: str,
     ) -> str:
-        """Store normalized markdown content. Returns the file URI."""
+        """Store normalized markdown content. Returns the stored file path."""
         source_dir = self._source_dir(source_name)
         source_dir.mkdir(parents=True, exist_ok=True)
         path = source_dir / f"{self._doc_stem(title)}.md"
@@ -75,16 +75,16 @@ class LocalDocumentStore:
         title: str,
         pdf_bytes: bytes,
     ) -> str:
-        """Store PDF export. Returns the file URI."""
+        """Store PDF export. Returns the stored file path."""
         source_dir = self._source_dir(source_name)
         source_dir.mkdir(parents=True, exist_ok=True)
         path = source_dir / f"{self._doc_stem(title)}.pdf"
         path.write_bytes(pdf_bytes)
         return str(path)
 
-    def read_normalized(self, file_uri: str) -> str | None:
-        """Read normalized markdown from a file URI."""
-        path = Path(file_uri)
+    def read_normalized(self, stored_path: str) -> str | None:
+        """Read normalized markdown from a stored file path."""
+        path = Path(stored_path)
         if path.exists():
             return path.read_text(encoding="utf-8")
         return None
