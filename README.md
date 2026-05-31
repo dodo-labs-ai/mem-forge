@@ -21,8 +21,8 @@ MemForge is a self-evolving memory layer for AI agents. It turns scattered team
 knowledge into structured, source-traced memories that agents can search,
 verify, and reuse.
 
-It connects to the systems teams already use, such as Confluence or SAP Wiki,
-Jira, GitHub Pages, Microsoft Teams, and long coding-agent sessions. On each
+It connects to the systems teams already use, such as Confluence, Jira,
+GitHub Pages, Microsoft Teams, and long coding-agent sessions. On each
 sync, MemForge extracts durable facts, decisions, procedures, and conventions
 while preserving source evidence and history.
 

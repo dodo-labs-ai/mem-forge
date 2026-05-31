@@ -160,7 +160,7 @@ async def test_authenticate_uses_bearer_pat_and_normalizes_ui_confluence_wiki_ur
 async def test_authenticate_uses_configured_confluence_ca_bundle(monkeypatch, tmp_path):
     RecordingAsyncClient.instances.clear()
     monkeypatch.setattr("memforge.genes.confluence_gene.httpx.AsyncClient", RecordingAsyncClient)
-    ca_bundle = tmp_path / "sap-ca.pem"
+    ca_bundle = tmp_path / "corp-ca.pem"
     ca_bundle.write_text("test-ca", encoding="utf-8")
 
     gene = ConfluenceGene(

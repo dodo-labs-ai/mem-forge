@@ -158,7 +158,7 @@ async def test_authenticate_prepares_cookie_client_without_bearer_header(monkeyp
 async def test_authenticate_uses_configured_jira_ca_bundle(monkeypatch, tmp_path):
     RecordingAsyncClient.instances.clear()
     monkeypatch.setattr("memforge.genes.jira_gene.httpx.AsyncClient", RecordingAsyncClient)
-    ca_bundle = tmp_path / "sap-ca.pem"
+    ca_bundle = tmp_path / "corp-ca.pem"
     ca_bundle.write_text("test-ca", encoding="utf-8")
     gene = JiraGene(
         config={
