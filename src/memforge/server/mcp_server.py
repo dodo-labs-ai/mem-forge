@@ -17,6 +17,7 @@ from mcp.types import Resource, TextContent, Tool
 
 from memforge.config import AppConfig
 from memforge.models import MemoryType
+from memforge.provenance import document_content_uri, document_content_url, document_pdf_url
 from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -282,8 +283,10 @@ def create_mcp_server(
             if doc:
                 entry["title"] = doc.title
                 entry["source_url"] = doc.source_url
-                entry["file_uri"] = doc.normalized_content_uri
+                entry["file_uri"] = document_content_uri(doc)
                 entry["pdf_uri"] = doc.pdf_content_uri
+                entry["content_url"] = document_content_url(doc)
+                entry["pdf_url"] = document_pdf_url(doc)
             provenance.append(entry)
 
         # Get linked entities

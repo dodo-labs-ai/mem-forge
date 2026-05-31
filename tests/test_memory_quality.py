@@ -113,6 +113,8 @@ async def _insert_document(
     db: Database,
     *,
     doc_id: str = "doc-acd",
+    raw_content_uri: str | None = "/tmp/source.raw",
+    normalized_content_uri: str | None = "/tmp/source.md",
     pdf_content_uri: str | None = None,
 ) -> DocumentRecord:
     now = datetime.now(timezone.utc)
@@ -128,9 +130,9 @@ async def _insert_document(
         version="1",
         content_hash=f"hash-{doc_id}",
         token_count=100,
-        raw_content_uri="/tmp/source.raw",
+        raw_content_uri=raw_content_uri,
         raw_content_type="text/html",
-        normalized_content_uri="/tmp/source.md",
+        normalized_content_uri=normalized_content_uri,
         pdf_content_uri=pdf_content_uri,
         last_synced=now,
     )
@@ -526,7 +528,16 @@ def test_memory_extraction_prompt_preserves_weak_reference_relationships():
 async def test_admin_memory_detail_includes_pdf_uri(db: Database, tmp_path: Path):
     from memforge.server.admin_api import create_admin_app
 
-    doc = await _insert_document(db, doc_id="doc-pdf-uri", pdf_content_uri="/tmp/source.pdf")
+    docs_dir = tmp_path / "memforge" / "documents"
+    docs_dir.mkdir(parents=True)
+    source_pdf = docs_dir / "source.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\n")
+
+    doc = await _insert_document(
+        db,
+        doc_id="doc-pdf-uri",
+        pdf_content_uri=str(source_pdf),
+    )
     memory = await _insert_memory(
         db,
         mem_id="mem-pdfuri1",
@@ -539,7 +550,49 @@ async def test_admin_memory_detail_includes_pdf_uri(db: Database, tmp_path: Path
         response = client.get(f"/api/memories/{memory.id}")
 
     assert response.status_code == 200
-    assert response.json()["sources"][0]["pdf_uri"] == "/tmp/source.pdf"
+    source = response.json()["sources"][0]
+    assert source["pdf_uri"] == str(source_pdf)
+    assert source["pdf_url"] == "/api/documents/doc-pdf-uri/pdf"
+
+
+@pytest.mark.asyncio
+async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Database, tmp_path: Path):
+    from memforge.server.admin_api import create_admin_app
+
+    docs_dir = tmp_path / "memforge" / "documents"
+    docs_dir.mkdir(parents=True)
+    source_md = docs_dir / "source.md"
+    source_pdf = docs_dir / "source.pdf"
+    source_md.write_text("# Source\n\nDurable memory evidence.", encoding="utf-8")
+    source_pdf.write_bytes(b"%PDF-1.4\n%memforge\n")
+
+    doc = await _insert_document(
+        db,
+        doc_id="doc-artifact-url",
+        normalized_content_uri=str(source_md),
+        pdf_content_uri=str(source_pdf),
+    )
+    memory = await _insert_memory(
+        db,
+        mem_id="mem-artifact-url",
+        content="Payroll Processing V2 keeps source artifacts available through the service.",
+    )
+    await db.add_memory_source(memory.id, doc.doc_id, "confluence", excerpt="source excerpt")
+
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        detail = client.get(f"/api/memories/{memory.id}")
+        content = client.get("/api/documents/doc-artifact-url/content")
+        pdf = client.get("/api/documents/doc-artifact-url/pdf")
+
+    assert detail.status_code == 200
+    source = detail.json()["sources"][0]
+    assert source["content_url"] == "/api/documents/doc-artifact-url/content"
+    assert source["pdf_url"] == "/api/documents/doc-artifact-url/pdf"
+    assert content.status_code == 200
+    assert content.text == "# Source\n\nDurable memory evidence."
+    assert pdf.status_code == 200
+    assert pdf.content == b"%PDF-1.4\n%memforge\n"
 
 
 @pytest.mark.asyncio

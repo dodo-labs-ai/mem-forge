@@ -23,6 +23,7 @@ from memforge.config import RetrievalConfig
 from memforge.llm.structured import StructuredLlmError
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SearchResult
+from memforge.provenance import document_content_uri, document_content_url, document_pdf_url
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.retrieval.query_analyzer import QueryAnalysis, analyze_query
 from memforge.storage.database import Database
@@ -803,6 +804,8 @@ class SearchEngine:
             source_type = None
             file_uri = None
             pdf_uri = None
+            content_url = None
+            pdf_url = None
             source_url = None
 
             try:
@@ -821,8 +824,10 @@ class SearchEngine:
                     doc = await self._db.get_document(primary.doc_id)
                     if doc:
                         source_doc_title = doc.title
-                        file_uri = doc.normalized_content_uri
+                        file_uri = document_content_uri(doc)
                         pdf_uri = doc.pdf_content_uri
+                        content_url = document_content_url(doc)
+                        pdf_url = document_pdf_url(doc)
                         source_url = doc.source_url
             except Exception:
                 logger.exception("Failed to fetch sources for memory %s", mid)
@@ -850,6 +855,8 @@ class SearchEngine:
                 source_type=source_type,
                 file_uri=file_uri,
                 pdf_uri=pdf_uri,
+                content_url=content_url,
+                pdf_url=pdf_url,
                 source_url=source_url,
                 corroborated_by=memory.corroboration_count,
                 last_observed_at=(
@@ -922,6 +929,8 @@ class SearchEngine:
             title = doc_id
             file_uri = None
             pdf_uri = None
+            content_url = None
+            pdf_url = None
             source_url = None
             source_type = None
 
@@ -929,8 +938,10 @@ class SearchEngine:
                 doc = await self._db.get_document(doc_id)
                 if doc:
                     title = doc.title
-                    file_uri = doc.normalized_content_uri
+                    file_uri = document_content_uri(doc)
                     pdf_uri = doc.pdf_content_uri
+                    content_url = document_content_url(doc)
+                    pdf_url = document_pdf_url(doc)
                     source_url = doc.source_url
                     source_type = doc.source
             except Exception:
@@ -948,6 +959,8 @@ class SearchEngine:
                 source_type=source_type,
                 file_uri=file_uri,
                 pdf_uri=pdf_uri,
+                content_url=content_url,
+                pdf_url=pdf_url,
                 source_url=source_url,
                 corroborated_by=0,
                 last_observed_at=None,

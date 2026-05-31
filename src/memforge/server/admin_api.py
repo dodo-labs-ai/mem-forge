@@ -17,6 +17,7 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -50,6 +51,12 @@ from memforge.models import (
     Memory,
     MemoryReview,
     canonicalize_entity_name,
+)
+from memforge.provenance import (
+    document_content_uri,
+    document_content_url,
+    document_pdf_url,
+    resolve_document_artifact_path,
 )
 from memforge.runtime import SyncAlreadyRunningError, SyncService
 from memforge.scheduler import SyncScheduler
@@ -183,6 +190,8 @@ class MemorySourceDetail(BaseModel):
     source_url: str | None = None
     file_uri: str | None = None
     pdf_uri: str | None = None
+    content_url: str | None = None
+    pdf_url: str | None = None
     added_at: str | None = None
 
 
@@ -907,6 +916,22 @@ def _dt_iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
 
 
+def _memory_source_detail(ms: Any, doc: Any | None) -> MemorySourceDetail:
+    return MemorySourceDetail(
+        doc_id=ms.doc_id,
+        source_type=ms.source_type,
+        excerpt=ms.excerpt,
+        support_kind=ms.support_kind,
+        doc_title=doc.title if doc else None,
+        source_url=doc.source_url if doc else None,
+        file_uri=document_content_uri(doc),
+        pdf_uri=doc.pdf_content_uri if doc else None,
+        content_url=document_content_url(doc),
+        pdf_url=document_pdf_url(doc),
+        added_at=_dt_iso(ms.added_at),
+    )
+
+
 def _memory_to_response(mem: Memory) -> MemoryResponse:
     """Convert a Memory dataclass to a Pydantic response model."""
     return MemoryResponse(
@@ -984,17 +1009,7 @@ async def _build_memory_summary(db: Database, memory: Memory) -> MemoryReviewMem
     sources: list[MemorySourceDetail] = []
     for ms in raw_sources:
         doc = await db.get_document(ms.doc_id)
-        sources.append(MemorySourceDetail(
-            doc_id=ms.doc_id,
-            source_type=ms.source_type,
-            excerpt=ms.excerpt,
-            support_kind=ms.support_kind,
-            doc_title=doc.title if doc else None,
-            source_url=doc.source_url if doc else None,
-            file_uri=(doc.normalized_content_uri or doc.raw_content_uri) if doc else None,
-            pdf_uri=doc.pdf_content_uri if doc else None,
-            added_at=_dt_iso(ms.added_at),
-        ))
+        sources.append(_memory_source_detail(ms, doc))
 
     entity_ids = await db.get_memory_entity_ids(memory.id)
     entity_names: list[str] = []
@@ -1295,6 +1310,7 @@ def create_admin_app(
 
     # -- Register routers --
     health_router = APIRouter(tags=["health"])
+    document_router = APIRouter(prefix="/api/documents", tags=["documents"])
     memory_router = APIRouter(prefix="/api/memories", tags=["memories"])
     review_router = APIRouter(prefix="/api/memory-reviews", tags=["memory-reviews"])
     entity_router = APIRouter(prefix="/api/entities", tags=["entities"])
@@ -1436,6 +1452,49 @@ def create_admin_app(
         )
 
     # ===================================================================
+    # 1b. Source Document Artifacts
+    # ===================================================================
+
+    @document_router.get("/{doc_id}/content")
+    async def get_document_content(
+        doc_id: str,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
+        """Serve normalized source content through the API for Docker/SaaS clients."""
+        doc = await db.get_document(doc_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        path = resolve_document_artifact_path(document_content_uri(doc), config)
+        if path is None:
+            raise HTTPException(status_code=404, detail="Document content artifact not found")
+
+        media_type = (
+            "text/markdown; charset=utf-8"
+            if path.suffix.lower() in {".md", ".markdown"}
+            else (doc.raw_content_type or "application/octet-stream")
+        )
+        return FileResponse(path, media_type=media_type, filename=path.name)
+
+    @document_router.get("/{doc_id}/pdf")
+    async def get_document_pdf(
+        doc_id: str,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
+        """Serve a stored source PDF through the API for Docker/SaaS clients."""
+        doc = await db.get_document(doc_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        path = resolve_document_artifact_path(doc.pdf_content_uri, config)
+        if path is None:
+            raise HTTPException(status_code=404, detail="Document PDF artifact not found")
+
+        return FileResponse(path, media_type="application/pdf", filename=path.name)
+
+    # ===================================================================
     # 2. Memory Endpoints
     # ===================================================================
 
@@ -1494,17 +1553,7 @@ def create_admin_app(
         source_details: list[MemorySourceDetail] = []
         for ms in raw_sources:
             doc = await db.get_document(ms.doc_id)
-            source_details.append(MemorySourceDetail(
-                doc_id=ms.doc_id,
-                source_type=ms.source_type,
-                excerpt=ms.excerpt,
-                support_kind=ms.support_kind,
-                doc_title=doc.title if doc else None,
-                source_url=doc.source_url if doc else None,
-                file_uri=(doc.normalized_content_uri or doc.raw_content_uri) if doc else None,
-                pdf_uri=doc.pdf_content_uri if doc else None,
-                added_at=_dt_iso(ms.added_at),
-            ))
+            source_details.append(_memory_source_detail(ms, doc))
 
         # Fetch linked entity names
         entity_ids = await db.get_memory_entity_ids(memory_id)
@@ -2981,6 +3030,7 @@ def create_admin_app(
     # Local tool — no auth required. All routers accessible directly.
     app.include_router(auth_router)
     app.include_router(health_router)
+    app.include_router(document_router)
     app.include_router(memory_router)
     app.include_router(review_router)
     app.include_router(entity_router)
