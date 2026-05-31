@@ -2,7 +2,7 @@
   "mcpServers": {
     "memforge": {
       "command": "sh",
-      "args": ["-lc", "exec \"${MEMFORGE_MCP_COMMAND:-memforge}\" serve"]
+      "args": ["-lc", "exec ${MEMFORGE_MCP_COMMAND:-memforge} serve"]
     }
   }
 }

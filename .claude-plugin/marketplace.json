@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "memforge",
+  "description": "MemForge plugin marketplace for agent memory integrations.",
+  "owner": {
+    "name": "MemForge Team"
+  },
+  "plugins": [
+    {
+      "name": "memforge-memory",
+      "description": "MemForge hook and MCP memory integration for Claude Code.",
+      "source": "./integrations/claude-code/memforge-memory",
+      "category": "productivity"
+    }
+  ]
+}

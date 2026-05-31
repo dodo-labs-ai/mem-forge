@@ -97,10 +97,31 @@ The complete docs map is in [docs/README.md](docs/README.md).
 
 ## Agent Integrations
 
-Installable examples live under:
+Installable local plugin packages live under:
 
 - [integrations/codex/memforge-memory](integrations/codex/memforge-memory)
 - [integrations/claude-code/memforge-memory](integrations/claude-code/memforge-memory)
+
+From a source checkout, register this repository as a local marketplace and
+install the plugin:
+
+```bash
+# Codex
+codex plugin marketplace add ./
+codex plugin add memforge-memory@memforge
+
+# Claude Code
+claude plugin marketplace add ./
+claude plugin install memforge-memory@memforge
+```
+
+For local development, run `uv sync` and point the plugin MCP server at the
+checkout executable:
+
+```bash
+export MEMFORGE_MCP_COMMAND="$PWD/.venv/bin/memforge"
+export MEMFORGE_API_URL="http://127.0.0.1:8765"
+```
 
 Both use the same adapter contract: hook payload in, compact memory context out,
 and redacted session windows uploaded to the service. See

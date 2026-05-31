@@ -35,6 +35,9 @@ data/
 .claude/
 .superpowers/
 .agents/
+!.agents/
+!.agents/plugins/
+!.agents/plugins/marketplace.json
 .mcp.json
 .mcp.local.json
 AGENTS.local.md
