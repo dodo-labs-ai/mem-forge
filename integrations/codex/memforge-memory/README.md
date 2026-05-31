@@ -12,6 +12,17 @@ development checkout, set `MEMFORGE_MCP_COMMAND` to the desired
 `memforge` executable path. `search` and `get_memory` run in that MCP process;
 hook calls and `get_resource` artifact reads use `MEMFORGE_API_URL`.
 
+Install from the repository root:
+
+```bash
+uv sync
+export MEMFORGE_MCP_COMMAND="$PWD/.venv/bin/memforge"
+export MEMFORGE_API_URL="http://127.0.0.1:8765"
+
+codex plugin marketplace add ./
+codex plugin add memforge-memory@memforge
+```
+
 The plugin adds context during `SessionStart` and `UserPromptSubmit`, records
 hook lifecycle receipts during `PreCompact` and `Stop`, and queues bounded,
 redacted transcript-window uploads to `/api/agent-sessions/windows`.

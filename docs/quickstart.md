@@ -64,11 +64,24 @@ uv sync --extra dev
 uv run memforge serve
 ```
 
-The integration packages under `integrations/` register this command by default.
-For a development checkout, set:
+The integration packages under `integrations/` run `memforge serve` by default.
+For a development checkout where `memforge` is not installed globally, point the
+plugin at the checkout executable:
 
 ```bash
-export MEMFORGE_MCP_COMMAND="uv run memforge"
+export MEMFORGE_MCP_COMMAND="$PWD/.venv/bin/memforge"
+```
+
+Then install the local plugin marketplace:
+
+```bash
+# Codex
+codex plugin marketplace add ./
+codex plugin add memforge-memory@memforge
+
+# Claude Code
+claude plugin marketplace add ./
+claude plugin install memforge-memory@memforge
 ```
 
 ## 5. Development From Source
