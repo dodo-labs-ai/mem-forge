@@ -10,12 +10,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MEMFORGE_BASE_DIR=/data \
     MEMFORGE_ADMIN_API_PORT=8765 \
     MEMFORGE_CORS_ORIGINS=http://localhost:5174,http://127.0.0.1:5174 \
+    MEMFORGE_CHROME_PATH=/usr/bin/chromium \
+    MEMFORGE_CHROME_NO_SANDBOX=1 \
     PATH=/app/.venv/bin:$PATH
 
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates chromium fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv==0.11.17
