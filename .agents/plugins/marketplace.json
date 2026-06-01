@@ -5,7 +5,7 @@
   },
   "plugins": [
     {
-      "name": "memforge-memory",
+      "name": "memory",
       "source": {
         "source": "local",
         "path": "./integrations/codex/memforge-memory"

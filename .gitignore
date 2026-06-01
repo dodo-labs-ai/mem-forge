@@ -31,6 +31,7 @@ data/
 .memforge/
 
 # Local agent/editor config
+docs/local/
 .codex/
 .claude/
 .superpowers/

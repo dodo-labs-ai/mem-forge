@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import sqlite3
 import subprocess
@@ -663,11 +664,15 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert (codex_root / "hooks" / "hooks.json").exists()
     assert (codex_root / "scripts" / "memforge_hook.py").exists()
     assert (codex_root / "scripts" / "memforge_hook_adapter.py").exists()
+    assert (codex_root / "scripts" / "memforge_mcp.py").exists()
+    assert (codex_root / ".mcp.json").exists()
 
     assert (claude_root / ".claude-plugin" / "plugin.json").exists()
     assert (claude_root / "hooks" / "hooks.json").exists()
     assert (claude_root / "scripts" / "memforge_hook.py").exists()
     assert (claude_root / "scripts" / "memforge_hook_adapter.py").exists()
+    assert (claude_root / "scripts" / "memforge_mcp.py").exists()
+    assert (claude_root / ".mcp.json").exists()
 
     codex_manifest = json.loads((codex_root / ".codex-plugin" / "plugin.json").read_text())
     assert codex_manifest["hooks"] == "./hooks/hooks.json"
@@ -681,6 +686,8 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
         commands = json.dumps(hooks)
         assert "memforge_hook.py" in commands
         assert "submit-session" in commands
+    assert "memforge_mcp.py" in (codex_root / ".mcp.json").read_text()
+    assert "memforge_mcp.py" in (claude_root / ".mcp.json").read_text()
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
@@ -741,6 +748,189 @@ def test_plugin_adapters_match_canonical_adapter():
         root / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_hook_adapter.py",
     ):
         assert adapter.read_text() == canonical
+
+
+def test_plugin_mcp_launchers_match_each_other():
+    root = Path(__file__).resolve().parents[1]
+    canonical = root / "src" / "memforge" / "plugin_mcp_proxy.py"
+    codex_launcher = root / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_mcp.py"
+    claude_launcher = (
+        root / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_mcp.py"
+    )
+
+    assert codex_launcher.read_text() == canonical.read_text()
+    assert codex_launcher.read_text() == claude_launcher.read_text()
+
+
+def test_mcp_proxy_starts_without_memforge_executable():
+    root = Path(__file__).resolve().parents[1]
+    proxy = root / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_mcp.py"
+    request = _mcp_initialize_request()
+    frame = b"Content-Length: " + str(len(request)).encode() + b"\r\n\r\n" + request
+
+    result = subprocess.run(
+        [sys.executable, str(proxy)],
+        input=frame,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == b""
+    _, payload = result.stdout.split(b"\r\n\r\n", 1)
+    response = json.loads(payload)
+    assert response["result"]["serverInfo"]["name"] == "memforge"
+    assert response["result"]["capabilities"]["tools"]["listChanged"] is False
+
+
+def test_mcp_proxy_supports_json_line_stdio():
+    root = Path(__file__).resolve().parents[1]
+    proxy = root / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_mcp.py"
+    request = _mcp_initialize_request() + b"\n"
+
+    result = subprocess.run(
+        [sys.executable, str(proxy)],
+        input=request,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == b""
+    response = json.loads(result.stdout)
+    assert response["result"]["serverInfo"]["name"] == "memforge"
+    assert response["result"]["capabilities"]["tools"]["listChanged"] is False
+
+
+def _mcp_initialize_request() -> bytes:
+    return json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test"}},
+    }).encode()
+
+
+def test_mcp_proxy_forwards_search_to_service_with_token(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["url"] = request.full_url
+            captured["timeout"] = timeout
+            captured["authorization"] = request.get_header("Authorization")
+            captured["content_type"] = request.get_header("Content-type")
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    result = proxy._call_tool("search", {"query": "artifact cache"})
+
+    assert result == {"results": []}
+    assert captured["url"] == "https://memforge.example/api/memories/search"
+    assert captured["authorization"] == "Bearer token-123"
+    assert captured["content_type"] == "application/json"
+    assert json.loads(captured["body"].decode()) == {"query": "artifact cache"}
+
+
+def test_mcp_proxy_downloads_resource_to_local_cache(monkeypatch, tmp_path):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+    body = b"%PDF-1.4\n%local-cache\n"
+
+    class FakeResponse:
+        headers = {
+            "content-type": "application/pdf",
+            "content-disposition": 'attachment; filename="source.pdf"',
+            "content-length": str(len(body)),
+        }
+
+        def __init__(self):
+            self._offset = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size=-1):
+            if size is None or size < 0:
+                size = len(body) - self._offset
+            chunk = body[self._offset:self._offset + size]
+            self._offset += len(chunk)
+            return chunk
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["url"] = request.full_url
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "http://memforge.test")
+    monkeypatch.setenv("MEMFORGE_ARTIFACT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    result = proxy._handle_get_resource({
+        "url": "/api/documents/doc-123/pdf",
+        "mode": "file",
+    })
+
+    local_path = Path(result["local_path"])
+    assert captured["url"] == "http://memforge.test/api/documents/doc-123/pdf"
+    assert result["mode"] == "file"
+    assert result["content_type"] == "application/pdf"
+    assert result["size_bytes"] == len(body)
+    assert local_path.parent == tmp_path
+    assert local_path.read_bytes() == body
+
+
+def test_mcp_proxy_rejects_foreign_and_ambiguous_resource_urls(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+
+    foreign = proxy._handle_get_resource({
+        "url": "https://evil.example/api/documents/doc-123/pdf",
+        "mode": "file",
+    })
+    encoded_slash = proxy._handle_get_resource({
+        "url": "/api/documents/doc%2F123/pdf",
+        "mode": "file",
+    })
+
+    assert foreign["error"] == "unsupported resource URL"
+    assert encoded_slash["error"] == "unsupported resource URL"
+
+
+def _load_plugin_mcp_proxy():
+    root = Path(__file__).resolve().parents[1]
+    proxy_path = root / "src" / "memforge" / "plugin_mcp_proxy.py"
+    spec = importlib.util.spec_from_file_location("memforge_mcp_test", proxy_path)
+    assert spec is not None
+    assert spec.loader is not None
+    proxy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(proxy)
+    return proxy
 
 
 def test_malformed_timeout_env_fails_open(monkeypatch, capsys):

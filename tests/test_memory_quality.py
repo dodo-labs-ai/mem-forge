@@ -1085,6 +1085,95 @@ async def test_admin_memory_list_search_accepts_hyphenated_jira_id(db: Database,
 
 
 @pytest.mark.asyncio
+async def test_admin_memory_search_endpoint_uses_service_search_engine(
+    db: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from memforge import runtime
+    from memforge.models import SearchResult
+    from memforge.server.admin_api import create_admin_app
+
+    calls = []
+
+    class FakeSearchEngine:
+        async def search(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "query": kwargs["query"],
+                "results": [
+                    SearchResult(
+                        memory_id="mem-proxy-search",
+                        memory_type="fact",
+                        summary="Proxy search stays service-owned.",
+                        confidence=0.9,
+                        relevance_score=1.0,
+                        source_doc_id="doc-proxy",
+                        content_url="/api/documents/doc-proxy/content",
+                        pdf_url="/api/documents/doc-proxy/pdf",
+                    )
+                ],
+            }
+
+    async def fake_build_search_engine(_db, _config):
+        return FakeSearchEngine()
+
+    monkeypatch.setattr(runtime, "build_search_engine", fake_build_search_engine)
+
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/memories/search",
+            json={"query": "proxy search", "top_k": 3},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert calls == [{
+        "query": "proxy search",
+        "memory_types": None,
+        "sources": None,
+        "time_range": None,
+        "entities": None,
+        "include_superseded": False,
+        "top_k": 3,
+    }]
+    assert payload["results"][0]["memory_id"] == "mem-proxy-search"
+    assert payload["results"][0]["pdf_url"] == "/api/documents/doc-proxy/pdf"
+
+
+@pytest.mark.asyncio
+async def test_admin_recent_changes_endpoint_returns_memory_updates(db: Database, tmp_path: Path):
+    from memforge.server.admin_api import create_admin_app
+
+    now = datetime.now(timezone.utc).isoformat()
+    await _insert_document(db, doc_id="doc-recent-change")
+    memory = await _insert_memory(
+        db,
+        mem_id="mem-recent-change",
+        content="Recent changes are service-owned for MCP proxy clients.",
+    )
+    async with db.db.execute(
+        """INSERT INTO changelog
+           (doc_id, change_type, previous_version, current_version, detected_at, title, source)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        ("doc-recent-change", "updated", "v1", "v2", now, "Recent Change", "confluence"),
+    ):
+        pass
+    await db.db.commit()
+
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        response = client.get("/api/recent-changes", params={"include_memories": "true"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total_changes"] == 1
+    assert payload["changelog_entries"][0]["doc_id"] == "doc-recent-change"
+    assert {item["id"] for item in payload["recent_memories"]} == {memory.id}
+
+
+@pytest.mark.asyncio
 async def test_admin_memory_list_search_accepts_fts_operator_text(db: Database, tmp_path: Path):
     from memforge.server.admin_api import create_admin_app
 

@@ -7,7 +7,7 @@
   },
   "plugins": [
     {
-      "name": "memforge-memory",
+      "name": "memory",
       "description": "MemForge hook and MCP memory integration for Claude Code.",
       "source": "./integrations/claude-code/memforge-memory",
       "category": "productivity"

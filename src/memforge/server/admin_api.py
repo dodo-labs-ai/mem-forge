@@ -7,6 +7,7 @@ sources/genes, schedule, LLM configuration, and system health/stats.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict, is_dataclass
 import json
 import logging
 import uuid
@@ -239,6 +240,16 @@ class MemoryUpdateRequest(BaseModel):
     content: str | None = None
     confidence: float | None = None
     status: str | None = None  # active, superseded, retired, decayed, pending_review
+
+
+class MemorySearchRequest(BaseModel):
+    query: str
+    memory_types: list[str] | None = None
+    sources: list[str] | None = None
+    time_range: dict[str, Any] | None = None
+    entities: list[str] | None = None
+    include_superseded: bool = False
+    top_k: int = Field(default=10, ge=1, le=50)
 
 
 # -- Entities --
@@ -914,6 +925,19 @@ def _dt_iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
 
 
+def _json_ready(value: Any) -> Any:
+    """Convert dataclasses and datetimes into JSON-native values."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return _json_ready(asdict(value))
+    if isinstance(value, dict):
+        return {k: _json_ready(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
 def _memory_source_detail(
     ms: Any,
     doc: Any | None,
@@ -1322,8 +1346,18 @@ def create_admin_app(
     source_router = APIRouter(prefix="/api/sources", tags=["sources"])
     agent_session_router = APIRouter(prefix="/api/agent-sessions", tags=["agent-sessions"])
     hook_router = APIRouter(prefix="/api/hooks", tags=["hooks"])
+    recent_change_router = APIRouter(prefix="/api/recent-changes", tags=["recent-changes"])
     schedule_router = APIRouter(prefix="/api/schedule", tags=["schedule"])
     llm_router = APIRouter(prefix="/api/llm-config", tags=["llm-config"])
+
+    async def get_search_engine(request: Request, db: Database, config: AppConfig):
+        from memforge.runtime import build_search_engine
+
+        engine = getattr(request.app.state, "memory_search_engine", None)
+        if engine is None:
+            engine = await build_search_engine(db, config)
+            request.app.state.memory_search_engine = engine
+        return engine
 
     # ===================================================================
     # 1. Health & Stats
@@ -1566,6 +1600,33 @@ def create_admin_app(
         total = await db.count_memories()
 
         return MemoryStatsResponse(by_type=by_type, by_status=by_status, total=total)
+
+    @memory_router.post("/search")
+    async def search_memories(
+        req: MemorySearchRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
+        """Service-owned memory search used by local agent MCP proxies."""
+        try:
+            engine = await get_search_engine(request, db, config)
+            result = await engine.search(
+                query=req.query,
+                memory_types=req.memory_types,
+                sources=req.sources,
+                time_range=req.time_range,
+                entities=req.entities,
+                include_superseded=req.include_superseded,
+                top_k=req.top_k,
+            )
+            return _json_ready(result)
+        except Exception as e:
+            logger.warning("Search failed: %s", e, exc_info=True)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Search unavailable: {e}",
+            ) from e
 
     @memory_router.get("/contradictions")
     async def memory_contradictions(
@@ -2502,6 +2563,95 @@ def create_admin_app(
 
         return {"data": sources}
 
+    # ===================================================================
+    # 4c. Recent Changes
+    # ===================================================================
+
+    @recent_change_router.get("")
+    async def recent_changes(
+        since: str | None = None,
+        source: str | None = None,
+        include_memories: bool = True,
+        db: Database = Depends(get_db),
+    ):
+        """Return recent source-document changes and optionally new or updated memories."""
+        if since:
+            since_dt = datetime.fromisoformat(since)
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+        else:
+            since_dt = datetime.now(timezone.utc) - timedelta(days=7)
+        since_iso = since_dt.isoformat()
+
+        changelog: list[dict[str, Any]] = []
+        try:
+            query = "SELECT * FROM changelog WHERE detected_at >= ?"
+            params: list[Any] = [since_iso]
+            if source:
+                query += " AND source = ?"
+                params.append(source)
+            query += " ORDER BY detected_at DESC LIMIT 100"
+
+            async with db.db.execute(query, params) as cursor:
+                async for row in cursor:
+                    d = dict(row)
+                    changelog.append({
+                        "id": d["id"],
+                        "doc_id": d["doc_id"],
+                        "change_type": d["change_type"],
+                        "title": d.get("title"),
+                        "source": d.get("source"),
+                        "previous_version": d.get("previous_version"),
+                        "current_version": d.get("current_version"),
+                        "ai_change_summary": d.get("ai_change_summary"),
+                        "detected_at": d["detected_at"],
+                    })
+        except Exception as e:
+            logger.warning("Failed to query changelog: %s", e)
+
+        recent_memories: list[dict[str, Any]] = []
+        if include_memories:
+            try:
+                mem_query = "SELECT * FROM memories WHERE updated_at >= ?"
+                mem_params: list[Any] = [since_iso]
+                if source:
+                    mem_query = (
+                        "SELECT DISTINCT m.* FROM memories m "
+                        "JOIN memory_sources ms ON m.id = ms.memory_id "
+                        "JOIN documents d ON ms.doc_id = d.doc_id "
+                        "WHERE m.updated_at >= ? AND d.source = ?"
+                    )
+                    mem_params = [since_iso, source]
+                    mem_query += " ORDER BY m.updated_at DESC LIMIT 50"
+                else:
+                    mem_query += " ORDER BY updated_at DESC LIMIT 50"
+
+                async with db.db.execute(mem_query, mem_params) as cursor:
+                    async for row in cursor:
+                        d = dict(row)
+                        recent_memories.append({
+                            "id": d["id"],
+                            "memory_type": d["memory_type"],
+                            "content": d["content"],
+                            "confidence": d["confidence"],
+                            "status": d["status"],
+                            "corroboration_count": d["corroboration_count"],
+                            "updated_at": d.get("updated_at"),
+                            "created_at": d.get("created_at"),
+                        })
+            except Exception as e:
+                logger.warning("Failed to query recent memories: %s", e)
+
+        result: dict[str, Any] = {
+            "since": since_iso,
+            "changelog_entries": changelog,
+            "total_changes": len(changelog),
+        }
+        if include_memories:
+            result["recent_memories"] = recent_memories
+            result["total_memories"] = len(recent_memories)
+        return result
+
     @source_router.post("")
     async def create_source(
         req: CreateSourceRequest,
@@ -3095,6 +3245,7 @@ def create_admin_app(
     app.include_router(source_router)
     app.include_router(agent_session_router)
     app.include_router(hook_router)
+    app.include_router(recent_change_router)
     app.include_router(schedule_router)
     app.include_router(llm_router)
 

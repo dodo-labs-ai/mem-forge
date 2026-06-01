@@ -1,27 +1,27 @@
 # MemForge Memory for Claude Code
 
-This plugin connects Claude Code lifecycle hooks to a local MemForge Admin
-API.
-It also registers the MemForge MCP server for explicit memory tools.
+This plugin connects Claude Code lifecycle hooks to a MemForge API.
+It also registers a thin local MCP proxy for explicit memory tools.
 
 Set `MEMFORGE_API_URL` if the API is not running at
 `http://127.0.0.1:8765`. The URL can point at a local instance or a hosted
 service. Set `MEMFORGE_API_TOKEN` when the service requires bearer auth.
 
-The bundled MCP server starts `memforge serve` from `PATH`. For a local
-development checkout, set `MEMFORGE_MCP_COMMAND` to the desired
-`memforge` executable path. `search` and `get_memory` run in that MCP process;
-hook calls and `get_resource` artifact reads use `MEMFORGE_API_URL`.
+The bundled MCP proxy does not start `memforge serve` and does not need a local
+MemForge CLI. It forwards search, memory detail, recent-change, and session
+document calls to `MEMFORGE_API_URL`. `get_resource(mode="file")` is handled
+locally so returned `local_path` values point to the agent machine.
+
+```text
+Claude Code MCP stdio -> plugin-local proxy -> HTTP(S) MemForge API
+get_resource(mode=file) -> ~/.memforge-agent/artifacts -> local_path
+```
 
 Install from the repository root:
 
 ```bash
-uv sync
-export MEMFORGE_MCP_COMMAND="$PWD/.venv/bin/memforge"
-export MEMFORGE_API_URL="http://127.0.0.1:8765"
-
 claude plugin marketplace add ./
-claude plugin install memforge-memory@memforge
+claude plugin install memory@memforge
 ```
 
 The plugin adds context during `SessionStart` and `UserPromptSubmit`, records
@@ -40,10 +40,10 @@ The hook worker does not call `/api/sources/{source_id}/sync`.
 It stores retry state in `~/.memforge-agent/queue.sqlite` unless
 `MEMFORGE_AGENT_QUEUE_DB` points somewhere else.
 
-The bundled MCP server exposes tools such as `search`, `get_memory`,
+The bundled MCP proxy exposes tools such as `search`, `get_memory`,
 `get_resource`, `list_recent_changes`, and `submit_agent_session_document`.
 `get_resource` fetches `content_url` / `pdf_url` artifacts through
-`MEMFORGE_API_URL`, so it works when MemForge storage lives in Docker or a
-hosted service.
+`MEMFORGE_API_URL`; in `file` mode it writes the artifact to
+`~/.memforge-agent/artifacts`.
 
 Hooks do not write canonical memories directly.

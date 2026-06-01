@@ -95,6 +95,40 @@ async def get_effective_llm_config(db: "Database", config: AppConfig) -> Effecti
     )
 
 
+async def build_search_engine(db: "Database", config: AppConfig) -> Any:
+    """Build the service-owned retrieval engine used by MCP and HTTP clients."""
+    from memforge.retrieval.search import SearchEngine
+
+    memory_collection = get_chroma_collection(
+        chroma_path=config.storage.chroma_path,
+        name="memories",
+    )
+    llm = await get_effective_llm_config(db, config)
+    embed_cfg = {
+        "base_url": llm.embedding_base_url,
+        "api_key": llm.embedding_api_key,
+        "model": llm.embedding_model,
+    }
+    structured_llm_client = None
+    if llm.enrichment_api_key:
+        structured_llm_client = LiteLlmStructuredClient(
+            StructuredLlmConfig(
+                model=llm.enrichment_model,
+                base_url=llm.enrichment_base_url or None,
+                api_key=llm.enrichment_api_key,
+                timeout_s=llm.request_timeout_s,
+            )
+        )
+    return SearchEngine(
+        db=db,
+        memory_collection=memory_collection,
+        embed_cfg=embed_cfg,
+        config=config.retrieval,
+        structured_llm_client=structured_llm_client,
+        artifact_config=config,
+    )
+
+
 async def build_sync_runtime(db: "Database", config: AppConfig) -> SyncRuntime:
     llm = await get_effective_llm_config(db, config)
     structured_llm_client = None
