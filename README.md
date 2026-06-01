@@ -47,6 +47,34 @@ integrations, with review flows for superseded facts and contradictions.
 Built-in genes today: `confluence`, `jira`, `github_pages`, `teams`, and
 `agent_session`.
 
+## Integrations
+
+MemForge connects the systems where team knowledge is created with the agents
+that need it during real work. Instead of rediscovering context every session,
+source systems sync into evidence-backed memories that agents can retrieve when
+they matter.
+
+### Memory Sources
+
+| Source | What MemForge captures |
+| --- | --- |
+| <img alt="Confluence" src="https://api.iconify.design/simple-icons:confluence.svg?color=%23172B4D" width="18"> **Confluence** | Pages, runbooks, architecture decisions, and exported PDFs. Reprocessed when source content changes. |
+| <img alt="Jira" src="https://api.iconify.design/simple-icons:jira.svg?color=%230052CC" width="18"> **Jira** | Issues, delivery outcomes, and conventions that outlive a ticket. |
+| <img alt="GitHub" src="https://api.iconify.design/simple-icons:github.svg?color=%23181717" width="18"> **GitHub Pages** | Published docs and design references from static project sites. |
+| <img alt="Microsoft Teams" src="https://api.iconify.design/simple-icons:microsoftteams.svg?color=%236264A7" width="18"> **Microsoft Teams** | Decisions, significant discussions, and follow-ups from team conversations. |
+
+### Agent Integrations
+
+Once installed, each plugin gives your agent a two-way memory loop out of the
+box: it can pull source-traced context while you code, and MemForge can turn
+useful work from the session into new memories afterward.
+
+**Supported today:** <img alt="Codex" src="https://api.iconify.design/simple-icons:openai.svg?color=%23000000" width="18"> **Codex** &nbsp;&nbsp; <img alt="Claude Code" src="https://api.iconify.design/simple-icons:claude.svg?color=%23D97757" width="18"> **Claude Code**
+
+More source connectors are in development, including Slack, Obsidian, Outlook,
+and custom team systems. Cursor and other agent runtimes can follow the same
+adapter contract. Built-in support today is the set listed above.
+
 ## Architecture
 
 ```mermaid
