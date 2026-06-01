@@ -28,19 +28,31 @@ search works over HTTP as usual. For backing source artifacts, prefer
 `content_url` and `pdf_url` from provenance; those URLs are served by the API
 and work even when the service storage lives inside a Docker volume.
 
-## 2. Configure Models And Secrets
+## 2. Configure Models
 
-Copy the example environment file when you want to set LLM and embedding API
-keys or local overrides:
+Open `http://localhost:5174/settings` and configure the enrichment and
+embedding endpoints. Use **Test connection** to verify that the MemForge API
+container can reach the URL and to load model ids when the endpoint exposes a
+model list.
+
+If MemForge runs in Docker and your model proxy runs on your Mac, use
+`http://host.docker.internal:<port>` instead of `http://localhost:<port>`.
+Inside the container, `localhost` points back to the container itself.
+
+You can also use `.env` for file-based configuration:
 
 ```bash
 cp .env.example .env
 ```
 
-Then edit `.env`:
+Then edit only the values you want to manage outside the UI:
 
 ```bash
+MEMFORGE_ENRICHMENT_MODEL=...
+MEMFORGE_ENRICHMENT_BASE_URL=...
 MEMFORGE_ENRICHMENT_API_KEY=...
+MEMFORGE_EMBEDDING_MODEL=...
+MEMFORGE_EMBEDDING_BASE_URL=...
 MEMFORGE_EMBEDDING_API_KEY=...
 ```
 
@@ -52,8 +64,8 @@ docker compose up --build
 
 ## 3. Use The Admin UI
 
-Use the Sources screen to add a source and run a sync. The Settings screen can
-also store runtime LLM configuration in the local database.
+Use the Sources screen to add a source and run a sync. Settings values saved in
+the UI are stored in the local database and are used by the next sync.
 
 ## 4. Install Agent Plugins
 
@@ -120,3 +132,24 @@ uv run memforge sync
 
 Use `uv run memforge sync --source "Source name"` to sync one configured
 source.
+
+## 7. Configure Confluence
+
+The Confluence source accepts a root, space, or page URL in the **Wiki URL**
+field. This keeps standard and corporate Confluence deployments on the same
+source type.
+
+Examples:
+
+```text
+https://team.atlassian.net/wiki
+https://team.atlassian.net/wiki/spaces/ENG
+https://wiki.company.example/wiki/spaces/PAY/pages/5695886009/Flexible+Payroll
+https://confluence.example.com
+```
+
+When a page URL is pasted, MemForge infers the space key, page ID, REST API
+path, and page-tree sync scope. `spaces` is required only for whole-space sync.
+Plain Confluence roots first try `/wiki/rest/api` and then `/rest/api`; use the
+advanced REST API path field only for deployments that serve Confluence below a
+custom path.

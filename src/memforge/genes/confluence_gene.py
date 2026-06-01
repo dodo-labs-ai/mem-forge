@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 
@@ -67,38 +67,45 @@ class ConfluenceGene(Gene):
             ],
             fields=[
                 ConfigField(
-                    key="base_url", label="Confluence Base URL",
+                    key="base_url", label="Wiki URL",
                     field_type=ConfigFieldType.URL, required=True,
-                    placeholder="https://wiki.example.com",
-                    help_text="Root URL of your Confluence instance",
+                    placeholder="https://wiki.example.com or a Confluence page URL",
+                    help_text="Paste a Confluence root, space, or page URL",
                     group="connection", order=0,
                 ),
                 ConfigField(
-                    key="spaces", label="Spaces to Sync",
-                    field_type=ConfigFieldType.TAG_LIST, required=True,
-                    placeholder="PAY, ARCH, DevOps",
-                    help_text="Comma-separated Confluence space keys",
+                    key="sync_mode", label="Sync Scope",
+                    field_type=ConfigFieldType.SELECT, required=False,
+                    options=["page_tree", "space"],
+                    help_text="Sync one page tree or a whole space",
                     group="scope", order=0,
+                ),
+                ConfigField(
+                    key="spaces", label="Spaces to Sync",
+                    field_type=ConfigFieldType.TAG_LIST, required=False,
+                    placeholder="PAY, ARCH, DevOps",
+                    help_text="Required when syncing whole spaces",
+                    group="scope", order=1,
                 ),
                 ConfigField(
                     key="page_tree_root", label="Page Tree Root (optional)",
                     field_type=ConfigFieldType.STRING, required=False,
                     placeholder="Page ID or URL",
                     help_text="Only sync pages under this root page",
-                    group="scope", order=1,
+                    group="scope", order=2,
                 ),
                 ConfigField(
                     key="exclude_labels", label="Exclude Labels",
                     field_type=ConfigFieldType.TAG_LIST, required=False,
                     placeholder="draft, archived, obsolete",
                     help_text="Pages with these labels will be skipped",
-                    group="scope", order=2,
+                    group="scope", order=3,
                 ),
                 ConfigField(
                     key="include_children", label="Include Child Pages",
                     field_type=ConfigFieldType.BOOLEAN, required=False,
                     default="true",
-                    group="scope", order=3,
+                    group="scope", order=4,
                 ),
                 ConfigField(
                     key="pat", label="Personal Access Token",
@@ -107,11 +114,18 @@ class ConfluenceGene(Gene):
                     group="connection", order=1,
                 ),
                 ConfigField(
+                    key="api_prefix", label="REST API Path",
+                    field_type=ConfigFieldType.STRING, required=False,
+                    placeholder="/wiki",
+                    help_text="Advanced override for Confluence deployments that serve REST below a path",
+                    group="connection", order=2, advanced=True,
+                ),
+                ConfigField(
                     key="tls_ca_bundle", label="TLS CA Bundle",
                     field_type=ConfigFieldType.STRING, required=False,
                     placeholder="/path/to/company-ca.pem",
                     help_text="Optional CA bundle path for internal HTTPS certificates",
-                    group="connection", order=2, advanced=True,
+                    group="connection", order=3, advanced=True,
                 ),
             ],
         )
@@ -122,7 +136,8 @@ class ConfluenceGene(Gene):
 
     async def authenticate(self) -> None:
         """Authenticate to Confluence via Personal Access Token."""
-        base_url = self._normalize_base_url(self.config.get("base_url", ""))
+        self.normalize_config(self.config)
+        base_url = str(self.config.get("base_url") or "").strip()
         if not base_url:
             raise ValueError("Confluence base_url is required")
         require_https_base_url(base_url, "Confluence")
@@ -144,7 +159,7 @@ class ConfluenceGene(Gene):
             verify=tls_verify(self.config),
         )
         try:
-            await self._get(client, f"{self._api_prefix}/rest/api/space", params={"limit": 1})
+            self._api_prefix = await self._select_api_prefix(client)
         except Exception:
             await client.aclose()
             raise
@@ -154,34 +169,158 @@ class ConfluenceGene(Gene):
     @staticmethod
     def _normalize_base_url(base_url: str) -> str:
         """Return the Confluence origin used with webui and REST API paths."""
-        value = base_url.strip().rstrip("/")
-        if not value:
-            return ""
+        return ConfluenceGene._parse_wiki_url(base_url).get("base_url", "").rstrip("/")
 
-        parts = urlsplit(value)
-        path = parts.path.rstrip("/")
-        if path == "/wiki" or path.endswith("/wiki"):
-            path = path[:-len("/wiki")] or ""
-            value = urlunsplit((parts.scheme, parts.netloc, path, "", "")).rstrip("/")
-        return value
+    @classmethod
+    def normalize_config(cls, config: dict) -> None:
+        """Normalize user-provided Confluence URLs in-place."""
+        raw_base_url = str(config.get("base_url") or "").strip()
+        parsed = cls._parse_wiki_url(raw_base_url)
+        if parsed.get("base_url"):
+            config["base_url"] = parsed["base_url"]
+        if parsed.get("api_prefix") and not str(config.get("api_prefix") or "").strip():
+            config["api_prefix"] = parsed["api_prefix"]
+        elif "api_prefix" in config:
+            config["api_prefix"] = cls._normalize_api_prefix(config.get("api_prefix"))
+
+        if parsed.get("space_key") and not cls._space_keys(config.get("spaces")):
+            config["spaces"] = [parsed["space_key"]]
+        if parsed.get("page_id") and not str(config.get("page_tree_root") or "").strip():
+            config["page_tree_root"] = parsed["page_id"]
+
+        page_tree_root = str(config.get("page_tree_root") or "").strip()
+        if page_tree_root:
+            config["page_tree_root"] = cls._page_id_from_url(page_tree_root) or page_tree_root
+        if str(config.get("page_tree_root") or "").strip() and not str(config.get("sync_mode") or "").strip():
+            config["sync_mode"] = "page_tree"
+
+    @classmethod
+    def _parse_wiki_url(cls, value: str) -> dict[str, str]:
+        text = value.strip().rstrip("/")
+        if not text:
+            return {}
+
+        parts = urlsplit(text)
+        result: dict[str, str] = {}
+        if parts.scheme and parts.netloc:
+            result["base_url"] = urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
+
+        path_parts = [part for part in parts.path.split("/") if part]
+        prefix_parts: list[str] = []
+        if "spaces" in path_parts:
+            space_index = path_parts.index("spaces")
+            prefix_parts = path_parts[:space_index]
+            if space_index + 1 < len(path_parts):
+                result["space_key"] = path_parts[space_index + 1]
+            page_id = cls._page_id_from_path_parts(path_parts[space_index + 2 :])
+            if page_id:
+                result["page_id"] = page_id
+        elif len(path_parts) == 1:
+            prefix_parts = path_parts
+
+        query_page_ids = parse_qs(parts.query).get("pageId")
+        if query_page_ids and query_page_ids[0].isdigit():
+            result["page_id"] = query_page_ids[0]
+
+        if prefix_parts:
+            result["api_prefix"] = cls._normalize_api_prefix("/" + "/".join(prefix_parts))
+        return result
+
+    @staticmethod
+    def _page_id_from_url(value: str) -> str | None:
+        text = value.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return text
+
+        parts = urlsplit(text)
+        query_page_ids = parse_qs(parts.query).get("pageId")
+        if query_page_ids and query_page_ids[0].isdigit():
+            return query_page_ids[0]
+
+        path_parts = [part for part in parts.path.split("/") if part]
+        return ConfluenceGene._page_id_from_path_parts(path_parts)
+
+    @staticmethod
+    def _page_id_from_path_parts(path_parts: list[str]) -> str | None:
+        for index, part in enumerate(path_parts):
+            if part == "pages" and index + 1 < len(path_parts) and path_parts[index + 1].isdigit():
+                return path_parts[index + 1]
+        return None
+
+    @staticmethod
+    def _normalize_api_prefix(value: object) -> str:
+        text = str(value or "").strip().rstrip("/")
+        if not text or text == "/":
+            return ""
+        return "/" + text.strip("/")
+
+    @staticmethod
+    def _space_keys(value: object) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return []
+
+    @classmethod
+    def _effective_sync_mode(cls, config: dict) -> str:
+        mode = str(config.get("sync_mode") or "").strip().lower()
+        if mode in {"page_tree", "space"}:
+            return mode
+        return "page_tree" if str(config.get("page_tree_root") or "").strip() else "space"
+
+    @classmethod
+    def _api_prefix_candidates(cls, config: dict) -> list[str]:
+        configured = cls._normalize_api_prefix(config.get("api_prefix"))
+        if configured:
+            return [configured]
+        return ["/wiki", ""]
+
+    async def _select_api_prefix(self, client: httpx.AsyncClient) -> str:
+        """Return the REST prefix that answers with Confluence JSON."""
+        last_error: Exception | None = None
+        for prefix in self._api_prefix_candidates(self.config):
+            try:
+                resp = await self._get(client, f"{prefix}/rest/api/space", params={"limit": 1})
+                self._json_response(resp, "checking Confluence REST API")
+                self.config["api_prefix"] = prefix
+                return prefix
+            except Exception as exc:
+                last_error = exc
+                if not self._can_try_next_api_prefix(exc):
+                    raise
+        if last_error is not None:
+            raise last_error
+        return "/wiki"
+
+    @staticmethod
+    def _can_try_next_api_prefix(exc: Exception) -> bool:
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code == 404
+        return isinstance(exc, RuntimeError) and "non-JSON response" in str(exc)
 
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         """Discover wiki pages from configured spaces or page tree root."""
-        page_tree_root = self.config.get("page_tree_root", "")
+        self.normalize_config(self.config)
+        sync_mode = self._effective_sync_mode(self.config)
+        page_tree_root = str(self.config.get("page_tree_root") or "").strip()
         include_children = self.config.get("include_children", True)
 
-        if page_tree_root:
-            # Page tree mode: discover all descendants of a root page
+        if sync_mode == "page_tree":
+            if not page_tree_root:
+                raise ValueError("Confluence Page Tree Root is required when syncing a page tree")
             async for item in self._discover_page_tree(page_tree_root, include_children, since):
                 yield item
-        else:
-            # Space mode: discover all pages in configured spaces
-            spaces = self.config.get("spaces", [])
-            if isinstance(spaces, str):
-                spaces = [s.strip() for s in spaces.split(",") if s.strip()]
-            for space_key in spaces:
-                async for item in self._discover_space(space_key, since):
-                    yield item
+            return
+
+        spaces = self._space_keys(self.config.get("spaces"))
+        if not spaces:
+            raise ValueError("Confluence Spaces to Sync is required when syncing whole spaces")
+        for space_key in spaces:
+            async for item in self._discover_space(space_key, since):
+                yield item
 
     async def _discover_page_tree(
         self, root_id: str, include_children: bool, since: datetime | None
@@ -209,7 +348,7 @@ class ConfluenceGene(Gene):
                         f"{self._api_prefix}/rest/api/content/{parent_id}/child/page",
                         params={"start": start, "limit": limit, "expand": "version,metadata.labels"},
                     )
-                    data = resp.json()
+                    data = self._json_response(resp, f"listing children of page {parent_id}")
                 except Exception as e:
                     logger.error("Failed to list children of page %s: %s", parent_id, e)
                     raise RuntimeError(f"Failed to list Confluence children for page {parent_id}: {e}") from e
@@ -240,7 +379,7 @@ class ConfluenceGene(Gene):
                 f"{self._api_prefix}/rest/api/content/{page_id}",
                 params={"expand": "version,metadata.labels,space"},
             )
-            page = resp.json()
+            page = self._json_response(resp, f"fetching page {page_id}")
             return self._parse_page(page, since, exclude_labels)
         except Exception as e:
             logger.error("Failed to fetch page %s: %s", page_id, e)
@@ -305,7 +444,7 @@ class ConfluenceGene(Gene):
                         "expand": "version,metadata.labels,space",
                     },
                 )
-                data = resp.json()
+                data = self._json_response(resp, f"listing pages in space {space_key}")
             except Exception as e:
                 logger.error("Failed to list pages in space %s: %s", space_key, e)
                 raise RuntimeError(f"Failed to list Confluence pages in space {space_key}: {e}") from e
@@ -330,7 +469,7 @@ class ConfluenceGene(Gene):
             f"{self._api_prefix}/rest/api/content/{page_id}",
             params={"expand": "body.storage,version"},
         )
-        data = resp.json()
+        data = self._json_response(resp, f"fetching page content {page_id}")
 
         body_html = data.get("body", {}).get("storage", {}).get("value", "")
 
@@ -430,3 +569,18 @@ class ConfluenceGene(Gene):
             params=params,
             limiter=getattr(self, "_request_limiter", None),
         )
+
+    @staticmethod
+    def _json_response(resp: httpx.Response, action: str) -> dict:
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            content_type = resp.headers.get("content-type", "unknown")
+            raise RuntimeError(
+                "Confluence returned a non-JSON response while "
+                f"{action} (status={resp.status_code}, content-type={content_type}). "
+                "Check that the Confluence URL resolves to the instance root and that the PAT can access the REST API."
+            ) from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Confluence returned unexpected JSON while {action}: expected an object")
+        return data

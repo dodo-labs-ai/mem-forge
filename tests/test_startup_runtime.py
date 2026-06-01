@@ -459,6 +459,71 @@ def test_admin_source_create_rejects_missing_atlassian_pat(
     assert expected_detail in response.json()["detail"]
 
 
+def test_admin_source_create_accepts_confluence_page_url_without_spaces(tmp_path, monkeypatch):
+    import sqlite3
+
+    from memforge.server.admin_api import create_admin_app
+
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
+    cfg = _config(tmp_path)
+    app = create_admin_app(config=cfg)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/sources",
+            json={
+                "type": "confluence",
+                "name": "Payroll Architecture",
+                "config": {
+                    "base_url": (
+                        "https://wiki.company.example/wiki/spaces/PAY/pages/"
+                        "5695886009/Flexible+Payroll"
+                    ),
+                    "pat": "wiki-pat-secret",
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    with sqlite3.connect(cfg.storage.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        stored = conn.execute(
+            "SELECT config FROM sources WHERE id = ?",
+            (response.json()["id"],),
+        ).fetchone()
+
+    stored_config = json.loads(stored["config"])
+    assert stored_config["base_url"] == "https://wiki.company.example"
+    assert stored_config["api_prefix"] == "/wiki"
+    assert stored_config["spaces"] == ["PAY"]
+    assert stored_config["page_tree_root"] == "5695886009"
+    assert stored_config["sync_mode"] == "page_tree"
+
+
+def test_admin_source_create_requires_spaces_for_confluence_space_scope(tmp_path, monkeypatch):
+    from memforge.server.admin_api import create_admin_app
+
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
+    app = create_admin_app(config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/sources",
+            json={
+                "type": "confluence",
+                "name": "Engineering Wiki",
+                "config": {
+                    "base_url": "https://wiki.example.test",
+                    "sync_mode": "space",
+                    "pat": "wiki-pat-secret",
+                },
+            },
+        )
+
+    assert response.status_code == 400
+    assert "Spaces to Sync is required" in response.json()["detail"]
+
+
 def test_admin_source_create_allows_jira_browser_session_without_source_cookie(tmp_path, monkeypatch):
     from memforge.server.admin_api import create_admin_app
 
@@ -1489,6 +1554,73 @@ async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path,
 
 
 @pytest.mark.asyncio
+async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    from memforge.models import SyncState
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_secrets import prepare_source_config_for_storage
+
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
+    source_id = "src-confluence-rescope"
+    old_config = {
+        "base_url": "https://wiki.example",
+        "sync_mode": "page_tree",
+        "page_tree_root": "5695886009",
+        "include_children": True,
+        "spaces": ["SFPAY"],
+    }
+    stored_config = prepare_source_config_for_storage(
+        {**old_config, "pat": "confluence-pat-secret"},
+        secret_fields=("pat",),
+    )
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="SFPAY Arch",
+        config_json=json.dumps(stored_config),
+    )
+    await db.upsert_sync_state(
+        SyncState(
+            source=source_id,
+            last_sync_at=datetime.now(timezone.utc),
+            last_sync_status="success",
+            docs_processed=17,
+            docs_updated=10,
+        ),
+    )
+
+    class FakeSyncService:
+        def __init__(self):
+            self.cancelled: list[str] = []
+
+        async def cancel_source(self, cancelled_source_id: str):
+            self.cancelled.append(cancelled_source_id)
+
+        async def shutdown(self):
+            return None
+
+    fake_sync_service = FakeSyncService()
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        app.state.sync_service = fake_sync_service
+        response = client.put(
+            f"/api/sources/{source_id}",
+            json={
+                "name": "SFPAY Arch",
+                "config": {
+                    **old_config,
+                    "page_tree_root": "5625394036",
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    assert fake_sync_service.cancelled == [source_id]
+    assert await db.get_sync_state(source_id) is None
+
+
+@pytest.mark.asyncio
 async def test_force_resync_resets_cursor_and_starts_source_sync(db, tmp_path):
     from datetime import datetime, timezone
 
@@ -1582,6 +1714,218 @@ def test_config_env_overrides_startup_runtime_values(monkeypatch, tmp_path):
     assert cfg.llm.enrichment_base_url == "http://localhost:6655/anthropic"
     assert cfg.llm.embedding_base_url == "http://localhost:6655/openai/v1"
     assert cfg.server.admin_api_port == 9876
+
+
+@pytest.mark.asyncio
+async def test_llm_config_probe_fetches_model_ids(db, tmp_path, monkeypatch):
+    import httpx
+
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    class ModelListClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, headers):
+            request = httpx.Request("GET", url)
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "gpt-5-mini"},
+                        {"id": "text-embedding-3-small"},
+                    ]
+                },
+                request=request,
+            )
+
+    monkeypatch.setattr(admin_api.httpx, "AsyncClient", lambda **kwargs: ModelListClient())
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/llm-config/probe",
+            json={
+                "kind": "embedding",
+                "base_url": "https://proxy.example.test/v1",
+                "api_key": "proxy-key",
+            },
+        )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["models_supported"] is True
+    assert [model["id"] for model in payload["models"]] == [
+        "gpt-5-mini",
+        "text-embedding-3-small",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_llm_config_probe_treats_missing_models_as_manual_fallback(db, tmp_path, monkeypatch):
+    import httpx
+
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    class MissingModelsClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, headers):
+            return httpx.Response(404, json={"error": "not found"}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(admin_api.httpx, "AsyncClient", lambda **kwargs: MissingModelsClient())
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/llm-config/probe",
+            json={"kind": "enrichment", "base_url": "https://proxy.example.test", "api_key": "proxy-key"},
+        )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["models_supported"] is False
+    assert payload["models"] == []
+    assert "does not expose a model list" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_llm_config_probe_falls_through_from_html_models_to_v1_models(db, tmp_path, monkeypatch):
+    import httpx
+
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    class HtmlThenModelsClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, headers):
+            request = httpx.Request("GET", url)
+            if url.endswith("/v1/models"):
+                return httpx.Response(200, json={"data": [{"id": "model-from-v1"}]}, request=request)
+            return httpx.Response(200, content=b"<html>not json</html>", request=request)
+
+    monkeypatch.setattr(admin_api.httpx, "AsyncClient", lambda **kwargs: HtmlThenModelsClient())
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/llm-config/probe",
+            json={"kind": "enrichment", "base_url": "https://proxy.example.test", "api_key": "proxy-key"},
+        )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["models_supported"] is True
+    assert [model["id"] for model in payload["models"]] == ["model-from-v1"]
+
+
+@pytest.mark.asyncio
+async def test_llm_config_probe_suggests_host_docker_internal(db, tmp_path, monkeypatch):
+    import httpx
+
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    class ConnectionFailureClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, headers):
+            raise httpx.ConnectError("connection refused", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(admin_api.httpx, "AsyncClient", lambda **kwargs: ConnectionFailureClient())
+    monkeypatch.setattr(admin_api, "_is_running_in_container", lambda: True)
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/llm-config/probe",
+            json={"kind": "embedding", "base_url": "http://localhost:6655/openai/v1", "api_key": None},
+        )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["ok"] is False
+    assert payload["stage"] == "connect"
+    assert payload["suggested_base_url"] == "http://host.docker.internal:6655/openai/v1"
+
+
+@pytest.mark.asyncio
+async def test_llm_config_probe_auth_error_without_key_is_actionable(db, tmp_path, monkeypatch):
+    import httpx
+
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    class AuthFailureClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, headers):
+            return httpx.Response(401, json={"error": "missing key"}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(admin_api.httpx, "AsyncClient", lambda **kwargs: AuthFailureClient())
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/llm-config/probe",
+            json={"kind": "enrichment", "base_url": "https://api.example.test/v1", "api_key": None},
+        )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["ok"] is False
+    assert payload["stage"] == "auth"
+    assert payload["message"] == "Add an API key, then test again."
+
+
+@pytest.mark.asyncio
+async def test_llm_config_put_can_preserve_and_clear_keys(db, tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    await db.set_llm_config({
+        "enrichment_model": "chat-model",
+        "enrichment_base_url": "https://chat.example.test/v1",
+        "enrichment_api_key": "chat-secret",
+        "embedding_model": "embed-model",
+        "embedding_base_url": "https://embed.example.test/v1",
+        "embedding_api_key": "embed-secret",
+    })
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        preserve_response = client.put("/api/llm-config", json={"embedding_api_key": None})
+        clear_response = client.put("/api/llm-config", json={"enrichment_api_key": ""})
+
+    stored = await db.get_llm_config()
+    assert preserve_response.status_code == 200
+    assert clear_response.status_code == 200
+    assert stored["embedding_api_key"] == "embed-secret"
+    assert stored["enrichment_api_key"] is None
 
 
 def test_cli_logging_uses_stderr_for_stdio_safety():
