@@ -7,7 +7,6 @@ import hashlib
 import html as html_lib
 import logging
 import os
-import shutil
 import sys
 import tempfile
 from collections.abc import Awaitable, Callable
@@ -22,7 +21,6 @@ from memforge.genes.atlassian_auth import get_with_rate_limit_retry
 logger = logging.getLogger(__name__)
 
 RenderPdf = Callable[[Path], Awaitable[bytes | None]]
-_PDF_RENDER_SEMAPHORE = asyncio.Semaphore(1)
 MAX_IMAGE_ASSETS = 200
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 25 * 1024 * 1024
@@ -30,12 +28,7 @@ MAX_PDF_BYTES = 100 * 1024 * 1024
 IMAGE_FETCH_TIMEOUT_SECONDS = 10.0
 IMAGE_STREAM_CHUNK_BYTES = 64 * 1024
 IMAGE_DOWNLOAD_CONCURRENCY = 4
-CHROME_RENDER_TIMEOUT_SECONDS = 90.0
 PDF_EXPORT_TIMEOUT_SECONDS = 120.0
-PDF_RENDERER_ENV = "MEMFORGE_PDF_RENDERER"
-PDF_RENDERER_AUTO = "auto"
-PDF_RENDERER_WEASYPRINT = "weasyprint"
-PDF_RENDERER_CHROME = "chrome"
 
 
 async def export_confluence_page_pdf(
@@ -133,36 +126,7 @@ async def _render_with_timeout(
 
 
 def default_pdf_renderer() -> RenderPdf | None:
-    renderer_name = os.environ.get(PDF_RENDERER_ENV, PDF_RENDERER_AUTO).strip().lower() or PDF_RENDERER_AUTO
-    if renderer_name == PDF_RENDERER_WEASYPRINT:
-        return default_weasyprint_renderer()
-    if renderer_name == PDF_RENDERER_CHROME:
-        return default_chrome_renderer()
-    if renderer_name != PDF_RENDERER_AUTO:
-        logger.warning(
-            "Unknown %s=%r; using auto PDF renderer selection",
-            PDF_RENDERER_ENV,
-            renderer_name,
-        )
-
-    weasyprint_renderer = default_weasyprint_renderer()
-    chrome_renderer = default_chrome_renderer()
-    if weasyprint_renderer is not None and chrome_renderer is not None:
-        return _fallback_renderer(weasyprint_renderer, chrome_renderer)
-    if weasyprint_renderer is not None:
-        return weasyprint_renderer
-    return chrome_renderer
-
-
-def _fallback_renderer(primary: RenderPdf, fallback: RenderPdf) -> RenderPdf:
-    async def render(html_path: Path) -> bytes | None:
-        pdf_bytes = await primary(html_path)
-        if pdf_bytes is not None:
-            return pdf_bytes
-        logger.warning("Primary PDF renderer failed for %s; retrying with Chrome", html_path)
-        return await fallback(html_path)
-
-    return render
+    return default_weasyprint_renderer()
 
 
 def default_weasyprint_renderer() -> RenderPdf | None:
@@ -204,106 +168,6 @@ def _prepare_weasyprint_library_path() -> None:
             paths.append(candidate)
     if paths:
         os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(paths)
-
-
-def default_chrome_renderer() -> RenderPdf | None:
-    chrome_path = _find_chrome()
-    if not chrome_path:
-        return None
-
-    async def render(html_path: Path) -> bytes | None:
-        pdf_path = html_path.with_suffix(".pdf")
-        profile_dir = html_path.parent / "chrome-profile"
-        profile_dir.mkdir(parents=True, exist_ok=True)
-        args = [
-            chrome_path,
-            "--headless=new",
-            f"--user-data-dir={profile_dir}",
-            "--no-first-run",
-            "--disable-sync",
-            "--disable-default-apps",
-            "--disable-gpu",
-            "--disable-extensions",
-            "--disable-dev-shm-usage",
-            "--hide-scrollbars",
-            "--allow-file-access-from-files",
-        ]
-        if _truthy_env("MEMFORGE_CHROME_NO_SANDBOX"):
-            args.append("--no-sandbox")
-        args.extend([
-            f"--print-to-pdf={pdf_path}",
-            html_path.as_uri(),
-        ])
-        async with _PDF_RENDER_SEMAPHORE:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            try:
-                rendered = await _wait_for_pdf_or_process_exit(proc, pdf_path)
-            finally:
-                await _terminate_process(proc)
-        if not pdf_path.exists():
-            logger.warning("Chrome PDF rendering failed for %s", html_path)
-            return None
-        if pdf_path.stat().st_size > MAX_PDF_BYTES:
-            logger.warning("Chrome PDF rendering exceeded size limit for %s", html_path)
-            return None
-        pdf_bytes = pdf_path.read_bytes()
-        if _looks_like_complete_pdf(pdf_bytes):
-            return pdf_bytes
-        if not rendered or proc.returncode != 0:
-            logger.warning("Chrome PDF rendering failed for %s", html_path)
-        return None
-
-    return render
-
-
-async def _terminate_process(proc) -> None:
-    if proc.returncode is not None:
-        return
-    proc.kill()
-    await proc.wait()
-
-
-async def _wait_for_pdf_or_process_exit(proc, pdf_path: Path) -> bool:
-    wait_task = asyncio.create_task(proc.wait())
-    last_size = -1
-    stable_reads = 0
-    try:
-        deadline = asyncio.get_running_loop().time() + CHROME_RENDER_TIMEOUT_SECONDS
-        while True:
-            if wait_task.done():
-                return pdf_path.exists()
-            if pdf_path.exists():
-                size = pdf_path.stat().st_size
-                if size == last_size and _looks_like_pdf(pdf_path):
-                    stable_reads += 1
-                    if stable_reads >= 2:
-                        return True
-                else:
-                    stable_reads = 0
-                    last_size = size
-            if asyncio.get_running_loop().time() >= deadline:
-                logger.warning("Chrome PDF rendering timed out for %s", pdf_path.with_suffix(".html"))
-                return pdf_path.exists()
-            await asyncio.sleep(0.5)
-    finally:
-        if not wait_task.done():
-            wait_task.cancel()
-            try:
-                await wait_task
-            except asyncio.CancelledError:
-                pass
-
-
-def _looks_like_pdf(pdf_path: Path) -> bool:
-    try:
-        with pdf_path.open("rb") as handle:
-            return _looks_like_complete_pdf(handle.read())
-    except OSError:
-        return False
 
 
 def _looks_like_complete_pdf(pdf_bytes: bytes) -> bool:
@@ -543,10 +407,6 @@ def _asset_filename(url: str, content_type: str) -> str:
     return f"{hashlib.sha256(url.encode('utf-8')).hexdigest()[:16]}{extension}"
 
 
-def _truthy_env(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _wrap_html(title: str, body: str) -> str:
     escaped_title = html_lib.escape(title, quote=True)
     return f"""<!doctype html>
@@ -569,18 +429,3 @@ pre, code {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
 {body}
 </body>
 </html>"""
-
-
-def _find_chrome() -> str | None:
-    candidates = [
-        os.environ.get("MEMFORGE_CHROME_PATH"),
-        shutil.which("google-chrome"),
-        shutil.which("chrome"),
-        shutil.which("chromium"),
-        shutil.which("chromium-browser"),
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return candidate
-    return None

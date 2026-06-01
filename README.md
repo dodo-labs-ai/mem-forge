@@ -130,9 +130,8 @@ For restricted or slow registry networks, use the bundled mirror profile:
 docker compose --env-file .env.mirrors.example up --build
 ```
 
-The API image uses WeasyPrint for Confluence PDF export and keeps Chrome as an
-optional fallback when `MEMFORGE_PDF_RENDERER=chrome` is configured with a local
-Chrome or Chromium executable.
+The API image uses WeasyPrint for Confluence PDF export and does not require a
+browser runtime.
 When an agent needs backing source content from a Docker-hosted service, it can
 read the returned `content_url` / `pdf_url` provenance links through MemForge's
 artifact endpoints instead of depending on service-local filesystem paths.

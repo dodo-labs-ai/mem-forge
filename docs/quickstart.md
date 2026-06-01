@@ -44,10 +44,8 @@ If either port is already in use, set `MEMFORGE_API_HOST_PORT` or
 `docker compose up --build` command.
 
 The API image uses WeasyPrint for Confluence PDF export. This keeps the
-self-hosted image much lighter than bundling Chromium while preserving
-print-oriented HTML layout for source evidence PDFs. Chrome remains available as
-an explicit fallback for deployments that install Chrome or Chromium and set
-`MEMFORGE_PDF_RENDERER=chrome`.
+self-hosted image much lighter than bundling a browser runtime while preserving
+print-oriented HTML layout for source evidence PDFs.
 
 Runtime data is stored in the `memforge-data` Docker volume. Remove that volume
 only when you intentionally want a clean local instance.
@@ -234,10 +232,7 @@ Plain Confluence roots first try `/wiki/rest/api` and then `/rest/api`; use the
 advanced REST API path field only for deployments that serve Confluence below a
 custom path.
 
-Confluence PDF artifacts are rendered with WeasyPrint by default. Set
-`MEMFORGE_PDF_RENDERER=chrome` only when you need browser-exact rendering and
-have supplied Chrome or Chromium through `MEMFORGE_CHROME_PATH` or the system
-`PATH`.
+Confluence PDF artifacts are rendered with WeasyPrint.
 
 When running the Python service directly on macOS, install WeasyPrint's native
 text-rendering libraries with `brew install pango`. The Docker image already
