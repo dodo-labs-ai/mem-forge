@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 from bs4 import BeautifulSoup
 
-from memforge.genes.confluence_pdf import default_chrome_renderer, export_confluence_page_pdf
+from memforge.genes import confluence_pdf
+from memforge.genes.confluence_pdf import (
+    default_chrome_renderer,
+    default_pdf_renderer,
+    default_weasyprint_renderer,
+    export_confluence_page_pdf,
+)
 
 COMPLETE_PDF = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n"
 
@@ -480,7 +486,7 @@ async def test_export_confluence_page_pdf_escapes_page_title(tmp_path):
 
 @pytest.mark.asyncio
 async def test_export_confluence_page_pdf_returns_none_when_renderer_missing(tmp_path, monkeypatch):
-    monkeypatch.setattr("memforge.genes.confluence_pdf._find_chrome", lambda: None)
+    monkeypatch.setattr("memforge.genes.confluence_pdf.default_pdf_renderer", lambda: None)
     client = RecordingClient()
 
     pdf = await export_confluence_page_pdf(
@@ -494,6 +500,81 @@ async def test_export_confluence_page_pdf_returns_none_when_renderer_missing(tmp
     )
 
     assert pdf is None
+
+
+def test_default_pdf_renderer_prefers_weasyprint_in_auto(monkeypatch):
+    async def fake_weasyprint(_html_path: Path) -> bytes:
+        return COMPLETE_PDF
+
+    monkeypatch.delenv("MEMFORGE_PDF_RENDERER", raising=False)
+    monkeypatch.setattr(confluence_pdf, "default_weasyprint_renderer", lambda: fake_weasyprint)
+    monkeypatch.setattr(confluence_pdf, "default_chrome_renderer", lambda: None)
+
+    assert default_pdf_renderer() is fake_weasyprint
+
+
+@pytest.mark.asyncio
+async def test_default_pdf_renderer_retries_chrome_when_weasyprint_fails(monkeypatch, tmp_path):
+    calls: list[str] = []
+
+    async def fake_weasyprint(_html_path: Path) -> None:
+        calls.append("weasyprint")
+        return None
+
+    async def fake_chrome(_html_path: Path) -> bytes:
+        calls.append("chrome")
+        return COMPLETE_PDF
+
+    monkeypatch.delenv("MEMFORGE_PDF_RENDERER", raising=False)
+    monkeypatch.setattr(confluence_pdf, "default_weasyprint_renderer", lambda: fake_weasyprint)
+    monkeypatch.setattr(confluence_pdf, "default_chrome_renderer", lambda: fake_chrome)
+
+    renderer = default_pdf_renderer()
+
+    assert renderer is not None
+    assert await renderer(tmp_path / "page.html") == COMPLETE_PDF
+    assert calls == ["weasyprint", "chrome"]
+
+
+def test_default_pdf_renderer_falls_back_to_chrome_in_auto(monkeypatch):
+    async def fake_chrome(_html_path: Path) -> bytes:
+        return COMPLETE_PDF
+
+    monkeypatch.delenv("MEMFORGE_PDF_RENDERER", raising=False)
+    monkeypatch.setattr(confluence_pdf, "default_weasyprint_renderer", lambda: None)
+    monkeypatch.setattr(confluence_pdf, "default_chrome_renderer", lambda: fake_chrome)
+
+    assert default_pdf_renderer() is fake_chrome
+
+
+def test_default_pdf_renderer_can_force_chrome(monkeypatch):
+    async def fake_chrome(_html_path: Path) -> bytes:
+        return COMPLETE_PDF
+
+    def fail_weasyprint():
+        raise AssertionError("weasyprint should not be selected when Chrome is forced")
+
+    monkeypatch.setenv("MEMFORGE_PDF_RENDERER", "chrome")
+    monkeypatch.setattr(confluence_pdf, "default_weasyprint_renderer", fail_weasyprint)
+    monkeypatch.setattr(confluence_pdf, "default_chrome_renderer", lambda: fake_chrome)
+
+    assert default_pdf_renderer() is fake_chrome
+
+
+@pytest.mark.asyncio
+async def test_default_weasyprint_renderer_renders_complete_pdf(tmp_path):
+    html_path = tmp_path / "page.html"
+    html_path.write_text("<!doctype html><html><body><h1>Architecture</h1><p>Readable content.</p></body></html>")
+
+    renderer = default_weasyprint_renderer()
+    if renderer is None:
+        pytest.skip("WeasyPrint renderer is not available in this environment")
+
+    pdf = await renderer(html_path)
+
+    assert pdf is not None
+    assert pdf.startswith(b"%PDF-")
+    assert b"%%EOF" in pdf[-2048:]
 
 
 @pytest.mark.asyncio

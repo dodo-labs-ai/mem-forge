@@ -15,10 +15,39 @@ cd mem-forge
 docker compose up --build
 ```
 
+If base images fail to pull from Docker Hub, copy `.env.example` to `.env` and
+set a mirror prefix before rebuilding:
+
+```bash
+cp .env.example .env
+sed -i.bak 's#^MEMFORGE_DOCKERHUB_PREFIX=.*#MEMFORGE_DOCKERHUB_PREFIX=docker.m.daocloud.io/library/#' .env
+docker compose up --build
+```
+
+For restricted or slow registry networks, the repository includes a build mirror
+profile covering Docker Hub, Debian apt, PyPI/uv, and npm:
+
+```bash
+docker compose --env-file .env.mirrors.example up --build
+```
+
+Copy `.env.mirrors.example` to `.env` only when you also want to edit local model
+keys or ports.
+
 Open `http://localhost:5174`. The UI is served by the `admin-ui` container and
 proxies `/api/*` requests to the `api` container.
 
 The API is also available directly at `http://localhost:8765`.
+
+If either port is already in use, set `MEMFORGE_API_HOST_PORT` or
+`MEMFORGE_ADMIN_UI_HOST_PORT` in `.env` and restart with the same
+`docker compose up --build` command.
+
+The API image uses WeasyPrint for Confluence PDF export. This keeps the
+self-hosted image much lighter than bundling Chromium while preserving
+print-oriented HTML layout for source evidence PDFs. Chrome remains available as
+an explicit fallback for deployments that install Chrome or Chromium and set
+`MEMFORGE_PDF_RENDERER=chrome`.
 
 Runtime data is stored in the `memforge-data` Docker volume. Remove that volume
 only when you intentionally want a clean local instance.
@@ -204,3 +233,12 @@ path, and page-tree sync scope. `spaces` is required only for whole-space sync.
 Plain Confluence roots first try `/wiki/rest/api` and then `/rest/api`; use the
 advanced REST API path field only for deployments that serve Confluence below a
 custom path.
+
+Confluence PDF artifacts are rendered with WeasyPrint by default. Set
+`MEMFORGE_PDF_RENDERER=chrome` only when you need browser-exact rendering and
+have supplied Chrome or Chromium through `MEMFORGE_CHROME_PATH` or the system
+`PATH`.
+
+When running the Python service directly on macOS, install WeasyPrint's native
+text-rendering libraries with `brew install pango`. The Docker image already
+includes the required runtime libraries.

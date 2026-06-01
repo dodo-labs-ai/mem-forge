@@ -5,6 +5,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        DOCKERHUB_PREFIX: ${MEMFORGE_DOCKERHUB_PREFIX:-}
+        DEBIAN_MIRROR: ${MEMFORGE_DEBIAN_MIRROR:-}
+        DEBIAN_SECURITY_MIRROR: ${MEMFORGE_DEBIAN_SECURITY_MIRROR:-}
+        PYPI_INDEX_URL: ${MEMFORGE_PYPI_INDEX_URL:-}
     env_file:
       - path: .env
         required: false
@@ -13,7 +18,7 @@ services:
       MEMFORGE_ADMIN_API_PORT: 8765
       MEMFORGE_CORS_ORIGINS: http://localhost:5174,http://127.0.0.1:5174
     ports:
-      - "8765:8765"
+      - "${MEMFORGE_API_HOST_PORT:-8765}:8765"
     volumes:
       - memforge-data:/data
     healthcheck:
@@ -33,11 +38,14 @@ services:
     build:
       context: .
       dockerfile: admin-ui/Dockerfile
+      args:
+        DOCKERHUB_PREFIX: ${MEMFORGE_DOCKERHUB_PREFIX:-}
+        NPM_REGISTRY: ${MEMFORGE_NPM_REGISTRY:-}
     depends_on:
       api:
         condition: service_healthy
     ports:
-      - "5174:8080"
+      - "${MEMFORGE_ADMIN_UI_HOST_PORT:-5174}:8080"
 
 volumes:
   memforge-data:

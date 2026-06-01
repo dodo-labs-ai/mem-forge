@@ -121,6 +121,18 @@ docker compose up --build
 Open `http://localhost:5174`. The compose stack starts the MemForge API, serves
 the admin UI, and keeps local data in the `memforge-data` Docker volume. Copy
 `.env.example` to `.env` when you want to set model keys or local overrides.
+If Docker Hub is slow or blocked in your network, set
+`MEMFORGE_DOCKERHUB_PREFIX` in `.env` to a mirror prefix such as
+`docker.m.daocloud.io/library/`, then rerun the same command.
+For restricted or slow registry networks, use the bundled mirror profile:
+
+```bash
+docker compose --env-file .env.mirrors.example up --build
+```
+
+The API image uses WeasyPrint for Confluence PDF export and keeps Chrome as an
+optional fallback when `MEMFORGE_PDF_RENDERER=chrome` is configured with a local
+Chrome or Chromium executable.
 When an agent needs backing source content from a Docker-hosted service, it can
 read the returned `content_url` / `pdf_url` provenance links through MemForge's
 artifact endpoints instead of depending on service-local filesystem paths.

@@ -8,6 +8,7 @@ import html as html_lib
 import logging
 import os
 import shutil
+import sys
 import tempfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -31,6 +32,10 @@ IMAGE_STREAM_CHUNK_BYTES = 64 * 1024
 IMAGE_DOWNLOAD_CONCURRENCY = 4
 CHROME_RENDER_TIMEOUT_SECONDS = 90.0
 PDF_EXPORT_TIMEOUT_SECONDS = 120.0
+PDF_RENDERER_ENV = "MEMFORGE_PDF_RENDERER"
+PDF_RENDERER_AUTO = "auto"
+PDF_RENDERER_WEASYPRINT = "weasyprint"
+PDF_RENDERER_CHROME = "chrome"
 
 
 async def export_confluence_page_pdf(
@@ -45,9 +50,9 @@ async def export_confluence_page_pdf(
     limiter: Any | None = None,
 ) -> bytes | None:
     """Render a Confluence page's REST export HTML to a local PDF."""
-    renderer = render_pdf if render_pdf is not None else default_chrome_renderer()
+    renderer = render_pdf if render_pdf is not None else default_pdf_renderer()
     if renderer is None:
-        logger.warning("Chrome renderer not found; skipping PDF export for %s", title)
+        logger.warning("PDF renderer not found; skipping PDF export for %s", title)
         return None
 
     request_url = f"{api_prefix}/rest/api/content/{page_id}"
@@ -125,6 +130,80 @@ async def _render_with_timeout(
     except TimeoutError:
         logger.warning("Confluence PDF export timed out for %s", title)
         return None
+
+
+def default_pdf_renderer() -> RenderPdf | None:
+    renderer_name = os.environ.get(PDF_RENDERER_ENV, PDF_RENDERER_AUTO).strip().lower() or PDF_RENDERER_AUTO
+    if renderer_name == PDF_RENDERER_WEASYPRINT:
+        return default_weasyprint_renderer()
+    if renderer_name == PDF_RENDERER_CHROME:
+        return default_chrome_renderer()
+    if renderer_name != PDF_RENDERER_AUTO:
+        logger.warning(
+            "Unknown %s=%r; using auto PDF renderer selection",
+            PDF_RENDERER_ENV,
+            renderer_name,
+        )
+
+    weasyprint_renderer = default_weasyprint_renderer()
+    chrome_renderer = default_chrome_renderer()
+    if weasyprint_renderer is not None and chrome_renderer is not None:
+        return _fallback_renderer(weasyprint_renderer, chrome_renderer)
+    if weasyprint_renderer is not None:
+        return weasyprint_renderer
+    return chrome_renderer
+
+
+def _fallback_renderer(primary: RenderPdf, fallback: RenderPdf) -> RenderPdf:
+    async def render(html_path: Path) -> bytes | None:
+        pdf_bytes = await primary(html_path)
+        if pdf_bytes is not None:
+            return pdf_bytes
+        logger.warning("Primary PDF renderer failed for %s; retrying with Chrome", html_path)
+        return await fallback(html_path)
+
+    return render
+
+
+def default_weasyprint_renderer() -> RenderPdf | None:
+    _prepare_weasyprint_library_path()
+    try:
+        from weasyprint import HTML
+    except Exception as exc:
+        logger.warning("WeasyPrint renderer not available: %s", exc)
+        return None
+
+    async def render(html_path: Path) -> bytes | None:
+        def render_sync() -> bytes:
+            return HTML(filename=str(html_path), base_url=html_path.parent.as_uri()).write_pdf()
+
+        try:
+            pdf_bytes = await asyncio.to_thread(render_sync)
+        except Exception as exc:
+            logger.warning("WeasyPrint PDF rendering failed for %s: %s", html_path, exc)
+            return None
+        if len(pdf_bytes) > MAX_PDF_BYTES:
+            logger.warning("WeasyPrint PDF rendering exceeded size limit for %s", html_path)
+            return None
+        if _looks_like_complete_pdf(pdf_bytes):
+            return pdf_bytes
+        logger.warning("WeasyPrint PDF rendering produced an incomplete PDF for %s", html_path)
+        return None
+
+    return render
+
+
+def _prepare_weasyprint_library_path() -> None:
+    if sys.platform != "darwin":
+        return
+    candidates = ["/opt/homebrew/lib", "/usr/local/lib"]
+    existing = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+    paths = [path for path in existing.split(":") if path]
+    for candidate in candidates:
+        if Path(candidate).exists() and candidate not in paths:
+            paths.append(candidate)
+    if paths:
+        os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(paths)
 
 
 def default_chrome_renderer() -> RenderPdf | None:
