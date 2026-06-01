@@ -55,34 +55,28 @@ docker compose up --build
 Use the Sources screen to add a source and run a sync. The Settings screen can
 also store runtime LLM configuration in the local database.
 
-## 4. Start MCP Tools
+## 4. Install Agent Plugins
 
-Agent clients can call MemForge through MCP. From a source checkout:
+Agent clients call MemForge through a plugin-local MCP proxy. The proxy does
+not need the `memforge` CLI; it talks to the MemForge API started by Docker and
+only writes client-local artifact cache files when `get_resource(mode="file")`
+is called.
 
-```bash
-uv sync --extra dev
-uv run memforge serve
-```
-
-The integration packages under `integrations/` run `memforge serve` by default.
-For a development checkout where `memforge` is not installed globally, point the
-plugin at the checkout executable:
-
-```bash
-export MEMFORGE_MCP_COMMAND="$PWD/.venv/bin/memforge"
-```
-
-Then install the local plugin marketplace:
+Install the local plugin marketplace:
 
 ```bash
 # Codex
 codex plugin marketplace add ./
-codex plugin add memforge-memory@memforge
+codex plugin add memory@memforge
 
 # Claude Code
 claude plugin marketplace add ./
-claude plugin install memforge-memory@memforge
+claude plugin install memory@memforge
 ```
+
+By default the plugins use `http://127.0.0.1:8765`. For a hosted or remote
+service, set `MEMFORGE_API_URL` and optional `MEMFORGE_API_TOKEN` before
+starting the agent client.
 
 ## 5. Development From Source
 

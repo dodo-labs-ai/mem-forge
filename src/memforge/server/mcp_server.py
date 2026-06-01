@@ -255,38 +255,9 @@ def create_mcp_server(
     async def _get_search_engine():
         nonlocal _search_engine
         if _search_engine is None:
-            from memforge.runtime import get_effective_llm_config
-            from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
-            from memforge.retrieval.embeddings import get_chroma_collection
-            from memforge.retrieval.search import SearchEngine
+            from memforge.runtime import build_search_engine
 
-            memory_collection = get_chroma_collection(
-                chroma_path=config.storage.chroma_path, name="memories",
-            )
-            llm = await get_effective_llm_config(db, config)
-            embed_cfg = {
-                "base_url": llm.embedding_base_url,
-                "api_key": llm.embedding_api_key,
-                "model": llm.embedding_model,
-            }
-            structured_llm_client = None
-            if llm.enrichment_api_key:
-                structured_llm_client = LiteLlmStructuredClient(
-                    StructuredLlmConfig(
-                        model=llm.enrichment_model,
-                        base_url=llm.enrichment_base_url or None,
-                        api_key=llm.enrichment_api_key,
-                        timeout_s=llm.request_timeout_s,
-                    )
-                )
-            _search_engine = SearchEngine(
-                db=db,
-                memory_collection=memory_collection,
-                embed_cfg=embed_cfg,
-                config=config.retrieval,
-                structured_llm_client=structured_llm_client,
-                artifact_config=config,
-            )
+            _search_engine = await build_search_engine(db, config)
         return _search_engine
 
     # ------------------------------------------------------------------

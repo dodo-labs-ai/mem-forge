@@ -38,8 +38,9 @@ integrations, with review flows for superseded facts and contradictions.
   gates before persistence.
 - Stores memory, provenance, review state, full-text search, and vector search
   in a local or self-hosted service.
-- Exposes an MCP server so Codex, Claude Code, and other clients can search and
-  submit generated session summaries.
+- Ships thin MCP proxies for Codex, Claude Code, and other clients so agents
+  can search, inspect provenance, and cache source artifacts locally while the
+  service owns memory logic.
 - Provides a React admin UI for source management, review queues, memory detail,
   entity browsing, and runtime settings.
 
@@ -51,7 +52,7 @@ Built-in genes today: `confluence`, `jira`, `github_pages`, `teams`, and
 ```mermaid
 flowchart LR
   Agent["Agent client\nCodex / Claude Code"]
-  Adapter["Thin adapter\nhooks + MCP"]
+  Adapter["Thin adapter\nhooks + local MCP proxy"]
   API["MemForge API"]
   Pipeline["Extraction pipeline\nquality + reconciliation"]
   Store["SQLite + FTS\nChroma vectors"]
@@ -62,13 +63,19 @@ flowchart LR
   API --> Pipeline
   Pipeline --> Store
   UI --> API
-  Agent -->|"search / get_memory / get_resource"| API
+  Agent -->|"MCP tool calls"| Adapter
+  Adapter -->|"search / get_memory / artifacts"| API
 ```
 
 Client adapters collect bounded, redacted evidence windows and upload them to
 `POST /api/agent-sessions/windows`. The service canonicalizes the window,
 generates the package, and queues the source sync. This keeps agent clients
 portable across local and future hosted deployments.
+
+For MCP, Codex and Claude Code talk to a plugin-local proxy over stdio. That
+proxy calls the self-hosted or hosted MemForge API over HTTP(S), so search and
+provenance logic stay service-owned while `get_resource(mode="file")` can still
+return a real path on the agent machine.
 
 ## Quick Start
 
@@ -108,19 +115,21 @@ install the plugin:
 ```bash
 # Codex
 codex plugin marketplace add ./
-codex plugin add memforge-memory@memforge
+codex plugin add memory@memforge
 
 # Claude Code
 claude plugin marketplace add ./
-claude plugin install memforge-memory@memforge
+claude plugin install memory@memforge
 ```
 
-For local development, run `uv sync` and point the plugin MCP server at the
-checkout executable:
+For normal self-hosted use, the plugin talks to the running MemForge API at
+`http://127.0.0.1:8765`. Set `MEMFORGE_API_URL` and optional
+`MEMFORGE_API_TOKEN` only when pointing the plugin at another local or hosted
+service.
 
 ```bash
-export MEMFORGE_MCP_COMMAND="$PWD/.venv/bin/memforge"
-export MEMFORGE_API_URL="http://127.0.0.1:8765"
+export MEMFORGE_API_URL=https://api.example.memforge
+export MEMFORGE_API_TOKEN=...
 ```
 
 Both use the same adapter contract: hook payload in, compact memory context out,
