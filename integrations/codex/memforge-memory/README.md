@@ -24,6 +24,27 @@ codex plugin marketplace add ./
 codex plugin add memory@memforge
 ```
 
+Start a new Codex session after install.
+
+```bash
+# optional
+codex mcp get memforge --json
+```
+
+Try a search:
+
+```text
+Use MemForge to search for "<topic>". Show the top memories with source_url,
+content_url, and pdf_url when present.
+```
+
+Fetch backing evidence:
+
+```text
+Search MemForge for "<topic>". If a result has content_url or pdf_url, call
+get_resource with mode="file" and show the local_path.
+```
+
 The plugin adds context during `SessionStart` and `UserPromptSubmit`, records
 hook lifecycle receipts during `PreCompact` and `Stop`, and queues bounded,
 redacted transcript-window uploads to `/api/agent-sessions/windows`.

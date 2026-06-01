@@ -86,11 +86,40 @@ claude plugin marketplace add ./
 claude plugin install memory@memforge
 ```
 
-By default the plugins use `http://127.0.0.1:8765`. For a hosted or remote
-service, set `MEMFORGE_API_URL` and optional `MEMFORGE_API_TOKEN` before
-starting the agent client.
+By default the plugins use `http://127.0.0.1:8765`. Keep Docker running while
+the agent client is open. For a hosted service, set `MEMFORGE_API_URL` and
+optional `MEMFORGE_API_TOKEN` before starting the agent.
 
-## 5. Development From Source
+Start a new Codex or Claude Code session after installing the plugin.
+
+Optional Codex check:
+
+```bash
+codex mcp get memforge --json
+```
+
+The MCP server should be named `memforge`.
+
+## 5. Query Memory From An Agent
+
+After a source has synced, ask:
+
+```text
+Use MemForge to search for "<topic>". Include source_url, content_url, and
+pdf_url when present.
+```
+
+To fetch backing evidence:
+
+```text
+Search MemForge for "<topic>". If a result has content_url or pdf_url, call
+get_resource with mode="file" and show the local_path.
+```
+
+`local_path` is written by the local plugin under
+`~/.memforge-agent/artifacts`, not by the Docker container.
+
+## 6. Development From Source
 
 Use the source path when you are changing MemForge itself rather than just
 running it locally.
@@ -124,7 +153,7 @@ npm run build
 By default, source-mode runtime data lives under `.memforge/` when you use the
 example environment file. That folder is ignored by git.
 
-## 6. Run A One-Off Sync
+## 7. Run A One-Off Sync
 
 ```bash
 uv run memforge sync
@@ -133,7 +162,7 @@ uv run memforge sync
 Use `uv run memforge sync --source "Source name"` to sync one configured
 source.
 
-## 7. Configure Confluence
+## 8. Configure Confluence
 
 The Confluence source accepts a root, space, or page URL in the **Wiki URL**
 field. This keeps standard and corporate Confluence deployments on the same

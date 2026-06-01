@@ -132,6 +132,22 @@ export MEMFORGE_API_URL=https://api.example.memforge
 export MEMFORGE_API_TOKEN=...
 ```
 
+After installing, start a new Codex or Claude Code session:
+
+```text
+Use MemForge to search for "<topic>". Include source URLs.
+```
+
+To fetch backing evidence:
+
+```text
+Search MemForge for "<topic>". If a result has content_url or pdf_url, call
+get_resource with mode="file" and show the local_path.
+```
+
+`local_path` is written by the local plugin under
+`~/.memforge-agent/artifacts`.
+
 Both use the same adapter contract: hook payload in, compact memory context out,
 and redacted session windows uploaded to the service. See
 [docs/integrations/agent-clients.md](docs/integrations/agent-clients.md) for the

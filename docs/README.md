@@ -2,8 +2,8 @@
 
 Start here if you are new to the repository:
 
-- [Quickstart](quickstart.md): local setup, API/admin UI startup, and agent
-  plugin installation.
+- [Quickstart](quickstart.md): local setup, API/admin UI startup, agent plugin
+  installation, and first memory queries.
 - [API overview](api.md): core Admin API endpoints.
 - [Architecture](architecture.md): service design, memory model, pipeline,
   storage, retrieval, MCP tools, and admin UI boundaries.
