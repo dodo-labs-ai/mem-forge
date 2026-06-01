@@ -1,0 +1,336 @@
+"""HTTP client for MemForge read-tool CLI commands."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import tempfile
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, unquote, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+DEFAULT_API_URL = "http://127.0.0.1:8765"
+DEFAULT_TIMEOUT_SECONDS = 60.0
+
+
+class NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+class ResourceTarget:
+    def __init__(self, doc_id: str, kind: str, relative_url: str, request_url: str) -> None:
+        self.doc_id = doc_id
+        self.kind = kind
+        self.relative_url = relative_url
+        self.request_url = request_url
+
+
+class ToolClient:
+    """HTTP-backed implementation of MCP-aligned CLI read tools."""
+
+    def __init__(
+        self,
+        *,
+        api_url: str | None = None,
+        api_token: str | None = None,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
+        self.api_url = (api_url or os.getenv("MEMFORGE_API_URL") or DEFAULT_API_URL).rstrip("/")
+        self.api_token = api_token if api_token is not None else os.getenv("MEMFORGE_API_TOKEN")
+        self.timeout_seconds = timeout_seconds
+
+    def search(
+        self,
+        *,
+        query: str,
+        top_k: int = 10,
+        memory_types: list[str] | tuple[str, ...] | None = None,
+        sources: list[str] | tuple[str, ...] | None = None,
+        time_range: dict[str, Any] | None = None,
+        entities: list[str] | tuple[str, ...] | None = None,
+        include_superseded: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "query": query,
+            "top_k": top_k,
+            "include_superseded": include_superseded,
+        }
+        if memory_types:
+            body["memory_types"] = list(memory_types)
+        if sources:
+            body["sources"] = list(sources)
+        if time_range:
+            body["time_range"] = time_range
+        if entities:
+            body["entities"] = list(entities)
+        return self._http_json("POST", "/api/memories/search", body)
+
+    def get_memory(self, memory_id: str) -> dict[str, Any]:
+        memory_id = memory_id.strip()
+        if not memory_id:
+            return {"error": "memory_id is required"}
+        return self._http_json("GET", f"/api/memories/{quote(memory_id, safe='')}", None)
+
+    def get_resource(
+        self,
+        *,
+        url: str,
+        mode: str = "text",
+        max_chars: int = 120_000,
+        max_bytes: int = 2_000_000,
+    ) -> dict[str, Any]:
+        mode = str(mode or "text").strip().lower()
+        if mode not in {"text", "file", "base64"}:
+            return {"error": f"unsupported mode: {mode}", "supported_modes": ["text", "file", "base64"]}
+
+        parsed_max_bytes = _positive_int(max_bytes, "max_bytes")
+        if isinstance(parsed_max_bytes, dict):
+            return parsed_max_bytes
+        parsed_max_chars = _positive_int(max_chars, "max_chars")
+        if isinstance(parsed_max_chars, dict):
+            return parsed_max_chars
+
+        target = _parse_resource_url(str(url or "").strip(), self.api_url)
+        if target is None:
+            return {
+                "error": "unsupported resource URL",
+                "hint": (
+                    "Use a relative MemForge /api/documents/{doc_id}/content, /pdf, "
+                    "or /artifacts/{kind} URL, or an absolute URL under MEMFORGE_API_URL."
+                ),
+            }
+
+        try:
+            if mode == "file":
+                return self._fetch_resource_file(target)
+            return self._fetch_resource_inline(
+                target,
+                mode=mode,
+                max_bytes=parsed_max_bytes,
+                max_chars=parsed_max_chars,
+            )
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            return {
+                "error": "resource fetch failed",
+                "status_code": exc.code,
+                "url": target.relative_url,
+                "detail": detail,
+            }
+        except (OSError, URLError) as exc:
+            return {"error": "resource fetch failed", "url": target.relative_url, "detail": str(exc)}
+
+    def _headers(self, *, json_body: bool = False) -> dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if json_body:
+            headers["Content-Type"] = "application/json"
+        if self.api_token:
+            headers["Authorization"] = f"Bearer {self.api_token}"
+        return headers
+
+    def _http_json(self, method: str, path: str, body: dict[str, Any] | None) -> dict[str, Any]:
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        request = Request(
+            f"{self.api_url}{path}",
+            data=data,
+            headers=self._headers(json_body=body is not None),
+            method=method,
+        )
+        try:
+            with build_opener(NoRedirectHandler).open(request, timeout=self.timeout_seconds) as response:
+                raw = response.read()
+                if not raw:
+                    return {}
+                return json.loads(raw.decode("utf-8"))
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            return {"error": "MemForge API request failed", "status_code": exc.code, "detail": detail}
+        except (OSError, URLError, json.JSONDecodeError) as exc:
+            return {"error": "MemForge API unavailable", "api_url": self.api_url, "detail": str(exc)}
+
+    def _fetch_resource_inline(
+        self,
+        target: ResourceTarget,
+        *,
+        mode: str,
+        max_bytes: int,
+        max_chars: int,
+    ) -> dict[str, Any]:
+        request = Request(target.request_url, headers=self._headers(), method="GET")
+        with build_opener(NoRedirectHandler).open(request, timeout=self.timeout_seconds) as response:
+            data = response.read(max_bytes + 1)
+            headers = _lower_headers(response.headers)
+            content_type = headers.get("content-type", "application/octet-stream")
+            metadata = _resource_metadata(target, headers, len(data), mode)
+            if len(data) > max_bytes:
+                return {
+                    **metadata,
+                    "error": "artifact exceeds max_bytes",
+                    "hint": "Use mode=file for large or binary artifacts.",
+                    "max_bytes": max_bytes,
+                }
+            if mode == "base64":
+                return {**metadata, "data_base64": base64.b64encode(data).decode("ascii")}
+            if not _is_text_content_type(content_type):
+                return {
+                    **metadata,
+                    "error": "artifact is not text",
+                    "hint": "Use mode=file or mode=base64 for binary artifacts.",
+                }
+            text = data.decode("utf-8", errors="replace")
+            return {**metadata, "text": text[:max_chars], "truncated": len(text) > max_chars}
+
+    def _fetch_resource_file(self, target: ResourceTarget) -> dict[str, Any]:
+        request = Request(target.request_url, headers=self._headers(), method="GET")
+        tmp_path: Path | None = None
+        try:
+            with build_opener(NoRedirectHandler).open(request, timeout=self.timeout_seconds) as response:
+                headers = _lower_headers(response.headers)
+                filename = _resource_filename(headers, target)
+                digest = hashlib.sha256()
+                observed_size = 0
+                cache_root = _artifact_cache_root()
+                safe_doc = _safe_cache_component(target.doc_id) or "document"
+                safe_kind = _safe_cache_component(target.kind) or "artifact"
+                with tempfile.NamedTemporaryFile(
+                    "wb",
+                    dir=cache_root,
+                    prefix=f".{safe_doc}-{safe_kind}-",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    tmp_path = Path(handle.name)
+                    while True:
+                        chunk = response.read(1024 * 256)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        observed_size += len(chunk)
+                        handle.write(chunk)
+                final_path = _cache_artifact_path(target.doc_id, target.kind, filename, digest.hexdigest()[:16])
+                if final_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+                else:
+                    tmp_path.chmod(0o600)
+                    tmp_path.replace(final_path)
+                return {
+                    **_resource_metadata(target, headers, observed_size, "file"),
+                    "local_path": str(final_path),
+                    "cleanup": "temporary-cache",
+                }
+        except Exception:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+            raise
+
+
+def _parse_resource_url(url: str, api_base_url: str) -> ResourceTarget | None:
+    parsed = urlparse(url)
+    base = urlparse(api_base_url)
+    if parsed.query or parsed.fragment:
+        return None
+
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme not in {"http", "https"}:
+            return None
+        if parsed.scheme != base.scheme or parsed.netloc != base.netloc:
+            return None
+        path = parsed.path
+    else:
+        path = url
+
+    if not path.startswith("/"):
+        path = f"/{path}"
+
+    parts = [unquote(part) for part in path.strip("/").split("/") if part]
+    if any(part in {".", ".."} or "/" in part or "\\" in part for part in parts):
+        return None
+    if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "content":
+        return ResourceTarget(parts[2], "content", path, f"{api_base_url}{path}")
+    if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "pdf":
+        return ResourceTarget(parts[2], "pdf", path, f"{api_base_url}{path}")
+    if len(parts) == 5 and parts[:2] == ["api", "documents"] and parts[3] == "artifacts":
+        return ResourceTarget(parts[2], parts[4], path, f"{api_base_url}{path}")
+    return None
+
+
+def _positive_int(raw_value: object, name: str) -> int | dict[str, Any]:
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return {"error": f"invalid {name}", "detail": f"{name} must be a positive integer."}
+    if value <= 0:
+        return {"error": f"invalid {name}", "detail": f"{name} must be a positive integer."}
+    return value
+
+
+def _resource_metadata(
+    target: ResourceTarget,
+    headers: dict[str, str],
+    observed_size: int,
+    mode: str,
+) -> dict[str, Any]:
+    return {
+        "doc_id": target.doc_id,
+        "kind": target.kind,
+        "content_type": headers.get("content-type", "application/octet-stream"),
+        "filename": _resource_filename(headers, target),
+        "size_bytes": _response_size_bytes(headers, observed_size),
+        "url": target.relative_url,
+        "mode": mode,
+    }
+
+
+def _lower_headers(headers: Any) -> dict[str, str]:
+    return {str(k).lower(): str(v) for k, v in headers.items()}
+
+
+def _response_size_bytes(headers: dict[str, str], fallback: int) -> int:
+    try:
+        return int(headers.get("content-length") or fallback)
+    except ValueError:
+        return fallback
+
+
+def _resource_filename(headers: dict[str, str], target: ResourceTarget) -> str:
+    disposition = headers.get("content-disposition", "")
+    match = re.search(r'filename="?([^";]+)"?', disposition)
+    if match:
+        return Path(match.group(1)).name
+    suffix = ".pdf" if target.kind == "pdf" else ".md" if target.kind == "content" else ".bin"
+    return f"{target.doc_id}-{target.kind}{suffix}"
+
+
+def _is_text_content_type(media_type: str) -> bool:
+    normalized = media_type.split(";", 1)[0].strip().lower()
+    return normalized.startswith("text/") or normalized in {
+        "application/json",
+        "application/xml",
+        "application/xhtml+xml",
+    }
+
+
+def _artifact_cache_root() -> Path:
+    cache_root = Path(
+        os.getenv("MEMFORGE_ARTIFACT_CACHE_DIR")
+        or (Path.home() / ".memforge-agent" / "artifacts")
+    ).expanduser()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    return cache_root
+
+
+def _safe_cache_component(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
+
+
+def _cache_artifact_path(doc_id: str, kind: str, filename: str, digest: str) -> Path:
+    safe_doc = _safe_cache_component(doc_id) or "document"
+    safe_kind = _safe_cache_component(kind) or "artifact"
+    suffix = Path(filename).suffix or ".bin"
+    return _artifact_cache_root() / f"{safe_doc}-{safe_kind}-{digest}{suffix}"

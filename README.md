@@ -102,6 +102,17 @@ For detailed setup, configuration, and first-source examples, see
 
 The complete docs map is in [docs/README.md](docs/README.md).
 
+You can also exercise the same read path from the CLI:
+
+```bash
+uv run memforge search "docker artifact provenance"
+uv run memforge get-memory mem-123
+uv run memforge get-resource /api/documents/doc-456/pdf --mode file
+```
+
+The CLI uses `MEMFORGE_API_URL` and optional `MEMFORGE_API_TOKEN` when set;
+otherwise it targets the local Admin API port from config.
+
 ## Agent Integrations
 
 Installable local plugin packages live under:

@@ -119,7 +119,29 @@ get_resource with mode="file" and show the local_path.
 `local_path` is written by the local plugin under
 `~/.memforge-agent/artifacts`, not by the Docker container.
 
-## 6. Development From Source
+## 6. Query Memory From The CLI
+
+The CLI mirrors the practical MCP read flow for local debugging and scripted
+checks. It calls the MemForge API instead of reading SQLite directly.
+
+```bash
+uv run memforge search "docker artifact provenance"
+uv run memforge get-memory mem-123
+uv run memforge get-resource /api/documents/doc-456/pdf --mode file
+```
+
+`get-resource --mode file` writes to the same client-local artifact cache used
+by the MCP proxy: `~/.memforge-agent/artifacts`.
+
+For hosted MemForge, set the same environment variables used by the agent
+plugins before running these commands:
+
+```bash
+export MEMFORGE_API_URL=https://api.example.memforge
+export MEMFORGE_API_TOKEN=...
+```
+
+## 7. Development From Source
 
 Use the source path when you are changing MemForge itself rather than just
 running it locally.
