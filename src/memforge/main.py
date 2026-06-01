@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 from pathlib import Path
 
 import click
@@ -12,6 +14,7 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 from memforge.config import AppConfig, load_config
+from memforge.tool_client import ToolClient
 
 console = Console()
 log_console = Console(stderr=True)
@@ -33,6 +36,24 @@ async def _get_db(config: AppConfig):
     db = Database(config.storage.db_path)
     await db.connect()
     return db
+
+
+def _default_api_url(config: AppConfig) -> str:
+    return os.getenv("MEMFORGE_API_URL") or f"http://127.0.0.1:{config.server.admin_api_port}"
+
+
+def _tool_client(ctx) -> ToolClient:
+    config: AppConfig = ctx.obj["config"]
+    return ToolClient(
+        api_url=_default_api_url(config),
+        api_token=os.getenv("MEMFORGE_API_TOKEN"),
+    )
+
+
+def _emit_tool_payload(ctx, payload: dict) -> None:
+    click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+    if payload.get("error"):
+        ctx.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +205,78 @@ def sync(ctx, source: str | None):
         console.print("\n[bold green]Sync complete![/]")
 
     asyncio.run(_run())
+
+
+@cli.command("search")
+@click.argument("query")
+@click.option("--top-k", default=10, show_default=True, type=int, help="Maximum number of results.")
+@click.option(
+    "--type",
+    "memory_types",
+    multiple=True,
+    type=click.Choice(["fact", "decision", "convention", "procedure"]),
+    help="Filter by memory type. Repeat for multiple types.",
+)
+@click.option("--source", "sources", multiple=True, help="Filter by source name or ID. Repeat for multiple sources.")
+@click.option("--entity", "entities", multiple=True, help="Entity hint. Repeat for multiple entities.")
+@click.option("--after", default=None, help="Only include results after this ISO date.")
+@click.option("--before", default=None, help="Only include results before this ISO date.")
+@click.option("--include-superseded", is_flag=True, help="Include superseded memories.")
+@click.pass_context
+def search(
+    ctx,
+    query: str,
+    top_k: int,
+    memory_types: tuple[str, ...],
+    sources: tuple[str, ...],
+    entities: tuple[str, ...],
+    after: str | None,
+    before: str | None,
+    include_superseded: bool,
+):
+    """Search MemForge using the same service path as the MCP search tool."""
+    time_range = {k: v for k, v in {"after": after, "before": before}.items() if v}
+    kwargs: dict = {
+        "query": query,
+        "top_k": top_k,
+        "include_superseded": include_superseded,
+    }
+    if memory_types:
+        kwargs["memory_types"] = list(memory_types)
+    if sources:
+        kwargs["sources"] = list(sources)
+    if entities:
+        kwargs["entities"] = list(entities)
+    if time_range:
+        kwargs["time_range"] = time_range
+    payload = _tool_client(ctx).search(**kwargs)
+    _emit_tool_payload(ctx, payload)
+
+
+@cli.command("get-memory")
+@click.argument("memory_id")
+@click.pass_context
+def get_memory(ctx, memory_id: str):
+    """Fetch full memory detail and provenance by memory ID."""
+    payload = _tool_client(ctx).get_memory(memory_id)
+    _emit_tool_payload(ctx, payload)
+
+
+@cli.command("get-resource")
+@click.argument("url")
+@click.option("--mode", default="text", show_default=True, type=click.Choice(["text", "file", "base64"]))
+@click.option("--max-chars", default=120_000, show_default=True, type=int, help="Maximum text characters to print.")
+@click.option("--max-bytes", default=2_000_000, show_default=True, type=int, help="Maximum bytes for inline modes.")
+@click.pass_context
+def get_resource(ctx, url: str, mode: str, max_chars: int, max_bytes: int):
+    """Fetch a source artifact URL returned by search or get-memory."""
+    payload = _tool_client(ctx).get_resource(
+        url=url,
+        mode=mode,
+        max_chars=max_chars,
+        max_bytes=max_bytes,
+    )
+    _emit_tool_payload(ctx, payload)
 
 
 @cli.command()
