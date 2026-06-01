@@ -24,6 +24,22 @@ claude plugin marketplace add ./
 claude plugin install memory@memforge
 ```
 
+Start a new Claude Code session after install.
+
+Try a search:
+
+```text
+Use MemForge to search for "<topic>". Show the top memories with source_url,
+content_url, and pdf_url when present.
+```
+
+Fetch backing evidence:
+
+```text
+Search MemForge for "<topic>". If a result has content_url or pdf_url, call
+get_resource with mode="file" and show the local_path.
+```
+
 The plugin adds context during `SessionStart` and `UserPromptSubmit`, records
 hook lifecycle receipts during `PreCompact`, `Stop`, and `SubagentStop`, and
 queues bounded, redacted transcript-window uploads to
