@@ -1,9 +1,9 @@
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Files, Loader2, MoreHorizontal, Play, Plus, RefreshCw, SlidersHorizontal, Trash2 } from "lucide-react";
+import { Files, Info, Loader2, MoreHorizontal, Play, Plus, RefreshCw, SlidersHorizontal, Trash2 } from "lucide-react";
 import client from "@/api/client";
-import type { GeneMetadata, Source } from "@/api/types";
+import type { AgentSessionCompleteness, GeneMetadata, Source, SourceProjectsResponse } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
 import { EmptyState } from "@/components/admin/EmptyState";
@@ -22,10 +22,12 @@ import {
 } from "@/components/ui/dialog";
 import { timeAgo } from "@/utils/date";
 import { SourceConfigDialog } from "./SourceConfigDialog";
+import { canConfigureSourceType, canDeleteSourceType, isManagedSourceType, userConfigurableGenes } from "./managedSources";
 import { getSourceActionEndpoint, getSourceMenuStyle, sourceActionLayout } from "./sourceActions";
 import { TeamsSourceWizard } from "./TeamsSourceWizard";
 
 const SOURCE_LABELS: Record<string, { name: string; subtitle: string; description: string }> = {
+  agent_session: { name: "Agent Session", subtitle: "Managed source", description: "Generated coding-agent session summaries" },
   confluence: { name: "Confluence", subtitle: "Knowledge source", description: "Wiki pages and documentation" },
   github_pages: { name: "GitHub Pages", subtitle: "Documentation source", description: "Published documentation pages" },
   jira: { name: "Jira", subtitle: "Work tracking source", description: "Tickets, decisions, and work items" },
@@ -33,6 +35,7 @@ const SOURCE_LABELS: Record<string, { name: string; subtitle: string; descriptio
 };
 
 const SOURCE_DOTS: Record<string, string> = {
+  agent_session: "bg-cyan-500",
   confluence: "bg-blue-500",
   github_pages: "bg-slate-500",
   jira: "bg-emerald-500",
@@ -41,6 +44,7 @@ const SOURCE_DOTS: Record<string, string> = {
 };
 
 const SOURCE_ITEM_LABELS: Record<string, string> = {
+  agent_session: "summaries",
   confluence: "pages",
   github_pages: "documents",
   jira: "issues",
@@ -65,6 +69,7 @@ export function SourcesPage() {
     sourceType: string | null;
     source?: Source | null;
   }>({ sourceType: null, source: null });
+  const [detailsSource, setDetailsSource] = useState<Source | null>(null);
   const [openMenuSourceId, setOpenMenuSourceId] = useState<string | null>(null);
   const [sourcePendingDelete, setSourcePendingDelete] = useState<Source | null>(null);
   const [pendingSyncIds, setPendingSyncIds] = useState<Set<string>>(new Set());
@@ -175,6 +180,8 @@ export function SourcesPage() {
             {sources.map((source) => {
               const isSyncing = source.sync?.status === "running" || pendingSyncIds.has(source.id);
               const isDeleting = deleteSource.isPending && sourcePendingDelete?.id === source.id;
+              const canConfigure = canConfigureSourceType(source.type);
+              const isManaged = isManagedSourceType(source.type);
               const gene = geneByName.get(source.type);
               const sourceLabel = SOURCE_LABELS[source.type] ?? {
                 name: gene?.display_name ?? source.type,
@@ -199,6 +206,11 @@ export function SourcesPage() {
                           {sourceLabel?.name ?? source.type}
                           {sourceLabel?.subtitle ? ` · ${sourceLabel.subtitle}` : ""}
                         </p>
+                        {source.type === "agent_session" && (
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            Populated automatically by Codex and Claude Code plugins.
+                          </p>
+                        )}
                         <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-sm text-muted-foreground">
                           <span>
                             <span className="font-medium text-foreground">{source.doc_count}</span> {itemLabel}
@@ -217,16 +229,30 @@ export function SourcesPage() {
                     </div>
 
                     <div className="flex items-center justify-end gap-2 sm:shrink-0">
-                      <Button
-                        type="button"
-                        variant="outline"
-                        aria-label="Configure source"
-                        disabled={isDeleting}
-                        onClick={() => setConfigDialog({ sourceType: source.type, source })}
-                      >
-                        <SlidersHorizontal className="size-4" />
-                        <span className="hidden lg:inline">{sourceActionLayout.primary[0].label}</span>
-                      </Button>
+                      {isManaged && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          aria-label="View managed source details"
+                          disabled={isDeleting}
+                          onClick={() => setDetailsSource(source)}
+                        >
+                          <Info className="size-4" />
+                          <span className="hidden lg:inline">Details</span>
+                        </Button>
+                      )}
+                      {canConfigure && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          aria-label="Configure source"
+                          disabled={isDeleting}
+                          onClick={() => setConfigDialog({ sourceType: source.type, source })}
+                        >
+                          <SlidersHorizontal className="size-4" />
+                          <span className="hidden lg:inline">{sourceActionLayout.primary[0].label}</span>
+                        </Button>
+                      )}
                       <Button
                         type="button"
                         disabled={isSyncing || isDeleting}
@@ -292,6 +318,13 @@ export function SourcesPage() {
         source={configDialog.source}
       />
 
+      <AgentSessionDetailsDialog
+        source={detailsSource}
+        onOpenChange={(open) => {
+          if (!open) setDetailsSource(null);
+        }}
+      />
+
       <TeamsSourceWizard
         open={teamsWizardOpen}
         onOpenChange={setTeamsWizardOpen}
@@ -337,6 +370,7 @@ function SourceActionsMenu({
   const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
   const forceResync = sourceActionLayout.menu.find((action) => action.id === "force-resync");
   const deleteAction = sourceActionLayout.menu.find((action) => action.id === "delete");
+  const canDelete = canDeleteSourceType(source.type);
 
   useLayoutEffect(() => {
     if (!open || !triggerRef.current || !menuRef.current) return;
@@ -392,7 +426,7 @@ function SourceActionsMenu({
               triggerBottom: rect.bottom,
               viewportWidth: window.innerWidth,
               viewportHeight: window.innerHeight,
-              menuHeight: 224,
+              menuHeight: canDelete ? 224 : 96,
             }));
           }
           onOpenChange(!open);
@@ -421,24 +455,203 @@ function SourceActionsMenu({
               <span className="mt-0.5 block text-xs">{forceResync?.description}</span>
             </span>
           </button>
-          <div className="my-1 h-px bg-border" />
-          <button
-            type="button"
-            role="menuitem"
-            className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
-            onClick={onDelete}
-          >
-            <Trash2 className="mt-0.5 size-4" />
-            <span>
-              <span className="block font-medium">{deleteAction?.label}</span>
-              <span className="mt-0.5 block text-xs text-destructive/80">{deleteAction?.description}</span>
-            </span>
-          </button>
+          {canDelete && (
+            <>
+              <div className="my-1 h-px bg-border" />
+              <button
+                type="button"
+                role="menuitem"
+                className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
+                onClick={onDelete}
+              >
+                <Trash2 className="mt-0.5 size-4" />
+                <span>
+                  <span className="block font-medium">{deleteAction?.label}</span>
+                  <span className="mt-0.5 block text-xs text-destructive/80">{deleteAction?.description}</span>
+                </span>
+              </button>
+            </>
+          )}
         </div>,
         document.body,
       )}
     </div>
   );
+}
+
+function AgentSessionDetailsDialog({
+  source,
+  onOpenChange,
+}: {
+  source: Source | null;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const open = Boolean(source);
+  const projectsQuery = useQuery<SourceProjectsResponse>({
+    queryKey: ["source-projects", source?.id],
+    queryFn: () => {
+      if (!source) throw new Error("source is required");
+      return client.get(`/api/sources/${source.id}/projects`).then((response) => response.data);
+    },
+    enabled: open && source?.type === "agent_session",
+  });
+  const completenessQuery = useQuery<AgentSessionCompleteness>({
+    queryKey: ["agent-session-completeness", source?.id],
+    queryFn: () => {
+      if (!source) throw new Error("source is required");
+      return client
+        .get("/api/agent-sessions/completeness", { params: { source_id: source.id } })
+        .then((response) => response.data);
+    },
+    enabled: open && source?.type === "agent_session",
+  });
+
+  if (!source) return null;
+
+  const counts = completenessQuery.data?.counts ?? {};
+  const projects = projectsQuery.data?.projects ?? [];
+  const memoriesCreated = source.memory_count ?? 0;
+  const keptSummaries = counts.package_created ?? 0;
+  const skippedLowSignal = counts.no_output ?? 0;
+  const failedCount = counts.failed ?? 0;
+  const latestFailure = completenessQuery.data?.latest_failure ?? null;
+  const totalProcessed = completenessQuery.data?.processed_total ?? keptSummaries + skippedLowSignal;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Agent Session Summaries</DialogTitle>
+          <DialogDescription>
+            Automatic memory source populated by coding-agent plugins.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <DetailMetric
+            label="Memories created"
+            value={formatCount(memoriesCreated)}
+            tone="primary"
+          />
+          <DetailMetric
+            label="Kept summaries"
+            value={formatCount(keptSummaries)}
+            tone="primary"
+          />
+        </div>
+
+        <p className="text-xs text-muted-foreground">
+          Most agent-session windows are conversational or temporary. MemForge keeps
+          only windows likely to help future work and skips the rest as low-signal.
+        </p>
+
+        <details className="rounded-lg border bg-muted/30 text-xs">
+          <summary className="cursor-pointer select-none px-3 py-2 text-muted-foreground hover:text-foreground">
+            Operational details
+          </summary>
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-1 px-3 pb-3 text-muted-foreground">
+            <dt>Windows processed</dt>
+            <dd className="text-right font-medium text-foreground">{formatCount(totalProcessed)}</dd>
+            <dt>Kept summaries</dt>
+            <dd className="text-right font-medium text-foreground">{formatCount(keptSummaries)}</dd>
+            <dt>Skipped low-signal</dt>
+            <dd className="text-right font-medium text-foreground">{formatCount(skippedLowSignal)}</dd>
+            <dt>Needs retry</dt>
+            <dd className="text-right font-medium text-foreground">{formatCount(failedCount)}</dd>
+          </dl>
+          {latestFailure && (
+            <div className="border-t px-3 py-2 text-muted-foreground">
+              <div className="font-medium text-foreground">Latest retry reason</div>
+              {latestFailure.reason && (
+                <div className="mt-1 truncate" title={latestFailure.reason}>
+                  {latestFailure.reason}
+                </div>
+              )}
+              {latestFailure.last_seen_at && (
+                <div className="mt-1">
+                  Last seen {timeAgo(latestFailure.last_seen_at)}
+                </div>
+              )}
+            </div>
+          )}
+        </details>
+
+        <div>
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-sm font-medium">Projects with extracted memory</h3>
+            <span className="text-xs text-muted-foreground">
+              {memoriesCreated} memories
+            </span>
+          </div>
+
+          <div className="mt-2 overflow-hidden rounded-lg border">
+            {projectsQuery.isPending ? (
+              <div className="flex items-center gap-2 p-3 text-sm text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" />
+                Loading projects...
+              </div>
+            ) : projectsQuery.isError ? (
+              <div className="p-3 text-sm text-destructive">
+                Failed to load project summary.
+              </div>
+            ) : projects.length === 0 ? (
+              <div className="p-3 text-sm text-muted-foreground">
+                No projects observed yet.
+              </div>
+            ) : (
+              <div className="divide-y">
+                {projects.map((project) => (
+                  <div key={project.project} className="grid gap-2 p-3 text-sm sm:grid-cols-[1fr_auto_auto_auto] sm:items-center">
+                    <div className="min-w-0 font-medium">{project.project}</div>
+                    <div className="text-muted-foreground">
+                      <span className="font-medium text-foreground">{project.document_count}</span> summaries
+                    </div>
+                    <div className="text-muted-foreground">
+                      <span className="font-medium text-foreground">{project.memory_count}</span> memories
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {timeAgo(project.last_observed_at)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <DialogFooter showCloseButton />
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function DetailMetric({
+  label,
+  value,
+  tone = "default",
+}: {
+  label: string;
+  value: string;
+  tone?: "default" | "primary";
+}) {
+  return (
+    <div className="rounded-lg border p-3">
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div
+        className={
+          tone === "primary"
+            ? "mt-1 text-2xl font-semibold tracking-tight text-foreground"
+            : "mt-1 text-lg font-semibold"
+        }
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function formatCount(value: number | undefined): string {
+  return (value ?? 0).toLocaleString();
 }
 
 function authSessionLabel(status: string) {
@@ -472,6 +685,8 @@ function AddSourceDialog({
   onTeamsSelected: () => void;
   onConfigureSelected: (sourceType: string) => void;
 }) {
+  const configurableGenes = userConfigurableGenes(genes);
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg">
@@ -489,7 +704,7 @@ function AddSourceDialog({
               Loading source types...
             </div>
           )}
-          {!isLoading && genes.map((gene) => {
+          {!isLoading && configurableGenes.map((gene) => {
             const source = SOURCE_LABELS[gene.name] ?? {
               name: gene.display_name,
               subtitle: gene.data_shape,

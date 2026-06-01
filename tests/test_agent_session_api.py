@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
+from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.storage.database import Database
 
 
@@ -16,6 +18,51 @@ def _config(tmp_path: Path) -> AppConfig:
     cfg.llm.enrichment_api_key = ""
     cfg.llm.embedding_api_key = ""
     return cfg
+
+
+async def _seed_source_project(
+    db: Database,
+    *,
+    doc_id: str,
+    project: str,
+    last_modified: datetime,
+    memory_ids: list[str],
+) -> None:
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            source="src-agent-sessions",
+            source_url=f"agent-session://codex/sess/{doc_id}",
+            title=f"Agent Session {doc_id}",
+            space_or_project=project,
+            author="codex",
+            last_modified=last_modified,
+            labels=[],
+            version=f"version-{doc_id}",
+            content_hash=f"hash-{doc_id}",
+            token_count=100,
+            raw_content_uri=None,
+            raw_content_type="application/json",
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=last_modified,
+        )
+    )
+    for memory_id in memory_ids:
+        memory = Memory(
+            id=memory_id,
+            memory_type="fact",
+            content=f"Memory {memory_id}",
+            content_hash=content_hash(f"Memory {memory_id}"),
+            project_key=project,
+            tags=["agent-session"],
+            confidence=0.9,
+            created_at=last_modified,
+            updated_at=last_modified,
+            status="active",
+        )
+        await db.insert_memory(memory)
+        await db.add_memory_source(memory.id, doc_id, "agent_session")
 
 
 def test_agent_session_window_prompt_uses_memory_quality_gate():
@@ -83,6 +130,74 @@ def test_agent_session_document_submit_api_records_generated_source(tmp_path):
         assert body["sync_started"] is False
         assert body["receipt"]["client"] == "codex"
         assert Path(body["document_uri"]).exists()
+    finally:
+        asyncio.run(database.close())
+
+
+def test_source_projects_endpoint_groups_agent_session_memory_by_project(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+    base_time = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+
+    async def _setup():
+        await database.connect()
+        await database.upsert_source(
+            "src-agent-sessions",
+            "agent_session",
+            "Agent Session Summaries",
+            json.dumps({}),
+        )
+        await _seed_source_project(
+            database,
+            doc_id="agent-doc-mem-inception-1",
+            project="mem-inception",
+            last_modified=base_time,
+            memory_ids=["mem-agent-1"],
+        )
+        await _seed_source_project(
+            database,
+            doc_id="agent-doc-mem-inception-2",
+            project="mem-inception",
+            last_modified=base_time + timedelta(minutes=5),
+            memory_ids=["mem-agent-2"],
+        )
+        await _seed_source_project(
+            database,
+            doc_id="agent-doc-payroll-1",
+            project="payroll-processing-service",
+            last_modified=base_time - timedelta(days=1),
+            memory_ids=["mem-agent-3"],
+        )
+
+    import asyncio
+
+    asyncio.run(_setup())
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            response = client.get("/api/sources/src-agent-sessions/projects")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body == {
+            "source_id": "src-agent-sessions",
+            "projects": [
+                {
+                    "project": "mem-inception",
+                    "document_count": 2,
+                    "memory_count": 2,
+                    "last_observed_at": "2026-06-01T10:05:00+00:00",
+                },
+                {
+                    "project": "payroll-processing-service",
+                    "document_count": 1,
+                    "memory_count": 1,
+                    "last_observed_at": "2026-05-31T10:00:00+00:00",
+                },
+            ],
+        }
     finally:
         asyncio.run(database.close())
 
@@ -746,8 +861,14 @@ def _make_receipt(
     outcome,
     source_id="src-agent-sessions",
     source_kind="generated_agent_window_summary",
+    reason=None,
+    updated_at=None,
 ):
     from memforge.models import AgentSessionReceipt
+
+    metadata: dict = {"outcome": outcome}
+    if reason is not None:
+        metadata["reason"] = reason
 
     return AgentSessionReceipt(
         doc_id=doc_id,
@@ -766,7 +887,8 @@ def _make_receipt(
         document_hash="sha256:deadbeef",
         source_kind=source_kind,
         document_uri="",
-        metadata={"outcome": outcome},
+        metadata=metadata,
+        updated_at=updated_at,
     )
 
 
@@ -806,6 +928,52 @@ def test_summarize_empty_session_returns_zero_fraction(tmp_path):
             assert summary["processed_total"] == 0
             assert summary["counts"] == {"package_created": 0, "no_output": 0, "failed": 0}
             assert summary["no_output_fraction"] == 0.0
+            assert summary["latest_failure"] is None
+        finally:
+            await database.close()
+
+    asyncio.run(_run())
+
+
+def test_summarize_agent_session_outcomes_includes_latest_failure(tmp_path):
+    database = Database(str(tmp_path / "api.db"))
+    import asyncio
+
+    async def _run():
+        await database.connect()
+        try:
+            await database.upsert_agent_session_receipt(
+                _make_receipt(
+                    doc_id="fail-1",
+                    session_id="sess-fail",
+                    outcome="failed",
+                    reason="LLM timeout",
+                    updated_at="2026-05-29T00:00:00+00:00",
+                )
+            )
+            await database.upsert_agent_session_receipt(
+                _make_receipt(
+                    doc_id="fail-2",
+                    session_id="sess-fail",
+                    outcome="failed",
+                    reason="schema validation error",
+                    updated_at="2026-05-30T12:00:00+00:00",
+                )
+            )
+            await database.upsert_agent_session_receipt(
+                _make_receipt(
+                    doc_id="ok-1",
+                    session_id="sess-fail",
+                    outcome="package_created",
+                )
+            )
+            summary = await database.summarize_agent_session_outcomes(session_id="sess-fail")
+            assert summary["counts"]["failed"] == 2
+            assert summary["latest_failure"] == {
+                "count": 2,
+                "reason": "schema validation error",
+                "last_seen_at": "2026-05-30T12:00:00+00:00",
+            }
         finally:
             await database.close()
 
@@ -840,6 +1008,7 @@ def test_agent_session_completeness_endpoint(tmp_path):
         assert body["processed_total"] == 2
         assert body["counts"] == {"package_created": 1, "no_output": 1, "failed": 0}
         assert body["no_output_fraction"] == 0.5
+        assert body["latest_failure"] is None
     finally:
         asyncio.run(database.close())
 

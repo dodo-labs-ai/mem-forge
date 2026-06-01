@@ -2412,8 +2412,15 @@ class Database:
         threshold, no background job. Explicit-document receipts and receipts
         without a recognized outcome are ignored so the fraction stays
         well-defined.
+
+        When at least one failed receipt is present, ``latest_failure`` carries
+        ``count``, ``reason`` (latest), and ``last_seen_at`` so the admin UI can
+        surface an operational warning without a second query.
         """
-        query = "SELECT metadata FROM agent_session_receipts WHERE source_kind = ?"
+        query = (
+            "SELECT metadata, updated_at FROM agent_session_receipts "
+            "WHERE source_kind = ?"
+        )
         params: list = [AGENT_SESSION_WINDOW_SOURCE_KIND]
         if session_id:
             query += " AND session_id = ?"
@@ -2423,6 +2430,8 @@ class Database:
             params.append(source_id)
 
         counts = {outcome: 0 for outcome in AGENT_SESSION_OUTCOMES}
+        latest_failure_reason: str | None = None
+        latest_failure_seen_at: str | None = None
         async with self.db.execute(query, params) as cursor:
             async for row in cursor:
                 try:
@@ -2432,6 +2441,15 @@ class Database:
                 outcome = metadata.get("outcome") if isinstance(metadata, dict) else None
                 if outcome in counts:
                     counts[outcome] += 1
+                if outcome == AGENT_SESSION_OUTCOME_FAILED:
+                    seen_at = row[1]
+                    if seen_at and (
+                        latest_failure_seen_at is None
+                        or seen_at > latest_failure_seen_at
+                    ):
+                        latest_failure_seen_at = seen_at
+                        reason = metadata.get("reason") if isinstance(metadata, dict) else None
+                        latest_failure_reason = reason if isinstance(reason, str) else None
 
         total = sum(counts.values())
         processed_total = (
@@ -2443,6 +2461,13 @@ class Database:
             if processed_total
             else 0.0
         )
+        latest_failure: dict | None = None
+        if counts[AGENT_SESSION_OUTCOME_FAILED]:
+            latest_failure = {
+                "count": counts[AGENT_SESSION_OUTCOME_FAILED],
+                "reason": latest_failure_reason,
+                "last_seen_at": latest_failure_seen_at,
+            }
         return {
             "session_id": session_id,
             "source_id": source_id,
@@ -2450,6 +2475,7 @@ class Database:
             "processed_total": processed_total,
             "counts": counts,
             "no_output_fraction": no_output_fraction,
+            "latest_failure": latest_failure,
         }
 
     async def upsert_agent_hook_receipt(self, receipt: AgentHookReceipt) -> None:

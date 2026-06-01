@@ -26,6 +26,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  applyConfluenceUrlInference,
+  isConfluenceFieldRequired,
+  isConfluenceFieldVisible,
+  parseConfluenceWikiUrl,
+} from "./confluenceConfig";
+import type { ParsedConfluenceWikiUrl } from "./confluenceConfig";
+import { canConfigureSourceType } from "./managedSources";
 
 type ConfigValue = string | number | boolean | string[] | null;
 type ConfigForm = Record<string, ConfigValue>;
@@ -47,10 +55,10 @@ export function SourceConfigDialog({
     queryKey: ["gene-config-schema", sourceType],
     queryFn: () =>
       client.get(`/api/genes/${sourceType}/config-schema`).then((response) => response.data),
-    enabled: open && Boolean(sourceType),
+    enabled: open && Boolean(sourceType) && canConfigureSourceType(sourceType ?? ""),
   });
 
-  if (!sourceType) return null;
+  if (!sourceType || !canConfigureSourceType(sourceType)) return null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -111,6 +119,10 @@ function SourceConfigForm({
   }));
   const authMode = stringValue(config.auth_mode) || "browser_cookie";
   const jiraBaseUrl = stringValue(config.base_url).trim();
+  const confluenceUrlInfo = useMemo(
+    () => sourceType === "confluence" ? parseConfluenceWikiUrl(stringValue(config.base_url)) : null,
+    [config.base_url, sourceType],
+  );
 
   const jiraSessionQuery = useQuery<JiraAuthSession>({
     queryKey: ["jira-session", jiraBaseUrl],
@@ -182,7 +194,13 @@ function SourceConfigForm({
   const previewReady = requiredFieldsAreFilled(sourceType, schema.fields, config);
 
   const updateField = (field: ConfigField, value: ConfigValue) => {
-    setConfig((current) => ({ ...current, [field.key]: value }));
+    setConfig((current) => {
+      const next = { ...current, [field.key]: value };
+      if (sourceType === "confluence" && field.key === "base_url") {
+        return applyConfluenceUrlInference(next) as ConfigForm;
+      }
+      return next;
+    });
   };
 
   const handleSave = () => {
@@ -220,6 +238,9 @@ function SourceConfigForm({
                         required={isFieldRequired(sourceType, field, config)}
                         onChange={(value) => updateField(field, value)}
                       />
+                      {sourceType === "confluence" && field.key === "base_url" && confluenceUrlInfo && (
+                        <ConfluenceDetectedPanel info={confluenceUrlInfo} />
+                      )}
                       {sourceType === "jira" && field.key === "auth_mode" && authMode === "browser_cookie" && (
                         <JiraBrowserSessionPanel
                           baseUrl={jiraBaseUrl}
@@ -391,6 +412,31 @@ function ConfigFieldInput({
         <span className="block text-xs text-destructive">Stored token cannot be decrypted. Re-enter it.</span>
       )}
     </Field>
+  );
+}
+
+function ConfluenceDetectedPanel({ info }: { info: ParsedConfluenceWikiUrl }) {
+  const rows = [
+    ["Site", info.normalizedBaseUrl],
+    ["API path", info.apiPrefix],
+    ["Space", info.spaceKey],
+    ["Root page", info.pageId],
+  ].filter(([, value]) => value);
+
+  if (rows.length === 0) return null;
+
+  return (
+    <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs">
+      <div className="font-medium">Detected</div>
+      <dl className="mt-1 grid gap-1 sm:grid-cols-2">
+        {rows.map(([label, value]) => (
+          <div key={label} className="min-w-0">
+            <dt className="text-muted-foreground">{label}</dt>
+            <dd className="truncate font-medium">{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
   );
 }
 
@@ -593,6 +639,9 @@ function initialSourceConfig(sourceType: string, sourceConfig: ConfigForm): Conf
     if (next.pat_configured) next.auth_mode = "pat";
     else if (next.jira_cookie_configured) next.auth_mode = "browser_cookie";
   }
+  if (sourceType === "confluence") {
+    return applyConfluenceUrlInference(next) as ConfigForm;
+  }
   return next;
 }
 
@@ -642,6 +691,9 @@ function requiredFieldsAreFilled(sourceType: string, fields: ConfigField[], conf
 }
 
 function isFieldVisible(sourceType: string, field: ConfigField, config: ConfigForm): boolean {
+  if (sourceType === "confluence") {
+    return isConfluenceFieldVisible(field.key, config);
+  }
   if (sourceType === "jira") {
     const authMode = stringValue(config.auth_mode) || "browser_cookie";
     if (field.key === "jira_cookie") return false;
@@ -661,6 +713,9 @@ function isFieldVisible(sourceType: string, field: ConfigField, config: ConfigFo
 }
 
 function isFieldRequired(sourceType: string, field: ConfigField, config: ConfigForm): boolean {
+  if (sourceType === "confluence") {
+    return field.required || isConfluenceFieldRequired(field.key, config);
+  }
   if (sourceType === "jira") {
     const authMode = stringValue(config.auth_mode) || "browser_cookie";
     if (field.key === "jira_cookie") return false;
@@ -700,6 +755,8 @@ function optionLabel(field: ConfigField, option: string): string {
     if (option === "none") return "No authentication";
   }
   if (field.key === "sync_mode") {
+    if (option === "page_tree") return "This page tree";
+    if (option === "space") return "Whole space";
     if (option === "single_page") return "Single page";
     if (option === "subtree") return "Subtree";
     if (option === "explicit_list") return "Explicit list";

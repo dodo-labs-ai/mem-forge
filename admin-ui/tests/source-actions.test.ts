@@ -21,9 +21,13 @@ assert.deepEqual(
 );
 
 const forceResync = sourceActionLayout.menu.find((action) => action.id === "force-resync");
+assert.equal(forceResync?.label, "Refresh source");
 assert.equal(forceResync?.tone, "neutral");
 assert.equal("disabled" in (forceResync ?? {}), false);
-assert.equal(forceResync?.description, "Reset the sync cursor and scan all documents.");
+assert.equal(
+  forceResync?.description,
+  "Look for new, changed, or removed documents. Existing memories are not rebuilt unless source content changed.",
+);
 assert.equal(getSourceActionEndpoint("src-1", "force-resync"), "/api/sources/src-1/force-resync");
 
 const deleteSource = sourceActionLayout.menu.find((action) => action.id === "delete");

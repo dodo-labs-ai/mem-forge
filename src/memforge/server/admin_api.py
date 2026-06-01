@@ -10,12 +10,15 @@ import asyncio
 from dataclasses import asdict, is_dataclass
 import json
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -407,6 +410,18 @@ class SourceResponse(BaseModel):
     created_at: str | None = None
 
 
+class SourceProjectResponse(BaseModel):
+    project: str
+    document_count: int
+    memory_count: int
+    last_observed_at: str | None = None
+
+
+class SourceProjectsResponse(BaseModel):
+    source_id: str
+    projects: list[SourceProjectResponse]
+
+
 class CreateSourceRequest(BaseModel):
     type: str
     name: str
@@ -508,9 +523,13 @@ class LlmConfigResponse(BaseModel):
     enrichment_model: str | None = None
     enrichment_base_url: str | None = None
     enrichment_api_key: str | None = None
+    enrichment_api_key_set: bool = False
+    enrichment_api_key_last4: str | None = None
     embedding_model: str | None = None
     embedding_base_url: str | None = None
     embedding_api_key: str | None = None
+    embedding_api_key_set: bool = False
+    embedding_api_key_last4: str | None = None
 
 
 class LlmConfigRequest(BaseModel):
@@ -520,6 +539,28 @@ class LlmConfigRequest(BaseModel):
     embedding_model: str | None = None
     embedding_base_url: str | None = None
     embedding_api_key: str | None = None
+
+
+class LlmModelOption(BaseModel):
+    id: str
+    label: str | None = None
+
+
+class LlmConfigProbeRequest(BaseModel):
+    kind: Literal["enrichment", "embedding"]
+    base_url: str
+    api_key: str | None = None
+
+
+class LlmConfigProbeResponse(BaseModel):
+    ok: bool
+    models_supported: bool = False
+    models: list[LlmModelOption] = Field(default_factory=list)
+    stage: Literal["validation", "connect", "tls", "timeout", "auth", "http"] | None = None
+    status: int | None = None
+    message: str
+    latency_ms: int | None = None
+    suggested_base_url: str | None = None
 
 
 # -- Memory reviews --
@@ -583,6 +624,201 @@ def _mask_api_key(key: str | None) -> str | None:
     return "*" * (len(key) - 4) + key[-4:]
 
 
+def _api_key_last4(key: str | None) -> str | None:
+    if not key:
+        return None
+    return key[-4:]
+
+
+def _is_running_in_container() -> bool:
+    return Path("/.dockerenv").exists()
+
+
+def _suggest_host_base_url(base_url: str) -> str | None:
+    parsed = urlsplit(base_url)
+    if parsed.hostname not in {"localhost", "127.0.0.1"}:
+        return None
+    if not _is_running_in_container():
+        return None
+    netloc = "host.docker.internal"
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _model_list_urls(base_url: str) -> list[str]:
+    root = base_url.strip().rstrip("/")
+    urls = [f"{root}/models"]
+    parsed = urlsplit(root)
+    if not parsed.path.rstrip("/").endswith("/v1"):
+        urls.append(f"{root}/v1/models")
+    return list(dict.fromkeys(urls))
+
+
+def _model_probe_headers(api_key: str | None) -> dict[str, str]:
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
+    return headers
+
+
+def _extract_model_options(payload: Any) -> list[LlmModelOption]:
+    if isinstance(payload, dict):
+        raw_items = payload.get("data")
+        if raw_items is None:
+            raw_items = payload.get("models")
+    else:
+        raw_items = payload
+
+    if not isinstance(raw_items, list):
+        return []
+
+    seen: set[str] = set()
+    models: list[LlmModelOption] = []
+    for item in raw_items:
+        model_id: str | None = None
+        label: str | None = None
+        if isinstance(item, str):
+            model_id = item
+        elif isinstance(item, dict):
+            raw_id = item.get("id") or item.get("name") or item.get("model")
+            if raw_id is not None:
+                model_id = str(raw_id)
+            raw_label = item.get("display_name") or item.get("label") or item.get("name")
+            if raw_label is not None and str(raw_label) != model_id:
+                label = str(raw_label)
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        models.append(LlmModelOption(id=model_id, label=label))
+    return models
+
+
+def _probe_error_response(
+    *,
+    base_url: str,
+    stage: Literal["validation", "connect", "tls", "timeout", "auth", "http"],
+    message: str,
+    status: int | None = None,
+    latency_ms: int | None = None,
+) -> LlmConfigProbeResponse:
+    return LlmConfigProbeResponse(
+        ok=False,
+        stage=stage,
+        status=status,
+        message=message,
+        latency_ms=latency_ms,
+        suggested_base_url=_suggest_host_base_url(base_url),
+    )
+
+
+async def _probe_llm_models(
+    *,
+    base_url: str,
+    api_key: str | None,
+) -> LlmConfigProbeResponse:
+    value = base_url.strip()
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return _probe_error_response(
+            base_url=value,
+            stage="validation",
+            message="Enter a URL starting with http:// or https://.",
+        )
+
+    headers = _model_probe_headers(api_key)
+    unsupported: tuple[int, int] | None = None
+    non_json_latency_ms: int | None = None
+
+    async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+        for url in _model_list_urls(value):
+            started = time.perf_counter()
+            try:
+                resp = await client.get(url, headers=headers)
+            except httpx.TimeoutException:
+                return _probe_error_response(
+                    base_url=value,
+                    stage="timeout",
+                    message="No response before the timeout.",
+                )
+            except httpx.ConnectError as exc:
+                text = str(exc).lower()
+                stage: Literal["connect", "tls"] = "tls" if "ssl" in text or "tls" in text else "connect"
+                return _probe_error_response(
+                    base_url=value,
+                    stage=stage,
+                    message=f"Could not reach {parsed.hostname or 'the endpoint'}.",
+                )
+            except httpx.HTTPError:
+                return _probe_error_response(
+                    base_url=value,
+                    stage="connect",
+                    message=f"Could not reach {parsed.hostname or 'the endpoint'}.",
+                )
+
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            if resp.status_code in {404, 405, 501}:
+                unsupported = (resp.status_code, latency_ms)
+                continue
+            if resp.status_code in {401, 403}:
+                return _probe_error_response(
+                    base_url=value,
+                    stage="auth",
+                    status=resp.status_code,
+                    latency_ms=latency_ms,
+                    message=(
+                        "Add an API key, then test again."
+                        if not api_key
+                        else f"Endpoint rejected the API key (HTTP {resp.status_code})."
+                    ),
+                )
+            if resp.status_code >= 400:
+                return _probe_error_response(
+                    base_url=value,
+                    stage="http",
+                    status=resp.status_code,
+                    latency_ms=latency_ms,
+                    message=f"Endpoint returned HTTP {resp.status_code}.",
+                )
+
+            try:
+                data = resp.json()
+            except ValueError:
+                non_json_latency_ms = latency_ms
+                continue
+
+            models = _extract_model_options(data)
+            return LlmConfigProbeResponse(
+                ok=True,
+                models_supported=True,
+                models=models,
+                message=(
+                    f"Connected. Found {len(models)} model{'s' if len(models) != 1 else ''}."
+                    if models else "Connected, but this endpoint returned no models."
+                ),
+                latency_ms=latency_ms,
+            )
+
+    if non_json_latency_ms is not None:
+        return LlmConfigProbeResponse(
+            ok=True,
+            models_supported=False,
+            message="Connected, but this endpoint did not return a model list.",
+            latency_ms=non_json_latency_ms,
+        )
+
+    status, latency_ms = unsupported or (404, None)
+    return LlmConfigProbeResponse(
+        ok=True,
+        models_supported=False,
+        status=status,
+        message="Connected, but this endpoint does not expose a model list.",
+        latency_ms=latency_ms,
+    )
+
+
 def _source_secret_fields(source_type: str) -> tuple[str, ...]:
     fields = set(source_secret_fields(source_type, GENE_REGISTRY))
     if source_type == "jira":
@@ -594,6 +830,11 @@ def _sync_scope_config(source_type: str, config: dict[str, Any]) -> dict[str, An
     """Return config fields that affect the document set discovered by sync."""
     jira_auth_mode = _jira_auth_mode(config) if source_type == "jira" else None
     scope = dict(config)
+    gene_cls = GENE_REGISTRY.get(source_type)
+    if gene_cls:
+        normalizer = getattr(gene_cls, "normalize_config", None)
+        if callable(normalizer):
+            normalizer(scope)
     for field in _source_secret_fields(source_type):
         scope.pop(field, None)
         scope.pop(f"{field}_encrypted", None)
@@ -604,7 +845,47 @@ def _sync_scope_config(source_type: str, config: dict[str, Any]) -> dict[str, An
     scope.pop("request_interval_ms", None)
     if source_type == "jira":
         scope["auth_mode"] = jira_auth_mode
+    if source_type == "confluence":
+        scope = _canonical_confluence_scope(scope)
     return scope
+
+
+def _canonical_confluence_scope(scope: dict[str, Any]) -> dict[str, Any]:
+    mode = str(scope.get("sync_mode") or "").strip().lower()
+    mode = mode if mode in {"page_tree", "space"} else ("page_tree" if str(scope.get("page_tree_root") or "").strip() else "space")
+    exclude_labels = _config_list_value(scope.get("exclude_labels"))
+    canonical: dict[str, Any] = {"sync_mode": mode}
+    api_prefix = str(scope.get("api_prefix") or "").strip()
+    if api_prefix:
+        canonical["api_prefix"] = api_prefix.rstrip("/")
+    if exclude_labels:
+        canonical["exclude_labels"] = exclude_labels
+    if mode == "page_tree":
+        canonical["page_tree_root"] = str(scope.get("page_tree_root") or "").strip()
+        canonical["include_children"] = _config_bool(scope.get("include_children"), default=True)
+    else:
+        canonical["spaces"] = _config_list_value(scope.get("spaces"))
+    return canonical
+
+
+def _config_list_value(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return []
+
+
+def _config_bool(value: Any, *, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes", "on"}:
+            return True
+        if text in {"false", "0", "no", "off"}:
+            return False
+    return default
 
 
 def _validate_source_config(
@@ -617,6 +898,10 @@ def _validate_source_config(
     validate_tls_ca_bundle(config)
     secret_fields = _source_secret_fields(source_type)
     gene_cls = GENE_REGISTRY.get(source_type)
+    if gene_cls:
+        normalizer = getattr(gene_cls, "normalize_config", None)
+        if callable(normalizer):
+            normalizer(config)
     has_secret_contract = bool(secret_fields) if gene_cls else _config_contains_secret(config, secret_fields)
     if has_secret_contract:
         product_name = gene_cls.metadata().display_name if gene_cls else source_type
@@ -633,8 +918,39 @@ def _validate_source_config(
             config,
             existing_config=existing_config,
         )
+    if source_type == "confluence":
+        _validate_confluence_config(config, existing_config=existing_config)
     if source_type == "jira":
         _validate_jira_auth_config(config, existing_config=existing_config)
+
+
+def _validate_confluence_config(
+    config: dict[str, Any],
+    existing_config: dict[str, Any] | None = None,
+) -> None:
+    existing_config = existing_config or {}
+    sync_mode = str(config.get("sync_mode") or existing_config.get("sync_mode") or "").strip().lower()
+    if sync_mode not in {"", "page_tree", "space"}:
+        raise ValueError("Confluence Sync Scope must be Page tree or Space")
+    if not sync_mode:
+        sync_mode = "page_tree" if str(config.get("page_tree_root") or existing_config.get("page_tree_root") or "").strip() else "space"
+
+    if sync_mode == "page_tree":
+        page_tree_root = str(config.get("page_tree_root") or existing_config.get("page_tree_root") or "").strip()
+        if not page_tree_root:
+            raise ValueError("Confluence Page Tree Root is required when syncing a page tree")
+        return
+
+    if not _config_list_has_value(config.get("spaces")) and not _config_list_has_value(existing_config.get("spaces")):
+        raise ValueError("Confluence Spaces to Sync is required when syncing whole spaces")
+
+
+def _config_list_has_value(value: Any) -> bool:
+    if isinstance(value, list):
+        return any(str(item).strip() for item in value)
+    if isinstance(value, str):
+        return any(part.strip() for part in value.split(","))
+    return False
 
 
 def _validate_github_pages_config(
@@ -2563,6 +2879,44 @@ def create_admin_app(
 
         return {"data": sources}
 
+    @source_router.get("/{source_id}/projects", response_model=SourceProjectsResponse)
+    async def list_source_projects(
+        source_id: str,
+        db: Database = Depends(get_db),
+    ):
+        """List project buckets observed for one source."""
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+
+        projects: list[SourceProjectResponse] = []
+        async with db.db.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(TRIM(d.space_or_project), ''), 'Unspecified') AS project,
+                COUNT(DISTINCT d.doc_id) AS document_count,
+                COUNT(DISTINCT ms.memory_id) AS memory_count,
+                MAX(d.last_modified) AS last_observed_at
+            FROM documents d
+            LEFT JOIN memory_sources ms ON ms.doc_id = d.doc_id
+            WHERE d.source = ?
+            GROUP BY COALESCE(NULLIF(TRIM(d.space_or_project), ''), 'Unspecified')
+            ORDER BY last_observed_at DESC, project ASC
+            """,
+            (source_id,),
+        ) as cur:
+            async for row in cur:
+                projects.append(
+                    SourceProjectResponse(
+                        project=str(row["project"]),
+                        document_count=int(row["document_count"]),
+                        memory_count=int(row["memory_count"]),
+                        last_observed_at=row["last_observed_at"],
+                    )
+                )
+
+        return SourceProjectsResponse(source_id=source_id, projects=projects)
+
     # ===================================================================
     # 4c. Recent Changes
     # ===================================================================
@@ -2689,6 +3043,7 @@ def create_admin_app(
         source_id: str,
         req: UpdateSourceRequest,
         db: Database = Depends(get_db),
+        sync_service: SyncService = Depends(get_sync_service),
     ):
         """Update an existing source's configuration."""
         existing = await db.get_source(source_id)
@@ -2722,6 +3077,9 @@ def create_admin_app(
         old_base_url = str(existing["config"].get("base_url") or "")
         new_base_url = str(src_config.get("base_url") or "")
         base_url_changed = bool(old_base_url) and old_base_url != new_base_url
+
+        if scope_changed or auth_secret_changed or base_url_changed:
+            await sync_service.cancel_source(source_id)
 
         await db.upsert_source(
             id=source_id,
@@ -3012,43 +3370,71 @@ def create_admin_app(
     async def get_llm_config(db: Database = Depends(get_db)):
         """Get LLM configuration. API keys are masked in the response."""
         cfg = await db.get_llm_config()
+        enrichment_key = cfg.get("enrichment_api_key")
+        embedding_key = cfg.get("embedding_api_key")
         return LlmConfigResponse(
             enrichment_model=cfg.get("enrichment_model"),
             enrichment_base_url=cfg.get("enrichment_base_url"),
-            enrichment_api_key=_mask_api_key(cfg.get("enrichment_api_key")),
+            enrichment_api_key=_mask_api_key(enrichment_key),
+            enrichment_api_key_set=bool(enrichment_key),
+            enrichment_api_key_last4=_api_key_last4(enrichment_key),
             embedding_model=cfg.get("embedding_model"),
             embedding_base_url=cfg.get("embedding_base_url"),
-            embedding_api_key=_mask_api_key(cfg.get("embedding_api_key")),
+            embedding_api_key=_mask_api_key(embedding_key),
+            embedding_api_key_set=bool(embedding_key),
+            embedding_api_key_last4=_api_key_last4(embedding_key),
         )
+
+    @llm_router.post("/probe")
+    async def probe_llm_config(
+        req: LlmConfigProbeRequest,
+        db: Database = Depends(get_db),
+    ):
+        """Test an LLM endpoint and fetch model ids when the endpoint supports it."""
+        current = await db.get_llm_config()
+        api_key = req.api_key
+        if api_key is None:
+            api_key = current.get(f"{req.kind}_api_key")
+        return await _probe_llm_models(base_url=req.base_url, api_key=api_key or None)
 
     @llm_router.put("")
     async def update_llm_config(
         req: LlmConfigRequest,
         db: Database = Depends(get_db),
     ):
-        """Update LLM configuration.
-
-        If an API key field is sent as the masked value (e.g. '****abcd'),
-        the existing key is preserved. Only non-masked values overwrite.
-        """
+        """Update LLM configuration."""
         # Fetch current config to preserve masked keys
         current = await db.get_llm_config()
+        fields_set = req.model_fields_set
 
-        def _resolve_key(new_val: str | None, current_val: str | None) -> str | None:
-            """Keep existing key if new value looks like a mask."""
+        def _resolve_value(field: str) -> str | None:
+            if field not in fields_set:
+                return current.get(field)
+            new_val = getattr(req, field)
             if new_val is None:
-                return current_val
+                return current.get(field)
+            return new_val.strip() or None
+
+        def _resolve_key(field: str) -> str | None:
+            if field not in fields_set:
+                return current.get(field)
+            new_val = getattr(req, field)
+            if new_val is None:
+                return current.get(field)
+            if new_val == "":
+                return None
             if new_val.startswith("*"):
-                return current_val
-            return new_val
+                # Masked values represent an existing secret, not a replacement.
+                return current.get(field)
+            return new_val.strip() or None
 
         await db.set_llm_config({
-            "enrichment_model": req.enrichment_model or current.get("enrichment_model"),
-            "enrichment_base_url": req.enrichment_base_url or current.get("enrichment_base_url"),
-            "enrichment_api_key": _resolve_key(req.enrichment_api_key, current.get("enrichment_api_key")),
-            "embedding_model": req.embedding_model or current.get("embedding_model"),
-            "embedding_base_url": req.embedding_base_url or current.get("embedding_base_url"),
-            "embedding_api_key": _resolve_key(req.embedding_api_key, current.get("embedding_api_key")),
+            "enrichment_model": _resolve_value("enrichment_model"),
+            "enrichment_base_url": _resolve_value("enrichment_base_url"),
+            "enrichment_api_key": _resolve_key("enrichment_api_key"),
+            "embedding_model": _resolve_value("embedding_model"),
+            "embedding_base_url": _resolve_value("embedding_base_url"),
+            "embedding_api_key": _resolve_key("embedding_api_key"),
         })
         return {"ok": True}
 

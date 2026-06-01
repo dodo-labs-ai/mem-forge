@@ -13,7 +13,40 @@ def test_confluence_schema_marks_tls_ca_bundle_as_advanced():
 
     assert fields["pat"].required is True
     assert fields["pat"].advanced is False
+    assert fields["base_url"].label == "Wiki URL"
+    assert fields["spaces"].required is False
+    assert fields["sync_mode"].advanced is False
     assert fields["tls_ca_bundle"].advanced is True
+
+
+def test_confluence_normalizes_corporate_wiki_page_url_to_page_tree_scope():
+    config = {
+        "base_url": "https://wiki.company.example/wiki/spaces/PAY/pages/5695886009/Flexible+Payroll",
+        "pat": "confluence-pat",
+    }
+
+    ConfluenceGene.normalize_config(config)
+
+    assert config["base_url"] == "https://wiki.company.example"
+    assert config["api_prefix"] == "/wiki"
+    assert config["spaces"] == ["PAY"]
+    assert config["page_tree_root"] == "5695886009"
+    assert config["sync_mode"] == "page_tree"
+
+
+def test_confluence_normalizes_space_url_without_page_tree_root():
+    config = {
+        "base_url": "https://team.atlassian.net/wiki/spaces/ENG",
+        "pat": "confluence-pat",
+    }
+
+    ConfluenceGene.normalize_config(config)
+
+    assert config["base_url"] == "https://team.atlassian.net"
+    assert config["api_prefix"] == "/wiki"
+    assert config["spaces"] == ["ENG"]
+    assert config.get("page_tree_root") is None
+    assert "sync_mode" not in config
 
 
 class RecordingAsyncClient:
@@ -40,6 +73,14 @@ class FailingAuthClient(RecordingAsyncClient):
     async def request(self, _method: str, url: str, **_kwargs):
         self.calls.append(url)
         return JsonResponse({}, status_code=401)
+
+
+class RootRestFallbackClient(RecordingAsyncClient):
+    async def request(self, _method: str, url: str, **_kwargs):
+        self.calls.append(url)
+        if url == "/wiki/rest/api/space":
+            return JsonResponse({}, status_code=404)
+        return JsonResponse({"results": []})
 
 
 class JsonResponse:
@@ -176,6 +217,30 @@ async def test_authenticate_uses_configured_confluence_ca_bundle(monkeypatch, tm
     await gene.authenticate()
 
     assert RecordingAsyncClient.instances[-1].kwargs["verify"] == str(ca_bundle)
+
+
+@pytest.mark.asyncio
+async def test_authenticate_falls_back_to_root_rest_api_for_plain_confluence_url(monkeypatch):
+    RecordingAsyncClient.instances.clear()
+    monkeypatch.setattr("memforge.genes.confluence_gene.httpx.AsyncClient", RootRestFallbackClient)
+
+    gene = ConfluenceGene(
+        config={
+            "base_url": "https://confluence.example.test",
+            "spaces": ["PAY"],
+            "pat": "confluence-pat",
+        },
+        source_id="src-confluence",
+    )
+
+    await gene.authenticate()
+
+    assert gene._base_url == "https://confluence.example.test"
+    assert gene._api_prefix == ""
+    assert RecordingAsyncClient.instances[-1].calls == [
+        "/wiki/rest/api/space",
+        "/rest/api/space",
+    ]
 
 
 @pytest.mark.asyncio

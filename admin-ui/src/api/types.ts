@@ -95,6 +95,34 @@ export interface Source {
   created_at: string;
 }
 
+export interface SourceProject {
+  project: string;
+  document_count: number;
+  memory_count: number;
+  last_observed_at: string | null;
+}
+
+export interface SourceProjectsResponse {
+  source_id: string;
+  projects: SourceProject[];
+}
+
+export interface AgentSessionLatestFailure {
+  count: number;
+  reason: string | null;
+  last_seen_at: string | null;
+}
+
+export interface AgentSessionCompleteness {
+  session_id: string | null;
+  source_id: string | null;
+  total: number;
+  processed_total: number;
+  counts: Record<string, number>;
+  no_output_fraction: number;
+  latest_failure: AgentSessionLatestFailure | null;
+}
+
 export interface JiraAuthSession {
   provider: "jira";
   origin: string;
@@ -170,12 +198,32 @@ export interface DiscoveryPreviewResponse {
 }
 
 export interface LlmConfig {
-  enrichment_model: string;
+  enrichment_model: string | null;
   enrichment_base_url: string | null;
   enrichment_api_key: string | null;
-  embedding_model: string;
+  enrichment_api_key_set?: boolean;
+  enrichment_api_key_last4?: string | null;
+  embedding_model: string | null;
   embedding_base_url: string | null;
   embedding_api_key: string | null;
+  embedding_api_key_set?: boolean;
+  embedding_api_key_last4?: string | null;
+}
+
+export interface LlmModelOption {
+  id: string;
+  label?: string | null;
+}
+
+export interface LlmConfigProbeResponse {
+  ok: boolean;
+  models_supported: boolean;
+  models: LlmModelOption[];
+  stage: "validation" | "connect" | "tls" | "timeout" | "auth" | "http" | null;
+  status: number | null;
+  message: string;
+  latency_ms: number | null;
+  suggested_base_url: string | null;
 }
 
 export interface StatBucket {

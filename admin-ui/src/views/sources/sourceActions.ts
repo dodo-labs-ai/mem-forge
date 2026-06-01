@@ -17,8 +17,9 @@ export const sourceActionLayout = {
   menu: [
     {
       id: "force-resync",
-      label: "Force Resync",
-      description: "Reset the sync cursor and scan all documents.",
+      label: "Refresh source",
+      description:
+        "Look for new, changed, or removed documents. Existing memories are not rebuilt unless source content changed.",
       tone: "neutral",
     },
     {
