@@ -106,7 +106,7 @@ def should_query_memory(request: AgentHookContextRequest) -> bool:
             "memory/",
             "retrieval/",
             "genes/",
-            "server/mcp",
+            "plugin_mcp_proxy",
             "server/admin_api",
             "docs/architecture",
         )

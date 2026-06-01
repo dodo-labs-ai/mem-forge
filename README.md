@@ -27,7 +27,7 @@ sync, MemForge extracts durable facts, decisions, procedures, and conventions
 while preserving source evidence and history.
 
 AI coding assistants often start each session blind to institutional context.
-MemForge bridges that gap through an MCP server, admin API, and agent-client
+MemForge bridges that gap through MCP-enabled agent plugins, an admin API, and
 integrations, with review flows for superseded facts and contradictions.
 
 ## What It Does
@@ -140,7 +140,7 @@ client-side versus service-side boundary.
 ## Project Layout
 
 ```text
-src/memforge/        Python service, CLI, pipeline, genes, MCP server
+src/memforge/        Python service, CLI, pipeline, genes, plugin MCP proxy
 admin-ui/               React admin console
 integrations/           Codex and Claude Code plugin packages
 docs/design/            Design notes for memory extraction and agent sessions

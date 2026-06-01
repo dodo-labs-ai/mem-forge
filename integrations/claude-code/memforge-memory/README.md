@@ -7,8 +7,8 @@ Set `MEMFORGE_API_URL` if the API is not running at
 `http://127.0.0.1:8765`. The URL can point at a local instance or a hosted
 service. Set `MEMFORGE_API_TOKEN` when the service requires bearer auth.
 
-The bundled MCP proxy does not start `memforge serve` and does not need a local
-MemForge CLI. It forwards search, memory detail, recent-change, and session
+The bundled MCP proxy does not need a local MemForge CLI or local-DB MCP
+process. It forwards search, memory detail, recent-change, and session
 document calls to `MEMFORGE_API_URL`. `get_resource(mode="file")` is handled
 locally so returned `local_path` values point to the agent machine.
 

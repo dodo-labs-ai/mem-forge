@@ -112,7 +112,6 @@ def init(ctx):
     console.print("  3. Run: cd admin-ui && npm run dev")
     console.print("  4. Add sources in the admin UI")
     console.print("  5. Run sync from the UI, schedule sync, or run: memforge sync")
-    console.print("  6. Run: memforge serve   (start the MCP server)")
 
 
 # ---------------------------------------------------------------------------
@@ -183,32 +182,6 @@ def sync(ctx, source: str | None):
 
         await db.close()
         console.print("\n[bold green]Sync complete![/]")
-
-    asyncio.run(_run())
-
-
-# ---------------------------------------------------------------------------
-# serve
-# ---------------------------------------------------------------------------
-
-
-@cli.command()
-@click.pass_context
-def serve(ctx):
-    """Start the MCP server (stdio transport) for LLM agents."""
-
-    async def _run():
-        config: AppConfig = ctx.obj["config"]
-        from memforge.storage.database import Database
-        from memforge.server.mcp_server import run_mcp_stdio
-
-        db = Database(config.storage.db_path)
-        await db.connect()
-
-        try:
-            await run_mcp_stdio(db, config)
-        finally:
-            await db.close()
 
     asyncio.run(_run())
 
