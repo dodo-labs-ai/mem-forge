@@ -9,7 +9,6 @@ from bs4 import BeautifulSoup
 
 from memforge.genes import confluence_pdf
 from memforge.genes.confluence_pdf import (
-    default_chrome_renderer,
     default_pdf_renderer,
     default_weasyprint_renderer,
     export_confluence_page_pdf,
@@ -501,64 +500,19 @@ async def test_export_confluence_page_pdf_returns_none_when_renderer_missing(tmp
 
     assert pdf is None
 
-
-def test_default_pdf_renderer_prefers_weasyprint_in_auto(monkeypatch):
+def test_default_pdf_renderer_uses_weasyprint(monkeypatch):
     async def fake_weasyprint(_html_path: Path) -> bytes:
         return COMPLETE_PDF
 
-    monkeypatch.delenv("MEMFORGE_PDF_RENDERER", raising=False)
     monkeypatch.setattr(confluence_pdf, "default_weasyprint_renderer", lambda: fake_weasyprint)
-    monkeypatch.setattr(confluence_pdf, "default_chrome_renderer", lambda: None)
 
     assert default_pdf_renderer() is fake_weasyprint
 
 
-@pytest.mark.asyncio
-async def test_default_pdf_renderer_retries_chrome_when_weasyprint_fails(monkeypatch, tmp_path):
-    calls: list[str] = []
-
-    async def fake_weasyprint(_html_path: Path) -> None:
-        calls.append("weasyprint")
-        return None
-
-    async def fake_chrome(_html_path: Path) -> bytes:
-        calls.append("chrome")
-        return COMPLETE_PDF
-
-    monkeypatch.delenv("MEMFORGE_PDF_RENDERER", raising=False)
-    monkeypatch.setattr(confluence_pdf, "default_weasyprint_renderer", lambda: fake_weasyprint)
-    monkeypatch.setattr(confluence_pdf, "default_chrome_renderer", lambda: fake_chrome)
-
-    renderer = default_pdf_renderer()
-
-    assert renderer is not None
-    assert await renderer(tmp_path / "page.html") == COMPLETE_PDF
-    assert calls == ["weasyprint", "chrome"]
-
-
-def test_default_pdf_renderer_falls_back_to_chrome_in_auto(monkeypatch):
-    async def fake_chrome(_html_path: Path) -> bytes:
-        return COMPLETE_PDF
-
-    monkeypatch.delenv("MEMFORGE_PDF_RENDERER", raising=False)
+def test_default_pdf_renderer_returns_none_when_weasyprint_missing(monkeypatch):
     monkeypatch.setattr(confluence_pdf, "default_weasyprint_renderer", lambda: None)
-    monkeypatch.setattr(confluence_pdf, "default_chrome_renderer", lambda: fake_chrome)
 
-    assert default_pdf_renderer() is fake_chrome
-
-
-def test_default_pdf_renderer_can_force_chrome(monkeypatch):
-    async def fake_chrome(_html_path: Path) -> bytes:
-        return COMPLETE_PDF
-
-    def fail_weasyprint():
-        raise AssertionError("weasyprint should not be selected when Chrome is forced")
-
-    monkeypatch.setenv("MEMFORGE_PDF_RENDERER", "chrome")
-    monkeypatch.setattr(confluence_pdf, "default_weasyprint_renderer", fail_weasyprint)
-    monkeypatch.setattr(confluence_pdf, "default_chrome_renderer", lambda: fake_chrome)
-
-    assert default_pdf_renderer() is fake_chrome
+    assert default_pdf_renderer() is None
 
 
 @pytest.mark.asyncio
@@ -597,162 +551,3 @@ async def test_export_confluence_page_pdf_times_out_slow_render(tmp_path, monkey
     )
 
     assert pdf is None
-
-
-@pytest.mark.asyncio
-async def test_default_chrome_renderer_keeps_sandbox_enabled_by_default(monkeypatch, tmp_path):
-    captured_args: dict[str, tuple[str, ...]] = {}
-
-    class FakeProcess:
-        returncode = 0
-
-        async def wait(self):
-            return 0
-
-        def kill(self):
-            return None
-
-    async def fake_create_subprocess_exec(*args, **_kwargs):
-        captured_args["args"] = args
-        for arg in args:
-            if str(arg).startswith("--print-to-pdf="):
-                Path(str(arg).split("=", 1)[1]).write_bytes(COMPLETE_PDF)
-        return FakeProcess()
-
-    monkeypatch.setattr("memforge.genes.confluence_pdf._find_chrome", lambda: "/usr/bin/chrome")
-    monkeypatch.setattr("memforge.genes.confluence_pdf.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
-    monkeypatch.delenv("MEMFORGE_CHROME_NO_SANDBOX", raising=False)
-    html_path = tmp_path / "page.html"
-    html_path.write_text("<html></html>", encoding="utf-8")
-
-    renderer = default_chrome_renderer()
-    assert renderer is not None
-    assert await renderer(html_path) == COMPLETE_PDF
-    assert "--no-sandbox" not in captured_args["args"]
-    assert any(str(arg).startswith("--user-data-dir=") for arg in captured_args["args"])
-    assert "--no-first-run" in captured_args["args"]
-    assert "--disable-sync" in captured_args["args"]
-    assert "--disable-default-apps" in captured_args["args"]
-    assert "--headless=new" in captured_args["args"]
-    assert "--allow-file-access-from-files" in captured_args["args"]
-    assert "--blink-settings=scriptEnabled=false" not in captured_args["args"]
-
-
-@pytest.mark.asyncio
-async def test_default_chrome_renderer_no_sandbox_requires_explicit_opt_in(monkeypatch, tmp_path):
-    captured_args: dict[str, tuple[str, ...]] = {}
-
-    class FakeProcess:
-        returncode = 0
-
-        async def wait(self):
-            return 0
-
-        def kill(self):
-            return None
-
-    async def fake_create_subprocess_exec(*args, **_kwargs):
-        captured_args["args"] = args
-        for arg in args:
-            if str(arg).startswith("--print-to-pdf="):
-                Path(str(arg).split("=", 1)[1]).write_bytes(COMPLETE_PDF)
-        return FakeProcess()
-
-    monkeypatch.setattr("memforge.genes.confluence_pdf._find_chrome", lambda: "/usr/bin/chrome")
-    monkeypatch.setattr("memforge.genes.confluence_pdf.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
-    monkeypatch.setenv("MEMFORGE_CHROME_NO_SANDBOX", "1")
-    html_path = tmp_path / "page.html"
-    html_path.write_text("<html></html>", encoding="utf-8")
-
-    renderer = default_chrome_renderer()
-    assert renderer is not None
-    assert await renderer(html_path) == COMPLETE_PDF
-    assert "--no-sandbox" in captured_args["args"]
-
-
-@pytest.mark.asyncio
-async def test_default_chrome_renderer_waits_for_complete_pdf_before_accepting(monkeypatch, tmp_path):
-    wait_started = asyncio.Event()
-    can_exit = asyncio.Event()
-    killed = False
-
-    class FakeProcess:
-        returncode: int | None = None
-
-        async def wait(self):
-            wait_started.set()
-            await can_exit.wait()
-            self.returncode = 0
-            return 0
-
-        def kill(self):
-            nonlocal killed
-            killed = True
-            self.returncode = -9
-            can_exit.set()
-
-    async def fake_create_subprocess_exec(*args, **_kwargs):
-        pdf_path = None
-        for arg in args:
-            if str(arg).startswith("--print-to-pdf="):
-                pdf_path = Path(str(arg).split("=", 1)[1])
-                break
-        assert pdf_path is not None
-        pdf_path.write_bytes(b"%PDF-partial")
-
-        async def finish_pdf():
-            await wait_started.wait()
-            await asyncio.sleep(1.1)
-            pdf_path.write_bytes(COMPLETE_PDF)
-            can_exit.set()
-
-        asyncio.create_task(finish_pdf())
-        return FakeProcess()
-
-    monkeypatch.setattr("memforge.genes.confluence_pdf._find_chrome", lambda: "/usr/bin/chrome")
-    monkeypatch.setattr("memforge.genes.confluence_pdf.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
-    html_path = tmp_path / "page.html"
-    html_path.write_text("<html></html>", encoding="utf-8")
-
-    renderer = default_chrome_renderer()
-    assert renderer is not None
-    assert await renderer(html_path) == COMPLETE_PDF
-    assert killed is False
-
-
-@pytest.mark.asyncio
-async def test_default_chrome_renderer_kills_process_when_cancelled(monkeypatch, tmp_path):
-    wait_started = asyncio.Event()
-    killed = False
-
-    class FakeProcess:
-        returncode: int | None = None
-
-        async def wait(self):
-            wait_started.set()
-            while self.returncode is None:
-                await asyncio.sleep(0.01)
-            return self.returncode
-
-        def kill(self):
-            nonlocal killed
-            killed = True
-            self.returncode = -9
-
-    async def fake_create_subprocess_exec(*_args, **_kwargs):
-        return FakeProcess()
-
-    monkeypatch.setattr("memforge.genes.confluence_pdf._find_chrome", lambda: "/usr/bin/chrome")
-    monkeypatch.setattr("memforge.genes.confluence_pdf.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
-    html_path = tmp_path / "page.html"
-    html_path.write_text("<html></html>", encoding="utf-8")
-
-    renderer = default_chrome_renderer()
-    assert renderer is not None
-    task = asyncio.create_task(renderer(html_path))
-    await wait_started.wait()
-    task.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert killed is True
