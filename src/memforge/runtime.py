@@ -96,7 +96,7 @@ async def get_effective_llm_config(db: "Database", config: AppConfig) -> Effecti
 
 
 async def build_search_engine(db: "Database", config: AppConfig) -> Any:
-    """Build the service-owned retrieval engine used by MCP and HTTP clients."""
+    """Build the service-owned retrieval engine used by HTTP and agent-proxy clients."""
     from memforge.retrieval.search import SearchEngine
 
     memory_collection = get_chroma_collection(
