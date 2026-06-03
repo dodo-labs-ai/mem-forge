@@ -21,9 +21,10 @@ logger = logging.getLogger(__name__)
 ATLASSIAN_REQUEST_ATTEMPTS = 4
 ATLASSIAN_DEFAULT_RETRY_DELAY_SECONDS = 2.0
 ATLASSIAN_MAX_RETRY_DELAY_SECONDS = 60.0
-# A cold connection often just needs to warm up, so a transient timeout is retried
-# after a short, fixed pause rather than the rate-limit backoff.
-ATLASSIAN_TIMEOUT_RETRY_DELAY_SECONDS = 1.0
+# A flaky connection (cold start, dual-stack IPv6 race, VPN or DNS warmup) often
+# succeeds on the next try, so a transient transport failure is retried after a
+# short, fixed pause rather than the rate-limit backoff.
+ATLASSIAN_TRANSPORT_RETRY_DELAY_SECONDS = 1.0
 _ATLASSIAN_LIMITERS_LOCK = Lock()
 _ATLASSIAN_REQUEST_LIMITERS: dict[str, "AtlassianRequestLimiter"] = {}
 
@@ -36,8 +37,8 @@ class AtlassianZeroQuotaRateLimitError(AtlassianRateLimitError):
     """Raised when an Atlassian REST endpoint reports no usable API quota."""
 
 
-class AtlassianRequestTimeoutError(RuntimeError):
-    """Raised when an Atlassian request keeps timing out after bounded retries."""
+class AtlassianRequestTransportError(RuntimeError):
+    """Raised when an Atlassian request keeps failing to connect after bounded retries."""
 
 
 class AtlassianRequestLimiter:
@@ -208,19 +209,21 @@ async def request_with_rate_limit_retry(
                 )
             else:
                 resp = await client.request(method, url, **kwargs)
-        except httpx.TimeoutException as exc:
+        except httpx.TransportError as exc:
             if attempt == ATLASSIAN_REQUEST_ATTEMPTS:
-                raise AtlassianRequestTimeoutError(
-                    f"{product_name} request timed out after {ATLASSIAN_REQUEST_ATTEMPTS} attempts for {url}. "
-                    "The instance may be slow or unreachable; check VPN or network, then retry."
+                detail = str(exc) or type(exc).__name__
+                raise AtlassianRequestTransportError(
+                    f"{product_name} request failed to reach {url} after {ATLASSIAN_REQUEST_ATTEMPTS} attempts "
+                    f"({detail}). The instance may be slow or unreachable; check VPN or network, then retry."
                 ) from exc
             logger.warning(
-                "%s request timed out %s; retrying in %.1fs",
+                "%s request transport error for %s (%s); retrying in %.1fs",
                 product_name,
                 url,
-                ATLASSIAN_TIMEOUT_RETRY_DELAY_SECONDS,
+                type(exc).__name__,
+                ATLASSIAN_TRANSPORT_RETRY_DELAY_SECONDS,
             )
-            await asyncio.sleep(ATLASSIAN_TIMEOUT_RETRY_DELAY_SECONDS)
+            await asyncio.sleep(ATLASSIAN_TRANSPORT_RETRY_DELAY_SECONDS)
             continue
         if resp.status_code != 429:
             resp.raise_for_status()

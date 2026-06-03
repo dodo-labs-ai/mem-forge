@@ -513,8 +513,13 @@ async def test_validate_reports_unreachable_origin_clearly(monkeypatch):
     from memforge.auth import jira_auth
     from memforge.auth.jira_auth import JiraAuthSessionError, validate_jira_cookie_session
 
+    async def _instant(_seconds):
+        return None
+
+    monkeypatch.setattr(jira_auth.asyncio, "sleep", _instant)  # do not wait between retries in the test
+
     def handler(request: httpx.Request) -> httpx.Response:
-        # A real DNS/connect failure surfaces as a ConnectError with an empty message.
+        # A genuinely unreachable host fails the same way on every retry.
         raise httpx.ConnectError("")
 
     real_async_client = httpx.AsyncClient
@@ -556,3 +561,34 @@ async def test_validate_retries_once_on_timeout_then_succeeds(monkeypatch):
     principal = await validate_jira_cookie_session("https://jira.example.test", "JSESSIONID=x")
     assert principal["accountId"] == "user-1"
     assert calls["n"] == 2  # timed out once, retried, then succeeded
+
+
+async def test_validate_retries_on_transient_connect_error_then_succeeds(monkeypatch):
+    from memforge.auth import jira_auth
+    from memforge.auth.jira_auth import validate_jira_cookie_session
+
+    async def _instant(_seconds):
+        return None
+
+    monkeypatch.setattr(jira_auth.asyncio, "sleep", _instant)
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # A flaky container path (e.g. a dual-stack IPv6 race) connect-errors first.
+            raise httpx.ConnectError("", request=request)
+        return httpx.Response(200, json={"accountId": "user-1", "displayName": "Ann"})
+
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(jira_auth.httpx, "AsyncClient", patched_async_client)
+
+    principal = await validate_jira_cookie_session("https://jira.example.test", "JSESSIONID=x")
+    assert principal["accountId"] == "user-1"
+    assert calls["n"] == 2  # connect-errored once, retried, then succeeded
