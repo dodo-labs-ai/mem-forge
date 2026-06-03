@@ -15,8 +15,11 @@ import { DataSurface } from "@/components/admin/DataSurface";
 import { EmptyState } from "@/components/admin/EmptyState";
 import { FilterSelect } from "@/components/admin/FilterSelect";
 import { PageHeader } from "@/components/admin/PageHeader";
+import { Pagination } from "@/components/admin/Pagination";
 import { SearchInput } from "@/components/admin/SearchInput";
 import { ConfidenceBadge, MemoryTypeBadge, StatusDot } from "@/components/admin/StatusBadge";
+import { MemoryTypeIcon } from "@/components/memories/MemoryTypeIcon";
+import { SourceIcon } from "@/components/sources/SourceIcon";
 import { Toolbar } from "@/components/admin/Toolbar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -108,7 +111,26 @@ export function MemoriesPage() {
   const [type, setType] = useState("all");
   const [status, setStatus] = useState("all");
   const [source, setSource] = useState("all");
+  const [page, setPage] = useState(0);
   const navigate = useNavigate();
+
+  // Any filter change resets to the first page so the offset stays in range.
+  const changeSearch = (value: string) => {
+    setSearch(value);
+    setPage(0);
+  };
+  const changeType = (value: string) => {
+    setType(value);
+    setPage(0);
+  };
+  const changeStatus = (value: string) => {
+    setStatus(value);
+    setPage(0);
+  };
+  const changeSource = (value: string) => {
+    setSource(value);
+    setPage(0);
+  };
 
   const sourcesQuery = useQuery<SourcesResponse | Source[]>({
     queryKey: ["sources"],
@@ -121,7 +143,7 @@ export function MemoriesPage() {
   });
 
   const memoriesQuery = useQuery<PaginatedResponse<Memory>>({
-    queryKey: ["memories", search, type, status, source],
+    queryKey: ["memories", search, type, status, source, page],
     queryFn: () =>
       client
         .get("/api/memories", {
@@ -131,7 +153,7 @@ export function MemoriesPage() {
             status: status !== "all" ? status : undefined,
             source: source !== "all" ? source : undefined,
             limit: LIST_PAGE_SIZE,
-            offset: 0,
+            offset: page * LIST_PAGE_SIZE,
           },
         })
         .then((response) => response.data),
@@ -225,18 +247,18 @@ export function MemoriesPage() {
             </p>
           </div>
           <Toolbar className="xl:justify-end">
-            <SearchInput value={search} onChange={setSearch} placeholder="Filter memories..." />
-            <FilterSelect value={type} onChange={setType} options={TYPE_OPTIONS} label="Filter by type" />
+            <SearchInput value={search} onChange={changeSearch} placeholder="Filter memories..." />
+            <FilterSelect value={type} onChange={changeType} options={TYPE_OPTIONS} label="Filter by type" />
             <FilterSelect
               value={status}
-              onChange={setStatus}
+              onChange={changeStatus}
               options={STATUS_OPTIONS}
               label="Filter by status"
               className="w-full sm:w-44"
             />
             <FilterSelect
               value={source}
-              onChange={setSource}
+              onChange={changeSource}
               label="Filter by source"
               className="w-full sm:w-56"
               options={[
@@ -264,7 +286,7 @@ export function MemoriesPage() {
             <Table>
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
-                  <TableHead className="w-8" />
+                  <TableHead className="w-12" />
                   <TableHead>Memory</TableHead>
                   <TableHead className="w-28">Type</TableHead>
                   <TableHead className="w-28">Confidence</TableHead>
@@ -275,6 +297,7 @@ export function MemoriesPage() {
               <TableBody>
                 {memories.map((memory) => {
                   const reviewId = reviewByMemoryId.get(memory.id);
+                  const origin = memory.origin_source_type;
                   const target =
                     reviewId && memory.status === "pending_review"
                       ? `/review/${reviewId}`
@@ -286,7 +309,14 @@ export function MemoriesPage() {
                       onClick={() => navigate(target)}
                     >
                       <TableCell>
-                        <StatusDot status={memory.status} />
+                        <div className="flex items-center gap-1.5">
+                          {origin ? (
+                            <SourceIcon type={origin} client={memory.origin_client} className="size-4" />
+                          ) : (
+                            <MemoryTypeIcon type={memory.memory_type} className="size-4" />
+                          )}
+                          <StatusDot status={memory.status} />
+                        </div>
                       </TableCell>
                       <TableCell>
                         <div className="max-w-2xl truncate text-sm font-medium">{memory.content}</div>
@@ -319,6 +349,13 @@ export function MemoriesPage() {
             </Table>
           </div>
         </AsyncBoundary>
+        <Pagination
+          page={page}
+          pageSize={LIST_PAGE_SIZE}
+          total={total}
+          onPageChange={setPage}
+          itemLabel="memories"
+        />
       </DataSurface>
     </div>
   );

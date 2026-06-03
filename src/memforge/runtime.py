@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from memforge.config import AppConfig
-from memforge.auth.jira_auth import JiraAuthSessionService, effective_jira_auth_mode
+from memforge.auth import browser_session
 from memforge.genes import GENE_REGISTRY, create_gene
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
@@ -220,15 +220,7 @@ async def run_source_sync(
     runtime = runtime or await build_sync_runtime(db, config)
     secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
     source_config = decrypt_source_config_for_runtime(source["config"], secret_fields=secret_fields)
-    if (
-        source["type"] == "jira"
-        and effective_jira_auth_mode(source_config) == "browser_cookie"
-    ):
-        source_config["jira_cookie"] = await JiraAuthSessionService(db).cookie_header_for_sync(
-            str(source_config.get("base_url") or ""),
-            tls_config=source_config,
-            allow_browser_refresh=False,
-        )
+    await browser_session.inject_cookie_for_source(db, source["type"], source_config)
     gene = create_gene(
         name=source["type"],
         config=source_config,
@@ -389,12 +381,10 @@ class SyncService:
             raise
         except Exception as e:
             logger.exception("Sync failed for source %s", source_id)
-            if (
-                source
-                and source.get("type") == "jira"
-                and "browser session" in str(e).lower()
-            ):
-                await JiraAuthSessionService(self.db).mark_expired(
+            if source and "browser session" in str(e).lower():
+                await browser_session.mark_expired_for_source(
+                    self.db,
+                    source.get("type", ""),
                     str(source.get("config", {}).get("base_url") or ""),
                     str(e),
                 )

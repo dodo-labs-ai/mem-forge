@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { ChevronRight, Database, RefreshCw } from "lucide-react";
@@ -8,6 +9,7 @@ import { DataSurface } from "@/components/admin/DataSurface";
 import { EmptyState } from "@/components/admin/EmptyState";
 import { FilterSelect } from "@/components/admin/FilterSelect";
 import { PageHeader } from "@/components/admin/PageHeader";
+import { Pagination } from "@/components/admin/Pagination";
 import { SearchInput } from "@/components/admin/SearchInput";
 import { Toolbar } from "@/components/admin/Toolbar";
 import { Badge } from "@/components/ui/badge";
@@ -18,6 +20,7 @@ export function EntitiesPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const search = searchParams.get("search") ?? "";
   const tag = searchParams.get("tag") ?? "all";
+  const [page, setPage] = useState(0);
   const navigate = useNavigate();
 
   const updateFilter = (key: "search" | "tag", value: string) => {
@@ -28,10 +31,11 @@ export function EntitiesPage() {
       next.set(key, value);
     }
     setSearchParams(next, { replace: true });
+    setPage(0);
   };
 
   const entitiesQuery = useQuery<PaginatedResponse<Entity>>({
-    queryKey: ["entities", search, tag],
+    queryKey: ["entities", search, tag, page],
     queryFn: () =>
       client
         .get("/api/entities", {
@@ -39,7 +43,7 @@ export function EntitiesPage() {
             search: search || undefined,
             tag: tag !== "all" ? tag : undefined,
             limit: ENTITY_PAGE_SIZE,
-            offset: 0,
+            offset: page * ENTITY_PAGE_SIZE,
           },
         })
         .then((response) => response.data),
@@ -144,6 +148,13 @@ export function EntitiesPage() {
             })}
           </ul>
         </AsyncBoundary>
+        <Pagination
+          page={page}
+          pageSize={ENTITY_PAGE_SIZE}
+          total={total}
+          onPageChange={setPage}
+          itemLabel="names"
+        />
       </DataSurface>
     </div>
   );

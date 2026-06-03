@@ -17,14 +17,17 @@ Claude Code MCP stdio -> plugin-local proxy -> HTTP(S) MemForge API
 get_resource(mode=file) -> ~/.memforge-agent/artifacts -> local_path
 ```
 
-Install from the repository root:
+Install from GitHub (run inside an active Claude Code session):
 
-```bash
-claude plugin marketplace add ./
-claude plugin install memory@memforge
+```text
+/plugin marketplace add shno-labs/mem-forge
+/plugin install memory@memforge
 ```
 
 Start a new Claude Code session after install.
+
+To push a local folder as a source, open the MemForge Admin UI, choose
+**Add Source -> Local Repository**, and run the printed CLI command.
 
 Try a search:
 
@@ -40,10 +43,11 @@ Search MemForge for "<topic>". If a result has content_url or pdf_url, call
 get_resource with mode="file" and show the local_path.
 ```
 
-The plugin adds context during `SessionStart` and `UserPromptSubmit`, records
-hook lifecycle receipts during `PreCompact`, `Stop`, and `SubagentStop`, and
-queues bounded, redacted transcript-window uploads to
-`/api/agent-sessions/windows`.
+The plugin adds context during `SessionStart`, records hook lifecycle receipts
+during `PreCompact`, `Stop`, and `SubagentStop`, and queues bounded, redacted
+transcript-window uploads to `/api/agent-sessions/windows`. Per-prompt memory
+retrieval is left to the MCP `search` tool, which fetches query-aware context
+on demand.
 
 Default capture flow:
 

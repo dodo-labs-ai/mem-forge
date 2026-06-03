@@ -17,6 +17,13 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from memforge.auth.browser_session import (
+    BrowserSessionError,
+    BrowserSessionMissingError,
+    BrowserSessionPrincipalChangedError,
+    BrowserSessionProvider,
+    register_provider,
+)
 from memforge.genes.atlassian_auth import require_https_base_url, tls_verify
 from memforge.source_secrets import decrypt_secret, encrypt_secret
 from memforge.storage.database import Database
@@ -33,21 +40,22 @@ BrowserExtractor = Callable[[str, str | None], tuple[str, str]]
 SessionValidator = Callable[[str, str, dict[str, Any] | None], Any]
 
 
-class JiraAuthSessionError(RuntimeError):
+class JiraAuthSessionError(BrowserSessionError):
     """Base class for Jira browser-session failures."""
 
 
-class JiraAuthSessionMissingError(JiraAuthSessionError):
+class JiraAuthSessionMissingError(JiraAuthSessionError, BrowserSessionMissingError):
     """Raised when no usable Jira browser session exists for an origin."""
 
 
-class JiraPrincipalChangedError(JiraAuthSessionError):
+class JiraPrincipalChangedError(JiraAuthSessionError, BrowserSessionPrincipalChangedError):
     """Raised when a refreshed browser session belongs to a different user."""
 
     def __init__(self, origin: str, old_principal_id: str | None, new_principal_id: str | None) -> None:
-        super().__init__(
+        BrowserSessionError.__init__(
+            self,
             f"Jira browser session for {origin} belongs to {new_principal_id}; "
-            f"existing session belongs to {old_principal_id}. Confirm principal change to continue."
+            f"existing session belongs to {old_principal_id}. Confirm principal change to continue.",
         )
         self.origin = origin
         self.old_principal_id = old_principal_id
@@ -462,3 +470,18 @@ async def _maybe_await(value: Any) -> Any:
     if hasattr(value, "__await__"):
         return await value
     return value
+
+
+# Register Jira as a browser-session provider so the generic CLI / sync layer can
+# manage its sessions without any Jira-specific branching.
+register_provider(
+    BrowserSessionProvider(
+        provider=JIRA_AUTH_PROVIDER,
+        source_type="jira",
+        label="Jira",
+        cookie_config_key="jira_cookie",
+        canonical_origin=canonical_jira_origin,
+        service_factory=lambda db: JiraAuthSessionService(db),
+        uses_browser_session=lambda config: effective_jira_auth_mode(config) == "browser_cookie",
+    )
+)

@@ -624,6 +624,121 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         """CREATE INDEX IF NOT EXISTS idx_memory_review_related_review
            ON memory_review_related_challengers(review_id)""",
     ]),
+    (11, "Add client column and index to documents table", [
+        "ALTER TABLE documents ADD COLUMN client TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_documents_source_client ON documents(source, client)",
+    ]),
+    (12, "Split singleton agent-session source into per-client sources", [
+        # For each known client that has documents under the singleton source,
+        # upsert its per-client source row and re-point those documents to it.
+        # Documents whose client value is not a recognised slug are left under
+        # the singleton so no data is lost. The singleton row itself is removed
+        # only when it has zero documents remaining.
+        #
+        # Step 1: populate documents.client from agent_session_receipts for rows
+        # that are still under the singleton and do not yet have a client value.
+        """UPDATE documents
+           SET client = (
+               SELECT asr.client
+               FROM agent_session_receipts asr
+               WHERE asr.doc_id = documents.doc_id
+               LIMIT 1
+           )
+           WHERE documents.source = 'src-agent-sessions'
+             AND documents.client IS NULL""",
+        # Step 2: upsert the codex per-client source (idempotent).
+        """INSERT INTO sources (id, type, name, config)
+           SELECT
+               'src-agent-sessions-codex',
+               'agent_session',
+               'Codex Session Summaries',
+               (SELECT config FROM sources WHERE id = 'src-agent-sessions')
+           WHERE EXISTS (
+               SELECT 1 FROM sources WHERE id = 'src-agent-sessions'
+           )
+           ON CONFLICT(id) DO NOTHING""",
+        # Step 3: upsert the claude-code per-client source (idempotent).
+        """INSERT INTO sources (id, type, name, config)
+           SELECT
+               'src-agent-sessions-claude-code',
+               'agent_session',
+               'Claude Code Session Summaries',
+               (SELECT config FROM sources WHERE id = 'src-agent-sessions')
+           WHERE EXISTS (
+               SELECT 1 FROM sources WHERE id = 'src-agent-sessions'
+           )
+           ON CONFLICT(id) DO NOTHING""",
+        # Step 4: re-point codex documents to the codex source.
+        """UPDATE documents
+           SET source = 'src-agent-sessions-codex'
+           WHERE source = 'src-agent-sessions'
+             AND client = 'codex'""",
+        # Step 5: re-point claude-code documents to the claude-code source.
+        """UPDATE documents
+           SET source = 'src-agent-sessions-claude-code'
+           WHERE source = 'src-agent-sessions'
+             AND client = 'claude-code'""",
+        # Step 6: remove the singleton source only when it has no remaining
+        # documents (clients other than the two known ones stay attached to it).
+        """DELETE FROM sources
+           WHERE id = 'src-agent-sessions'
+             AND NOT EXISTS (
+                 SELECT 1 FROM documents WHERE source = 'src-agent-sessions'
+             )""",
+    ]),
+    (13, "Rename agent-session sources to drop 'Summaries' and re-split any singleton remnants", [
+        # The display name was tightened from 'X Session Summaries' to 'X Session'.
+        # This migration also re-runs the singleton split because a server running
+        # the pre-split code path could recreate src-agent-sessions and write
+        # new documents to it before being restarted; the SQL below is identical
+        # to migration 12 and idempotent on a fully-split database.
+        """UPDATE sources SET name = 'Codex Session'
+           WHERE id = 'src-agent-sessions-codex'""",
+        """UPDATE sources SET name = 'Claude Code Session'
+           WHERE id = 'src-agent-sessions-claude-code'""",
+        """UPDATE documents
+           SET client = (
+               SELECT asr.client
+               FROM agent_session_receipts asr
+               WHERE asr.doc_id = documents.doc_id
+               LIMIT 1
+           )
+           WHERE documents.source = 'src-agent-sessions'
+             AND documents.client IS NULL""",
+        """INSERT INTO sources (id, type, name, config)
+           SELECT
+               'src-agent-sessions-codex',
+               'agent_session',
+               'Codex Session',
+               (SELECT config FROM sources WHERE id = 'src-agent-sessions')
+           WHERE EXISTS (
+               SELECT 1 FROM sources WHERE id = 'src-agent-sessions'
+           )
+           ON CONFLICT(id) DO NOTHING""",
+        """INSERT INTO sources (id, type, name, config)
+           SELECT
+               'src-agent-sessions-claude-code',
+               'agent_session',
+               'Claude Code Session',
+               (SELECT config FROM sources WHERE id = 'src-agent-sessions')
+           WHERE EXISTS (
+               SELECT 1 FROM sources WHERE id = 'src-agent-sessions'
+           )
+           ON CONFLICT(id) DO NOTHING""",
+        """UPDATE documents
+           SET source = 'src-agent-sessions-codex'
+           WHERE source = 'src-agent-sessions'
+             AND client = 'codex'""",
+        """UPDATE documents
+           SET source = 'src-agent-sessions-claude-code'
+           WHERE source = 'src-agent-sessions'
+             AND client = 'claude-code'""",
+        """DELETE FROM sources
+           WHERE id = 'src-agent-sessions'
+             AND NOT EXISTS (
+                 SELECT 1 FROM documents WHERE source = 'src-agent-sessions'
+             )""",
+    ]),
 ]
 
 
@@ -707,8 +822,9 @@ class Database:
                     doc_id, source, source_url, title, space_or_project,
                     author, last_modified, labels, version, content_hash,
                     token_count, raw_content_uri, raw_content_type,
-                    normalized_content_uri, pdf_content_uri, last_synced, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    normalized_content_uri, pdf_content_uri, last_synced,
+                    client, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(doc_id) DO UPDATE SET
                     source=excluded.source, source_url=excluded.source_url,
                     title=excluded.title, space_or_project=excluded.space_or_project,
@@ -719,7 +835,9 @@ class Database:
                     raw_content_type=excluded.raw_content_type,
                     normalized_content_uri=excluded.normalized_content_uri,
                     pdf_content_uri=excluded.pdf_content_uri,
-                    last_synced=excluded.last_synced, updated_at=excluded.updated_at""",
+                    last_synced=excluded.last_synced,
+                    client=COALESCE(excluded.client, documents.client),
+                    updated_at=excluded.updated_at""",
                 (
                     doc.doc_id, doc.source, doc.source_url, doc.title,
                     doc.space_or_project, doc.author,
@@ -727,7 +845,9 @@ class Database:
                     json.dumps(doc.labels), doc.version, doc.content_hash,
                     doc.token_count, doc.raw_content_uri, doc.raw_content_type,
                     doc.normalized_content_uri, doc.pdf_content_uri,
-                    doc.last_synced.isoformat(), _now_iso(),
+                    doc.last_synced.isoformat(),
+                    doc.client,
+                    _now_iso(),
                 ),
             )
             await self.db.commit()
@@ -749,8 +869,8 @@ class Database:
                     doc_id, source, source_url, title, space_or_project, author,
                     last_modified, labels, version, content_hash, token_count,
                     raw_content_uri, raw_content_type, normalized_content_uri,
-                    pdf_content_uri, last_synced, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pdf_content_uri, last_synced, client, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(doc_id) DO UPDATE SET
                     source=excluded.source, source_url=excluded.source_url,
                     title=excluded.title, space_or_project=excluded.space_or_project,
@@ -762,6 +882,7 @@ class Database:
                     normalized_content_uri=excluded.normalized_content_uri,
                     pdf_content_uri=excluded.pdf_content_uri,
                     last_synced=excluded.last_synced,
+                    client=COALESCE(excluded.client, documents.client),
                     created_at=COALESCE(excluded.created_at, documents.created_at),
                     updated_at=excluded.updated_at""",
                 (
@@ -772,6 +893,7 @@ class Database:
                     doc.raw_content_uri, doc.raw_content_type,
                     doc.normalized_content_uri, doc.pdf_content_uri,
                     doc.last_synced.isoformat(),
+                    doc.client,
                     doc.created_at.isoformat() if doc.created_at else None,
                     doc.updated_at.isoformat() if doc.updated_at else None,
                 ),
@@ -1685,6 +1807,32 @@ class Database:
                 ))
         return results
 
+    async def get_origin_source_pairs(
+        self, memory_ids: list[str]
+    ) -> dict[str, list[tuple[str, str | None, str | None]]]:
+        """Return each memory's (source_type, support_kind, client) triples, ordered
+        oldest-first by (added_at, doc_id), for a batch of memories in one query.
+        The client value comes from documents.client and is None for non-agent-session
+        sources. Memories with no sources are absent from the result."""
+        if not memory_ids:
+            return {}
+        placeholders = ",".join("?" for _ in memory_ids)
+        grouped: dict[str, list[tuple[str, str | None, str | None]]] = {}
+        async with self.db.execute(
+            f"""SELECT ms.memory_id, ms.source_type, ms.support_kind, d.client
+                FROM memory_sources ms
+                LEFT JOIN documents d ON d.doc_id = ms.doc_id
+                WHERE ms.memory_id IN ({placeholders})
+                ORDER BY ms.added_at ASC, ms.doc_id ASC""",
+            memory_ids,
+        ) as cursor:
+            async for row in cursor:
+                d = dict(row)
+                grouped.setdefault(d["memory_id"], []).append(
+                    (d["source_type"], d.get("support_kind"), d.get("client"))
+                )
+        return grouped
+
     async def get_corroborated_sources_by_doc(self, doc_id: str) -> list[MemorySource]:
         results: list[MemorySource] = []
         async with self.db.execute(
@@ -2307,6 +2455,16 @@ class Database:
                 (status, last_error, _now_iso(), provider, origin),
             )
             await self.db.commit()
+
+    async def delete_auth_session(self, provider: str, origin: str) -> bool:
+        """Delete a stored auth session. Returns True if a row was removed."""
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                "DELETE FROM auth_sessions WHERE provider = ? AND origin = ?",
+                (provider, origin),
+            )
+            await self.db.commit()
+            return cursor.rowcount > 0
 
     # ==================================================================
     # Agent session receipt lineage
@@ -3247,6 +3405,7 @@ class Database:
             normalized_content_uri=d["normalized_content_uri"],
             pdf_content_uri=d.get("pdf_content_uri"),
             last_synced=datetime.fromisoformat(d["last_synced"]),
+            client=d.get("client"),
             created_at=_parse_dt(d.get("created_at")),
             updated_at=_parse_dt(d.get("updated_at")),
         )

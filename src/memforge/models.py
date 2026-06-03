@@ -263,6 +263,7 @@ class DocumentRecord:
     normalized_content_uri: str | None
     pdf_content_uri: str | None
     last_synced: datetime
+    client: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

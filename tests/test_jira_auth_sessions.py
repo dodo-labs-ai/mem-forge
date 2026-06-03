@@ -325,7 +325,15 @@ async def test_runtime_resolves_jira_browser_session_without_persisting_cookie(d
                 session_validator=lambda origin, cookie, tls_config=None: {"accountId": "user-123"},
             ).cookie_header_for_sync(base_url, allow_browser_refresh=allow_browser_refresh, tls_config=tls_config)
 
-    monkeypatch.setattr(runtime, "JiraAuthSessionService", FakeJiraAuthSessionService)
+    import dataclasses
+
+    from memforge.auth import browser_session as bs
+
+    monkeypatch.setattr(
+        bs,
+        "_PROVIDERS",
+        {**bs._PROVIDERS, "jira": dataclasses.replace(bs.get_provider("jira"), service_factory=FakeJiraAuthSessionService)},
+    )
 
     result = await runtime.run_source_sync(
         db=db,
@@ -377,7 +385,15 @@ async def test_runtime_keeps_legacy_jira_pat_source_in_pat_mode(db, tmp_path, mo
         def orchestrator(self):
             return FakeOrchestrator()
 
-    monkeypatch.setattr(runtime, "JiraAuthSessionService", FailingJiraAuthSessionService)
+    import dataclasses
+
+    from memforge.auth import browser_session as bs
+
+    monkeypatch.setattr(
+        bs,
+        "_PROVIDERS",
+        {**bs._PROVIDERS, "jira": dataclasses.replace(bs.get_provider("jira"), service_factory=FailingJiraAuthSessionService)},
+    )
 
     await runtime.run_source_sync(
         db=db,
