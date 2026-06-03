@@ -7,6 +7,7 @@ resolution for those sessions.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -35,11 +36,14 @@ JIRA_SESSION_EXPIRED = "expired"
 JIRA_SESSION_MISSING = "missing"
 JIRA_SESSION_FAILED = "failed"
 
-# A cold connection to a slow corporate Jira can exceed a tight read timeout on
-# the first call, so the read budget is generous and one retry warms it up.
+# A container's path to a corporate Jira is often intermittently flaky (cold
+# connections, dual-stack IPv6 races, VPN or DNS warmup), so transient connect or
+# read failures are retried a few times before giving up, with a generous read
+# budget for slow first responses.
 JIRA_VALIDATE_CONNECT_TIMEOUT_SECONDS = 10.0
 JIRA_VALIDATE_READ_TIMEOUT_SECONDS = 60.0
-JIRA_VALIDATE_ATTEMPTS = 2
+JIRA_VALIDATE_ATTEMPTS = 4
+JIRA_VALIDATE_RETRY_DELAY_SECONDS = 0.5
 
 SessionValidator = Callable[[str, str, dict[str, Any] | None], Any]
 
@@ -321,22 +325,21 @@ def _redacted_status(stored: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _probe_jira_myself(client: httpx.AsyncClient, origin: str) -> httpx.Response:
-    """GET ``/myself``, retrying once on a transient timeout (cold connections are slow).
+    """GET ``/myself``, retrying transient transport failures before giving up.
 
-    A timeout is worth one retry because the first call often just has to warm up
-    the TLS/proxy path. A non-timeout transport error (connection refused, DNS, TLS
-    failure) will not improve on retry, so it fails fast with a clear message.
+    A connect or read failure to a corporate Jira from inside a container is often
+    intermittent (a dual-stack IPv6 race, a cold connection, VPN or DNS warmup), so
+    a few quick retries usually succeed where the first attempt did not. After the
+    attempts are exhausted it raises a clear, non-blank message.
     """
     last_exc: Exception | None = None
-    for _attempt in range(JIRA_VALIDATE_ATTEMPTS):
+    for attempt in range(JIRA_VALIDATE_ATTEMPTS):
         try:
             return await client.get("/rest/api/2/myself")
-        except httpx.TimeoutException as exc:
-            last_exc = exc
-            continue
         except httpx.TransportError as exc:
             last_exc = exc
-            break
+            if attempt + 1 < JIRA_VALIDATE_ATTEMPTS:
+                await asyncio.sleep(JIRA_VALIDATE_RETRY_DELAY_SECONDS)
     detail = str(last_exc) or type(last_exc).__name__
     raise JiraAuthSessionError(
         f"Could not reach Jira at {canonical_jira_origin(origin)} to validate the session ({detail})."
