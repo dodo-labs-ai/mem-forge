@@ -1443,58 +1443,111 @@ def adapter_auth():
     pass
 
 
-def _run_session_op(ctx, async_factory):
-    async def _run():
-        config: AppConfig = ctx.obj["config"]
-        db = await _get_db(config)
+def _principal_change_payload(upload_result: dict) -> dict:
+    """Translate a 409 upload response into the principal-changed signal the CLI emits."""
+    inner: dict = {}
+    body = upload_result.get("detail")
+    if isinstance(body, str):
         try:
-            return await async_factory(db)
-        finally:
-            await db.close()
+            parsed = json.loads(body)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            candidate = parsed.get("detail", parsed)
+            if isinstance(candidate, dict):
+                inner = candidate
+    return {
+        "error": "principal_changed",
+        "origin": inner.get("origin"),
+        "old_principal_id": inner.get("old_principal_id"),
+        "new_principal_id": inner.get("new_principal_id"),
+    }
 
-    return asyncio.run(_run())
+
+# Watch defaults. The tick interval is deliberately shorter than a typical Jira
+# idle-session timeout so the stored copy is renewed while it is still valid.
+WATCH_DEFAULT_INTERVAL_SECONDS = 1800  # 30 minutes
+WATCH_BACKOFF_BASE_SECONDS = 5
+WATCH_BACKOFF_MAX_SECONDS = 300  # 5 minutes
+
+
+def _cookie_hash(cookie_header: str) -> str:
+    return hashlib.sha256(cookie_header.encode("utf-8")).hexdigest()
+
+
+async def run_watch_tick(*, base_url, browser, client, last_hash, capture, log):
+    """One watch iteration. Returns (action, new_last_hash).
+
+    action is one of: uploaded, unchanged, expired, principal_conflict, transport_error.
+    Pure over its injected collaborators (capture, client, log) so it is unit-testable.
+    """
+    from memforge.auth.jira_auth import JiraAuthSessionMissingError
+
+    try:
+        result = await capture(base_url, browser=browser)
+    except JiraAuthSessionMissingError as exc:
+        client.mark_jira_session_expired(base_url=base_url, error=str(exc))
+        log(f"Jira session for {base_url} is not active; sign back into Jira in your browser. ({exc})")
+        return "expired", None
+
+    new_hash = _cookie_hash(result.cookie_header)
+    if new_hash == last_hash:
+        return "unchanged", last_hash
+
+    uploaded = client.upload_jira_session(
+        base_url=base_url, cookie_header=result.cookie_header, browser=result.browser,
+    )
+    if uploaded.get("status_code") == 409:
+        log(f"A different Jira user is signed in for {base_url}; re-run refresh with --confirm-principal-change.")
+        return "principal_conflict", last_hash
+    if uploaded.get("error"):
+        log(f"Upload to MemForge failed: {uploaded.get('detail') or uploaded['error']}")
+        return "transport_error", last_hash
+    log(f"Refreshed Jira session for {base_url} (cookie {new_hash[:8]}).")
+    return "uploaded", new_hash
 
 
 def _make_browser_session_group(descriptor):
     """Build an ``adapter auth <provider>`` group (status/list/forget/refresh).
 
-    Every subcommand routes through the provider-agnostic ``browser_session``
-    ops, so a new browser-session source needs only to register a descriptor.
+    These commands manage the browser session stored on the remote MemForge
+    server over the active target. ``status``, ``list``, and ``forget`` ask the
+    server about its stored session, and ``refresh`` captures the cookie from
+    the local browser and uploads it, so the server owns the durable session.
     """
     provider = descriptor.provider
+    if provider != "jira":
+        raise NotImplementedError(
+            f"Browser-session CLI is implemented for Jira only; {provider} needs its own ToolClient methods."
+        )
 
-    @click.group(name=provider, help=f"Manage the local {descriptor.label} browser session.")
+    @click.group(name=provider, help=f"Manage the {descriptor.label} browser session on the server.")
     def group():
-        pass
+        """Manage the server's stored browser session for this provider.
+
+        ``status``, ``list``, and ``forget`` talk to the remote MemForge server.
+        ``refresh`` captures the cookie from the local browser and uploads it.
+        """
 
     @group.command("status")
     @click.option("--base-url", required=True, help=f"{descriptor.label} base URL.")
     @click.pass_context
     def status_cmd(ctx, base_url):
-        """Show the stored session status (read-only) for an origin."""
-        try:
-            payload = _run_session_op(ctx, lambda db: browser_session.status(db, provider, base_url))
-        except ValueError as exc:
-            payload = {"error": "status_failed", "detail": str(exc)}
-        _emit_tool_payload(ctx, payload)
+        """Show the server's stored session status for an origin."""
+        _emit_tool_payload(ctx, _tool_client(ctx).get_jira_session(base_url))
 
     @group.command("list")
     @click.pass_context
     def list_cmd(ctx):
-        """List known origins: authenticated sessions and configured sources."""
-        origins = _run_session_op(ctx, lambda db: browser_session.list_origins(db, provider))
-        _emit_tool_payload(ctx, {"origins": origins})
+        """List known origins from the server."""
+        _emit_tool_payload(ctx, _tool_client(ctx).list_jira_origins())
 
     @group.command("forget")
-    @click.option("--base-url", required=True, help="Origin whose stored browser session to delete.")
+    @click.option("--base-url", required=True, help="Origin whose stored session to delete.")
     @click.pass_context
     def forget_cmd(ctx, base_url):
-        """Forget (delete) the stored browser session for an origin."""
-        try:
-            payload = _run_session_op(ctx, lambda db: browser_session.forget(db, provider, base_url))
-        except ValueError as exc:
-            raise click.ClickException(str(exc))
-        _emit_tool_payload(ctx, payload)
+        """Forget the server's stored session for an origin."""
+        _emit_tool_payload(ctx, _tool_client(ctx).forget_jira_session(base_url))
 
     @group.command("refresh")
     @click.option("--base-url", required=True, help=f"{descriptor.label} base URL.")
@@ -1502,34 +1555,67 @@ def _make_browser_session_group(descriptor):
     @click.option("--confirm-principal-change", is_flag=True, help="Allow this session to replace a different user.")
     @click.pass_context
     def refresh_cmd(ctx, base_url, browser, confirm_principal_change):
-        """Re-capture the browser session for an origin."""
+        """Capture the local browser session and upload it to the server."""
+        from memforge.auth import jira_capture
+        from memforge.auth.jira_auth import JiraAuthSessionError, JiraAuthSessionMissingError
+
         try:
-            result = _run_session_op(
-                ctx,
-                lambda db: browser_session.refresh(
-                    db,
-                    provider,
-                    base_url=base_url,
-                    browser=browser,
-                    confirm_principal_change=confirm_principal_change,
-                ),
-            )
-        except browser_session.BrowserSessionPrincipalChangedError as exc:
-            _emit_tool_payload(
-                ctx,
-                {
-                    "error": "principal_changed",
-                    "detail": str(exc),
-                    "origin": exc.origin,
-                    "old_principal_id": exc.old_principal_id,
-                    "new_principal_id": exc.new_principal_id,
-                },
-            )
+            result = asyncio.run(jira_capture.capture_and_prevalidate(base_url, browser=browser))
+        except JiraAuthSessionMissingError as exc:
+            _emit_tool_payload(ctx, {"error": "no_session", "detail": str(exc)})
             return
-        except (browser_session.BrowserSessionError, ValueError) as exc:
+        except (JiraAuthSessionError, ValueError) as exc:
             _emit_tool_payload(ctx, {"error": "auth_failed", "detail": str(exc)})
             return
-        _emit_tool_payload(ctx, {"ok": True, **result})
+        payload = _tool_client(ctx).upload_jira_session(
+            base_url=result.origin,
+            cookie_header=result.cookie_header,
+            browser=result.browser,
+            confirm_principal_change=confirm_principal_change,
+        )
+        if payload.get("status_code") == 409:
+            _emit_tool_payload(ctx, _principal_change_payload(payload))
+            return
+        _emit_tool_payload(ctx, payload)
+
+    @group.command("watch")
+    @click.option("--base-url", required=True, help=f"{descriptor.label} base URL.")
+    @click.option("--browser", default=None, help="Browser to read cookies from, for example chrome or edge.")
+    @click.option("--interval-seconds", type=int, default=WATCH_DEFAULT_INTERVAL_SECONDS, show_default=True,
+                  help="Seconds between re-capture attempts. Keep it under your Jira idle timeout.")
+    @click.pass_context
+    def watch_cmd(ctx, base_url, browser, interval_seconds):
+        """Keep the server's Jira session fresh by re-capturing on an interval."""
+        from memforge.auth import jira_capture
+
+        client = _tool_client(ctx)
+
+        async def _capture(url, *, browser=None):
+            return await jira_capture.capture_and_prevalidate(url, browser=browser)
+
+        async def _loop():
+            last_hash = None
+            backoff = WATCH_BACKOFF_BASE_SECONDS
+            while True:
+                try:
+                    action, last_hash = await run_watch_tick(
+                        base_url=base_url, browser=browser, client=client,
+                        last_hash=last_hash, capture=_capture, log=click.echo,
+                    )
+                except Exception as exc:  # a daemon must survive any single-tick failure
+                    click.echo(f"Jira watch tick failed: {exc}")
+                    action = "transport_error"
+                if action == "transport_error":
+                    await asyncio.sleep(min(backoff, WATCH_BACKOFF_MAX_SECONDS))
+                    backoff = min(backoff * 2, WATCH_BACKOFF_MAX_SECONDS)
+                    continue
+                backoff = WATCH_BACKOFF_BASE_SECONDS
+                await asyncio.sleep(interval_seconds)
+
+        try:
+            asyncio.run(_loop())
+        except KeyboardInterrupt:
+            click.echo("Stopped Jira session watch.")
 
     return group
 

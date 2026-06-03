@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 ATLASSIAN_REQUEST_ATTEMPTS = 4
 ATLASSIAN_DEFAULT_RETRY_DELAY_SECONDS = 2.0
 ATLASSIAN_MAX_RETRY_DELAY_SECONDS = 60.0
+# A cold connection often just needs to warm up, so a transient timeout is retried
+# after a short, fixed pause rather than the rate-limit backoff.
+ATLASSIAN_TIMEOUT_RETRY_DELAY_SECONDS = 1.0
 _ATLASSIAN_LIMITERS_LOCK = Lock()
 _ATLASSIAN_REQUEST_LIMITERS: dict[str, "AtlassianRequestLimiter"] = {}
 
@@ -31,6 +34,10 @@ class AtlassianRateLimitError(RuntimeError):
 
 class AtlassianZeroQuotaRateLimitError(AtlassianRateLimitError):
     """Raised when an Atlassian REST endpoint reports no usable API quota."""
+
+
+class AtlassianRequestTimeoutError(RuntimeError):
+    """Raised when an Atlassian request keeps timing out after bounded retries."""
 
 
 class AtlassianRequestLimiter:
@@ -193,13 +200,28 @@ async def request_with_rate_limit_retry(
             kwargs["params"] = params
         if json_body is not None:
             kwargs["json"] = json_body
-        if limiter is not None:
-            resp = await limiter.run(
-                lambda: client.request(method, url, **kwargs),
-                delay_for_response=lambda response: _limiter_delay_seconds(response, attempt),
+        try:
+            if limiter is not None:
+                resp = await limiter.run(
+                    lambda: client.request(method, url, **kwargs),
+                    delay_for_response=lambda response: _limiter_delay_seconds(response, attempt),
+                )
+            else:
+                resp = await client.request(method, url, **kwargs)
+        except httpx.TimeoutException as exc:
+            if attempt == ATLASSIAN_REQUEST_ATTEMPTS:
+                raise AtlassianRequestTimeoutError(
+                    f"{product_name} request timed out after {ATLASSIAN_REQUEST_ATTEMPTS} attempts for {url}. "
+                    "The instance may be slow or unreachable; check VPN or network, then retry."
+                ) from exc
+            logger.warning(
+                "%s request timed out %s; retrying in %.1fs",
+                product_name,
+                url,
+                ATLASSIAN_TIMEOUT_RETRY_DELAY_SECONDS,
             )
-        else:
-            resp = await client.request(method, url, **kwargs)
+            await asyncio.sleep(ATLASSIAN_TIMEOUT_RETRY_DELAY_SECONDS)
+            continue
         if resp.status_code != 429:
             resp.raise_for_status()
             return resp

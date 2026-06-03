@@ -5,7 +5,6 @@ import pytest
 from click.testing import CliRunner
 
 import memforge.main as main
-from memforge.auth.jira_auth import JiraAuthSessionError, JiraPrincipalChangedError
 from memforge.main import cli
 
 
@@ -238,67 +237,132 @@ def test_env_api_url_does_not_use_active_target_token(monkeypatch, tmp_path: Pat
     ]
 
 
-class _FakeDB:
-    async def close(self):
-        pass
+class _StubClient:
+    def __init__(self, **responses):
+        self._responses = responses
+        self.calls = []
+
+    def get_jira_session(self, base_url):
+        self.calls.append(("get_jira_session", base_url))
+        return self._responses.get("get_jira_session", {})
+
+    def list_jira_origins(self):
+        self.calls.append(("list_jira_origins", None))
+        return self._responses.get("list_jira_origins", {"origins": []})
+
+    def forget_jira_session(self, base_url):
+        self.calls.append(("forget_jira_session", base_url))
+        return self._responses.get("forget_jira_session", {"ok": True, "forgotten": True})
+
+    def upload_jira_session(self, **kwargs):
+        self.calls.append(("upload_jira_session", kwargs))
+        return self._responses.get("upload_jira_session", {})
 
 
-async def _fake_get_db(config):
-    return _FakeDB()
-
-
-def test_adapter_jira_refresh_uses_base_url(monkeypatch):
-    calls: list[dict] = []
-
-    async def fake_refresh(db, provider, *, base_url, browser=None, confirm_principal_change=False):
-        calls.append({"provider": provider, "base_url": base_url, "browser": browser, "confirm": confirm_principal_change})
-        return {"origin": base_url, "principal_name": "i551096", "browser": browser, "sources_reset": []}
-
-    monkeypatch.setattr(main, "_get_db", _fake_get_db)
-    monkeypatch.setattr(main.browser_session, "refresh", fake_refresh)
-
-    result = CliRunner().invoke(
-        cli,
-        ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap", "--browser", "chrome"],
-    )
-
+def test_adapter_jira_status_reports_stored_session(monkeypatch):
+    stub = _StubClient(get_jira_session={
+        "provider": "jira", "origin": "https://jira.tools.sap", "status": "active",
+        "principal_name": "Rose H", "browser": "chrome",
+    })
+    monkeypatch.setattr(main, "_tool_client", lambda ctx: stub)
+    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "status", "--base-url", "https://jira.tools.sap"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["ok"] is True
-    assert payload["origin"] == "https://jira.tools.sap"
-    assert calls == [
-        {"provider": "jira", "base_url": "https://jira.tools.sap", "browser": "chrome", "confirm": False}
-    ]
+    assert payload["status"] == "active"
+    assert payload["principal_name"] == "Rose H"
+    assert stub.calls == [("get_jira_session", "https://jira.tools.sap")]
 
 
-def test_adapter_jira_refresh_failure_returns_json_error(monkeypatch):
-    async def fake_refresh(db, provider, *, base_url, browser=None, confirm_principal_change=False):
-        raise JiraAuthSessionError("No active Jira browser session cookies were found")
+def test_adapter_jira_status_missing_session_is_not_an_error(monkeypatch):
+    stub = _StubClient(get_jira_session={"provider": "jira", "origin": "https://jira.tools.sap", "status": "missing"})
+    monkeypatch.setattr(main, "_tool_client", lambda ctx: stub)
+    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "status", "--base-url", "https://jira.tools.sap"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["status"] == "missing"
 
-    monkeypatch.setattr(main, "_get_db", _fake_get_db)
-    monkeypatch.setattr(main.browser_session, "refresh", fake_refresh)
+
+def test_adapter_jira_refresh_captures_and_uploads(monkeypatch):
+    from memforge.auth import jira_capture
+
+    captured = {}
+
+    async def fake_capture(base_url, *, browser=None):
+        captured["base_url"] = base_url
+        captured["browser"] = browser
+        return jira_capture.JiraCaptureResult(
+            origin=base_url, cookie_header="SESSION=x", browser=browser, principal={"accountId": "u1"},
+        )
+
+    stub = _StubClient(upload_jira_session={"provider": "jira", "origin": "https://jira.tools.sap", "status": "active"})
+    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
+    monkeypatch.setattr(main, "_tool_client", lambda ctx: stub)
+
+    result = CliRunner().invoke(
+        cli, ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap", "--browser", "chrome"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "active"
+    assert captured == {"base_url": "https://jira.tools.sap", "browser": "chrome"}
+    assert stub.calls[0][0] == "upload_jira_session"
+    assert stub.calls[0][1]["cookie_header"] == "SESSION=x"
+    assert stub.calls[0][1]["base_url"] == "https://jira.tools.sap"
+
+
+def test_adapter_jira_refresh_no_session_returns_json_error(monkeypatch):
+    from memforge.auth import jira_capture
+    from memforge.auth.jira_auth import JiraAuthSessionMissingError
+
+    async def fake_capture(base_url, *, browser=None):
+        raise JiraAuthSessionMissingError("No active Jira browser session cookies were found")
+
+    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
+    monkeypatch.setattr(main, "_tool_client", lambda ctx: _StubClient())
 
     result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap"])
-
     assert result.exit_code == 1
     payload = json.loads(result.output)
-    assert payload["error"] == "auth_failed"
+    assert payload["error"] == "no_session"
     assert "No active Jira" in payload["detail"]
 
 
+def test_adapter_jira_refresh_capture_error_returns_json_error(monkeypatch):
+    from memforge.auth import jira_capture
+
+    async def fake_capture(base_url, *, browser=None):
+        raise ValueError("Unsupported browser for Jira session extraction: netscape")
+
+    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
+    monkeypatch.setattr(main, "_tool_client", lambda ctx: _StubClient())
+
+    result = CliRunner().invoke(
+        cli, ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap", "--browser", "netscape"],
+    )
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["error"] == "auth_failed"
+    assert "Unsupported browser" in payload["detail"]
+
+
 def test_adapter_jira_refresh_principal_change_returns_json_error(monkeypatch):
-    async def fake_refresh(db, provider, *, base_url, browser=None, confirm_principal_change=False):
-        raise JiraPrincipalChangedError(
-            "https://jira.tools.sap",
-            old_principal_id="old-user",
-            new_principal_id="new-user",
+    from memforge.auth import jira_capture
+
+    async def fake_capture(base_url, *, browser=None):
+        return jira_capture.JiraCaptureResult(
+            origin=base_url, cookie_header="SESSION=x", browser=None, principal={"accountId": "u1"},
         )
 
-    monkeypatch.setattr(main, "_get_db", _fake_get_db)
-    monkeypatch.setattr(main.browser_session, "refresh", fake_refresh)
+    body = json.dumps({"detail": {
+        "message": "changed", "origin": "https://jira.tools.sap",
+        "old_principal_id": "old-user", "new_principal_id": "new-user",
+    }})
+    stub = _StubClient(upload_jira_session={
+        "error": "MemForge API request failed", "status_code": 409, "detail": body,
+    })
+    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
+    monkeypatch.setattr(main, "_tool_client", lambda ctx: stub)
 
     result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap"])
-
     assert result.exit_code == 1
     payload = json.loads(result.output)
     assert payload["error"] == "principal_changed"
@@ -307,43 +371,18 @@ def test_adapter_jira_refresh_principal_change_returns_json_error(monkeypatch):
     assert payload["new_principal_id"] == "new-user"
 
 
-def test_adapter_jira_status_reports_stored_session(monkeypatch):
-    async def fake_status(db, provider, base_url):
-        assert provider == "jira"
-        assert base_url == "https://jira.tools.sap"
-        return {
-            "provider": "jira",
-            "origin": "https://jira.tools.sap",
-            "status": "active",
-            "principal_name": "Rose H",
-            "browser": "chrome",
-            "validated_at": "2026-06-02T10:00:00+00:00",
-            "last_error": None,
-        }
-
-    monkeypatch.setattr(main, "_get_db", _fake_get_db)
-    monkeypatch.setattr(main.browser_session, "status", fake_status)
-
-    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "status", "--base-url", "https://jira.tools.sap"])
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["status"] == "active"
-    assert payload["principal_name"] == "Rose H"
-    assert payload["origin"] == "https://jira.tools.sap"
-
-
-def test_adapter_jira_status_missing_session_is_not_an_error(monkeypatch):
-    async def fake_status(db, provider, base_url):
-        return {"provider": "jira", "origin": "https://jira.tools.sap", "status": "missing", "last_error": None}
-
-    monkeypatch.setattr(main, "_get_db", _fake_get_db)
-    monkeypatch.setattr(main.browser_session, "status", fake_status)
-
-    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "status", "--base-url", "https://jira.tools.sap"])
-
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["status"] == "missing"
+def test_adapter_jira_list_and_forget(monkeypatch):
+    stub = _StubClient(
+        list_jira_origins={"origins": [{"origin": "https://jira.tools.sap", "status": "active"}]},
+        forget_jira_session={"ok": True, "origin": "https://jira.tools.sap", "forgotten": True},
+    )
+    monkeypatch.setattr(main, "_tool_client", lambda ctx: stub)
+    list_result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "list"])
+    assert list_result.exit_code == 0, list_result.output
+    assert json.loads(list_result.output)["origins"][0]["origin"] == "https://jira.tools.sap"
+    forget_result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "forget", "--base-url", "https://jira.tools.sap"])
+    assert forget_result.exit_code == 0, forget_result.output
+    assert json.loads(forget_result.output)["forgotten"] is True
 
 
 def test_legacy_auth_jira_is_removed():
@@ -749,3 +788,9 @@ def test_adapter_kb_push_reports_service_errors(monkeypatch, tmp_path: Path):
     assert payload["counts"]["failed"] == 1
     assert payload["failed"][0]["status_code"] == 400
     assert "error" in payload
+
+
+def test_adapter_jira_watch_command_is_registered():
+    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "watch", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "--interval-seconds" in result.output

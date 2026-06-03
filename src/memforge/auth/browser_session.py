@@ -5,8 +5,8 @@ the service cannot authenticate as the user (no REST/PAT quota, SSO-gated, etc.)
 The session is captured on the user's machine and stored in the shared
 ``auth_sessions`` table, keyed by ``(provider, origin)``.
 
-This module owns the provider-agnostic lifecycle — list / status / forget /
-refresh / sync-time cookie injection — so adding a new browser-session source
+This module owns the provider-agnostic lifecycle: list / status / forget /
+store-uploaded / sync-time cookie injection, so adding a new browser-session source
 means registering one :class:`BrowserSessionProvider` descriptor, not
 reimplementing session management. Each descriptor supplies the provider's
 origin canonicaliser, the config key its gene reads the cookie from, and a
@@ -46,12 +46,13 @@ class BrowserSessionService(Protocol):
 
     async def get_status(self, base_url: str) -> dict[str, Any]: ...
 
-    async def refresh_from_browser(
-        self, *, base_url: str, browser: str | None = None, confirm_principal_change: bool = False
+    async def store_uploaded_session(
+        self, *, base_url: str, cookie_header: str, browser: str | None = None,
+        tls_config: dict | None = None, confirm_principal_change: bool = False,
     ) -> dict[str, Any]: ...
 
     async def cookie_header_for_sync(
-        self, base_url: str, *, allow_browser_refresh: bool = True, tls_config: dict | None = None
+        self, base_url: str, *, tls_config: dict | None = None
     ) -> str: ...
 
     async def mark_expired(self, base_url: str, error: str) -> None: ...
@@ -153,17 +154,19 @@ async def forget(db: Database, provider: str, base_url: str) -> dict[str, Any]:
     return {"ok": True, "provider": provider, "origin": origin, "forgotten": removed}
 
 
-async def refresh(
+async def store_uploaded(
     db: Database,
     provider: str,
     *,
     base_url: str,
+    cookie_header: str,
     browser: str | None = None,
     confirm_principal_change: bool = False,
 ) -> dict[str, Any]:
     descriptor = get_provider(provider)
-    return await descriptor.service_factory(db).refresh_from_browser(
+    return await descriptor.service_factory(db).store_uploaded_session(
         base_url=base_url,
+        cookie_header=cookie_header,
         browser=browser,
         confirm_principal_change=confirm_principal_change,
     )
@@ -182,7 +185,6 @@ async def inject_cookie_for_source(db: Database, source_type: str, config: dict[
     config[descriptor.cookie_config_key] = await service.cookie_header_for_sync(
         str(config.get("base_url") or ""),
         tls_config=config,
-        allow_browser_refresh=False,
     )
     return True
 

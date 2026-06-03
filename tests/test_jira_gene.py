@@ -836,3 +836,41 @@ async def test_fetch_reports_comment_rate_limit_when_comments_are_enabled(monkey
         "/rest/api/2/issue/PAY-123/comment",
         "/rest/api/2/issue/PAY-123/comment",
     ]
+
+
+@pytest.mark.asyncio
+async def test_discover_retries_once_on_transient_timeout(monkeypatch):
+    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
+
+    class TimeoutThenSuccessClient(RecordingAsyncClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._timed_out = False
+
+        async def request(self, method: str, url: str, **kwargs):
+            self.calls.append((method, url, kwargs))
+            if not self._timed_out:
+                self._timed_out = True
+                raise httpx.ReadTimeout("slow", request=httpx.Request(method, f"https://jira.example.test{url}"))
+            return JsonResponse({"issues": [], "total": 0})
+
+    gene = JiraGene(
+        config={
+            "base_url": "https://jira.example.test",
+            "projects": ["PAY"],
+            "auth_mode": "browser_cookie",
+            "jira_cookie": "JSESSIONID=ok",
+        },
+        source_id="src-jira",
+    )
+    client = TimeoutThenSuccessClient(base_url="https://jira.example.test")
+    gene._client = client
+    gene._base_url = "https://jira.example.test"
+
+    items = [item async for item in gene.discover()]
+
+    assert items == []  # search returned no issues once the retry succeeded
+    assert [call[0:2] for call in client.calls] == [
+        ("POST", "/rest/api/2/search"),
+        ("POST", "/rest/api/2/search"),
+    ]

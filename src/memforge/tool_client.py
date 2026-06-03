@@ -133,6 +133,33 @@ class ToolClient:
             {"type": source_type, "name": name, "config": config},
         )
 
+    def get_jira_session(self, base_url: str) -> dict[str, Any]:
+        return self._http_json("GET", f"/api/auth/jira-session?base_url={quote(base_url, safe='')}", None)
+
+    def list_jira_origins(self) -> dict[str, Any]:
+        return self._http_json("GET", "/api/auth/jira-origins", None)
+
+    def upload_jira_session(
+        self, *, base_url: str, cookie_header: str, browser: str | None = None,
+        confirm_principal_change: bool = False,
+    ) -> dict[str, Any]:
+        return self._http_json(
+            "POST",
+            "/api/auth/jira-session",
+            {
+                "base_url": base_url,
+                "cookie_header": cookie_header,
+                "browser": browser,
+                "confirm_principal_change": confirm_principal_change,
+            },
+        )
+
+    def forget_jira_session(self, base_url: str) -> dict[str, Any]:
+        return self._http_json("DELETE", f"/api/auth/jira-session?base_url={quote(base_url, safe='')}", None)
+
+    def mark_jira_session_expired(self, *, base_url: str, error: str) -> dict[str, Any]:
+        return self._http_json("POST", "/api/auth/jira-session/expire", {"base_url": base_url, "error": error})
+
     def health(self) -> dict[str, Any]:
         return self._http_json("GET", "/api/health", None)
 

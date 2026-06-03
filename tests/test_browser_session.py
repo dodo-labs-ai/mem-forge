@@ -17,11 +17,13 @@ class _FakeService:
     async def get_status(self, base_url):
         return {"provider": "demo", "origin": base_url, "status": "active"}
 
-    async def cookie_header_for_sync(self, base_url, *, allow_browser_refresh=True, tls_config=None):
+    async def cookie_header_for_sync(self, base_url, *, tls_config=None):
         return "DEMO-COOKIE=abc"
 
-    async def refresh_from_browser(self, *, base_url, browser=None, confirm_principal_change=False):
-        return {"ok": True, "origin": base_url, "browser": browser}
+    async def store_uploaded_session(self, *, base_url, cookie_header, browser=None,
+                                     tls_config=None, confirm_principal_change=False):
+        return {"provider": "demo", "origin": base_url, "status": "active",
+                "cookie_header": cookie_header, "browser": browser}
 
 
 def _demo_provider() -> bs.BrowserSessionProvider:
@@ -104,6 +106,20 @@ def test_inject_cookie_for_source(tmp_path):
     assert config["demo_cookie"] == "DEMO-COOKIE=abc"
     assert skipped is False
     assert "demo_cookie" not in other
+
+
+def test_store_uploaded_dispatches_to_service(tmp_path):
+    bs.register_provider(_demo_provider())
+    db = _db(tmp_path)
+    try:
+        result = asyncio.run(bs.store_uploaded(
+            db, "demo", base_url="https://demo.one", cookie_header="SESSION=x", browser="Chrome",
+        ))
+    finally:
+        asyncio.run(db.close())
+    assert result["status"] == "active"
+    assert result["cookie_header"] == "SESSION=x"
+    assert result["browser"] == "Chrome"
 
 
 def test_unknown_provider_raises():
