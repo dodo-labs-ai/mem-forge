@@ -4,6 +4,7 @@ import json
 from http.cookiejar import Cookie, CookieJar
 from pathlib import Path
 
+import httpx
 import pytest
 
 from memforge.config import AppConfig
@@ -57,7 +58,7 @@ def _cookie(
 
 
 def test_cookie_header_post_filters_domain_path_and_secure_scope():
-    from memforge.auth.jira_auth import _cookie_header_from_jar
+    from memforge.auth.jira_capture import _cookie_header_from_jar
 
     jar = CookieJar()
     jar.set_cookie(_cookie("root", "ok", ".example.test", "/", secure=False))
@@ -129,35 +130,74 @@ async def test_jira_auth_session_is_encrypted_redacted_and_shared_by_origin(db, 
 
 
 @pytest.mark.asyncio
-async def test_jira_auth_session_missing_does_not_implicitly_read_browser_when_sync_disallows_refresh(db):
-    from memforge.auth.jira_auth import JiraAuthSessionMissingError, JiraAuthSessionService
+async def test_store_uploaded_session_validates_and_stores(db, monkeypatch):
+    from memforge.auth.jira_auth import JiraAuthSessionService
 
-    def fail_extractor(origin, browser):
-        raise AssertionError("sync should not read browser cookies implicitly")
-
-    service = JiraAuthSessionService(db, browser_extractor=fail_extractor)
-
-    with pytest.raises(JiraAuthSessionMissingError):
-        await service.cookie_header_for_sync("https://jira.example.test", allow_browser_refresh=False)
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
+    service = JiraAuthSessionService(
+        db,
+        session_validator=lambda origin, cookie, tls_config=None: {"accountId": "user-123", "displayName": "Ann"},
+    )
+    status = await service.store_uploaded_session(
+        base_url="https://jira.example.test",
+        cookie_header="SESSION=good",
+        browser="Chrome",
+    )
+    assert status["status"] == "active"
+    assert status["principal_id"] == "user-123"
 
 
 @pytest.mark.asyncio
-async def test_jira_auth_session_refresh_failure_is_persisted_for_missing_session(db, monkeypatch):
+async def test_cookie_header_for_sync_marks_expired_without_rescrape(db, monkeypatch):
+    from memforge.auth.jira_auth import JiraAuthSessionMissingError, JiraAuthSessionService
+
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
+    good = JiraAuthSessionService(
+        db,
+        session_validator=lambda origin, cookie, tls_config=None: {"accountId": "user-123"},
+    )
+    await good.store_uploaded_session(base_url="https://jira.example.test", cookie_header="SESSION=good", browser=None)
+
+    def dead_validator(origin, cookie, tls_config=None):
+        raise JiraAuthSessionMissingError("expired")
+
+    expiring = JiraAuthSessionService(db, session_validator=dead_validator)
+    with pytest.raises(JiraAuthSessionMissingError):
+        await expiring.cookie_header_for_sync("https://jira.example.test")
+    status = await expiring.get_status("https://jira.example.test")
+    assert status["status"] == "expired"
+
+
+@pytest.mark.asyncio
+async def test_cookie_header_for_sync_without_stored_session_raises_missing(db):
+    from memforge.auth.jira_auth import JiraAuthSessionMissingError, JiraAuthSessionService
+
+    # Sync runs on the server, which never scrapes a browser; with no stored
+    # session there is simply nothing to use.
+    service = JiraAuthSessionService(db)
+    with pytest.raises(JiraAuthSessionMissingError):
+        await service.cookie_header_for_sync("https://jira.example.test")
+
+
+@pytest.mark.asyncio
+async def test_store_uploaded_session_failure_is_persisted_as_expired(db, monkeypatch):
     from memforge.auth.jira_auth import JiraAuthSessionError, JiraAuthSessionService
 
     monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
 
-    def fail_extractor(origin, browser):
-        raise RuntimeError("Chrome profile is locked")
+    def reject(origin, cookie, tls_config=None):
+        raise JiraAuthSessionError("Jira rejected the uploaded cookie")
 
-    service = JiraAuthSessionService(db, browser_extractor=fail_extractor)
+    service = JiraAuthSessionService(db, session_validator=reject)
 
     with pytest.raises(JiraAuthSessionError):
-        await service.refresh_from_browser(base_url="https://jira.example.test")
+        await service.store_uploaded_session(
+            base_url="https://jira.example.test", cookie_header="SESSION=bad", browser="Chrome",
+        )
 
     status = await service.get_status("https://jira.example.test")
-    assert status["status"] == "failed"
-    assert status["last_error"] == "Chrome profile is locked"
+    assert status["status"] == "expired"
+    assert status["last_error"] == "Jira rejected the uploaded cookie"
 
 
 @pytest.mark.asyncio
@@ -319,11 +359,11 @@ async def test_runtime_resolves_jira_browser_session_without_persisting_cookie(d
         def __init__(self, database):
             self.database = database
 
-        async def cookie_header_for_sync(self, base_url, *, allow_browser_refresh=True, tls_config=None):
+        async def cookie_header_for_sync(self, base_url, *, tls_config=None):
             return await JiraAuthSessionService(
                 self.database,
                 session_validator=lambda origin, cookie, tls_config=None: {"accountId": "user-123"},
-            ).cookie_header_for_sync(base_url, allow_browser_refresh=allow_browser_refresh, tls_config=tls_config)
+            ).cookie_header_for_sync(base_url, tls_config=tls_config)
 
     import dataclasses
 
@@ -447,3 +487,72 @@ async def test_sync_service_marks_shared_jira_session_expired_when_sync_reports_
     assert "Refresh the session" in status["last_error"]
     assert sync_state is not None
     assert sync_state.last_sync_status == "failed"
+
+
+async def test_validate_treats_html_login_page_as_not_accepted(monkeypatch):
+    from memforge.auth import jira_auth
+    from memforge.auth.jira_auth import JiraAuthSessionMissingError, validate_jira_cookie_session
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # SSO often answers an expired session with a 200 HTML login page.
+        return httpx.Response(200, text="<html><body>Log in</body></html>")
+
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(jira_auth.httpx, "AsyncClient", patched_async_client)
+
+    with pytest.raises(JiraAuthSessionMissingError):
+        await validate_jira_cookie_session("https://jira.example.test", "SESSION=dead")
+
+
+async def test_validate_reports_unreachable_origin_clearly(monkeypatch):
+    from memforge.auth import jira_auth
+    from memforge.auth.jira_auth import JiraAuthSessionError, validate_jira_cookie_session
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # A real DNS/connect failure surfaces as a ConnectError with an empty message.
+        raise httpx.ConnectError("")
+
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(jira_auth.httpx, "AsyncClient", patched_async_client)
+
+    with pytest.raises(JiraAuthSessionError) as excinfo:
+        await validate_jira_cookie_session("https://jira.example.test", "JSESSIONID=x")
+    message = str(excinfo.value)
+    assert message  # never blank, even when the transport error carries no message
+    assert "jira.example.test" in message
+
+
+async def test_validate_retries_once_on_timeout_then_succeeds(monkeypatch):
+    from memforge.auth import jira_auth
+    from memforge.auth.jira_auth import validate_jira_cookie_session
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # A cold connection times out on the first call.
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(200, json={"accountId": "user-1", "displayName": "Ann"})
+
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(jira_auth.httpx, "AsyncClient", patched_async_client)
+
+    principal = await validate_jira_cookie_session("https://jira.example.test", "JSESSIONID=x")
+    assert principal["accountId"] == "user-1"
+    assert calls["n"] == 2  # timed out once, retried, then succeeded

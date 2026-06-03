@@ -674,6 +674,33 @@ async function actionJiraForget() {
   if (confirmForget) await runStep("Forgetting Jira session", ["adapter", "auth", "jira", "forget", "--base-url", baseUrl]);
 }
 
+async function actionJiraWatch() {
+  const baseUrl = await pickBrowserOrigin("jira", "Keep which Jira origin fresh?");
+  if (!baseUrl) return;
+  note(
+    `The watch daemon runs in the foreground and re-captures your Jira session on a timer.
+Run it in its own terminal (or under launchd/systemd) so it keeps the server's session fresh:
+
+  memforge adapter auth jira watch --base-url ${baseUrl}`,
+    "Background refresh",
+  );
+  const startNow = ensureNotCancelled(
+    await confirm({ message: "Start it here now? (blocks this menu until you stop it)", initialValue: false }),
+  );
+  if (startNow) {
+    log.info("Starting watch. Press Ctrl-C to stop and return to the menu.");
+    await new Promise((resolve) => {
+      const env = { ...process.env, MEMFORGE_NO_INTERACTIVE: "1" };
+      const child = spawn(MEMFORGE_BIN, ["adapter", "auth", "jira", "watch", "--base-url", baseUrl], {
+        env,
+        stdio: "inherit",
+      });
+      child.on("error", resolve);
+      child.on("close", resolve);
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Area: Search memory
 // ---------------------------------------------------------------------------
@@ -773,6 +800,7 @@ const AREAS = [
       { value: "status", label: "Check session status", hint: "is the current login still valid?", run: actionJiraStatus },
       { value: "auth", label: "Authenticate browser session", hint: "hand over your Jira cookies", run: actionAuthJira },
       { value: "forget", label: "Forget a session", hint: "delete a stored browser session", run: actionJiraForget },
+      { value: "watch", label: "Start background refresh", hint: "keep the session fresh on a timer", run: actionJiraWatch },
     ],
   },
   {

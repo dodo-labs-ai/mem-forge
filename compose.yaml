@@ -17,8 +17,16 @@ services:
       MEMFORGE_BASE_DIR: /data
       MEMFORGE_ADMIN_API_PORT: 8765
       MEMFORGE_CORS_ORIGINS: http://localhost:5174,http://127.0.0.1:5174
+      # A Jira session cookie is uploaded over this API. The port below is
+      # published on loopback only by default, so the upload stays on this
+      # machine and plaintext is safe; that is why this defaults to on. To
+      # expose the API to the network, set MEMFORGE_API_BIND_ADDR=0.0.0.0,
+      # then turn this off (empty) and serve over HTTPS.
+      MEMFORGE_ALLOW_PLAINTEXT_SESSION_UPLOAD: ${MEMFORGE_ALLOW_PLAINTEXT_SESSION_UPLOAD:-1}
     ports:
-      - "${MEMFORGE_API_HOST_PORT:-8765}:8765"
+      # Loopback-only by default: reachable from this host (CLI, browser), not the
+      # network. Set MEMFORGE_API_BIND_ADDR=0.0.0.0 to expose it (and add HTTPS).
+      - "${MEMFORGE_API_BIND_ADDR:-127.0.0.1}:${MEMFORGE_API_HOST_PORT:-8765}:8765"
     volumes:
       - memforge-data:/data
     healthcheck:

@@ -30,6 +30,7 @@ const requiredLabels = [
   "Check session status",
   "Authenticate browser session",
   "Forget a session",
+  "Start background refresh",
   "Run diagnostics",
   "← Back",
 ];
@@ -54,6 +55,7 @@ const requiredCommands = [
   ['"adapter", "auth", "jira", "status"', "Jira status wraps `adapter auth jira status`"],
   ['"adapter", "auth", "jira", "refresh"', "Jira auth wraps `adapter auth jira refresh`"],
   ['"adapter", "auth", "jira", "forget"', "Forget wraps `adapter auth jira forget`"],
+  ['"adapter", "auth", "jira", "watch"', "Background refresh wraps `adapter auth jira watch`"],
   ['"adapter", "auth", provider, "list"', "Origin picker wraps `adapter auth <provider> list`"],
   ['"memory", "search"', "Search wraps `memforge memory search`"],
   ['"adapter", "status"', "Status wraps `memforge adapter status`"],

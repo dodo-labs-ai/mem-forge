@@ -41,6 +41,10 @@ DEFAULT_ISSUE_TYPES = ["Epic", "Story", "Bug", "Task"]
 JIRA_AUTH_MODE_COOKIE = "browser_cookie"
 JIRA_AUTH_MODE_PAT = "pat"
 DEFAULT_REQUEST_INTERVAL_MS = 750
+# Connect is quick even cold; a JQL search against a slow corporate Jira can take
+# a while to return, so the read budget is generous.
+JIRA_CONNECT_TIMEOUT_SECONDS = 10.0
+JIRA_READ_TIMEOUT_SECONDS = 60.0
 COMMENT_MAX_RESULTS = 100
 HYDRATED_SEARCH_MAX_RESULTS = 25
 JIRA_SEARCH_FIELDS = ["*all"]
@@ -343,7 +347,7 @@ class JiraGene(Gene):
         client = httpx.AsyncClient(
             base_url=base_url,
             headers=_jira_headers(self.config),
-            timeout=30.0,
+            timeout=httpx.Timeout(JIRA_READ_TIMEOUT_SECONDS, connect=JIRA_CONNECT_TIMEOUT_SECONDS),
             follow_redirects=True,
             verify=tls_verify(self.config),
         )
