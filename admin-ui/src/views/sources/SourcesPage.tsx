@@ -21,33 +21,33 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { timeAgo } from "@/utils/date";
+import { SourceIcon } from "@/components/sources/SourceIcon";
 import { SourceConfigDialog } from "./SourceConfigDialog";
-import { canConfigureSourceType, canDeleteSourceType, isManagedSourceType, userConfigurableGenes } from "./managedSources";
+import { canConfigureSourceType, canDeleteSourceType, isManagedSourceId, isManagedSourceType, isPushBasedSourceType, userConfigurableGenes } from "./managedSources";
 import { getSourceActionEndpoint, getSourceMenuStyle, sourceActionLayout } from "./sourceActions";
 import { TeamsSourceWizard } from "./TeamsSourceWizard";
 
 const SOURCE_LABELS: Record<string, { name: string; subtitle: string; description: string }> = {
+  // Per-client agent-session sources returned by the split backend.
+  "src-agent-sessions-codex": { name: "Codex Session", subtitle: "Managed source", description: "Coding-agent session summaries from the Codex plugin" },
+  "src-agent-sessions-claude-code": { name: "Claude Code Session", subtitle: "Managed source", description: "Coding-agent session summaries from the Claude Code plugin" },
+  // Legacy / fallback entry used when the backend returns the singleton type.
   agent_session: { name: "Agent Session", subtitle: "Managed source", description: "Generated coding-agent session summaries" },
   confluence: { name: "Confluence", subtitle: "Knowledge source", description: "Wiki pages and documentation" },
   github_pages: { name: "GitHub Pages", subtitle: "Documentation source", description: "Published documentation pages" },
   jira: { name: "Jira", subtitle: "Work tracking source", description: "Tickets, decisions, and work items" },
+  local_markdown: { name: "Local Repository", subtitle: "Local folder source", description: "Push files from a folder on your machine." },
   teams: { name: "Microsoft Teams", subtitle: "Conversation source", description: "Channel messages, group chats, and direct messages" },
 };
 
-const SOURCE_DOTS: Record<string, string> = {
-  agent_session: "bg-cyan-500",
-  confluence: "bg-blue-500",
-  github_pages: "bg-slate-500",
-  jira: "bg-emerald-500",
-  teams: "bg-violet-500",
-  outlook: "bg-orange-500",
-};
-
 const SOURCE_ITEM_LABELS: Record<string, string> = {
+  "src-agent-sessions-codex": "summaries",
+  "src-agent-sessions-claude-code": "summaries",
   agent_session: "summaries",
   confluence: "pages",
   github_pages: "documents",
   jira: "issues",
+  local_markdown: "files",
   teams: "conversations",
 };
 
@@ -181,19 +181,22 @@ export function SourcesPage() {
               const isSyncing = source.sync?.status === "running" || pendingSyncIds.has(source.id);
               const isDeleting = deleteSource.isPending && sourcePendingDelete?.id === source.id;
               const canConfigure = canConfigureSourceType(source.type);
-              const isManaged = isManagedSourceType(source.type);
+              // Per-client agent-session sources are identified by source id; the
+              // legacy singleton falls back to the type-level managed check.
+              const isManaged = isManagedSourceType(source.type) || isManagedSourceId(source.id);
               const gene = geneByName.get(source.type);
-              const sourceLabel = SOURCE_LABELS[source.type] ?? {
+              // Resolve label by source id first (for per-client splits), then by type.
+              const sourceLabel = SOURCE_LABELS[source.id] ?? SOURCE_LABELS[source.type] ?? {
                 name: gene?.display_name ?? source.type,
                 subtitle: gene?.data_shape ?? "",
               };
-              const itemLabel = SOURCE_ITEM_LABELS[source.type] ?? "documents";
+              const itemLabel = SOURCE_ITEM_LABELS[source.id] ?? SOURCE_ITEM_LABELS[source.type] ?? "documents";
 
               return (
                 <div key={source.id} className="space-y-3 p-4">
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                     <div className="flex min-w-0 items-start gap-3">
-                      <span className={`mt-1 size-2.5 shrink-0 rounded-full ${SOURCE_DOTS[source.type] ?? "bg-muted-foreground"}`} />
+                      <SourceIcon type={source.type} client={source.client} className="mt-0.5 size-5" />
                       <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-2">
                           <h3 className="truncate text-sm font-medium">{source.name}</h3>
@@ -208,7 +211,7 @@ export function SourcesPage() {
                         </p>
                         {source.type === "agent_session" && (
                           <p className="mt-1 text-xs text-muted-foreground">
-                            Populated automatically by Codex and Claude Code plugins.
+                            Populated automatically by the plugin. No manual sync needed.
                           </p>
                         )}
                         <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-sm text-muted-foreground">
@@ -221,7 +224,7 @@ export function SourcesPage() {
                           <span>{source.sync?.status === "running" ? "Syncing now" : `Last synced: ${timeAgo(source.last_sync)}`}</span>
                           {source.type === "jira" && source.auth_session && (
                             <span className={source.auth_session.status === "active" ? "text-emerald-600" : "text-destructive"}>
-                              Browser session: {authSessionLabel(source.auth_session.status)}
+                              Browser session (local adapter): {authSessionLabel(source.auth_session.status)}
                             </span>
                           )}
                         </div>
@@ -253,18 +256,20 @@ export function SourcesPage() {
                           <span className="hidden lg:inline">{sourceActionLayout.primary[0].label}</span>
                         </Button>
                       )}
-                      <Button
-                        type="button"
-                        disabled={isSyncing || isDeleting}
-                        onClick={() => syncSource.mutate({ sourceId: source.id })}
-                      >
-                        {isSyncing ? (
-                          <Loader2 className="size-4 animate-spin" />
-                        ) : (
-                          <Play className="size-4" />
-                        )}
-                        {isSyncing ? "Syncing" : sourceActionLayout.primary[1].label}
-                      </Button>
+                      {!isManaged && (
+                        <Button
+                          type="button"
+                          disabled={isSyncing || isDeleting}
+                          onClick={() => syncSource.mutate({ sourceId: source.id })}
+                        >
+                          {isSyncing ? (
+                            <Loader2 className="size-4 animate-spin" />
+                          ) : (
+                            <Play className="size-4" />
+                          )}
+                          {isSyncing ? "Syncing" : sourceActionLayout.primary[1].label}
+                        </Button>
+                      )}
                       <SourceActionsMenu
                         source={source}
                         open={openMenuSourceId === source.id}
@@ -304,7 +309,9 @@ export function SourcesPage() {
           setTeamsWizardOpen(true);
         }}
         onConfigureSelected={(sourceType) => {
-          setAddOpen(false);
+          if (!isPushBasedSourceType(sourceType)) {
+            setAddOpen(false);
+          }
           setConfigDialog({ sourceType, source: null });
         }}
       />
@@ -521,7 +528,7 @@ function AgentSessionDetailsDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Agent Session Summaries</DialogTitle>
+          <DialogTitle>Agent Session</DialogTitle>
           <DialogDescription>
             Automatic memory source populated by coding-agent plugins.
           </DialogDescription>
@@ -686,61 +693,280 @@ function AddSourceDialog({
   onConfigureSelected: (sourceType: string) => void;
 }) {
   const configurableGenes = userConfigurableGenes(genes);
+  const remoteGenes = configurableGenes.filter((gene) => !isPushBasedSourceType(gene.name));
+  const pushGenes = configurableGenes.filter((gene) => isPushBasedSourceType(gene.name));
+  const [agentSetupClient, setAgentSetupClient] = useState<AgentSessionClient | null>(null);
+
+  const renderConfigurableGene = (gene: (typeof configurableGenes)[number]) => {
+    const source = SOURCE_LABELS[gene.name] ?? {
+      name: gene.display_name,
+      subtitle: gene.data_shape,
+      description: gene.description,
+    };
+    const isTeams = gene.name === "teams";
+    // Push-based sources open a setup walkthrough rather than a server-side
+    // form; they share the "View setup" affordance with the agent-session cards
+    // so the dialog reads as a single push group instead of mixed treatments.
+    const isPushBased = isPushBasedSourceType(gene.name);
+    return (
+      <div key={gene.name} className="rounded-lg border p-4">
+        <div className="flex items-start gap-3">
+          <SourceIcon type={gene.name} className="mt-0.5 size-6" />
+          <div className="min-w-0">
+            <div className="text-sm font-medium">{source.name}</div>
+            <div className="mt-1 text-xs text-muted-foreground">{source.description}</div>
+          </div>
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant={isPushBased ? "outline" : "default"}
+            onClick={() => onConfigureSelected(gene.name)}
+          >
+            {isPushBased ? (
+              <>
+                <Info className="size-3.5" />
+                View setup
+              </>
+            ) : (
+              "Configure"
+            )}
+          </Button>
+          {isTeams && (
+            <Button type="button" size="sm" variant="outline" onClick={onTeamsSelected}>
+              Browse Teams
+            </Button>
+          )}
+        </div>
+      </div>
+    );
+  };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Connect a new source</DialogTitle>
-          <DialogDescription>
-            Configure source connection and sync scope before creating it.
-          </DialogDescription>
-        </DialogHeader>
+    <>
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Connect a new source</DialogTitle>
+            <DialogDescription>
+              Configure source connection and sync scope before creating it.
+            </DialogDescription>
+          </DialogHeader>
 
-        <div className="grid gap-3 sm:grid-cols-2">
           {isLoading && (
-            <div className="col-span-full flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+            <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
               <Loader2 className="size-4 animate-spin" />
               Loading source types...
             </div>
           )}
-          {!isLoading && configurableGenes.map((gene) => {
-            const source = SOURCE_LABELS[gene.name] ?? {
-              name: gene.display_name,
-              subtitle: gene.data_shape,
-              description: gene.description,
-            };
-            const isTeams = gene.name === "teams";
-            return (
-              <div key={gene.name} className="rounded-lg border p-4">
-                <div className="flex items-start gap-3">
-                  <span className={`mt-1 size-3 shrink-0 rounded-full ${SOURCE_DOTS[gene.name] ?? "bg-muted-foreground"}`} />
-                  <div className="min-w-0">
-                    <div className="text-sm font-medium">{source.name}</div>
-                    <div className="mt-1 text-xs text-muted-foreground">{source.description}</div>
+
+          {!isLoading && (
+            <div className="space-y-5">
+              {remoteGenes.length > 0 && (
+                <section className="space-y-3">
+                  <SectionDivider label="Pull from a remote service" />
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    {remoteGenes.map(renderConfigurableGene)}
                   </div>
+                </section>
+              )}
+
+              <section className="space-y-3">
+                <SectionDivider label="Push from your local device" />
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {pushGenes.map(renderConfigurableGene)}
+                  {AGENT_SESSION_CARDS.map((card) => (
+                    <div key={card.client} className="rounded-lg border p-4">
+                      <div className="flex items-start gap-3">
+                        <SourceIcon
+                          type="agent_session"
+                          client={card.client}
+                          className="mt-0.5 size-6"
+                        />
+                        <div className="min-w-0">
+                          <div className="text-sm font-medium">{card.title}</div>
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            {card.description}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="mt-4">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => setAgentSetupClient(card.client)}
+                        >
+                          <Info className="size-3.5" />
+                          View setup
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-                <div className="mt-4 flex flex-wrap gap-2">
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant={isTeams ? "outline" : "default"}
-                    onClick={() => onConfigureSelected(gene.name)}
-                  >
-                    Configure
-                  </Button>
-                  {isTeams && (
-                    <Button type="button" size="sm" onClick={onTeamsSelected}>
-                      Browse Teams
-                    </Button>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
+              </section>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <AgentSessionSetupDialog
+        client={agentSetupClient}
+        onOpenChange={(open) => !open && setAgentSetupClient(null)}
+      />
+    </>
+  );
+}
+
+const MEMFORGE_MARKETPLACE_REPO = "shno-labs/mem-forge";
+const MEMFORGE_PLUGIN_NAME = "memory@memforge";
+
+const CODEX_PLUGIN_COMMANDS = [
+  `codex plugin marketplace add ${MEMFORGE_MARKETPLACE_REPO}`,
+  `codex plugin add ${MEMFORGE_PLUGIN_NAME}`,
+] as const;
+
+const CLAUDE_CODE_PLUGIN_COMMANDS = [
+  `/plugin marketplace add ${MEMFORGE_MARKETPLACE_REPO}`,
+  `/plugin install ${MEMFORGE_PLUGIN_NAME}`,
+] as const;
+
+type AgentSessionClient = "codex" | "claude-code";
+
+const AGENT_SESSION_CARDS: ReadonlyArray<{
+  client: AgentSessionClient;
+  title: string;
+  description: string;
+}> = [
+  {
+    client: "codex",
+    title: "Codex Session",
+    description:
+      "Save Codex coding sessions as memory.",
+  },
+  {
+    client: "claude-code",
+    title: "Claude Code Session",
+    description:
+      "Save Claude Code coding sessions as memory.",
+  },
+];
+
+const AGENT_SESSION_SETUP_BY_CLIENT: Record<
+  AgentSessionClient,
+  { agentName: string; commands: readonly string[]; runFrom: string }
+> = {
+  codex: {
+    agentName: "Codex",
+    commands: CODEX_PLUGIN_COMMANDS,
+    runFrom: "Run these from any terminal where the codex CLI is on PATH:",
+  },
+  "claude-code": {
+    agentName: "Claude Code",
+    commands: CLAUDE_CODE_PLUGIN_COMMANDS,
+    runFrom: "Run these inside an active Claude Code session:",
+  },
+};
+
+function AgentSessionSetupDialog({
+  client,
+  onOpenChange,
+}: {
+  client: AgentSessionClient | null;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const setup = client ? AGENT_SESSION_SETUP_BY_CLIENT[client] : null;
+  return (
+    <Dialog open={Boolean(client)} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{setup ? `${setup.agentName} session setup` : "Agent session setup"}</DialogTitle>
+          <DialogDescription>
+            MemForge is a SaaS service and cannot read local agent transcripts. The plugin runs on
+            your machine, captures session windows, and pushes them to MemForge after each session.
+            No further configuration in this UI is needed; the source appears automatically after
+            the first upload.
+          </DialogDescription>
+        </DialogHeader>
+
+        {setup && (
+          <div className="space-y-5">
+            <AgentPluginInstructions
+              agentName={setup.agentName}
+              runFrom={setup.runFrom}
+              commands={setup.commands}
+            />
+
+            <p className="text-xs text-muted-foreground">
+              After installing, set{" "}
+              <code className="rounded bg-muted px-1 font-mono text-[11px]">MEMFORGE_API_URL</code>{" "}
+              and optionally{" "}
+              <code className="rounded bg-muted px-1 font-mono text-[11px]">MEMFORGE_API_TOKEN</code>{" "}
+              when the plugin should reach a non-default or hosted MemForge instance. See{" "}
+              <span className="font-medium text-foreground">
+                docs/design/agent-session-saas-plugin-flow.md
+              </span>{" "}
+              in the MemForge repository for the full design.
+            </p>
+          </div>
+        )}
+
+        <DialogFooter>
+          <Button type="button" onClick={() => onOpenChange(false)}>
+            Got it
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+function AgentPluginInstructions({
+  agentName,
+  runFrom,
+  commands,
+}: {
+  agentName: string;
+  runFrom: string;
+  commands: readonly string[];
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="text-sm font-medium">{agentName}</div>
+      <p className="text-xs text-muted-foreground">{runFrom}</p>
+      <div className="space-y-1.5">
+        {commands.map((command) => (
+          <CopyableCommand key={command} command={command} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SectionDivider({ label }: { label: string }) {
+  return (
+    <div className="flex items-center gap-3">
+      <div className="h-px flex-1 bg-border" />
+      <span className="text-xs font-medium text-muted-foreground">{label}</span>
+      <div className="h-px flex-1 bg-border" />
+    </div>
+  );
+}
+
+function CopyableCommand({ command }: { command: string }) {
+  const copy = () => {
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      void navigator.clipboard.writeText(command);
+    }
+  };
+  return (
+    <div className="flex items-center gap-2 rounded-md border bg-muted/30 p-2">
+      <code className="flex-1 break-all font-mono text-[11px] text-foreground">{command}</code>
+      <Button type="button" variant="outline" size="sm" onClick={copy}>
+        Copy
+      </Button>
+    </div>
   );
 }
 

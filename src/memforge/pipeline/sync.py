@@ -781,6 +781,7 @@ class GeneSyncOrchestrator:
             normalized_content_uri=norm_uri,
             pdf_content_uri=pdf_uri,
             last_synced=now,
+            client=normalized.source_semantics.get("client") or None,
         )
 
         if existing_hash == new_hash and existing_metadata and not force_reprocess:

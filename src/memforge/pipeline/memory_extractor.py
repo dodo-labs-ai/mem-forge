@@ -21,6 +21,24 @@ logger = logging.getLogger(__name__)
 __all__ = ["MemoryExtractor"]
 
 # ---------------------------------------------------------------------------
+# Caps and bands shared by the extraction prompts and runtime truncation. Both
+# the prompt prose and the .format() arguments reference these constants so the
+# LLM sees the same limits the code enforces.
+# ---------------------------------------------------------------------------
+
+EXTRACTION_QUOTE_MAX_CHARS = 200
+EXTRACTION_TAG_MIN = 2
+EXTRACTION_TAG_MAX = 5
+DOC_CONTENT_CHAR_CAP = 100_000
+CHANGED_HUNK_CHAR_CAP = 40_000
+UPDATED_DOC_CHAR_CAP = 100_000
+EXISTING_MEMORIES_WINDOW = 30
+EXISTING_MEMORIES_WINDOW_CHANGE = 50
+DOCUMENT_OUTLINE_CHAR_CAP = 8_000
+GLOSSARY_APPENDIX_CHAR_CAP = 2_000
+UNIT_MARKDOWN_CHAR_CAP = 80_000
+
+# ---------------------------------------------------------------------------
 # Memory extraction prompt (Call 2)
 # ---------------------------------------------------------------------------
 
@@ -36,34 +54,46 @@ MEMORY_EXTRACTION_PROMPT = """You are extracting atomic knowledge from a documen
 {content}
 </document>
 
-Extract all durable atomic knowledge units justified by the document. Return an empty "memories" array if the document contains no durable team memory. Each memory must be a JSON object with:
+Extract durable atomic knowledge units justified by the document. Returning an empty "memories" array IS the correct answer when the document contains no durable team memory; do not invent memories to fill output. Each memory must be a JSON object with:
 - "content": self-contained factual sentence (understandable without the source document)
 - "memory_type": one of "fact", "decision", "convention", "procedure"
 - "confidence": 0.0-1.0 (use high confidence only when the source directly states durable domain knowledge)
 - "entity_refs": list of key entity names (use the canonical names from <entities_found>)
-- "tags": 2-5 lowercase topic tags
+- "tags": {tag_min}-{tag_max} lowercase topic tags
 - "valid_from": ISO date if time-bound, null otherwise
 - "valid_until": ISO date if time-bound, null otherwise
-- "extraction_context": exact quote from the document this was extracted from (max 200 chars). For chat/message sources, include the sender name and timestamp prefix (e.g. "**Alice** (10:05): the actual message content")
+- "extraction_context": exact quote from the document this was extracted from (max {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix (e.g. "**Alice** (10:05): the actual message content")
 
-Rules:
-- Each memory must be SELF-CONTAINED (understandable without the source document)
-- Do NOT re-extract facts listed in <existing_memories_for_these_entities>
-- Focus on NEW or UPDATED information
-- Use entity names from <entities_found>, not your own variations
-- Prefer specifics ("PostgreSQL 15" not "a database")
-- Emit each durable claim once, in a single canonical phrasing. Do not output multiple reworded variants of the same fact, decision, or procedure
-- For tickets: extract the decision/outcome, not the discussion
-- For runbooks: each distinct step is a separate procedural memory
-- For design docs: extract decisions, dependencies, constraints
-- For agent_session sources: keep only durable, reusable project knowledge from the submitted summary (confirmed decisions, conventions, procedures, and verified implementation facts that stay true beyond this session). Record the durable OUTCOME of a change as a single fact. Do NOT emit before/after/verified play-by-play, prior or superseded code states, or step-by-step narration of one edit. Do NOT create memories about the memory system, the agent's own tooling or context injection, or session mechanics, and never include internal memory ids (for example "memories are loaded at SessionStart" or "mem-1a2b3c"). Skip one-off run output and smoke-test/verification results (for example "the command printed 6"); a passing check is evidence, not durable knowledge unless it states a lasting behavior. Skip receipt/session metadata, validation commands, runtime notes, service start/stop state, local paths, and working-tree state
-- For discussions: extract DECISIONS and CONVENTIONS that reached consensus — skip unresolved opinions, tentative suggestions, and questions without answers
-- For chat sources: skip transient status updates, review-in-progress notes, and temporary caveats. Focus on decisions, persistent facts, and action items
-- Do not extract document metadata as memories: author names, last modified dates, document status, revision-history rows, reviewer lists, and link list rows belong to provenance/source metadata
-- Do not infer relationships from reference/link-only evidence. If a source only provides a link or label, skip it or preserve the weaker relationship exactly as stated
-- Preserve conditional language. If the source says "if", "provided", "as long as", "would", or "should", keep that condition in the memory. Do not turn open questions into decisions
-- Do NOT extract: formatting details, boilerplate, table-of-contents entries
-- Do NOT extract: passwords, credentials, tokens, API keys, or any secret/authentication information
+Top rules (apply these first; reject candidates that fail any of them):
+
+0. PREFER EMPTY. Returning {{"memories": []}} is the default. The bar for emitting a memory is high: it must teach a future developer something they would otherwise miss, six months from now, after the code has been refactored. Sessions full of routine work, mechanical edits, debugging detours, version-control bookkeeping, conversational exchanges, and meta-discussion of the work itself produce ZERO memories — that is the expected outcome, not a failure.
+
+1. CODE-RECOVERABLE FACTS ARE NOT MEMORIES. Reject any candidate a developer could verify by reading the current code, schema, types, configuration, or running `grep` / `git log -p` in under a minute. Specifically, do not emit memories that restate function or method names, class names, type signatures, prop names, parameter lists, ID or constant string values, file paths, schema column names, migration numbers, framework configuration values, or "X passes Y to Z" wiring sentences. Keep a candidate only when it states a constraint, reason, rule, or invariant that survives a future refactor and is NOT visible in any single file.
+
+2. ONE CLAIM, ONE MEMORY. If the document restates the same underlying claim more than once (e.g., "X must be populated for icons" and "without X, icons fall back to dots"), pick the single most general phrasing and emit one memory. Do not emit reworded duplicates of the same fact, decision, or procedure.
+
+3. FOLD REJECTED ALTERNATIVES INTO THE CHOSEN DECISION. When a discussion records that path A was picked over B and C, emit ONE decision memory of the form "picked A over B and C because <reason>". Do not emit B and C as their own "rejected" memories.
+
+4. FUTURE USEFULNESS CHECK. Before emitting any memory, ask: "Will a developer six months from now act better because this memory exists, after the code has been refactored?" If the answer is no — for example, the claim is true only because of how the code is currently written, or the claim self-resolves within days (a not-yet-validated risk, a temporary caveat) — skip it.
+
+5. NO META-MEMORIES. Do NOT emit memories about the act of working: how a commit was structured, how a diff was split, that a procedure was followed, that a tool was used, that a test failure was pre-existing, that work was in progress at session end, that a rule from a project guidance file was respected. The session log, git history, and the guidance file itself already record all of this. Memory is about the project's domain, not the meta-process of editing it.
+
+Standard rules:
+- Each memory must be SELF-CONTAINED (understandable without the source document).
+- Do NOT re-extract facts already listed in <existing_memories_for_these_entities>; focus on NEW or UPDATED information.
+- Use entity names from <entities_found>, not your own variations.
+- Prefer specifics ("PostgreSQL 15" not "a database").
+- For tickets: extract the decision/outcome, not the discussion.
+- For runbooks: each distinct step is a separate procedural memory.
+- For design docs: extract decisions, dependencies, constraints.
+- For agent_session sources: keep only durable, reusable project knowledge from the submitted summary — confirmed decisions, conventions, procedures, and architectural rules that stay true beyond this session AND are not visible by reading the current code. Record the durable OUTCOME and the WHY of a change as a single fact; do NOT emit before/after/verified play-by-play, prior or superseded code states, or step-by-step narration of one edit. Do NOT create memories about the memory system, the agent's own tooling or context injection, or session mechanics, and never include internal memory ids (for example "memories are loaded at SessionStart" or "mem-1a2b3c"). Skip one-off run output and smoke-test/verification results (for example "the command printed 6"); a passing check is evidence, not durable knowledge unless it states a lasting behavior. Skip receipt/session metadata, validation commands, runtime notes, service start/stop state, local paths, and working-tree state. When the project being worked on IS a memory or tooling system, treat its symbol names, ID strings, and column names as code-recoverable per rule 1; only emit memories that state a rule about how the system must behave (e.g., "push-based source types must not be user-configurable in the dialog") rather than what the code currently does.
+- For discussions: extract DECISIONS and CONVENTIONS that reached consensus — skip unresolved opinions, tentative suggestions, and questions without answers.
+- For chat sources: skip transient status updates, review-in-progress notes, and temporary caveats. Focus on decisions, persistent facts, and action items.
+- Do not extract document metadata as memories: author names, last modified dates, document status, revision-history rows, reviewer lists, and link list rows belong to provenance/source metadata.
+- Do not infer relationships from reference/link-only evidence. If a source only provides a link or label, skip it or preserve the weaker relationship exactly as stated.
+- Preserve conditional language. If the source says "if", "provided", "as long as", "would", or "should", keep that condition in the memory. Do not turn open questions into decisions.
+- Do NOT extract: formatting details, boilerplate, table-of-contents entries.
+- Do NOT extract: passwords, credentials, tokens, API keys, or any secret/authentication information.
 
 Return ONLY a JSON object with a "memories" array. Use {{"memories": []}} when there are no memories."""
 
@@ -86,29 +116,42 @@ MEMORY_CHANGE_EXTRACTION_PROMPT = """You are extracting memory changes from an u
 The changed hunks show what changed between the previous and updated normalized document.
 Use the full updated document only as context and for validating exact quotes.
 
-Return an empty "memories" array if the changes do not introduce, refine, replace, or remove durable team knowledge.
+Returning an empty "memories" array IS the correct answer when the changes do not introduce, refine, replace, or remove durable team knowledge; do not invent memories to fill output.
 For changed durable knowledge, return JSON objects with:
 - "content": self-contained factual sentence (understandable without the source document)
 - "memory_type": one of "fact", "decision", "convention", "procedure"
 - "confidence": 0.0-1.0
 - "entity_refs": list of key entity names (use the canonical names from <entities_found>)
-- "tags": 2-5 lowercase topic tags
+- "tags": {tag_min}-{tag_max} lowercase topic tags
 - "valid_from": ISO date if time-bound, null otherwise
 - "valid_until": ISO date if time-bound, null otherwise
-- "extraction_context": exact quote from the updated document this was extracted from (max 200 chars). For chat/message sources, include the sender name and timestamp prefix from the updated document.
+- "extraction_context": exact quote from the updated document this was extracted from (max {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix from the updated document.
 
-Rules:
-- Focus ONLY on durable memory changes caused by <changed_hunks>
-- Use <updated_document> only to understand context and copy exact quotes; do not extract unaffected facts elsewhere in it
-- Do NOT re-extract facts already covered by <existing_memories_for_this_document> unless <changed_hunks> materially changes the current durable claim
-- If <changed_hunks> only removes old durable knowledge without stating replacement current knowledge, return an empty "memories" array; reconciliation will decide whether to retire the old memory
-- Do not create memories about the edit itself, such as "was removed", "no longer mentioned", "the document changed", or "previously"
-- For agent_session sources: keep only durable, reusable project knowledge (confirmed decisions, conventions, procedures, verified implementation facts). Record a change's durable outcome as a single fact, not before/after/verified play-by-play. Do not create memories about the memory system, the agent's tooling or context injection, or session mechanics, and never include internal memory ids. Skip one-off run output and smoke-test results, receipt/session metadata, runtime notes, local paths, and working-tree state
-- Emit each durable claim once, in a single canonical phrasing; do not output reworded duplicates of the same fact, decision, or procedure
-- Treat normalized source headers and platform/provenance fields as operational metadata: workflow status, assignee/owner routing, sprint/milestone, rank/order, labels/tags, timestamps, participants, reactions, edit time, author/reviewer rows, revision history, link-list rows, and formatting
-- Return an empty "memories" array for operational metadata-only changes unless the changed text explicitly states durable team knowledge, such as a decision, constraint, convention, procedure, product behavior, architectural fact, or long-lived ownership/responsibility rule
-- Preserve conditional language. Do not turn open questions, suggestions, or unresolved discussion into decisions
-- Do NOT extract table-of-contents entries, boilerplate, passwords, credentials, tokens, or API keys
+Top rules (apply these first; reject candidates that fail any of them):
+
+0. PREFER EMPTY. Returning {{"memories": []}} is the default. The bar for emitting a memory is high. Routine refactors, formatting changes, dependency bumps, mechanical renames, and metadata-only edits produce ZERO memories — that is the expected outcome.
+
+1. CODE-RECOVERABLE FACTS ARE NOT MEMORIES. Reject any candidate a developer could verify by reading the current code, schema, types, configuration, or running `grep` / `git log -p` in under a minute (function/class names, type signatures, prop names, ID/constant values, file paths, schema columns, migration numbers, "X passes Y to Z" wiring). Keep a candidate only when it states a constraint, reason, rule, or invariant that survives a future refactor.
+
+2. ONE CLAIM, ONE MEMORY. Pick the single most general phrasing and emit one memory; do not output reworded duplicates of the same claim.
+
+3. FOLD REJECTED ALTERNATIVES INTO THE CHOSEN DECISION. Emit one "picked A over B and C because <reason>" decision memory rather than separate "rejected B" / "rejected C" memories.
+
+4. FUTURE USEFULNESS CHECK. Skip claims that will be obvious after the next refactor, or that self-resolve within days (a not-yet-validated risk, a temporary caveat).
+
+5. NO META-MEMORIES. Do not emit memories about the editing process itself: commit structure, diff splitting, that a guidance-file rule was followed, that a test failure was pre-existing, that work was in progress. Memory is about the project's domain, not the meta-process.
+
+Standard rules:
+- Focus ONLY on durable memory changes caused by <changed_hunks>.
+- Use <updated_document> only to understand context and copy exact quotes; do not extract unaffected facts elsewhere in it.
+- Do NOT re-extract facts already covered by <existing_memories_for_this_document> unless <changed_hunks> materially changes the current durable claim.
+- If <changed_hunks> only removes old durable knowledge without stating replacement current knowledge, return an empty "memories" array; reconciliation will decide whether to retire the old memory.
+- Do not create memories about the edit itself, such as "was removed", "no longer mentioned", "the document changed", or "previously".
+- For agent_session sources: keep only durable, reusable project knowledge (confirmed decisions, conventions, procedures, architectural rules) that is NOT visible by reading the current code. Record a change's durable outcome and the WHY as a single fact, not before/after/verified play-by-play. Do not create memories about the memory system, the agent's tooling or context injection, or session mechanics, and never include internal memory ids. Skip one-off run output and smoke-test results, receipt/session metadata, runtime notes, local paths, and working-tree state.
+- Treat normalized source headers and platform/provenance fields as operational metadata: workflow status, assignee/owner routing, sprint/milestone, rank/order, labels/tags, timestamps, participants, reactions, edit time, author/reviewer rows, revision history, link-list rows, and formatting.
+- Return an empty "memories" array for operational metadata-only changes unless the changed text explicitly states durable team knowledge, such as a decision, constraint, convention, procedure, product behavior, architectural fact, or long-lived ownership/responsibility rule.
+- Preserve conditional language. Do not turn open questions, suggestions, or unresolved discussion into decisions.
+- Do NOT extract table-of-contents entries, boilerplate, passwords, credentials, tokens, or API keys.
 
 Return ONLY a JSON object with a "memories" array. Use {{"memories": []}} when there are no memory changes."""
 
@@ -144,19 +187,33 @@ Each memory must be a JSON object with:
 - "memory_type": one of "fact", "decision", "convention", "procedure"
 - "confidence": 0.0-1.0
 - "entity_refs": list of key entity names from <entities_found>
-- "tags": 2-5 lowercase topic tags
+- "tags": {tag_min}-{tag_max} lowercase topic tags
 - "valid_from": ISO date if time-bound, null otherwise
 - "valid_until": ISO date if time-bound, null otherwise
-- "extraction_context": exact quote from <unit_markdown> (max 200 chars)
+- "extraction_context": exact quote from <unit_markdown> (max {quote_max} chars)
 - "evidence_quote": exact quote copied from <unit_markdown>
 - "evidence_anchor": "unit"
 
-Rules:
-- Extract only durable team knowledge grounded in <unit_markdown>
-- Do not extract document outline, glossary, title, URL, or source metadata as memories
-- For agent_session sources, extract only durable project decisions, conventions, procedures, and verified implementation facts from the submitted summary. Skip receipt/session metadata, validation commands/results, runtime notes, service start/stop state, local paths, working-tree state, and facts about the agent session itself
-- Do not extract passwords, credentials, tokens, API keys, or secrets
-- Preserve conditional language
+Top rules (apply these first; reject candidates that fail any of them):
+
+0. PREFER EMPTY. Returning {{"memories": []}} is the default. Most units do not contain durable team knowledge worth keeping; emit zero rather than weak memories.
+
+1. CODE-RECOVERABLE FACTS ARE NOT MEMORIES. Reject any candidate a developer could verify by reading the current code, schema, types, configuration, or running `grep` / `git log -p` in under a minute. Keep a candidate only when it states a constraint, reason, rule, or invariant that survives a future refactor.
+
+2. ONE CLAIM, ONE MEMORY. Pick the most general phrasing for each underlying claim; do not output reworded duplicates.
+
+3. FOLD REJECTED ALTERNATIVES INTO THE CHOSEN DECISION. Emit one "picked A over B because <reason>" decision rather than separate "rejected" memories.
+
+4. FUTURE USEFULNESS CHECK. Skip claims that self-resolve within days or that will be obvious after the next refactor.
+
+5. NO META-MEMORIES. Do not emit memories about the editing process itself: commit structure, diff splitting, that a guidance-file rule was followed, that a test failure was pre-existing, that work was in progress.
+
+Standard rules:
+- Extract only durable team knowledge grounded in <unit_markdown>.
+- Do not extract document outline, glossary, title, URL, or source metadata as memories.
+- For agent_session sources, extract only durable project decisions, conventions, procedures, and architectural rules that are NOT visible by reading the current code. Skip receipt/session metadata, validation commands/results, runtime notes, service start/stop state, local paths, working-tree state, and facts about the agent session itself.
+- Do not extract passwords, credentials, tokens, API keys, or secrets.
+- Preserve conditional language.
 
 Return ONLY a JSON object with a "memories" array. Use {{"memories": []}} when there are no memories."""
 
@@ -228,7 +285,10 @@ class MemoryExtractor:
 
         # Format existing memories
         if existing_memories:
-            existing_str = "\n".join(f"- [{m.memory_type}] {m.content}" for m in existing_memories[:30])
+            existing_str = "\n".join(
+                f"- [{m.memory_type}] {m.content}"
+                for m in existing_memories[:EXISTING_MEMORIES_WINDOW]
+            )
         else:
             existing_str = "(no existing memories for these entities)"
 
@@ -237,7 +297,10 @@ class MemoryExtractor:
             doc_type=doc_type,
             entities_found=entities_str,
             existing_memories=existing_str,
-            content=content[:100_000],
+            content=content[:DOC_CONTENT_CHAR_CAP],
+            tag_min=EXTRACTION_TAG_MIN,
+            tag_max=EXTRACTION_TAG_MAX,
+            quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
 
         return await self._extract_with_schema(prompt, label="memory extraction")
@@ -262,7 +325,10 @@ class MemoryExtractor:
 
         entities_str = ", ".join(entities) if entities else "(none found)"
         if existing_memories:
-            existing_str = "\n".join(f"- [{m.id}] [{m.memory_type}] {m.content}" for m in existing_memories[:50])
+            existing_str = "\n".join(
+                f"- [{m.id}] [{m.memory_type}] {m.content}"
+                for m in existing_memories[:EXISTING_MEMORIES_WINDOW_CHANGE]
+            )
         else:
             existing_str = "(no existing memories for this document)"
 
@@ -271,8 +337,11 @@ class MemoryExtractor:
             doc_type=doc_type,
             entities_found=entities_str,
             existing_memories=existing_str,
-            changed_hunks=changed_hunks[:40_000],
-            updated_document=updated_document[:100_000],
+            changed_hunks=changed_hunks[:CHANGED_HUNK_CHAR_CAP],
+            updated_document=updated_document[:UPDATED_DOC_CHAR_CAP],
+            tag_min=EXTRACTION_TAG_MIN,
+            tag_max=EXTRACTION_TAG_MAX,
+            quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
 
         return await self._extract_with_schema(prompt, label="memory change extraction")
@@ -294,7 +363,10 @@ class MemoryExtractor:
 
         entities_str = ", ".join(context.entities) if context.entities else "(none found)"
         if existing_memories:
-            existing_str = "\n".join(f"- [{m.memory_type}] {m.content}" for m in existing_memories[:30])
+            existing_str = "\n".join(
+                f"- [{m.memory_type}] {m.content}"
+                for m in existing_memories[:EXISTING_MEMORIES_WINDOW]
+            )
         else:
             existing_str = "(no existing memories for these entities)"
 
@@ -306,9 +378,12 @@ class MemoryExtractor:
             heading_path=" > ".join(context.unit.heading_path),
             entities_found=entities_str,
             existing_memories=existing_str,
-            document_outline=context.document_outline[:8_000],
-            glossary_appendix=context.glossary_appendix[:2_000],
-            unit_markdown=context.unit.unit_markdown[:80_000],
+            document_outline=context.document_outline[:DOCUMENT_OUTLINE_CHAR_CAP],
+            glossary_appendix=context.glossary_appendix[:GLOSSARY_APPENDIX_CHAR_CAP],
+            unit_markdown=context.unit.unit_markdown[:UNIT_MARKDOWN_CHAR_CAP],
+            tag_min=EXTRACTION_TAG_MIN,
+            tag_max=EXTRACTION_TAG_MAX,
+            quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
         result = await self._extract_with_schema(prompt, label="unit memory extraction")
         if result.error_type:
@@ -321,7 +396,7 @@ class MemoryExtractor:
             evidence_quote = memory.evidence_quote or memory.extraction_context or ""
             memory.evidence_quote = evidence_quote
             memory.evidence_anchor = "unit"
-            memory.extraction_context = evidence_quote[:200]
+            memory.extraction_context = evidence_quote[:EXTRACTION_QUOTE_MAX_CHARS]
             kept.append(memory)
         return MemoryExtractionResult(memories=kept)
 

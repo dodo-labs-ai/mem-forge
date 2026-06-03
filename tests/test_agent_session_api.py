@@ -27,15 +27,17 @@ async def _seed_source_project(
     project: str,
     last_modified: datetime,
     memory_ids: list[str],
+    source_id: str = "src-agent-sessions-codex",
+    client: str = "codex",
 ) -> None:
     await db.upsert_document(
         DocumentRecord(
             doc_id=doc_id,
-            source="src-agent-sessions",
+            source=source_id,
             source_url=f"agent-session://codex/sess/{doc_id}",
             title=f"Agent Session {doc_id}",
             space_or_project=project,
-            author="codex",
+            author=client,
             last_modified=last_modified,
             labels=[],
             version=f"version-{doc_id}",
@@ -46,6 +48,7 @@ async def _seed_source_project(
             normalized_content_uri=None,
             pdf_content_uri=None,
             last_synced=last_modified,
+            client=client,
         )
     )
     for memory_id in memory_ids:
@@ -83,12 +86,12 @@ def test_agent_session_window_prompt_uses_memory_quality_gate():
         transcript_markdown=None,
     )
 
-    assert "Will a future agent plausibly act better because this package exists?" in prompt
-    assert "Prefer evidence in this order:" in prompt
-    assert "User-confirmed decisions, constraints, corrections, and accepted direction" in prompt
-    assert "Tool-verified facts: files changed, tests run, errors observed, service responses" in prompt
-    assert "Assistant summaries only when backed by user or tool evidence" in prompt
-    assert "Do not preserve tentative proposals, rejected paths, or brainstorming as durable facts" in prompt
+    assert "A future agent would not act differently because this package exists." in prompt
+    assert "Your job is to COMPRESS, not to structure." in prompt
+    assert "A user-confirmed decision (with the WHY in the same sentence" in prompt
+    assert "A non-obvious tool-verified fact about how the system behaves end-to-end" in prompt
+    assert "Do NOT write bullets that a developer could verify by reading the current code" in prompt
+    assert "Fold rejected alternatives INTO the chosen decision" in prompt
 
 
 def test_agent_session_document_submit_api_records_generated_source(tmp_path):
@@ -126,7 +129,7 @@ def test_agent_session_document_submit_api_records_generated_source(tmp_path):
 
         assert response.status_code == 200
         body = response.json()
-        assert body["source_id"] == "src-agent-sessions"
+        assert body["source_id"] == "src-agent-sessions-codex"
         assert body["sync_started"] is False
         assert body["receipt"]["client"] == "codex"
         assert Path(body["document_uri"]).exists()
@@ -144,9 +147,9 @@ def test_source_projects_endpoint_groups_agent_session_memory_by_project(tmp_pat
     async def _setup():
         await database.connect()
         await database.upsert_source(
-            "src-agent-sessions",
+            "src-agent-sessions-codex",
             "agent_session",
-            "Agent Session Summaries",
+            "Codex Session",
             json.dumps({}),
         )
         await _seed_source_project(
@@ -177,12 +180,12 @@ def test_source_projects_endpoint_groups_agent_session_memory_by_project(tmp_pat
     try:
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
-            response = client.get("/api/sources/src-agent-sessions/projects")
+            response = client.get("/api/sources/src-agent-sessions-codex/projects")
 
         assert response.status_code == 200
         body = response.json()
         assert body == {
-            "source_id": "src-agent-sessions",
+            "source_id": "src-agent-sessions-codex",
             "projects": [
                 {
                     "project": "mem-inception",
@@ -270,7 +273,7 @@ def test_agent_session_window_api_generates_package_and_discards_raw_window(tmp_
         assert response.status_code == 200
         body = response.json()
         assert body["result"] == "package_created"
-        assert body["source_id"] == "src-agent-sessions"
+        assert body["source_id"] == "src-agent-sessions-codex"
         assert body["sync_started"] is False
         assert body["window_hash"].startswith("sha256:")
 
@@ -414,7 +417,7 @@ def test_agent_session_window_api_queues_service_owned_sync(tmp_path):
         assert body["result"] == "package_created"
         assert body["sync_started"] is False
         assert body["sync_queued"] is True
-        assert fake_sync.queued == ["src-agent-sessions"]
+        assert fake_sync.queued == ["src-agent-sessions-codex"]
     finally:
         asyncio.run(database.close())
 
@@ -502,7 +505,7 @@ def test_agent_session_window_api_accepts_no_output_without_creating_source(tmp_
         assert body["reason"] == "trivial explanation"
 
         async def _assert_no_source():
-            assert await database.get_source("src-agent-sessions") is None
+            assert await database.get_source("src-agent-sessions-codex") is None
 
         asyncio.run(_assert_no_source())
     finally:
@@ -844,7 +847,7 @@ def test_hook_receipt_api_records_lineage_without_source_document(tmp_path):
 
         async def _assert_storage():
             receipts = await database.list_agent_hook_receipts(session_id="sess-hook")
-            source = await database.get_source("src-agent-sessions")
+            source = await database.get_source("src-agent-sessions-codex")
             assert len(receipts) == 1
             assert receipts[0]["receipt_id"] == body["receipt_id"]
             assert source is None
@@ -859,7 +862,7 @@ def _make_receipt(
     doc_id,
     session_id,
     outcome,
-    source_id="src-agent-sessions",
+    source_id="src-agent-sessions-codex",
     source_kind="generated_agent_window_summary",
     reason=None,
     updated_at=None,
@@ -1087,5 +1090,250 @@ def test_package_write_is_atomic_no_temp_left(tmp_path):
         assert package_path.exists()
         json.loads(package_path.read_text(encoding="utf-8"))  # complete, valid JSON
         assert list(package_path.parent.glob("*.tmp")) == []  # no leftover temp file
+    finally:
+        asyncio.run(database.close())
+
+
+def test_per_client_source_split_creates_two_distinct_source_rows(tmp_path):
+    """Submitting from codex and claude-code creates two separate source rows."""
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+    import asyncio
+
+    asyncio.run(database.connect())
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            codex_response = client.post(
+                "/api/agent-sessions/documents",
+                json={
+                    "client": "codex",
+                    "session_id": "sess-codex",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "document_markdown": "## Outcome\nCodex session summary.",
+                    "process_now": False,
+                },
+            )
+            assert codex_response.status_code == 200
+
+            claude_response = client.post(
+                "/api/agent-sessions/documents",
+                json={
+                    "client": "claude-code",
+                    "session_id": "sess-claude-code",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "document_markdown": "## Outcome\nClaude Code session summary.",
+                    "process_now": False,
+                },
+            )
+            assert claude_response.status_code == 200
+
+        codex_body = codex_response.json()
+        claude_body = claude_response.json()
+
+        assert codex_body["source_id"] == "src-agent-sessions-codex"
+        assert claude_body["source_id"] == "src-agent-sessions-claude-code"
+        assert codex_body["receipt"]["client"] == "codex"
+        assert claude_body["receipt"]["client"] == "claude-code"
+
+        async def _check_sources():
+            sources = await database.list_sources()
+            source_ids = {s["id"] for s in sources}
+            assert "src-agent-sessions-codex" in source_ids
+            assert "src-agent-sessions-claude-code" in source_ids
+            # The legacy singleton must not be created for known clients.
+            assert "src-agent-sessions" not in source_ids
+
+            codex_src = await database.get_source("src-agent-sessions-codex")
+            claude_src = await database.get_source("src-agent-sessions-claude-code")
+            assert codex_src is not None
+            assert codex_src["name"] == "Codex Session"
+            assert codex_src["type"] == "agent_session"
+            assert claude_src is not None
+            assert claude_src["name"] == "Claude Code Session"
+            assert claude_src["type"] == "agent_session"
+
+        asyncio.run(_check_sources())
+    finally:
+        asyncio.run(database.close())
+
+
+def test_db_migration_splits_singleton_documents_to_per_client_sources(tmp_path):
+    """Migration 12 re-points documents from the old singleton to per-client sources."""
+    import asyncio
+    import aiosqlite
+
+    async def _run():
+        db_path = str(tmp_path / "migration.db")
+        # Open a raw connection and apply only the base schema and migrations
+        # up through 10, so we can seed singleton data before 11/12 run.
+        conn = await aiosqlite.connect(db_path)
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA foreign_keys = ON")
+
+        # Apply just enough schema for our test.
+        from memforge.storage.database import SCHEMA, MIGRATIONS
+        await conn.executescript(SCHEMA)
+        now_ts = "2026-06-01T10:00:00+00:00"
+        # Record migrations 1-10 as applied without executing (schema already created them).
+        for version, description, _ in MIGRATIONS:
+            if version > 10:
+                break
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
+                (version, description, now_ts),
+            )
+        await conn.commit()
+
+        # Seed singleton source and documents.
+        await conn.execute(
+            "INSERT INTO sources (id, type, name, config) VALUES (?, ?, ?, ?)",
+            ("src-agent-sessions", "agent_session", "Agent Session Summaries", "{}"),
+        )
+        for client_name, doc_id in [("codex", "doc-codex-m"), ("claude-code", "doc-cc-m")]:
+            await conn.execute(
+                """INSERT INTO documents
+                   (doc_id, source, source_url, title, space_or_project, author,
+                    last_modified, labels, version, content_hash, last_synced)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (doc_id, "src-agent-sessions",
+                 f"agent-session://{client_name}/sess/{doc_id}",
+                 f"{client_name} doc", "workspace", client_name,
+                 now_ts, "[]", "v1", f"hash-{doc_id}", now_ts),
+            )
+            await conn.execute(
+                """INSERT INTO agent_session_receipts
+                   (doc_id, source_id, client, session_id, trigger, workspace,
+                    history_window_kind, submitted_at, document_hash, source_kind,
+                    document_uri, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (doc_id, "src-agent-sessions", client_name, "sess-x", "Stop",
+                 "/workspace", "session", now_ts, f"hash-{doc_id}",
+                 "generated_agent_summary", "", now_ts),
+            )
+        await conn.commit()
+        await conn.close()
+
+        # Now open via Database, which will run migrations 11 and 12.
+        database = Database(db_path)
+        await database.connect()
+        try:
+            codex_src = await database.get_source("src-agent-sessions-codex")
+            cc_src = await database.get_source("src-agent-sessions-claude-code")
+            singleton_src = await database.get_source("src-agent-sessions")
+            codex_doc = await database.get_document("doc-codex-m")
+            cc_doc = await database.get_document("doc-cc-m")
+        finally:
+            await database.close()
+
+        assert codex_src is not None, "codex source must exist after migration"
+        assert codex_src["name"] == "Codex Session"
+        assert codex_src["type"] == "agent_session"
+        assert cc_src is not None, "claude-code source must exist after migration"
+        assert cc_src["name"] == "Claude Code Session"
+        # Both known-client docs were re-pointed, so singleton has zero docs.
+        assert singleton_src is None, "singleton must be removed after all docs are re-pointed"
+        assert codex_doc is not None
+        assert codex_doc.source == "src-agent-sessions-codex"
+        assert codex_doc.client == "codex"
+        assert cc_doc is not None
+        assert cc_doc.source == "src-agent-sessions-claude-code"
+        assert cc_doc.client == "claude-code"
+
+    asyncio.run(_run())
+
+
+def test_memories_endpoint_exposes_origin_client_for_agent_session_memories(tmp_path):
+    """origin_client is 'codex' or 'claude-code' for agent-session memories and None for jira."""
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+    base_time = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+
+    async def _setup():
+        await database.connect()
+        # Seed a jira source and document.
+        await database.upsert_source("src-jira", "jira", "Jira", json.dumps({}))
+        jira_doc_id = "doc-jira-1"
+        await database.upsert_document(
+            DocumentRecord(
+                doc_id=jira_doc_id,
+                source="src-jira",
+                source_url="https://jira.example.com/PAY-1",
+                title="PAY-1",
+                space_or_project="payroll",
+                author=None,
+                last_modified=base_time,
+                labels=[],
+                version="v1",
+                content_hash="hash-jira",
+                token_count=50,
+                raw_content_uri=None,
+                raw_content_type="text/plain",
+                normalized_content_uri=None,
+                pdf_content_uri=None,
+                last_synced=base_time,
+            )
+        )
+        # Seed codex and claude-code agent session documents with the client column set.
+        await _seed_source_project(
+            database,
+            doc_id="doc-codex-origin",
+            project="mem-inception",
+            last_modified=base_time,
+            memory_ids=["mem-codex-origin"],
+            source_id="src-agent-sessions-codex",
+            client="codex",
+        )
+        await _seed_source_project(
+            database,
+            doc_id="doc-cc-origin",
+            project="mem-inception",
+            last_modified=base_time,
+            memory_ids=["mem-cc-origin"],
+            source_id="src-agent-sessions-claude-code",
+            client="claude-code",
+        )
+        # Jira memory without a client column on its document.
+        jira_memory = Memory(
+            id="mem-jira-origin",
+            memory_type="fact",
+            content="Jira memory",
+            content_hash=content_hash("Jira memory"),
+            project_key="payroll",
+            tags=[],
+            confidence=0.9,
+            created_at=base_time,
+            updated_at=base_time,
+            status="active",
+        )
+        await database.insert_memory(jira_memory)
+        await database.add_memory_source(jira_memory.id, jira_doc_id, "jira")
+
+    import asyncio
+
+    asyncio.run(_setup())
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            response = client.get("/api/memories")
+
+        assert response.status_code == 200
+        data = {m["id"]: m for m in response.json()["data"]}
+
+        assert data["mem-codex-origin"]["origin_client"] == "codex"
+        assert data["mem-codex-origin"]["origin_source_type"] == "agent_session"
+
+        assert data["mem-cc-origin"]["origin_client"] == "claude-code"
+        assert data["mem-cc-origin"]["origin_source_type"] == "agent_session"
+
+        assert data["mem-jira-origin"]["origin_client"] is None
+        assert data["mem-jira-origin"]["origin_source_type"] == "jira"
     finally:
         asyncio.run(database.close())

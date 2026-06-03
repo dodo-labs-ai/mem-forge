@@ -4,6 +4,8 @@ import { AlertCircle, ArrowLeft, ExternalLink, Loader2 } from "lucide-react";
 import client from "@/api/client";
 import type { Memory, MemorySource } from "@/api/types";
 import { ConfidenceBadge, MemoryTypeBadge, StatusDot } from "@/components/admin/StatusBadge";
+import { MemoryTypeIcon } from "@/components/memories/MemoryTypeIcon";
+import { SourceIcon } from "@/components/sources/SourceIcon";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -79,6 +81,7 @@ export function MemoryDetailPage() {
   }
 
   const lifecycleDetail = getLifecycleDetail(memory);
+  const origin = memory.origin_source_type;
 
   return (
     <div className="space-y-6">
@@ -91,6 +94,11 @@ export function MemoryDetailPage() {
           <div className="flex items-start justify-between gap-3">
             <div className="flex items-center gap-3">
               <StatusDot status={memory.status} />
+              {origin ? (
+                <SourceIcon type={origin} client={memory.origin_client} className="size-4" />
+              ) : (
+                <MemoryTypeIcon type={memory.memory_type} className="size-4" />
+              )}
               <MemoryTypeBadge type={memory.memory_type} />
               <span className="text-xs text-muted-foreground">
                 {STATUS_LABELS[memory.status] ?? memory.status}

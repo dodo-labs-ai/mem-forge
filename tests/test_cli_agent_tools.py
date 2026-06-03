@@ -1,23 +1,38 @@
 import json
+from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 import memforge.main as main
+from memforge.auth.jira_auth import JiraAuthSessionError, JiraPrincipalChangedError
 from memforge.main import cli
 
 
 class FakeToolClient:
     calls: list[tuple[str, dict]] = []
     response: dict = {}
+    list_response: dict = {"data": []}
+    create_response: dict = {"id": "src-created"}
 
     def __init__(self, *, api_url: str, api_token: str | None = None):
         self.api_url = api_url
         self.api_token = api_token
 
     @classmethod
-    def reset(cls, response: dict) -> None:
+    def reset(cls, response: dict, *, list_response: dict | None = None, create_response: dict | None = None) -> None:
         cls.calls = []
         cls.response = response
+        cls.list_response = {"data": []} if list_response is None else list_response
+        cls.create_response = {"id": "src-created"} if create_response is None else create_response
+
+    def list_sources(self):
+        self.calls.append(("list_sources", {"api_url": self.api_url, "api_token": self.api_token}))
+        return self.list_response
+
+    def create_source(self, **kwargs):
+        self.calls.append(("create_source", {"api_url": self.api_url, "api_token": self.api_token, **kwargs}))
+        return self.create_response
 
     def search(self, **kwargs):
         self.calls.append(("search", {"api_url": self.api_url, "api_token": self.api_token, **kwargs}))
@@ -29,6 +44,17 @@ class FakeToolClient:
 
     def get_resource(self, **kwargs):
         self.calls.append(("get_resource", {"api_url": self.api_url, "api_token": self.api_token, **kwargs}))
+        return self.response
+
+    def push_local_markdown_document(self, **kwargs):
+        self.calls.append((
+            "push_local_markdown_document",
+            {"api_url": self.api_url, "api_token": self.api_token, **kwargs},
+        ))
+        return self.response
+
+    def health(self):
+        self.calls.append(("health", {"api_url": self.api_url, "api_token": self.api_token}))
         return self.response
 
 
@@ -134,3 +160,592 @@ def test_agent_tool_cli_returns_nonzero_for_tool_error(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.output)["error"] == "MemForge API unavailable"
+
+
+def test_memory_group_keeps_read_tools_api_backed(monkeypatch):
+    FakeToolClient.reset({"memory_id": "mem-456", "content": "A memory"})
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient, raising=False)
+
+    result = CliRunner().invoke(cli, ["memory", "get", "mem-456"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["memory_id"] == "mem-456"
+    assert FakeToolClient.calls[0][0] == "get_memory"
+
+
+def test_target_profile_sets_default_api_url(monkeypatch, tmp_path: Path):
+    cli_config = tmp_path / "cli.toml"
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(cli_config))
+    FakeToolClient.reset({"status": "ok"})
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient, raising=False)
+
+    add_result = CliRunner().invoke(
+        cli,
+        ["target", "add", "sap.prod", "--api-url", "https://memforge.example.test", "--token-env", "SAP_TOKEN"],
+    )
+    check_result = CliRunner().invoke(cli, ["target", "check"], env={"SAP_TOKEN": "secret-token"})
+
+    assert add_result.exit_code == 0, add_result.output
+    assert check_result.exit_code == 0, check_result.output
+    assert FakeToolClient.calls == [
+        ("health", {"api_url": "https://memforge.example.test", "api_token": "secret-token"})
+    ]
+
+
+def test_target_profile_does_not_mix_global_token(monkeypatch, tmp_path: Path):
+    cli_config = tmp_path / "cli.toml"
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(cli_config))
+    FakeToolClient.reset({"status": "ok"})
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient, raising=False)
+
+    add_result = CliRunner().invoke(
+        cli,
+        ["target", "add", "sap", "--api-url", "https://memforge.example.test", "--token-env", "SAP_TOKEN"],
+    )
+    check_result = CliRunner().invoke(
+        cli,
+        ["target", "check"],
+        env={"MEMFORGE_API_TOKEN": "wrong-token", "SAP_TOKEN": "target-token"},
+    )
+
+    assert add_result.exit_code == 0, add_result.output
+    assert check_result.exit_code == 0, check_result.output
+    assert FakeToolClient.calls == [
+        ("health", {"api_url": "https://memforge.example.test", "api_token": "target-token"})
+    ]
+
+
+def test_env_api_url_does_not_use_active_target_token(monkeypatch, tmp_path: Path):
+    cli_config = tmp_path / "cli.toml"
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(cli_config))
+    FakeToolClient.reset({"status": "ok"})
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient, raising=False)
+
+    add_result = CliRunner().invoke(
+        cli,
+        ["target", "add", "sap", "--api-url", "https://memforge.example.test", "--token-env", "SAP_TOKEN"],
+    )
+    check_result = CliRunner().invoke(
+        cli,
+        ["target", "check"],
+        env={"MEMFORGE_API_URL": "https://override.example.test", "SAP_TOKEN": "target-token"},
+    )
+
+    assert add_result.exit_code == 0, add_result.output
+    assert check_result.exit_code == 0, check_result.output
+    assert FakeToolClient.calls == [
+        ("health", {"api_url": "https://override.example.test", "api_token": None})
+    ]
+
+
+class _FakeDB:
+    async def close(self):
+        pass
+
+
+async def _fake_get_db(config):
+    return _FakeDB()
+
+
+def test_adapter_jira_refresh_uses_base_url(monkeypatch):
+    calls: list[dict] = []
+
+    async def fake_refresh(db, provider, *, base_url, browser=None, confirm_principal_change=False):
+        calls.append({"provider": provider, "base_url": base_url, "browser": browser, "confirm": confirm_principal_change})
+        return {"origin": base_url, "principal_name": "i551096", "browser": browser, "sources_reset": []}
+
+    monkeypatch.setattr(main, "_get_db", _fake_get_db)
+    monkeypatch.setattr(main.browser_session, "refresh", fake_refresh)
+
+    result = CliRunner().invoke(
+        cli,
+        ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap", "--browser", "chrome"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["origin"] == "https://jira.tools.sap"
+    assert calls == [
+        {"provider": "jira", "base_url": "https://jira.tools.sap", "browser": "chrome", "confirm": False}
+    ]
+
+
+def test_adapter_jira_refresh_failure_returns_json_error(monkeypatch):
+    async def fake_refresh(db, provider, *, base_url, browser=None, confirm_principal_change=False):
+        raise JiraAuthSessionError("No active Jira browser session cookies were found")
+
+    monkeypatch.setattr(main, "_get_db", _fake_get_db)
+    monkeypatch.setattr(main.browser_session, "refresh", fake_refresh)
+
+    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["error"] == "auth_failed"
+    assert "No active Jira" in payload["detail"]
+
+
+def test_adapter_jira_refresh_principal_change_returns_json_error(monkeypatch):
+    async def fake_refresh(db, provider, *, base_url, browser=None, confirm_principal_change=False):
+        raise JiraPrincipalChangedError(
+            "https://jira.tools.sap",
+            old_principal_id="old-user",
+            new_principal_id="new-user",
+        )
+
+    monkeypatch.setattr(main, "_get_db", _fake_get_db)
+    monkeypatch.setattr(main.browser_session, "refresh", fake_refresh)
+
+    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["error"] == "principal_changed"
+    assert payload["origin"] == "https://jira.tools.sap"
+    assert payload["old_principal_id"] == "old-user"
+    assert payload["new_principal_id"] == "new-user"
+
+
+def test_adapter_jira_status_reports_stored_session(monkeypatch):
+    async def fake_status(db, provider, base_url):
+        assert provider == "jira"
+        assert base_url == "https://jira.tools.sap"
+        return {
+            "provider": "jira",
+            "origin": "https://jira.tools.sap",
+            "status": "active",
+            "principal_name": "Rose H",
+            "browser": "chrome",
+            "validated_at": "2026-06-02T10:00:00+00:00",
+            "last_error": None,
+        }
+
+    monkeypatch.setattr(main, "_get_db", _fake_get_db)
+    monkeypatch.setattr(main.browser_session, "status", fake_status)
+
+    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "status", "--base-url", "https://jira.tools.sap"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "active"
+    assert payload["principal_name"] == "Rose H"
+    assert payload["origin"] == "https://jira.tools.sap"
+
+
+def test_adapter_jira_status_missing_session_is_not_an_error(monkeypatch):
+    async def fake_status(db, provider, base_url):
+        return {"provider": "jira", "origin": "https://jira.tools.sap", "status": "missing", "last_error": None}
+
+    monkeypatch.setattr(main, "_get_db", _fake_get_db)
+    monkeypatch.setattr(main.browser_session, "status", fake_status)
+
+    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "status", "--base-url", "https://jira.tools.sap"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["status"] == "missing"
+
+
+def test_legacy_auth_jira_is_removed():
+    help_result = CliRunner().invoke(cli, ["auth", "--help"])
+    result = CliRunner().invoke(cli, ["auth", "jira", "--base-url", "https://jira.tools.sap"])
+
+    assert help_result.exit_code == 0, help_result.output
+    assert "jira" not in help_result.output
+    assert result.exit_code != 0
+    assert "No such command 'jira'" in result.output
+
+
+def test_adapter_list_includes_markdown_kb_capability():
+    result = CliRunner().invoke(cli, ["adapter", "list"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert {"type": "kb", "kind": "markdown"} in payload["data"]
+
+
+def test_adapter_kb_add_and_list_profiles(monkeypatch, tmp_path: Path):
+    adapter_config = tmp_path / "adapter.toml"
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
+
+    add_result = CliRunner().invoke(
+        cli,
+        [
+            "adapter",
+            "kb",
+            "add",
+            "work.vault",
+            "--root",
+            str(vault_root),
+            "--vault-id",
+            "work-vault",
+            "--include",
+            "**/*.md",
+            "--exclude",
+            ".obsidian/**",
+        ],
+    )
+    list_result = CliRunner().invoke(cli, ["adapter", "kb", "list"])
+
+    assert add_result.exit_code == 0, add_result.output
+    assert list_result.exit_code == 0, list_result.output
+    payload = json.loads(list_result.output)
+    assert payload["profiles"]["work.vault"]["root"] == str(vault_root)
+    assert payload["profiles"]["work.vault"]["vault_id"] == "work-vault"
+
+
+def test_adapter_kb_scan_reports_counts_without_a_profile(monkeypatch, tmp_path: Path):
+    vault_root = tmp_path / "vault"
+    (vault_root / "notes").mkdir(parents=True)
+    (vault_root / ".obsidian").mkdir()
+    (vault_root / "notes" / "a.md").write_text("# A\n\nbody", encoding="utf-8")
+    (vault_root / "notes" / "b.md").write_text("# B\n\nbody", encoding="utf-8")
+    (vault_root / ".obsidian" / "workspace.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+
+    result = CliRunner().invoke(cli, ["adapter", "kb", "scan", "--root", str(vault_root), "--limit", "5"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["counts"]["included"] == 2
+    paths = sorted(item["relative_path"] for item in payload["items"])
+    assert paths == ["notes/a.md", "notes/b.md"]
+
+
+def test_adapter_kb_scan_rejects_missing_root(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    result = CliRunner().invoke(cli, ["adapter", "kb", "scan", "--root", str(tmp_path / "nope")])
+    assert result.exit_code != 0
+
+
+def test_adapter_kb_remove_deletes_profile(monkeypatch, tmp_path: Path):
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+
+    CliRunner().invoke(cli, ["adapter", "kb", "add", "work", "--root", str(vault_root)])
+    remove_result = CliRunner().invoke(cli, ["adapter", "kb", "remove", "work"])
+    list_result = CliRunner().invoke(cli, ["adapter", "kb", "list"])
+
+    assert remove_result.exit_code == 0, remove_result.output
+    assert json.loads(remove_result.output) == {"ok": True, "removed": "work"}
+    assert json.loads(list_result.output)["profiles"] == {}
+
+
+def test_adapter_kb_remove_unknown_profile_errors(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    result = CliRunner().invoke(cli, ["adapter", "kb", "remove", "nope"])
+    assert result.exit_code != 0
+
+
+def test_adapter_kb_add_create_source_creates_and_stores_source_id(monkeypatch, tmp_path: Path):
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({}, list_response={"data": []},
+                         create_response={"id": "src-new123", "type": "local_markdown"})
+
+    add_result = CliRunner().invoke(
+        cli,
+        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--vault-id", "engineering",
+         "--display-label", "Eng notes", "--create-source"],
+    )
+    list_result = CliRunner().invoke(cli, ["adapter", "kb", "list"])
+
+    assert add_result.exit_code == 0, add_result.output
+    payload = json.loads(add_result.output)
+    assert payload["source_id"] == "src-new123"
+    assert payload["source_reused"] is False
+    assert json.loads(list_result.output)["profiles"]["work"]["source_id"] == "src-new123"
+
+    create_calls = [c for c in FakeToolClient.calls if c[0] == "create_source"]
+    assert len(create_calls) == 1
+    assert create_calls[0][1]["source_type"] == "local_markdown"
+    assert create_calls[0][1]["config"]["vault_id"] == "engineering"
+    assert create_calls[0][1]["config"]["display_label"] == "Eng notes"
+
+
+def test_adapter_kb_add_create_source_reuses_existing_by_vault_id(monkeypatch, tmp_path: Path):
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset(
+        {},
+        list_response={"data": [
+            {"id": "src-other", "type": "jira", "config": {"vault_id": "engineering"}},
+            {"id": "src-exist", "type": "local_markdown", "config": {"vault_id": "engineering"}},
+        ]},
+        create_response={"id": "should-not-be-used"},
+    )
+
+    add_result = CliRunner().invoke(
+        cli,
+        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--vault-id", "engineering", "--create-source"],
+    )
+
+    assert add_result.exit_code == 0, add_result.output
+    payload = json.loads(add_result.output)
+    assert payload["source_id"] == "src-exist"
+    assert payload["source_reused"] is True
+    assert not [c for c in FakeToolClient.calls if c[0] == "create_source"]
+
+
+def test_adapter_kb_add_create_source_reports_link_error_but_saves_profile(monkeypatch, tmp_path: Path):
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({}, list_response={"error": "MemForge API unavailable", "detail": "connection refused"})
+
+    add_result = CliRunner().invoke(
+        cli,
+        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--vault-id", "engineering", "--create-source"],
+    )
+    list_result = CliRunner().invoke(cli, ["adapter", "kb", "list"])
+
+    assert add_result.exit_code == 0, add_result.output
+    payload = json.loads(add_result.output)
+    assert "source_id" not in payload
+    assert payload["source_link_error"] == "MemForge API unavailable"
+    assert json.loads(list_result.output)["profiles"]["work"]["root"] == str(vault_root)
+
+
+def test_adapter_kb_push_uses_profile_source_id_when_omitted(monkeypatch, tmp_path: Path):
+    vault_root = tmp_path / "vault"
+    (vault_root / "notes").mkdir(parents=True)
+    (vault_root / "notes" / "a.md").write_text("# A\n\nbody", encoding="utf-8")
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "d1", "document_hash": "h1"},
+                         list_response={"data": []}, create_response={"id": "src-stored"})
+
+    CliRunner().invoke(cli, ["adapter", "kb", "add", "work", "--root", str(vault_root),
+                             "--vault-id", "engineering", "--create-source"])
+    push_result = CliRunner().invoke(cli, ["adapter", "kb", "push", "work"])
+
+    assert push_result.exit_code == 0, push_result.output
+    payload = json.loads(push_result.output)
+    assert payload["source_id"] == "src-stored"
+    push_calls = [c for c in FakeToolClient.calls if c[0] == "push_local_markdown_document"]
+    assert push_calls and push_calls[0][1]["source_id"] == "src-stored"
+
+
+def test_adapter_kb_push_explicit_source_id_overrides_profile(monkeypatch, tmp_path: Path):
+    vault_root = tmp_path / "vault"
+    (vault_root / "notes").mkdir(parents=True)
+    (vault_root / "notes" / "a.md").write_text("# A\n\nbody", encoding="utf-8")
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "d1", "document_hash": "h1"},
+                         list_response={"data": []}, create_response={"id": "src-stored"})
+
+    CliRunner().invoke(cli, ["adapter", "kb", "add", "work", "--root", str(vault_root),
+                             "--vault-id", "engineering", "--create-source"])
+    push_result = CliRunner().invoke(cli, ["adapter", "kb", "push", "work", "--source-id", "src-explicit"])
+
+    assert push_result.exit_code == 0, push_result.output
+    assert json.loads(push_result.output)["source_id"] == "src-explicit"
+
+
+def test_adapter_kb_push_without_any_source_id_errors(monkeypatch, tmp_path: Path):
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({})
+
+    CliRunner().invoke(cli, ["adapter", "kb", "add", "work", "--root", str(vault_root)])
+    push_result = CliRunner().invoke(cli, ["adapter", "kb", "push", "work"])
+
+    assert push_result.exit_code != 0
+
+
+def test_adapter_kb_add_without_create_source_makes_no_api_calls(monkeypatch, tmp_path: Path):
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({})
+
+    add_result = CliRunner().invoke(
+        cli, ["adapter", "kb", "add", "work", "--root", str(vault_root)],
+    )
+
+    assert add_result.exit_code == 0, add_result.output
+    assert FakeToolClient.calls == []
+    assert "source_id" not in json.loads(add_result.output)
+
+
+def test_adapter_kb_preview_scans_markdown_profile(monkeypatch, tmp_path: Path):
+    adapter_config = tmp_path / "adapter.toml"
+    vault_root = tmp_path / "vault"
+    (vault_root / "notes").mkdir(parents=True)
+    (vault_root / ".obsidian").mkdir()
+    (vault_root / "notes" / "cutoff.md").write_text("# Cutoff\n\nA durable note.", encoding="utf-8")
+    (vault_root / ".obsidian" / "workspace.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
+
+    add_result = CliRunner().invoke(
+        cli,
+        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--exclude", ".obsidian/**"],
+    )
+    preview_result = CliRunner().invoke(cli, ["adapter", "kb", "preview", "work", "--limit", "5"])
+
+    assert add_result.exit_code == 0, add_result.output
+    assert preview_result.exit_code == 0, preview_result.output
+    payload = json.loads(preview_result.output)
+    assert payload["profile"] == "work"
+    assert payload["counts"]["included"] == 1
+    assert payload["items"][0]["relative_path"] == "notes/cutoff.md"
+    assert payload["items"][0]["content_type"] == "text/markdown"
+
+
+def test_adapter_kb_custom_excludes_keep_default_safety_excludes(monkeypatch, tmp_path: Path):
+    adapter_config = tmp_path / "adapter.toml"
+    vault_root = tmp_path / "vault"
+    (vault_root / ".obsidian").mkdir(parents=True)
+    (vault_root / "archive").mkdir()
+    (vault_root / "notes").mkdir()
+    (vault_root / ".obsidian" / "private.md").write_text("# Private\n", encoding="utf-8")
+    (vault_root / "archive" / "old.md").write_text("# Old\n", encoding="utf-8")
+    (vault_root / "notes" / "live.md").write_text("# Live\n", encoding="utf-8")
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
+
+    add_result = CliRunner().invoke(
+        cli,
+        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--exclude", "archive/**"],
+    )
+    preview_result = CliRunner().invoke(cli, ["adapter", "kb", "preview", "work", "--limit", "10"])
+
+    assert add_result.exit_code == 0, add_result.output
+    assert preview_result.exit_code == 0, preview_result.output
+    payload = json.loads(preview_result.output)
+    assert payload["counts"]["included"] == 1
+    assert [item["relative_path"] for item in payload["items"]] == ["notes/live.md"]
+
+
+def test_adapter_kb_preview_rejects_missing_root(monkeypatch, tmp_path: Path):
+    adapter_config = tmp_path / "adapter.toml"
+    adapter_config.write_text('[kb."bad"]\nvault_id = "bad"\ninclude = ["*.md"]\n', encoding="utf-8")
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
+
+    result = CliRunner().invoke(cli, ["adapter", "kb", "preview", "bad"])
+
+    assert result.exit_code != 0
+    assert "root is required" in result.output
+
+
+def test_adapter_kb_preview_does_not_follow_symlink_escape(monkeypatch, tmp_path: Path):
+    adapter_config = tmp_path / "adapter.toml"
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("# Outside\n", encoding="utf-8")
+    try:
+        (vault_root / "leak.md").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
+
+    add_result = CliRunner().invoke(cli, ["adapter", "kb", "add", "work", "--root", str(vault_root)])
+    preview_result = CliRunner().invoke(cli, ["adapter", "kb", "preview", "work", "--limit", "10"])
+
+    assert add_result.exit_code == 0, add_result.output
+    assert preview_result.exit_code == 0, preview_result.output
+    payload = json.loads(preview_result.output)
+    assert payload["counts"]["included"] == 0
+    assert payload["counts"]["ignored"] == 1
+
+
+def test_adapter_kb_push_forwards_documents_to_service(monkeypatch, tmp_path: Path):
+    adapter_config = tmp_path / "adapter.toml"
+    vault_root = tmp_path / "vault"
+    (vault_root / "decisions").mkdir(parents=True)
+    (vault_root / "decisions" / "cutoff.md").write_text("# Cutoff\n\nTuesday.", encoding="utf-8")
+    (vault_root / "decisions" / "release.md").write_text("# Release\n\nThursday.", encoding="utf-8")
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "local-md-fake", "document_hash": "abc123"})
+
+    add_result = CliRunner().invoke(
+        cli,
+        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--vault-id", "engineering"],
+    )
+    push_result = CliRunner().invoke(
+        cli,
+        ["adapter", "kb", "push", "work", "--source-id", "src-abcd1234", "--submitted-by", "cli-test"],
+    )
+
+    assert add_result.exit_code == 0, add_result.output
+    assert push_result.exit_code == 0, push_result.output
+    payload = json.loads(push_result.output)
+    assert payload["counts"]["pushed"] == 2
+    assert payload["counts"]["failed"] == 0
+    assert payload["source_id"] == "src-abcd1234"
+    assert payload["vault_id"] == "engineering"
+    relative_paths = sorted(item["relative_path"] for item in payload["pushed"])
+    assert relative_paths == ["decisions/cutoff.md", "decisions/release.md"]
+
+    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_local_markdown_document"]
+    assert len(push_calls) == 2
+    first_kwargs = push_calls[0][1]
+    assert first_kwargs["source_id"] == "src-abcd1234"
+    assert first_kwargs["vault_id"] == "engineering"
+    assert first_kwargs["submitted_by"] == "cli-test"
+    assert first_kwargs["process_now"] is False
+    # The CLI now sends raw file text tagged with a content type; conversion is server-side.
+    assert first_kwargs["markdown_body"] == "# Cutoff\n\nTuesday."
+    assert first_kwargs["content_type"] == "text/markdown"
+
+
+def test_adapter_kb_push_process_now_triggers_on_last_document(monkeypatch, tmp_path: Path):
+    adapter_config = tmp_path / "adapter.toml"
+    vault_root = tmp_path / "vault"
+    (vault_root / "notes").mkdir(parents=True)
+    (vault_root / "notes" / "first.md").write_text("# First\n", encoding="utf-8")
+    (vault_root / "notes" / "second.md").write_text("# Second\n", encoding="utf-8")
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "local-md-fake", "document_hash": "abc123"})
+
+    add_result = CliRunner().invoke(
+        cli,
+        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--vault-id", "engineering"],
+    )
+    push_result = CliRunner().invoke(
+        cli,
+        ["adapter", "kb", "push", "work", "--source-id", "src-abcd1234", "--process-now"],
+    )
+
+    assert add_result.exit_code == 0, add_result.output
+    assert push_result.exit_code == 0, push_result.output
+    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_local_markdown_document"]
+    assert [call[1]["process_now"] for call in push_calls] == [False, True]
+
+
+def test_adapter_kb_push_reports_service_errors(monkeypatch, tmp_path: Path):
+    adapter_config = tmp_path / "adapter.toml"
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+    (vault_root / "doc.md").write_text("# Doc\n", encoding="utf-8")
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"error": "MemForge API request failed", "status_code": 400, "detail": "vault mismatch"})
+
+    add_result = CliRunner().invoke(
+        cli, ["adapter", "kb", "add", "work", "--root", str(vault_root), "--vault-id", "engineering"]
+    )
+    push_result = CliRunner().invoke(
+        cli, ["adapter", "kb", "push", "work", "--source-id", "src-bad"]
+    )
+
+    assert add_result.exit_code == 0, add_result.output
+    assert push_result.exit_code != 0
+    payload = json.loads(push_result.output)
+    assert payload["counts"]["failed"] == 1
+    assert payload["failed"][0]["status_code"] == 400
+    assert "error" in payload

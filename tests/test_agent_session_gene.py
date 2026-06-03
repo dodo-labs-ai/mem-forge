@@ -50,7 +50,7 @@ async def test_submit_agent_session_document_records_receipt_and_source_package(
         submitted_at="2026-05-21T11:30:00+00:00",
     )
 
-    source = await db.get_source("src-agent-sessions")
+    source = await db.get_source("src-agent-sessions-codex")
     receipt = await db.get_agent_session_receipt(result["doc_id"])
     package = json.loads(Path(result["document_uri"]).read_text(encoding="utf-8"))
 
@@ -86,7 +86,7 @@ async def test_agent_session_gene_discovers_and_normalizes_submitted_documents(d
         history_window_start="2026-05-21T12:00:00+00:00",
         history_window_end="2026-05-21T12:30:00+00:00",
     )
-    source = await db.get_source("src-agent-sessions")
+    source = await db.get_source("src-agent-sessions-claude-code")
     gene = AgentSessionGene(config=source["config"], source_id=source["id"])
 
     items = [item async for item in gene.discover()]
@@ -121,7 +121,7 @@ async def test_agent_session_gene_incremental_discovery_uses_submitted_timestamp
         history_window_kind="session",
         submitted_at="2026-05-21T09:00:00+00:00",
     )
-    source = await db.get_source("src-agent-sessions")
+    source = await db.get_source("src-agent-sessions-codex")
     gene = create_gene("agent_session", source["config"], source["id"])
 
     items = [
@@ -159,7 +159,7 @@ async def test_agent_session_gene_ignores_hook_receipts(db: Database, tmp_path: 
         workspace="/workspace/mem-forge",
         repo="mem-forge",
     )
-    source = await db.get_source("src-agent-sessions")
+    source = await db.get_source("src-agent-sessions-codex")
     gene = create_gene("agent_session", source["config"], source["id"])
 
     items = [item async for item in gene.discover()]
@@ -217,7 +217,7 @@ async def test_agent_session_gene_skips_legacy_hook_capture_packages(db: Databas
         workspace="/workspace/mem-forge",
         repo="mem-forge",
     )
-    source = await db.get_source("src-agent-sessions")
+    source = await db.get_source("src-agent-sessions-codex")
     documents_dir = Path(source["config"]["documents_dir"])
     legacy_package = {
         "doc_id": "agent-session-codex-legacy-stop-hook-capture",
@@ -268,7 +268,7 @@ async def test_agent_session_gene_omits_receipt_metadata_from_normalized_markdow
             "turn_id": "turn-1",
         },
     )
-    source = await db.get_source("src-agent-sessions")
+    source = await db.get_source("src-agent-sessions-codex")
     gene = create_gene("agent_session", source["config"], source["id"])
     items = [item async for item in gene.discover()]
     item = next(item for item in items if item.item_id == submitted["doc_id"])
@@ -312,7 +312,7 @@ async def test_agent_session_gene_keeps_operational_sections_out_of_extraction_m
         workspace="/workspace/mem-forge",
         repo="mem-forge",
     )
-    source = await db.get_source("src-agent-sessions")
+    source = await db.get_source("src-agent-sessions-codex")
     gene = create_gene("agent_session", source["config"], source["id"])
     items = [item async for item in gene.discover()]
     item = next(item for item in items if item.item_id == submitted["doc_id"])

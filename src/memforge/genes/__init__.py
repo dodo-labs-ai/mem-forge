@@ -134,6 +134,7 @@ def _register_builtins() -> None:
         ("confluence", "memforge.genes.confluence_gene", "ConfluenceGene"),
         ("github_pages", "memforge.genes.github_pages_gene", "GitHubPagesGene"),
         ("jira", "memforge.genes.jira_gene", "JiraGene"),
+        ("local_markdown", "memforge.genes.local_markdown_gene", "LocalMarkdownGene"),
         ("teams", "memforge.genes.teams_gene", "TeamsGene"),
     ]
 

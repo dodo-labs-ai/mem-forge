@@ -3,9 +3,8 @@
     "memforge": {
       "command": "python3",
       "args": [
-        "./scripts/memforge_mcp.py"
-      ],
-      "cwd": "."
+        "${CLAUDE_PLUGIN_ROOT}/scripts/memforge_mcp.py"
+      ]
     }
   }
 }

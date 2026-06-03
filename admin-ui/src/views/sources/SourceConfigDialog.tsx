@@ -33,6 +33,7 @@ import {
   parseConfluenceWikiUrl,
 } from "./confluenceConfig";
 import type { ParsedConfluenceWikiUrl } from "./confluenceConfig";
+import { buildLocalMarkdownPushCommand } from "./localMarkdownConfig";
 import { canConfigureSourceType } from "./managedSources";
 
 type ConfigValue = string | number | boolean | string[] | null;
@@ -51,11 +52,16 @@ export function SourceConfigDialog({
   source?: Source | null;
   onSaved?: () => void;
 }) {
+  // A local repository is created from the CLI (which scans the folder and
+  // pushes), not by hand in the UI, so a new one shows setup instructions
+  // instead of a config form.
+  const isNewLocalRepo = sourceType === "local_markdown" && !source;
+
   const schemaQuery = useQuery<GeneConfigSchema>({
     queryKey: ["gene-config-schema", sourceType],
     queryFn: () =>
       client.get(`/api/genes/${sourceType}/config-schema`).then((response) => response.data),
-    enabled: open && Boolean(sourceType) && canConfigureSourceType(sourceType ?? ""),
+    enabled: open && Boolean(sourceType) && canConfigureSourceType(sourceType ?? "") && !isNewLocalRepo,
   });
 
   if (!sourceType || !canConfigureSourceType(sourceType)) return null;
@@ -63,7 +69,9 @@ export function SourceConfigDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex max-h-[90vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl">
-        {schemaQuery.isPending ? (
+        {isNewLocalRepo ? (
+          <LocalRepoSetupInstructions onClose={() => onOpenChange(false)} />
+        ) : schemaQuery.isPending ? (
           <div className="flex items-center justify-center gap-2 p-12 text-sm text-muted-foreground">
             <Loader2 className="size-4 animate-spin" />
             Loading source schema...
@@ -129,18 +137,6 @@ function SourceConfigForm({
     queryFn: () =>
       client.get("/api/auth/jira-session", { params: { base_url: jiraBaseUrl } }).then((response) => response.data),
     enabled: sourceType === "jira" && authMode === "browser_cookie" && jiraBaseUrl.startsWith("https://"),
-  });
-
-  const refreshJiraSession = useMutation({
-    mutationFn: ({ confirmPrincipalChange = false }: { confirmPrincipalChange?: boolean } = {}) =>
-      client.post("/api/auth/jira-session/refresh", {
-        base_url: jiraBaseUrl,
-        confirm_principal_change: confirmPrincipalChange,
-      }).then((response) => response.data as JiraAuthSession),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["jira-session", jiraBaseUrl] });
-      queryClient.invalidateQueries({ queryKey: ["sources"] });
-    },
   });
 
   const saveSource = useMutation({
@@ -241,15 +237,21 @@ function SourceConfigForm({
                       {sourceType === "confluence" && field.key === "base_url" && confluenceUrlInfo && (
                         <ConfluenceDetectedPanel info={confluenceUrlInfo} />
                       )}
+                      {sourceType === "jira" && field.key === "jql" && (
+                        <JiraEffectiveQueryPanel jql={stringValue(config.jql)} />
+                      )}
                       {sourceType === "jira" && field.key === "auth_mode" && authMode === "browser_cookie" && (
                         <JiraBrowserSessionPanel
                           baseUrl={jiraBaseUrl}
                           session={jiraSessionQuery.data}
                           loading={jiraSessionQuery.isFetching}
-                          refreshPending={refreshJiraSession.isPending}
-                          error={refreshJiraSession.error ?? jiraSessionQuery.error}
-                          onRefresh={() => refreshJiraSession.mutate({ confirmPrincipalChange: false })}
-                          onConfirmPrincipalChange={() => refreshJiraSession.mutate({ confirmPrincipalChange: true })}
+                          error={jiraSessionQuery.error}
+                        />
+                      )}
+                      {sourceType === "local_markdown" && field.key === "vault_id" && (
+                        <LocalMarkdownPushPanel
+                          sourceId={source?.id ?? null}
+                          vaultId={stringValue(config.vault_id).trim()}
                         />
                       )}
                     </div>
@@ -276,13 +278,17 @@ function SourceConfigForm({
               </details>
             )}
 
-            <DiscoveryPreviewPanel
-              ready={previewReady}
-              isPending={previewDiscovery.isPending}
-              error={previewDiscovery.isError ? previewDiscovery.error : null}
-              data={previewDiscovery.data}
-              onPreview={() => previewDiscovery.mutate()}
-            />
+            {/* Local repositories are pushed from the CLI, not discovered server-side,
+                so the discovery preview does not apply (and its inbox is empty here). */}
+            {sourceType !== "local_markdown" && (
+              <DiscoveryPreviewPanel
+                ready={previewReady}
+                isPending={previewDiscovery.isPending}
+                error={previewDiscovery.isError ? previewDiscovery.error : null}
+                data={previewDiscovery.data}
+                onPreview={() => previewDiscovery.mutate()}
+              />
+            )}
           </div>
 
           {saveSource.isError && (
@@ -388,6 +394,20 @@ function ConfigFieldInput({
     );
   }
 
+  if (field.key === "jql") {
+    return (
+      <Field label={field.label} required={required} helpText={field.help_text}>
+        <textarea
+          className="min-h-20 w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs shadow-xs outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+          rows={4}
+          value={stringValue(value)}
+          placeholder={field.placeholder}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      </Field>
+    );
+  }
+
   const isInteger = field.field_type === "integer";
   const isList = field.field_type === "tag_list";
   const isSecret = field.field_type === "secret";
@@ -440,24 +460,45 @@ function ConfluenceDetectedPanel({ info }: { info: ParsedConfluenceWikiUrl }) {
   );
 }
 
+function buildEffectiveJqlPreview(raw: string): string {
+  const query = raw.trim();
+  if (!query) return "";
+  const match = query.match(/\border\s+by\b/i);
+  const where = match ? query.slice(0, match.index).trim() : query;
+  const order = match ? query.slice(match.index).trim() : "ORDER BY updated DESC";
+  const delta = "updated >= '<last-sync>'";
+  const whereWithDelta = where ? `(${where}) AND ${delta}` : delta;
+  return `${whereWithDelta} ${order}`.trim();
+}
+
+function JiraEffectiveQueryPanel({ jql }: { jql: string }) {
+  const preview = buildEffectiveJqlPreview(jql);
+  if (!preview) return null;
+  return (
+    <div className="rounded-lg border bg-muted/30 p-3 text-xs">
+      <div className="text-sm font-medium text-foreground">Effective query at sync</div>
+      <p className="mt-1 text-muted-foreground">
+        Your JQL runs as-is. MemForge inserts an incremental updated-since filter before your
+        ORDER BY so each sync only fetches changed issues.
+      </p>
+      <code className="mt-2 block break-all rounded-md border bg-background p-2 font-mono text-[11px] text-foreground">
+        {preview}
+      </code>
+    </div>
+  );
+}
+
 function JiraBrowserSessionPanel({
   baseUrl,
   session,
   loading,
-  refreshPending,
   error,
-  onRefresh,
-  onConfirmPrincipalChange,
 }: {
   baseUrl: string;
   session?: JiraAuthSession;
   loading: boolean;
-  refreshPending: boolean;
   error: unknown;
-  onRefresh: () => void;
-  onConfirmPrincipalChange: () => void;
 }) {
-  const disabled = !baseUrl.startsWith("https://") || refreshPending;
   const status = session?.status ?? "missing";
   const isActive = status === "active";
   const statusLabel =
@@ -467,45 +508,139 @@ function JiraBrowserSessionPanel({
           "Missing";
   const principal = session?.principal_name || session?.principal_id || "unknown user";
   const errorText = error ? extractSaveError(error) : session?.last_error || "";
-  const principalChangeBlocked = isPrincipalChangeError(error);
+  const command = `memforge adapter auth jira --base-url ${baseUrl || "<jira-base-url>"}`;
+  const handleCopy = () => {
+    if (typeof navigator === "undefined" || !navigator.clipboard) return;
+    void navigator.clipboard.writeText(command);
+  };
 
   return (
     <div className="rounded-lg border p-3">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
-            <span>Browser session</span>
-            <span className={isActive ? "text-emerald-600" : "text-destructive"}>{statusLabel}</span>
-            {loading && <Loader2 className="size-3.5 animate-spin text-muted-foreground" />}
-          </div>
-          <p className="mt-1 text-xs text-muted-foreground">
-            {isActive
-              ? `Signed in as ${principal}${session?.browser ? ` via ${session.browser}` : ""}`
-              : "Sign in to Jira in your browser, then refresh the local session."}
-          </p>
-          {session?.origin && (
-            <p className="mt-1 break-all text-xs text-muted-foreground">{session.origin}</p>
-          )}
-          {errorText && (
-            <div className="mt-2 flex items-start gap-2 rounded-md bg-destructive/10 p-2 text-xs text-destructive">
-              <AlertCircle className="mt-0.5 size-3 shrink-0" />
-              <span className="min-w-0 whitespace-normal break-words">
-                {errorText}
-              </span>
-            </div>
-          )}
-        </div>
-        <Button type="button" variant="outline" size="sm" onClick={onRefresh} disabled={disabled}>
-          {refreshPending ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-          Refresh Session
-        </Button>
-        {principalChangeBlocked && (
-          <Button type="button" size="sm" onClick={onConfirmPrincipalChange} disabled={disabled}>
-            {refreshPending ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
-            Confirm Change
-          </Button>
-        )}
+      <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
+        <span>Browser session (local adapter)</span>
+        <span className={isActive ? "text-emerald-600" : "text-destructive"}>{statusLabel}</span>
+        {loading && <Loader2 className="size-3.5 animate-spin text-muted-foreground" />}
       </div>
+      <p className="mt-1 text-xs text-muted-foreground">
+        {isActive
+          ? `Signed in as ${principal}${session?.browser ? ` via ${session.browser}` : ""}`
+          : "MemForge never reads your browser. Capture the session from the machine where you're signed in to Jira, using the local CLI adapter; it appears here once captured."}
+      </p>
+      {session?.origin && (
+        <p className="mt-1 break-all text-xs text-muted-foreground">{session.origin}</p>
+      )}
+      <div className="mt-3 flex items-center gap-2 rounded-md border bg-background p-2">
+        <code className="flex-1 break-all font-mono text-[11px] text-foreground">{command}</code>
+        <Button type="button" variant="outline" size="sm" onClick={handleCopy}>
+          Copy
+        </Button>
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground">
+        {isActive
+          ? "Re-run this on your machine to refresh when the session expires."
+          : "Run this on your machine. A different Jira login? Re-run it (the CLI confirms the principal change)."}
+      </p>
+      {errorText && (
+        <div className="mt-2 flex items-start gap-2 rounded-md bg-destructive/10 p-2 text-xs text-destructive">
+          <AlertCircle className="mt-0.5 size-3 shrink-0" />
+          <span className="min-w-0 whitespace-normal break-words">
+            {errorText}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CliCommand({ command }: { command: string }) {
+  const copy = () => {
+    if (typeof navigator !== "undefined" && navigator.clipboard) void navigator.clipboard.writeText(command);
+  };
+  return (
+    <div className="flex items-center gap-2 rounded-md border bg-muted/30 p-2">
+      <code className="flex-1 break-all font-mono text-[11px] text-foreground">{command}</code>
+      <Button type="button" variant="outline" size="sm" onClick={copy}>
+        Copy
+      </Button>
+    </div>
+  );
+}
+
+function LocalRepoSetupInstructions({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
+      <DialogHeader>
+        <DialogTitle>Add a local repository</DialogTitle>
+      </DialogHeader>
+      <p className="text-sm text-muted-foreground">
+        A local repository is set up from the CLI. MemForge does not read your filesystem, so the
+        CLI scans your folder and pushes its files into a source it creates for you.
+      </p>
+
+      <div className="space-y-2">
+        <div className="text-sm font-medium text-foreground">Guided setup (recommended)</div>
+        <CliCommand command="memforge" />
+        <p className="text-xs text-muted-foreground">
+          Run the CLI and choose{" "}
+          <span className="font-medium text-foreground">Local repository &rarr; Set up a repository</span>.
+          It walks you through the folder, shows a quick scan, creates this source, and runs the
+          first sync.
+        </p>
+      </div>
+
+      <details className="text-sm">
+        <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+          Prefer one-off commands?
+        </summary>
+        <div className="mt-2 space-y-2">
+          <CliCommand command="memforge adapter kb add my-repo --root /path/to/folder --create-source" />
+          <CliCommand command="memforge adapter kb push my-repo --process-now" />
+        </div>
+      </details>
+
+      <DialogFooter className="mx-0 mb-0 flex-row justify-end rounded-none rounded-b-xl bg-background p-3">
+        <Button type="button" onClick={onClose}>
+          Got it
+        </Button>
+      </DialogFooter>
+    </div>
+  );
+}
+
+function LocalMarkdownPushPanel({
+  sourceId,
+  vaultId,
+}: {
+  sourceId: string | null;
+  vaultId: string;
+}) {
+  const command = buildLocalMarkdownPushCommand({ vaultId, sourceId });
+  const ready = Boolean(sourceId) && vaultId.length > 0;
+  const handleCopy = () => {
+    if (typeof navigator === "undefined" || !navigator.clipboard) return;
+    void navigator.clipboard.writeText(command);
+  };
+
+  return (
+    <div className="rounded-lg border bg-muted/30 p-3 text-xs">
+      <div className="text-sm font-medium text-foreground">Push from the local CLI adapter</div>
+      <p className="mt-1 text-muted-foreground">
+        MemForge does not read your filesystem. The local CLI adapter scans your markdown
+        folder, normalizes each file, and pushes documents into this source. Configure a
+        local profile with <code>memforge adapter kb add</code>, then run the push command
+        below to send documents through the service.
+      </p>
+      <div className="mt-3 flex items-center gap-2 rounded-md border bg-background p-2">
+        <code className="flex-1 break-all font-mono text-[11px] text-foreground">{command}</code>
+        <Button type="button" variant="outline" size="sm" onClick={handleCopy} disabled={!ready}>
+          Copy
+        </Button>
+      </div>
+      {!sourceId && (
+        <p className="mt-2 text-muted-foreground">
+          Save this source first to get a stable source id, then run the push command.
+        </p>
+      )}
     </div>
   );
 }
@@ -698,6 +833,11 @@ function isFieldVisible(sourceType: string, field: ConfigField, config: ConfigFo
     const authMode = stringValue(config.auth_mode) || "browser_cookie";
     if (field.key === "jira_cookie") return false;
     if (field.key === "pat") return authMode === "pat";
+    const queryMode = stringValue(config.query_mode) || "simple";
+    if (field.key === "jql") return queryMode === "advanced";
+    if (field.key === "projects" || field.key === "issue_types" || field.key === "jql_filter") {
+      return queryMode === "simple";
+    }
     return true;
   }
   if (sourceType === "github_pages") {
@@ -720,6 +860,9 @@ function isFieldRequired(sourceType: string, field: ConfigField, config: ConfigF
     const authMode = stringValue(config.auth_mode) || "browser_cookie";
     if (field.key === "jira_cookie") return false;
     if (field.key === "pat") return authMode === "pat";
+    const queryMode = stringValue(config.query_mode) || "simple";
+    if (field.key === "projects") return queryMode === "simple";
+    if (field.key === "jql") return queryMode === "advanced";
   }
   if (sourceType === "github_pages") {
     const syncMode = stringValue(config.sync_mode) || "single_page";
@@ -748,8 +891,12 @@ const GITHUB_PAGES_MODE_FIELDS = new Set<string>([
 ]);
 
 function optionLabel(field: ConfigField, option: string): string {
+  if (field.key === "query_mode") {
+    if (option === "simple") return "Simple (projects & issue types)";
+    if (option === "advanced") return "Advanced (raw JQL)";
+  }
   if (field.key === "auth_mode") {
-    if (option === "browser_cookie") return "Browser session";
+    if (option === "browser_cookie") return "Browser session (local adapter)";
     if (option === "pat") return "Personal access token";
     if (option === "github_pat") return "Personal access token";
     if (option === "none") return "No authentication";
@@ -810,17 +957,6 @@ function extractSaveError(error: unknown): string {
   }
   if (error instanceof Error && error.message) return error.message;
   return fallback;
-}
-
-function isPrincipalChangeError(error: unknown): boolean {
-  if (!error || typeof error !== "object" || !("response" in error)) return false;
-  const response = (error as { response?: { status?: number; data?: { detail?: unknown } } }).response;
-  if (response?.status !== 409) return false;
-  const detail = response.data?.detail;
-  if (detail && typeof detail === "object" && "message" in detail) {
-    return String((detail as { message: unknown }).message).includes("Confirm principal change");
-  }
-  return typeof detail === "string" && detail.includes("Confirm principal change");
 }
 
 function toBoolean(value: ConfigValue | undefined): boolean {

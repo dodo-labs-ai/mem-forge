@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 
@@ -44,6 +45,63 @@ COMMENT_MAX_RESULTS = 100
 HYDRATED_SEARCH_MAX_RESULTS = 25
 JIRA_SEARCH_FIELDS = ["*all"]
 JIRA_SEARCH_EXPAND = ["changelog", "renderedFields"]
+
+JIRA_QUERY_MODE_SIMPLE = "simple"
+JIRA_QUERY_MODE_ADVANCED = "advanced"
+_DEFAULT_ORDER_BY = "ORDER BY updated DESC"
+_ORDER_BY_RE = re.compile(r"\border\s+by\b", re.IGNORECASE)
+
+
+def _delta_clause(since: datetime) -> str:
+    return f"updated >= '{since.strftime('%Y-%m-%d %H:%M')}'"
+
+
+def _augment_advanced_jql(raw_jql: str, since: datetime | None) -> str:
+    """Use a user-authored JQL as-is, injecting the delta clause before ORDER BY.
+
+    The user's query is authoritative: its ORDER BY (or a default) is preserved,
+    and the incremental ``updated >=`` filter is AND-ed onto the where clause
+    (wrapped in parentheses so a top-level OR keeps its meaning).
+    """
+    query = raw_jql.strip()
+    match = _ORDER_BY_RE.search(query)
+    if match:
+        where = query[: match.start()].strip()
+        order = query[match.start():].strip()
+    else:
+        where = query
+        order = _DEFAULT_ORDER_BY
+    if since:
+        delta = _delta_clause(since)
+        where = f"({where}) AND {delta}" if where else delta
+    return f"{where} {order}".strip()
+
+
+def _build_jql(config: dict, since: datetime | None) -> str:
+    """Build the effective JQL for a sync from the source config.
+
+    In ``advanced`` query mode the configured ``jql`` is authoritative. In
+    ``simple`` mode the query is assembled from projects, issue types, and an
+    optional refine filter.
+    """
+    if str(config.get("query_mode") or JIRA_QUERY_MODE_SIMPLE).strip().lower() == JIRA_QUERY_MODE_ADVANCED:
+        return _augment_advanced_jql(str(config.get("jql") or ""), since)
+
+    projects = config.get("projects", [])
+    if isinstance(projects, str):
+        projects = [p.strip() for p in projects.split(",") if p.strip()]
+    issue_types = config.get("issue_types", DEFAULT_ISSUE_TYPES)
+    if isinstance(issue_types, str):
+        issue_types = [t.strip() for t in issue_types.split(",") if t.strip()]
+    jql_filter = config.get("jql_filter", "")
+
+    jql = f"project in ({','.join(projects)}) AND issuetype in ({','.join(issue_types)})"
+    if jql_filter:
+        jql += f" AND ({jql_filter})"
+    if since:
+        jql += f" AND {_delta_clause(since)}"
+    jql += f" {_DEFAULT_ORDER_BY}"
+    return jql
 
 
 def _request_interval_seconds(config: dict) -> float:
@@ -118,6 +176,39 @@ def _issue_payload_from_search(issue: dict, config: dict) -> dict:
     return payload
 
 
+def _issue_content_item(issue: dict, base_url: str) -> ContentItem:
+    """Map a Jira search issue to a ContentItem, tolerating null optional fields.
+
+    Jira returns ``priority``/``assignee``/etc. as explicit ``null`` when unset,
+    so ``fields.get(key, {})`` is not safe (the key exists with a None value).
+    """
+    fields = issue.get("fields") or {}
+    key = issue.get("key", "")
+    updated_str = fields.get("updated", "")
+    try:
+        last_modified = datetime.fromisoformat(updated_str.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        last_modified = datetime.now(timezone.utc)
+    assignee = fields.get("assignee") or {}
+    return ContentItem(
+        item_id=f"jira-{key}",
+        title=f"{key}: {fields.get('summary', 'Untitled')}",
+        source_url=f"{base_url}/browse/{key}",
+        last_modified=last_modified,
+        content_type="application/json",
+        space_or_project=(fields.get("project") or {}).get("key", ""),
+        version=updated_str,
+        author=assignee.get("displayName") if assignee else None,
+        labels=fields.get("labels") or [],
+        extra={
+            "issue_key": key,
+            "status": (fields.get("status") or {}).get("name", ""),
+            "priority": (fields.get("priority") or {}).get("name", ""),
+            "issue_type": (fields.get("issuetype") or {}).get("name", ""),
+        },
+    )
+
+
 class JiraGene(Gene):
     """Jira data source gene.
 
@@ -155,35 +246,62 @@ class JiraGene(Gene):
                     field_type=ConfigFieldType.SELECT, required=True,
                     options=[JIRA_AUTH_MODE_COOKIE, JIRA_AUTH_MODE_PAT],
                     default=JIRA_AUTH_MODE_COOKIE,
-                    help_text="Use a signed-in browser session for Enterprise Jira. Use PAT only when Jira grants REST API quota.",
+                    help_text=(
+                        "Browser session uses the local CLI adapter "
+                        "(`memforge adapter auth jira --base-url ...`) to capture cookies "
+                        "from your signed-in browser. Use this for Enterprise Jira where "
+                        "REST API quota is not available. PAT mode is only for Jira "
+                        "deployments that grant the user REST API quota."
+                    ),
                     group="connection", order=1,
                 ),
                 ConfigField(
-                    key="projects", label="Projects to Sync",
-                    field_type=ConfigFieldType.TAG_LIST, required=True,
-                    placeholder="PAY, ARCH",
-                    help_text="Comma-separated Jira project keys",
+                    key="query_mode", label="Query mode",
+                    field_type=ConfigFieldType.SELECT, required=False,
+                    options=[JIRA_QUERY_MODE_SIMPLE, JIRA_QUERY_MODE_ADVANCED],
+                    default=JIRA_QUERY_MODE_SIMPLE,
+                    help_text=(
+                        "Simple builds the query from projects and issue types. "
+                        "Advanced uses a full JQL you provide (authoritative)."
+                    ),
                     group="scope", order=0,
+                ),
+                ConfigField(
+                    key="projects", label="Projects to Sync",
+                    field_type=ConfigFieldType.TAG_LIST, required=False,
+                    placeholder="PAY, ARCH",
+                    help_text="Comma-separated Jira project keys (simple mode)",
+                    group="scope", order=1,
+                ),
+                ConfigField(
+                    key="jql", label="JQL",
+                    field_type=ConfigFieldType.STRING, required=False,
+                    placeholder='project = PROJ AND type != "Test" ORDER BY Rank ASC',
+                    help_text=(
+                        "Full JQL used as-is in advanced mode. MemForge adds an "
+                        "incremental updated-since filter before your ORDER BY."
+                    ),
+                    group="scope", order=2,
                 ),
                 ConfigField(
                     key="jql_filter", label="JQL Filter (optional)",
                     field_type=ConfigFieldType.STRING, required=False,
                     placeholder="labels = 'important'",
-                    help_text="Additional JQL filter to refine results",
-                    group="scope", order=1,
+                    help_text="Additional JQL filter to refine results (simple mode)",
+                    group="scope", order=3,
                 ),
                 ConfigField(
                     key="issue_types", label="Issue Types",
                     field_type=ConfigFieldType.MULTI_SELECT, required=False,
                     options=["Epic", "Story", "Bug", "Task", "Sub-task", "Defect"],
                     default="Epic,Story,Bug,Task",
-                    group="scope", order=2,
+                    group="scope", order=4,
                 ),
                 ConfigField(
                     key="include_comments", label="Include Comments",
                     field_type=ConfigFieldType.BOOLEAN, required=False,
                     default="true",
-                    group="scope", order=3,
+                    group="scope", order=5,
                 ),
                 ConfigField(
                     key="pat", label="Personal Access Token",
@@ -240,25 +358,7 @@ class JiraGene(Gene):
 
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         """Discover issues via JQL search."""
-        projects = self.config.get("projects", [])
-        if isinstance(projects, str):
-            projects = [p.strip() for p in projects.split(",") if p.strip()]
-
-        issue_types = self.config.get("issue_types", DEFAULT_ISSUE_TYPES)
-        if isinstance(issue_types, str):
-            issue_types = [t.strip() for t in issue_types.split(",") if t.strip()]
-
-        jql_filter = self.config.get("jql_filter", "")
-
-        # Build JQL
-        project_clause = f"project in ({','.join(projects)})"
-        type_clause = f"issuetype in ({','.join(issue_types)})"
-        jql = f"{project_clause} AND {type_clause}"
-        if jql_filter:
-            jql += f" AND ({jql_filter})"
-        if since:
-            jql += f" AND updated >= '{since.strftime('%Y-%m-%d %H:%M')}'"
-        jql += " ORDER BY updated DESC"
+        jql = _build_jql(self.config, since)
 
         self._hydrated_issues = {}
         start_at = 0
@@ -287,37 +387,9 @@ class JiraGene(Gene):
                 break
 
             for issue in issues:
-                fields = issue.get("fields", {})
                 key = issue.get("key", "")
                 self._hydrated_issues[key] = issue
-                updated_str = fields.get("updated", "")
-
-                try:
-                    last_modified = datetime.fromisoformat(updated_str.replace("Z", "+00:00"))
-                except (ValueError, AttributeError):
-                    last_modified = datetime.now(timezone.utc)
-
-                project_key = fields.get("project", {}).get("key", "")
-                assignee = fields.get("assignee", {})
-                assignee_name = assignee.get("displayName") if assignee else None
-
-                yield ContentItem(
-                    item_id=f"jira-{key}",
-                    title=f"{key}: {fields.get('summary', 'Untitled')}",
-                    source_url=f"{self._base_url}/browse/{key}",
-                    last_modified=last_modified,
-                    content_type="application/json",
-                    space_or_project=project_key,
-                    version=updated_str,
-                    author=assignee_name,
-                    labels=fields.get("labels", []),
-                    extra={
-                        "issue_key": key,
-                        "status": fields.get("status", {}).get("name", ""),
-                        "priority": fields.get("priority", {}).get("name", ""),
-                        "issue_type": fields.get("issuetype", {}).get("name", ""),
-                    },
-                )
+                yield _issue_content_item(issue, self._base_url)
 
             # Pagination
             if start_at + len(issues) >= data.get("total", 0):

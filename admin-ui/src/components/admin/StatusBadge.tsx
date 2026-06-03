@@ -24,10 +24,10 @@ export function MemoryTypeBadge({ type }: { type: string }) {
   );
 }
 
-export function StatusDot({ status }: { status: string }) {
+export function StatusDot({ status, className }: { status: string; className?: string }) {
   return (
     <span
-      className={cn("inline-block size-2 rounded-full", statusStyles[status] ?? "bg-muted-foreground")}
+      className={cn("inline-block size-2 rounded-full", statusStyles[status] ?? "bg-muted-foreground", className)}
       title={status}
     />
   );

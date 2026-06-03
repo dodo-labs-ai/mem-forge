@@ -27,6 +27,7 @@ const baseMemory: Memory = {
   extraction_context: null,
   entity_refs: [],
   sources: [],
+  origin_source_type: null,
 };
 
 assert.equal(getLifecycleDetail(baseMemory), null);

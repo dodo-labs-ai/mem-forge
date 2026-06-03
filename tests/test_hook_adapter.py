@@ -681,7 +681,8 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     claude_hooks = json.loads((claude_root / "hooks" / "hooks.json").read_text())
 
     for hooks in (codex_hooks, claude_hooks):
-        assert "UserPromptSubmit" in hooks["hooks"]
+        assert "SessionStart" in hooks["hooks"]
+        assert "PreCompact" in hooks["hooks"]
         assert "Stop" in hooks["hooks"]
         commands = json.dumps(hooks)
         assert "memforge_hook.py" in commands

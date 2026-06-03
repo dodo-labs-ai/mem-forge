@@ -13,18 +13,6 @@
         ]
       }
     ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}/scripts/memforge_hook.py\" context --client claude-code",
-            "timeout": 10,
-            "statusMessage": "Checking MemForge memory"
-          }
-        ]
-      }
-    ],
     "PreCompact": [
       {
         "hooks": [
