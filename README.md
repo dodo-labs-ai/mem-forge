@@ -12,7 +12,7 @@
   <img alt="Code style Ruff" src="https://img.shields.io/badge/code%20style-ruff-111827">
 </p>
 
-*Provenance-backed memory for coding agents and development teams.*
+*Self-evolving, evidence-based memory layer for coding agents and development teams.*
 
 > **Status:** alpha. APIs, storage formats, and integration packaging may change
 > while the project settles.
