@@ -10,7 +10,7 @@ Requirements:
 - Docker with a current Compose v2
 
 ```bash
-git clone https://github.com/dodoman-sun/mem-forge.git
+git clone https://github.com/shno-labs/mem-forge.git
 cd mem-forge
 docker compose up --build
 ```
