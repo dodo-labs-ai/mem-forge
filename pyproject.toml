@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "memforge"
 version = "0.1.0"
-description = "Auto-evolutionary agent memory layer for development teams"
+description = "Evidence-based agent memory layer for Codex, Claude Code, and development teams"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [
     { name = "MemForge Contributors" },
 ]
-keywords = ["agent-memory", "mcp", "coding-agents", "knowledge-base", "llm"]
+keywords = ["agent-memory", "mcp", "mcp-server", "codex", "claude-code", "coding-agents", "llm", "rag"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -55,9 +55,9 @@ dev = [
 memforge = "memforge.main:cli"
 
 [project.urls]
-Homepage = "https://github.com/dodoman-sun/mem-forge"
-Repository = "https://github.com/dodoman-sun/mem-forge"
-Issues = "https://github.com/dodoman-sun/mem-forge/issues"
+Homepage = "https://github.com/shno-labs/mem-forge"
+Repository = "https://github.com/shno-labs/mem-forge"
+Issues = "https://github.com/shno-labs/mem-forge/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/memforge"]

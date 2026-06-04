@@ -5,21 +5,21 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/dodoman-sun/mem-forge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/dodoman-sun/mem-forge/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/shno-labs/mem-forge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/shno-labs/mem-forge/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Python 3.12+" src="https://img.shields.io/badge/python-3.12%2B-3776AB">
   <img alt="License Apache 2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
   <img alt="Status alpha" src="https://img.shields.io/badge/status-alpha-f59e0b">
   <img alt="Code style Ruff" src="https://img.shields.io/badge/code%20style-ruff-111827">
 </p>
 
-*Self-evolving, evidence-based memory layer for coding agents and development teams.*
+*Self-evolving, evidence-based agent memory layer for Codex, Claude Code, and development teams.*
 
 > **Status:** alpha. APIs, storage formats, and integration packaging may change
 > while the project settles.
 
-MemForge is a self-evolving memory layer for AI agents. It turns scattered team
-knowledge into structured, source-traced memories that agents can search,
-verify, and reuse.
+MemForge (`mem-forge`) is a self-evolving memory layer for AI coding agents. It
+turns scattered team context into structured, source-traced memories that agents
+can search, verify, and reuse.
 
 It connects to the systems teams already use, such as Confluence, Jira,
 GitHub Pages, Microsoft Teams, and long coding-agent sessions. On each
@@ -32,8 +32,8 @@ integrations, with review flows for superseded facts and contradictions.
 
 ## What It Does
 
-- Ingests knowledge from genes such as wiki pages, issue trackers, GitHub Pages,
-  Teams exports, and generated agent-session packages.
+- Ingests source context from genes such as wiki pages, issue trackers,
+  GitHub Pages, Teams exports, and generated agent-session packages.
 - Extracts durable facts, decisions, procedures, and conventions with quality
   gates before persistence.
 - Stores memory, provenance, review state, full-text search, and vector search
@@ -49,10 +49,10 @@ Built-in genes today: `confluence`, `jira`, `github_pages`, `teams`,
 
 ## Integrations
 
-MemForge connects the systems where team knowledge is created with the agents
-that need it during real work. Instead of rediscovering context every session,
-source systems sync into evidence-backed memories that agents can retrieve when
-they matter.
+MemForge connects the systems where team context is created with the agents that
+need it during real work. Instead of rediscovering context every session, source
+systems sync into evidence-backed memories that agents can retrieve when they
+matter.
 
 ### Agent Integrations
 
@@ -113,7 +113,7 @@ Requirements:
 - Docker with a current Compose v2
 
 ```bash
-git clone https://github.com/dodoman-sun/mem-forge.git
+git clone https://github.com/shno-labs/mem-forge.git
 cd mem-forge
 
 docker compose up --build

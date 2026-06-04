@@ -6,7 +6,7 @@ contributions are small, well-tested, and easy to review.
 ## Development Setup
 
 ```bash
-git clone https://github.com/dodoman-sun/mem-forge.git
+git clone https://github.com/shno-labs/mem-forge.git
 cd mem-forge
 uv sync --extra dev
 cd admin-ui && npm ci && cd ..
