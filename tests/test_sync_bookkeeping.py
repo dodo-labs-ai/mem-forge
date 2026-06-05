@@ -25,6 +25,7 @@ from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.runtime import SyncService
 from memforge.config import AppConfig
 from memforge.storage.database import Database
+from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
 
 @pytest.fixture
@@ -570,9 +571,11 @@ async def _insert_document_with_metadata(
 
 
 def _audited_memory_store(db: Database) -> MemoryStore:
+    adapters = build_sqlite_adapters(db, object())
     return MemoryStore(
-        db=db,
-        memory_collection=object(),
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
         embed_cfg={},
         audit_logger=MemoryAuditLogger(
             db,

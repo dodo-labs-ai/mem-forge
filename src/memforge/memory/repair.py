@@ -15,6 +15,7 @@ from memforge.memory.index_payloads import (
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory
 from memforge.retrieval.embeddings import embed_texts
+from memforge.retrieval.vector_metadata import upsert_with_stored_vector_hash
 
 __all__ = ["MemoryIndexRepairResult", "MemoryIndexRepairer"]
 
@@ -113,7 +114,8 @@ class MemoryIndexRepairer:
                     expected_embedding_text=expected_embedding_text,
                     embedding=vector,
                 )
-                self.memory_collection.upsert(
+                upsert_with_stored_vector_hash(
+                    self.memory_collection,
                     ids=[memory.id],
                     embeddings=[vector],
                     metadatas=[metadata],
@@ -144,7 +146,8 @@ class MemoryIndexRepairer:
                     expected_embedding_text=expected_embedding_text,
                     embedding=vector,
                 )
-                self.memory_collection.upsert(
+                upsert_with_stored_vector_hash(
+                    self.memory_collection,
                     ids=[memory.id],
                     embeddings=[vector],
                     metadatas=[metadata],
@@ -206,7 +209,8 @@ class MemoryIndexRepairer:
                     expected_embedding_text=expected_embedding_text,
                     embedding=vector,
                 )
-                self.document_collection.upsert(
+                upsert_with_stored_vector_hash(
+                    self.document_collection,
                     ids=[doc_id],
                     embeddings=[vector],
                     documents=[expected_embedding_text],
@@ -235,7 +239,8 @@ class MemoryIndexRepairer:
                     expected_embedding_text=expected_embedding_text,
                     embedding=vector,
                 )
-                self.document_collection.upsert(
+                upsert_with_stored_vector_hash(
+                    self.document_collection,
                     ids=[doc_id],
                     embeddings=[vector],
                     documents=[expected_embedding_text],

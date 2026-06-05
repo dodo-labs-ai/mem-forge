@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import struct
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -218,3 +219,62 @@ async def test_repair_recreates_document_vector_from_metadata_embedding_text(db:
     assert result.document_vectors_created == 1
     assert captured["text"] == "Short semantic summary\npayroll\nrequirement\nmedium"
     assert document_collection.documents["doc-missing"] == captured["text"]
+
+
+def _as_float32(values: list[float]) -> list[float]:
+    """Mimic Chroma persisting embeddings as 32-bit floats, so the vector a
+    later get() returns is not bit-identical to the Python list upserted."""
+    return [struct.unpack("f", struct.pack("f", float(value)))[0] for value in values]
+
+
+class Float32Collection(RepairableCollection):
+    """A repairable fake that persists embeddings as float32, like Chroma.
+
+    Exact-list fakes hide the round trip, so the stored vector hash must be
+    derived from what the collection persists, not from the pre-upsert list.
+    """
+
+    def upsert(self, *, ids, embeddings=None, metadatas=None, documents=None) -> None:
+        stored = [_as_float32(vector) for vector in embeddings] if embeddings else embeddings
+        super().upsert(ids=ids, embeddings=stored, metadatas=metadatas, documents=documents)
+
+
+@pytest.mark.asyncio
+async def test_repair_stamps_vector_hash_from_persisted_float32_payload(db: Database, tmp_path: Path):
+    # Repairing a document vector must leave embedding_vector_hash describing the
+    # vector the collection actually persisted (float32), not the pre-upsert list.
+    await _insert_doc(db, "doc-f32", tmp_path, content="body")
+    await db.upsert_metadata(DocumentMetadata(
+        doc_id="doc-f32",
+        summary="Short semantic summary",
+        tags=["payroll"],
+        entities=[],
+        doc_type="requirement",
+        complexity="medium",
+        enriched_at=datetime.now(timezone.utc),
+    ))
+    document_collection = Float32Collection({})
+    repairer = MemoryIndexRepairer(
+        db=db,
+        memory_collection=Float32Collection({}),
+        document_collection=document_collection,
+        embed_cfg={"base_url": "http://embed.test", "api_key": "key", "model": "model"},
+    )
+
+    async def fake_embed_document(text: str) -> list[float]:
+        return [0.123456789, 0.987654321, 0.555555555]
+
+    repairer._embed_document = fake_embed_document  # type: ignore[assignment]
+
+    await repairer.repair()
+
+    report = await MemoryIndexHealthChecker(
+        db=db,
+        memory_collection=repairer.memory_collection,
+        document_collection=document_collection,
+    ).check()
+    vector_hash_mismatches = [
+        issue for issue in report.issues
+        if issue.kind == "document_chroma_embedding_vector_hash_mismatch"
+    ]
+    assert vector_hash_mismatches == []

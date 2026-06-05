@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.index_payloads import (
@@ -19,10 +19,8 @@ from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory
 from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
-from memforge.retrieval.vector_metadata import upsert_with_stored_vector_hash
-
-if TYPE_CHECKING:
-    from memforge.storage.database import Database
+from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
+from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +29,21 @@ __all__ = ["MemoryStore"]
 DEDUP_CANDIDATE_LIMIT = 10
 
 
-def _first_collection_value(values: Any, default: Any) -> Any:
-    if values is None:
-        return default
-    if len(values) == 0:
-        return default
-    return values[0]
+def _dedup_access_scope() -> AccessScope:
+    """The permissive single-datastore scope for dedup candidate selection.
+
+    In Phase 0 this matches the historical where={"status":"active"} filter;
+    the per-writer access narrowing activates in a later phase.
+    """
+    return AccessScope(
+        user_id=LOCAL_DEV_USER_ID,
+        open_projects=frozenset(),
+        member_projects=frozenset(),
+        include_private=False,
+        allowed_statuses=("active",),
+        active_project=None,
+        scope_mode="project-first",
+    )
 
 
 def _memory_embedding_text(memory: Memory) -> str:
@@ -56,21 +63,36 @@ class MemoryStore:
 
     def __init__(
         self,
-        db: Database,
-        memory_collection: Any,  # ChromaDB collection
+        relational: RelationalStore,
+        keyword: KeywordSearch,
+        vector: VectorStore,
         embed_cfg: dict,
         dedup_threshold: float = 0.08,
         audit_logger: MemoryAuditLogger | None = None,
-        document_collection: Any | None = None,
+        document_index: DocumentVectorIndex | None = None,
     ) -> None:
-        self.db = db
-        self.collection = memory_collection
-        self.document_collection = document_collection
-        self.document_index = DocumentVectorIndex(document_collection)
+        self.relational = relational
+        self.keyword = keyword
+        self.vector = vector
+        self.document_index = document_index or DocumentVectorIndex(None)
         self.embed_cfg = embed_cfg
         self.dedup_threshold = dedup_threshold
         self._embedding_cache = EmbeddingCache()
         self.audit_logger = audit_logger
+
+    @property
+    def collection(self) -> Any:
+        """The underlying memory vector collection (index-health and tests)."""
+        return self.vector.collection
+
+    @property
+    def db(self) -> Any:
+        """The bound Database, reached through the relational handle.
+
+        Row writes and their co-transactional FTS writes live in Database
+        methods, so the store delegates to them through this handle.
+        """
+        return self.relational._db
 
     # -------------------------------------------------------------------
     # Core: Deduplicate and Insert
@@ -93,12 +115,11 @@ class MemoryStore:
         embedding_text = _memory_embedding_text(memory)
         embedding = await self._embed(embedding_text)
 
-        # Query ChromaDB for near-duplicates
+        # Query the vector channel for near-duplicates.
         try:
-            similar = self.collection.query(
-                query_embeddings=[embedding],
-                n_results=DEDUP_CANDIDATE_LIMIT,
-                where={"status": "active"},
+            dedup_scope = _dedup_access_scope()
+            candidates = await self.vector.query(
+                embedding, dedup_scope, None, DEDUP_CANDIDATE_LIMIT
             )
         except Exception as e:
             await self._emit(
@@ -110,14 +131,13 @@ class MemoryStore:
                 error=str(e),
                 payload={"index": "chroma", "operation": "dedup_query"},
             )
-            logger.error("ChromaDB query failed during dedup for %s: %s", memory.id, e)
+            logger.error("Vector dedup query failed for %s: %s", memory.id, e)
             raise
 
-        # Check near-duplicates, but never trust Chroma metadata alone.
-        candidate_ids = similar["ids"][0] if similar.get("ids") and similar["ids"] else []
-        distances = similar["distances"][0] if similar.get("distances") and similar["distances"] else []
-        for existing_id, distance in zip(candidate_ids, distances):
-            if distance >= self.dedup_threshold:
+        # vector.query returns (id, score); the vector store owns the distance
+        # math, so it decides whether a candidate is within the dedup threshold.
+        for existing_id, score in candidates:
+            if not self.vector.within_dedup_threshold(self.dedup_threshold, score):
                 continue
 
             existing = await self.db.get_memory(existing_id)
@@ -131,7 +151,7 @@ class MemoryStore:
                     reason="Chroma returned a missing or non-active memory during deduplication",
                     payload={
                         "candidate_memory_id": memory.id,
-                        "distance": distance,
+                        "score": score,
                         "db_status": existing.status if existing else "missing",
                     },
                 )
@@ -151,8 +171,8 @@ class MemoryStore:
                 context=context,
             )
             logger.debug(
-                "Memory corroborated: %s (distance=%.4f, doc=%s)",
-                existing_id, distance, doc_id,
+                "Memory corroborated: %s (score=%.4f, doc=%s)",
+                existing_id, score, doc_id,
             )
             return "corroborated"
 
@@ -268,8 +288,7 @@ class MemoryStore:
             chroma_upsert_started = True
             indexed_text = await self._canonical_memory_embedding_text(memory)
             indexed_embedding = await self._embed(indexed_text)
-            upsert_with_stored_vector_hash(
-                self.collection,
+            await self.vector.upsert(
                 ids=[memory.id],
                 embeddings=[indexed_embedding],
                 metadatas=[{
@@ -345,7 +364,7 @@ class MemoryStore:
         """Update a memory's content across all stores."""
         context = self._operation_context()
         previous = await self.db.get_memory(memory_id)
-        previous_vector = self._memory_vector_snapshot(memory_id)
+        previous_vector = await self._memory_vector_snapshot(memory_id)
         memory = None
         try:
             await self.db.update_memory_content(memory_id, new_content, new_confidence, new_tags)
@@ -362,8 +381,7 @@ class MemoryStore:
                     memory_id=memory_id,
                     payload={"operation": "memory_update"},
                 )
-                upsert_with_stored_vector_hash(
-                    self.collection,
+                await self.vector.upsert(
                     ids=[memory_id],
                     embeddings=[embedding],
                     metadatas=[{
@@ -431,8 +449,8 @@ class MemoryStore:
         """
         context = self._operation_context(doc_id=doc_id)
         old_snapshot = await self.db.get_memory(old_memory_id)
-        old_vector = self._memory_vector_snapshot(old_memory_id)
-        new_vector = self._memory_vector_snapshot(new_memory.id)
+        old_vector = await self._memory_vector_snapshot(old_memory_id)
+        new_vector = await self._memory_vector_snapshot(new_memory.id)
         new_chroma_upsert_started = False
         await self._emit(
             "memory_supersede_attempted",
@@ -484,8 +502,7 @@ class MemoryStore:
                     payload={"operation": "memory_supersede_insert"},
                 )
                 new_chroma_upsert_started = True
-                upsert_with_stored_vector_hash(
-                    self.collection,
+                await self.vector.upsert(
                     ids=[new_memory.id],
                     embeddings=[embedding],
                     metadatas=[{
@@ -844,7 +861,7 @@ class MemoryStore:
         """Hard-delete a memory from SQLite, FTS5, and ChromaDB."""
         context = self._operation_context()
         previous = await self.db.get_memory(memory_id)
-        previous_vector = self._memory_vector_snapshot(memory_id)
+        previous_vector = await self._memory_vector_snapshot(memory_id)
         await self._emit(
             "memory_purge_attempted",
             "attempted",
@@ -859,7 +876,7 @@ class MemoryStore:
                 memory_id=memory_id,
                 payload={"label": "purged"},
             )
-            self.collection.delete(ids=[memory_id])
+            await self.vector.delete([memory_id])
             await self._emit(
                 "chroma_delete_committed",
                 "committed",
@@ -915,8 +932,8 @@ class MemoryStore:
         context = context or self._operation_context()
         incumbent_snapshot = await self.db.get_memory(incumbent.id)
         challenger_snapshot = await self.db.get_memory(challenger.id)
-        incumbent_vector = self._memory_vector_snapshot(incumbent.id)
-        challenger_vector = self._memory_vector_snapshot(challenger.id)
+        incumbent_vector = await self._memory_vector_snapshot(incumbent.id)
+        challenger_vector = await self._memory_vector_snapshot(challenger.id)
         promotion_phase = "db_promote"
         try:
             await self.db.promote_quarantined_challenger(
@@ -946,8 +963,7 @@ class MemoryStore:
             )
             embedding_text = await self._canonical_memory_embedding_text(challenger)
             embedding = await self._embed(embedding_text)
-            upsert_with_stored_vector_hash(
-                self.collection,
+            await self.vector.upsert(
                 ids=[challenger.id],
                 embeddings=[embedding],
                 metadatas=[{
@@ -1103,10 +1119,7 @@ class MemoryStore:
                 memory_id=memory_id,
                 payload={"label": label},
             )
-            await self.db.db.execute(
-                "DELETE FROM memories_fts WHERE memory_id = ?", (memory_id,)
-            )
-            await self.db.db.commit()
+            await self.keyword.remove(memory_id)
             await self._emit(
                 "fts_delete_committed",
                 "committed",
@@ -1134,7 +1147,7 @@ class MemoryStore:
                 memory_id=memory_id,
                 payload={"label": label},
             )
-            self.collection.delete(ids=[memory_id])
+            await self.vector.delete([memory_id])
             await self._emit(
                 "chroma_delete_committed",
                 "committed",
@@ -1210,8 +1223,7 @@ class MemoryStore:
             )
             embedding_text = await self._canonical_memory_embedding_text(memory)
             embedding = await self._embed(embedding_text)
-            upsert_with_stored_vector_hash(
-                self.collection,
+            await self.vector.upsert(
                 ids=[memory.id],
                 embeddings=[embedding],
                 metadatas=[{
@@ -1250,6 +1262,9 @@ class MemoryStore:
             raise
 
     async def _memory_ids_for_doc(self, doc_id: str) -> list[str]:
+        """Document-cascade row lookup. Reads provenance rows through the bound
+        connection: a row helper, not a retrieval channel, so it stays outside
+        the adapters in this phase."""
         ids: list[str] = []
         async with self.db.db.execute(
             "SELECT memory_id FROM memory_sources WHERE doc_id = ?",
@@ -1282,19 +1297,15 @@ class MemoryStore:
     def _document_vector_snapshot(self, doc_id: str) -> dict[str, Any] | None:
         return self.document_index.snapshot(doc_id)
 
-    def _memory_vector_snapshot(self, memory_id: str) -> dict[str, Any] | None:
-        raw = self.collection.get(
-            ids=[memory_id],
-            include=["embeddings", "documents", "metadatas"],
-        )
-        ids = raw.get("ids") or []
-        if not ids:
+    async def _memory_vector_snapshot(self, memory_id: str) -> dict[str, Any] | None:
+        record = await self.vector.get_record(memory_id)
+        if record is None:
             return None
         return {
-            "id": ids[0],
-            "embedding": _first_collection_value(raw.get("embeddings"), None),
-            "document": _first_collection_value(raw.get("documents"), None),
-            "metadata": _first_collection_value(raw.get("metadatas"), {}) or {},
+            "id": record["id"],
+            "embedding": record.get("embedding"),
+            "document": None,
+            "metadata": record.get("metadata") or {},
         }
 
     async def _restore_deleted_document_state(
@@ -1388,7 +1399,7 @@ class MemoryStore:
                     memory_id=memory_id,
                     payload={"label": label},
                 )
-                self.collection.delete(ids=[memory_id])
+                await self.vector.delete([memory_id])
                 await self._emit(
                     "chroma_delete_committed",
                     "committed",
@@ -1408,14 +1419,12 @@ class MemoryStore:
                 raise
             return
 
-        kwargs: dict[str, Any] = {
-            "ids": [snapshot["id"]],
-            "metadatas": [snapshot.get("metadata") or {}],
-        }
-        if snapshot.get("embedding") is not None:
-            kwargs["embeddings"] = [snapshot["embedding"]]
-        if snapshot.get("document") is not None:
-            kwargs["documents"] = [snapshot["document"]]
+        embedding = snapshot.get("embedding")
+        # A snapshot with no stored embedding cannot be re-upserted, so the
+        # vector record is dropped instead, matching the None-snapshot branch.
+        if embedding is None:
+            await self.vector.delete([memory_id])
+            return
         try:
             await self._emit(
                 "chroma_upsert_attempted",
@@ -1424,7 +1433,11 @@ class MemoryStore:
                 memory_id=memory_id,
                 payload={"operation": label},
             )
-            self.collection.upsert(**kwargs)
+            await self.vector.upsert(
+                ids=[snapshot["id"]],
+                embeddings=[embedding],
+                metadatas=[snapshot.get("metadata") or {}],
+            )
             await self._emit(
                 "chroma_upsert_committed",
                 "committed",

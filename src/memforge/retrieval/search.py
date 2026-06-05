@@ -26,7 +26,8 @@ from memforge.models import Memory, SearchResult
 from memforge.provenance import document_content_url, document_pdf_url
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.retrieval.query_analyzer import QueryAnalysis, analyze_query
-from memforge.storage.database import Database
+from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
+from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,21 @@ def _sanitize_fts_query(text: str) -> str:
     return " ".join(safe)
 
 
+def _default_access_scope(include_superseded: bool) -> AccessScope:
+    """The permissive single-datastore scope: real lifecycle filtering, no
+    access narrowing. The access branches activate in a later phase; here it
+    carries only the status set the request asked for."""
+    return AccessScope(
+        user_id=LOCAL_DEV_USER_ID,
+        open_projects=frozenset(),
+        member_projects=frozenset(),
+        include_private=False,
+        allowed_statuses=allowed_search_statuses(include_superseded),
+        active_project=None,
+        scope_mode="project-first",
+    )
+
+
 # ---------------------------------------------------------------------------
 # SearchEngine
 # ---------------------------------------------------------------------------
@@ -87,35 +103,48 @@ def _sanitize_fts_query(text: str) -> str:
 class SearchEngine:
     """Hybrid retrieval engine: vector + BM25 + graph + temporal, fused via RRF.
 
+    Bound to the storage adapters, never to a database connection or a Chroma
+    collection directly. Per-request visibility rides on the ``AccessScope``
+    each channel builds; the engine instance carries no caller identity.
+
     Parameters
     ----------
-    db : Database
-        Async SQLite database (must already be connected).
-    memory_collection : Any
-        ChromaDB collection for memory embeddings (name="memories").
+    relational : RelationalStore
+        Source-of-truth rows plus the scoped graph, temporal, source, and
+        ranking reads.
+    keyword : KeywordSearch
+        The BM25/FTS5 channel.
+    vector : VectorStore
+        The embedding channel; owns the distance-to-score conversion.
     embed_cfg : dict
-        Keys: ``base_url``, ``api_key``, ``model`` — forwarded to
-        :func:`embed_texts`.
+        Keys ``base_url``, ``api_key``, ``model`` forwarded to
+        :func:`embed_texts` for query embeddings.
     config : RetrievalConfig
         Tuning knobs (``rrf_k``, ``recency_half_life_days``, etc.).
-    document_collection : Any | None
-        Optional ChromaDB collection for document-level embeddings
-        (name="documents").  Required for document fallback.
+    structured_llm_client : Any | None
+        Optional cross-encoder reranking client.
+    artifact_config : AppConfig | None
+        Resolves content/pdf provenance URLs for enriched results.
+    document_vector : VectorStore | None
+        Optional documents-collection channel for the document fallback.
+        Unbound on the service path, so the fallback stays disabled.
     """
 
     def __init__(
         self,
-        db: Database,
-        memory_collection: Any,
+        relational: RelationalStore,
+        keyword: KeywordSearch,
+        vector: VectorStore,
         embed_cfg: dict,
         config: RetrievalConfig,
-        document_collection: Any | None = None,
         structured_llm_client: Any | None = None,
         artifact_config: AppConfig | None = None,
+        document_vector: VectorStore | None = None,
     ) -> None:
-        self._db = db
-        self._mem_collection = memory_collection
-        self._doc_collection = document_collection
+        self._relational = relational
+        self._keyword = keyword
+        self._vector = vector
+        self._document_vector = document_vector
         self._embed_cfg = embed_cfg
         self._config = config
         self._embed_cache = EmbeddingCache(max_size=config.embedding_cache_size)
@@ -236,9 +265,14 @@ class SearchEngine:
             else:
                 channel_results.append(result)
 
-        # ----- 5. Fuse via RRF -----
+        # ----- 5. Fuse via RRF, then apply the source-of-truth re-checks -----
         fused = self._rrf_fusion(channel_results, k=self._config.rrf_k)
         fused = await self._filter_candidates_by_status(fused, include_superseded)
+        if sources:
+            supported = await self._relational.filter_ids_supported_by_sources(
+                [c.memory_id for c in fused], sources
+            )
+            fused = [c for c in fused if c.memory_id in supported]
         total_candidates = len(fused)
 
         # ----- 6. Apply ranking -----
@@ -288,55 +322,18 @@ class SearchEngine:
         include_superseded: bool,
         limit: int,
     ) -> list[tuple[str, float]]:
-        """Embed query via cache, then query ChromaDB memories collection."""
+        """Embed the query via cache, then query the vector channel.
+
+        Source filtering is not applied here: it is authoritative on the
+        fused candidate set (a memory has many sources; this channel cannot
+        express that). The ``sources`` parameter is accepted for a uniform
+        channel signature.
+        """
         embedding = self._get_or_compute_embedding(query)
         if embedding is None:
             return []
-
-        where_clauses: list[dict] = []
-        if memory_types:
-            where_clauses.append({"memory_type": {"$in": memory_types}})
-        statuses = allowed_search_statuses(include_superseded)
-        if len(statuses) == 1:
-            where_clauses.append({"status": statuses[0]})
-        else:
-            where_clauses.append({"status": {"$in": list(statuses)}})
-        if sources:
-            where_clauses.append({"source": {"$in": sources}})
-
-        where: dict | None = None
-        if len(where_clauses) == 1:
-            where = where_clauses[0]
-        elif len(where_clauses) > 1:
-            where = {"$and": where_clauses}
-
-        try:
-            query_params: dict[str, Any] = {
-                "query_embeddings": [embedding],
-                "n_results": limit,
-            }
-            if where:
-                query_params["where"] = where
-
-            results = self._mem_collection.query(**query_params)
-        except Exception:
-            logger.exception("ChromaDB vector search failed")
-            return []
-
-        if not results or not results.get("ids") or not results["ids"][0]:
-            return []
-
-        ids = results["ids"][0]
-        distances = results["distances"][0] if results.get("distances") else [0.0] * len(ids)
-
-        # ChromaDB cosine distance: lower = more similar.
-        # Convert to a similarity score for consistent ranking.
-        scored: list[tuple[str, float]] = []
-        for mid, dist in zip(ids, distances):
-            similarity = max(1.0 - dist, 0.0)
-            scored.append((mid, similarity))
-
-        return scored
+        scope = _default_access_scope(include_superseded)
+        return await self._vector.query(embedding, scope, memory_types, limit)
 
     async def _bm25_search(
         self,
@@ -347,63 +344,19 @@ class SearchEngine:
         include_superseded: bool,
         limit: int,
     ) -> list[tuple[str, float]]:
-        """Query the ``memories_fts`` FTS5 table with optional alias expansion."""
-        # Build expanded FTS query
+        """Query the keyword channel with optional alias expansion.
+
+        Source filtering is applied once on the fused set (Step 8), not per
+        channel, so this method does not re-check ``sources``.
+        """
         expanded = await self._expand_query_with_aliases(
             query, analysis.detected_entity_ids
         )
         fts_query = _sanitize_fts_query(expanded)
         if not fts_query:
             return []
-
-        # Build the SQL with joins for source/status filtering
-        sql_parts = [
-            "SELECT f.memory_id, rank",
-            "FROM memories_fts f",
-            "JOIN memories m ON f.memory_id = m.id",
-        ]
-        joins: list[str] = []
-        conditions: list[str] = [
-            "memories_fts MATCH ?",
-        ]
-        params: list[Any] = [fts_query]
-
-        statuses = allowed_search_statuses(include_superseded)
-        placeholders = ",".join("?" for _ in statuses)
-        conditions.append(f"m.status IN ({placeholders})")
-        params.extend(statuses)
-        if memory_types:
-            placeholders = ",".join("?" for _ in memory_types)
-            conditions.append(f"m.memory_type IN ({placeholders})")
-            params.extend(memory_types)
-        if sources:
-            joins.append("JOIN memory_sources ms ON m.id = ms.memory_id")
-            joins.append("JOIN documents d ON ms.doc_id = d.doc_id")
-            placeholders = ",".join("?" for _ in sources)
-            conditions.append(f"d.source IN ({placeholders})")
-            params.extend(sources)
-
-        for j in joins:
-            sql_parts.append(j)
-        sql_parts.append("WHERE " + " AND ".join(conditions))
-        sql_parts.append("ORDER BY rank")
-        sql_parts.append(f"LIMIT {limit}")
-
-        full_sql = " ".join(sql_parts)
-
-        try:
-            results: list[tuple[str, float]] = []
-            async with self._db.db.execute(full_sql, params) as cursor:
-                async for row in cursor:
-                    # FTS5 rank is negative (more negative = better match).
-                    # Invert so higher = better.
-                    memory_id = row[0]
-                    rank_score = -float(row[1]) if row[1] is not None else 0.0
-                    results.append((memory_id, rank_score))
-            return results
-        except Exception:
-            logger.exception("BM25 search failed")
-            return []
+        scope = _default_access_scope(include_superseded)
+        return await self._keyword.search(fts_query, scope, memory_types, limit)
 
     async def _graph_search(
         self,
@@ -412,86 +365,11 @@ class SearchEngine:
         include_superseded: bool,
         limit: int,
     ) -> list[tuple[str, float]]:
-        """Entity-graph traversal: direct links + 1-hop co-entity expansion.
-
-        Algorithm from architecture.md Section 14h.
-        """
-        if not entity_ids:
-            return []
-
-        # --- Direct links: memories referencing query entities ---
-        placeholders = ",".join("?" for _ in entity_ids)
-        statuses = allowed_search_statuses(include_superseded)
-        status_placeholders = ",".join("?" for _ in statuses)
-        status_filter = f"AND m.status IN ({status_placeholders})"
-        type_filter = ""
-        type_params: list[Any] = []
-        if memory_types:
-            type_placeholders = ",".join("?" for _ in memory_types)
-            type_filter = f"AND m.memory_type IN ({type_placeholders})"
-            type_params = list(memory_types)
-
-        direct_sql = f"""
-            SELECT m.id, COUNT(me.entity_id) AS entity_overlap
-            FROM memories m
-            JOIN memory_entities me ON m.id = me.memory_id
-            WHERE me.entity_id IN ({placeholders})
-              {status_filter}
-              {type_filter}
-            GROUP BY m.id
-            ORDER BY entity_overlap DESC
-            LIMIT ?
-        """
-        direct_params: list[Any] = [*entity_ids, *statuses, *type_params, limit]
-
-        direct_results: list[tuple[str, int]] = []
-        try:
-            async with self._db.db.execute(direct_sql, direct_params) as cursor:
-                async for row in cursor:
-                    direct_results.append((row[0], int(row[1])))
-        except Exception:
-            logger.exception("Graph direct search failed")
-            return []
-
-        # Score direct results
-        num_query_entities = len(entity_ids)
-        scored: list[tuple[str, float]] = []
-        for mid, overlap in direct_results:
-            scored.append((mid, float(overlap) / num_query_entities))
-
-        # --- 1-hop expansion ---
-        if direct_results:
-            direct_ids = [r[0] for r in direct_results]
-            d_placeholders = ",".join("?" for _ in direct_ids)
-
-            expanded_sql = f"""
-                SELECT m.id, COUNT(DISTINCT me2.entity_id) AS shared_entities
-                FROM memory_entities me1
-                JOIN memory_entities me2 ON me1.entity_id = me2.entity_id
-                JOIN memories m ON me2.memory_id = m.id
-                WHERE me1.memory_id IN ({d_placeholders})
-                  AND m.id NOT IN ({d_placeholders})
-                  {status_filter}
-                  {type_filter}
-                GROUP BY m.id
-                HAVING shared_entities >= 2
-                ORDER BY shared_entities DESC
-                LIMIT ?
-            """
-            expanded_params: list[Any] = [
-                *direct_ids, *direct_ids, *statuses, *type_params, limit,
-            ]
-
-            try:
-                async with self._db.db.execute(expanded_sql, expanded_params) as cursor:
-                    async for row in cursor:
-                        mid = row[0]
-                        shared = int(row[1])
-                        scored.append((mid, 0.5 * shared / num_query_entities))
-            except Exception:
-                logger.exception("Graph 1-hop expansion failed")
-
-        return scored
+        """Entity-graph traversal via the relational channel."""
+        scope = _default_access_scope(include_superseded)
+        return await self._relational.graph_search(
+            entity_ids, scope, memory_types, limit
+        )
 
     async def _temporal_filter(
         self,
@@ -501,54 +379,11 @@ class SearchEngine:
         include_superseded: bool,
         limit: int,
     ) -> list[tuple[str, float]]:
-        """SQL date-range filter on memories.created_at / updated_at."""
-        conditions: list[str] = []
-        params: list[Any] = []
-
-        if start:
-            iso_start = start.isoformat()
-            conditions.append("(m.updated_at >= ? OR m.created_at >= ?)")
-            params.extend([iso_start, iso_start])
-        if end:
-            iso_end = end.isoformat()
-            conditions.append("(m.updated_at <= ? OR m.created_at <= ?)")
-            params.extend([iso_end, iso_end])
-
-        if not conditions:
-            return []
-
-        statuses = allowed_search_statuses(include_superseded)
-        placeholders = ",".join("?" for _ in statuses)
-        conditions.append(f"m.status IN ({placeholders})")
-        params.extend(statuses)
-        if memory_types:
-            placeholders = ",".join("?" for _ in memory_types)
-            conditions.append(f"m.memory_type IN ({placeholders})")
-            params.extend(memory_types)
-
-        where = " AND ".join(conditions)
-        sql = f"""
-            SELECT m.id FROM memories m
-            WHERE {where}
-            ORDER BY m.updated_at DESC
-            LIMIT ?
-        """
-        params.append(limit)
-
-        try:
-            results: list[tuple[str, float]] = []
-            async with self._db.db.execute(sql, params) as cursor:
-                idx = 0
-                async for row in cursor:
-                    # Assign a decreasing score based on result order so that
-                    # more-recently-updated memories rank higher within this channel.
-                    idx += 1
-                    score = 1.0 / idx
-                    results.append((row[0], score))
-            return results
-        except Exception:
-            logger.exception("Temporal filter failed")
-            return []
+        """SQL date-range filter via the relational channel."""
+        scope = _default_access_scope(include_superseded)
+        return await self._relational.temporal_search(
+            start, end, scope, memory_types, limit
+        )
 
     # ==================================================================
     # Fusion
@@ -586,30 +421,13 @@ class SearchEngine:
         candidates: list[_RankedCandidate],
         include_superseded: bool,
     ) -> list[_RankedCandidate]:
-        """Apply DB-source-of-truth lifecycle visibility after channel fusion."""
+        """Apply the source-of-truth visibility re-check after channel fusion."""
         if not candidates:
             return []
-
-        allowed = set(allowed_search_statuses(include_superseded))
-        memory_ids = [c.memory_id for c in candidates]
-        visible: set[str] = set()
-        batch_size = 200
-
-        for i in range(0, len(memory_ids), batch_size):
-            batch = memory_ids[i : i + batch_size]
-            placeholders = ",".join("?" for _ in batch)
-            try:
-                async with self._db.db.execute(
-                    f"SELECT id, status FROM memories WHERE id IN ({placeholders})",
-                    batch,
-                ) as cursor:
-                    async for row in cursor:
-                        if row["status"] in allowed:
-                            visible.add(row["id"])
-            except Exception:
-                logger.exception("Failed to apply lifecycle status filter")
-                return []
-
+        scope = _default_access_scope(include_superseded)
+        visible = await self._relational.filter_visible_ids(
+            [c.memory_id for c in candidates], scope
+        )
         return [c for c in candidates if c.memory_id in visible]
 
     # ==================================================================
@@ -631,29 +449,10 @@ class SearchEngine:
         if not candidates:
             return candidates
 
-        # Fetch updated_at for each candidate (bulk query)
-        id_to_updated: dict[str, datetime | None] = {}
-        batch_size = 200
-        memory_ids = [c.memory_id for c in candidates]
-        for i in range(0, len(memory_ids), batch_size):
-            batch = memory_ids[i : i + batch_size]
-            placeholders = ",".join("?" for _ in batch)
-            try:
-                async with self._db.db.execute(
-                    f"SELECT id, updated_at FROM memories WHERE id IN ({placeholders})",
-                    batch,
-                ) as cursor:
-                    async for row in cursor:
-                        dt_str = row[1]
-                        dt = None
-                        if dt_str:
-                            try:
-                                dt = datetime.fromisoformat(dt_str)
-                            except (ValueError, TypeError):
-                                pass
-                        id_to_updated[row[0]] = dt
-            except Exception:
-                logger.exception("Failed to fetch updated_at for ranking batch")
+        # Fetch updated_at for each candidate via the relational channel.
+        id_to_updated = await self._relational.fetch_updated_at(
+            [c.memory_id for c in candidates]
+        )
 
         # Normalize RRF scores to [0, 1]
         max_rrf = max(c.rrf_score for c in candidates) if candidates else 1.0
@@ -704,7 +503,7 @@ class SearchEngine:
         id_to_content: dict[str, str] = {}
         for c in to_rerank:
             try:
-                mem = await self._db.get_memory(c.memory_id)
+                mem = await self._relational.get_memory(c.memory_id)
                 if mem:
                     id_to_content[c.memory_id] = mem.content
             except Exception:
@@ -793,7 +592,7 @@ class SearchEngine:
 
             # Fetch memory
             try:
-                memory = await self._db.get_memory(mid)
+                memory = await self._relational.get_memory(mid)
             except Exception:
                 logger.exception("Failed to fetch memory %s", mid)
                 continue
@@ -809,7 +608,7 @@ class SearchEngine:
             source_url = None
 
             try:
-                mem_sources = await self._db.get_memory_sources(mid)
+                mem_sources = await self._relational.get_memory_sources(mid)
                 if mem_sources:
                     # Sort by added_at descending to get most recent
                     mem_sources.sort(
@@ -821,7 +620,7 @@ class SearchEngine:
                     source_type = primary.source_type
 
                     # Fetch document details
-                    doc = await self._db.get_document(primary.doc_id)
+                    doc = await self._relational.get_document(primary.doc_id)
                     if doc:
                         source_doc_title = doc.title
                         content_url = document_content_url(doc, self._artifact_config)
@@ -880,7 +679,7 @@ class SearchEngine:
 
         Returns ``SearchResult`` objects with ``is_document_result=True``.
         """
-        if remaining_slots <= 0 or self._doc_collection is None:
+        if remaining_slots <= 0 or self._document_vector is None:
             return []
 
         embedding = self._get_or_compute_embedding(query)
@@ -890,7 +689,7 @@ class SearchEngine:
         try:
             # Over-fetch so we can exclude docs already represented by memories
             fetch_n = remaining_slots + (len(exclude_doc_ids) if exclude_doc_ids else 0)
-            chroma_result = self._doc_collection.query(
+            chroma_result = self._document_vector.collection.query(
                 query_embeddings=[embedding],
                 n_results=min(fetch_n, 50),
             )
@@ -919,7 +718,7 @@ class SearchEngine:
             if len(results) >= remaining_slots:
                 break
 
-            similarity = max(1.0 - dist, 0.0)
+            similarity = self._document_vector.similarity(dist)
 
             # Fetch document metadata
             title = doc_id
@@ -929,7 +728,7 @@ class SearchEngine:
             source_type = None
 
             try:
-                doc = await self._db.get_document(doc_id)
+                doc = await self._relational.get_document(doc_id)
                 if doc:
                     title = doc.title
                     content_url = document_content_url(doc, self._artifact_config)
@@ -980,7 +779,7 @@ class SearchEngine:
         alias_terms: list[str] = []
         for eid in entity_ids:
             try:
-                aliases = await self._db.get_aliases_for_entity(eid)
+                aliases = await self._relational.get_aliases_for_entity(eid)
                 for a in aliases:
                     norm = a.alias_normalized.strip()
                     if norm and norm.lower() not in query.lower():
@@ -1011,11 +810,11 @@ class SearchEngine:
         """Build a mapping of canonical_name + aliases -> entity_id."""
         entities: dict[str, int] = {}
         try:
-            all_entities = await self._db.get_all_entities()
+            all_entities = await self._relational.get_all_entities()
             for ent in all_entities:
                 entities[ent.canonical_name] = ent.id
             # Layer in aliases — canonical names take precedence on collision
-            all_aliases = await self._db.get_all_aliases()
+            all_aliases = await self._relational.get_all_aliases()
             for alias_name, canonical_id in all_aliases:
                 if alias_name not in entities:
                     entities[alias_name] = canonical_id

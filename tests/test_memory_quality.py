@@ -13,6 +13,7 @@ from memforge.memory.engine import MemoryEngine
 from memforge.memory.store import MemoryStore
 from memforge.models import DocumentRecord, Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
 from memforge.storage.database import Database
+from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
 
 METADATA_CONTENT = (
@@ -244,7 +245,8 @@ def test_classifier_keeps_useful_memory_with_link_list_context():
 
 @pytest.mark.asyncio
 async def test_engine_skips_metadata_only_candidate(db: Database):
-    engine = MemoryEngine(db=db, memory_store=DirectInsertStore(db))
+    adapters = build_sqlite_adapters(db, FakeCollection())
+    engine = MemoryEngine(relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db))
 
     stats = await engine.process_memories(
         doc_id="doc-acd",
@@ -258,7 +260,8 @@ async def test_engine_skips_metadata_only_candidate(db: Database):
 
 @pytest.mark.asyncio
 async def test_engine_skips_open_question_candidate(db: Database):
-    engine = MemoryEngine(db=db, memory_store=DirectInsertStore(db))
+    adapters = build_sqlite_adapters(db, FakeCollection())
+    engine = MemoryEngine(relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db))
 
     stats = await engine.process_memories(
         doc_id="doc-acd",
@@ -272,7 +275,8 @@ async def test_engine_skips_open_question_candidate(db: Database):
 
 @pytest.mark.asyncio
 async def test_engine_keeps_conditional_ap_rule(db: Database):
-    engine = MemoryEngine(db=db, memory_store=DirectInsertStore(db))
+    adapters = build_sqlite_adapters(db, FakeCollection())
+    engine = MemoryEngine(relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db))
 
     stats = await engine.process_memories(
         doc_id="doc-acd",
@@ -295,7 +299,14 @@ async def test_reconciliation_skips_bad_replacement_candidate_instead_of_superse
         content="Payroll Processing V2 uses the Payroll Processing concept as its reference design.",
     )
     await db.add_memory_source(old_memory.id, doc.doc_id, "confluence")
-    engine = MemoryEngine(db=db, memory_store=DirectInsertStore(db), structured_llm_client=object())
+    adapters = build_sqlite_adapters(db, FakeCollection())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=DirectInsertStore(db),
+        structured_llm_client=object(),
+    )
     good_extraction = _raw("Payroll Processing V2 validates changed regular pay dates.", "accepted rule")
     bad_replacement = _raw(LINK_CONTENT, LINK_CONTEXT)
 
@@ -331,7 +342,10 @@ async def test_reconciliation_action_failure_is_audited_without_fallback(db: Dat
     old_memory = await _insert_memory(db, mem_id="mem-fallback-old", content="Old fact")
     await db.add_memory_source(old_memory.id, doc.doc_id, "confluence")
     store = FailingUpdateAuditStore(db)
-    engine = MemoryEngine(db=db, memory_store=store, structured_llm_client=object())
+    adapters = build_sqlite_adapters(db, FakeCollection())
+    engine = MemoryEngine(
+        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+    )
     replacement = _raw("New fact", "new excerpt")
 
     async def fake_reconcile_memories(**kwargs):
@@ -374,8 +388,16 @@ async def test_reconciliation_all_filtered_update_retires_sole_source_memory(db:
     )
     await db.add_memory_source(old_memory.id, doc.doc_id, "confluence")
     collection = FakeCollection()
-    store = MemoryStore(db=db, memory_collection=collection, embed_cfg={})
-    engine = MemoryEngine(db=db, memory_store=store, structured_llm_client=object())
+    adapters = build_sqlite_adapters(db, collection)
+    store = MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+    )
+    engine = MemoryEngine(
+        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+    )
 
     stats = await engine.reconcile_and_persist(
         doc_id=doc.doc_id,
@@ -405,8 +427,16 @@ async def test_reconciliation_all_filtered_update_removes_one_source_but_keeps_s
     await db.add_memory_source(old_memory.id, doc.doc_id, "confluence")
     await db.add_memory_source(old_memory.id, other_doc.doc_id, "confluence")
     collection = FakeCollection()
-    store = MemoryStore(db=db, memory_collection=collection, embed_cfg={})
-    engine = MemoryEngine(db=db, memory_store=store, structured_llm_client=object())
+    adapters = build_sqlite_adapters(db, collection)
+    store = MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+    )
+    engine = MemoryEngine(
+        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+    )
 
     stats = await engine.reconcile_and_persist(
         doc_id=doc.doc_id,
@@ -441,7 +471,13 @@ async def test_store_document_delete_cleans_indexes_for_last_corroborated_source
         support_kind="corroborated",
     )
     collection = FakeCollection()
-    store = MemoryStore(db=db, memory_collection=collection, embed_cfg={})
+    adapters = build_sqlite_adapters(db, collection)
+    store = MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+    )
 
     retired_ids = await store.delete_document(doc.doc_id)
 
@@ -468,7 +504,13 @@ async def test_store_source_cascade_cleans_indexes_for_retired_memories(db: Data
         excerpt="A source cascade should remove retired memories from search.",
     )
     collection = FakeCollection()
-    store = MemoryStore(db=db, memory_collection=collection, embed_cfg={})
+    adapters = build_sqlite_adapters(db, collection)
+    store = MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+    )
 
     retired_ids = await store.delete_source_cascade(doc.source)
 

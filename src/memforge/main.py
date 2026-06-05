@@ -304,7 +304,7 @@ def _dispatch_interactive() -> int:
     """Run the Clack-based interactive menu when memforge is called bare.
 
     Returns the exit code the launcher should use. The dispatcher is a single
-    seam: tests monkey-patch this function so they can verify routing without
+    adapters: tests monkey-patch this function so they can verify routing without
     spawning Node, and the production implementation forwards to the bundled
     Node script via :func:`_run_interactive_script`.
     """
