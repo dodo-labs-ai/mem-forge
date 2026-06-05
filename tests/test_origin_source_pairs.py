@@ -25,7 +25,6 @@ def _memory(mem_id: str) -> Memory:
         memory_type="fact",
         content=f"content for {mem_id}",
         content_hash=content_hash(mem_id),
-        scope="project:PAY",
         project_key="PAY",
         tags=[],
         confidence=0.9,

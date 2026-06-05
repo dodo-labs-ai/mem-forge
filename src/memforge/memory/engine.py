@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 from memforge.memory.entity_resolver import EntityResolver, insert_llm_alias, resolve_entity
 from memforge.memory.lifecycle import requires_human_review
 from memforge.memory.quality import classify_memory_candidate
+from memforge.memory.visibility_policy import default_visibility
 from memforge.models import (
     Memory,
     MemoryReview,
@@ -165,12 +166,14 @@ class MemoryEngine:
                 continue
 
             # Build memory object
+            visibility, owner_user_id = default_visibility(source_type)
             memory = Memory(
                 id=generate_memory_id(),
                 memory_type=raw.memory_type,
                 content=raw.content.strip(),
                 content_hash=content_hash(raw.content.strip()),
-                scope=f"project:{project_key}" if project_key else "team",
+                visibility=visibility,
+                owner_user_id=owner_user_id,
                 project_key=project_key,
                 entity_refs=raw.entity_refs,
                 tags=raw.tags,
@@ -470,7 +473,7 @@ class MemoryEngine:
                 if op.action == ReconcileAction.ADD and op.memory:
                     if not self._candidate_can_persist(op.memory, stats):
                         continue
-                    memory = self._build_memory(op.memory, project_key)
+                    memory = self._build_memory(op.memory, project_key, source_type)
                     memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
                     result = await self.memory_store.deduplicate_and_insert(
                         memory=memory,
@@ -497,7 +500,7 @@ class MemoryEngine:
                 elif op.action == ReconcileAction.SUPERSEDE and op.memory_id and op.memory:
                     if not self._candidate_can_persist(op.memory, stats):
                         continue
-                    new_memory = self._build_memory(op.memory, project_key)
+                    new_memory = self._build_memory(op.memory, project_key, source_type)
                     memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
                     await self.memory_store.supersede_memory(
                         old_memory_id=op.memory_id,
@@ -628,7 +631,7 @@ class MemoryEngine:
         """Insert a hidden challenger and create a review case for a replacement."""
         if not op.memory or not self._candidate_can_persist(op.memory, stats):
             return False
-        challenger = self._build_memory(op.memory, project_key)
+        challenger = self._build_memory(op.memory, project_key, source_type)
         challenger.status = "pending_review"
         memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
         await self.memory_store.insert_memory(
@@ -780,14 +783,16 @@ class MemoryEngine:
         )
         return False
 
-    def _build_memory(self, raw: RawMemory, project_key: str | None) -> Memory:
+    def _build_memory(self, raw: RawMemory, project_key: str | None, source_type: str) -> Memory:
         """Build a Memory object from a RawMemory."""
+        visibility, owner_user_id = default_visibility(source_type)
         return Memory(
             id=generate_memory_id(),
             memory_type=raw.memory_type,
             content=raw.content.strip(),
             content_hash=content_hash(raw.content.strip()),
-            scope=f"project:{project_key}" if project_key else "team",
+            visibility=visibility,
+            owner_user_id=owner_user_id,
             project_key=project_key,
             entity_refs=raw.entity_refs,
             tags=raw.tags,

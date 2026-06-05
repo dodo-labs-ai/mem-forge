@@ -721,16 +721,15 @@ async def test_admin_sources_exposes_running_stored_counts_separately(db, tmp_pa
         )
         await db.db.execute(
             """INSERT INTO memories (
-                id, memory_type, content, content_hash, tags, scope,
+                id, memory_type, content, content_hash, tags,
                 project_key, confidence, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 f"mem-{index}",
                 "fact",
                 f"Memory {index}",
                 f"memory-hash-{index}",
                 "[]",
-                "team",
                 None,
                 0.8,
                 "active",

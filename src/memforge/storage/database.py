@@ -28,6 +28,7 @@ from memforge.models import (
     MemoryReviewRelatedChallenger,
     MemorySource,
     SyncState,
+    Visibility,
 )
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
@@ -66,6 +67,22 @@ def _parse_dt(s: str | None) -> datetime | None:
     if not s:
         return None
     return datetime.fromisoformat(s)
+
+
+_VALID_VISIBILITIES = frozenset({Visibility.WORKSPACE.value, Visibility.PRIVATE.value})
+
+
+def _validate_visibility(visibility: str, owner_user_id: str | None) -> None:
+    """Enforce the owner/visibility invariant before any memory write."""
+    if visibility not in _VALID_VISIBILITIES:
+        raise ValueError(
+            f"visibility must be one of {sorted(_VALID_VISIBILITIES)}, got {visibility!r}"
+        )
+    if (visibility == Visibility.PRIVATE.value) != (owner_user_id is not None):
+        raise ValueError(
+            "owner_user_id must be set iff visibility is private "
+            f"(visibility={visibility!r}, owner_user_id={owner_user_id!r})"
+        )
 
 
 def _entity_from_row(d: dict) -> Entity:
@@ -177,7 +194,8 @@ CREATE TABLE IF NOT EXISTS memories (
     content             TEXT NOT NULL,
     content_hash        TEXT NOT NULL,
     tags                TEXT NOT NULL DEFAULT '[]',
-    scope               TEXT NOT NULL DEFAULT 'team',
+    visibility          TEXT NOT NULL DEFAULT 'workspace',
+    owner_user_id       TEXT,
     project_key         TEXT,
     confidence          REAL NOT NULL DEFAULT 0.7,
     corroboration_count INTEGER NOT NULL DEFAULT 1,
@@ -192,7 +210,9 @@ CREATE TABLE IF NOT EXISTS memories (
     replacement_reason  TEXT,
     extraction_context  TEXT,
     created_at          TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK (visibility IN ('private','workspace')),
+    CHECK ((visibility = 'private') = (owner_user_id IS NOT NULL))
 );
 
 CREATE TABLE IF NOT EXISTS memory_sources (
@@ -366,8 +386,10 @@ CREATE INDEX IF NOT EXISTS idx_sync_history_finished ON sync_history(finished_at
 CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(canonical_name);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
-CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);
 CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_key);
+-- idx_memories_access and idx_memories_owner index the visibility and owner_user_id
+-- columns and are created in migration 14, which adds those columns. SCHEMA runs
+-- before migrations, so an upgrading database does not have those columns here yet.
 CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash);
 CREATE INDEX IF NOT EXISTS idx_memory_sources_doc ON memory_sources(doc_id);
 CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_id);
@@ -739,6 +761,22 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                  SELECT 1 FROM documents WHERE source = 'src-agent-sessions'
              )""",
     ]),
+    (14, "Add visibility and owner columns to memories", [
+        "ALTER TABLE memories ADD COLUMN visibility TEXT NOT NULL DEFAULT 'workspace'",
+        "ALTER TABLE memories ADD COLUMN owner_user_id TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_memories_access ON memories(status, visibility)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_owner ON memories(owner_user_id)",
+        "DROP INDEX IF EXISTS idx_memories_scope",
+    ]),
+    (15, "Backfill visibility and project_key from legacy scope", [
+        "UPDATE memories SET visibility = 'workspace' WHERE visibility IS NULL OR visibility = ''",
+        "UPDATE memories SET owner_user_id = NULL WHERE visibility = 'workspace'",
+        "UPDATE memories SET project_key = substr(scope, 9) "
+        "WHERE project_key IS NULL AND scope LIKE 'project:%'",
+        "UPDATE memories SET project_key = 'SHARED' "
+        "WHERE project_key IS NULL AND scope = 'team'",
+        "UPDATE memories SET project_key = 'UNSORTED' WHERE project_key IS NULL",
+    ]),
 ]
 
 
@@ -785,9 +823,15 @@ class Database:
                 try:
                     await self.db.execute(sql)
                 except Exception as e:
-                    if "duplicate column" in str(e).lower():
+                    message = str(e).lower()
+                    legacy_scope_backfill = (
+                        version == 15
+                        and "no such column" in message
+                        and "scope" in sql.lower()
+                    )
+                    if "duplicate column" in message or legacy_scope_backfill:
                         logger.debug(
-                            "Migration %d: column already exists, skipping: %s",
+                            "Migration %d: expected-absent column on this DB, skipping: %s",
                             version, sql,
                         )
                     else:
@@ -1134,21 +1178,22 @@ class Database:
 
     async def insert_memory(self, mem: Memory) -> str:
         """Insert a memory and its FTS5 row. Returns the memory id."""
+        _validate_visibility(mem.visibility, mem.owner_user_id)
         async with self._write_lock:
             now = _now_iso()
             status = normalize_memory_status(mem.status)
             await self.db.execute(
                 """INSERT INTO memories (
-                    id, memory_type, content, content_hash, tags, scope,
+                    id, memory_type, content, content_hash, tags, visibility, owner_user_id,
                     project_key, confidence, corroboration_count,
                     contradiction_count, valid_from, valid_until,
                     superseded_by, status, retirement_reason, retired_at,
                     superseded_at, replacement_reason, extraction_context,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     mem.id, mem.memory_type, mem.content, mem.content_hash,
-                    json.dumps(mem.tags), mem.scope, mem.project_key,
+                    json.dumps(mem.tags), mem.visibility, mem.owner_user_id, mem.project_key,
                     mem.confidence, mem.corroboration_count,
                     mem.contradiction_count,
                     mem.valid_from.isoformat() if mem.valid_from else None,
@@ -1415,6 +1460,7 @@ class Database:
         search_visible_statuses: set[str],
     ) -> None:
         """Restore one memory row and its FTS visibility from a captured snapshot."""
+        _validate_visibility(memory.visibility, memory.owner_user_id)
         entity_names = await self.get_memory_entity_names(memory.id)
         tags_text = " ".join(memory.tags)
         entities_text = " ".join(entity_names)
@@ -1423,7 +1469,7 @@ class Database:
             await self.db.execute(
                 """UPDATE memories SET
                     memory_type = ?, content = ?, content_hash = ?, tags = ?,
-                    scope = ?, project_key = ?, confidence = ?,
+                    visibility = ?, owner_user_id = ?, project_key = ?, confidence = ?,
                     corroboration_count = ?, contradiction_count = ?,
                     valid_from = ?, valid_until = ?, superseded_by = ?,
                     status = ?, retirement_reason = ?, retired_at = ?,
@@ -1435,7 +1481,8 @@ class Database:
                     memory.content,
                     memory.content_hash,
                     json.dumps(memory.tags),
-                    memory.scope,
+                    memory.visibility,
+                    memory.owner_user_id,
                     memory.project_key,
                     memory.confidence,
                     memory.corroboration_count,
@@ -1536,22 +1583,23 @@ class Database:
         replacement_reason: str | None = None,
     ) -> None:
         """Mark old memory as superseded and insert the new one."""
+        _validate_visibility(new_memory.visibility, new_memory.owner_user_id)
         async with self._write_lock:
             now = _now_iso()
             new_status = normalize_memory_status(new_memory.status)
             await self.db.execute(
                 """INSERT INTO memories (
-                    id, memory_type, content, content_hash, tags, scope,
+                    id, memory_type, content, content_hash, tags, visibility, owner_user_id,
                     project_key, confidence, corroboration_count,
                     contradiction_count, valid_from, valid_until,
                     superseded_by, status, retirement_reason, retired_at,
                     superseded_at, replacement_reason, extraction_context,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     new_memory.id, new_memory.memory_type, new_memory.content,
                     new_memory.content_hash, json.dumps(new_memory.tags),
-                    new_memory.scope, new_memory.project_key,
+                    new_memory.visibility, new_memory.owner_user_id, new_memory.project_key,
                     new_memory.confidence, new_memory.corroboration_count,
                     new_memory.contradiction_count,
                     new_memory.valid_from.isoformat() if new_memory.valid_from else None,
@@ -3418,7 +3466,8 @@ class Database:
             content=d["content"],
             content_hash=d["content_hash"],
             tags=json.loads(d.get("tags") or "[]"),
-            scope=d["scope"],
+            visibility=d["visibility"],
+            owner_user_id=d["owner_user_id"],
             project_key=d["project_key"],
             confidence=d["confidence"],
             corroboration_count=d["corroboration_count"],

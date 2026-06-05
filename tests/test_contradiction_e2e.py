@@ -89,7 +89,6 @@ def _make_memory(mem_id: str, content: str, mem_type: str = "fact") -> Memory:
         memory_type=mem_type,
         content=content,
         content_hash=content_hash(content),
-        scope="team",
         project_key=None,
         entity_refs=[],
         tags=[],
