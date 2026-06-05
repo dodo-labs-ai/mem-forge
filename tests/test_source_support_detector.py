@@ -31,7 +31,6 @@ def _memory(mem_id: str, content: str, *, project_key: str = "PAY") -> Memory:
         memory_type="fact",
         content=content,
         content_hash=content_hash(content),
-        scope=f"project:{project_key}",
         project_key=project_key,
         tags=["payroll"],
         confidence=0.9,

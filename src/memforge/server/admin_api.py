@@ -204,7 +204,8 @@ class MemoryResponse(BaseModel):
     memory_type: str
     content: str
     content_hash: str
-    scope: str
+    visibility: str
+    owner_user_id: str | None = None
     project_key: str | None = None
     tags: list[str] = []
     confidence: float
@@ -1402,7 +1403,8 @@ def _memory_to_response(
         memory_type=mem.memory_type,
         content=mem.content,
         content_hash=mem.content_hash,
-        scope=mem.scope,
+        visibility=mem.visibility,
+        owner_user_id=mem.owner_user_id,
         project_key=mem.project_key,
         tags=mem.tags,
         confidence=mem.confidence,
@@ -2158,7 +2160,8 @@ def create_admin_app(
             memory_type=mem.memory_type,
             content=mem.content,
             content_hash=mem.content_hash,
-            scope=mem.scope,
+            visibility=mem.visibility,
+            owner_user_id=mem.owner_user_id,
             project_key=mem.project_key,
             tags=mem.tags,
             confidence=mem.confidence,

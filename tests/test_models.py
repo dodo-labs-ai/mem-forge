@@ -8,6 +8,7 @@ from memforge.models import (
     RawMemory,
     GeneMetadata,
     ContentItem,
+    Visibility,
     content_hash,
     generate_memory_id,
     slugify,
@@ -68,7 +69,8 @@ class TestMemoryDataclass:
             content="test content",
             content_hash="abc123",
         )
-        assert mem.scope == "team"
+        assert mem.visibility == Visibility.WORKSPACE.value
+        assert mem.owner_user_id is None
         assert mem.status == "active"
         assert mem.confidence == 0.7
         assert mem.corroboration_count == 1
@@ -82,12 +84,12 @@ class TestMemoryDataclass:
             memory_type="decision",
             content="Team chose gRPC",
             content_hash="def456",
-            scope="project:PAY",
+            visibility=Visibility.WORKSPACE.value,
             project_key="PAY",
             confidence=0.95,
         )
         assert mem.memory_type == "decision"
-        assert mem.scope == "project:PAY"
+        assert mem.visibility == Visibility.WORKSPACE.value
         assert mem.project_key == "PAY"
         assert mem.confidence == 0.95
 

@@ -5,7 +5,8 @@ export interface Memory {
   memory_type: "fact" | "decision" | "convention" | "procedure";
   content: string;
   content_hash: string;
-  scope: string;
+  visibility: string;
+  owner_user_id: string | null;
   project_key: string | null;
   tags: string[];
   confidence: number;

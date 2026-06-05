@@ -145,7 +145,6 @@ def _make_memory(mem_id: str, content: str) -> Memory:
         memory_type="fact",
         content=content,
         content_hash=content_hash(content),
-        scope="team",
         project_key=None,
         entity_refs=[],
         tags=[],

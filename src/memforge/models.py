@@ -68,6 +68,20 @@ class MemoryStatus(str, Enum):
     PENDING_REVIEW = "pending_review"
 
 
+class Visibility(str, Enum):
+    """Per-row access tier within one datastore. 'org' is reserved (strict silos)."""
+
+    WORKSPACE = "workspace"
+    PRIVATE = "private"
+
+
+# Reserved project keys. SHARED is the team-wide bucket; UNSORTED is the
+# down-weighted backlog for memories with no resolvable project. Named here so
+# helper code and tests never repeat the literal; the SQL migrations may inline them.
+SHARED_PROJECT_KEY = "SHARED"
+UNSORTED_PROJECT_KEY = "UNSORTED"
+
+
 class ReconcileAction(str, Enum):
     ADD = "ADD"
     UPDATE = "UPDATE"
@@ -126,7 +140,8 @@ class Memory:
     content_hash: str                # SHA-256 for dedup
 
     # Scoping
-    scope: str = "team"              # "team" | "project:{key}" | "source:{id}"
+    visibility: str = Visibility.WORKSPACE.value  # team-visible by default
+    owner_user_id: str | None = None              # set iff visibility is private
     project_key: str | None = None
 
     # Entity linkage

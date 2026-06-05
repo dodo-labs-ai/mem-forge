@@ -105,6 +105,7 @@ class MemoryStore:
         source_type: str,
         entity_ids: list[int] | None = None,
         excerpt: str | None = None,
+        scope: AccessScope | None = None,
     ) -> str:
         """Check for near-duplicates, then insert or corroborate.
 
@@ -117,7 +118,7 @@ class MemoryStore:
 
         # Query the vector channel for near-duplicates.
         try:
-            dedup_scope = _dedup_access_scope()
+            dedup_scope = scope or _dedup_access_scope()
             candidates = await self.vector.query(
                 embedding, dedup_scope, None, DEDUP_CANDIDATE_LIMIT
             )
