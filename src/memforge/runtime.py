@@ -22,9 +22,11 @@ from memforge.pipeline.enricher import Enricher
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.source_support_detector import SourceSupportDetector
 from memforge.pipeline.sync import GeneSyncOrchestrator
+from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.retrieval.embeddings import get_chroma_collection
 from memforge.source_secrets import decrypt_source_config_for_runtime, source_secret_fields
 from memforge.storage.document_store import LocalDocumentStore
+from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
 if TYPE_CHECKING:
     from memforge.storage.database import Database
@@ -119,9 +121,11 @@ async def build_search_engine(db: "Database", config: AppConfig) -> Any:
                 timeout_s=llm.request_timeout_s,
             )
         )
+    adapters = build_sqlite_adapters(db, memory_collection)
     return SearchEngine(
-        db=db,
-        memory_collection=memory_collection,
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
         embed_cfg=embed_cfg,
         config=config.retrieval,
         structured_llm_client=structured_llm_client,
@@ -173,14 +177,18 @@ async def build_sync_runtime(db: "Database", config: AppConfig) -> SyncRuntime:
         "api_key": llm.embedding_api_key,
         "model": llm.embedding_model,
     }
+    adapters = build_sqlite_adapters(db, memory_collection)
     memory_store = MemoryStore(
-        db=db,
-        memory_collection=memory_collection,
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
         embed_cfg=embed_cfg,
         audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="sync")),
-        document_collection=doc_collection,
+        document_index=DocumentVectorIndex(doc_collection),
     )
     memory_engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
         db=db,
         memory_store=memory_store,
         embed_cfg=embed_cfg,

@@ -12,6 +12,7 @@ from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.retrieval.query_analyzer import QueryAnalysis
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.database import Database
+from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
 
 class FakeCollection:
@@ -93,9 +94,13 @@ async def test_default_search_returns_only_active_memories(db, monkeypatch):
 
     monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
+    adapters = build_sqlite_adapters(
+        db, FakeCollection([retired.id, pending.id, superseded.id, active.id])
+    )
     engine = SearchEngine(
-        db=db,
-        memory_collection=FakeCollection([retired.id, pending.id, superseded.id, active.id]),
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
         embed_cfg={},
         config=RetrievalConfig(),
     )
@@ -123,9 +128,11 @@ async def test_search_results_expose_service_artifact_urls_without_storage_uris(
     monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     config = _config(tmp_path)
+    adapters = build_sqlite_adapters(db, FakeCollection([active.id]))
     engine = SearchEngine(
-        db=db,
-        memory_collection=FakeCollection([active.id]),
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
         embed_cfg={},
         config=config.retrieval,
         artifact_config=config,
@@ -155,9 +162,13 @@ async def test_include_superseded_includes_history_but_not_retired_or_pending(db
 
     monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
+    adapters = build_sqlite_adapters(
+        db, FakeCollection([retired.id, pending.id, superseded.id, active.id])
+    )
     engine = SearchEngine(
-        db=db,
-        memory_collection=FakeCollection([retired.id, pending.id, superseded.id, active.id]),
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
         embed_cfg={},
         config=RetrievalConfig(),
     )

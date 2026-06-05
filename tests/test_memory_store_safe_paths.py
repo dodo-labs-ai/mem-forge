@@ -10,7 +10,9 @@ import pytest
 from memforge.memory.audit import AuditContext, MemoryAuditEvent, MemoryAuditLogger
 from memforge.memory.store import MemoryStore
 from memforge.models import Memory, content_hash
+from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.storage.database import Database
+from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
 
 class RecordingCollection:
@@ -298,10 +300,12 @@ def _store(
     document_collection: RecordingCollection | None = None,
 ) -> MemoryStore:
     logger = MemoryAuditLogger(db, default_context=AuditContext(actor_type="test", run_id="run-1"))
+    adapters = build_sqlite_adapters(db, collection)
     store = MemoryStore(
-        db=db,
-        memory_collection=collection,
-        document_collection=document_collection,
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        document_index=DocumentVectorIndex(document_collection),
         embed_cfg={},
         audit_logger=logger,
     )

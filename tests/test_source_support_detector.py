@@ -13,6 +13,7 @@ from memforge.memory.store import MemoryStore
 from memforge.models import Memory, content_hash
 from memforge.pipeline.source_support_detector import SourceSupportDetector
 from memforge.storage.database import Database
+from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
 
 @pytest.fixture
@@ -97,13 +98,21 @@ class FakeCollection:
 
 
 def _memory_store(db: Database, collection: FakeCollection | None = None) -> MemoryStore:
-    return MemoryStore(db=db, memory_collection=collection or FakeCollection(), embed_cfg={})
+    adapters = build_sqlite_adapters(db, collection or FakeCollection())
+    return MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+    )
 
 
 def _audited_memory_store(db: Database, collection: FakeCollection | None = None) -> MemoryStore:
+    adapters = build_sqlite_adapters(db, collection or FakeCollection())
     return MemoryStore(
-        db=db,
-        memory_collection=collection or FakeCollection(),
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
         embed_cfg={},
         audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="test")),
     )

@@ -1509,8 +1509,10 @@ async def _build_memory_store(db: Database, config: AppConfig) -> MemoryStore:
     """Build a request-scoped memory store with effective embedding settings."""
 
     from memforge.memory.audit import AuditContext, MemoryAuditLogger
+    from memforge.retrieval.document_index import DocumentVectorIndex
     from memforge.retrieval.embeddings import get_chroma_collection
     from memforge.runtime import get_effective_llm_config
+    from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
     llm = await get_effective_llm_config(db, config)
     memory_collection = get_chroma_collection(
@@ -1526,12 +1528,14 @@ async def _build_memory_store(db: Database, config: AppConfig) -> MemoryStore:
         "api_key": llm.embedding_api_key,
         "model": llm.embedding_model,
     }
+    adapters = build_sqlite_adapters(db, memory_collection)
     return MemoryStore(
-        db=db,
-        memory_collection=memory_collection,
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
         embed_cfg=embed_cfg,
         audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="admin")),
-        document_collection=document_collection,
+        document_index=DocumentVectorIndex(document_collection),
     )
 
 
