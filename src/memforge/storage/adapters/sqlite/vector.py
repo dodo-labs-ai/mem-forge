@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Sequence
 
+from memforge.retrieval.access_predicate import visible_chroma_where
 from memforge.retrieval.vector_metadata import upsert_with_stored_vector_hash
 from memforge.storage.adapters.context import AccessScope
 
@@ -41,19 +42,6 @@ class SqliteVectorStore:
         """
         return (1.0 - score) < distance_threshold
 
-    def _status_where(self, scope: AccessScope, memory_types: list[str] | None) -> dict | None:
-        clauses: list[dict] = []
-        if memory_types:
-            clauses.append({"memory_type": {"$in": memory_types}})
-        statuses = scope.allowed_statuses
-        if len(statuses) == 1:
-            clauses.append({"status": statuses[0]})
-        else:
-            clauses.append({"status": {"$in": list(statuses)}})
-        if len(clauses) == 1:
-            return clauses[0]
-        return {"$and": clauses}
-
     async def query(
         self,
         embedding: Sequence[float],
@@ -61,7 +49,7 @@ class SqliteVectorStore:
         memory_types: list[str] | None,
         limit: int,
     ) -> list[tuple[str, float]]:
-        where = self._status_where(scope, memory_types)
+        where = visible_chroma_where(scope, memory_types)
         params: dict[str, Any] = {
             "query_embeddings": [list(embedding)],
             "n_results": limit,

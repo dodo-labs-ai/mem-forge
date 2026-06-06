@@ -3,17 +3,30 @@
 Hooks are lifecycle automation, not a separate memory pipeline.  This module
 builds compact, model-readable context from existing persisted memories and
 source state; session document intake remains owned by agent_sessions.py.
+
+Hook context is PERSONALIZED retrieval: the principal is supplied by the
+caller (the HTTP handler resolves it server-side, never from the body), and
+both the search and recent-changes paths apply the same default-deny access
+predicate as the rest of the retrieval engine. Search runs through the
+unified ``SearchEngine`` so there is exactly one predicate implementation;
+recent changes share the predicate via ``visible_sql``.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from memforge.memory.lifecycle import allowed_search_statuses
+from memforge.models import SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY
+from memforge.retrieval.access_predicate import visible_sql
+from memforge.storage.adapters.context import AccessScope
 from memforge.storage.database import Database
+
+if TYPE_CHECKING:
+    from memforge.retrieval.search import SearchEngine
 
 __all__ = ["AgentHookContextRequest", "build_agent_hook_context", "should_query_memory"]
 
@@ -116,14 +129,33 @@ def should_query_memory(request: AgentHookContextRequest) -> bool:
 async def build_agent_hook_context(
     db: Database,
     request: AgentHookContextRequest,
+    *,
+    principal_user_id: str,
+    search_engine: "SearchEngine | None" = None,
 ) -> dict[str, Any]:
-    """Build a compact memory context block for an agent lifecycle hook."""
+    """Build a compact memory context block for an agent lifecycle hook.
+
+    The ``principal_user_id`` is required and supplied by the caller (the HTTP
+    handler resolves it via ``resolve_principal(request)``). It is never read
+    from the request body: a non-HTTP caller cannot fall back to body-derived
+    identity. Both the search and recent-changes paths apply the same
+    PERSONALIZED access predicate (``include_private=True`` for the principal),
+    so the agent author sees their own private context but never another
+    user's. ``search_engine`` is the unified retrieval engine; when omitted,
+    the search path is skipped so a non-HTTP caller cannot accidentally route
+    around the engine.
+    """
     max_memories = min(max(request.max_memories, 1), 10)
     query_memory = should_query_memory(request)
 
-    memories = await _search_memories(db, request, max_memories) if query_memory else []
+    scope = _personalized_scope(request, principal_user_id)
+    memories = (
+        await _search_memories(search_engine, request, scope, max_memories)
+        if query_memory and search_engine is not None
+        else []
+    )
     recent_changes = (
-        await _recent_memory_changes(db, request, limit=3)
+        await _recent_memory_changes(db, request, scope, limit=3)
         if query_memory and request.include_recent_changes
         else []
     )
@@ -145,79 +177,79 @@ async def build_agent_hook_context(
     }
 
 
-async def _search_memories(
-    db: Database,
+def _personalized_scope(
     request: AgentHookContextRequest,
+    principal_user_id: str,
+) -> AccessScope:
+    """Build the per-request PERSONALIZED scope shared by every hook channel.
+
+    ``include_private=True`` so the agent author's own private rows are
+    available, gated by ``owner_user_id == principal_user_id`` in the
+    predicate. The repo (when present) joins the open-projects set as
+    relevance, not access; the reserved keys keep SHARED and UNSORTED open.
+    """
+    open_projects = {SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}
+    if request.repo:
+        open_projects.add(request.repo)
+    return AccessScope(
+        user_id=principal_user_id,
+        open_projects=frozenset(open_projects),
+        member_projects=frozenset(),
+        include_private=True,
+        allowed_statuses=allowed_search_statuses(False),
+        active_project=request.repo,
+        scope_mode="project-first",
+    )
+
+
+async def _search_memories(
+    engine: "SearchEngine",
+    request: AgentHookContextRequest,
+    scope: AccessScope,
     limit: int,
 ) -> list[dict[str, Any]]:
     terms = _query_terms(request)
     if not terms:
         return []
-
-    conditions = ["m.status = 'active'"]
-    params: list[Any] = []
-    if request.repo:
-        conditions.append("(m.project_key IS NULL OR m.project_key = ?)")
-        params.append(request.repo)
-
-    like_clause = " OR ".join(["m.content LIKE ?" for _ in terms])
-    tag_clause = " OR ".join(["m.tags LIKE ?" for _ in terms])
-    conditions.append(f"({like_clause} OR {tag_clause})")
-    params.extend([f"%{term}%" for term in terms])
-    params.extend([f"%{term}%" for term in terms])
-    params.append(limit)
-
-    query = f"""
-        SELECT m.*
-        FROM memories m
-        WHERE {" AND ".join(conditions)}
-        ORDER BY
-            CASE m.memory_type
-                WHEN 'decision' THEN 0
-                WHEN 'convention' THEN 1
-                WHEN 'procedure' THEN 2
-                ELSE 3
-            END,
-            m.confidence DESC,
-            m.updated_at DESC
-        LIMIT ?
-    """
-    results: list[dict[str, Any]] = []
-    async with db.db.execute(query, params) as cursor:
-        async for row in cursor:
-            data = dict(row)
-            results.append({
-                "id": data["id"],
-                "memory_type": data["memory_type"],
-                "content": data["content"],
-                "confidence": data["confidence"],
-                "project_key": data.get("project_key"),
-                "tags": json.loads(data.get("tags") or "[]"),
-                "updated_at": data.get("updated_at"),
-            })
-    return results
+    query = " ".join(terms)
+    result = await engine.search(query, top_k=limit, request_scope=scope)
+    rows: list[dict[str, Any]] = []
+    for row in result.get("results", []):
+        if row.memory_id is None:
+            continue
+        rows.append({
+            "id": row.memory_id,
+            "memory_type": row.memory_type,
+            "content": row.summary,
+            "confidence": row.confidence,
+            "tags": list(row.tags),
+        })
+    return rows
 
 
 async def _recent_memory_changes(
     db: Database,
     request: AgentHookContextRequest,
+    scope: AccessScope,
     *,
     limit: int,
 ) -> list[dict[str, Any]]:
     since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-    conditions = ["updated_at >= ?", "status = 'active'"]
-    params: list[Any] = [since]
+    predicate_sql, predicate_params = visible_sql(scope, "m")
+    conditions = [predicate_sql, "m.updated_at >= ?"]
+    params: list[Any] = list(predicate_params)
+    params.append(since)
     if request.repo:
-        conditions.append("(project_key IS NULL OR project_key = ?)")
+        conditions.append("(m.project_key IS NULL OR m.project_key = ?)")
         params.append(request.repo)
     params.append(limit)
-    query = """
-        SELECT id, memory_type, content, status, updated_at
-        FROM memories
-        WHERE {conditions}
-        ORDER BY updated_at DESC
+    query = f"""
+        SELECT m.id, m.memory_type, m.content, m.status, m.updated_at
+        FROM memories m
+        WHERE {" AND ".join(conditions)}
+        ORDER BY m.updated_at DESC
         LIMIT ?
-    """.format(conditions=" AND ".join(conditions))
+    """
     results: list[dict[str, Any]] = []
     async with db.db.execute(query, params) as cursor:
         async for row in cursor:

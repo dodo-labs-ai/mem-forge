@@ -164,8 +164,16 @@ class SearchEngine:
         entities: list[str] | None = None,
         include_superseded: bool = False,
         top_k: int = 10,
+        *,
+        request_scope: AccessScope | None = None,
     ) -> dict:
         """Unified search: memories (primary) + documents (fallback).
+
+        The keyword-only ``request_scope`` carries the per-request access
+        predicate (caller identity, project openness, the private-branch
+        toggle). Existing positional callers see the permissive single-
+        datastore default; surfaces that build a real scope (the admin API,
+        the agent-hook channel) opt in by passing one.
 
         Returns
         -------
@@ -176,6 +184,7 @@ class SearchEngine:
             ``retrieval_time_ms``: wall-clock milliseconds for the entire search.
         """
         t0 = time.monotonic()
+        scope = request_scope or _default_access_scope(include_superseded)
 
         # ----- 1. Build known entities dict for query analysis -----
         known_entities = await self._build_known_entities()
@@ -224,20 +233,20 @@ class SearchEngine:
 
         # Vector search is always on
         tasks.append(asyncio.ensure_future(
-            self._vector_search(query, memory_types, sources, include_superseded, fetch_k)
+            self._vector_search(query, memory_types, sources, scope, fetch_k)
         ))
         channel_names.append("vector")
 
         # BM25 is always on
         tasks.append(asyncio.ensure_future(
-            self._bm25_search(query, analysis, memory_types, sources, include_superseded, fetch_k)
+            self._bm25_search(query, analysis, memory_types, sources, scope, fetch_k)
         ))
         channel_names.append("bm25")
 
         # Graph traversal — only when entities detected
         if analysis.use_graph and analysis.detected_entity_ids:
             tasks.append(asyncio.ensure_future(
-                self._graph_search(analysis.detected_entity_ids, memory_types, include_superseded, fetch_k)
+                self._graph_search(analysis.detected_entity_ids, memory_types, scope, fetch_k)
             ))
             channel_names.append("graph")
 
@@ -248,7 +257,7 @@ class SearchEngine:
                     analysis.temporal_start,
                     analysis.temporal_end,
                     memory_types,
-                    include_superseded,
+                    scope,
                     fetch_k,
                 )
             ))
@@ -267,7 +276,7 @@ class SearchEngine:
 
         # ----- 5. Fuse via RRF, then apply the source-of-truth re-checks -----
         fused = self._rrf_fusion(channel_results, k=self._config.rrf_k)
-        fused = await self._filter_candidates_by_status(fused, include_superseded)
+        fused = await self._filter_candidates_by_status(fused, scope)
         if sources:
             supported = await self._relational.filter_ids_supported_by_sources(
                 [c.memory_id for c in fused], sources
@@ -319,7 +328,7 @@ class SearchEngine:
         query: str,
         memory_types: list[str] | None,
         sources: list[str] | None,
-        include_superseded: bool,
+        scope: AccessScope,
         limit: int,
     ) -> list[tuple[str, float]]:
         """Embed the query via cache, then query the vector channel.
@@ -332,7 +341,6 @@ class SearchEngine:
         embedding = self._get_or_compute_embedding(query)
         if embedding is None:
             return []
-        scope = _default_access_scope(include_superseded)
         return await self._vector.query(embedding, scope, memory_types, limit)
 
     async def _bm25_search(
@@ -341,7 +349,7 @@ class SearchEngine:
         analysis: QueryAnalysis,
         memory_types: list[str] | None,
         sources: list[str] | None,
-        include_superseded: bool,
+        scope: AccessScope,
         limit: int,
     ) -> list[tuple[str, float]]:
         """Query the keyword channel with optional alias expansion.
@@ -355,18 +363,16 @@ class SearchEngine:
         fts_query = _sanitize_fts_query(expanded)
         if not fts_query:
             return []
-        scope = _default_access_scope(include_superseded)
         return await self._keyword.search(fts_query, scope, memory_types, limit)
 
     async def _graph_search(
         self,
         entity_ids: list[int],
         memory_types: list[str] | None,
-        include_superseded: bool,
+        scope: AccessScope,
         limit: int,
     ) -> list[tuple[str, float]]:
         """Entity-graph traversal via the relational channel."""
-        scope = _default_access_scope(include_superseded)
         return await self._relational.graph_search(
             entity_ids, scope, memory_types, limit
         )
@@ -376,11 +382,10 @@ class SearchEngine:
         start: datetime | None,
         end: datetime | None,
         memory_types: list[str] | None,
-        include_superseded: bool,
+        scope: AccessScope,
         limit: int,
     ) -> list[tuple[str, float]]:
         """SQL date-range filter via the relational channel."""
-        scope = _default_access_scope(include_superseded)
         return await self._relational.temporal_search(
             start, end, scope, memory_types, limit
         )
@@ -419,12 +424,11 @@ class SearchEngine:
     async def _filter_candidates_by_status(
         self,
         candidates: list[_RankedCandidate],
-        include_superseded: bool,
+        scope: AccessScope,
     ) -> list[_RankedCandidate]:
         """Apply the source-of-truth visibility re-check after channel fusion."""
         if not candidates:
             return []
-        scope = _default_access_scope(include_superseded)
         visible = await self._relational.filter_visible_ids(
             [c.memory_id for c in candidates], scope
         )

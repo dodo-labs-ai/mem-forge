@@ -1008,6 +1008,12 @@ class GeneSyncOrchestrator:
             source_id=source_id,
             doc_id=doc_id,
         )
+        # The gene exposes the uploader as a write-time hint on source_semantics.
+        # The sync pipeline forwards it to the memory engine so the new memory
+        # carries the uploader's owner_user_id at persistence time. This stays a
+        # write-time signal only: read-time visibility is decided by the access
+        # predicate, never by this hint.
+        uploader_user_id = normalized.source_semantics.get("uploader_user_id")
         if extraction_result.error_type:
             logger.warning(
                 "Skipping memory persistence for %s after extraction failure: %s",
@@ -1027,6 +1033,7 @@ class GeneSyncOrchestrator:
                 changed_hunks=update_plan.changed_hunks if update_plan else None,
                 update_plan_stats=self._document_update_plan_stats(update_plan),
                 audit_context=memory_context,
+                user_id=uploader_user_id,
             )
             stats["memories_extracted"] = memory_stats.get("added", 0)
             stats["memories_corroborated"] = memory_stats.get("updated", 0)
@@ -1038,6 +1045,7 @@ class GeneSyncOrchestrator:
                 project_key=project_key,
                 entity_ids=entity_ids,
                 audit_context=memory_context,
+                user_id=uploader_user_id,
             )
             stats["memories_extracted"] = memory_stats.get("inserted", 0)
             stats["memories_corroborated"] = memory_stats.get("corroborated", 0)

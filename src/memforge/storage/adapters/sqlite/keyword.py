@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from memforge.retrieval.access_predicate import visible_sql
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope
 
@@ -37,13 +38,11 @@ class SqliteKeywordSearch:
         memory_types: list[str] | None,
         limit: int,
     ) -> list[tuple[str, float]]:
+        predicate_sql, predicate_params = visible_sql(scope, "m")
         conditions = ["memories_fts MATCH ?"]
         params: list[Any] = [fts_query]
-
-        statuses = scope.allowed_statuses
-        status_placeholders = ",".join("?" for _ in statuses)
-        conditions.append(f"m.status IN ({status_placeholders})")
-        params.extend(statuses)
+        conditions.append(predicate_sql)
+        params.extend(predicate_params)
 
         if memory_types:
             type_placeholders = ",".join("?" for _ in memory_types)

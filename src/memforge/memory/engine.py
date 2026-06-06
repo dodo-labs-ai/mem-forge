@@ -154,6 +154,7 @@ class MemoryEngine:
         project_key: str | None = None,
         entity_ids: list[int] | None = None,
         audit_context: Any | None = None,
+        user_id: str | None = None,
     ) -> dict:
         """Process extracted memories: build, dedup, and persist.
 
@@ -166,7 +167,7 @@ class MemoryEngine:
                 continue
 
             # Build memory object
-            visibility, owner_user_id = default_visibility(source_type)
+            visibility, owner_user_id = default_visibility(source_type, user_id=user_id)
             memory = Memory(
                 id=generate_memory_id(),
                 memory_type=raw.memory_type,
@@ -265,6 +266,7 @@ class MemoryEngine:
         changed_hunks: str | None = None,
         update_plan_stats: dict[str, Any] | None = None,
         audit_context: Any | None = None,
+        user_id: str | None = None,
     ) -> dict:
         """Process memories with LLM reconciliation against existing memories.
 
@@ -303,6 +305,7 @@ class MemoryEngine:
                 project_key=project_key,
                 entity_ids=entity_ids,
                 audit_context=audit_context,
+                user_id=user_id,
             )
             stats["added"] = result.get("inserted", 0)
             stats["skipped"] = result.get("skipped", 0)
@@ -334,6 +337,7 @@ class MemoryEngine:
                 project_key=project_key,
                 entity_ids=entity_ids,
                 audit_context=audit_context,
+                user_id=user_id,
             )
             stats["added"] = result.get("inserted", 0)
             stats["skipped"] += result.get("skipped", 0)
@@ -409,6 +413,7 @@ class MemoryEngine:
                             source_type=source_type,
                             project_key=project_key,
                             stats=stats,
+                            user_id=user_id,
                         ):
                             continue
                     else:
@@ -457,6 +462,7 @@ class MemoryEngine:
                             source_type=source_type,
                             project_key=project_key,
                             stats=stats,
+                            user_id=user_id,
                         ):
                             continue
                     elif op.memory_id:
@@ -473,7 +479,7 @@ class MemoryEngine:
                 if op.action == ReconcileAction.ADD and op.memory:
                     if not self._candidate_can_persist(op.memory, stats):
                         continue
-                    memory = self._build_memory(op.memory, project_key, source_type)
+                    memory = self._build_memory(op.memory, project_key, source_type, user_id=user_id)
                     memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
                     result = await self.memory_store.deduplicate_and_insert(
                         memory=memory,
@@ -500,7 +506,7 @@ class MemoryEngine:
                 elif op.action == ReconcileAction.SUPERSEDE and op.memory_id and op.memory:
                     if not self._candidate_can_persist(op.memory, stats):
                         continue
-                    new_memory = self._build_memory(op.memory, project_key, source_type)
+                    new_memory = self._build_memory(op.memory, project_key, source_type, user_id=user_id)
                     memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
                     await self.memory_store.supersede_memory(
                         old_memory_id=op.memory_id,
@@ -627,11 +633,12 @@ class MemoryEngine:
         source_type: str,
         project_key: str | None,
         stats: dict,
+        user_id: str | None = None,
     ) -> bool:
         """Insert a hidden challenger and create a review case for a replacement."""
         if not op.memory or not self._candidate_can_persist(op.memory, stats):
             return False
-        challenger = self._build_memory(op.memory, project_key, source_type)
+        challenger = self._build_memory(op.memory, project_key, source_type, user_id=user_id)
         challenger.status = "pending_review"
         memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
         await self.memory_store.insert_memory(
@@ -783,9 +790,15 @@ class MemoryEngine:
         )
         return False
 
-    def _build_memory(self, raw: RawMemory, project_key: str | None, source_type: str) -> Memory:
+    def _build_memory(
+        self,
+        raw: RawMemory,
+        project_key: str | None,
+        source_type: str,
+        user_id: str | None = None,
+    ) -> Memory:
         """Build a Memory object from a RawMemory."""
-        visibility, owner_user_id = default_visibility(source_type)
+        visibility, owner_user_id = default_visibility(source_type, user_id=user_id)
         return Memory(
             id=generate_memory_id(),
             memory_type=raw.memory_type,

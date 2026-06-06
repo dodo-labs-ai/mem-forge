@@ -28,6 +28,7 @@ from memforge.models import (
     MemoryReviewRelatedChallenger,
     MemorySource,
     SyncState,
+    UNSORTED_PROJECT_KEY,
     Visibility,
 )
 from memforge.memory.audit import MemoryAuditEvent
@@ -83,6 +84,13 @@ def _validate_visibility(visibility: str, owner_user_id: str | None) -> None:
             "owner_user_id must be set iff visibility is private "
             f"(visibility={visibility!r}, owner_user_id={owner_user_id!r})"
         )
+
+
+def _normalize_project_key(project_key: str | None) -> str:
+    """Every persisted memory carries a non-NULL project_key; an unsupplied key
+    lands in the UNSORTED backlog so the access predicate can use simple IN
+    semantics without SQL three-valued NULL traps."""
+    return project_key or UNSORTED_PROJECT_KEY
 
 
 def _entity_from_row(d: dict) -> Entity:
@@ -362,6 +370,14 @@ CREATE TABLE IF NOT EXISTS users (
     role            TEXT NOT NULL DEFAULT 'viewer',
     last_login      TEXT,
     created_at      TEXT DEFAULT (datetime('now'))
+);
+
+-- ---------------------------------------------------------------
+-- Projects (stub table referenced by the access predicate's dangling-key
+-- fallback; per-project metadata lives elsewhere and is filled in later).
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS projects (
+    project_key TEXT PRIMARY KEY
 );
 
 -- ---------------------------------------------------------------
@@ -777,6 +793,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         "WHERE project_key IS NULL AND scope = 'team'",
         "UPDATE memories SET project_key = 'UNSORTED' WHERE project_key IS NULL",
     ]),
+    (16, "Backfill NULL project_key to UNSORTED and add the projects stub table", [
+        # The CREATE TABLE matches SCHEMA above; running it in a migration covers
+        # any database that already passed connect() before SCHEMA carried it.
+        "CREATE TABLE IF NOT EXISTS projects (project_key TEXT PRIMARY KEY)",
+        f"UPDATE memories SET project_key = '{UNSORTED_PROJECT_KEY}' "
+        "WHERE project_key IS NULL",
+    ]),
 ]
 
 
@@ -1179,6 +1202,7 @@ class Database:
     async def insert_memory(self, mem: Memory) -> str:
         """Insert a memory and its FTS5 row. Returns the memory id."""
         _validate_visibility(mem.visibility, mem.owner_user_id)
+        project_key = _normalize_project_key(mem.project_key)
         async with self._write_lock:
             now = _now_iso()
             status = normalize_memory_status(mem.status)
@@ -1193,7 +1217,7 @@ class Database:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     mem.id, mem.memory_type, mem.content, mem.content_hash,
-                    json.dumps(mem.tags), mem.visibility, mem.owner_user_id, mem.project_key,
+                    json.dumps(mem.tags), mem.visibility, mem.owner_user_id, project_key,
                     mem.confidence, mem.corroboration_count,
                     mem.contradiction_count,
                     mem.valid_from.isoformat() if mem.valid_from else None,
@@ -1461,6 +1485,7 @@ class Database:
     ) -> None:
         """Restore one memory row and its FTS visibility from a captured snapshot."""
         _validate_visibility(memory.visibility, memory.owner_user_id)
+        project_key = _normalize_project_key(memory.project_key)
         entity_names = await self.get_memory_entity_names(memory.id)
         tags_text = " ".join(memory.tags)
         entities_text = " ".join(entity_names)
@@ -1483,7 +1508,7 @@ class Database:
                     json.dumps(memory.tags),
                     memory.visibility,
                     memory.owner_user_id,
-                    memory.project_key,
+                    project_key,
                     memory.confidence,
                     memory.corroboration_count,
                     memory.contradiction_count,
@@ -1584,6 +1609,7 @@ class Database:
     ) -> None:
         """Mark old memory as superseded and insert the new one."""
         _validate_visibility(new_memory.visibility, new_memory.owner_user_id)
+        project_key = _normalize_project_key(new_memory.project_key)
         async with self._write_lock:
             now = _now_iso()
             new_status = normalize_memory_status(new_memory.status)
@@ -1599,7 +1625,7 @@ class Database:
                 (
                     new_memory.id, new_memory.memory_type, new_memory.content,
                     new_memory.content_hash, json.dumps(new_memory.tags),
-                    new_memory.visibility, new_memory.owner_user_id, new_memory.project_key,
+                    new_memory.visibility, new_memory.owner_user_id, project_key,
                     new_memory.confidence, new_memory.corroboration_count,
                     new_memory.contradiction_count,
                     new_memory.valid_from.isoformat() if new_memory.valid_from else None,
