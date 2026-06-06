@@ -43,6 +43,7 @@ from memforge.memory.index_payloads import (
     document_embedding_text,
     embedding_text_hash,
 )
+from memforge.memory.visibility_policy import default_visibility
 
 if TYPE_CHECKING:
     from memforge.genes.base import Gene
@@ -1051,6 +1052,9 @@ class GeneSyncOrchestrator:
             stats["memories_corroborated"] = memory_stats.get("corroborated", 0)
 
         if not extraction_result.error_type and self.source_support_detector:
+            writer_visibility, writer_owner_user_id = default_visibility(
+                source_type, user_id=uploader_user_id,
+            )
             async with self._llm_semaphore:
                 support_stats = await self.source_support_detector.detect_and_persist(
                     doc_id=doc_id,
@@ -1060,6 +1064,9 @@ class GeneSyncOrchestrator:
                     project_key=project_key,
                     db=self.db,
                     memory_store=self.memory_store,
+                    writer_visibility=writer_visibility,
+                    writer_owner_user_id=writer_owner_user_id,
+                    writer_project_key=project_key,
                 )
             stats["memory_supports_added"] = support_stats.get("added", 0)
             stats["memory_supports_updated"] = support_stats.get("updated", 0)

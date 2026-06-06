@@ -16,7 +16,13 @@ from memforge.memory.index_payloads import (
     memory_embedding_text,
 )
 from memforge.memory.lifecycle import allowed_search_statuses
-from memforge.models import Memory, Visibility
+from memforge.models import (
+    Memory,
+    MemoryStatus,
+    SHARED_PROJECT_KEY,
+    UNSORTED_PROJECT_KEY,
+    Visibility,
+)
 from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
@@ -29,19 +35,34 @@ __all__ = ["MemoryStore"]
 DEDUP_CANDIDATE_LIMIT = 10
 
 
-def _dedup_access_scope() -> AccessScope:
-    """The permissive single-datastore scope for dedup candidate selection.
+def _writer_access_scope(memory: Memory) -> AccessScope:
+    """The dedup scope a writer of this memory must use.
 
-    In Phase 0 this matches the historical where={"status":"active"} filter;
-    the per-writer access narrowing activates in a later phase.
+    A private writer's pool is its own private set; a workspace writer's
+    pool is workspace rows in the same project. Cross-visibility merges
+    are blocked by the access predicate plus the visibility-mismatch
+    guard in deduplicate_and_insert.
     """
+    open_projects = {SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}
+    if memory.project_key:
+        open_projects.add(memory.project_key)
+    if memory.visibility == Visibility.PRIVATE.value:
+        return AccessScope(
+            user_id=memory.owner_user_id or LOCAL_DEV_USER_ID,
+            open_projects=frozenset(open_projects),
+            member_projects=frozenset(),
+            include_private=True,
+            allowed_statuses=(MemoryStatus.ACTIVE.value,),
+            active_project=memory.project_key,
+            scope_mode="project-first",
+        )
     return AccessScope(
         user_id=LOCAL_DEV_USER_ID,
-        open_projects=frozenset(),
+        open_projects=frozenset(open_projects),
         member_projects=frozenset(),
         include_private=False,
-        allowed_statuses=("active",),
-        active_project=None,
+        allowed_statuses=(MemoryStatus.ACTIVE.value,),
+        active_project=memory.project_key,
         scope_mode="project-first",
     )
 
@@ -160,7 +181,7 @@ class MemoryStore:
 
         # Query the vector channel for near-duplicates.
         try:
-            dedup_scope = scope or _dedup_access_scope()
+            dedup_scope = scope or _writer_access_scope(memory)
             candidates = await self.vector.query(
                 embedding, dedup_scope, None, DEDUP_CANDIDATE_LIMIT
             )
@@ -204,6 +225,30 @@ class MemoryStore:
                 )
                 continue
 
+            # The predicate decides what the writer can SEE; dedup is a write-side
+            # decision that adds two narrower rules on top of "visible candidates":
+            #   1. Same visibility tier: a private write must not corroborate a team row,
+            #      and vice versa, even when the predicate exposes both.
+            #   2. Same project scope:
+            #      - workspace candidates must share project_key with the writer
+            #        (vector channel does not pre-filter by project; cross-project
+            #        merges would otherwise leak across project boundaries).
+            #      - private candidates must share owner_user_id with the writer
+            #        (private dedups against the same user's set only).
+            if existing.visibility != memory.visibility:
+                continue
+            if memory.visibility == Visibility.WORKSPACE.value:
+                # NULL project_key is normalized to UNSORTED at persistence time,
+                # so apply the same normalization on both sides of the comparison
+                # to keep same-project candidates eligible for corroboration.
+                writer_project = memory.project_key or UNSORTED_PROJECT_KEY
+                candidate_project = existing.project_key or UNSORTED_PROJECT_KEY
+                if writer_project != candidate_project:
+                    continue
+            if (memory.visibility == Visibility.PRIVATE.value
+                    and existing.owner_user_id != memory.owner_user_id):
+                continue
+
             # Near-duplicate found, corroborate instead of creating.
             await self.add_source_support(
                 existing_id,
@@ -212,6 +257,9 @@ class MemoryStore:
                 excerpt,
                 support_kind="extracted",
                 context=context,
+                writer_visibility=memory.visibility,
+                writer_owner_user_id=memory.owner_user_id,
+                writer_project_key=memory.project_key,
             )
             logger.debug(
                 "Memory corroborated: %s (score=%.4f, doc=%s)",
@@ -674,9 +722,38 @@ class MemoryStore:
         *,
         support_kind: str = "extracted",
         context: AuditContext | None = None,
+        writer_visibility: str | None = None,
+        writer_owner_user_id: str | None = None,
+        writer_project_key: str | None = None,
     ) -> str:
-        """Add or update source support for an existing memory."""
+        """Add or update source support for an existing memory.
+
+        The mutating boundary for support edges. Outcomes are
+        ``"inserted"``, ``"updated"``, ``"unchanged"``, ``"missing"``,
+        or ``"rejected"`` when the writer's visibility, owner, or
+        project does not match the target. Support edges never cross
+        a visibility, owner, or project boundary.
+        """
         context = context or self._operation_context(doc_id=doc_id)
+        target = await self.db.get_memory(memory_id)
+        if target is None:
+            return "missing"
+        if writer_visibility is not None and writer_visibility != target.visibility:
+            return "rejected"
+        if (
+            writer_visibility == Visibility.PRIVATE.value
+            and writer_owner_user_id != target.owner_user_id
+        ):
+            return "rejected"
+        if writer_visibility == Visibility.WORKSPACE.value:
+            # NULL project_key is normalized to UNSORTED at persistence time, so
+            # apply the same normalization on both sides of the comparison to
+            # keep the workspace-project boundary symmetric across writers and
+            # targets.
+            expected = writer_project_key or UNSORTED_PROJECT_KEY
+            actual = target.project_key or UNSORTED_PROJECT_KEY
+            if expected != actual:
+                return "rejected"
         await self._emit(
             "source_support_add_attempted",
             "attempted",

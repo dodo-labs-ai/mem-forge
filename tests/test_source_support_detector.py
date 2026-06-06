@@ -176,6 +176,9 @@ async def test_detect_and_persist_routes_corroborated_support_through_store(db: 
             *,
             support_kind: str = "extracted",
             context=None,
+            writer_visibility: str | None = None,
+            writer_owner_user_id: str | None = None,
+            writer_project_key: str | None = None,
         ) -> str:
             self.calls.append((memory_id, doc_id, source_type, excerpt, support_kind))
             return "inserted"
@@ -240,6 +243,9 @@ async def test_existing_support_refresh_routes_through_store(db: Database):
             *,
             support_kind: str = "extracted",
             context=None,
+            writer_visibility: str | None = None,
+            writer_owner_user_id: str | None = None,
+            writer_project_key: str | None = None,
         ) -> str:
             self.calls.append((memory_id, doc_id, source_type, excerpt, support_kind))
             return "updated"

@@ -97,8 +97,18 @@ async def get_effective_llm_config(db: "Database", config: AppConfig) -> Effecti
     )
 
 
-async def build_search_engine(db: "Database", config: AppConfig) -> Any:
-    """Build the service-owned retrieval engine used by HTTP and agent-proxy clients."""
+async def build_search_engine(
+    db: "Database",
+    config: AppConfig,
+    *,
+    audit_logger: MemoryAuditLogger | None = None,
+) -> Any:
+    """Build the service-owned retrieval engine used by HTTP and agent-proxy clients.
+
+    The optional audit logger is threaded into the relational adapter so any
+    promote-to-workspace path reachable through the engine records its attempts
+    on the same audit channel as the rest of the runtime.
+    """
     from memforge.retrieval.search import SearchEngine
 
     memory_collection = get_chroma_collection(
@@ -121,7 +131,7 @@ async def build_search_engine(db: "Database", config: AppConfig) -> Any:
                 timeout_s=llm.request_timeout_s,
             )
         )
-    adapters = build_sqlite_adapters(db, memory_collection)
+    adapters = build_sqlite_adapters(db, memory_collection, audit_logger=audit_logger)
     return SearchEngine(
         relational=adapters.relational,
         keyword=adapters.keyword,
@@ -177,7 +187,13 @@ async def build_sync_runtime(db: "Database", config: AppConfig) -> SyncRuntime:
         "api_key": llm.embedding_api_key,
         "model": llm.embedding_model,
     }
-    adapters = build_sqlite_adapters(db, memory_collection)
+    adapters = build_sqlite_adapters(
+        db,
+        memory_collection,
+        audit_logger=MemoryAuditLogger(
+            db, default_context=AuditContext(actor_type="sync")
+        ),
+    )
     memory_store = MemoryStore(
         relational=adapters.relational,
         keyword=adapters.keyword,

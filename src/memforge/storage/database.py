@@ -12,7 +12,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import aiosqlite
 
@@ -1933,12 +1933,40 @@ class Database:
         entity_ids: list[int],
         project_key: str | None = None,
         limit: int = 30,
+        writer_visibility: str | None = None,
+        writer_owner_user_id: str | None = None,
+        writer_project_key: str | None = None,
     ) -> list[Memory]:
-        """Rank active memories that may be supported by the current document."""
+        """Rank active memories that may be supported by the current document.
+
+        When ``writer_visibility`` is provided, the candidate pool is narrowed
+        to the same visibility tier as the writer; private writers see only
+        their own owner's set, and workspace writers see only candidates in
+        their own project. Callers that omit the writer args (legacy and tests)
+        receive the unscoped pool.
+        """
         if not entity_ids:
             return []
 
         placeholders = ",".join("?" for _ in entity_ids)
+        scope_clauses: list[str] = []
+        scope_params: list[Any] = []
+        if writer_visibility is not None:
+            scope_clauses.append("AND m.visibility = ?")
+            scope_params.append(writer_visibility)
+            if (
+                writer_visibility == Visibility.PRIVATE.value
+                and writer_owner_user_id is not None
+            ):
+                scope_clauses.append("AND m.owner_user_id = ?")
+                scope_params.append(writer_owner_user_id)
+            if writer_visibility == Visibility.WORKSPACE.value:
+                # NULL project_key is normalized to UNSORTED at persistence
+                # time; resolve the writer side the same way so the candidate
+                # pool stays inside one project boundary.
+                scope_clauses.append("AND m.project_key = ?")
+                scope_params.append(writer_project_key or UNSORTED_PROJECT_KEY)
+        scope_sql = ("\n              " + "\n              ".join(scope_clauses)) if scope_clauses else ""
         sql = f"""
             SELECT m.*,
                    COUNT(DISTINCT me.entity_id) AS entity_overlap,
@@ -1946,7 +1974,7 @@ class Database:
             FROM memories m
             JOIN memory_entities me ON m.id = me.memory_id
             WHERE me.entity_id IN ({placeholders})
-              AND m.status = 'active'
+              AND m.status = 'active'{scope_sql}
               AND NOT EXISTS (
                   SELECT 1 FROM memory_sources ms
                   WHERE ms.memory_id = m.id AND ms.doc_id = ?
@@ -1959,7 +1987,7 @@ class Database:
                      m.updated_at DESC
             LIMIT ?
         """
-        params = [project_key, project_key, *entity_ids, doc_id, limit]
+        params = [project_key, project_key, *entity_ids, *scope_params, doc_id, limit]
         results: list[Memory] = []
         async with self.db.execute(sql, params) as cursor:
             async for row in cursor:

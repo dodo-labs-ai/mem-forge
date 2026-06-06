@@ -1567,7 +1567,13 @@ async def _build_memory_store(db: Database, config: AppConfig) -> MemoryStore:
         "api_key": llm.embedding_api_key,
         "model": llm.embedding_model,
     }
-    adapters = build_sqlite_adapters(db, memory_collection)
+    adapters = build_sqlite_adapters(
+        db,
+        memory_collection,
+        audit_logger=MemoryAuditLogger(
+            db, default_context=AuditContext(actor_type="admin")
+        ),
+    )
     return MemoryStore(
         relational=adapters.relational,
         keyword=adapters.keyword,
@@ -1857,11 +1863,18 @@ def create_admin_app(
     llm_router = APIRouter(prefix="/api/llm-config", tags=["llm-config"])
 
     async def get_search_engine(request: Request, db: Database, config: AppConfig):
+        from memforge.memory.audit import AuditContext, MemoryAuditLogger
         from memforge.runtime import build_search_engine
 
         engine = getattr(request.app.state, "memory_search_engine", None)
         if engine is None:
-            engine = await build_search_engine(db, config)
+            engine = await build_search_engine(
+                db,
+                config,
+                audit_logger=MemoryAuditLogger(
+                    db, default_context=AuditContext(actor_type="admin")
+                ),
+            )
             request.app.state.memory_search_engine = engine
         return engine
 

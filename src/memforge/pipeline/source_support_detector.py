@@ -79,6 +79,9 @@ class SourceSupportDetector:
         project_key: str | None,
         db: Database,
         memory_store: MemoryStore,
+        writer_visibility: str | None = None,
+        writer_owner_user_id: str | None = None,
+        writer_project_key: str | None = None,
     ) -> dict[str, int]:
         """Attach corroborated provenance for supported existing memories."""
         stats = {
@@ -148,6 +151,9 @@ class SourceSupportDetector:
                 source_type=source_type,
                 document=document,
                 stats=stats,
+                writer_visibility=writer_visibility,
+                writer_owner_user_id=writer_owner_user_id,
+                writer_project_key=writer_project_key,
             )
         elif existing_sources:
             stats["removed_stale"] += await self._remove_stale_sources(
@@ -165,6 +171,9 @@ class SourceSupportDetector:
             entity_ids=entity_ids,
             project_key=project_key,
             limit=self.max_candidates,
+            writer_visibility=writer_visibility,
+            writer_owner_user_id=writer_owner_user_id,
+            writer_project_key=writer_project_key,
         )
         candidates_by_id: dict[str, Memory] = {memory.id: memory for memory in candidates}
 
@@ -245,6 +254,9 @@ class SourceSupportDetector:
                 excerpt,
                 support_kind="corroborated",
                 context=audit_context,
+                writer_visibility=writer_visibility,
+                writer_owner_user_id=writer_owner_user_id,
+                writer_project_key=writer_project_key,
             )
             stats["checked"] += 1
             if outcome == "inserted":
@@ -267,6 +279,9 @@ class SourceSupportDetector:
         source_type: str,
         document: str,
         stats: dict[str, int],
+        writer_visibility: str | None = None,
+        writer_owner_user_id: str | None = None,
+        writer_project_key: str | None = None,
     ) -> int:
         refreshed_existing_ids: set[str] = set()
         remove_ids: set[str] = set()
@@ -331,6 +346,9 @@ class SourceSupportDetector:
                 excerpt,
                 support_kind="corroborated",
                 context=audit_context,
+                writer_visibility=writer_visibility,
+                writer_owner_user_id=writer_owner_user_id,
+                writer_project_key=writer_project_key,
             )
             stats["checked"] += 1
             if outcome == "updated":
