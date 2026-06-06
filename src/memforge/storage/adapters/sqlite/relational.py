@@ -12,12 +12,14 @@ import logging
 from datetime import datetime
 from typing import Any, Sequence
 
+from memforge.memory.audit import MemoryAuditLogger
 from memforge.models import (
     DocumentRecord,
     Entity,
     EntityAlias,
     Memory,
     MemorySource,
+    Visibility,
 )
 from memforge.retrieval.access_predicate import visible_sql
 from memforge.storage.database import Database
@@ -43,8 +45,13 @@ _EXPANSION_WEIGHT = 0.5
 class SqliteRelationalStore:
     """The row channel backed by the memories table."""
 
-    def __init__(self, db: Database) -> None:
+    def __init__(
+        self,
+        db: Database,
+        audit_logger: MemoryAuditLogger | None = None,
+    ) -> None:
         self._db = db
+        self._audit_logger = audit_logger
 
     async def insert_memory(self, memory: Memory) -> str:
         return await self._db.insert_memory(memory)
@@ -77,6 +84,49 @@ class SqliteRelationalStore:
     ) -> None:
         await self._db.add_memory_source(
             memory_id, doc_id, source_type, excerpt, support_kind=support_kind
+        )
+
+    async def promote_to_workspace(
+        self,
+        memory_id: str,
+        *,
+        actor_user_id: str,
+        reason: str,
+    ) -> None:
+        """Flip a private memory to workspace visibility.
+
+        The full flip-and-redo flow (re-stamping vector metadata in place and
+        re-running dedup against the team set) is designed but not yet
+        implemented. This method locks the contract: it verifies the row
+        exists and is private, that the actor owns it, audits the attempt,
+        and then refuses with NotImplementedError. A non-owner caller is
+        rejected before any audit row is written, so a hostile attempt
+        leaves no trail.
+        """
+        target = await self.get_memory(memory_id)
+        if target is None:
+            raise LookupError(f"memory {memory_id!r} not found")
+        if target.visibility != Visibility.PRIVATE.value:
+            raise ValueError(
+                f"memory {memory_id!r} is not private; nothing to promote"
+            )
+        if target.owner_user_id != actor_user_id:
+            raise PermissionError(
+                f"actor {actor_user_id!r} does not own memory {memory_id!r}"
+            )
+        if self._audit_logger is not None:
+            await self._audit_logger.emit(
+                "memory_promoted",
+                "failed",
+                memory_id=memory_id,
+                reason="not_implemented",
+                payload={
+                    "requested_reason": reason,
+                    "actor": actor_user_id,
+                },
+            )
+        raise NotImplementedError(
+            "promote_to_workspace is not yet implemented"
         )
 
     async def filter_visible_ids(

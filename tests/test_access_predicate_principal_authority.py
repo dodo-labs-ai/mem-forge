@@ -74,7 +74,7 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
                     visibility=WORKSPACE, owner=None),
         )
 
-        async def fake_build_search_engine(db, config):
+        async def fake_build_search_engine(db, config, *, audit_logger=None):
             from memforge.config import RetrievalConfig
             from memforge.retrieval.search import SearchEngine
             from memforge.storage.adapters.sqlite import build_sqlite_adapters

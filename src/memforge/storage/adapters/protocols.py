@@ -73,6 +73,22 @@ class RelationalStore(Protocol):
         excerpt: str | None,
         support_kind: str = "extracted",
     ) -> None: ...
+    async def promote_to_workspace(
+        self,
+        memory_id: str,
+        *,
+        actor_user_id: str,
+        reason: str,
+    ) -> None:
+        """Flip a private memory to workspace visibility.
+
+        The full promotion flow (re-stamping vector metadata in place,
+        re-running dedup against the team set) is designed but not yet
+        implemented. Implementations must raise NotImplementedError after
+        auditing the attempt and after verifying the actor owns the row.
+        A non-owner caller must be rejected before any audit emission.
+        """
+        ...
 
 
 @runtime_checkable
