@@ -15,8 +15,6 @@ from memforge.memory.store import MemoryStore
 from memforge.models import (
     DocumentRecord,
     RawMemory,
-    SHARED_PROJECT_KEY,
-    UNSORTED_PROJECT_KEY,
     Visibility,
 )
 from memforge.storage.adapters.context import AccessScope
@@ -77,8 +75,6 @@ async def engine_fixture(tmp_path, monkeypatch):
 def _personalized_scope(user_id: str) -> AccessScope:
     return AccessScope(
         user_id=user_id,
-        open_projects=frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}),
-        member_projects=frozenset(),
         include_private=True,
         allowed_statuses=("active",),
         active_project=None,

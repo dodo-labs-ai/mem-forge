@@ -170,7 +170,9 @@ async def submit_local_markdown_document(
         raise
 
     # The DB upsert refreshes documents_dir so a freshly created source picks
-    # up its inbox even if the gene has not authenticated yet.
+    # up its inbox even if the gene has not authenticated yet. Any
+    # admin-attached project_binding rides through unchanged so this
+    # idempotent refresh never erases admin configuration.
     refreshed_config = dict(source.get("config") or {})
     refreshed_config["documents_dir"] = str(inbox)
     await db.upsert_source(
@@ -178,6 +180,7 @@ async def submit_local_markdown_document(
         type=LOCAL_MARKDOWN_SOURCE_TYPE,
         name=source.get("name") or source_id,
         config_json=json.dumps(refreshed_config),
+        project_binding=source.get("project_binding"),
     )
 
     return {

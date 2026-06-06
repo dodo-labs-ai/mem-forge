@@ -65,7 +65,10 @@ async def test_submit_agent_session_document_records_receipt_and_source_package(
     assert package["markdown"].startswith("# Session Summary")
     documents_root = Path(source["config"]["documents_dir"])
     doc_path = Path(result["document_uri"])
-    assert doc_path == documents_root / "mem-forge" / f"{result['doc_id']}.json"
+    # Without an admin-bound `project_binding`, agent-session documents
+    # land under the UNSORTED bucket. An admin can later attach a
+    # `by_field` binding on `repo` to route per-project.
+    assert doc_path == documents_root / "unsorted" / f"{result['doc_id']}.json"
 
 
 @pytest.mark.asyncio
@@ -92,7 +95,9 @@ async def test_agent_session_gene_discovers_and_normalizes_submitted_documents(d
     items = [item async for item in gene.discover()]
     assert [item.item_id for item in items] == [submitted["doc_id"]]
     assert items[0].source_url.startswith("agent-session://claude-code/sess-456/")
-    assert items[0].space_or_project == "mem-forge"
+    # No binding on the source: project resolves to UNSORTED rather than
+    # leaking the workspace basename or the repo into the project key.
+    assert items[0].space_or_project == "UNSORTED"
 
     raw = await gene.fetch(items[0])
     normalized = await gene.normalize(raw)

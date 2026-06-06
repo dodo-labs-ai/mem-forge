@@ -14,8 +14,6 @@ from memforge.storage.adapters.sqlite.vector import SqliteVectorStore
 def _scope() -> AccessScope:
     return AccessScope(
         user_id=LOCAL_DEV_USER_ID,
-        open_projects=frozenset(),
-        member_projects=frozenset(),
         include_private=False,
         allowed_statuses=("active",),
         active_project=None,

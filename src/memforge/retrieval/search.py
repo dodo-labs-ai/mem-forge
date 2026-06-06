@@ -22,7 +22,7 @@ from typing import Any
 from memforge.config import AppConfig, RetrievalConfig
 from memforge.llm.structured import StructuredLlmError
 from memforge.memory.lifecycle import allowed_search_statuses
-from memforge.models import Memory, SearchResult
+from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
 from memforge.provenance import document_content_url, document_pdf_url
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.retrieval.query_analyzer import QueryAnalysis, analyze_query
@@ -31,7 +31,27 @@ from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, 
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["SearchEngine"]
+__all__ = [
+    "CROSS_PROJECT_PENALTY",
+    "SearchEngine",
+    "W_RECENCY_DEFAULT",
+    "W_RECENCY_TEMPORAL",
+    "W_RRF_DEFAULT",
+    "W_RRF_TEMPORAL",
+]
+
+
+# Ranking weights for the final score. Standard queries lean on RRF; queries
+# the analyzer flags as temporal lift the recency contribution.
+W_RRF_DEFAULT = 0.85
+W_RECENCY_DEFAULT = 0.15
+W_RRF_TEMPORAL = 0.70
+W_RECENCY_TEMPORAL = 0.30
+
+# Cross-project affinity penalty subtracted in `project-first` mode for any
+# candidate that is neither the active project nor SHARED. Applied after RRF
+# normalization and clamped at zero so a penalized candidate cannot go negative.
+CROSS_PROJECT_PENALTY = 0.20
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +65,30 @@ class _RankedCandidate:
     rrf_score: float = 0.0
     final_score: float = 0.0
     updated_at: datetime | None = None
+    project_key: str | None = None
+
+
+def _affinity_penalty(project_key: str | None, scope: AccessScope) -> float:
+    """Cross-project penalty applied after RRF normalization.
+
+    Returns 0.0 when:
+      - scope_mode is "workspace" (no project narrowing)
+      - the caller did not declare an active_project (legacy callers and
+        the per-id readers have no frame of reference, so every project
+        is treated equally and existing flat ranking is preserved)
+      - project_key is SHARED (the team-wide bucket)
+      - project_key equals scope.active_project (the caller's frame)
+
+    Returns CROSS_PROJECT_PENALTY for every other key including UNSORTED,
+    so unmapped knowledge degrades like any cross-project hit.
+    """
+    if scope.scope_mode == "workspace":
+        return 0.0
+    if scope.active_project is None:
+        return 0.0
+    if project_key == SHARED_PROJECT_KEY or project_key == scope.active_project:
+        return 0.0
+    return CROSS_PROJECT_PENALTY
 
 
 def _age_days(dt: datetime | None) -> float:
@@ -67,8 +111,14 @@ def _recency_score(age_days: float, half_life: float = 90.0) -> float:
 def _sanitize_fts_query(text: str) -> str:
     """Escape characters that are special in FTS5 MATCH syntax.
 
-    FTS5 interprets *, ^, (, ), :, " as operators.  We quote each word to
-    avoid syntax errors on user input that happens to contain them.
+    FTS5 interprets ``*``, ``^``, ``(``, ``)``, ``:``, ``"`` as operators.
+    Each whitespace-separated token is stripped of punctuation and re-quoted
+    as an FTS5 phrase, so the result is always a flat AND of literal phrases.
+
+    This sanitizer is for USER input only. Engine-built FTS5 fragments
+    (parenthesized OR groups, quoted phrases produced by the alias expander,
+    etc.) MUST NOT be passed through this function: it is structure-blind and
+    will demote operators to literal tokens, destroying the query.
     """
     words = text.split()
     safe: list[str] = []
@@ -83,12 +133,9 @@ def _sanitize_fts_query(text: str) -> str:
 
 def _default_access_scope(include_superseded: bool) -> AccessScope:
     """The permissive single-datastore scope: real lifecycle filtering, no
-    access narrowing. The access branches activate in a later phase; here it
-    carries only the status set the request asked for."""
+    access narrowing. Carries only the status set the request asked for."""
     return AccessScope(
         user_id=LOCAL_DEV_USER_ID,
-        open_projects=frozenset(),
-        member_projects=frozenset(),
         include_private=False,
         allowed_statuses=allowed_search_statuses(include_superseded),
         active_project=None,
@@ -170,7 +217,7 @@ class SearchEngine:
         """Unified search: memories (primary) + documents (fallback).
 
         The keyword-only ``request_scope`` carries the per-request access
-        predicate (caller identity, project openness, the private-branch
+        predicate (caller identity, scope mode, and the private-branch
         toggle). Existing positional callers see the permissive single-
         datastore default; surfaces that build a real scope (the admin API,
         the agent-hook channel) opt in by passing one.
@@ -285,7 +332,7 @@ class SearchEngine:
         total_candidates = len(fused)
 
         # ----- 6. Apply ranking -----
-        ranked = await self._apply_ranking(fused, analysis.is_temporal)
+        ranked = await self._apply_ranking(fused, analysis.is_temporal, scope=scope)
 
         # ----- 6b. Optional cross-encoder rerank -----
         ranked = await self._rerank_with_llm(query, ranked, top_k)
@@ -357,12 +404,21 @@ class SearchEngine:
         Source filtering is applied once on the fused set (Step 8), not per
         channel, so this method does not re-check ``sources``.
         """
-        expanded = await self._expand_query_with_aliases(
-            query, analysis.detected_entity_ids
-        )
-        fts_query = _sanitize_fts_query(expanded)
-        if not fts_query:
+        sanitized_query = _sanitize_fts_query(query)
+        if not sanitized_query:
             return []
+        alias_clause = await self._build_alias_clause(
+            analysis.detected_entity_ids, query
+        )
+        # When aliases contribute new terms, broaden recall by ORing them
+        # against the user's phrase list. The user side is wrapped in parens
+        # so its implicit AND binds tighter than the top-level OR; without
+        # the parens FTS5 would attach OR only to the last user phrase.
+        fts_query = (
+            sanitized_query
+            if not alias_clause
+            else f"({sanitized_query}) OR {alias_clause}"
+        )
         return await self._keyword.search(fts_query, scope, memory_types, limit)
 
     async def _graph_search(
@@ -442,19 +498,22 @@ class SearchEngine:
         self,
         candidates: list[_RankedCandidate],
         is_temporal: bool,
+        *,
+        scope: AccessScope,
     ) -> list[_RankedCandidate]:
-        """Apply recency-weighted final ranking.
+        """Apply recency-weighted final ranking with the cross-project penalty.
 
-        ``final_score = w_rrf * rrf_normalized + w_recency * recency``
+        ``final_score = max(0, w_rrf * rrf_normalized + w_recency * recency - penalty)``
 
-        Standard:  w_rrf=0.85, w_recency=0.15
-        Temporal:  w_rrf=0.70, w_recency=0.30
+        Standard:  w_rrf=W_RRF_DEFAULT,  w_recency=W_RECENCY_DEFAULT
+        Temporal:  w_rrf=W_RRF_TEMPORAL, w_recency=W_RECENCY_TEMPORAL
         """
         if not candidates:
             return candidates
 
-        # Fetch updated_at for each candidate via the relational channel.
-        id_to_updated = await self._relational.fetch_updated_at(
+        # Single relational read fetches both ranking inputs (updated_at and
+        # project_key) so the per-channel ranker never needs a second roundtrip.
+        id_to_meta = await self._relational.fetch_ranking_metadata(
             [c.memory_id for c in candidates]
         )
 
@@ -464,15 +523,18 @@ class SearchEngine:
             max_rrf = 1.0
 
         half_life = float(self._config.recency_half_life_days)
-        w_rrf = 0.70 if is_temporal else 0.85
-        w_rec = 0.30 if is_temporal else 0.15
+        w_rrf = W_RRF_TEMPORAL if is_temporal else W_RRF_DEFAULT
+        w_rec = W_RECENCY_TEMPORAL if is_temporal else W_RECENCY_DEFAULT
 
         for c in candidates:
-            c.updated_at = id_to_updated.get(c.memory_id)
+            meta = id_to_meta.get(c.memory_id, {})
+            c.updated_at = meta.get("updated_at")
+            c.project_key = meta.get("project_key")
             rrf_norm = c.rrf_score / max_rrf
             age = _age_days(c.updated_at)
             recency = _recency_score(age, half_life)
-            c.final_score = w_rrf * rrf_norm + w_rec * recency
+            penalty = _affinity_penalty(c.project_key, scope)
+            c.final_score = max(0.0, w_rrf * rrf_norm + w_rec * recency - penalty)
 
         candidates.sort(key=lambda c: c.final_score, reverse=True)
         return candidates
@@ -665,6 +727,7 @@ class SearchEngine:
                 freshness=freshness,
                 contradiction_warning=contradiction_warning,
                 is_document_result=False,
+                status=memory.status,
             ))
 
         return results
@@ -768,17 +831,28 @@ class SearchEngine:
     # Query expansion
     # ==================================================================
 
-    async def _expand_query_with_aliases(
+    async def _build_alias_clause(
         self,
-        query: str,
         entity_ids: list[int],
+        user_query: str,
     ) -> str:
-        """Expand query with known aliases of detected entities for BM25.
+        """Build an FTS5-valid alias OR group for the detected entities.
 
-        Format: ``"original query terms" ("alias1" OR "alias2" OR "canonical")``
+        Returns a string of the form
+        ``("alias1" OR "alias2" OR "canonical")`` ready to be appended next
+        to a separately-sanitized user query, or ``""`` when no aliases
+        contribute new terms. Aliases that already appear in ``user_query``
+        (case-insensitive substring) are skipped, since they would only
+        restate what the user typed.
+
+        The returned fragment is already FTS5-valid: parens, the ``OR``
+        operator, and double-quoted phrases are intentional and load-bearing.
+        It MUST NOT be passed through :func:`_sanitize_fts_query`, which is
+        structure-blind and would demote ``OR`` to a literal token and strip
+        the grouping parens.
         """
         if not entity_ids:
-            return query
+            return ""
 
         alias_terms: list[str] = []
         for eid in entity_ids:
@@ -786,13 +860,13 @@ class SearchEngine:
                 aliases = await self._relational.get_aliases_for_entity(eid)
                 for a in aliases:
                     norm = a.alias_normalized.strip()
-                    if norm and norm.lower() not in query.lower():
+                    if norm and norm.lower() not in user_query.lower():
                         alias_terms.append(norm)
             except Exception:
                 logger.exception("Failed to fetch aliases for entity %d", eid)
 
         if not alias_terms:
-            return query
+            return ""
 
         # De-duplicate while preserving order
         seen: set[str] = set()
@@ -804,7 +878,7 @@ class SearchEngine:
                 unique.append(t)
 
         or_clause = " OR ".join(f'"{t}"' for t in unique)
-        return f"{query} ({or_clause})"
+        return f"({or_clause})"
 
     # ==================================================================
     # Internal helpers

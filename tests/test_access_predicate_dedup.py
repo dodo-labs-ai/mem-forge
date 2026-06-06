@@ -115,8 +115,6 @@ def _writer_scope() -> AccessScope:
     """
     return AccessScope(
         user_id="u-1",
-        open_projects=frozenset({SHARED_PROJECT_KEY}),
-        member_projects=frozenset(),
         include_private=False,
         allowed_statuses=("active",),
         active_project=None,

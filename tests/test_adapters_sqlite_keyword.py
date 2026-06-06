@@ -16,8 +16,6 @@ from memforge.storage.adapters.sqlite.keyword import SqliteKeywordSearch
 def _scope(statuses=("active",)) -> AccessScope:
     return AccessScope(
         user_id=LOCAL_DEV_USER_ID,
-        open_projects=frozenset(),
-        member_projects=frozenset(),
         include_private=False,
         allowed_statuses=statuses,
         active_project=None,

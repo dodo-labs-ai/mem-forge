@@ -1,10 +1,5 @@
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { ChevronDown } from "lucide-react";
+import { cn } from "@/lib/utils";
 
 export interface FilterOption {
   value: string;
@@ -24,27 +19,21 @@ export function FilterSelect({
   label: string;
   className?: string;
 }) {
-  const selectedLabel = options.find((option) => option.value === value)?.label ?? value;
-
   return (
-    <Select<string>
-      value={value}
-      onValueChange={(next) => {
-        if (typeof next === "string") {
-          onChange(next);
-        }
-      }}
-    >
-      <SelectTrigger aria-label={label} className={className ?? "w-full sm:w-40"} size="default">
-        <SelectValue>{selectedLabel}</SelectValue>
-      </SelectTrigger>
-      <SelectContent>
+    <div className={cn("relative", className ?? "w-full sm:w-40")}>
+      <select
+        aria-label={label}
+        value={value}
+        className="h-8 w-full appearance-none rounded-md border border-input bg-background py-1 pl-3 pr-8 text-sm text-foreground shadow-xs outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
+        onChange={(event) => onChange(event.target.value)}
+      >
         {options.map((option) => (
-          <SelectItem key={option.value} value={option.value}>
+          <option key={option.value} value={option.value}>
             {option.label}
-          </SelectItem>
+          </option>
         ))}
-      </SelectContent>
-    </Select>
+      </select>
+      <ChevronDown className="pointer-events-none absolute right-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+    </div>
   );
 }

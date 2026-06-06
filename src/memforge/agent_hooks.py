@@ -20,7 +20,6 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from memforge.memory.lifecycle import allowed_search_statuses
-from memforge.models import SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY
 from memforge.retrieval.access_predicate import visible_sql
 from memforge.storage.adapters.context import AccessScope
 from memforge.storage.database import Database
@@ -185,16 +184,14 @@ def _personalized_scope(
 
     ``include_private=True`` so the agent author's own private rows are
     available, gated by ``owner_user_id == principal_user_id`` in the
-    predicate. The repo (when present) joins the open-projects set as
-    relevance, not access; the reserved keys keep SHARED and UNSORTED open.
+    predicate. The repo (when present) becomes the active project so the
+    ranker can apply the cross-project affinity penalty without the
+    predicate excluding rows from other projects: in ``project-first``
+    mode every workspace row stays visible at the predicate and the
+    ranker handles the relevance weighting.
     """
-    open_projects = {SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}
-    if request.repo:
-        open_projects.add(request.repo)
     return AccessScope(
         user_id=principal_user_id,
-        open_projects=frozenset(open_projects),
-        member_projects=frozenset(),
         include_private=True,
         allowed_statuses=allowed_search_statuses(False),
         active_project=request.repo,
@@ -234,14 +231,17 @@ async def _recent_memory_changes(
     *,
     limit: int,
 ) -> list[dict[str, Any]]:
+    """Return the recent-changes feed under the same access predicate the
+    search path uses. Visibility and any project narrowing both ride on
+    ``visible_sql(scope)``; this feed adds only the time window and the page
+    limit on top of it.
+    """
+    del request  # the access predicate already encodes the caller's project scope
     since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     predicate_sql, predicate_params = visible_sql(scope, "m")
     conditions = [predicate_sql, "m.updated_at >= ?"]
     params: list[Any] = list(predicate_params)
     params.append(since)
-    if request.repo:
-        conditions.append("(m.project_key IS NULL OR m.project_key = ?)")
-        params.append(request.repo)
     params.append(limit)
     query = f"""
         SELECT m.id, m.memory_type, m.content, m.status, m.updated_at

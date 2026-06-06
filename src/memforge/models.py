@@ -82,6 +82,22 @@ SHARED_PROJECT_KEY = "SHARED"
 UNSORTED_PROJECT_KEY = "UNSORTED"
 
 
+@dataclass
+class Project:
+    """A relevance bucket within the bound datastore.
+
+    `is_shared=True` is the team-wide SHARED bucket: never down-weighted by the
+    cross-project affinity penalty and always open for the access predicate.
+    `is_shared=False` is a normal project (or the reserved UNSORTED backlog).
+    """
+
+    id: str
+    key: str
+    name: str
+    is_shared: bool = False
+    created_at: datetime | None = None
+
+
 class ReconcileAction(str, Enum):
     ADD = "ADD"
     UPDATE = "UPDATE"
@@ -429,9 +445,17 @@ class ConfigGroup:
 
 @dataclass
 class GeneConfigSchema:
-    """Dynamic config schema a gene declares for UI rendering."""
+    """Dynamic config schema a gene declares for UI rendering.
+
+    `project_field` names the field a `by_field` project_binding reads on
+    each item this gene produces. Doc-shaped genes typically expose
+    `space_or_project`; the agent-session gene exposes `repo`. The admin
+    UI uses this to scope the binding editor to fields the gene actually
+    populates.
+    """
     groups: list[ConfigGroup] = field(default_factory=list)
     fields: list[ConfigField] = field(default_factory=list)
+    project_field: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +523,7 @@ class SearchResult:
     freshness: str = "current"  # current | stale | unverified
     contradiction_warning: str | None = None
     is_document_result: bool = False
+    status: str = "active"  # mirrors Memory.status; "active" for document fallbacks
 
 
 @dataclass

@@ -20,8 +20,6 @@ from memforge.storage.adapters.sqlite.relational import SqliteRelationalStore
 def _scope(statuses=("active",)) -> AccessScope:
     return AccessScope(
         user_id=LOCAL_DEV_USER_ID,
-        open_projects=frozenset(),
-        member_projects=frozenset(),
         include_private=False,
         allowed_statuses=statuses,
         active_project=None,
@@ -109,12 +107,12 @@ async def test_filter_visible_ids_honors_superseded_when_allowed(db):
 
 
 @pytest.mark.asyncio
-async def test_fetch_updated_at_returns_datetimes(db):
+async def test_fetch_ranking_metadata_returns_updated_at(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))
-    stamped = await store.fetch_updated_at(["m1", "missing"])
-    assert isinstance(stamped["m1"], datetime)
-    assert "missing" not in stamped
+    rows = await store.fetch_ranking_metadata(["m1", "missing"])
+    assert isinstance(rows["m1"]["updated_at"], datetime)
+    assert "missing" not in rows
 
 
 @pytest.mark.asyncio

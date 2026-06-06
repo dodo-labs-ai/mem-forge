@@ -24,7 +24,7 @@ from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from memforge.config import AppConfig
 from memforge.auth import browser_session
@@ -56,6 +56,8 @@ from memforge.models import (
     ConfigFieldType,
     Memory,
     MemoryReview,
+    Project,
+    UNSORTED_PROJECT_KEY,
     canonicalize_entity_name,
 )
 from memforge.provenance import (
@@ -104,18 +106,17 @@ def _workspace_default_scope(request: Request, *, include_private: bool):
     """Build the workspace-default AccessScope for an admin-API HTTP read.
 
     The caller's identity is server-derived (``resolve_principal(request)``);
-    open projects are the reserved SHARED and UNSORTED keys, only the active
-    status is allowed, and private rows surface only when the caller opts in
-    via ``include_private``.
+    only the active status is allowed; private rows surface only when the
+    caller opts in via ``include_private``. Per-id and list readers do not
+    receive a request-time `scope_mode`, so the scope mode is fixed at
+    ``project-first``: cross-project rows stay visible and the ranker
+    handles the affinity weighting.
     """
-    from memforge.models import SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY
     from memforge.server.principal import resolve_principal
     from memforge.storage.adapters.context import AccessScope
 
     return AccessScope(
         user_id=resolve_principal(request),
-        open_projects=frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}),
-        member_projects=frozenset(),
         include_private=include_private,
         allowed_statuses=("active",),
         active_project=None,
@@ -293,10 +294,24 @@ class MemorySearchRequest(BaseModel):
     include_superseded: bool = False
     top_k: int = Field(default=10, ge=1, le=50)
     active_project: str | None = None
+    scope_mode: Literal["project", "project-first", "workspace"] = "project-first"
     include_private: bool = False
+    status: str | None = None  # post-rank row-status filter; mirrors GET /api/memories
     # NO user_id field. The caller's identity is server-derived from
     # resolve_principal(request); a body-supplied user_id is never used as
     # access authority.
+
+    @model_validator(mode="after")
+    def _coerce_scope_without_active_project(self) -> "MemorySearchRequest":
+        """Project-aware ranking requires an active project. When the caller
+        asks for a project-aware mode without one, fall through to the flat
+        workspace ranking so the contract stays "default just works"."""
+        if self.scope_mode in ("project", "project-first") and self.active_project is None:
+            logger.info(
+                "Search request omitted active_project; falling back to flat workspace ranking."
+            )
+            self.scope_mode = "workspace"
+        return self
 
 
 # -- Entities --
@@ -458,6 +473,7 @@ class SourceResponse(BaseModel):
     last_sync: str | None = None
     doc_count: int = 0
     created_at: str | None = None
+    project_binding: dict | None = None
 
 
 class SourceProjectResponse(BaseModel):
@@ -472,10 +488,51 @@ class SourceProjectsResponse(BaseModel):
     projects: list[SourceProjectResponse]
 
 
+class ResolvedProjectResponse(BaseModel):
+    """Where memories from a source actually landed after the resolver ran."""
+
+    project_key: str
+    memory_count: int
+
+
+class ResolvedProjectsResponse(BaseModel):
+    source_id: str
+    projects: list[ResolvedProjectResponse]
+
+
+# Wire/storage translation: `kind` ("normal" | "shared") rides over the wire,
+# `is_shared` lives in the column. Translation happens in `_project_to_response`
+# (storage to wire) and inline in the create/update handlers (wire to storage).
+class ProjectCreateRequest(BaseModel):
+    name: str
+    key: str | None = None
+    kind: Literal["normal", "shared"] = "normal"
+
+
+class ProjectUpdateRequest(BaseModel):
+    name: str | None = None
+    kind: Literal["normal", "shared"] | None = None
+
+
+class ProjectResponse(BaseModel):
+    id: str
+    key: str
+    name: str
+    kind: Literal["normal", "shared"]
+    created_at: str | None = None
+
+
+class ProjectDeleteResponse(BaseModel):
+    id: str
+    rebucketed_count: int
+    rebucketed_memory_ids: list[str]
+
+
 class CreateSourceRequest(BaseModel):
     type: str
     name: str
     config: dict
+    project_binding: dict | None = None
 
 
 class SourceSyncRequest(BaseModel):
@@ -486,6 +543,7 @@ class UpdateSourceRequest(BaseModel):
     name: str | None = None
     config: dict | None = None
     status: str | None = None
+    project_binding: dict | None = None
 
 
 class AgentSessionDocumentRequest(BaseModel):
@@ -1584,6 +1642,63 @@ async def _build_memory_store(db: Database, config: AppConfig) -> MemoryStore:
     )
 
 
+async def _build_project_adapters(db: Database, config: AppConfig):
+    """Build the storage adapters for project CRUD requests.
+
+    The relational handle owns project rows; the vector handle is bound to
+    the same memories collection that the memory store rebuckets so the
+    delete handler can update both sides in lockstep.
+    """
+    from memforge.memory.audit import AuditContext, MemoryAuditLogger
+    from memforge.retrieval.embeddings import get_chroma_collection
+    from memforge.storage.adapters.sqlite import build_sqlite_adapters
+
+    memory_collection = get_chroma_collection(
+        chroma_path=config.storage.chroma_path,
+        name="memories",
+    )
+    return build_sqlite_adapters(
+        db,
+        memory_collection,
+        audit_logger=MemoryAuditLogger(
+            db, default_context=AuditContext(actor_type="admin")
+        ),
+    )
+
+
+# Allowed character class for derived project keys: ASCII letters and digits
+# only, joined by single underscores. Anything else collapses to one
+# underscore. The cap matches the size of typical workspace tags so derived
+# keys remain human-readable.
+_PROJECT_KEY_ALLOWED_PATTERN = r"[^A-Za-z0-9]+"
+_PROJECT_KEY_FALLBACK = "PROJECT"
+_PROJECT_KEY_MAX_LENGTH = 32
+
+
+def _derive_project_key(name: str) -> str:
+    """Derive a deterministic key from a project name.
+
+    Uppercase A-Z, 0-9, single underscores, capped at
+    `_PROJECT_KEY_MAX_LENGTH`. A name that derives to a reserved key
+    (SHARED, UNSORTED) collides with the seeded row and is rejected by
+    the create handler's UNIQUE-constraint path with HTTP 409.
+    """
+    import re
+
+    cleaned = re.sub(_PROJECT_KEY_ALLOWED_PATTERN, "_", name).strip("_").upper()
+    return (cleaned or _PROJECT_KEY_FALLBACK)[:_PROJECT_KEY_MAX_LENGTH]
+
+
+def _project_to_response(project: Project) -> ProjectResponse:
+    return ProjectResponse(
+        id=project.id,
+        key=project.key,
+        name=project.name,
+        kind="shared" if project.is_shared else "normal",
+        created_at=project.created_at.isoformat() if project.created_at else None,
+    )
+
+
 async def _build_review_service(db: Database, config: AppConfig) -> ReviewService:
     """Build a request-scoped review service.
 
@@ -1861,6 +1976,7 @@ def create_admin_app(
     recent_change_router = APIRouter(prefix="/api/recent-changes", tags=["recent-changes"])
     schedule_router = APIRouter(prefix="/api/schedule", tags=["schedule"])
     llm_router = APIRouter(prefix="/api/llm-config", tags=["llm-config"])
+    projects_router = APIRouter(prefix="/api/projects", tags=["projects"])
 
     async def get_search_engine(request: Request, db: Database, config: AppConfig):
         from memforge.memory.audit import AuditContext, MemoryAuditLogger
@@ -2129,21 +2245,22 @@ def create_admin_app(
     ):
         """Service-owned memory search used by local agent MCP proxies."""
         from memforge.memory.lifecycle import allowed_search_statuses
-        from memforge.models import SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY
         from memforge.server.principal import resolve_principal
         from memforge.storage.adapters.context import AccessScope
 
         try:
             engine = await get_search_engine(request, db, config)
             user_id = resolve_principal(request)
+            # `project-first` and `workspace` modes weight cross-project hits
+            # but keep them visible at the predicate. `project` mode is the
+            # only mode that narrows the workspace branch, and it narrows to
+            # `{active_project, SHARED}` inside the predicate itself.
             scope = AccessScope(
                 user_id=user_id,
-                open_projects=frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}),
-                member_projects=frozenset(),
                 include_private=req.include_private,
                 allowed_statuses=allowed_search_statuses(req.include_superseded),
                 active_project=req.active_project,
-                scope_mode="project-first",
+                scope_mode=req.scope_mode,
             )
             result = await engine.search(
                 query=req.query,
@@ -2155,6 +2272,13 @@ def create_admin_app(
                 top_k=req.top_k,
                 request_scope=scope,
             )
+            # Row-status filter is applied post-rank so the GET and POST
+            # routes share the same status semantics without coupling the
+            # ranker to lifecycle filtering.
+            if req.status:
+                kept = [r for r in result["results"] if getattr(r, "status", "active") == req.status]
+                result["results"] = kept
+                result["total_candidates"] = len(kept)
             return _json_ready(result)
         except Exception as e:
             logger.warning("Search failed: %s", e, exc_info=True)
@@ -2351,8 +2475,9 @@ def create_admin_app(
         Filters: type (fact/decision/convention/procedure), status, source,
         project, free-text search. Supports limit/offset pagination.
 
-        The access predicate gates every row: workspace rows on open projects
-        are always visible, and the caller's own private rows surface only
+        The access predicate gates every row: workspace rows are visible
+        across every project (the ranker handles project relevance, not
+        the predicate), and the caller's own private rows surface only
         when ``include_private=True``.
         """
         from memforge.retrieval.access_predicate import visible_sql
@@ -3189,6 +3314,31 @@ def create_admin_app(
 
         return SourceProjectsResponse(source_id=source_id, projects=projects)
 
+    @source_router.get(
+        "/{source_id}/projects/resolved", response_model=ResolvedProjectsResponse
+    )
+    async def list_source_resolved_projects(
+        source_id: str,
+        db: Database = Depends(get_db),
+    ):
+        """List the resolved `project_key` distribution for one source.
+
+        Reflects where the project resolver actually placed writes under
+        the source's current `project_binding`. The sibling
+        `/projects` endpoint reports the raw `documents.space_or_project`
+        observed during sync, before resolution.
+        """
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+
+        rows = await db.list_resolved_projects_for_source(source_id)
+        projects = [
+            ResolvedProjectResponse(project_key=key, memory_count=count)
+            for key, count in rows
+        ]
+        return ResolvedProjectsResponse(source_id=source_id, projects=projects)
+
     # ===================================================================
     # 4c. Recent Changes
     # ===================================================================
@@ -3310,6 +3460,7 @@ def create_admin_app(
             type=req.type,
             name=req.name,
             config_json=json.dumps(source_config),
+            project_binding=req.project_binding,
         )
         return {"id": source_id, "name": req.name, "type": req.type}
 
@@ -3364,6 +3515,11 @@ def create_admin_app(
             type=existing["type"],
             name=name,
             config_json=json.dumps(src_config),
+            project_binding=(
+                req.project_binding
+                if req.project_binding is not None
+                else existing.get("project_binding")
+            ),
         )
         if base_url_changed:
             release_atlassian_request_limiter(old_base_url, owner_id=source_id)
@@ -3778,6 +3934,91 @@ def create_admin_app(
         return {"ok": True}
 
     # ===================================================================
+    # Projects
+    # ===================================================================
+
+    @projects_router.get("", response_model=list[ProjectResponse])
+    async def list_projects_route(
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
+        adapters = await _build_project_adapters(db, config)
+        rows = await adapters.relational.list_projects()
+        return [_project_to_response(p) for p in rows]
+
+    @projects_router.post(
+        "", response_model=ProjectResponse, status_code=201
+    )
+    async def create_project_route(
+        req: ProjectCreateRequest,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
+        adapters = await _build_project_adapters(db, config)
+        key = (req.key or _derive_project_key(req.name)).strip()
+        if not key:
+            raise HTTPException(status_code=400, detail="project key cannot be empty")
+        try:
+            created = await adapters.relational.create_project(
+                key=key, name=req.name, is_shared=(req.kind == "shared"),
+            )
+        except ValueError:
+            raise HTTPException(
+                status_code=409,
+                detail=f"project key {key!r} already exists",
+            )
+        return _project_to_response(created)
+
+    @projects_router.patch("/{project_id}", response_model=ProjectResponse)
+    async def update_project_route(
+        project_id: str,
+        req: ProjectUpdateRequest,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
+        adapters = await _build_project_adapters(db, config)
+        existing = await adapters.relational.get_project(project_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        is_shared: bool | None = None
+        if req.kind is not None:
+            is_shared = req.kind == "shared"
+        updated = await adapters.relational.update_project(
+            project_id, name=req.name, is_shared=is_shared,
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return _project_to_response(updated)
+
+    @projects_router.delete("/{project_id}", response_model=ProjectDeleteResponse)
+    async def delete_project_route(
+        project_id: str,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
+        adapters = await _build_project_adapters(db, config)
+        try:
+            affected = await adapters.relational.list_project_memory_ids(project_id)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="project not found")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        memory_store = await _build_memory_store(db, config)
+        # Vector metadata moves first so a failure here aborts the
+        # transaction with both stores still pointing at the original
+        # project. Only after the vector channel reports success do we
+        # commit the relational rebucket and drop the project row.
+        await memory_store.rebucket_project_memories(
+            affected, UNSORTED_PROJECT_KEY,
+        )
+        await adapters.relational.commit_project_deletion(project_id, affected)
+        return ProjectDeleteResponse(
+            id=project_id,
+            rebucketed_count=len(affected),
+            rebucketed_memory_ids=affected,
+        )
+
+    # ===================================================================
     # Memory Reviews
     # ===================================================================
 
@@ -3973,6 +4214,7 @@ def create_admin_app(
     app.include_router(recent_change_router)
     app.include_router(schedule_router)
     app.include_router(llm_router)
+    app.include_router(projects_router)
 
     # -- Detailed stats endpoint (observability) --
 

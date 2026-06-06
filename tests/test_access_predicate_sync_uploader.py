@@ -27,8 +27,6 @@ from memforge.models import (
     EnrichmentResult,
     MemoryExtractionResult,
     RawMemory,
-    SHARED_PROJECT_KEY,
-    UNSORTED_PROJECT_KEY,
 )
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.storage.adapters.context import AccessScope
@@ -49,8 +47,6 @@ def _config(tmp_path: Path) -> AppConfig:
 def _personalized_scope(user_id: str) -> AccessScope:
     return AccessScope(
         user_id=user_id,
-        open_projects=frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}),
-        member_projects=frozenset(),
         include_private=True,
         allowed_statuses=("active",),
         active_project=None,

@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import aiosqlite
 
@@ -27,6 +29,8 @@ from memforge.models import (
     MemoryReview,
     MemoryReviewRelatedChallenger,
     MemorySource,
+    Project,
+    SHARED_PROJECT_KEY,
     SyncState,
     UNSORTED_PROJECT_KEY,
     Visibility,
@@ -252,14 +256,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
 -- Sources & Sync
 -- ---------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS sources (
-    id          TEXT PRIMARY KEY,
-    type        TEXT NOT NULL,
-    name        TEXT NOT NULL,
-    config      TEXT NOT NULL,               -- JSON
-    status      TEXT NOT NULL DEFAULT 'active',
-    last_sync   TEXT,
-    doc_count   INTEGER DEFAULT 0,
-    created_at  TEXT DEFAULT (datetime('now'))
+    id              TEXT PRIMARY KEY,
+    type            TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    config          TEXT NOT NULL,           -- JSON
+    status          TEXT NOT NULL DEFAULT 'active',
+    last_sync       TEXT,
+    doc_count       INTEGER DEFAULT 0,
+    project_binding TEXT,                    -- JSON: {"mode": "fixed", ...} or {"mode": "by_field", ...}
+    created_at      TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS auth_sessions (
@@ -373,11 +378,18 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 -- ---------------------------------------------------------------
--- Projects (stub table referenced by the access predicate's dangling-key
--- fallback; per-project metadata lives elsewhere and is filled in later).
+-- Projects: per-row metadata for the relevance bucket on each memory.
+-- SHARED is the team-wide bucket (never down-weighted, always satisfies
+-- the access predicate). UNSORTED is the unmapped backlog (open and
+-- visible, but down-weighted like any cross-project hit until an admin
+-- binds the field value).
 -- ---------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS projects (
-    project_key TEXT PRIMARY KEY
+    id            TEXT PRIMARY KEY,
+    key           TEXT NOT NULL UNIQUE,
+    name          TEXT NOT NULL,
+    is_shared     INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- ---------------------------------------------------------------
@@ -799,6 +811,34 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         "CREATE TABLE IF NOT EXISTS projects (project_key TEXT PRIMARY KEY)",
         f"UPDATE memories SET project_key = '{UNSORTED_PROJECT_KEY}' "
         "WHERE project_key IS NULL",
+    ]),
+    (17, "Replace stub projects table with full schema and seed reserved rows", [
+        # Rebuild the stub table under the full schema in one step. The
+        # two reserved rows are seeded immediately so the resolver's
+        # `UNSORTED` default and the SHARED bucket are valid foreign-key
+        # targets the moment the migration completes.
+        "DROP TABLE IF EXISTS projects",
+        (
+            "CREATE TABLE projects ("
+            "    id            TEXT PRIMARY KEY,"
+            "    key           TEXT NOT NULL UNIQUE,"
+            "    name          TEXT NOT NULL,"
+            "    is_shared     INTEGER NOT NULL DEFAULT 0,"
+            "    created_at    TEXT NOT NULL DEFAULT (datetime('now'))"
+            ")"
+        ),
+        # Seed the two reserved rows. INSERT OR IGNORE keeps the migration
+        # idempotent against any future re-application.
+        (
+            "INSERT OR IGNORE INTO projects (id, key, name, is_shared) "
+            f"VALUES ('proj-shared',   '{SHARED_PROJECT_KEY}',   'Shared',   1)"
+        ),
+        (
+            "INSERT OR IGNORE INTO projects (id, key, name, is_shared) "
+            f"VALUES ('proj-unsorted', '{UNSORTED_PROJECT_KEY}', 'Unsorted', 0)"
+        ),
+        # The sources table gains project_binding. Legacy rows read NULL.
+        "ALTER TABLE sources ADD COLUMN project_binding TEXT",
     ]),
 ]
 
@@ -2257,14 +2297,27 @@ class Database:
         type: str,
         name: str,
         config_json: str,
+        project_binding: Mapping[str, Any] | None = None,
     ) -> None:
+        """Insert or update a source row.
+
+        `project_binding` is the structured rule the project resolver
+        consults when memories are extracted from this source. `None`
+        leaves the source unbound and resolves writes to `UNSORTED`.
+        """
+        binding_json = (
+            json.dumps(dict(project_binding)) if project_binding else None
+        )
         async with self._write_lock:
             await self.db.execute(
-                """INSERT INTO sources (id, type, name, config)
-                   VALUES (?, ?, ?, ?)
+                """INSERT INTO sources (id, type, name, config, project_binding)
+                   VALUES (?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
-                   type=excluded.type, name=excluded.name, config=excluded.config""",
-                (id, type, name, config_json),
+                   type=excluded.type,
+                   name=excluded.name,
+                   config=excluded.config,
+                   project_binding=excluded.project_binding""",
+                (id, type, name, config_json, binding_json),
             )
             await self.db.commit()
 
@@ -2277,6 +2330,9 @@ class Database:
                 return None
             d = dict(row)
             d["config"] = json.loads(d["config"])
+            d["project_binding"] = (
+                json.loads(d["project_binding"]) if d.get("project_binding") else None
+            )
             return d
 
     async def restore_source_snapshot(self, source: dict) -> None:
@@ -2315,8 +2371,188 @@ class Database:
             async for row in cursor:
                 d = dict(row)
                 d["config"] = json.loads(d["config"])
+                d["project_binding"] = (
+                    json.loads(d["project_binding"]) if d.get("project_binding") else None
+                )
                 results.append(d)
         return results
+
+    async def list_resolved_projects_for_source(
+        self, source_id: str
+    ) -> list[tuple[str, int]]:
+        """Group memories from a source by their resolved `project_key`.
+
+        Distinct from `list_source_projects`, which reports the raw
+        `documents.space_or_project` field as observed at sync time. This
+        view follows provenance through `memory_sources` and reads the
+        resolver's verdict on each memory, so the admin can see where
+        writes actually landed under the active `project_binding`.
+        """
+        rows: list[tuple[str, int]] = []
+        async with self.db.execute(
+            """
+            SELECT m.project_key AS project_key,
+                   COUNT(DISTINCT m.id) AS memory_count
+            FROM memories m
+            JOIN memory_sources ms ON ms.memory_id = m.id
+            JOIN documents d ON d.doc_id = ms.doc_id
+            WHERE d.source = ?
+            GROUP BY m.project_key
+            ORDER BY memory_count DESC, project_key ASC
+            """,
+            (source_id,),
+        ) as cursor:
+            async for row in cursor:
+                key = row["project_key"] or UNSORTED_PROJECT_KEY
+                rows.append((str(key), int(row["memory_count"])))
+        return rows
+
+    # ------------------------------------------------------------------
+    # Projects
+    # ------------------------------------------------------------------
+
+    async def create_project(
+        self, *, key: str, name: str, is_shared: bool = False
+    ) -> Project:
+        """Insert a project row, raising ValueError if `key` already exists."""
+        proj_id = f"proj-{uuid.uuid4().hex[:12]}"
+        try:
+            async with self._write_lock:
+                await self.db.execute(
+                    "INSERT INTO projects (id, key, name, is_shared) "
+                    "VALUES (?, ?, ?, ?)",
+                    (proj_id, key, name, 1 if is_shared else 0),
+                )
+                await self.db.commit()
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"project key {key!r} already exists") from exc
+        created = await self.get_project(proj_id)
+        if created is None:
+            raise RuntimeError(f"project {proj_id!r} disappeared after insert")
+        return created
+
+    async def get_project(self, project_id: str) -> Project | None:
+        async with self.db.execute(
+            "SELECT id, key, name, is_shared, created_at "
+            "FROM projects WHERE id = ?",
+            (project_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return Project(
+            id=row["id"],
+            key=row["key"],
+            name=row["name"],
+            is_shared=bool(row["is_shared"]),
+            created_at=_parse_dt(row["created_at"]),
+        )
+
+    async def list_projects(self) -> list[Project]:
+        out: list[Project] = []
+        async with self.db.execute(
+            "SELECT id, key, name, is_shared, created_at "
+            "FROM projects ORDER BY key"
+        ) as cur:
+            async for row in cur:
+                out.append(
+                    Project(
+                        id=row["id"],
+                        key=row["key"],
+                        name=row["name"],
+                        is_shared=bool(row["is_shared"]),
+                        created_at=_parse_dt(row["created_at"]),
+                    )
+                )
+        return out
+
+    async def update_project(
+        self,
+        project_id: str,
+        *,
+        name: str | None = None,
+        is_shared: bool | None = None,
+    ) -> Project | None:
+        fields: list[str] = []
+        params: list[Any] = []
+        if name is not None:
+            fields.append("name = ?")
+            params.append(name)
+        if is_shared is not None:
+            fields.append("is_shared = ?")
+            params.append(1 if is_shared else 0)
+        if not fields:
+            return await self.get_project(project_id)
+        params.append(project_id)
+        async with self._write_lock:
+            await self.db.execute(
+                f"UPDATE projects SET {', '.join(fields)} WHERE id = ?",
+                params,
+            )
+            await self.db.commit()
+        return await self.get_project(project_id)
+
+    async def list_project_memory_ids(self, project_id: str) -> list[str]:
+        """Return memory ids attached to a project, validating that the
+        project is real and not a reserved bucket.
+
+        Pairs with `commit_project_deletion`: the caller (the project
+        delete handler) reads the affected ids first, hands them to the
+        owning vector service so embedding metadata moves to UNSORTED,
+        then asks the database to commit the relational rebucket and
+        drop the project row. Reserved keys (SHARED, UNSORTED) raise
+        `ValueError`; an unknown id raises `LookupError`.
+        """
+        target = await self.get_project(project_id)
+        if target is None:
+            raise LookupError(f"project {project_id!r} not found")
+        if target.key in (SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY):
+            raise ValueError(
+                f"project {target.key!r} is reserved and cannot be deleted"
+            )
+        affected_ids: list[str] = []
+        async with self.db.execute(
+            "SELECT id FROM memories WHERE project_key = ?", (target.key,)
+        ) as cur:
+            async for row in cur:
+                affected_ids.append(row["id"])
+        return affected_ids
+
+    async def commit_project_deletion(
+        self, project_id: str, affected_ids: Sequence[str]
+    ) -> None:
+        """Rebucket the named memories to UNSORTED and drop the project
+        row, in one transaction.
+
+        `affected_ids` is the snapshot the caller already moved on the
+        vector side. Rebucketing by id rather than by `project_key`
+        means a memory inserted under this project after the snapshot
+        was taken stays untouched here, so the relational and vector
+        channels never disagree about which rows this delete moved.
+
+        Reserved keys (SHARED, UNSORTED) raise `ValueError`. Calling
+        with an empty `affected_ids` list still drops the project row
+        so a project that owned no memories deletes cleanly.
+        """
+        target = await self.get_project(project_id)
+        if target is None:
+            return
+        if target.key in (SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY):
+            raise ValueError(
+                f"project {target.key!r} is reserved and cannot be deleted"
+            )
+        async with self._write_lock:
+            if affected_ids:
+                placeholders = ",".join("?" for _ in affected_ids)
+                await self.db.execute(
+                    f"UPDATE memories SET project_key = ? "
+                    f"WHERE id IN ({placeholders}) AND project_key = ?",
+                    (UNSORTED_PROJECT_KEY, *affected_ids, target.key),
+                )
+            await self.db.execute(
+                "DELETE FROM projects WHERE id = ?", (project_id,)
+            )
+            await self.db.commit()
 
     async def delete_source_cascade(self, source_id: str) -> list[str]:
         """Delete a source and cascade to all documents + memories linked to those docs.

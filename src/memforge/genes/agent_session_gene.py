@@ -153,6 +153,7 @@ class AgentSessionGene(Gene):
                     order=1,
                 ),
             ],
+            project_field="repo",
         )
 
     async def authenticate(self) -> None:

@@ -3,9 +3,17 @@
 One definition, three projections: a SQL WHERE fragment for the relational and
 keyword channels, a Chroma where dict for the vector channel, and an in-process
 predicate for the post-fusion re-check and tests. A row is visible iff its
-status is allowed AND it is on the workspace branch (visibility='workspace' AND
-project_open) OR, only when scope.include_private is set, the caller's own
-private branch (visibility='private' AND owner_user_id = caller).
+status is allowed AND it is on the workspace branch (visibility='workspace',
+which covers every workspace-visible row in the bound datastore) OR, only when
+scope.include_private is set, the caller's own private branch (visibility='private'
+AND owner_user_id = caller).
+
+`scope_mode` decides whether project_key narrows the workspace branch. In
+``project-first`` (the default) and ``workspace`` modes the workspace branch
+keeps every project_key untouched and the ranker handles affinity weighting.
+In ``project`` mode the workspace branch narrows upstream to the active project
+plus SHARED: UNSORTED and other projects are pruned at the predicate, never
+returned.
 """
 
 from __future__ import annotations
@@ -14,7 +22,6 @@ from typing import Any, Iterable, Mapping
 
 from memforge.models import (
     SHARED_PROJECT_KEY,
-    UNSORTED_PROJECT_KEY,
     Visibility,
 )
 from memforge.storage.adapters.context import AccessScope
@@ -22,13 +29,12 @@ from memforge.storage.adapters.context import AccessScope
 __all__ = ["is_visible", "visible_chroma_where", "visible_sql"]
 
 
-# Reserved keys that always count as open. project_open(key, scope) is
-# satisfied iff key is in scope.open_projects, plus the dangling fail-safe.
-_ALWAYS_OPEN_KEYS = frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY})
-
-
-def _open_project_keys(scope: AccessScope) -> tuple[str, ...]:
-    keys = set(scope.open_projects) | _ALWAYS_OPEN_KEYS
+def _project_mode_keys(scope: AccessScope) -> tuple[str, ...]:
+    """Return the project keys that satisfy the workspace branch in
+    ``project`` mode. Only the active project plus SHARED qualify;
+    UNSORTED and every other project are pruned.
+    """
+    keys: set[str] = {SHARED_PROJECT_KEY}
     if scope.active_project:
         keys.add(scope.active_project)
     return tuple(sorted(keys))
@@ -41,7 +47,6 @@ def visible_sql(scope: AccessScope, alias: str) -> tuple[str, list[Any]]:
     list, then the workspace branch, then the private branch only when allowed.
     """
     statuses = list(scope.allowed_statuses)
-    open_keys = list(_open_project_keys(scope))
     params: list[Any] = []
     parts: list[str] = []
 
@@ -49,16 +54,28 @@ def visible_sql(scope: AccessScope, alias: str) -> tuple[str, list[Any]]:
     parts.append(f"{alias}.status IN ({status_placeholders})")
     params.extend(statuses)
 
-    project_placeholders = ",".join("?" for _ in open_keys)
-    workspace_branch = (
-        f"({alias}.visibility = ? AND ("
-        f"{alias}.project_key IN ({project_placeholders}) OR "
-        f"{alias}.project_key NOT IN (SELECT project_key FROM projects)"
-        "))"
-    )
+    if scope.scope_mode == "project":
+        # Hard narrowing in project mode: the workspace branch admits a
+        # candidate only when its project_key is the active project or
+        # SHARED. Other rows (UNSORTED, RISK, dangling keys) are pruned
+        # at the predicate.
+        narrow_keys = list(_project_mode_keys(scope))
+        project_placeholders = ",".join("?" for _ in narrow_keys)
+        workspace_branch = (
+            f"({alias}.visibility = ? AND "
+            f"{alias}.project_key IN ({project_placeholders}))"
+        )
+        params.append(Visibility.WORKSPACE.value)
+        params.extend(narrow_keys)
+    else:
+        # Project-first and workspace modes weight cross-project hits via
+        # the ranker. The predicate keeps every workspace row visible
+        # regardless of project_key, so adding a real `projects` row for
+        # a project never silently drops candidates from results.
+        workspace_branch = f"({alias}.visibility = ?)"
+        params.append(Visibility.WORKSPACE.value)
+
     branches = [workspace_branch]
-    params.append(Visibility.WORKSPACE.value)
-    params.extend(open_keys)
 
     if scope.include_private:
         branches.append(
@@ -77,16 +94,11 @@ def visible_chroma_where(
 ) -> Mapping[str, Any]:
     """Return a Chroma where dict equivalent to visible_sql at the access tier.
 
-    Chroma's filter language has no NOT-IN-against-a-foreign-table primitive,
-    so the workspace branch deliberately filters on `visibility` (and status,
-    memory_type) only. Project narrowing is intentionally NOT encoded at the
-    vector tier here: the post-fusion `filter_visible_ids` reapplies the full
-    SQL predicate (including the dangling-project fallback) and is the
-    authoritative re-check for any candidate the vector channel returns.
-    Encoding `project_key IN (open_keys)` in Chroma alone would silently drop a
-    legitimately-visible vector candidate whose project_key has no row in the
-    `projects` table. The relational re-check decides; the vector pre-filter
-    only narrows by what it can express safely.
+    Project narrowing is intentionally NOT encoded at the vector tier here:
+    the post-fusion `filter_visible_ids` reapplies the full SQL predicate and
+    is the authoritative re-check for any candidate the vector channel
+    returns. The pre-filter only narrows by what Chroma can express safely
+    (visibility, status, memory_type).
     """
     statuses = list(scope.allowed_statuses)
     clauses: list[Mapping[str, Any]] = []
@@ -118,17 +130,22 @@ def is_visible(
     *,
     dangling_project_keys: Iterable[str] | None = None,
 ) -> bool:
-    """In-process predicate. Default-deny: unknown visibility is hidden."""
+    """In-process predicate. Default-deny: unknown visibility is hidden.
+
+    `dangling_project_keys` is accepted for backward-compat with callers
+    that pass it, but it is never read: the SQL predicate no longer
+    consults a dangling-key fallback because workspace visibility itself
+    spans every project in the relevance-weighted modes.
+    """
+    del dangling_project_keys  # retained for API compatibility
     if row.get("status") not in scope.allowed_statuses:
         return False
     visibility = row.get("visibility")
     if visibility == Visibility.WORKSPACE.value:
-        project_key = row.get("project_key") or ""
-        if project_key in _open_project_keys(scope):
-            return True
-        if dangling_project_keys is not None and project_key in dangling_project_keys:
-            return True
-        return False
+        if scope.scope_mode == "project":
+            project_key = row.get("project_key") or ""
+            return project_key in _project_mode_keys(scope)
+        return True
     if visibility == Visibility.PRIVATE.value and scope.include_private:
         return row.get("owner_user_id") == scope.user_id
     return False

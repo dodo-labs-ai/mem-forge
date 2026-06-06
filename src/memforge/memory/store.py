@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Sequence
 
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.index_payloads import (
@@ -19,7 +19,6 @@ from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import (
     Memory,
     MemoryStatus,
-    SHARED_PROJECT_KEY,
     UNSORTED_PROJECT_KEY,
     Visibility,
 )
@@ -38,19 +37,14 @@ DEDUP_CANDIDATE_LIMIT = 10
 def _writer_access_scope(memory: Memory) -> AccessScope:
     """The dedup scope a writer of this memory must use.
 
-    A private writer's pool is its own private set; a workspace writer's
-    pool is workspace rows in the same project. Cross-visibility merges
-    are blocked by the access predicate plus the visibility-mismatch
-    guard in deduplicate_and_insert.
+    A private writer asks under its own user id; a workspace writer asks
+    under the local dev principal. Cross-visibility merges are blocked by
+    the access predicate plus the visibility-mismatch guard in
+    deduplicate_and_insert.
     """
-    open_projects = {SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}
-    if memory.project_key:
-        open_projects.add(memory.project_key)
     if memory.visibility == Visibility.PRIVATE.value:
         return AccessScope(
             user_id=memory.owner_user_id or LOCAL_DEV_USER_ID,
-            open_projects=frozenset(open_projects),
-            member_projects=frozenset(),
             include_private=True,
             allowed_statuses=(MemoryStatus.ACTIVE.value,),
             active_project=memory.project_key,
@@ -58,8 +52,6 @@ def _writer_access_scope(memory: Memory) -> AccessScope:
         )
     return AccessScope(
         user_id=LOCAL_DEV_USER_ID,
-        open_projects=frozenset(open_projects),
-        member_projects=frozenset(),
         include_private=False,
         allowed_statuses=(MemoryStatus.ACTIVE.value,),
         active_project=memory.project_key,
@@ -156,6 +148,77 @@ class MemoryStore:
         methods, so the store delegates to them through this handle.
         """
         return self.relational._db
+
+    async def rebucket_project_memories(
+        self,
+        affected_ids: Sequence[str],
+        new_project_key: str,
+    ) -> None:
+        """Rewrite the vector metadata `project_key` for the affected
+        memories so the embedding channel agrees with the relational
+        rebucket about where each row now lives.
+
+        Project deletion runs this first, then commits the relational
+        rebucket. Driving the vector update first means a failure here
+        leaves both stores still pointing at the original project, with
+        no half-applied state to reconcile. The predicate would otherwise
+        find rows under the new key while the vector channel kept
+        scoring them under the previous one.
+
+        If a per-id upsert fails partway through the batch, every record
+        already moved is restored to its pre-call metadata before the
+        original exception is re-raised. The relational rebucket has not
+        run yet, so a clean rollback here returns the system to the
+        exact state the caller observed before invoking this method.
+        """
+        if not affected_ids:
+            return
+        # Snapshot each record before any mutation so a partial-failure
+        # rollback can restore exactly what the vector channel held
+        # before this call. Records the vector store does not know about
+        # (returned None) or that lack an embedding are ignored, the
+        # same way the original mutation skips them.
+        snapshots: list[tuple[str, list[float], dict[str, Any]]] = []
+        for memory_id in affected_ids:
+            record = await self.vector.get_record(memory_id)
+            if record is None:
+                continue
+            embedding = record.get("embedding")
+            if embedding is None:
+                continue
+            metadata = dict(record.get("metadata") or {})
+            snapshots.append((memory_id, embedding, metadata))
+
+        applied: list[tuple[str, list[float], dict[str, Any]]] = []
+        try:
+            for memory_id, embedding, original_metadata in snapshots:
+                rebucketed_metadata = dict(original_metadata)
+                rebucketed_metadata["project_key"] = new_project_key
+                await self.vector.upsert(
+                    ids=[memory_id],
+                    embeddings=[embedding],
+                    metadatas=[rebucketed_metadata],
+                )
+                applied.append((memory_id, embedding, original_metadata))
+        except Exception:
+            # Roll back every record this call already moved so the
+            # vector channel matches the relational state the caller
+            # held before invoking us. A rollback failure is logged but
+            # does not mask the original error.
+            for memory_id, embedding, original_metadata in reversed(applied):
+                try:
+                    await self.vector.upsert(
+                        ids=[memory_id],
+                        embeddings=[embedding],
+                        metadatas=[original_metadata],
+                    )
+                except Exception as rollback_err:  # pragma: no cover - defensive
+                    logger.error(
+                        "vector rollback failed for memory_id=%s: %s",
+                        memory_id,
+                        rollback_err,
+                    )
+            raise
 
     # -------------------------------------------------------------------
     # Core: Deduplicate and Insert

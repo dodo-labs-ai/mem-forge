@@ -129,7 +129,7 @@ def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path, mon
         asyncio.run(database.close())
 
 
-def test_hook_context_recent_changes_are_repo_scoped(tmp_path):
+def test_hook_context_recent_changes_use_access_predicate(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
@@ -140,14 +140,14 @@ def test_hook_context_recent_changes_are_repo_scoped(tmp_path):
         await database.insert_memory(
             _memory(
                 "mem-other-project",
-                "Other product lifecycle decision should not be injected into MemForge hooks.",
+                "Other product lifecycle decision visible across projects.",
                 project_key="other-product",
             )
         )
         await database.insert_memory(
             _memory(
                 "mem-hook-2",
-                "MemForge hook context must stay scoped to the active repo.",
+                "MemForge hook context surfaces recent changes from any project.",
                 project_key="mem-forge",
             )
         )
@@ -171,9 +171,11 @@ def test_hook_context_recent_changes_are_repo_scoped(tmp_path):
         assert response.status_code == 200
         body = response.json()
         recent_ids = {change["id"] for change in body["recent_changes"]}
+        # The recent-changes feed rides on the same access predicate as
+        # search. In the default project-first mode, cross-project rows
+        # remain visible; the ranker (not this feed) handles affinity.
         assert "mem-hook-2" in recent_ids
-        assert "mem-other-project" not in recent_ids
-        assert "Other product" not in body["context_markdown"]
+        assert "mem-other-project" in recent_ids
     finally:
         asyncio.run(database.close())
 

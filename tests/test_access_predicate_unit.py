@@ -1,6 +1,5 @@
 from memforge.models import (
     SHARED_PROJECT_KEY,
-    UNSORTED_PROJECT_KEY,
     Visibility,
 )
 from memforge.retrieval.access_predicate import (
@@ -16,12 +15,9 @@ PRIVATE = Visibility.PRIVATE.value
 
 def _scope(*, include_private: bool, user_id: str = "u-1",
            active_project: str | None = None,
-           statuses: tuple[str, ...] = ("active",),
-           open_projects: frozenset[str] | None = None) -> AccessScope:
+           statuses: tuple[str, ...] = ("active",)) -> AccessScope:
     return AccessScope(
         user_id=user_id,
-        open_projects=open_projects or frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}),
-        member_projects=frozenset(),
         include_private=include_private,
         allowed_statuses=statuses,
         active_project=active_project,
@@ -33,7 +29,7 @@ def test_visible_sql_team_excludes_private_branch():
     fragment, params = visible_sql(_scope(include_private=False), "m")
     assert "m.visibility = ?" in fragment
     assert "owner_user_id" not in fragment  # private branch must not appear at all
-    # status, visibility=workspace, and project_open must all be in params/fragment
+    # status and visibility=workspace must both be represented.
     assert WORKSPACE in params and "active" in params
 
 
@@ -47,9 +43,8 @@ def test_visible_sql_personalized_includes_owned_private():
 
 def test_visible_chroma_where_team_only_workspace():
     where = visible_chroma_where(_scope(include_private=False), memory_types=None)
-    # Workspace-only at the access tier: no private branch, no project_key
-    # narrowing (the relational post-fusion re-check is the authority on
-    # project openness). The "$and" wraps status + visibility=workspace.
+    # Workspace-only at the vector access tier: no private branch and no
+    # project_key narrowing. The "$and" wraps status + visibility=workspace.
     flat = where.get("$and", [where])
     assert any(c == {"visibility": WORKSPACE} for c in flat)
     assert not any(
@@ -90,11 +85,10 @@ def test_is_visible_personalized_excludes_other_users_private():
     assert is_visible(row, _scope(include_private=True, user_id="u-1")) is False
 
 
-def test_is_visible_workspace_dangling_project_treated_as_open():
-    # A workspace memory whose project_key has no row in the projects table
-    # is treated as open (dangling fail-safe).
+def test_is_visible_project_first_keeps_unknown_project_key_visible():
+    # In project-first mode, project_key affects ranking rather than access:
+    # a workspace memory remains visible even when the key is not registered.
     row = {"status": "active", "visibility": WORKSPACE,
            "owner_user_id": None, "project_key": "DANGLING"}
-    scope = _scope(include_private=False, open_projects=frozenset({SHARED_PROJECT_KEY,
-                                                                   UNSORTED_PROJECT_KEY}))
+    scope = _scope(include_private=False)
     assert is_visible(row, scope, dangling_project_keys={"DANGLING"}) is True

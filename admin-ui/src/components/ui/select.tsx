@@ -78,7 +78,9 @@ function SelectContent({
           )}
           {...props}
         >
-          {children}
+          <SelectPrimitive.List>
+            {children}
+          </SelectPrimitive.List>
         </SelectPrimitive.Popup>
       </SelectPrimitive.Positioner>
     </SelectPrimitive.Portal>

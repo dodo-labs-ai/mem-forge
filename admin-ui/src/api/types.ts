@@ -118,6 +118,20 @@ export interface SourceProjectsResponse {
   projects: SourceProject[];
 }
 
+/**
+ * Wire-side project kind. "shared" is team-wide (never penalised in ranking);
+ * "normal" is a regular project bucket. Storage stores this as `is_shared` 0/1.
+ */
+export type ProjectKind = "normal" | "shared";
+
+export interface Project {
+  id: string;
+  key: string;
+  name: string;
+  kind: ProjectKind;
+  created_at: string;
+}
+
 export interface AgentSessionLatestFailure {
   count: number;
   reason: string | null;

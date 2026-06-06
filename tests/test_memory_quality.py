@@ -728,7 +728,7 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
 ):
     from memforge import runtime
     from memforge.memory.lifecycle import allowed_search_statuses
-    from memforge.models import SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY, SearchResult
+    from memforge.models import SearchResult
     from memforge.server.admin_api import create_admin_app
     from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 
@@ -769,12 +769,12 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
     payload = response.json()
     expected_scope = AccessScope(
         user_id=LOCAL_DEV_USER_ID,
-        open_projects=frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}),
-        member_projects=frozenset(),
         include_private=False,
         allowed_statuses=allowed_search_statuses(False),
         active_project=None,
-        scope_mode="project-first",
+        # The request omits active_project, so the project-aware default
+        # falls back to flat workspace ranking.
+        scope_mode="workspace",
     )
     assert calls == [{
         "query": "proxy search",
