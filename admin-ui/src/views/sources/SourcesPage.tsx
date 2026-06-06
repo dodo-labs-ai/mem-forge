@@ -1,16 +1,20 @@
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Files, Info, Loader2, MoreHorizontal, Play, Plus, RefreshCw, SlidersHorizontal, Trash2 } from "lucide-react";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Files, Info, Loader2, MoreHorizontal, Plus, RefreshCw, Trash2 } from "lucide-react";
 import client from "@/api/client";
-import type { AgentSessionCompleteness, GeneMetadata, Source, SourceProjectsResponse } from "@/api/types";
+import type {
+  AgentSessionCompleteness,
+  GeneMetadata,
+  Project,
+  ResolvedProjectsResponse,
+  Source,
+  SourceProjectsResponse,
+} from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
 import { EmptyState } from "@/components/admin/EmptyState";
 import { PageHeader } from "@/components/admin/PageHeader";
-import { StatusDot } from "@/components/admin/StatusBadge";
-import { SyncStatusBar } from "@/components/admin/SyncStatusBar";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -25,6 +29,14 @@ import { SourceIcon } from "@/components/sources/SourceIcon";
 import { SourceConfigDialog } from "./SourceConfigDialog";
 import { canConfigureSourceType, canDeleteSourceType, isManagedSourceId, isManagedSourceType, isPushBasedSourceType, userConfigurableGenes } from "./managedSources";
 import { getSourceActionEndpoint, getSourceMenuStyle, sourceActionLayout } from "./sourceActions";
+import { ProjectGroup } from "./ProjectGroup";
+import {
+  PROJECT_GROUPS_DEFAULT_EXPANDED,
+  groupSourcesByProject,
+  projectGroupKey,
+  type ResolvedBySource,
+} from "./projectGrouping";
+import { SourceRow } from "./SourceRow";
 import { TeamsSourceWizard } from "./TeamsSourceWizard";
 
 const SOURCE_LABELS: Record<string, { name: string; subtitle: string; description: string }> = {
@@ -68,11 +80,13 @@ export function SourcesPage() {
   const [configDialog, setConfigDialog] = useState<{
     sourceType: string | null;
     source?: Source | null;
+    initialFocus?: { step: "project" };
   }>({ sourceType: null, source: null });
   const [detailsSource, setDetailsSource] = useState<Source | null>(null);
   const [openMenuSourceId, setOpenMenuSourceId] = useState<string | null>(null);
   const [sourcePendingDelete, setSourcePendingDelete] = useState<Source | null>(null);
   const [pendingSyncIds, setPendingSyncIds] = useState<Set<string>>(new Set());
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
 
   const genesQuery = useQuery<GeneMetadata[]>({
     queryKey: ["genes"],
@@ -86,6 +100,11 @@ export function SourcesPage() {
       const sources = normalizeSources(query.state.data);
       return sources.some((source) => source.sync?.status === "running") ? 2000 : false;
     },
+  });
+
+  const projectsQuery = useQuery<Project[]>({
+    queryKey: ["projects"],
+    queryFn: () => client.get("/api/projects").then((response) => response.data),
   });
 
   const syncSource = useMutation({
@@ -135,6 +154,58 @@ export function SourcesPage() {
   const geneByName = new Map(genes.map((gene) => [gene.name, gene]));
   const totalDocs = sources.reduce((sum, source) => sum + source.doc_count, 0);
   const totalMemories = sources.reduce((sum, source) => sum + (source.memory_count ?? 0), 0);
+  const projects = projectsQuery.data ?? [];
+
+  // Sources whose project assignment depends on per-document field values
+  // need the resolver result to know which groups they appear in. Sources
+  // pinned to a single project (or unbound, or managed) don't.
+  const sourcesNeedingResolve = sources.filter(
+    (source) =>
+      source.project_binding?.mode === "by_field" &&
+      !isManagedSourceType(source.type) &&
+      !isManagedSourceId(source.id),
+  );
+
+  const resolvedQueries = useQueries({
+    queries: sourcesNeedingResolve.map((source) => ({
+      queryKey: ["resolvedProjects", source.id],
+      queryFn: () =>
+        client
+          .get<ResolvedProjectsResponse>(`/api/sources/${source.id}/projects/resolved`)
+          .then((response) => response.data),
+    })),
+  });
+
+  const resolvedBySource: ResolvedBySource = {};
+  sourcesNeedingResolve.forEach((source, index) => {
+    const data = resolvedQueries[index]?.data;
+    if (data?.projects) {
+      resolvedBySource[source.id] = data.projects;
+    }
+  });
+
+  const groups = groupSourcesByProject(sources, projects, resolvedBySource);
+
+  const allInUnmapped =
+    sources.length > 0 && groups.length === 1 && groups[0].project === null;
+
+  const isGroupExpanded = (group: typeof groups[number]) => {
+    const key = projectGroupKey(group);
+    return PROJECT_GROUPS_DEFAULT_EXPANDED ? !collapsedGroups.has(key) : collapsedGroups.has(key);
+  };
+
+  const toggleGroup = (group: typeof groups[number]) => {
+    const key = projectGroupKey(group);
+    setCollapsedGroups((current) => {
+      const next = new Set(current);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  };
 
   return (
     <div className="space-y-4">
@@ -176,123 +247,82 @@ export function SourcesPage() {
             />
           }
         >
-          <div className="divide-y">
-            {sources.map((source) => {
-              const isSyncing = source.sync?.status === "running" || pendingSyncIds.has(source.id);
-              const isDeleting = deleteSource.isPending && sourcePendingDelete?.id === source.id;
-              const canConfigure = canConfigureSourceType(source.type);
-              // Per-client agent-session sources are identified by source id; the
-              // legacy singleton falls back to the type-level managed check.
-              const isManaged = isManagedSourceType(source.type) || isManagedSourceId(source.id);
-              const gene = geneByName.get(source.type);
-              // Resolve label by source id first (for per-client splits), then by type.
-              const sourceLabel = SOURCE_LABELS[source.id] ?? SOURCE_LABELS[source.type] ?? {
-                name: gene?.display_name ?? source.type,
-                subtitle: gene?.data_shape ?? "",
-              };
-              const itemLabel = SOURCE_ITEM_LABELS[source.id] ?? SOURCE_ITEM_LABELS[source.type] ?? "documents";
-
+          <div>
+            {allInUnmapped && (
+              <div className="border-b bg-amber-50/60 px-4 py-3 text-sm text-amber-900 dark:bg-amber-900/20 dark:text-amber-100">
+                None of your sources are bound to a project yet. Open Configure on any source
+                below to pick where its memories should land.
+              </div>
+            )}
+            {groups.map((group) => {
+              const expanded = isGroupExpanded(group);
+              const groupKey = projectGroupKey(group);
+              const isUnmappedGroup = group.project === null;
               return (
-                <div key={source.id} className="space-y-3 p-4">
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                    <div className="flex min-w-0 items-start gap-3">
-                      <SourceIcon type={source.type} client={source.client} className="mt-0.5 size-5" />
-                      <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <h3 className="truncate text-sm font-medium">{source.name}</h3>
-                          <StatusDot status={source.status} />
-                          <Badge variant={source.status === "active" ? "secondary" : "outline"}>
-                            {source.status}
-                          </Badge>
-                        </div>
-                        <p className="mt-1 text-xs text-muted-foreground">
-                          {sourceLabel?.name ?? source.type}
-                          {sourceLabel?.subtitle ? ` · ${sourceLabel.subtitle}` : ""}
-                        </p>
-                        {source.type === "agent_session" && (
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            Populated automatically by the plugin. No manual sync needed.
-                          </p>
-                        )}
-                        <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-sm text-muted-foreground">
-                          <span>
-                            <span className="font-medium text-foreground">{source.doc_count}</span> {itemLabel}
-                          </span>
-                          <span>
-                            <span className="font-medium text-foreground">{source.memory_count ?? 0}</span> memories
-                          </span>
-                          <span>{source.sync?.status === "running" ? "Syncing now" : `Last synced: ${timeAgo(source.last_sync)}`}</span>
-                          {source.type === "jira" && source.auth_session && (
-                            <span className={source.auth_session.status === "active" ? "text-emerald-600" : "text-destructive"}>
-                              Browser session (local adapter): {authSessionLabel(source.auth_session.status)}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
+                <ProjectGroup
+                  key={groupKey}
+                  group={group}
+                  expanded={expanded}
+                  onToggle={() => toggleGroup(group)}
+                >
+                  {group.sources.map(({ source, memory_count }) => {
+                    const isSyncing = source.sync?.status === "running" || pendingSyncIds.has(source.id);
+                    const isDeleting = deleteSource.isPending && sourcePendingDelete?.id === source.id;
+                    const canConfigure = canConfigureSourceType(source.type);
+                    const isManaged = isManagedSourceType(source.type) || isManagedSourceId(source.id);
+                    const gene = geneByName.get(source.type);
+                    const sourceLabel = SOURCE_LABELS[source.id] ?? SOURCE_LABELS[source.type] ?? {
+                      name: gene?.display_name ?? source.type,
+                      subtitle: gene?.data_shape ?? "",
+                    };
+                    const itemLabel =
+                      SOURCE_ITEM_LABELS[source.id] ??
+                      SOURCE_ITEM_LABELS[source.type] ??
+                      "documents";
 
-                    <div className="flex items-center justify-end gap-2 sm:shrink-0">
-                      {isManaged && (
-                        <Button
-                          type="button"
-                          variant="outline"
-                          aria-label="View managed source details"
-                          disabled={isDeleting}
-                          onClick={() => setDetailsSource(source)}
-                        >
-                          <Info className="size-4" />
-                          <span className="hidden lg:inline">Details</span>
-                        </Button>
-                      )}
-                      {canConfigure && (
-                        <Button
-                          type="button"
-                          variant="outline"
-                          aria-label="Configure source"
-                          disabled={isDeleting}
-                          onClick={() => setConfigDialog({ sourceType: source.type, source })}
-                        >
-                          <SlidersHorizontal className="size-4" />
-                          <span className="hidden lg:inline">{sourceActionLayout.primary[0].label}</span>
-                        </Button>
-                      )}
-                      {!isManaged && (
-                        <Button
-                          type="button"
-                          disabled={isSyncing || isDeleting}
-                          onClick={() => syncSource.mutate({ sourceId: source.id })}
-                        >
-                          {isSyncing ? (
-                            <Loader2 className="size-4 animate-spin" />
-                          ) : (
-                            <Play className="size-4" />
-                          )}
-                          {isSyncing ? "Syncing" : sourceActionLayout.primary[1].label}
-                        </Button>
-                      )}
-                      <SourceActionsMenu
+                    return (
+                      <SourceRow
+                        key={`${groupKey}:${source.id}`}
                         source={source}
-                        open={openMenuSourceId === source.id}
-                        onOpenChange={(open) => setOpenMenuSourceId(open ? source.id : null)}
-                        onDelete={() => {
-                          setOpenMenuSourceId(null);
-                          setSourcePendingDelete(source);
-                        }}
-                        onForceResync={() => {
-                          setOpenMenuSourceId(null);
-                          forceResyncSource.mutate(source.id);
-                        }}
-                        disableForceResync={isSyncing || isDeleting}
+                        perGroupMemoryCount={memory_count}
+                        isSyncing={isSyncing}
+                        isDeleting={isDeleting}
+                        canConfigure={canConfigure}
+                        isManaged={isManaged}
+                        sourceLabel={sourceLabel}
+                        itemLabel={itemLabel}
+                        authSessionLabel={authSessionLabel}
+                        onConfigure={() =>
+                          setConfigDialog({
+                            sourceType: source.type,
+                            source,
+                            initialFocus: isUnmappedGroup ? { step: "project" } : undefined,
+                          })
+                        }
+                        onSync={() => syncSource.mutate({ sourceId: source.id })}
+                        onShowDetails={() => setDetailsSource(source)}
+                        actionsMenu={
+                          <SourceActionsMenu
+                            source={source}
+                            open={openMenuSourceId === source.id}
+                            onOpenChange={(open) =>
+                              setOpenMenuSourceId(open ? source.id : null)
+                            }
+                            onDelete={() => {
+                              setOpenMenuSourceId(null);
+                              setSourcePendingDelete(source);
+                            }}
+                            onForceResync={() => {
+                              setOpenMenuSourceId(null);
+                              forceResyncSource.mutate(source.id);
+                            }}
+                            disableForceResync={isSyncing || isDeleting}
+                          />
+                        }
                       />
-                    </div>
-                  </div>
-
-                  <SyncStatusBar
-                    sync={source.sync}
-                    itemLabel={itemLabel}
-                    onRetry={() => syncSource.mutate({ sourceId: source.id })}
-                  />
-                </div>
+                    );
+                  })}
+                </ProjectGroup>
               );
             })}
           </div>
@@ -323,6 +353,7 @@ export function SourcesPage() {
         }}
         sourceType={configDialog.sourceType}
         source={configDialog.source}
+        initialFocus={configDialog.initialFocus}
       />
 
       <AgentSessionDetailsDialog
@@ -500,7 +531,7 @@ function AgentSessionDetailsDialog({
       if (!source) throw new Error("source is required");
       return client.get(`/api/sources/${source.id}/projects`).then((response) => response.data);
     },
-    enabled: open && source?.type === "agent_session",
+    enabled: open && (source?.type === "agent_session" || (source ? isManagedSourceId(source.id) : false)),
   });
   const completenessQuery = useQuery<AgentSessionCompleteness>({
     queryKey: ["agent-session-completeness", source?.id],
@@ -510,7 +541,7 @@ function AgentSessionDetailsDialog({
         .get("/api/agent-sessions/completeness", { params: { source_id: source.id } })
         .then((response) => response.data);
     },
-    enabled: open && source?.type === "agent_session",
+    enabled: open && (source?.type === "agent_session" || (source ? isManagedSourceId(source.id) : false)),
   });
 
   if (!source) return null;

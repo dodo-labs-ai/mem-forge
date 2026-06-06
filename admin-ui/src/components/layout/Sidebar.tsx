@@ -16,6 +16,7 @@ import { BRAND_INITIALS, BRAND_NAME, BRAND_SUBTITLE } from "@/brand";
 import { TaiSealLogo } from "@/components/brand/TaiSealLogo";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { ACTIVE_WORKSPACE_NAME } from "@/lib/workspace";
 
 const navGroups = [
   {
@@ -141,7 +142,7 @@ function AccountFooter() {
         </span>
         <span className="min-w-0 flex-1">
           <span className="block truncate font-medium leading-none">{BRAND_NAME}</span>
-          <span className="mt-1 block truncate text-xs text-muted-foreground">Private workspace</span>
+          <span className="mt-1 block truncate text-xs text-muted-foreground">{ACTIVE_WORKSPACE_NAME}</span>
         </span>
         <ChevronsUpDown className="size-4 shrink-0 text-muted-foreground" />
       </button>

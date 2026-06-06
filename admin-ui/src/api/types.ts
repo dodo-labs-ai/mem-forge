@@ -1,11 +1,17 @@
 // API types for the MemForge admin UI
 
+/**
+ * Visibility levels carried on every memory. "private" is owner-only;
+ * "workspace" is everyone in the active workspace.
+ */
+export type Visibility = "private" | "workspace";
+
 export interface Memory {
   id: string;
   memory_type: "fact" | "decision" | "convention" | "procedure";
   content: string;
   content_hash: string;
-  visibility: string;
+  visibility: Visibility | string;
   owner_user_id: string | null;
   project_key: string | null;
   tags: string[];
@@ -104,6 +110,12 @@ export interface Source {
   sync?: SyncStatus | null;
   auth_session?: JiraAuthSession | null;
   created_at: string;
+  /**
+   * How memories extracted from this source are routed to projects.
+   * Absent or null means the source is unbound and its memories fall to
+   * the Unmapped backlog until an admin classifies them.
+   */
+  project_binding?: ProjectBinding | null;
 }
 
 export interface SourceProject {
@@ -130,6 +142,54 @@ export interface Project {
   name: string;
   kind: ProjectKind;
   created_at: string;
+}
+
+/**
+ * How a source binds its extracted memories to projects.
+ *
+ * - `fixed`: every memory the source produces lands in `project_key`.
+ * - `by_field`: the resolver reads `field` off each document and looks the
+ *   value up in `map`; values not in `map` fall through to `default`.
+ */
+export type ProjectBindingMode = "fixed" | "by_field";
+
+export interface ProjectBinding {
+  mode: ProjectBindingMode;
+  project_key?: string;
+  field?: string;
+  map?: Record<string, string>;
+  default?: string;
+}
+
+/**
+ * One project bucket a source has actually contributed memories to,
+ * as reported by `GET /api/sources/{id}/projects/resolved`.
+ */
+export interface SourceResolvedProject {
+  project_key: string;
+  memory_count: number;
+}
+
+export interface ResolvedProjectsResponse {
+  source_id: string;
+  projects: SourceResolvedProject[];
+}
+
+/** A source rendered inside one project group, with that group's memory count. */
+export interface GroupedSource {
+  source: Source;
+  memory_count: number;
+}
+
+/**
+ * One section in the project-grouped sources view. `project` is null for the
+ * Unmapped backlog (sources without a `project_binding`).
+ */
+export interface SourceProjectGroup {
+  project: Project | null;
+  sources: GroupedSource[];
+  docCount: number;
+  memoryCount: number;
 }
 
 export interface AgentSessionLatestFailure {
@@ -206,6 +266,12 @@ export interface ConfigGroup {
 export interface GeneConfigSchema {
   groups: ConfigGroup[];
   fields: ConfigField[];
+  /**
+   * Key of the document field a `by_field` project binding should read.
+   * The matching `ConfigField.label` supplies the human label; absent
+   * means this gene does not support `by_field` and the dialog hides it.
+   */
+  project_field?: string | null;
 }
 
 export interface DiscoveryPreviewItem {
