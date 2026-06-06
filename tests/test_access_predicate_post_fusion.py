@@ -23,8 +23,6 @@ async def test_filter_visible_ids_strips_other_users_private(tmp_path):
         adapters = build_sqlite_adapters(db, memory_collection=None)
         scope = AccessScope(
             user_id="u-1",
-            open_projects=frozenset({SHARED_PROJECT_KEY}),
-            member_projects=frozenset(),
             include_private=True,  # PERSONALIZED
             allowed_statuses=("active",),
             active_project=None,

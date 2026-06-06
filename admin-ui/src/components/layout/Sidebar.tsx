@@ -5,6 +5,7 @@ import {
   ChevronsUpDown,
   Database,
   Files,
+  FolderKanban,
   Settings,
   ShieldCheck,
   X,
@@ -24,6 +25,7 @@ const navGroups = [
       { to: "/review", label: "Review", icon: ShieldCheck, badgeKey: "pending-reviews" as const },
       { to: "/entities", label: "Entities", icon: Database },
       { to: "/sources", label: "Sources", icon: Files },
+      { to: "/projects", label: "Project setup", icon: FolderKanban },
     ],
   },
   {

@@ -8,7 +8,7 @@ adapter's job, never the caller's.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, TypedDict, runtime_checkable
 
 from memforge.models import (
     DocumentRecord,
@@ -16,8 +16,21 @@ from memforge.models import (
     EntityAlias,
     Memory,
     MemorySource,
+    Project,
 )
 from memforge.storage.adapters.context import AccessScope
+
+
+class RankingMetadata(TypedDict, total=False):
+    """The per-memory inputs the ranker needs alongside RRF scores.
+
+    `updated_at` drives the recency curve; `project_key` drives the
+    cross-project affinity penalty. Both come back in one relational read
+    so the ranker never makes a second roundtrip.
+    """
+
+    updated_at: datetime | None
+    project_key: str | None
 
 
 @runtime_checkable
@@ -47,9 +60,9 @@ class RelationalStore(Protocol):
     async def filter_ids_supported_by_sources(
         self, ids: Sequence[str], sources: Sequence[str]
     ) -> set[str]: ...
-    async def fetch_updated_at(
+    async def fetch_ranking_metadata(
         self, ids: Sequence[str]
-    ) -> dict[str, datetime | None]: ...
+    ) -> Mapping[str, RankingMetadata]: ...
     async def graph_search(
         self,
         entity_ids: Sequence[int],
@@ -87,6 +100,42 @@ class RelationalStore(Protocol):
         implemented. Implementations must raise NotImplementedError after
         auditing the attempt and after verifying the actor owns the row.
         A non-owner caller must be rejected before any audit emission.
+        """
+        ...
+
+    async def create_project(
+        self, *, key: str, name: str, is_shared: bool = False
+    ) -> Project: ...
+    async def get_project(self, project_id: str) -> Project | None: ...
+    async def list_projects(self) -> list[Project]: ...
+    async def update_project(
+        self,
+        project_id: str,
+        *,
+        name: str | None = None,
+        is_shared: bool | None = None,
+    ) -> Project | None: ...
+    async def list_project_memory_ids(self, project_id: str) -> list[str]:
+        """Return the memory ids attached to a project.
+
+        Pairs with `commit_project_deletion`. The handler reads the
+        affected ids first, has the owning vector service rewrite their
+        embedding metadata to UNSORTED, then commits the relational
+        rebucket. Reserved keys (SHARED, UNSORTED) raise `ValueError`;
+        an unknown id raises `LookupError`.
+        """
+        ...
+
+    async def commit_project_deletion(
+        self, project_id: str, affected_ids: Sequence[str]
+    ) -> None:
+        """Rebucket the named memories to UNSORTED and drop the project
+        row, in one transaction.
+
+        `affected_ids` is the same id list the caller already moved on
+        the vector side, so the relational rebucket touches exactly the
+        rows the vector channel touched. Reserved keys (SHARED,
+        UNSORTED) raise `ValueError`.
         """
         ...
 

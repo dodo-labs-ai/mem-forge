@@ -43,6 +43,7 @@ from memforge.memory.index_payloads import (
     document_embedding_text,
     embedding_text_hash,
 )
+from memforge.memory.project_resolver import resolve_project_key
 from memforge.memory.visibility_policy import default_visibility
 
 if TYPE_CHECKING:
@@ -764,7 +765,14 @@ class GeneSyncOrchestrator:
 
         token_count = _count_tokens(markdown_body)
         now = datetime.now(timezone.utc)
-        project_key = item.space_or_project if item.space_or_project else None
+        source_row = await self.db.get_source(source_id)
+        binding = source_row.get("project_binding") if source_row else None
+        project_key = resolve_project_key(
+            binding,
+            item_field_value=item.space_or_project,
+            repo=None,
+            workspace=None,
+        )
         doc_record = DocumentRecord(
             doc_id=doc_id,
             source=source_id,

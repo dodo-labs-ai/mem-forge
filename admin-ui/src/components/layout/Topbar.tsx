@@ -1,6 +1,7 @@
 import { Bell, Circle, Menu, Sun } from "lucide-react";
 import { BRAND_INITIALS } from "@/brand";
 import { Button } from "@/components/ui/button";
+import { ActiveProjectChip } from "./ActiveProjectChip";
 import { CommandSearch } from "./CommandSearch";
 
 export function Topbar({ onOpenNavigation }: { onOpenNavigation: () => void }) {
@@ -22,6 +23,7 @@ export function Topbar({ onOpenNavigation }: { onOpenNavigation: () => void }) {
       </div>
 
       <div className="flex items-center gap-1">
+        <ActiveProjectChip />
         <Button type="button" variant="ghost" size="icon-sm" aria-label="Theme">
           <Sun className="size-4" />
         </Button>

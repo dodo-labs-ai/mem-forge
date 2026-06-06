@@ -18,7 +18,6 @@ from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import (
     Memory,
     SHARED_PROJECT_KEY,
-    UNSORTED_PROJECT_KEY,
     Visibility,
     content_hash,
 )
@@ -50,8 +49,6 @@ def _mem(mid: str, *, visibility=WORKSPACE, owner=None,
 def _scope(*, include_private: bool, include_superseded: bool) -> AccessScope:
     return AccessScope(
         user_id="u-1",
-        open_projects=frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}),
-        member_projects=frozenset(),
         include_private=include_private,
         allowed_statuses=allowed_search_statuses(include_superseded),
         active_project=None,

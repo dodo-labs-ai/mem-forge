@@ -16,8 +16,6 @@ def test_local_dev_user_id_is_the_single_local_caller():
 def test_access_scope_is_frozen():
     scope = AccessScope(
         user_id=LOCAL_DEV_USER_ID,
-        open_projects=frozenset({"SHARED"}),
-        member_projects=frozenset({"SHARED"}),
         include_private=False,
         allowed_statuses=("active",),
         active_project=None,
@@ -30,8 +28,6 @@ def test_access_scope_is_frozen():
 def test_access_scope_carries_relevance_and_lifecycle_fields():
     scope = AccessScope(
         user_id=LOCAL_DEV_USER_ID,
-        open_projects=frozenset({"SHARED", "PAY"}),
-        member_projects=frozenset({"SHARED", "PAY"}),
         include_private=True,
         allowed_statuses=("active", "superseded"),
         active_project="PAY",

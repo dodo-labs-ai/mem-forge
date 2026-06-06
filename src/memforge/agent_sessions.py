@@ -16,6 +16,7 @@ from memforge.agent_session_contract import (
     AGENT_SESSION_PACKAGE_KIND,
 )
 from memforge.config import AppConfig
+from memforge.memory.project_resolver import resolve_project_key
 from memforge.models import AgentHookReceipt, AgentSessionReceipt, content_hash, slugify
 from memforge.storage.database import Database
 
@@ -566,11 +567,17 @@ async def ensure_agent_session_source(
     # documents_dir belong to this source. Without it the gene would rglob the
     # entire inbox and stamp foreign clients' documents with this source id.
     source_config = {"documents_dir": str(inbox), "client": client}
+    # Preserve any admin-attached project_binding across the idempotent
+    # upsert so a binding configured through the admin API is not silently
+    # cleared the next time a session document arrives.
+    existing = await db.get_source(source_id)
+    existing_binding = existing.get("project_binding") if existing else None
     await db.upsert_source(
         id=source_id,
         type=AGENT_SESSION_SOURCE_TYPE,
         name=source_name,
         config_json=json.dumps(source_config),
+        project_binding=existing_binding,
     )
     source = await db.get_source(source_id)
     assert source is not None
@@ -630,7 +637,12 @@ async def submit_agent_session_document(
     per_client_source_id = agent_session_source_id(client)
     source_url = f"agent-session://{slugify(client)}/{slugify(session_id)}/{slugify(trigger)}/{doc_id}"
     doc_title = title or f"Agent Session: {client} {session_id} {trigger}"
-    project = repo or Path(workspace).name or "agent-session"
+    project = resolve_project_key(
+        source.get("project_binding"),
+        item_field_value=None,
+        repo=repo,
+        workspace=workspace,
+    )
     package_path = documents_dir / slugify(project) / f"{doc_id}.json"
     package_path.parent.mkdir(parents=True, exist_ok=True)
 

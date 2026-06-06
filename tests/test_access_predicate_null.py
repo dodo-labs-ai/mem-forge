@@ -18,7 +18,6 @@ import pytest
 from memforge.models import (
     Memory,
     SHARED_PROJECT_KEY,
-    UNSORTED_PROJECT_KEY,
     Visibility,
     content_hash,
 )
@@ -42,8 +41,6 @@ async def db(tmp_path):
 def _scope(*, include_private: bool) -> AccessScope:
     return AccessScope(
         user_id="u-1",
-        open_projects=frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}),
-        member_projects=frozenset(),
         include_private=include_private,
         allowed_statuses=("active", "superseded"),
         active_project=None,

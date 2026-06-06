@@ -19,6 +19,7 @@ from memforge.models import (
     EntityAlias,
     Memory,
     MemorySource,
+    Project,
     Visibility,
 )
 from memforge.retrieval.access_predicate import visible_sql
@@ -307,28 +308,70 @@ class SqliteRelationalStore:
             return []
         return results
 
-    async def fetch_updated_at(
+    async def fetch_ranking_metadata(
         self, ids: Sequence[str]
-    ) -> dict[str, datetime | None]:
-        stamped: dict[str, datetime | None] = {}
+    ) -> dict[str, dict[str, Any]]:
+        """Return ``updated_at`` and ``project_key`` for each id in one read.
+
+        Both columns feed the ranker (recency curve and cross-project
+        affinity penalty), so a single batched ``SELECT`` keeps the per-
+        candidate roundtrip count at one regardless of the channel set.
+        """
+        ranked: dict[str, dict[str, Any]] = {}
         memory_ids = list(ids)
         for start in range(0, len(memory_ids), _BATCH_SIZE):
             batch = memory_ids[start : start + _BATCH_SIZE]
             placeholders = ",".join("?" for _ in batch)
             try:
                 async with self._db.db.execute(
-                    f"SELECT id, updated_at FROM memories WHERE id IN ({placeholders})",
+                    f"SELECT id, updated_at, project_key FROM memories "
+                    f"WHERE id IN ({placeholders})",
                     batch,
                 ) as cursor:
                     async for row in cursor:
-                        raw = row[1]
+                        raw_updated = row[1]
                         parsed: datetime | None = None
-                        if raw:
+                        if raw_updated:
                             try:
-                                parsed = datetime.fromisoformat(raw)
+                                parsed = datetime.fromisoformat(raw_updated)
                             except (ValueError, TypeError):
                                 parsed = None
-                        stamped[row[0]] = parsed
+                        ranked[row[0]] = {
+                            "updated_at": parsed,
+                            "project_key": row[2],
+                        }
             except Exception:
-                logger.exception("Failed to fetch updated_at for memory ids")
-        return stamped
+                logger.exception("Failed to fetch ranking metadata for memory ids")
+        return ranked
+
+    async def create_project(
+        self, *, key: str, name: str, is_shared: bool = False
+    ) -> Project:
+        return await self._db.create_project(
+            key=key, name=name, is_shared=is_shared
+        )
+
+    async def get_project(self, project_id: str) -> Project | None:
+        return await self._db.get_project(project_id)
+
+    async def list_projects(self) -> list[Project]:
+        return await self._db.list_projects()
+
+    async def update_project(
+        self,
+        project_id: str,
+        *,
+        name: str | None = None,
+        is_shared: bool | None = None,
+    ) -> Project | None:
+        return await self._db.update_project(
+            project_id, name=name, is_shared=is_shared
+        )
+
+    async def list_project_memory_ids(self, project_id: str) -> list[str]:
+        return await self._db.list_project_memory_ids(project_id)
+
+    async def commit_project_deletion(
+        self, project_id: str, affected_ids: Sequence[str]
+    ) -> None:
+        await self._db.commit_project_deletion(project_id, affected_ids)

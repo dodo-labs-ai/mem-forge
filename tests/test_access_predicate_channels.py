@@ -4,7 +4,6 @@ from memforge.models import (
     Visibility,
     content_hash,
     SHARED_PROJECT_KEY,
-    UNSORTED_PROJECT_KEY,
 )
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -33,8 +32,6 @@ def _mem(mid: str, content: str, *, visibility=WORKSPACE, owner=None,
 def _scope(*, user_id="u-1", include_private=False) -> AccessScope:
     return AccessScope(
         user_id=user_id,
-        open_projects=frozenset({SHARED_PROJECT_KEY}),
-        member_projects=frozenset(),
         include_private=include_private,
         allowed_statuses=("active",),
         active_project=None,
@@ -160,11 +157,10 @@ async def test_vector_hides_other_users_private_memory(db):
 
 
 @pytest.mark.asyncio
-async def test_vector_pre_filter_does_not_drop_dangling_project_workspace_memory(db):
-    # The vector tier intentionally does not narrow by project_key (Chroma cannot
-    # express the dangling-project fail-safe). A workspace memory whose project
-    # key has no row in the projects table must still be a vector candidate;
-    # the relational post-fusion re-check is the authority on project openness.
+async def test_vector_pre_filter_does_not_drop_workspace_memory_by_project_key(db):
+    # The vector tier intentionally does not narrow by project_key. A workspace
+    # memory from any project remains a vector candidate; the relational
+    # post-fusion re-check applies the authoritative access predicate.
     from memforge.storage.adapters.sqlite.vector import SqliteVectorStore
     coll = _Coll()
     coll.upsert(
@@ -223,8 +219,6 @@ async def test_search_engine_team_search_excludes_private(db, monkeypatch):
 
     team_scope = AccessScope(
         user_id="u-1",
-        open_projects=frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}),
-        member_projects=frozenset(),
         include_private=False,
         allowed_statuses=("active",),
         active_project=None,

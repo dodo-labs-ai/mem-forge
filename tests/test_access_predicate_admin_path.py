@@ -22,7 +22,6 @@ from memforge.config import RetrievalConfig
 from memforge.models import (
     Memory,
     SHARED_PROJECT_KEY,
-    UNSORTED_PROJECT_KEY,
     Visibility,
     content_hash,
 )
@@ -175,8 +174,6 @@ async def test_search_with_admin_styled_caller_still_hides_other_users_private(
     # an administrator. The scope is the only authority.
     admin_styled_scope = AccessScope(
         user_id="u-1",
-        open_projects=frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}),
-        member_projects=frozenset(),
         include_private=False,
         allowed_statuses=("active",),
         active_project=None,
