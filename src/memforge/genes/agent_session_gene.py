@@ -138,6 +138,20 @@ class AgentSessionGene(Gene):
                     group="storage",
                     order=0,
                 ),
+                ConfigField(
+                    key="client",
+                    label="Client",
+                    field_type=ConfigFieldType.STRING,
+                    required=False,
+                    placeholder="codex",
+                    help_text=(
+                        "Client slug this source ingests (e.g. 'codex', 'claude-code'). "
+                        "When set, the gene only picks up packages whose receipt.client "
+                        "matches this value. Leave empty to ingest all clients."
+                    ),
+                    group="storage",
+                    order=1,
+                ),
             ],
         )
 
@@ -150,6 +164,7 @@ class AgentSessionGene(Gene):
 
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         documents_dir = Path(self.config["documents_dir"]).expanduser()
+        configured_client = self.config.get("client")
         for package_path in sorted(documents_dir.rglob("*.json")):
             package = json.loads(package_path.read_text(encoding="utf-8"))
             if not _is_ingestable_agent_session_package(package):
@@ -159,6 +174,12 @@ class AgentSessionGene(Gene):
                 )
                 continue
             receipt = package.get("receipt", {})
+            # Per-client sources share a documents_dir, so each gene must filter
+            # the directory by receipt.client to avoid stamping foreign clients'
+            # documents with its own source id. Legacy single-source mode (no
+            # configured client) keeps the unfiltered behavior.
+            if configured_client and receipt.get("client") != configured_client:
+                continue
             last_modified = _parse_dt(package["last_modified"])
             if since and last_modified <= since:
                 continue
