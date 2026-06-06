@@ -562,7 +562,10 @@ async def ensure_agent_session_source(
     source_name = agent_session_source_name(client)
     inbox = Path(documents_dir) if documents_dir else default_agent_session_documents_dir(config)
     inbox.mkdir(parents=True, exist_ok=True)
-    source_config = {"documents_dir": str(inbox)}
+    # The "client" key tells AgentSessionGene which packages in the shared
+    # documents_dir belong to this source. Without it the gene would rglob the
+    # entire inbox and stamp foreign clients' documents with this source id.
+    source_config = {"documents_dir": str(inbox), "client": client}
     await db.upsert_source(
         id=source_id,
         type=AGENT_SESSION_SOURCE_TYPE,
