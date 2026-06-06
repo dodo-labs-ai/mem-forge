@@ -75,8 +75,19 @@ def test_hook_context_skips_trivial_prompt(tmp_path):
         asyncio.run(database.close())
 
 
-def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path):
+def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path, monkeypatch):
+    from memforge.retrieval import search as search_module
     from memforge.server.admin_api import create_admin_app
+
+    # Stub the embedding API: the unit test has no real LLM endpoint, but the
+    # hook is now routed through the unified search engine which always asks
+    # for a query embedding. Returning a deterministic vector keeps the vector
+    # channel quiet so BM25 can surface the seeded memory.
+    monkeypatch.setattr(
+        search_module,
+        "embed_texts",
+        lambda texts, **_kwargs: [[0.0] * 8 for _ in texts],
+    )
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "hooks.db"))
@@ -86,7 +97,7 @@ def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path):
         await database.insert_memory(
             _memory(
                 "mem-hook-1",
-                "MemForge lifecycle cleanup must route through MemoryStore so SQLite, FTS, and Chroma stay consistent.",
+                "In the mem-forge project, MemForge lifecycle cleanup must route through MemoryStore so SQLite, FTS, and Chroma stay consistent.",
                 tags=["memory-lifecycle", "index-consistency"],
             )
         )
@@ -103,7 +114,7 @@ def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path):
                     "workspace": "/workspace/mem-forge",
                     "repo": "mem-forge",
                     "branch": "codex/agent-hook-integration",
-                    "prompt": "Before changing memory lifecycle consistency, what project decisions should I know?",
+                    "prompt": "Before changing MemForge lifecycle cleanup, what should route through MemoryStore?",
                     "max_memories": 3,
                 },
             )

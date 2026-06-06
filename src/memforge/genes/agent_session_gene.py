@@ -190,7 +190,13 @@ class AgentSessionGene(Gene):
     async def normalize(self, raw: RawContent) -> NormalizedContent:
         package = json.loads(raw.body.decode("utf-8"))
         receipt = package.get("receipt", {})
+        receipt_metadata = receipt.get("metadata") or {}
         markdown = package.get("markdown", "")
+        # The uploader hint is a write-time signal that travels with the package
+        # so the sync pipeline can stamp the correct owner at persistence time.
+        # It is never authoritative for retrieval; the access predicate stays in
+        # charge of read-time visibility.
+        uploader_user_id = receipt_metadata.get("user_id")
 
         return NormalizedContent(
             item=raw.item,
@@ -205,6 +211,7 @@ class AgentSessionGene(Gene):
                 "branch": receipt.get("branch"),
                 "commit_sha": receipt.get("commit_sha"),
                 "history_window_kind": receipt.get("history_window_kind"),
+                "uploader_user_id": uploader_user_id,
             },
         )
 

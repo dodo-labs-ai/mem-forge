@@ -171,12 +171,15 @@ class MemoryIndexRepairer:
         embedding: Any | None,
     ) -> dict[str, Any]:
         metadata = dict(existing_metadata or {})
+        metadata.pop("space_or_project", None)
         sources = await self.db.get_memory_sources(memory.id)
         if sources and not metadata.get("source_doc_id"):
             metadata["source_doc_id"] = sources[0].doc_id
         metadata.update({
             "memory_type": memory.memory_type,
-            "space_or_project": memory.project_key or "",
+            "project_key": memory.project_key or "",
+            "visibility": memory.visibility,
+            "owner_user_id": memory.owner_user_id or "",
             "confidence": memory.confidence,
             "status": memory.status,
             "content_hash": memory.content_hash,

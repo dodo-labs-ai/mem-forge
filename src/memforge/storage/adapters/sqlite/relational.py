@@ -19,6 +19,7 @@ from memforge.models import (
     Memory,
     MemorySource,
 )
+from memforge.retrieval.access_predicate import visible_sql
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope
 
@@ -81,20 +82,22 @@ class SqliteRelationalStore:
     async def filter_visible_ids(
         self, ids: Sequence[str], scope: AccessScope
     ) -> set[str]:
-        allowed = set(scope.allowed_statuses)
         visible: set[str] = set()
         memory_ids = list(ids)
+        if not memory_ids:
+            return visible
+        pred_sql, pred_params = visible_sql(scope, "m")
         for start in range(0, len(memory_ids), _BATCH_SIZE):
             batch = memory_ids[start : start + _BATCH_SIZE]
             placeholders = ",".join("?" for _ in batch)
+            sql = (
+                "SELECT m.id FROM memories m "
+                f"WHERE m.id IN ({placeholders}) AND {pred_sql}"
+            )
             try:
-                async with self._db.db.execute(
-                    f"SELECT id, status FROM memories WHERE id IN ({placeholders})",
-                    batch,
-                ) as cursor:
+                async with self._db.db.execute(sql, [*batch, *pred_params]) as cursor:
                     async for row in cursor:
-                        if row["status"] in allowed:
-                            visible.add(row["id"])
+                        visible.add(row["id"])
             except Exception:
                 logger.exception("Failed to filter visible memory ids")
                 return set()
@@ -138,9 +141,7 @@ class SqliteRelationalStore:
             return []
 
         placeholders = ",".join("?" for _ in ids)
-        statuses = scope.allowed_statuses
-        status_placeholders = ",".join("?" for _ in statuses)
-        status_filter = f"AND m.status IN ({status_placeholders})"
+        predicate_sql, predicate_params = visible_sql(scope, "m")
         type_filter = ""
         type_params: list[Any] = []
         if memory_types:
@@ -153,12 +154,12 @@ class SqliteRelationalStore:
             "FROM memories m "
             "JOIN memory_entities me ON m.id = me.memory_id "
             f"WHERE me.entity_id IN ({placeholders}) "
-            f"{status_filter} {type_filter} "
+            f"AND {predicate_sql} {type_filter} "
             "GROUP BY m.id "
             "ORDER BY entity_overlap DESC "
             "LIMIT ?"
         )
-        direct_params: list[Any] = [*ids, *statuses, *type_params, limit]
+        direct_params: list[Any] = [*ids, *predicate_params, *type_params, limit]
 
         direct_results: list[tuple[str, int]] = []
         try:
@@ -184,14 +185,14 @@ class SqliteRelationalStore:
                 "JOIN memories m ON me2.memory_id = m.id "
                 f"WHERE me1.memory_id IN ({d_placeholders}) "
                 f"AND m.id NOT IN ({d_placeholders}) "
-                f"{status_filter} {type_filter} "
+                f"AND {predicate_sql} {type_filter} "
                 "GROUP BY m.id "
                 f"HAVING shared_entities >= {_MIN_SHARED_ENTITIES_FOR_EXPANSION} "
                 "ORDER BY shared_entities DESC "
                 "LIMIT ?"
             )
             expanded_params: list[Any] = [
-                *direct_ids, *direct_ids, *statuses, *type_params, limit,
+                *direct_ids, *direct_ids, *predicate_params, *type_params, limit,
             ]
             try:
                 async with self._db.db.execute(expanded_sql, expanded_params) as cursor:
@@ -226,10 +227,9 @@ class SqliteRelationalStore:
         if not conditions:
             return []
 
-        statuses = scope.allowed_statuses
-        status_placeholders = ",".join("?" for _ in statuses)
-        conditions.append(f"m.status IN ({status_placeholders})")
-        params.extend(statuses)
+        predicate_sql, predicate_params = visible_sql(scope, "m")
+        conditions.append(predicate_sql)
+        params.extend(predicate_params)
         if memory_types:
             type_placeholders = ",".join("?" for _ in memory_types)
             conditions.append(f"m.memory_type IN ({type_placeholders})")

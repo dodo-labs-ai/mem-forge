@@ -16,7 +16,7 @@ from memforge.memory.index_payloads import (
     memory_embedding_text,
 )
 from memforge.memory.lifecycle import allowed_search_statuses
-from memforge.models import Memory
+from memforge.models import Memory, Visibility
 from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
@@ -52,6 +52,48 @@ def _memory_embedding_text(memory: Memory) -> str:
     Type prefix causes memories of the same type to cluster in embedding space.
     """
     return memory_embedding_text(memory)
+
+
+def _memory_metadata(
+    memory: Memory,
+    *,
+    embedding_text_hash: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Vector metadata payload for a live memory write.
+
+    Single source of truth for the keys stamped on every memory upsert, so
+    every write site agrees with the access predicate's pre-filter and the
+    repair pass's rewritten payload.
+    """
+    base: dict[str, Any] = {
+        "memory_type": memory.memory_type,
+        "project_key": memory.project_key or "",
+        "visibility": memory.visibility,
+        "owner_user_id": memory.owner_user_id or "",
+        "confidence": memory.confidence,
+        "status": memory.status,
+        "content_hash": memory.content_hash,
+        "embedding_text_hash": embedding_text_hash,
+    }
+    if extra:
+        base.update(extra)
+    return base
+
+
+def _normalize_snapshot_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Carry a saved snapshot's vector metadata across the rename and the new
+    visibility/owner keys. A pre-rename snapshot has the legacy
+    `space_or_project` key and lacks `visibility`/`owner_user_id`; a snapshot
+    taken after has the new keys. This helper makes either replayable."""
+    out = dict(metadata or {})
+    if "project_key" not in out and "space_or_project" in out:
+        out["project_key"] = out.pop("space_or_project")
+    out.pop("space_or_project", None)
+    out.setdefault("visibility", Visibility.WORKSPACE.value)
+    out.setdefault("owner_user_id", "")
+    out.setdefault("project_key", "")
+    return out
 
 
 class MemoryStore:
@@ -292,15 +334,11 @@ class MemoryStore:
             await self.vector.upsert(
                 ids=[memory.id],
                 embeddings=[indexed_embedding],
-                metadatas=[{
-                    "memory_type": memory.memory_type,
-                    "source_doc_id": doc_id,
-                    "space_or_project": memory.project_key or "",
-                    "confidence": memory.confidence,
-                    "status": memory.status,
-                    "content_hash": memory.content_hash,
-                    "embedding_text_hash": embedding_text_hash(indexed_text),
-                }],
+                metadatas=[_memory_metadata(
+                    memory,
+                    embedding_text_hash=embedding_text_hash(indexed_text),
+                    extra={"source_doc_id": doc_id},
+                )],
             )
             await self._emit(
                 "chroma_upsert_committed",
@@ -385,14 +423,10 @@ class MemoryStore:
                 await self.vector.upsert(
                     ids=[memory_id],
                     embeddings=[embedding],
-                    metadatas=[{
-                        "memory_type": memory.memory_type,
-                        "space_or_project": memory.project_key or "",
-                        "confidence": memory.confidence,
-                        "status": memory.status,
-                        "content_hash": memory.content_hash,
-                        "embedding_text_hash": embedding_text_hash(embedding_text),
-                    }],
+                    metadatas=[_memory_metadata(
+                        memory,
+                        embedding_text_hash=embedding_text_hash(embedding_text),
+                    )],
                 )
                 await self._emit(
                     "chroma_upsert_committed",
@@ -506,15 +540,11 @@ class MemoryStore:
                 await self.vector.upsert(
                     ids=[new_memory.id],
                     embeddings=[embedding],
-                    metadatas=[{
-                        "memory_type": new_memory.memory_type,
-                        "source_doc_id": doc_id,
-                        "space_or_project": new_memory.project_key or "",
-                        "confidence": new_memory.confidence,
-                        "status": new_memory.status,
-                        "content_hash": new_memory.content_hash,
-                        "embedding_text_hash": embedding_text_hash(embedding_text),
-                    }],
+                    metadatas=[_memory_metadata(
+                        new_memory,
+                        embedding_text_hash=embedding_text_hash(embedding_text),
+                        extra={"source_doc_id": doc_id},
+                    )],
                 )
                 await self._emit(
                     "chroma_upsert_committed",
@@ -967,14 +997,11 @@ class MemoryStore:
             await self.vector.upsert(
                 ids=[challenger.id],
                 embeddings=[embedding],
-                metadatas=[{
-                    "memory_type": challenger.memory_type,
-                    "space_or_project": challenger.project_key or "",
-                    "confidence": challenger.confidence,
-                    "status": "active",
-                    "content_hash": challenger.content_hash,
-                    "embedding_text_hash": embedding_text_hash(embedding_text),
-                }],
+                metadatas=[_memory_metadata(
+                    challenger,
+                    embedding_text_hash=embedding_text_hash(embedding_text),
+                    extra={"status": "active"},
+                )],
             )
             await self._emit(
                 "chroma_upsert_committed",
@@ -1227,14 +1254,10 @@ class MemoryStore:
             await self.vector.upsert(
                 ids=[memory.id],
                 embeddings=[embedding],
-                metadatas=[{
-                    "memory_type": memory.memory_type,
-                    "space_or_project": memory.project_key or "",
-                    "confidence": memory.confidence,
-                    "status": memory.status,
-                    "content_hash": memory.content_hash,
-                    "embedding_text_hash": embedding_text_hash(embedding_text),
-                }],
+                metadatas=[_memory_metadata(
+                    memory,
+                    embedding_text_hash=embedding_text_hash(embedding_text),
+                )],
             )
             await self._emit(
                 "chroma_upsert_committed",
@@ -1437,7 +1460,7 @@ class MemoryStore:
             await self.vector.upsert(
                 ids=[snapshot["id"]],
                 embeddings=[embedding],
-                metadatas=[snapshot.get("metadata") or {}],
+                metadatas=[_normalize_snapshot_metadata(snapshot.get("metadata") or {})],
             )
             await self._emit(
                 "chroma_upsert_committed",

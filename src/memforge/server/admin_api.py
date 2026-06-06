@@ -100,6 +100,36 @@ def _like_pattern(value: str) -> str:
     return f"%{escaped}%"
 
 
+def _workspace_default_scope(request: Request, *, include_private: bool):
+    """Build the workspace-default AccessScope for an admin-API HTTP read.
+
+    The caller's identity is server-derived (``resolve_principal(request)``);
+    open projects are the reserved SHARED and UNSORTED keys, only the active
+    status is allowed, and private rows surface only when the caller opts in
+    via ``include_private``.
+    """
+    from memforge.models import SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY
+    from memforge.server.principal import resolve_principal
+    from memforge.storage.adapters.context import AccessScope
+
+    return AccessScope(
+        user_id=resolve_principal(request),
+        open_projects=frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}),
+        member_projects=frozenset(),
+        include_private=include_private,
+        allowed_statuses=("active",),
+        active_project=None,
+        scope_mode="project-first",
+    )
+
+
+async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
+    """Return the subset of ``ids`` the caller may see under ``scope``."""
+    from memforge.storage.adapters.sqlite.relational import SqliteRelationalStore
+
+    return await SqliteRelationalStore(db).filter_visible_ids(list(ids), scope)
+
+
 AUDIT_HEALTH_FAILURE_EVENTS = (
     "source_support_verification_failed",
     "contradiction_detection_failed",
@@ -262,6 +292,11 @@ class MemorySearchRequest(BaseModel):
     entities: list[str] | None = None
     include_superseded: bool = False
     top_k: int = Field(default=10, ge=1, le=50)
+    active_project: str | None = None
+    include_private: bool = False
+    # NO user_id field. The caller's identity is server-derived from
+    # resolve_principal(request); a body-supplied user_id is never used as
+    # access authority.
 
 
 # -- Entities --
@@ -469,6 +504,7 @@ class AgentSessionDocumentRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     submitted_at: str | None = None
     process_now: bool = True
+    user_id: str | None = None
 
 
 class LocalAdapterDocumentRequest(BaseModel):
@@ -507,6 +543,7 @@ class AgentSessionWindowRequest(BaseModel):
     retention: str = "none"
     submitted_at: str | None = None
     process_now: bool = False
+    user_id: str | None = None
 
 
 class AgentHookReceiptRequest(BaseModel):
@@ -2078,8 +2115,23 @@ def create_admin_app(
         config: AppConfig = Depends(get_config),
     ):
         """Service-owned memory search used by local agent MCP proxies."""
+        from memforge.memory.lifecycle import allowed_search_statuses
+        from memforge.models import SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY
+        from memforge.server.principal import resolve_principal
+        from memforge.storage.adapters.context import AccessScope
+
         try:
             engine = await get_search_engine(request, db, config)
+            user_id = resolve_principal(request)
+            scope = AccessScope(
+                user_id=user_id,
+                open_projects=frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}),
+                member_projects=frozenset(),
+                include_private=req.include_private,
+                allowed_statuses=allowed_search_statuses(req.include_superseded),
+                active_project=req.active_project,
+                scope_mode="project-first",
+            )
             result = await engine.search(
                 query=req.query,
                 memory_types=req.memory_types,
@@ -2088,6 +2140,7 @@ def create_admin_app(
                 entities=req.entities,
                 include_superseded=req.include_superseded,
                 top_k=req.top_k,
+                request_scope=scope,
             )
             return _json_ready(result)
         except Exception as e:
@@ -2126,12 +2179,19 @@ def create_admin_app(
     @memory_router.get("/{memory_id}", response_model=MemoryDetailResponse)
     async def get_memory(
         memory_id: str,
+        request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
     ):
         """Get full memory detail including provenance (linked source documents)."""
+        scope = _workspace_default_scope(request, include_private=False)
         mem = await db.get_memory(memory_id)
         if not mem:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        # Default-deny: a row the caller cannot see by the access predicate is
+        # indistinguishable from a missing row to that caller.
+        visible = await _filter_visible_ids(db, [memory_id], scope)
+        if memory_id not in visible:
             raise HTTPException(status_code=404, detail="Memory not found")
 
         # Fetch provenance: memory_sources with document titles and artifact URLs.
@@ -2262,11 +2322,13 @@ def create_admin_app(
 
     @memory_router.get("", response_model=MemoryListResponse)
     async def list_memories(
+        request: Request,
         type: str | None = None,
         status: str | None = None,
         source: str | None = None,
         project: str | None = None,
         search: str | None = None,
+        include_private: bool = False,
         limit: int = 50,
         offset: int = 0,
         db: Database = Depends(get_db),
@@ -2275,11 +2337,20 @@ def create_admin_app(
 
         Filters: type (fact/decision/convention/procedure), status, source,
         project, free-text search. Supports limit/offset pagination.
+
+        The access predicate gates every row: workspace rows on open projects
+        are always visible, and the caller's own private rows surface only
+        when ``include_private=True``.
         """
+        from memforge.retrieval.access_predicate import visible_sql
+
+        scope = _workspace_default_scope(request, include_private=include_private)
+        predicate_sql, predicate_params = visible_sql(scope, "m")
         if search:
             fts_query = _fts_query(search)
             like_query = _like_pattern(search)
             conditions: list[str] = [
+                predicate_sql,
                 """(
                     m.id IN (
                         SELECT memory_id
@@ -2299,7 +2370,10 @@ def create_admin_app(
                     )
                 )"""
             ]
-            params: list[Any] = [fts_query, like_query, like_query, like_query]
+            params: list[Any] = [
+                *predicate_params,
+                fts_query, like_query, like_query, like_query,
+            ]
 
             if source:
                 conditions.append(
@@ -2342,8 +2416,8 @@ def create_admin_app(
             # We need offset support so we build the query manually
             query = "SELECT DISTINCT m.* FROM memories m"
             joins: list[str] = []
-            conditions_list: list[str] = ["1=1"]
-            params_list: list[Any] = []
+            conditions_list: list[str] = [predicate_sql]
+            params_list: list[Any] = list(predicate_params)
 
             if source:
                 joins.append("JOIN memory_sources ms ON m.id = ms.memory_id")
@@ -3432,6 +3506,7 @@ def create_admin_app(
                 title=req.title,
                 metadata=req.metadata,
                 submitted_at=req.submitted_at,
+                user_id=req.user_id,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -3497,6 +3572,7 @@ def create_admin_app(
                 retention=req.retention,
                 submitted_at=req.submitted_at,
                 process_now=req.process_now,
+                user_id=req.user_id,
             )
         except ValueError as e:
             detail = str(e)
@@ -3552,13 +3628,19 @@ def create_admin_app(
     @hook_router.post("/context")
     async def build_hook_context(
         req: AgentHookContextRequest,
+        request: Request,
         db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
     ):
         """Return compact memory context for Codex/Claude lifecycle hooks."""
         from memforge.agent_hooks import (
             AgentHookContextRequest as HookContextRequest,
             build_agent_hook_context,
         )
+        from memforge.server.principal import resolve_principal
+
+        principal_user_id = resolve_principal(request)
+        engine = await get_search_engine(request, db, config)
 
         hook_request = HookContextRequest(
             client=req.client,
@@ -3571,7 +3653,12 @@ def create_admin_app(
             max_memories=req.max_memories,
             include_recent_changes=req.include_recent_changes,
         )
-        return await build_agent_hook_context(db, hook_request)
+        return await build_agent_hook_context(
+            db,
+            hook_request,
+            principal_user_id=principal_user_id,
+            search_engine=engine,
+        )
 
     # ===================================================================
     # 5. Schedule Endpoints

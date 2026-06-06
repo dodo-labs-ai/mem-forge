@@ -594,6 +594,7 @@ async def submit_agent_session_document(
     source_kind: str = AGENT_SESSION_SOURCE_KIND,
     window_hash: str | None = None,
     submitted_at: str | None = None,
+    user_id: str | None = None,
 ) -> dict:
     """Store a generated session document package and receipt lineage."""
     if not client.strip():
@@ -630,6 +631,10 @@ async def submit_agent_session_document(
     package_path = documents_dir / slugify(project) / f"{doc_id}.json"
     package_path.parent.mkdir(parents=True, exist_ok=True)
 
+    receipt_metadata = dict(metadata or {})
+    if user_id is not None:
+        receipt_metadata["user_id"] = user_id
+
     receipt = AgentSessionReceipt(
         doc_id=doc_id,
         source_id=per_client_source_id,
@@ -647,7 +652,7 @@ async def submit_agent_session_document(
         document_hash=document_hash,
         source_kind=source_kind,
         document_uri=str(package_path),
-        metadata=metadata or {},
+        metadata=receipt_metadata,
         updated_at=submitted_at,
     )
     package = {
@@ -783,6 +788,7 @@ async def submit_agent_session_window(
     retention: str = "none",
     submitted_at: str | None = None,
     process_now: bool = True,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """Generate and store an agent-session package from an uploaded window."""
     if not client.strip():
@@ -916,6 +922,7 @@ async def submit_agent_session_window(
             source_kind=AGENT_SESSION_WINDOW_SOURCE_KIND,
             window_hash=window_hash,
             submitted_at=submitted_at,
+            user_id=user_id,
         )
     except Exception as exc:
         await _record_window_outcome(

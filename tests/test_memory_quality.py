@@ -727,8 +727,10 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from memforge import runtime
-    from memforge.models import SearchResult
+    from memforge.memory.lifecycle import allowed_search_statuses
+    from memforge.models import SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY, SearchResult
     from memforge.server.admin_api import create_admin_app
+    from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 
     calls = []
 
@@ -765,6 +767,15 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
 
     assert response.status_code == 200
     payload = response.json()
+    expected_scope = AccessScope(
+        user_id=LOCAL_DEV_USER_ID,
+        open_projects=frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY}),
+        member_projects=frozenset(),
+        include_private=False,
+        allowed_statuses=allowed_search_statuses(False),
+        active_project=None,
+        scope_mode="project-first",
+    )
     assert calls == [{
         "query": "proxy search",
         "memory_types": None,
@@ -773,6 +784,7 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
         "entities": None,
         "include_superseded": False,
         "top_k": 3,
+        "request_scope": expected_scope,
     }]
     assert payload["results"][0]["memory_id"] == "mem-proxy-search"
     assert payload["results"][0]["pdf_url"] == "/api/documents/doc-proxy/pdf"
