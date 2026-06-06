@@ -1,12 +1,10 @@
 import { useMemo, useState } from "react";
 import type { FormEvent } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, FolderKanban, Loader2, Lock, Plus, Trash2 } from "lucide-react";
 import client from "@/api/client";
-import {
-  RESERVED_PROJECT_KEYS,
-  isReservedProjectKey,
-} from "@/api/projectKeys";
+import { RESERVED_PROJECT_KEYS, isReservedProjectKey } from "@/api/projectKeys";
 import type { Project, ProjectKind } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
@@ -23,7 +21,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import {
   Table,
   TableBody,
@@ -34,6 +31,14 @@ import {
 } from "@/components/ui/table";
 import { useActiveProject } from "@/state/activeProject";
 import { timeAgo } from "@/utils/date";
+import {
+  ProjectCreateFields,
+} from "./ProjectCreateFields";
+import {
+  emptyProjectCreateForm,
+  projectCreateKeyConflictsWithBuiltIn,
+} from "./projectCreateForm";
+import type { ProjectCreateFormState } from "./projectCreateForm";
 
 /**
  * The DELETE /api/projects/{id} response reports how many memories were
@@ -52,18 +57,6 @@ function readMovedCount(payload: DeleteProjectWireResponse): number {
   return typeof value === "number" ? value : 0;
 }
 
-interface CreateProjectFormState {
-  name: string;
-  key: string;
-  shared: boolean;
-}
-
-const emptyCreateForm: CreateProjectFormState = {
-  name: "",
-  key: "",
-  shared: false,
-};
-
 function CreateProjectDialog({
   open,
   onOpenChange,
@@ -72,16 +65,14 @@ function CreateProjectDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const queryClient = useQueryClient();
-  const [form, setForm] = useState<CreateProjectFormState>(emptyCreateForm);
+  const [form, setForm] = useState<ProjectCreateFormState>(emptyProjectCreateForm);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
-  const trimmedKey = form.key.trim().toUpperCase();
-  const keyConflictsWithBuiltIn =
-    trimmedKey.length > 0 && isReservedProjectKey(trimmedKey);
+  const keyConflictsWithBuiltIn = projectCreateKeyConflictsWithBuiltIn(form);
 
   const createProject = useMutation({
-    mutationFn: async (payload: CreateProjectFormState) => {
+    mutationFn: async (payload: ProjectCreateFormState) => {
       const kind: ProjectKind = payload.shared ? "shared" : "normal";
       const body: Record<string, unknown> = {
         name: payload.name.trim(),
@@ -94,7 +85,7 @@ function CreateProjectDialog({
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["projects"] });
-      setForm(emptyCreateForm);
+      setForm(emptyProjectCreateForm);
       setErrorMessage(null);
       setAdvancedOpen(false);
       onOpenChange(false);
@@ -123,7 +114,7 @@ function CreateProjectDialog({
       open={open}
       onOpenChange={(next) => {
         if (!next) {
-          setForm(emptyCreateForm);
+          setForm(emptyProjectCreateForm);
           setErrorMessage(null);
           setAdvancedOpen(false);
         }
@@ -139,64 +130,12 @@ function CreateProjectDialog({
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={submit} className="space-y-4">
-          <label className="block space-y-1 text-sm">
-            <span className="font-medium">Name</span>
-            <Input
-              value={form.name}
-              onChange={(event) => setForm({ ...form, name: event.target.value })}
-              placeholder="Payments platform"
-              autoFocus
-            />
-          </label>
-
-          <details
-            className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-sm"
-            open={advancedOpen}
-            onToggle={(event) => {
-              setAdvancedOpen((event.currentTarget as HTMLDetailsElement).open);
-            }}
-          >
-            <summary className="cursor-pointer list-none text-sm font-medium text-muted-foreground hover:text-foreground">
-              Advanced
-            </summary>
-            <div className="mt-3 space-y-4">
-              <label className="block space-y-1 text-sm">
-                <span className="font-medium">Code (optional)</span>
-                <Input
-                  value={form.key}
-                  onChange={(event) => setForm({ ...form, key: event.target.value })}
-                  placeholder="PAY"
-                />
-                <span className="block text-xs text-muted-foreground">
-                  Short code shown in URLs and tags (e.g., PAY).
-                </span>
-                {keyConflictsWithBuiltIn && (
-                  <span className="block text-xs text-destructive" role="alert">
-                    That code is reserved for system use. Pick a different one.
-                  </span>
-                )}
-              </label>
-              <label className="flex items-start gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  className="mt-0.5 size-4 rounded border-border accent-primary"
-                  checked={form.shared}
-                  onChange={(event) =>
-                    setForm({ ...form, shared: event.target.checked })
-                  }
-                />
-                <span className="space-y-1">
-                  <span className="block font-medium">
-                    Make this a team-wide project
-                  </span>
-                  <span className="block text-xs text-muted-foreground">
-                    Team-wide projects surface for everyone, no matter what
-                    they're working on.
-                  </span>
-                </span>
-              </label>
-            </div>
-          </details>
+          <ProjectCreateFields
+            form={form}
+            onChange={setForm}
+            advancedOpen={advancedOpen}
+            onAdvancedToggle={setAdvancedOpen}
+          />
 
           {errorMessage && !keyConflictsWithBuiltIn && (
             <p className="text-sm text-destructive" role="alert">
@@ -354,9 +293,21 @@ export function ProjectsPage() {
                       className={isActive ? "bg-primary/5" : undefined}
                     >
                       <TableCell className="font-mono text-xs font-medium">
-                        {project.key}
+                        <Link
+                          to={`/projects/${project.key}`}
+                          className="underline-offset-4 hover:underline"
+                        >
+                          {project.key}
+                        </Link>
                       </TableCell>
-                      <TableCell>{project.name}</TableCell>
+                      <TableCell>
+                        <Link
+                          to={`/projects/${project.key}`}
+                          className="font-medium underline-offset-4 hover:underline"
+                        >
+                          {project.name}
+                        </Link>
+                      </TableCell>
                       <TableCell className="text-muted-foreground">
                         {timeAgo(project.created_at)}
                       </TableCell>

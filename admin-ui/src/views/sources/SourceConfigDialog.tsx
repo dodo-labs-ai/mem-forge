@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, Check, Loader2, RefreshCw } from "lucide-react";
@@ -8,6 +8,7 @@ import type {
   DiscoveryPreviewResponse,
   GeneConfigSchema,
   JiraAuthSession,
+  ProjectBinding,
   Source,
 } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -35,6 +36,8 @@ import {
 import type { ParsedConfluenceWikiUrl } from "./confluenceConfig";
 import { buildLocalMarkdownPushCommand } from "./localMarkdownConfig";
 import { canConfigureSourceType } from "./managedSources";
+import { ProjectBindingFields } from "./ProjectBindingFields";
+import { projectBindingIsComplete } from "./projectBinding";
 
 type ConfigValue = string | number | boolean | string[] | null;
 type ConfigForm = Record<string, ConfigValue>;
@@ -45,12 +48,14 @@ export function SourceConfigDialog({
   sourceType,
   source,
   onSaved,
+  initialFocus,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   sourceType: string | null;
   source?: Source | null;
   onSaved?: () => void;
+  initialFocus?: { step: "project" };
 }) {
   // A local repository is created from the CLI (which scans the folder and
   // pushes), not by hand in the UI, so a new one shows setup instructions
@@ -98,6 +103,7 @@ export function SourceConfigDialog({
             schema={schemaQuery.data}
             onOpenChange={onOpenChange}
             onSaved={onSaved}
+            initialFocus={initialFocus}
           />
         )}
       </DialogContent>
@@ -111,12 +117,14 @@ function SourceConfigForm({
   schema,
   onOpenChange,
   onSaved,
+  initialFocus,
 }: {
   sourceType: string;
   source?: Source | null;
   schema: GeneConfigSchema;
   onOpenChange: (open: boolean) => void;
   onSaved?: () => void;
+  initialFocus?: { step: "project" };
 }) {
   const queryClient = useQueryClient();
   const isEdit = Boolean(source);
@@ -125,12 +133,25 @@ function SourceConfigForm({
     ...buildDefaultConfig(schema.fields),
     ...initialSourceConfig(sourceType, (source?.config ?? {}) as ConfigForm),
   }));
+  const [binding, setBinding] = useState<ProjectBinding | null>(
+    () => source?.project_binding ?? { mode: "fixed", project_key: "" },
+  );
+  const projectSectionRef = useRef<HTMLDivElement | null>(null);
   const authMode = stringValue(config.auth_mode) || "browser_cookie";
   const jiraBaseUrl = stringValue(config.base_url).trim();
   const confluenceUrlInfo = useMemo(
     () => sourceType === "confluence" ? parseConfluenceWikiUrl(stringValue(config.base_url)) : null,
     [config.base_url, sourceType],
   );
+
+  useEffect(() => {
+    if (initialFocus?.step === "project" && projectSectionRef.current) {
+      projectSectionRef.current.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    }
+  }, [initialFocus]);
 
   const jiraSessionQuery = useQuery<JiraAuthSession>({
     queryKey: ["jira-session", jiraBaseUrl],
@@ -140,7 +161,11 @@ function SourceConfigForm({
   });
 
   const saveSource = useMutation({
-    mutationFn: (payload: { name: string; config: ConfigForm }) => {
+    mutationFn: (payload: {
+      name: string;
+      config: ConfigForm;
+      project_binding: ProjectBinding | null;
+    }) => {
       if (source) {
         return client.put(`/api/sources/${source.id}`, payload);
       }
@@ -151,6 +176,7 @@ function SourceConfigForm({
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sources"] });
+      queryClient.invalidateQueries({ queryKey: ["projects"] });
       queryClient.invalidateQueries({ queryKey: ["stats"] });
       onSaved?.();
       onOpenChange(false);
@@ -185,7 +211,8 @@ function SourceConfigForm({
 
   const canSave =
     name.trim().length > 0 &&
-    requiredFieldsAreFilled(sourceType, schema.fields, config);
+    requiredFieldsAreFilled(sourceType, schema.fields, config) &&
+    projectBindingIsComplete(binding);
 
   const previewReady = requiredFieldsAreFilled(sourceType, schema.fields, config);
 
@@ -203,6 +230,7 @@ function SourceConfigForm({
     saveSource.mutate({
       name: name.trim(),
       config: serializeConfig(schema.fields, config),
+      project_binding: binding,
     });
   };
 
@@ -289,6 +317,15 @@ function SourceConfigForm({
                 onPreview={() => previewDiscovery.mutate()}
               />
             )}
+
+            <div ref={projectSectionRef}>
+              <ProjectBindingFields
+                schema={schema}
+                sourceId={source?.id ?? null}
+                value={binding}
+                onChange={setBinding}
+              />
+            </div>
           </div>
 
           {saveSource.isError && (

@@ -6,6 +6,7 @@ import { MemoriesPage } from "@/views/memories/MemoriesPage";
 import { MemoryDetailPage } from "@/views/memories/MemoryDetailPage";
 import { EntitiesPage } from "@/views/entities/EntitiesPage";
 import { EntityDetailPage } from "@/views/entities/EntityDetailPage";
+import { ProjectDetailPage } from "@/views/projects/ProjectDetailPage";
 import { ProjectsPage } from "@/views/projects/ProjectsPage";
 import { ReviewQueuePage } from "@/views/review/ReviewQueuePage";
 import { ReviewDetailPage } from "@/views/review/ReviewDetailPage";
@@ -32,6 +33,7 @@ export default function App() {
             <Route path="/entities/:id" element={<EntityDetailPage />} />
             <Route path="/sources" element={<SourcesPage />} />
             <Route path="/projects" element={<ProjectsPage />} />
+            <Route path="/projects/:key" element={<ProjectDetailPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/" element={<Navigate to="/memories" replace />} />
           </Route>
