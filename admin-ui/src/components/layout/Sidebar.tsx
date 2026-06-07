@@ -1,11 +1,13 @@
 import { NavLink } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
+import type { ComponentType } from "react";
 import {
   Brain,
   ChevronsUpDown,
   Database,
   Files,
   FolderKanban,
+  Puzzle,
   Settings,
   ShieldCheck,
   X,
@@ -17,8 +19,21 @@ import { TaiSealLogo } from "@/components/brand/TaiSealLogo";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { ACTIVE_WORKSPACE_NAME } from "@/lib/workspace";
+import { getExtensionNavItems } from "@/extension";
 
-const navGroups = [
+type NavGroupItem = {
+  to: string;
+  label: string;
+  icon: ComponentType<{ className?: string }>;
+  badgeKey?: "pending-reviews";
+};
+
+type NavGroup = {
+  label: string;
+  items: NavGroupItem[];
+};
+
+const navGroups: NavGroup[] = [
   {
     label: "General",
     items: [
@@ -90,13 +105,33 @@ function Brand({ onClose }: { onClose?: () => void }) {
   );
 }
 
+const DEFAULT_EXTENSION_GROUP_LABEL = "Extension";
+
+function buildExtensionGroups(): NavGroup[] {
+  const items = getExtensionNavItems();
+  if (items.length === 0) return [];
+  const groups = new Map<string, NavGroupItem[]>();
+  for (const item of items) {
+    const groupLabel = item.group ?? DEFAULT_EXTENSION_GROUP_LABEL;
+    const bucket = groups.get(groupLabel) ?? [];
+    bucket.push({
+      to: item.to,
+      label: item.label,
+      icon: item.icon ?? Puzzle,
+    });
+    groups.set(groupLabel, bucket);
+  }
+  return Array.from(groups, ([label, items]) => ({ label, items }));
+}
+
 function NavItems({ onNavigate }: { onNavigate?: () => void }) {
   const pendingReviews = usePendingReviewCount();
   const pendingCount = pendingReviews.data?.total ?? 0;
+  const allGroups: NavGroup[] = [...navGroups, ...buildExtensionGroups()];
 
   return (
     <nav className="flex-1 space-y-5 overflow-y-auto px-2 py-2">
-      {navGroups.map((group) => (
+      {allGroups.map((group) => (
         <div key={group.label} className="space-y-1">
           <div className="px-2 pb-1 text-[11px] font-medium text-muted-foreground">
             {group.label}

@@ -1,7 +1,9 @@
+import type { ReactNode } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AppShell } from "@/components/layout/AppShell";
 import { DEFAULT_QUERY_STALE_MS } from "@/lib/constants";
+import { getExtensionRoutes, getExtensionShell } from "@/extension";
 import { MemoriesPage } from "@/views/memories/MemoriesPage";
 import { MemoryDetailPage } from "@/views/memories/MemoryDetailPage";
 import { EntitiesPage } from "@/views/entities/EntitiesPage";
@@ -19,26 +21,46 @@ const queryClient = new QueryClient({
   },
 });
 
+function PassThroughShell({ children }: { children: ReactNode }) {
+  return <>{children}</>;
+}
+
 export default function App() {
+  // OSS routes are listed inline; extension routes are appended after them so
+  // a misconfigured extension cannot shadow built-in product-memory surfaces
+  // (the registration layer also drops reserved-prefix routes defensively).
+  const extensionRoutes = getExtensionRoutes();
+  const shell = getExtensionShell();
+  const ShellWrapper = shell?.Wrapper ?? PassThroughShell;
+
   return (
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <Routes>
-          <Route element={<AppShell />}>
-            <Route path="/memories" element={<MemoriesPage />} />
-            <Route path="/memories/:id" element={<MemoryDetailPage />} />
-            <Route path="/review" element={<ReviewQueuePage />} />
-            <Route path="/review/:id" element={<ReviewDetailPage />} />
-            <Route path="/entities" element={<EntitiesPage />} />
-            <Route path="/entities/:id" element={<EntityDetailPage />} />
-            <Route path="/sources" element={<SourcesPage />} />
-            <Route path="/projects" element={<ProjectsPage />} />
-            <Route path="/projects/:key" element={<ProjectDetailPage />} />
-            <Route path="/settings" element={<SettingsPage />} />
-            <Route path="/" element={<Navigate to="/memories" replace />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
-    </QueryClientProvider>
+    <ShellWrapper>
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route path="/memories" element={<MemoriesPage />} />
+              <Route path="/memories/:id" element={<MemoryDetailPage />} />
+              <Route path="/review" element={<ReviewQueuePage />} />
+              <Route path="/review/:id" element={<ReviewDetailPage />} />
+              <Route path="/entities" element={<EntitiesPage />} />
+              <Route path="/entities/:id" element={<EntityDetailPage />} />
+              <Route path="/sources" element={<SourcesPage />} />
+              <Route path="/projects" element={<ProjectsPage />} />
+              <Route path="/projects/:key" element={<ProjectDetailPage />} />
+              <Route path="/settings" element={<SettingsPage />} />
+              {extensionRoutes.map((route, index) => (
+                <Route
+                  key={typeof route.path === "string" ? route.path : `ext-${index}`}
+                  path={route.path}
+                  element={route.element}
+                />
+              ))}
+              <Route path="/" element={<Navigate to="/memories" replace />} />
+            </Route>
+          </Routes>
+        </BrowserRouter>
+      </QueryClientProvider>
+    </ShellWrapper>
   );
 }
