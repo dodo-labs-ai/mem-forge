@@ -46,6 +46,8 @@ export interface ExtensionNavItem {
   icon?: ComponentType<{ className?: string }>;
   /** Optional group label; defaults to "Extension". */
   group?: string;
+  /** Optional render-time visibility predicate owned by the extension. */
+  visibleWhen?: () => boolean;
 }
 
 export interface ExtensionTopbarSlot {
