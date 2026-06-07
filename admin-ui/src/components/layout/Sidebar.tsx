@@ -108,7 +108,7 @@ function Brand({ onClose }: { onClose?: () => void }) {
 const DEFAULT_EXTENSION_GROUP_LABEL = "Extension";
 
 function buildExtensionGroups(): NavGroup[] {
-  const items = getExtensionNavItems();
+  const items = getExtensionNavItems().filter((item) => item.visibleWhen?.() ?? true);
   if (items.length === 0) return [];
   const groups = new Map<string, NavGroupItem[]>();
   for (const item of items) {
