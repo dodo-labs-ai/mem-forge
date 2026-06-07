@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import {
   __resetCloudExtensionForTests,
+  getExtensionAccountSurface,
   getExtensionNavItems,
   getExtensionRoutes,
   getExtensionShell,
@@ -16,6 +17,7 @@ __resetCloudExtensionForTests();
 assert.deepEqual(getExtensionRoutes(), []);
 assert.deepEqual(getExtensionNavItems(), []);
 assert.deepEqual(getExtensionTopbarSlots(), []);
+assert.equal(getExtensionAccountSurface(), null);
 assert.equal(getExtensionShell(), null);
 
 // The reserved-route set is the OSS-owned product-memory surface plus settings.
@@ -45,6 +47,10 @@ const registered = mountCloudExtension({
     { id: "principal-menu", render: () => null },
     { id: "principal-menu-2", render: () => null, placement: "before-account" },
   ],
+  accountSurface: {
+    topbar: () => "topbar-account",
+    sidebarFooter: () => "sidebar-account",
+  },
   shell: { Wrapper: ({ children }) => children },
 });
 assert.equal(registered, true);
@@ -57,6 +63,8 @@ const visibleNavItems = getExtensionNavItems().filter((item) => item.visibleWhen
 assert.equal(visibleNavItems.length, 1);
 assert.equal(visibleNavItems[0]!.to, "/extension/usage");
 assert.equal(getExtensionTopbarSlots().length, 2);
+assert.equal(getExtensionAccountSurface()?.topbar?.(), "topbar-account");
+assert.equal(getExtensionAccountSurface()?.sidebarFooter?.(), "sidebar-account");
 assert.notEqual(getExtensionShell(), null);
 
 // Second mount is rejected: the shell stays deterministic for the lifetime of
@@ -119,6 +127,7 @@ assert.equal(wrapperOnly, true);
 assert.deepEqual(getExtensionRoutes(), []);
 assert.deepEqual(getExtensionNavItems(), []);
 assert.deepEqual(getExtensionTopbarSlots(), []);
+assert.equal(getExtensionAccountSurface(), null);
 assert.notEqual(getExtensionShell(), null);
 
 console.log("extension.test.ts: all assertions passed");

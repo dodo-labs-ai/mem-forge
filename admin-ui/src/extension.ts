@@ -14,9 +14,9 @@
  *   - When no extension is mounted, the shell renders unchanged: the consumer
  *     APIs return empty arrays and a pass-through wrapper.
  *
- * The contract is intentionally narrow: routes, nav items, topbar slots, and
- * an optional shell wrapper/provider. Anything richer should land here as a
- * new typed slot, not as escape hatches.
+ * The contract is intentionally narrow: routes, nav items, topbar slots, an
+ * optional shell wrapper/provider, and an optional account-surface owner.
+ * Anything richer should land here as a new typed slot, not as escape hatches.
  */
 import type { ComponentType, ReactNode } from "react";
 import type { RouteObject } from "react-router-dom";
@@ -67,6 +67,27 @@ export interface ExtensionShellWrapper {
   Wrapper: ComponentType<{ children: ReactNode }>;
 }
 
+/**
+ * Account surface contributions. The OSS shell renders identity affordances in
+ * exactly two places: the topbar (compact avatar/menu trigger) and the sidebar
+ * footer (verbose identity card). When no extension owns these surfaces the
+ * shell falls back to non-interactive identity decoration so a standalone
+ * build does not advertise menu actions it cannot fulfill.
+ */
+export interface ExtensionAccountSurface {
+  /**
+   * Replaces the default topbar account affordance. Extensions are expected
+   * to render an interactive control (button/menu trigger) with appropriate
+   * `role`, `aria-*`, and keyboard semantics.
+   */
+  topbar?: () => ReactNode;
+  /**
+   * Replaces the default sidebar footer identity card. Extensions own the
+   * full footer node, including any popover/menu attached to it.
+   */
+  sidebarFooter?: () => ReactNode;
+}
+
 export interface CloudExtension {
   /** Stable id for telemetry and duplicate detection. */
   id: string;
@@ -78,6 +99,12 @@ export interface CloudExtension {
   topbarSlots?: ExtensionTopbarSlot[];
   /** Optional shell wrapper; rendered around the entire app. */
   shell?: ExtensionShellWrapper;
+  /**
+   * Optional account-surface owner. When provided, the extension takes over
+   * the relevant identity affordance(s) so the composed shell exposes a
+   * single, genuinely interactive control instead of the OSS placeholder.
+   */
+  accountSurface?: ExtensionAccountSurface;
 }
 
 interface RegisteredExtension extends CloudExtension {
@@ -157,6 +184,10 @@ export function getExtensionTopbarSlots(): ExtensionTopbarSlot[] {
 
 export function getExtensionShell(): ExtensionShellWrapper | null {
   return mounted?.shell ?? null;
+}
+
+export function getExtensionAccountSurface(): ExtensionAccountSurface | null {
+  return mounted?.accountSurface ?? null;
 }
 
 export const RESERVED_OSS_ROUTE_SEGMENTS = RESERVED_ROUTE_SEGMENTS;
