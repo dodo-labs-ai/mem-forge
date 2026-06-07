@@ -2,10 +2,27 @@ import { Bell, ChevronsUpDown, Circle, Menu, Sun } from "lucide-react";
 import { BRAND_INITIALS } from "@/brand";
 import { Button } from "@/components/ui/button";
 import { ACTIVE_WORKSPACE_NAME } from "@/lib/workspace";
+import { getExtensionTopbarSlots } from "@/extension";
 import { ActiveProjectChip } from "./ActiveProjectChip";
 import { CommandSearch } from "./CommandSearch";
 
 const WORKSPACE_SWITCH_HINT = "Workspace switching arrives with team support.";
+
+function ExtensionSlots({ placement }: { placement: "before-account" }) {
+  const slots = getExtensionTopbarSlots().filter(
+    (slot) => (slot.placement ?? "before-account") === placement,
+  );
+  if (slots.length === 0) return null;
+  return (
+    <>
+      {slots.map((slot) => (
+        <span key={slot.id} className="contents">
+          {slot.render()}
+        </span>
+      ))}
+    </>
+  );
+}
 
 export function Topbar({ onOpenNavigation }: { onOpenNavigation: () => void }) {
   return (
@@ -45,6 +62,7 @@ export function Topbar({ onOpenNavigation }: { onOpenNavigation: () => void }) {
           <Circle className="size-2 fill-emerald-500 text-emerald-500" />
           <span>API</span>
         </div>
+        <ExtensionSlots placement="before-account" />
         <div className="grid size-8 place-items-center rounded-md bg-muted text-xs font-medium">
           {BRAND_INITIALS}
         </div>
