@@ -1,12 +1,9 @@
-import { Bell, ChevronsUpDown, Circle, Menu, Sun } from "lucide-react";
+import { Bell, Circle, Menu, Sun } from "lucide-react";
 import { BRAND_INITIALS, BRAND_NAME } from "@/brand";
 import { Button } from "@/components/ui/button";
-import { ACTIVE_WORKSPACE_NAME } from "@/lib/workspace";
 import { getExtensionAccountSurface, getExtensionTopbarSlots } from "@/extension";
 import { ActiveProjectChip } from "./ActiveProjectChip";
 import { CommandSearch } from "./CommandSearch";
-
-const WORKSPACE_SWITCH_HINT = "Workspace switching arrives with team support.";
 
 function ExtensionSlots({ placement }: { placement: "before-account" }) {
   const slots = getExtensionTopbarSlots().filter(
@@ -43,6 +40,13 @@ function DefaultAccountBadge() {
   );
 }
 
+/**
+ * Active project is the only scoping control in the topbar. The shell
+ * deliberately exposes a single pill so users always know which project the
+ * memory surfaces are reading and writing against; environment or install
+ * identity is the responsibility of an extension surface, never a second
+ * peer chevron in the bar.
+ */
 export function Topbar({ onOpenNavigation }: { onOpenNavigation: () => void }) {
   const accountSurface = getExtensionAccountSurface();
   return (
@@ -64,14 +68,6 @@ export function Topbar({ onOpenNavigation }: { onOpenNavigation: () => void }) {
 
       <div className="flex items-center gap-1">
         <ActiveProjectChip />
-        <span
-          className="hidden items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground sm:inline-flex"
-          title={WORKSPACE_SWITCH_HINT}
-          aria-label={`Workspace: ${ACTIVE_WORKSPACE_NAME}`}
-        >
-          <span className="truncate">{ACTIVE_WORKSPACE_NAME}</span>
-          <ChevronsUpDown className="size-3 opacity-70" aria-hidden="true" />
-        </span>
         <Button type="button" variant="ghost" size="icon-sm" aria-label="Theme">
           <Sun className="size-4" />
         </Button>
