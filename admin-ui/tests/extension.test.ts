@@ -34,7 +34,12 @@ const registered = mountCloudExtension({
   ],
   navItems: [
     { to: "/extension/usage", label: "Usage" },
-    { to: "/extension/billing", label: "Billing", group: "Extension" },
+    {
+      to: "/extension/billing",
+      label: "Billing",
+      group: "Extension",
+      visibleWhen: () => false,
+    },
   ],
   topbarSlots: [
     { id: "principal-menu", render: () => null },
@@ -45,6 +50,12 @@ const registered = mountCloudExtension({
 assert.equal(registered, true);
 assert.equal(getExtensionRoutes().length, 2);
 assert.equal(getExtensionNavItems().length, 2);
+assert.equal(getExtensionNavItems()[1]!.visibleWhen?.(), false);
+// `visibleWhen` is the render-time consumer contract: items default to visible,
+// and a predicate returning `false` hides the item from the nav.
+const visibleNavItems = getExtensionNavItems().filter((item) => item.visibleWhen?.() ?? true);
+assert.equal(visibleNavItems.length, 1);
+assert.equal(visibleNavItems[0]!.to, "/extension/usage");
 assert.equal(getExtensionTopbarSlots().length, 2);
 assert.notEqual(getExtensionShell(), null);
 
