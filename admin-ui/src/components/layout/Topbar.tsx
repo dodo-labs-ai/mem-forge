@@ -1,8 +1,8 @@
 import { Bell, ChevronsUpDown, Circle, Menu, Sun } from "lucide-react";
-import { BRAND_INITIALS } from "@/brand";
+import { BRAND_INITIALS, BRAND_NAME } from "@/brand";
 import { Button } from "@/components/ui/button";
 import { ACTIVE_WORKSPACE_NAME } from "@/lib/workspace";
-import { getExtensionTopbarSlots } from "@/extension";
+import { getExtensionAccountSurface, getExtensionTopbarSlots } from "@/extension";
 import { ActiveProjectChip } from "./ActiveProjectChip";
 import { CommandSearch } from "./CommandSearch";
 
@@ -24,7 +24,27 @@ function ExtensionSlots({ placement }: { placement: "before-account" }) {
   );
 }
 
+/**
+ * Default standalone account affordance. Decorative only: an extension that
+ * owns identity will replace this with an interactive control via
+ * `accountSurface.topbar`. Marking it `aria-hidden` and giving it a title
+ * keeps the visual layout stable without advertising a menu the standalone
+ * shell cannot open.
+ */
+function DefaultAccountBadge() {
+  return (
+    <div
+      className="grid size-8 place-items-center rounded-md bg-muted text-xs font-medium"
+      aria-hidden="true"
+      title={BRAND_NAME}
+    >
+      {BRAND_INITIALS}
+    </div>
+  );
+}
+
 export function Topbar({ onOpenNavigation }: { onOpenNavigation: () => void }) {
+  const accountSurface = getExtensionAccountSurface();
   return (
     <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b bg-background px-3 lg:px-4">
       <Button
@@ -63,9 +83,7 @@ export function Topbar({ onOpenNavigation }: { onOpenNavigation: () => void }) {
           <span>API</span>
         </div>
         <ExtensionSlots placement="before-account" />
-        <div className="grid size-8 place-items-center rounded-md bg-muted text-xs font-medium">
-          {BRAND_INITIALS}
-        </div>
+        {accountSurface?.topbar ? accountSurface.topbar() : <DefaultAccountBadge />}
       </div>
     </header>
   );

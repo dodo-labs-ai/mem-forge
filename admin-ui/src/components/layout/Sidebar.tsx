@@ -3,7 +3,6 @@ import { useQuery } from "@tanstack/react-query";
 import type { ComponentType } from "react";
 import {
   Brain,
-  ChevronsUpDown,
   Database,
   Files,
   FolderKanban,
@@ -19,7 +18,7 @@ import { TaiSealLogo } from "@/components/brand/TaiSealLogo";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { ACTIVE_WORKSPACE_NAME } from "@/lib/workspace";
-import { getExtensionNavItems } from "@/extension";
+import { getExtensionAccountSurface, getExtensionNavItems } from "@/extension";
 
 type NavGroupItem = {
   to: string;
@@ -166,21 +165,32 @@ function NavItems({ onNavigate }: { onNavigate?: () => void }) {
 }
 
 function AccountFooter() {
+  const accountSurface = getExtensionAccountSurface();
+  if (accountSurface?.sidebarFooter) {
+    // The extension owns the footer outright, including any popover/menu
+    // semantics. The OSS shell only reserves the slot.
+    return <div className="p-2">{accountSurface.sidebarFooter()}</div>;
+  }
+  // Standalone fallback: a static identity card. We deliberately avoid a
+  // <button> here so the shell does not advertise an account menu the
+  // standalone build cannot fulfill.
   return (
     <div className="p-2">
-      <button
-        type="button"
-        className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm transition-colors hover:bg-sidebar-accent"
+      <div
+        className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm"
+        aria-label={`${BRAND_NAME} workspace: ${ACTIVE_WORKSPACE_NAME}`}
       >
-        <span className="grid size-8 shrink-0 place-items-center rounded-md bg-background text-xs font-medium ring-1 ring-sidebar-border">
+        <span
+          className="grid size-8 shrink-0 place-items-center rounded-md bg-background text-xs font-medium ring-1 ring-sidebar-border"
+          aria-hidden="true"
+        >
           {BRAND_INITIALS}
         </span>
         <span className="min-w-0 flex-1">
           <span className="block truncate font-medium leading-none">{BRAND_NAME}</span>
           <span className="mt-1 block truncate text-xs text-muted-foreground">{ACTIVE_WORKSPACE_NAME}</span>
         </span>
-        <ChevronsUpDown className="size-4 shrink-0 text-muted-foreground" />
-      </button>
+      </div>
     </div>
   );
 }
