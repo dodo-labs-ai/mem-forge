@@ -282,6 +282,7 @@ def test_admin_allows_jira_browser_session_source_without_source_cookie(tmp_path
                     "projects": ["PAY"],
                     "auth_mode": "browser_cookie",
                 },
+                "project_binding": {"mode": "fixed", "project_key": "PAY"},
             },
         )
         assert response.status_code == 200, response.text

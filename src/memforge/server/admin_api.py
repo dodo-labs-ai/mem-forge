@@ -546,6 +546,31 @@ class UpdateSourceRequest(BaseModel):
     project_binding: dict | None = None
 
 
+def _request_includes_field(model: BaseModel, field_name: str) -> bool:
+    fields_set = getattr(model, "model_fields_set", None)
+    if fields_set is None:
+        fields_set = getattr(model, "__fields_set__", set())
+    return field_name in fields_set
+
+
+def _validate_source_project_binding(binding: dict | None) -> None:
+    if binding is None:
+        raise ValueError("project binding is required")
+    mode = binding.get("mode")
+    if mode == "fixed":
+        project_key = str(binding.get("project_key") or "").strip()
+        if not project_key:
+            raise ValueError("fixed project binding requires project_key")
+        return
+    if mode == "by_field":
+        field = str(binding.get("field") or "").strip()
+        default = str(binding.get("default") or "").strip()
+        if not field or not default:
+            raise ValueError("field project binding requires field and default")
+        return
+    raise ValueError("project binding mode must be fixed or by_field")
+
+
 class AgentSessionDocumentRequest(BaseModel):
     client: str
     session_id: str
@@ -3454,6 +3479,7 @@ def create_admin_app(
                 req.config,
                 secret_fields=_source_secret_fields(req.type),
             )
+            _validate_source_project_binding(req.project_binding)
             if req.type == "jira":
                 source_config = _drop_source_owned_jira_cookie(source_config)
             if req.type == "local_markdown":
@@ -3514,6 +3540,12 @@ def create_admin_app(
 
         if scope_changed or auth_secret_changed or base_url_changed:
             await sync_service.cancel_source(source_id)
+
+        if _request_includes_field(req, "project_binding"):
+            try:
+                _validate_source_project_binding(req.project_binding)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         await db.upsert_source(
             id=source_id,
