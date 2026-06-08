@@ -1429,7 +1429,12 @@ def _config_contains_secret(config: dict[str, Any], secret_fields: tuple[str, ..
 
 def _dt_iso(dt: datetime | None) -> str | None:
     """Convert a datetime to ISO string, or None."""
-    return dt.isoformat() if dt else None
+    if dt is None:
+        return None
+    value = dt
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
 
 
 def _json_ready(value: Any) -> Any:
@@ -1441,7 +1446,7 @@ def _json_ready(value: Any) -> Any:
     if isinstance(value, list | tuple):
         return [_json_ready(v) for v in value]
     if isinstance(value, datetime):
-        return value.isoformat()
+        return _dt_iso(value)
     return value
 
 
@@ -1695,7 +1700,7 @@ def _project_to_response(project: Project) -> ProjectResponse:
         key=project.key,
         name=project.name,
         kind="shared" if project.is_shared else "normal",
-        created_at=project.created_at.isoformat() if project.created_at else None,
+        created_at=_dt_iso(project.created_at),
     )
 
 
