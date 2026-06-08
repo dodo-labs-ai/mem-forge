@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import re
 
 from fastapi.testclient import TestClient
 
@@ -86,6 +87,21 @@ def test_create_with_explicit_key(tmp_path):
             )
             assert create.status_code == 201, create.text
             assert create.json()["key"] == "RISK"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_project_created_at_is_timezone_qualified(tmp_path):
+    app, database = _make_app(tmp_path)
+    try:
+        with TestClient(app) as client:
+            create = client.post(
+                "/api/projects",
+                json={"name": "Risk Engine", "key": "RISK"},
+            )
+            assert create.status_code == 201, create.text
+            created_at = create.json()["created_at"]
+            assert re.search(r"(Z|[+-]\d{2}:\d{2})$", created_at), created_at
     finally:
         asyncio.run(database.close())
 
@@ -454,4 +470,3 @@ def test_resolved_projects_endpoint_groups_memories_by_resolved_key(tmp_path):
             assert by_key == {"PAY": 1, "RISK": 1}
     finally:
         asyncio.run(database.close())
-
