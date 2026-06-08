@@ -16,6 +16,10 @@ from memforge.storage.database import Database
 TEST_SOURCE_KEY = "VV4JjZLLr2BcgRnhV90gCnxzchn43M900VQy3dXJI30="
 
 
+def _project_binding(project_key: str = "PAY") -> dict[str, str]:
+    return {"mode": "fixed", "project_key": project_key}
+
+
 class FakeCollection:
     def query(self, **kwargs):
         return {"ids": [[]], "distances": [[]]}
@@ -260,6 +264,7 @@ def test_admin_source_create_encrypts_and_redacts_pat(tmp_path, monkeypatch):
                     "spaces": ["PAY"],
                     "pat": "wiki-pat-secret",
                 },
+                "project_binding": _project_binding(),
             },
         )
         assert response.status_code == 200
@@ -303,6 +308,7 @@ def test_admin_source_update_preserves_encrypted_pat_when_blank(tmp_path, monkey
                     "spaces": ["PAY"],
                     "pat": "wiki-pat-secret",
                 },
+                "project_binding": _project_binding(),
             },
         )
         assert create_response.status_code == 200
@@ -481,6 +487,7 @@ def test_admin_source_create_accepts_confluence_page_url_without_spaces(tmp_path
                     ),
                     "pat": "wiki-pat-secret",
                 },
+                "project_binding": _project_binding(),
             },
         )
 
@@ -541,6 +548,7 @@ def test_admin_source_create_allows_jira_browser_session_without_source_cookie(t
                     "projects": ["PAY"],
                     "auth_mode": "browser_cookie",
                 },
+                "project_binding": _project_binding(),
             },
         )
 
@@ -588,6 +596,7 @@ def test_admin_source_create_ignores_forged_jira_cookie_configured_flag(tmp_path
                     "auth_mode": "browser_cookie",
                     "jira_cookie_configured": True,
                 },
+                "project_binding": _project_binding(),
             },
         )
         source_id = response.json().get("id")
@@ -1445,6 +1454,7 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
                     "sync_mode": "single_page",
                     "page_url": "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking/",
                 },
+                "project_binding": _project_binding(),
             },
         )
         wrong_site_path = client.post(

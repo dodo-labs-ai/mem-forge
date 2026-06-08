@@ -34,6 +34,7 @@ def _create_local_markdown_source(client: TestClient, *, name: str = "Engineerin
             "type": "local_markdown",
             "name": name,
             "config": {"vault_id": vault_id, "display_label": "Engineering notes"},
+            "project_binding": {"mode": "fixed", "project_key": vault_id.upper()},
         },
     )
     assert response.status_code == 200, response.text
