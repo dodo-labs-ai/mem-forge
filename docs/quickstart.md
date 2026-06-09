@@ -157,6 +157,10 @@ uv run memforge get-memory mem-123
 uv run memforge get-resource /api/documents/doc-456/pdf --mode file
 ```
 
+Running `uv run memforge` with no subcommand opens the interactive Clack menu.
+Keep Node.js available on `PATH`; MemForge installs the packaged menu
+dependencies into `~/.cache/memforge/interactive-cli` on first use.
+
 `get-resource --mode file` writes to the same client-local artifact cache used
 by the MCP proxy: `~/.memforge-agent/artifacts`.
 

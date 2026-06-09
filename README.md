@@ -145,6 +145,7 @@ The complete docs map is in [docs/README.md](docs/README.md).
 You can also exercise the same read path from the CLI:
 
 ```bash
+uv run memforge
 uv run memforge search "docker artifact provenance"
 uv run memforge get-memory mem-123
 uv run memforge get-resource /api/documents/doc-456/pdf --mode file
@@ -152,6 +153,9 @@ uv run memforge get-resource /api/documents/doc-456/pdf --mode file
 
 The CLI uses `MEMFORGE_API_URL` and optional `MEMFORGE_API_TOKEN` when set;
 otherwise it targets the local Admin API port from config.
+The bare interactive CLI requires Node.js on `PATH`; MemForge prepares the
+packaged Clack menu in a user cache on first use, so no manual `cd cli &&
+npm install` step is required.
 
 ## Plugin Installation
 
