@@ -53,10 +53,10 @@ assert.match(
   "standalone topbar account badge should be decorative when no extension owns it",
 );
 
-assert.match(
+assert.doesNotMatch(
   topbarSource,
-  /<ActiveProjectChip \/>/,
-  "topbar should render the active project chip as its scoping control",
+  /ActiveProjectChip/,
+  "topbar should not duplicate the page-level project picker",
 );
 
 assert.doesNotMatch(

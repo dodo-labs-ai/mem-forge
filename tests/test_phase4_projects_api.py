@@ -234,7 +234,7 @@ def test_create_source_round_trips_project_binding(tmp_path):
         asyncio.run(database.close())
 
 
-def test_create_source_requires_project_binding(tmp_path):
+def test_create_source_without_project_binding_lands_in_unmapped(tmp_path):
     app, database = _make_app(tmp_path)
     try:
         with TestClient(app) as client:
@@ -243,11 +243,18 @@ def test_create_source_requires_project_binding(tmp_path):
                 json={
                     "type": "agent_session",
                     "name": "codex sessions",
-                    "config": {"client": "codex", "documents_dir": str(tmp_path / "in")},
-                },
-            )
-            assert resp.status_code == 400
-            assert resp.json()["detail"] == "project binding is required"
+                        "config": {"client": "codex", "documents_dir": str(tmp_path / "in")},
+                    },
+                )
+            assert resp.status_code == 200, resp.text
+            source_id = resp.json()["id"]
+
+        async def _read():
+            return await database.get_source(source_id)
+
+        stored = asyncio.run(_read())
+        assert stored is not None
+        assert stored["project_binding"] is None
     finally:
         asyncio.run(database.close())
 
@@ -296,7 +303,7 @@ def test_update_source_replaces_and_preserves_project_binding(tmp_path):
         asyncio.run(database.close())
 
 
-def test_update_source_rejects_clearing_project_binding(tmp_path):
+def test_update_source_can_clear_project_binding_to_unmapped(tmp_path):
     app, database = _make_app(tmp_path)
     try:
         with TestClient(app) as client:
@@ -315,14 +322,13 @@ def test_update_source_rejects_clearing_project_binding(tmp_path):
                 f"/api/sources/{source_id}",
                 json={"project_binding": None},
             )
-            assert resp.status_code == 400
-            assert resp.json()["detail"] == "project binding is required"
+            assert resp.status_code == 200, resp.text
 
         async def _read():
             return await database.get_source(source_id)
 
         stored = asyncio.run(_read())
-        assert stored["project_binding"] == {"mode": "fixed", "project_key": "PAY"}
+        assert stored["project_binding"] is None
     finally:
         asyncio.run(database.close())
 

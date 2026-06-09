@@ -2,7 +2,6 @@ import { Bell, Circle, Menu, Sun } from "lucide-react";
 import { BRAND_INITIALS, BRAND_NAME } from "@/brand";
 import { Button } from "@/components/ui/button";
 import { getExtensionAccountSurface, getExtensionTopbarSlots } from "@/extension";
-import { ActiveProjectChip } from "./ActiveProjectChip";
 import { CommandSearch } from "./CommandSearch";
 
 function ExtensionSlots({ placement }: { placement: "before-account" }) {
@@ -40,13 +39,6 @@ function DefaultAccountBadge() {
   );
 }
 
-/**
- * Active project is the only scoping control in the topbar. The shell
- * deliberately exposes a single pill so users always know which project the
- * memory surfaces are reading and writing against; environment or install
- * identity is the responsibility of an extension surface, never a second
- * peer chevron in the bar.
- */
 export function Topbar({ onOpenNavigation }: { onOpenNavigation: () => void }) {
   const accountSurface = getExtensionAccountSurface();
   return (
@@ -67,7 +59,6 @@ export function Topbar({ onOpenNavigation }: { onOpenNavigation: () => void }) {
       </div>
 
       <div className="flex items-center gap-1">
-        <ActiveProjectChip />
         <Button type="button" variant="ghost" size="icon-sm" aria-label="Theme">
           <Sun className="size-4" />
         </Button>

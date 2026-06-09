@@ -4,8 +4,8 @@ import { projectBindingIsComplete } from "../src/views/sources/projectBinding.js
 
 assert.equal(
   projectBindingIsComplete(null),
-  false,
-  "source creation requires an explicit project binding",
+  true,
+  "source creation can intentionally leave a source unmapped",
 );
 
 assert.equal(

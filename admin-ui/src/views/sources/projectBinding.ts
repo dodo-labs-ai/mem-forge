@@ -6,14 +6,15 @@
  *   - by_field: the resolver looks up `field` per document; unmapped
  *     values fall through to `default`
  *
- * Validation is intentionally minimal so an admin can save partial state
- * mid-edit only when it is unambiguous. `map` is allowed to be empty.
+ * `null` is a valid saved state: the source stays in the Unmapped backlog and
+ * its memories resolve to UNSORTED until an admin binds it. Concrete bindings
+ * still need enough data to be unambiguous. `map` is allowed to be empty.
  */
 import type { ProjectBinding } from "../../api/types.js";
 
 export function projectBindingIsComplete(binding: ProjectBinding | null): boolean {
   if (!binding) {
-    return false;
+    return true;
   }
   if (binding.mode === "fixed") {
     return Boolean(binding.project_key && binding.project_key.trim().length > 0);

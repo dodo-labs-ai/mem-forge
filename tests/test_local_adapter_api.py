@@ -41,6 +41,20 @@ def _create_local_markdown_source(client: TestClient, *, name: str = "Engineerin
     return response.json()
 
 
+def _create_unmapped_local_markdown_source(client: TestClient, *, name: str = "Engineering notes",
+                                           vault_id: str = "engineering") -> dict:
+    response = client.post(
+        "/api/sources",
+        json={
+            "type": "local_markdown",
+            "name": name,
+            "config": {"vault_id": vault_id, "display_label": "Engineering notes"},
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def test_create_local_markdown_source_populates_inbox_path(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
@@ -101,6 +115,35 @@ def test_local_adapter_document_push_writes_package(tmp_path):
         assert package["relative_path"] == "decisions/cutoff.md"
         assert package["title"] == "Cutoff Decision"
         assert package["markdown"].startswith("# Cutoff")
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_adapter_document_push_allows_unmapped_source(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            created = _create_unmapped_local_markdown_source(client)
+            source_id = created["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "vault_id": "engineering",
+                    "relative_path": "notes/unmapped.md",
+                    "markdown_body": "# Unmapped\n\nStill ingest this.",
+                    "process_now": False,
+                },
+            )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        row = asyncio.run(database.get_source(source_id))
+        assert row is not None
+        assert row["project_binding"] is None
+        assert Path(body["package_path"]).exists()
     finally:
         asyncio.run(database.close())
 
