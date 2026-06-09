@@ -37,6 +37,13 @@ WORKER_LEASE_BUFFER_SECONDS = 60.0
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
 PLUGIN_VERSION = "0.1.0"
+SESSION_START_USAGE_GUIDANCE = (
+    "## MemForge Usage Guidance\n\n"
+    "For non-trivial tasks involving this repo's prior decisions, architecture, "
+    "debugging history, reviews, conventions, source context, or consistency "
+    "with earlier work, use the MemForge MCP search tool before answering or "
+    "editing. Use get_memory and get_resource when you need source evidence.\n"
+)
 
 _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("bearer", re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s\"']+")),
@@ -141,6 +148,19 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run_context(payload: dict[str, Any], *, client: str, api_url: str, timeout: float) -> int:
     event_name = _event_name(payload)
+    if event_name == "SessionStart":
+        _emit_additional_context(event_name, SESSION_START_USAGE_GUIDANCE)
+        if _is_recover_event(event_name):
+            try:
+                _recover_incomplete_sessions(
+                    client=client,
+                    session_id=str(payload.get("session_id") or "") or None,
+                )
+            except Exception:
+                pass
+        _drain_pending_agent_windows_if_present(api_url=api_url, timeout=timeout)
+        return 0
+
     request = {
         "client": client,
         "hook": event_name,
@@ -157,13 +177,7 @@ def _run_context(payload: dict[str, Any], *, client: str, api_url: str, timeout:
     else:
         context = response.get("context_markdown")
     if context:
-        print(json.dumps({
-            "continue": True,
-            "hookSpecificOutput": {
-                "hookEventName": event_name,
-                "additionalContext": context,
-            },
-        }))
+        _emit_additional_context(event_name, context)
 
     if _is_recover_event(event_name):
         try:
@@ -175,6 +189,16 @@ def _run_context(payload: dict[str, Any], *, client: str, api_url: str, timeout:
             pass
     _drain_pending_agent_windows_if_present(api_url=api_url, timeout=timeout)
     return 0
+
+
+def _emit_additional_context(event_name: str, context: str) -> None:
+    print(json.dumps({
+        "continue": True,
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": context,
+        },
+    }))
 
 
 def _run_submit_session(payload: dict[str, Any], *, client: str, api_url: str, timeout: float) -> int:
