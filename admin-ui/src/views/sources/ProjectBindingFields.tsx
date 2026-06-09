@@ -177,6 +177,13 @@ export function ProjectBindingFields({
     emit(nextMode);
   };
 
+  const chooseUnmapped = () => {
+    setFixedKey("");
+    setDefaultKey(UNSORTED_PROJECT_KEY);
+    setMapRows([]);
+    onChange(null);
+  };
+
   const chooseFixedKey = (nextFixedKey: string) => {
     setFixedKey(nextFixedKey);
     emit(mode, nextFixedKey);
@@ -253,26 +260,39 @@ export function ProjectBindingFields({
       <header className="space-y-1">
         <h3 className="text-sm font-semibold">Where does this source land?</h3>
         <p className="text-xs text-muted-foreground">
-          Pick the project these memories should belong to.
+          Leave it unmapped to keep memories searchable in Unsorted, or bind it
+          to a project now.
         </p>
       </header>
 
-      {byFieldEnabled ? (
+      <div className="flex flex-wrap items-center gap-2">
         <div className="inline-flex rounded-md border border-border bg-muted/30 p-0.5 text-xs">
           <ModeButton
-            active={mode === FIXED_MODE}
+            active={value === null}
+            onClick={chooseUnmapped}
+            label="Unmapped"
+          />
+          <ModeButton
+            active={value !== null && mode === FIXED_MODE}
             onClick={() => chooseMode(FIXED_MODE)}
             label="One project"
           />
-          <ModeButton
-            active={mode === BY_FIELD_MODE}
-            onClick={() => chooseMode(BY_FIELD_MODE)}
-            label="Map by field"
-          />
+          {byFieldEnabled ? (
+            <ModeButton
+              active={value !== null && mode === BY_FIELD_MODE}
+              onClick={() => chooseMode(BY_FIELD_MODE)}
+              label="Map by field"
+            />
+          ) : null}
         </div>
-      ) : null}
+      </div>
 
-      {mode === FIXED_MODE ? (
+      {value === null ? (
+        <div className="rounded-md border border-border/60 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+          This source is not assigned to a project yet. New memories land in
+          Unsorted and remain visible in the all-project memory view.
+        </div>
+      ) : mode === FIXED_MODE ? (
         <div className="space-y-2">
           <div className="flex items-center gap-2">
             <ProjectPicker

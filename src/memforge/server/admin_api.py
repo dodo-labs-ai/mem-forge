@@ -555,7 +555,7 @@ def _request_includes_field(model: BaseModel, field_name: str) -> bool:
 
 def _validate_source_project_binding(binding: dict | None) -> None:
     if binding is None:
-        raise ValueError("project binding is required")
+        return
     mode = binding.get("mode")
     if mode == "fixed":
         project_key = str(binding.get("project_key") or "").strip()
@@ -3554,7 +3554,7 @@ def create_admin_app(
             config_json=json.dumps(src_config),
             project_binding=(
                 req.project_binding
-                if req.project_binding is not None
+                if _request_includes_field(req, "project_binding")
                 else existing.get("project_binding")
             ),
         )

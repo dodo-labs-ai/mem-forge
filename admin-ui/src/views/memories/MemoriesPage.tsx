@@ -19,7 +19,6 @@ import { PageHeader } from "@/components/admin/PageHeader";
 import { Pagination } from "@/components/admin/Pagination";
 import { SearchInput } from "@/components/admin/SearchInput";
 import { ConfidenceBadge, MemoryTypeBadge, StatusDot } from "@/components/admin/StatusBadge";
-import { CrossProjectBanner } from "@/components/layout/CrossProjectBanner";
 import { MemoryTypeIcon } from "@/components/memories/MemoryTypeIcon";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { Toolbar } from "@/components/admin/Toolbar";
@@ -36,7 +35,6 @@ import {
 } from "@/components/ui/table";
 import { LIST_PAGE_SIZE } from "@/lib/constants";
 import { timeAgo } from "@/utils/date";
-import { useActiveProject } from "@/state/activeProject";
 import {
   SHARED_PROJECT_KEY,
   UNSORTED_PROJECT_KEY,
@@ -64,8 +62,8 @@ const STATUS_OPTIONS = [
   { value: "retired", label: "Retired" },
 ];
 
-// The narrow toggle defaults to "active project on top"; flipping it to true
-// keeps the list focused on the active project plus SHARED.
+// The narrow toggle defaults to "selected project on top"; flipping it to true
+// keeps search focused on that project plus SHARED.
 const NARROW_TOGGLE_DEFAULT = false;
 
 interface SourcesResponse {
@@ -204,7 +202,6 @@ export function MemoriesPage() {
   const [narrowToggle, setNarrowToggle] = useState(NARROW_TOGGLE_DEFAULT);
   const [page, setPage] = useState(0);
   const navigate = useNavigate();
-  const { activeProjectKey, crossProjectMode } = useActiveProject();
 
   // Any filter change resets to the first page so the offset stays in range.
   const changeSearch = (value: string) => {
@@ -247,28 +244,20 @@ export function MemoriesPage() {
     queryFn: () => client.get("/api/stats").then((response) => response.data),
   });
 
-  // The list view is a project-scoped browse by default and a ranked search
-  // whenever the user types. `GET /api/memories` handles both empty-query
-  // browsing (with `project=` narrowing the predicate-visible set) and the
-  // explicit cross-project admin view; `POST /api/memories/search` runs only
-  // when there is a query for the ranker to act on. Relevance weighting is
-  // meaningful only against a query, so an empty input routes to browse.
-  // Both shapes normalize to a `Memory[]` row list before rendering.
-  //
-  // The toolbar's project filter overrides the topbar chip for THIS page only:
-  // when the user picks a specific project here, that key drives both routes;
-  // when set to "all", the chip's active project carries through.
+  // The list view is an all-project browse by default. The page-level project
+  // filter is the only project selector for this surface: "All projects" sends
+  // no project parameter, while a specific project (including UNSORTED) narrows
+  // the result set. `POST /api/memories/search` runs only for query text plus a
+  // selected project, where the ranker can apply project affinity.
   const pageProjectOverride = pageProject !== PAGE_PROJECT_ALL ? pageProject : null;
-  const effectiveProjectKey = pageProjectOverride ?? activeProjectKey;
+  const effectiveProjectKey = pageProjectOverride;
   const hasQuery = search.trim().length > 0;
-  const useSearchRoute = !crossProjectMode && effectiveProjectKey !== null && hasQuery;
-  const memoriesEnabled = crossProjectMode || effectiveProjectKey !== null;
+  const useSearchRoute = effectiveProjectKey !== null && hasQuery;
   const memoriesQuery = useQuery<PaginatedResponse<Memory>>({
     queryKey: [
       "memories",
       useSearchRoute ? "ranked" : "keyword",
       effectiveProjectKey,
-      crossProjectMode,
       narrowToggle,
       search,
       type,
@@ -277,14 +266,13 @@ export function MemoriesPage() {
       pageProject,
       page,
     ],
-    enabled: memoriesEnabled,
+    enabled: true,
     queryFn: async () => {
       if (useSearchRoute) {
         // The UI only ever asks for a project-bound view: the narrow toggle
-        // hard-restricts results to the active project plus the shared bucket,
+        // hard-restricts results to the selected project plus the shared bucket,
         // while the default leaves cross-project hits visible but down-weighted
-        // by the ranker. Cross-project browsing flows through GET /api/memories
-        // instead, so this route never needs the workspace-wide variant.
+        // by the ranker. All-project browsing flows through GET /api/memories.
         const body = {
           query: search || "",
           memory_types: type !== "all" ? [type] : undefined,
@@ -309,7 +297,7 @@ export function MemoriesPage() {
           type: type !== "all" ? type : undefined,
           status: status !== "all" ? status : undefined,
           source: source !== "all" ? source : undefined,
-          project: !crossProjectMode && effectiveProjectKey ? effectiveProjectKey : undefined,
+          project: effectiveProjectKey ?? undefined,
           limit: LIST_PAGE_SIZE,
           offset: page * LIST_PAGE_SIZE,
         },
@@ -356,28 +344,9 @@ export function MemoriesPage() {
   const effectiveProject = effectiveProjectKey ? projectByKey.get(effectiveProjectKey) : undefined;
   const effectiveProjectLabel =
     effectiveProject?.name ?? effectiveProjectKey ?? "Active project";
-  // Friendly names for the toolbar disagreement note: prefer the project's
-  // display name, fall back to the key, and surface the cross-project case
-  // explicitly for completeness even though the toolbar gate hides it.
-  const friendlyProjectName = (key: string | null): string => {
-    if (key === null) {
-      return crossProjectMode ? "Cross-project view" : "Active project";
-    }
-    if (key === SHARED_PROJECT_KEY) return SHARED_PROJECT_LABEL;
-    return projectByKey.get(key)?.name ?? key;
-  };
-  // The page filter takes precedence for THIS view, but the topbar chip still
-  // claims a different active project. Surface the disagreement in muted text
-  // so the user can see why the table contents differ from the chip.
-  const overrideShadowsChip =
-    pageProject !== PAGE_PROJECT_ALL &&
-    activeProjectKey !== null &&
-    pageProject !== activeProjectKey;
-  const pageProjectName = friendlyProjectName(pageProject);
-  const activeProjectName = friendlyProjectName(activeProjectKey);
-  // Project filter offers user-pickable projects only. UNSORTED is a system
-  // bucket and stays out of the picker; SHARED is included with a tinted
-  // "team-wide" badge so its team-wide nature reads at a glance.
+  // Project filter offers user-facing projects only. The UNSORTED backlog is
+  // included by "All projects" and managed from Sources, but it is not a real
+  // project choice in this picker.
   const projectOptions = [
     { value: PAGE_PROJECT_ALL, label: "All projects" },
     ...projectList
@@ -393,9 +362,6 @@ export function MemoriesPage() {
   const stats = statsQuery.data;
   const activeCount = bucketCount(stats?.memories_by_status, "active");
   const openReviewCount = reviewsQuery.data?.total;
-
-  const showFirstChoiceEmpty = !crossProjectMode && effectiveProjectKey === null;
-
   return (
     <div className="space-y-4">
       <PageHeader
@@ -447,8 +413,6 @@ export function MemoriesPage() {
         />
       </div>
 
-      {crossProjectMode && <CrossProjectBanner />}
-
       <DataSurface>
         <div className="flex flex-col gap-3 border-b p-4 xl:flex-row xl:items-center xl:justify-between">
           <div>
@@ -484,12 +448,7 @@ export function MemoriesPage() {
               className="w-full sm:w-56"
               options={projectOptions}
             />
-            {overrideShadowsChip && (
-              <p className="text-xs text-muted-foreground">
-                Filter set to {pageProjectName}, chip is {activeProjectName}
-              </p>
-            )}
-            {!crossProjectMode && effectiveProjectKey !== null && (
+            {effectiveProjectKey !== null && (
               <div
                 role="group"
                 aria-label="Project scope"
@@ -525,16 +484,7 @@ export function MemoriesPage() {
             )}
           </Toolbar>
         </div>
-        {showFirstChoiceEmpty ? (
-          <div className="p-6">
-            <EmptyState
-              icon={Brain}
-              title="Pick a project to start"
-              description="Click the chip in the top right to choose what you're working on, or pick the cross-project view."
-            />
-          </div>
-        ) : (
-          <>
+        <>
             <AsyncBoundary
               isLoading={memoriesQuery.isLoading}
               isError={memoriesQuery.isError}
@@ -573,8 +523,11 @@ export function MemoriesPage() {
                       const projectKey = memory.project_key;
                       const projectName = projectKey ? projectByKey.get(projectKey)?.name : undefined;
                       const isSharedProject = projectKey === SHARED_PROJECT_KEY;
+                      const isUnsortedProject = projectKey === UNSORTED_PROJECT_KEY;
                       const projectChipLabel = isSharedProject
                         ? SHARED_PROJECT_LABEL
+                        : isUnsortedProject
+                          ? "Unsorted"
                         : projectName ?? projectKey;
                       return (
                         <TableRow
@@ -609,11 +562,11 @@ export function MemoriesPage() {
                                     {tag}
                                   </Badge>
                                 ))}
-                                {projectKey && !isReservedProjectKey(projectKey) && (
+                                {projectKey && (!isReservedProjectKey(projectKey) || isUnsortedProject) && (
                                   <Badge
                                     variant="outline"
                                     className="gap-1 text-[11px] text-muted-foreground"
-                                    title={`Project ${projectChipLabel}`}
+                                    title={isUnsortedProject ? "Unmapped memory backlog" : `Project ${projectChipLabel}`}
                                   >
                                     <FolderTree className="size-3" />
                                     {projectChipLabel}
@@ -660,8 +613,7 @@ export function MemoriesPage() {
                 itemLabel="memories"
               />
             )}
-          </>
-        )}
+        </>
       </DataSurface>
     </div>
   );

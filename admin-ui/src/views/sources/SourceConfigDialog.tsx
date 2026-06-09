@@ -134,7 +134,7 @@ function SourceConfigForm({
     ...initialSourceConfig(sourceType, (source?.config ?? {}) as ConfigForm),
   }));
   const [binding, setBinding] = useState<ProjectBinding | null>(
-    () => source?.project_binding ?? { mode: "fixed", project_key: "" },
+    () => source?.project_binding ?? null,
   );
   const projectSectionRef = useRef<HTMLDivElement | null>(null);
   const authMode = stringValue(config.auth_mode) || "browser_cookie";
