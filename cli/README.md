@@ -6,10 +6,10 @@ automatically when `memforge` is invoked with no subcommand.
 
 ## Setup
 
-```sh
-cd cli
-npm install
-```
+The installed Python package owns this UI. When `memforge` is invoked with no
+subcommand, the Python launcher copies the packaged files into a versioned user
+cache and runs `npm ci --omit=dev` there on first use. Users should not run
+`npm install` in this directory as part of normal MemForge setup.
 
 ## Usage
 
@@ -26,6 +26,7 @@ in its environment, so there is no recursion.
 ## Development
 
 ```sh
+npm ci
 node index.mjs        # run the menu directly
 npm test              # dependency wiring + menu shape
 ```

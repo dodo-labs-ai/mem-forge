@@ -10,6 +10,8 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+from importlib import metadata
 from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -58,6 +60,12 @@ LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
 INTERACTIVE_DISABLE_ENV = "MEMFORGE_NO_INTERACTIVE"
 INTERACTIVE_SCRIPT_ENV = "MEMFORGE_INTERACTIVE_SCRIPT"
 INTERACTIVE_BIN_ENV = "MEMFORGE_CLI_BIN"
+INTERACTIVE_CACHE_ENV = "MEMFORGE_INTERACTIVE_CACHE"
+INTERACTIVE_RESOURCE_DIR = "interactive_cli"
+INTERACTIVE_INSTALL_LOCK = ".install.lock"
+INTERACTIVE_INSTALL_LOCK_TIMEOUT_SECONDS = 120
+INTERACTIVE_INSTALL_LOCK_STALE_SECONDS = 600
+INTERACTIVE_DEPENDENCY_SENTINEL = Path("node_modules") / "@clack" / "prompts"
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -314,27 +322,26 @@ def _dispatch_interactive() -> int:
     return _run_interactive_script()
 
 
-def _interactive_script_path() -> Path | None:
+def _interactive_resource_dir() -> Path:
+    return Path(__file__).resolve().parent / INTERACTIVE_RESOURCE_DIR
+
+
+def _interactive_script_path(resource_dir: Path | None = None) -> Path | None:
     override = os.environ.get(INTERACTIVE_SCRIPT_ENV, "").strip()
     if override:
         candidate = Path(override).expanduser()
         return candidate if candidate.exists() else None
-    # Walk up from the installed memforge package to find the repo-bundled
-    # `cli/index.mjs`. Editable installs and the source checkout both put this
-    # at <repo>/cli/index.mjs.
-    here = Path(__file__).resolve()
-    for parent in [here.parent.parent.parent, *here.parents]:
-        candidate = parent / "cli" / "index.mjs"
-        if candidate.exists():
-            return candidate
-    return None
+    resource_dir = resource_dir or _interactive_resource_dir()
+    candidate = resource_dir / "index.mjs"
+    return candidate if candidate.exists() else None
 
 
 def _run_interactive_script() -> int:
-    script = _interactive_script_path()
+    resource_dir = _interactive_resource_dir()
+    script = _interactive_script_path(resource_dir)
     if script is None:
         log_console.print(
-            "[yellow]Interactive UI not available: cli/index.mjs is missing.[/]\n"
+            "[yellow]Interactive UI not available: packaged interactive assets are missing.[/]\n"
             "Run scriptable subcommands directly. See [bold]memforge --help[/]."
         )
         return 2
@@ -347,12 +354,16 @@ def _run_interactive_script() -> int:
         )
         return 2
 
-    if not (script.parent / "node_modules" / "@clack" / "prompts").exists():
-        log_console.print(
-            "[yellow]Interactive UI dependencies are not installed.[/]\n"
-            f"Run [bold]cd {script.parent} && npm install[/], then re-run [bold]memforge[/]."
-        )
-        return 2
+    if not os.environ.get(INTERACTIVE_SCRIPT_ENV, "").strip():
+        try:
+            workspace = _prepare_interactive_workspace(resource_dir)
+        except RuntimeError as exc:
+            log_console.print(
+                f"[yellow]{exc}[/]\n"
+                "Run scriptable subcommands directly, or retry after npm can install the interactive UI."
+            )
+            return 2
+        script = workspace / "index.mjs"
 
     env = os.environ.copy()
     env.setdefault(INTERACTIVE_BIN_ENV, sys.argv[0] or "memforge")
@@ -360,6 +371,118 @@ def _run_interactive_script() -> int:
 
     completed = subprocess.run([node_bin, str(script)], env=env)
     return completed.returncode
+
+
+def _prepare_interactive_workspace(resource_dir: Path | None = None) -> Path:
+    resource_dir = resource_dir or _interactive_resource_dir()
+    _validate_interactive_resources(resource_dir)
+    workspace = _interactive_cache_root() / _interactive_cache_key(resource_dir)
+    if (workspace / INTERACTIVE_DEPENDENCY_SENTINEL).exists():
+        return workspace
+
+    with _interactive_install_lock(workspace):
+        _copy_interactive_resources(resource_dir, workspace)
+        if not (workspace / INTERACTIVE_DEPENDENCY_SENTINEL).exists():
+            _install_interactive_dependencies(workspace)
+    return workspace
+
+
+def _validate_interactive_resources(resource_dir: Path) -> None:
+    missing = [
+        name
+        for name in ("index.mjs", "package.json", "package-lock.json")
+        if not (resource_dir / name).exists()
+    ]
+    if missing:
+        raise RuntimeError(
+            "Interactive UI package is incomplete: missing "
+            + ", ".join(missing)
+            + f" under {resource_dir}."
+        )
+
+
+def _interactive_cache_root() -> Path:
+    configured = os.environ.get(INTERACTIVE_CACHE_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    xdg_cache = os.environ.get("XDG_CACHE_HOME", "").strip()
+    base = Path(xdg_cache).expanduser() if xdg_cache else Path.home() / ".cache"
+    return base / "memforge" / "interactive-cli"
+
+
+def _interactive_cache_key(resource_dir: Path) -> str:
+    try:
+        package_version = metadata.version("memforge")
+    except metadata.PackageNotFoundError:
+        package_version = "0.0.0"
+    digest = hashlib.sha256()
+    for name in ("package-lock.json", "package.json", "index.mjs"):
+        digest.update(name.encode("utf-8"))
+        digest.update((resource_dir / name).read_bytes())
+    return f"{package_version}-{digest.hexdigest()[:12]}"
+
+
+def _copy_interactive_resources(resource_dir: Path, workspace: Path) -> None:
+    workspace.mkdir(parents=True, exist_ok=True)
+    for name in ("index.mjs", "package.json", "package-lock.json"):
+        source = resource_dir / name
+        target = workspace / name
+        if not target.exists() or target.read_bytes() != source.read_bytes():
+            shutil.copy2(source, target)
+
+
+class _interactive_install_lock:
+    def __init__(self, workspace: Path) -> None:
+        self.path = workspace / INTERACTIVE_INSTALL_LOCK
+        self.fd: int | None = None
+
+    def __enter__(self) -> "_interactive_install_lock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + INTERACTIVE_INSTALL_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(self.fd, str(os.getpid()).encode("utf-8"))
+                return self
+            except FileExistsError:
+                if self._is_stale():
+                    self.path.unlink(missing_ok=True)
+                    continue
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Timed out waiting for interactive UI install lock at {self.path}.")
+                time.sleep(0.1)
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _is_stale(self) -> bool:
+        try:
+            age = time.time() - self.path.stat().st_mtime
+        except FileNotFoundError:
+            return False
+        return age > INTERACTIVE_INSTALL_LOCK_STALE_SECONDS
+
+
+def _install_interactive_dependencies(workspace: Path) -> None:
+    npm_bin = shutil.which("npm")
+    if npm_bin is None:
+        raise RuntimeError("Interactive UI requires npm on PATH to prepare its first-run dependencies.")
+    try:
+        subprocess.run(
+            [npm_bin, "ci", "--omit=dev", "--no-audit", "--no-fund"],
+            cwd=workspace,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"Interactive UI dependency installation failed in {workspace}. "
+            f"Retry manually with: cd {workspace} && npm ci --omit=dev --no-audit --no-fund"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
