@@ -44,6 +44,36 @@ def test_hook_adapter_returns_additional_context_for_prompt_hook(monkeypatch, ca
     assert "MemoryStore" in output["hookSpecificOutput"]["additionalContext"]
 
 
+def test_hook_adapter_injects_session_start_memforge_usage_guidance_without_api(monkeypatch, capsys):
+    from memforge import hook_adapter
+
+    requests: list[tuple[str, dict]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        raise AssertionError("SessionStart guidance should not call the API")
+
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
+        "hook_event_name": "SessionStart",
+        "session_id": "sess-start",
+        "cwd": "/tmp/mem-forge",
+    }))
+
+    exit_code = hook_adapter.main(["context"])
+
+    assert exit_code == 0
+    assert requests == []
+    output = json.loads(capsys.readouterr().out)
+    assert output["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    context = output["hookSpecificOutput"]["additionalContext"]
+    assert "MemForge Usage Guidance" in context
+    assert "MCP search" in context
+    assert "get_memory" in context
+    assert "get_resource" in context
+    assert "Relevant Memories" not in context
+
+
 def test_hook_adapter_submits_lifecycle_receipt_when_transcript_is_missing(monkeypatch, capsys):
     from memforge import hook_adapter
 
