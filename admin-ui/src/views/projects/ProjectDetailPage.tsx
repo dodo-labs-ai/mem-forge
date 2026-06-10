@@ -480,7 +480,7 @@ function DeleteConfirmDialog({
           {memoryCount > 0
             ? `Project "${project.name}" will be deleted and ${memoryCount.toLocaleString()} ${
                 memoryCount === 1 ? "memory" : "memories"
-              } will move to the unsorted bucket.`
+              } will move to the Unsorted project.`
             : `Project "${project.name}" will be deleted. No memories are linked to it.`}
         </p>
         <div className="mt-4 flex justify-end gap-2">

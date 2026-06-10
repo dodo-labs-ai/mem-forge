@@ -566,7 +566,7 @@ export function MemoriesPage() {
                                   <Badge
                                     variant="outline"
                                     className="gap-1 text-[11px] text-muted-foreground"
-                                    title={isUnsortedProject ? "Unmapped memory backlog" : `Project ${projectChipLabel}`}
+                                    title={isUnsortedProject ? "Unsorted project (built-in catch-all)" : `Project ${projectChipLabel}`}
                                   >
                                     <FolderTree className="size-3" />
                                     {projectChipLabel}

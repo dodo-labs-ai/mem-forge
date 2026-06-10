@@ -4,7 +4,7 @@
  * Ordering rule (deterministic):
  *   1. SHARED bucket (the team-wide project, if any sources land there)
  *   2. User projects, alphabetical by display name
- *   3. UNSORTED bucket (system catch-all)
+ *   3. Unsorted project (system catch-all, see UNSORTED_PROJECT_KEY)
  *   4. Unmapped (sources with no `project_binding` at all)
  *
  * Membership rule:
@@ -47,7 +47,7 @@ export type ResolvedBySource = Record<string, SourceResolvedProject[]>;
 
 // An empty or whitespace-only project_key on a binding means the admin has not
 // chosen a project yet; that source belongs in the Unmapped (null) group, NOT
-// in the system UNSORTED bucket (which is a real reserved project).
+// in the Unsorted project (which is a real reserved project).
 function isUsableKey(key: string | undefined | null): key is string {
   return typeof key === "string" && key.trim().length > 0;
 }

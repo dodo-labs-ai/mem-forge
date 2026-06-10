@@ -11,9 +11,9 @@ import { projectGroupKey } from "./projectGrouping";
 
 const UNMAPPED_GROUP_TITLE = "Unmapped";
 const UNMAPPED_GROUP_DESCRIPTION =
-  "No project assigned yet. Memories stay searchable in Unsorted until configured.";
+  "This source has no project binding yet. Its memories land in the Unsorted project until you bind it.";
 const UNSORTED_GROUP_DESCRIPTION =
-  "Searchable catch-all for memories without a project assignment.";
+  "Built-in catch-all project for memories from sources that have no project binding.";
 
 export function ProjectGroup({
   group,

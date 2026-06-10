@@ -42,7 +42,7 @@ import type { ProjectCreateFormState } from "./projectCreateForm";
 
 /**
  * The DELETE /api/projects/{id} response reports how many memories were
- * moved into the unsorted bucket. We read it via a runtime key so the
+ * moved into the Unsorted project. We read it via a runtime key so the
  * snake_case wire name never appears as user-facing copy.
  */
 const REBUCKETED_COUNT_FIELD = "rebucketed" + "_count";
@@ -252,7 +252,7 @@ export function ProjectsPage() {
         >
           {`Project "${lastDeleteSummary.name}" deleted. ${lastDeleteSummary.movedCount} ${
             lastDeleteSummary.movedCount === 1 ? "memory" : "memories"
-          } moved to the unsorted bucket.`}
+          } moved to the Unsorted project.`}
         </div>
       )}
 
