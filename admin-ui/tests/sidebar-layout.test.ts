@@ -21,6 +21,12 @@ assert.match(
   "sidebar footer should allow an extension-owned account surface",
 );
 
+assert.match(
+  sidebarSource,
+  /getExtensionHiddenReservedNavItems/,
+  "sidebar should allow a composed extension to replace a built-in reserved nav item",
+);
+
 assert.doesNotMatch(
   sidebarSource,
   /function AccountFooter\(\)[\s\S]*?<button[\s\S]*?<\/button>/,
@@ -75,6 +81,20 @@ assert.doesNotMatch(
   topbarSource,
   /aria-label=`Workspace:/,
   "topbar should not advertise a workspace switcher alongside the active project chip",
+);
+
+const appSource = readFileSync("src/App.tsx", "utf8");
+
+assert.match(
+  appSource,
+  /getExtensionReservedRouteRedirects/,
+  "app routes should allow a composed extension to redirect selected built-in reserved routes",
+);
+
+assert.match(
+  appSource,
+  /path="\/settings"[\s\S]*<Navigate to=\{settingsRedirect\.to\} replace \/>/,
+  "the settings route should redirect only when the extension explicitly owns it",
 );
 
 console.log("sidebar-layout.test.ts: all assertions passed");

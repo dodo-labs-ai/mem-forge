@@ -105,33 +105,36 @@ class AppConfig:
             self.storage.docs_path = os.environ["MEMFORGE_STORAGE_DOCS_PATH"]
         self.storage.resolve(self.base_dir)
         # Environment variable overrides (MEMFORGE_* prefix)
-        self.llm.enrichment_model = (
-            os.environ.get("MEMFORGE_ENRICHMENT_MODEL")
-            or self.llm.enrichment_model
+        def env_override(name: str, fallback: str) -> str:
+            return os.environ[name] if name in os.environ else fallback
+
+        self.llm.enrichment_model = env_override(
+            "MEMFORGE_ENRICHMENT_MODEL",
+            self.llm.enrichment_model,
         )
-        self.llm.enrichment_base_url = (
-            os.environ.get("MEMFORGE_ENRICHMENT_BASE_URL")
-            or self.llm.enrichment_base_url
+        self.llm.enrichment_base_url = env_override(
+            "MEMFORGE_ENRICHMENT_BASE_URL",
+            self.llm.enrichment_base_url,
         )
-        self.llm.enrichment_api_key = (
-            os.environ.get("MEMFORGE_ENRICHMENT_API_KEY")
-            or self.llm.enrichment_api_key
+        self.llm.enrichment_api_key = env_override(
+            "MEMFORGE_ENRICHMENT_API_KEY",
+            self.llm.enrichment_api_key,
         )
         self.llm.request_timeout_s = float(
             os.environ.get("MEMFORGE_LLM_REQUEST_TIMEOUT_SECONDS")
             or self.llm.request_timeout_s
         )
-        self.llm.embedding_model = (
-            os.environ.get("MEMFORGE_EMBEDDING_MODEL")
-            or self.llm.embedding_model
+        self.llm.embedding_model = env_override(
+            "MEMFORGE_EMBEDDING_MODEL",
+            self.llm.embedding_model,
         )
-        self.llm.embedding_base_url = (
-            os.environ.get("MEMFORGE_EMBEDDING_BASE_URL")
-            or self.llm.embedding_base_url
+        self.llm.embedding_base_url = env_override(
+            "MEMFORGE_EMBEDDING_BASE_URL",
+            self.llm.embedding_base_url,
         )
-        self.llm.embedding_api_key = (
-            os.environ.get("MEMFORGE_EMBEDDING_API_KEY")
-            or self.llm.embedding_api_key
+        self.llm.embedding_api_key = env_override(
+            "MEMFORGE_EMBEDDING_API_KEY",
+            self.llm.embedding_api_key,
         )
         self.server.admin_api_port = int(
             os.environ.get("MEMFORGE_ADMIN_API_PORT")

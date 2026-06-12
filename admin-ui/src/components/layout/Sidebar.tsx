@@ -17,7 +17,11 @@ import { BRAND_NAME, BRAND_SUBTITLE } from "@/brand";
 import { TaiSealLogo } from "@/components/brand/TaiSealLogo";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { getExtensionAccountSurface, getExtensionNavItems } from "@/extension";
+import {
+  getExtensionAccountSurface,
+  getExtensionHiddenReservedNavItems,
+  getExtensionNavItems,
+} from "@/extension";
 
 type NavGroupItem = {
   to: string;
@@ -105,6 +109,22 @@ function Brand({ onClose }: { onClose?: () => void }) {
 
 const DEFAULT_EXTENSION_GROUP_LABEL = "Extension";
 
+function routeSegment(path: string): string {
+  return path.replace(/^\/+/, "").split("/", 1)[0] ?? "";
+}
+
+function buildBaseGroups(): NavGroup[] {
+  const hiddenReservedNavItems = new Set<string>(getExtensionHiddenReservedNavItems());
+  if (hiddenReservedNavItems.size === 0) return navGroups;
+
+  return navGroups
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => !hiddenReservedNavItems.has(routeSegment(item.to))),
+    }))
+    .filter((group) => group.items.length > 0);
+}
+
 function buildExtensionGroups(): NavGroup[] {
   const items = getExtensionNavItems().filter((item) => item.visibleWhen?.() ?? true);
   if (items.length === 0) return [];
@@ -125,7 +145,7 @@ function buildExtensionGroups(): NavGroup[] {
 function NavItems({ onNavigate }: { onNavigate?: () => void }) {
   const pendingReviews = usePendingReviewCount();
   const pendingCount = pendingReviews.data?.total ?? 0;
-  const allGroups: NavGroup[] = [...navGroups, ...buildExtensionGroups()];
+  const allGroups: NavGroup[] = [...buildBaseGroups(), ...buildExtensionGroups()];
 
   return (
     <nav className="flex-1 space-y-5 overflow-y-auto px-2 py-2">

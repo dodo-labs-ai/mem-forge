@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
+from memforge.llm.providers import is_litellm_provider_model
 from memforge.memory.index_payloads import (
     document_embedding_text,
     embedding_text_hash,
@@ -326,11 +327,12 @@ class MemoryIndexRepairer:
         ))[0]
 
     def _has_embedding_config(self) -> bool:
-        return bool(
-            self.embed_cfg.get("base_url")
-            and self.embed_cfg.get("api_key")
-            and self.embed_cfg.get("model")
-        )
+        model = str(self.embed_cfg.get("model") or "").strip()
+        if not model:
+            return False
+        if is_litellm_provider_model(model):
+            return True
+        return bool(self.embed_cfg.get("base_url") and self.embed_cfg.get("api_key"))
 
     def _collection_records(self, collection: Any) -> dict[str, dict[str, Any]]:
         raw = collection.get(include=["embeddings", "documents", "metadatas"])

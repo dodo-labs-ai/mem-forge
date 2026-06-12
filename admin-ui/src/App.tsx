@@ -3,7 +3,11 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AppShell } from "@/components/layout/AppShell";
 import { DEFAULT_QUERY_STALE_MS } from "@/lib/constants";
-import { getExtensionRoutes, getExtensionShell } from "@/extension";
+import {
+  getExtensionReservedRouteRedirects,
+  getExtensionRoutes,
+  getExtensionShell,
+} from "@/extension";
 import { MemoriesPage } from "@/views/memories/MemoriesPage";
 import { MemoryDetailPage } from "@/views/memories/MemoryDetailPage";
 import { EntitiesPage } from "@/views/entities/EntitiesPage";
@@ -30,6 +34,9 @@ export default function App() {
   // a misconfigured extension cannot shadow built-in product-memory surfaces
   // (the registration layer also drops reserved-prefix routes defensively).
   const extensionRoutes = getExtensionRoutes();
+  const settingsRedirect = getExtensionReservedRouteRedirects().find(
+    (redirect) => redirect.from === "settings",
+  );
   const shell = getExtensionShell();
   const ShellWrapper = shell?.Wrapper ?? PassThroughShell;
 
@@ -48,7 +55,16 @@ export default function App() {
               <Route path="/sources" element={<SourcesPage />} />
               <Route path="/projects" element={<ProjectsPage />} />
               <Route path="/projects/:key" element={<ProjectDetailPage />} />
-              <Route path="/settings" element={<SettingsPage />} />
+              <Route
+                path="/settings"
+                element={
+                  settingsRedirect ? (
+                    <Navigate to={settingsRedirect.to} replace />
+                  ) : (
+                    <SettingsPage />
+                  )
+                }
+              />
               {extensionRoutes.map((route, index) => (
                 <Route
                   key={typeof route.path === "string" ? route.path : `ext-${index}`}
