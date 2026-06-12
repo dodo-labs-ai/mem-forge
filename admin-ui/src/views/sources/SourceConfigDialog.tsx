@@ -41,6 +41,7 @@ import { projectBindingIsComplete } from "./projectBinding";
 
 type ConfigValue = string | number | boolean | string[] | null;
 type ConfigForm = Record<string, ConfigValue>;
+const DISCOVERY_PREVIEW_LIMIT = 5;
 
 export function SourceConfigDialog({
   open,
@@ -188,6 +189,7 @@ function SourceConfigForm({
       client
         .post(`/api/genes/${sourceType}/preview-discovery`, {
           config: serializeConfig(schema.fields, config),
+          limit: DISCOVERY_PREVIEW_LIMIT,
         })
         .then((response) => response.data as DiscoveryPreviewResponse),
   });
