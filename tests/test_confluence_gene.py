@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
-from memforge.genes.confluence_gene import ConfluenceGene
+from memforge.genes.confluence_gene import ConfluenceGene, PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY
 
 
 def test_confluence_schema_marks_tls_ca_bundle_as_advanced():
@@ -157,6 +157,28 @@ class PageTreeClient:
             })
         if url.endswith("/content/target/child/page"):
             return JsonResponse({"results": []})
+        return JsonResponse({"results": []})
+
+    async def get(self, url: str, **kwargs):
+        return await self.request("GET", url, **kwargs)
+
+
+class PreviewLimitClient:
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, dict]] = []
+
+    async def request(self, _method: str, url: str, **kwargs):
+        self.requests.append((url, kwargs.get("params") or {}))
+        if url.endswith("/content/root"):
+            return JsonResponse(_page("root", "Root", "2026-05-20T00:00:00Z"))
+        if url.endswith("/content/root/child/page"):
+            return JsonResponse({
+                "results": [
+                    _page("child-1", "Child 1", "2026-05-21T00:00:00Z"),
+                    _page("child-2", "Child 2", "2026-05-22T00:00:00Z"),
+                    _page("child-3", "Child 3", "2026-05-23T00:00:00Z"),
+                ],
+            })
         return JsonResponse({"results": []})
 
     async def get(self, url: str, **kwargs):
@@ -395,3 +417,30 @@ async def test_page_tree_discovery_traverses_unchanged_parent_to_find_changed_ch
 
     assert [item.title for item in items] == ["Changed Child"]
     assert "/wiki/rest/api/content/parent/child/page" in client.calls
+
+
+@pytest.mark.asyncio
+async def test_page_tree_preview_limits_child_page_request_size():
+    client = PreviewLimitClient()
+    gene = ConfluenceGene(
+        config={
+            "base_url": "https://wiki.example.com",
+            "page_tree_root": "root",
+            "include_children": True,
+            PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY: 3,
+        },
+        source_id="preview-confluence",
+    )
+    gene._base_url = "https://wiki.example.com"
+    gene._api_prefix = "/wiki"
+    gene._client = client
+
+    items = [item async for item in gene.discover(since=None)]
+
+    assert [item.title for item in items] == ["Root", "Child 1", "Child 2"]
+    child_requests = [
+        params
+        for url, params in client.requests
+        if url.endswith("/content/root/child/page")
+    ]
+    assert child_requests == [{"start": 0, "limit": 2, "expand": "version,metadata.labels"}]

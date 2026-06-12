@@ -2831,6 +2831,7 @@ def create_admin_app(
         try:
             _validate_source_config(name, req.config)
             preview_config = dict(req.config)
+            preview_config["_memforge_preview_limit"] = req.limit + 1
             # Browser-session sources keep the cookie in the auth store, not the
             # source config. Inject it the same way a real sync does (no-op for
             # source types that do not use a browser session).

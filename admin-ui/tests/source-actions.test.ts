@@ -89,3 +89,15 @@ assert.match(
   /className="[^"]*cursor-pointer[^"]*disabled:cursor-not-allowed[^"]*"/,
   "enabled overflow menu actions should use a pointer cursor while disabled actions keep not-allowed",
 );
+
+const sourceConfigDialogSource = readFileSync("src/views/sources/SourceConfigDialog.tsx", "utf8");
+assert.match(
+  sourceConfigDialogSource,
+  /const DISCOVERY_PREVIEW_LIMIT = 5;/,
+  "source discovery preview should request a small bounded result set",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /limit: DISCOVERY_PREVIEW_LIMIT/,
+  "source discovery preview requests should send the bounded limit to the API",
+);
