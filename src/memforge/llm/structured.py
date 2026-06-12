@@ -10,6 +10,8 @@ from typing import Literal, Protocol, get_args, get_origin
 import litellm
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from memforge.llm.providers import litellm_optional_kwargs
+
 logger = logging.getLogger(__name__)
 
 
@@ -237,7 +239,7 @@ class AgentSessionPackageResponse(StructuredResponseModel):
 class StructuredLlmConfig:
     model: str
     base_url: str | None
-    api_key: str
+    api_key: str | None
     timeout_s: float
     # Transparently retry transient gateway/connection blips (e.g. a stale
     # keep-alive connection through an Envoy gateway closed on idle timeout, or a
@@ -558,11 +560,13 @@ class LiteLlmStructuredClient:
         response = await litellm.acompletion(
             model=model_name,
             messages=[{"role": "user", "content": request_prompt}],
-            api_base=self.config.base_url,
-            api_key=self.config.api_key,
             timeout=self.config.timeout_s,
             max_tokens=max_tokens,
             num_retries=self.config.num_retries,
+            **litellm_optional_kwargs(
+                api_base=self.config.base_url,
+                api_key=self.config.api_key,
+            ),
             **({"response_format": response_format} if native_schema else {}),
         )
         raw_content = _message_content(response)

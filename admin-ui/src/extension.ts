@@ -67,6 +67,13 @@ export interface ExtensionShellWrapper {
   Wrapper: ComponentType<{ children: ReactNode }>;
 }
 
+export interface ExtensionReservedRouteRedirect {
+  /** Reserved OSS route segment intentionally handed to the extension. */
+  from: ReservedRouteSegment;
+  /** Absolute non-reserved target path owned by the extension. */
+  to: string;
+}
+
 /**
  * Account surface contributions. The OSS shell renders identity affordances in
  * exactly two places: the topbar (compact avatar/menu trigger) and the sidebar
@@ -100,6 +107,17 @@ export interface CloudExtension {
   /** Optional shell wrapper; rendered around the entire app. */
   shell?: ExtensionShellWrapper;
   /**
+   * Optional redirects from selected OSS-owned top-level routes to extension
+   * routes. This lets a composed shell deliberately replace a built-in surface
+   * without letting extension route registrations shadow OSS routes.
+   */
+  reservedRouteRedirects?: ExtensionReservedRouteRedirect[];
+  /**
+   * Optional OSS nav items to hide when the extension redirects/replaces the
+   * corresponding built-in surface.
+   */
+  hiddenReservedNavItems?: ReservedRouteSegment[];
+  /**
    * Optional account-surface owner. When provided, the extension takes over
    * the relevant identity affordance(s) so the composed shell exposes a
    * single, genuinely interactive control instead of the OSS placeholder.
@@ -111,6 +129,8 @@ interface RegisteredExtension extends CloudExtension {
   routes: RouteObject[];
   navItems: ExtensionNavItem[];
   topbarSlots: ExtensionTopbarSlot[];
+  reservedRouteRedirects: ExtensionReservedRouteRedirect[];
+  hiddenReservedNavItems: ReservedRouteSegment[];
 }
 
 let mounted: RegisteredExtension | null = null;
@@ -141,6 +161,30 @@ function filterNavItems(items: ExtensionNavItem[] | undefined): ExtensionNavItem
   return items.filter((item) => !isReservedPath(item.to));
 }
 
+function filterReservedRouteRedirects(
+  redirects: ExtensionReservedRouteRedirect[] | undefined,
+): ExtensionReservedRouteRedirect[] {
+  if (!redirects || redirects.length === 0) return [];
+  return redirects.filter((redirect) => {
+    if (!(RESERVED_ROUTE_SEGMENTS as readonly string[]).includes(redirect.from)) {
+      return false;
+    }
+    return typeof redirect.to === "string" && redirect.to.startsWith("/") && !isReservedPath(redirect.to);
+  });
+}
+
+function filterHiddenReservedNavItems(
+  items: ReservedRouteSegment[] | undefined,
+): ReservedRouteSegment[] {
+  if (!items || items.length === 0) return [];
+  return items.filter((item, index) => {
+    if (!(RESERVED_ROUTE_SEGMENTS as readonly string[]).includes(item)) {
+      return false;
+    }
+    return items.indexOf(item) === index;
+  });
+}
+
 /**
  * Register an extension at module init. Subsequent calls are no-ops; the
  * first registration wins and the shell stays deterministic.
@@ -158,6 +202,8 @@ export function mountCloudExtension(extension: CloudExtension): boolean {
     routes: filterRoutes(extension.routes),
     navItems: filterNavItems(extension.navItems),
     topbarSlots: extension.topbarSlots ?? [],
+    reservedRouteRedirects: filterReservedRouteRedirects(extension.reservedRouteRedirects),
+    hiddenReservedNavItems: filterHiddenReservedNavItems(extension.hiddenReservedNavItems),
   };
   return true;
 }
@@ -184,6 +230,14 @@ export function getExtensionTopbarSlots(): ExtensionTopbarSlot[] {
 
 export function getExtensionShell(): ExtensionShellWrapper | null {
   return mounted?.shell ?? null;
+}
+
+export function getExtensionReservedRouteRedirects(): ExtensionReservedRouteRedirect[] {
+  return mounted?.reservedRouteRedirects ?? [];
+}
+
+export function getExtensionHiddenReservedNavItems(): ReservedRouteSegment[] {
+  return mounted?.hiddenReservedNavItems ?? [];
 }
 
 export function getExtensionAccountSurface(): ExtensionAccountSurface | null {

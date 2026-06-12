@@ -10,6 +10,9 @@ from typing import Any
 
 import chromadb
 import httpx
+import litellm
+
+from memforge.llm.providers import is_litellm_provider_model, litellm_optional_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +26,7 @@ __all__ = ["embed_texts", "get_chroma_collection"]
 def embed_texts(
     texts: list[str],
     base_url: str,
-    api_key: str,
+    api_key: str | None,
     model: str,
     timeout: float = 60.0,
     max_retries: int = 3,
@@ -35,6 +38,16 @@ def embed_texts(
     """
     if not texts:
         return []
+
+    if is_litellm_provider_model(model):
+        response = litellm.embedding(
+            model=model,
+            input=texts,
+            timeout=timeout,
+            num_retries=max_retries,
+            **litellm_optional_kwargs(api_base=base_url or None, api_key=api_key),
+        )
+        return _embedding_vectors(response)
 
     url = f"{base_url.rstrip('/')}/embeddings"
     last_error = None
@@ -66,6 +79,30 @@ def embed_texts(
                 logger.error("Embedding API call failed after %d attempts: %s", max_retries + 1, e)
 
     raise last_error  # type: ignore[misc]
+
+
+def _embedding_vectors(response: object) -> list[list[float]]:
+    data = getattr(response, "data", None)
+    if data is None and isinstance(response, dict):
+        data = response.get("data")
+    if not isinstance(data, list):
+        raise ValueError("LiteLLM embedding response is missing data")
+
+    def item_index(item: object) -> int:
+        if isinstance(item, dict):
+            return int(item.get("index", 0))
+        return int(getattr(item, "index", 0))
+
+    def item_embedding(item: object) -> list[float]:
+        if isinstance(item, dict):
+            embedding = item.get("embedding")
+        else:
+            embedding = getattr(item, "embedding", None)
+        if not isinstance(embedding, list):
+            raise ValueError("LiteLLM embedding item is missing embedding")
+        return embedding
+
+    return [item_embedding(item) for item in sorted(data, key=item_index)]
 
 
 # ---------------------------------------------------------------------------
