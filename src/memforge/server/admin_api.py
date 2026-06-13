@@ -75,31 +75,14 @@ from memforge.source_secrets import (
     redact_source_config,
     source_secret_fields,
 )
+from memforge.server.memory_admin_service import (
+    list_memory_admin_page,
+    pick_origin_source_type,
+)
+from memforge.storage.admin_memory import MemoryAdminListFilters
 from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
-
-
-def _fts_query(value: str) -> str:
-    """Return a safe FTS5 query for user-entered memory search text."""
-    terms = value.strip().split()
-    if not terms:
-        return '""'
-    quoted_terms = []
-    for term in terms:
-        escaped = term.replace('"', '""')
-        quoted_terms.append(f'"{escaped}"')
-    return " ".join(quoted_terms)
-
-
-def _like_pattern(value: str) -> str:
-    escaped = (
-        value.strip()
-        .replace("\\", "\\\\")
-        .replace("%", "\\%")
-        .replace("_", "\\_")
-    )
-    return f"%{escaped}%"
 
 
 def _workspace_default_scope(request: Request, *, include_private: bool):
@@ -1500,12 +1483,7 @@ def _pick_origin_source_type(pairs: list[tuple[str, str | None, str | None]]) ->
     """Pick a memory's display source and client from its (source_type, support_kind, client) triples,
     ordered oldest-first: the extraction origin if any, else the first source.
     Returns (source_type, client). Both are None when there are no sources."""
-    if not pairs:
-        return None, None
-    for source_type, support_kind, client in pairs:
-        if support_kind == "extracted":
-            return source_type, client
-    return pairs[0][0], pairs[0][2]
+    return pick_origin_source_type(pairs)
 
 
 async def _origin_source_types(db: Database, memory_ids: list[str]) -> dict[str, tuple[str, str | None]]:
@@ -2500,122 +2478,26 @@ def create_admin_app(
         the predicate), and the caller's own private rows surface only
         when ``include_private=True``.
         """
-        from memforge.retrieval.access_predicate import visible_sql
-
         scope = _workspace_default_scope(request, include_private=include_private)
-        predicate_sql, predicate_params = visible_sql(scope, "m")
-        if search:
-            fts_query = _fts_query(search)
-            like_query = _like_pattern(search)
-            conditions: list[str] = [
-                predicate_sql,
-                """(
-                    m.id IN (
-                        SELECT memory_id
-                        FROM memories_fts
-                        WHERE memories_fts MATCH ?
-                    )
-                    OR EXISTS (
-                        SELECT 1
-                        FROM memory_sources ms_search
-                        JOIN documents d_search ON ms_search.doc_id = d_search.doc_id
-                        WHERE ms_search.memory_id = m.id
-                          AND (
-                            d_search.doc_id LIKE ? ESCAPE '\\'
-                            OR d_search.title LIKE ? ESCAPE '\\'
-                            OR d_search.source_url LIKE ? ESCAPE '\\'
-                          )
-                    )
-                )"""
-            ]
-            params: list[Any] = [
-                *predicate_params,
-                fts_query, like_query, like_query, like_query,
-            ]
-
-            if source:
-                conditions.append(
-                    """EXISTS (
-                        SELECT 1
-                        FROM memory_sources ms_filter
-                        JOIN documents d_filter ON ms_filter.doc_id = d_filter.doc_id
-                        WHERE ms_filter.memory_id = m.id
-                          AND d_filter.source = ?
-                    )"""
-                )
-                params.append(source)
-            if type:
-                conditions.append("m.memory_type = ?")
-                params.append(type)
-            if status:
-                conditions.append("m.status = ?")
-                params.append(normalize_memory_status(status))
-            if project:
-                conditions.append("m.project_key = ?")
-                params.append(project)
-
-            where_clause = " AND ".join(conditions)
-            query = f"SELECT DISTINCT m.* FROM memories m WHERE {where_clause} ORDER BY m.updated_at DESC LIMIT ? OFFSET ?"
-            params.extend([limit, offset])
-
-            memories: list[Memory] = []
-            async with db.db.execute(query, params) as cursor:
-                async for row in cursor:
-                    memories.append(db._row_to_memory(row))
-
-            # Count query for total
-            count_query = f"SELECT COUNT(DISTINCT m.id) FROM memories m WHERE {where_clause}"
-            count_params = params[:-2]  # exclude limit/offset
-            async with db.db.execute(count_query, count_params) as cursor:
-                total_row = await cursor.fetchone()
-                total = total_row[0] if total_row else 0
-        else:
-            # Use the Database.list_memories method for non-search queries
-            # We need offset support so we build the query manually
-            query = "SELECT DISTINCT m.* FROM memories m"
-            joins: list[str] = []
-            conditions_list: list[str] = [predicate_sql]
-            params_list: list[Any] = list(predicate_params)
-
-            if source:
-                joins.append("JOIN memory_sources ms ON m.id = ms.memory_id")
-                joins.append("JOIN documents d ON ms.doc_id = d.doc_id")
-                conditions_list.append("d.source = ?")
-                params_list.append(source)
-            if type:
-                conditions_list.append("m.memory_type = ?")
-                params_list.append(type)
-            if status:
-                conditions_list.append("m.status = ?")
-                params_list.append(normalize_memory_status(status))
-            if project:
-                conditions_list.append("m.project_key = ?")
-                params_list.append(project)
-
-            join_clause = " ".join(joins)
-            where_clause = " AND ".join(conditions_list)
-
-            # Count
-            count_q = f"SELECT COUNT(DISTINCT m.id) FROM memories m {join_clause} WHERE {where_clause}"
-            async with db.db.execute(count_q, params_list) as cursor:
-                total_row = await cursor.fetchone()
-                total = total_row[0] if total_row else 0
-
-            # Fetch page
-            full_q = f"{query} {join_clause} WHERE {where_clause} ORDER BY m.updated_at DESC LIMIT ? OFFSET ?"
-            page_params = params_list + [limit, offset]
-            memories = []
-            async with db.db.execute(full_q, page_params) as cursor:
-                async for row in cursor:
-                    memories.append(db._row_to_memory(row))
-
-        origins = await _origin_source_types(db, [m.id for m in memories])
+        page = await list_memory_admin_page(
+            db,
+            scope=scope,
+            filters=MemoryAdminListFilters(
+                memory_type=type,
+                status=status,
+                source=source,
+                project=project,
+                search=search,
+            ),
+            limit=limit,
+            offset=offset,
+        )
         return MemoryListResponse(
             data=[
-                _memory_to_response(m, *origins.get(m.id, (None, None)))
-                for m in memories
+                _memory_to_response(m, *page.origins.get(m.id, (None, None)))
+                for m in page.memories
             ],
-            total=total,
+            total=page.total,
             limit=limit,
             offset=offset,
         )

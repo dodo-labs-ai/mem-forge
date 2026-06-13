@@ -38,6 +38,11 @@ from memforge.models import (
 )
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
+from memforge.retrieval.access_predicate import visible_sql
+from memforge.storage.admin_memory import (
+    MemoryAdminListFilters,
+    MemoryAdminQueryPage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +118,27 @@ def _entity_from_row(d: dict) -> Entity:
         display_name=d["display_name"],
         created_at=_parse_dt(d.get("created_at")),
     )
+
+
+def _admin_fts_query(value: str) -> str:
+    terms = value.strip().split()
+    if not terms:
+        return '""'
+    quoted_terms = []
+    for term in terms:
+        escaped = term.replace('"', '""')
+        quoted_terms.append(f'"{escaped}"')
+    return " ".join(quoted_terms)
+
+
+def _admin_like_pattern(value: str) -> str:
+    escaped = (
+        value.strip()
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    return f"%{escaped}%"
 
 
 # ---------------------------------------------------------------------------
@@ -1795,6 +1821,127 @@ class Database:
             async for row in cursor:
                 results.append(self._row_to_memory(row))
         return results
+
+    async def query_memory_admin_page(
+        self,
+        *,
+        scope,
+        filters: MemoryAdminListFilters,
+        limit: int,
+        offset: int,
+    ) -> MemoryAdminQueryPage:
+        predicate_sql, predicate_params = visible_sql(scope, "m")
+        if filters.search:
+            fts_query = _admin_fts_query(filters.search)
+            like_query = _admin_like_pattern(filters.search)
+            conditions: list[str] = [
+                predicate_sql,
+                """(
+                    m.id IN (
+                        SELECT memory_id
+                        FROM memories_fts
+                        WHERE memories_fts MATCH ?
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM memory_sources ms_search
+                        JOIN documents d_search ON ms_search.doc_id = d_search.doc_id
+                        WHERE ms_search.memory_id = m.id
+                          AND (
+                            d_search.doc_id LIKE ? ESCAPE '\\'
+                            OR d_search.title LIKE ? ESCAPE '\\'
+                            OR d_search.source_url LIKE ? ESCAPE '\\'
+                          )
+                    )
+                )""",
+            ]
+            params: list[Any] = [
+                *predicate_params,
+                fts_query,
+                like_query,
+                like_query,
+                like_query,
+            ]
+
+            if filters.source:
+                conditions.append(
+                    """EXISTS (
+                        SELECT 1
+                        FROM memory_sources ms_filter
+                        JOIN documents d_filter ON ms_filter.doc_id = d_filter.doc_id
+                        WHERE ms_filter.memory_id = m.id
+                          AND d_filter.source = ?
+                    )"""
+                )
+                params.append(filters.source)
+            if filters.memory_type:
+                conditions.append("m.memory_type = ?")
+                params.append(filters.memory_type)
+            if filters.status:
+                conditions.append("m.status = ?")
+                params.append(normalize_memory_status(filters.status))
+            if filters.project:
+                conditions.append("m.project_key = ?")
+                params.append(filters.project)
+
+            where_clause = " AND ".join(conditions)
+            memories: list[Memory] = []
+            query = (
+                f"SELECT DISTINCT m.* FROM memories m WHERE {where_clause} "
+                "ORDER BY m.updated_at DESC LIMIT ? OFFSET ?"
+            )
+            async with self.db.execute(query, [*params, limit, offset]) as cursor:
+                async for row in cursor:
+                    memories.append(self._row_to_memory(row))
+
+            count_query = (
+                f"SELECT COUNT(DISTINCT m.id) FROM memories m WHERE {where_clause}"
+            )
+            async with self.db.execute(count_query, params) as cursor:
+                total_row = await cursor.fetchone()
+                total = total_row[0] if total_row else 0
+            return MemoryAdminQueryPage(memories=memories, total=total)
+
+        query = "SELECT DISTINCT m.* FROM memories m"
+        joins: list[str] = []
+        conditions: list[str] = [predicate_sql]
+        params = list(predicate_params)
+
+        if filters.source:
+            joins.append("JOIN memory_sources ms ON m.id = ms.memory_id")
+            joins.append("JOIN documents d ON ms.doc_id = d.doc_id")
+            conditions.append("d.source = ?")
+            params.append(filters.source)
+        if filters.memory_type:
+            conditions.append("m.memory_type = ?")
+            params.append(filters.memory_type)
+        if filters.status:
+            conditions.append("m.status = ?")
+            params.append(normalize_memory_status(filters.status))
+        if filters.project:
+            conditions.append("m.project_key = ?")
+            params.append(filters.project)
+
+        join_clause = " ".join(joins)
+        where_clause = " AND ".join(conditions)
+
+        count_q = (
+            f"SELECT COUNT(DISTINCT m.id) FROM memories m {join_clause} "
+            f"WHERE {where_clause}"
+        )
+        async with self.db.execute(count_q, params) as cursor:
+            total_row = await cursor.fetchone()
+            total = total_row[0] if total_row else 0
+
+        full_q = (
+            f"{query} {join_clause} WHERE {where_clause} "
+            "ORDER BY m.updated_at DESC LIMIT ? OFFSET ?"
+        )
+        memories = []
+        async with self.db.execute(full_q, [*params, limit, offset]) as cursor:
+            async for row in cursor:
+                memories.append(self._row_to_memory(row))
+        return MemoryAdminQueryPage(memories=memories, total=total)
 
     async def count_memories(
         self,
