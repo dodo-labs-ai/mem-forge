@@ -3623,8 +3623,15 @@ def create_admin_app(
     async def update_llm_config(
         req: LlmConfigRequest,
         db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
     ):
         """Update LLM configuration."""
+        if not config.server.llm_config_writable:
+            raise HTTPException(
+                status_code=405,
+                detail="LLM settings are managed by the deployment environment",
+            )
+
         # Fetch current config to preserve masked keys
         current = await db.get_llm_config()
         fields_set = req.model_fields_set
