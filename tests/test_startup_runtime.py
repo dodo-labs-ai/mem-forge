@@ -1975,6 +1975,34 @@ async def test_llm_config_put_can_preserve_and_clear_keys(db, tmp_path):
     assert stored["enrichment_api_key"] is None
 
 
+@pytest.mark.asyncio
+async def test_llm_config_put_can_be_disabled_for_deployment_managed_config(db, tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    await db.set_llm_config({
+        "enrichment_model": "chat-model",
+        "enrichment_base_url": "https://chat.example.test/v1",
+        "enrichment_api_key": "chat-secret",
+        "embedding_model": "embed-model",
+        "embedding_base_url": "https://embed.example.test/v1",
+        "embedding_api_key": "embed-secret",
+    })
+    cfg = _config(tmp_path)
+    cfg.server.llm_config_writable = False
+    app = create_admin_app(db=db, config=cfg)
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/api/llm-config",
+            json={"enrichment_model": "replacement-model"},
+        )
+
+    stored = await db.get_llm_config()
+    assert response.status_code == 405
+    assert response.json()["detail"] == "LLM settings are managed by the deployment environment"
+    assert stored["enrichment_model"] == "chat-model"
+
+
 def test_cli_logging_uses_stderr_for_stdio_safety():
     from memforge.main import setup_logging
 

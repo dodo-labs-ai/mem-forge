@@ -83,6 +83,7 @@ class ServerConfig:
     admin_api_port: int = 8765
     jwt_secret: str = ""
     cors_origins: str = "*"  # comma-separated origins, or "*" for dev
+    llm_config_writable: bool = True
 
 
 @dataclass
@@ -144,6 +145,11 @@ class AppConfig:
             os.environ.get("MEMFORGE_CORS_ORIGINS")
             or self.server.cors_origins
         )
+        if os.environ.get("MEMFORGE_LLM_CONFIG_WRITABLE") is not None:
+            self.server.llm_config_writable = (
+                os.environ["MEMFORGE_LLM_CONFIG_WRITABLE"].strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
         self.server.jwt_secret = (
             os.environ.get("MEMFORGE_JWT_SECRET")
             or self.server.jwt_secret
