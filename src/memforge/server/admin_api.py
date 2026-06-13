@@ -79,6 +79,7 @@ from memforge.server.memory_admin_service import (
     list_memory_admin_page,
     pick_origin_source_type,
 )
+from memforge.server.source_admin_service import list_source_admin_rows
 from memforge.storage.admin_memory import MemoryAdminListFilters
 from memforge.storage.database import Database
 
@@ -2973,47 +2974,7 @@ def create_admin_app(
         sync_service: SyncService = Depends(get_sync_service),
     ):
         """List all configured sources with per-source memory counts and sync status."""
-        sources = await db.list_sources()
-
-        # Get per-source memory counts
-        memory_counts: dict[str, int] = {}
-        async with db.db.execute("""
-            SELECT d.source, COUNT(DISTINCT ms.memory_id)
-            FROM memory_sources ms
-            JOIN documents d ON ms.doc_id = d.doc_id
-            WHERE d.source IS NOT NULL
-            GROUP BY d.source
-        """) as cur:
-            async for row in cur:
-                memory_counts[row[0]] = row[1]
-
-        # Get per-source document counts (from actual documents table)
-        doc_counts: dict[str, int] = {}
-        async with db.db.execute("""
-            SELECT source, COUNT(*) FROM documents
-            WHERE source IS NOT NULL
-            GROUP BY source
-        """) as cur:
-            async for row in cur:
-                doc_counts[row[0]] = row[1]
-
-        # Batch-fetch latest sync_history entry per source
-        latest_history: dict[str, dict] = {}
-        source_ids = [s["id"] for s in sources]
-        if source_ids:
-            placeholders = ",".join("?" * len(source_ids))
-            async with db.db.execute(f"""
-                SELECT sh.* FROM sync_history sh
-                INNER JOIN (
-                    SELECT source, MAX(id) as max_id
-                    FROM sync_history GROUP BY source
-                ) latest ON sh.id = latest.max_id
-                WHERE sh.source IN ({placeholders})
-            """, source_ids) as cur:
-                async for row in cur:
-                    d = dict(row)
-                    d["failed_docs"] = json.loads(d["failed_docs"]) if d.get("failed_docs") else []
-                    latest_history[d["source"]] = d
+        sources = await list_source_admin_rows(db, sync_service=sync_service)
 
         # Attach memory_count and sync status to each source
         from memforge.agent_sessions import (
@@ -3030,8 +2991,6 @@ def create_admin_app(
                 secret_fields=_source_secret_fields(s["type"]),
                 validate_encryption=True,
             )
-            s["memory_count"] = memory_counts.get(s["id"], 0)
-            s["doc_count"] = doc_counts.get(s["id"], s.get("doc_count", 0))
             # Surface the originating client for agent-session sources so the UI
             # can pick a per-client brand mark without re-deriving from the id.
             if s["type"] == AGENT_SESSION_SOURCE_TYPE:
@@ -3051,40 +3010,6 @@ def create_admin_app(
                         "last_error": str(exc),
                     }
 
-            sid = s["id"]
-            if sync_service.is_running(sid):
-                progress = sync_service.progress.get(sid, {})
-                s["sync"] = {
-                    "status": "running",
-                    "phase": progress.get("phase"),
-                    "started_at": progress.get("started_at"),
-                    "finished_at": None,
-                    "docs_processed": progress.get("docs_processed", 0),
-                    "docs_total": progress.get("docs_total", 0),
-                    "docs_updated": progress.get("docs_updated", 0),
-                    "docs_failed": progress.get("docs_failed", 0),
-                    "memories_extracted": progress.get("memories_extracted", 0),
-                    "docs_stored": doc_counts.get(sid, s.get("doc_count", 0)),
-                    "memories_stored": memory_counts.get(sid, 0),
-                    "current_title": progress.get("title"),
-                    "error_message": None,
-                }
-            elif sid in latest_history:
-                h = latest_history[sid]
-                s["sync"] = {
-                    "status": h.get("status", "success"),
-                    "started_at": h.get("started_at"),
-                    "finished_at": h.get("finished_at"),
-                    "docs_processed": h.get("docs_processed", 0),
-                    "docs_updated": h.get("docs_updated", 0),
-                    "docs_failed": h.get("docs_failed", 0),
-                    "memories_extracted": h.get("memories_extracted", 0),
-                    "error_message": h.get("error_message"),
-                    "failed_docs": h.get("failed_docs", []),
-                }
-            else:
-                s["sync"] = None
-
         return {"data": sources}
 
     @source_router.get("/{source_id}/projects", response_model=SourceProjectsResponse)
@@ -3097,31 +3022,15 @@ def create_admin_app(
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
 
-        projects: list[SourceProjectResponse] = []
-        async with db.db.execute(
-            """
-            SELECT
-                COALESCE(NULLIF(TRIM(d.space_or_project), ''), 'Unspecified') AS project,
-                COUNT(DISTINCT d.doc_id) AS document_count,
-                COUNT(DISTINCT ms.memory_id) AS memory_count,
-                MAX(d.last_modified) AS last_observed_at
-            FROM documents d
-            LEFT JOIN memory_sources ms ON ms.doc_id = d.doc_id
-            WHERE d.source = ?
-            GROUP BY COALESCE(NULLIF(TRIM(d.space_or_project), ''), 'Unspecified')
-            ORDER BY last_observed_at DESC, project ASC
-            """,
-            (source_id,),
-        ) as cur:
-            async for row in cur:
-                projects.append(
-                    SourceProjectResponse(
-                        project=str(row["project"]),
-                        document_count=int(row["document_count"]),
-                        memory_count=int(row["memory_count"]),
-                        last_observed_at=row["last_observed_at"],
-                    )
-                )
+        projects = [
+            SourceProjectResponse(
+                project=str(row["project"]),
+                document_count=int(row["document_count"]),
+                memory_count=int(row["memory_count"]),
+                last_observed_at=row.get("last_observed_at"),
+            )
+            for row in await db.list_source_projects(source_id)
+        ]
 
         return SourceProjectsResponse(source_id=source_id, projects=projects)
 
