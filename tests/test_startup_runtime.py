@@ -132,6 +132,44 @@ async def test_build_sync_runtime_wires_litellm_structured_source_support_client
     assert captured["config"].api_key == "local-key"
 
 
+@pytest.mark.asyncio
+async def test_build_sync_runtime_wires_env_backed_provider_model_without_api_key(
+    db,
+    tmp_path,
+    monkeypatch,
+):
+    from memforge.config import AppConfig
+    from memforge.runtime import build_sync_runtime
+
+    captured = {}
+
+    class RecordingStructuredClient:
+        def __init__(self, config):
+            captured["config"] = config
+            captured["client"] = self
+
+    monkeypatch.setattr("memforge.runtime.LiteLlmStructuredClient", RecordingStructuredClient)
+    monkeypatch.setattr("memforge.runtime.get_chroma_collection", lambda **kwargs: FakeCollection())
+
+    config = AppConfig()
+    config.base_dir = tmp_path
+    config.storage.db_path = str(tmp_path / "mem.db")
+    config.storage.chroma_path = str(tmp_path / "chroma")
+    config.storage.docs_path = str(tmp_path / "docs")
+    config.llm.enrichment_model = "provider/chat-model"
+    config.llm.enrichment_base_url = ""
+    config.llm.enrichment_api_key = ""
+
+    runtime = await build_sync_runtime(db, config)
+
+    assert runtime.structured_llm_client is captured["client"]
+    assert runtime.memory_extractor.structured_llm_client is captured["client"]
+    assert runtime.enricher.structured_llm_client is captured["client"]
+    assert captured["config"].model == "provider/chat-model"
+    assert captured["config"].base_url is None
+    assert captured["config"].api_key is None
+
+
 def test_enrichment_and_extraction_clients_bound_request_timeout(monkeypatch):
     """Document LLM clients should use the configured request timeout."""
     from memforge.pipeline.enricher import Enricher

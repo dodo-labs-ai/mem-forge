@@ -126,6 +126,9 @@ def _workspace_default_scope(request: Request, *, include_private: bool):
 
 async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
     """Return the subset of ``ids`` the caller may see under ``scope``."""
+    if not hasattr(db, "db") and hasattr(db, "filter_visible_ids"):
+        return await db.filter_visible_ids(list(ids), scope)
+
     from memforge.storage.adapters.sqlite.relational import SqliteRelationalStore
 
     return await SqliteRelationalStore(db).filter_visible_ids(list(ids), scope)
@@ -1607,15 +1610,7 @@ async def _build_memory_summary(
         doc = await db.get_document(ms.doc_id)
         sources.append(_memory_source_detail(ms, doc, config))
 
-    entity_ids = await db.get_memory_entity_ids(memory.id)
-    entity_names: list[str] = []
-    for eid in entity_ids:
-        async with db.db.execute(
-            "SELECT canonical_name FROM entities WHERE id = ?", (eid,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                entity_names.append(row[0])
+    entity_names = await db.get_memory_entity_names(memory.id)
 
     return MemoryReviewMemorySummary(
         id=memory.id,
@@ -1743,17 +1738,20 @@ async def _build_review_service(db: Database, config: AppConfig) -> ReviewServic
 async def _build_agent_session_window_client(db: Database, config: AppConfig):
     """Build the request-scoped LLM client for agent-session window packaging."""
 
+    from memforge.llm.providers import is_litellm_provider_model
     from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
     from memforge.runtime import get_effective_llm_config
 
     llm = await get_effective_llm_config(db, config)
-    if not llm.enrichment_api_key:
+    if not llm.enrichment_api_key and not is_litellm_provider_model(
+        llm.enrichment_model
+    ):
         return None
     return LiteLlmStructuredClient(
         StructuredLlmConfig(
             model=llm.enrichment_model,
             base_url=llm.enrichment_base_url or None,
-            api_key=llm.enrichment_api_key,
+            api_key=llm.enrichment_api_key or None,
             timeout_s=llm.request_timeout_s,
         )
     )
@@ -2368,16 +2366,8 @@ def create_admin_app(
             doc = await db.get_document(ms.doc_id)
             source_details.append(_memory_source_detail(ms, doc, config))
 
-        # Fetch linked entity names
-        entity_ids = await db.get_memory_entity_ids(memory_id)
-        entity_names: list[str] = []
-        for eid in entity_ids:
-            async with db.db.execute(
-                "SELECT canonical_name FROM entities WHERE id = ?", (eid,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    entity_names.append(row[0])
+        # Fetch linked entity names.
+        entity_names = await db.get_memory_entity_names(memory_id)
 
         origin_info = (await _origin_source_types(db, [memory_id])).get(memory_id, (None, None))
         origin_source_type, origin_client = origin_info
@@ -2643,51 +2633,31 @@ def create_admin_app(
         db: Database = Depends(get_db),
     ):
         """List entities with optional tag filter and search."""
-        query = "SELECT * FROM entities WHERE 1=1"
-        params: list[Any] = []
-        if tag:
-            query += " AND tags LIKE ?"
-            params.append(f'%"{tag}"%')
-        if search:
-            query += " AND (canonical_name LIKE ? OR display_name LIKE ?)"
-            like = f"%{search}%"
-            params.extend([like, like])
-
-        # Count
-        count_q = query.replace("SELECT *", "SELECT COUNT(*)")
-        async with db.db.execute(count_q, params) as cursor:
-            total_row = await cursor.fetchone()
-            total = total_row[0] if total_row else 0
-
-        query += " ORDER BY display_name LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-
-        entities: list[EntityResponse] = []
-        async with db.db.execute(query, params) as cursor:
-            async for row in cursor:
-                d = dict(row)
-                from memforge.storage.database import _entity_from_row
-                ent = _entity_from_row(d)
-                entities.append(EntityResponse(
-                    id=ent.id,
-                    canonical_name=ent.canonical_name,
-                    tags=ent.tags,
-                    display_name=ent.display_name,
-                    created_at=d.get("created_at"),
-                ))
+        entity_rows, total = await db.list_entities(
+            tag=tag,
+            search=search,
+            limit=limit,
+            offset=offset,
+        )
+        entities = [
+            EntityResponse(
+                id=ent.id,
+                canonical_name=ent.canonical_name,
+                tags=ent.tags,
+                display_name=ent.display_name,
+                created_at=_dt_iso(ent.created_at),
+            )
+            for ent in entity_rows
+        ]
 
         return EntityListResponse(data=entities, total=total)
 
     @entity_router.get("/{entity_id}", response_model=EntityDetailResponse)
     async def get_entity(entity_id: int, db: Database = Depends(get_db)):
         """Get entity detail with aliases and linked memory count."""
-        async with db.db.execute(
-            "SELECT * FROM entities WHERE id = ?", (entity_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Entity not found")
-            d = dict(row)
+        ent = await db.get_entity(entity_id)
+        if ent is None:
+            raise HTTPException(status_code=404, detail="Entity not found")
 
         aliases = await db.get_aliases_for_entity(entity_id)
         alias_responses = [
@@ -2700,22 +2670,14 @@ def create_admin_app(
             for a in aliases
         ]
 
-        # Count linked memories
-        async with db.db.execute(
-            "SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?", (entity_id,)
-        ) as cursor:
-            count_row = await cursor.fetchone()
-            linked_count = count_row[0] if count_row else 0
-
-        from memforge.storage.database import _entity_from_row
-        ent = _entity_from_row(d)
+        linked_count = await db.count_memories_for_entity(entity_id)
 
         return EntityDetailResponse(
             id=ent.id,
             canonical_name=ent.canonical_name,
             tags=ent.tags,
             display_name=ent.display_name,
-            created_at=d.get("created_at"),
+            created_at=_dt_iso(ent.created_at),
             aliases=alias_responses,
             linked_memory_count=linked_count,
         )
@@ -2730,74 +2692,20 @@ def create_admin_app(
         All memory_entities rows, aliases, and document references pointing to
         source_id are moved to target_id. The source entity is then deleted.
         """
-        # Validate both entities exist
-        async with db.db.execute(
-            "SELECT * FROM entities WHERE id = ?", (req.source_id,)
-        ) as cursor:
-            source_row = await cursor.fetchone()
-            if not source_row:
-                raise HTTPException(status_code=404, detail="Source entity not found")
-
-        async with db.db.execute(
-            "SELECT * FROM entities WHERE id = ?", (req.target_id,)
-        ) as cursor:
-            target_row = await cursor.fetchone()
-            if not target_row:
-                raise HTTPException(status_code=404, detail="Target entity not found")
-
-        source_entity = dict(source_row)
-        target_entity = dict(target_row)
-
-        async with db._write_lock:
-            # Move memory_entities from source to target
-            # Use INSERT OR IGNORE to avoid duplicate PK violations
-            await db.db.execute(
-                """UPDATE OR IGNORE memory_entities
-                   SET entity_id = ?
-                   WHERE entity_id = ?""",
-                (req.target_id, req.source_id),
+        try:
+            merged = await db.merge_entities(
+                source_id=req.source_id,
+                target_id=req.target_id,
             )
-            # Clean up any remaining rows that couldn't be moved (duplicates)
-            await db.db.execute(
-                "DELETE FROM memory_entities WHERE entity_id = ?",
-                (req.source_id,),
-            )
-
-            # Move aliases from source to target
-            await db.db.execute(
-                """UPDATE OR IGNORE entity_aliases
-                   SET canonical_id = ?
-                   WHERE canonical_id = ?""",
-                (req.target_id, req.source_id),
-            )
-            await db.db.execute(
-                "DELETE FROM entity_aliases WHERE canonical_id = ?",
-                (req.source_id,),
-            )
-
-            # Add the source entity's canonical name as an alias of the target
-            source_canonical = source_entity["canonical_name"]
-            await db.db.execute(
-                """INSERT OR IGNORE INTO entity_aliases
-                   (alias, alias_normalized, canonical_id, source)
-                   VALUES (?, ?, ?, 'admin_manual')""",
-                (source_canonical, canonicalize_entity_name(source_canonical), req.target_id),
-            )
-
-            # Delete the source entity
-            await db.db.execute(
-                "DELETE FROM entities WHERE id = ?", (req.source_id,)
-            )
-            await db.db.commit()
+        except LookupError as exc:
+            detail = str(exc)
+            if detail not in {"Source entity not found", "Target entity not found"}:
+                detail = "Entity not found"
+            raise HTTPException(status_code=404, detail=detail)
 
         return {
             "ok": True,
-            "merged": {
-                "source_id": req.source_id,
-                "source_name": source_entity["canonical_name"],
-                "target_id": req.target_id,
-                "target_name": target_entity["canonical_name"],
-            },
+            "merged": merged,
         }
 
     @entity_router.get("/{entity_id}/aliases")
@@ -2806,12 +2714,8 @@ def create_admin_app(
         db: Database = Depends(get_db),
     ):
         """List all aliases for an entity."""
-        # Verify entity exists
-        async with db.db.execute(
-            "SELECT id FROM entities WHERE id = ?", (entity_id,)
-        ) as cursor:
-            if not await cursor.fetchone():
-                raise HTTPException(status_code=404, detail="Entity not found")
+        if await db.get_entity(entity_id) is None:
+            raise HTTPException(status_code=404, detail="Entity not found")
 
         aliases = await db.get_aliases_for_entity(entity_id)
         return {
@@ -2833,12 +2737,8 @@ def create_admin_app(
         db: Database = Depends(get_db),
     ):
         """Add a manual alias for an entity."""
-        # Verify entity exists
-        async with db.db.execute(
-            "SELECT id FROM entities WHERE id = ?", (entity_id,)
-        ) as cursor:
-            if not await cursor.fetchone():
-                raise HTTPException(status_code=404, detail="Entity not found")
+        if await db.get_entity(entity_id) is None:
+            raise HTTPException(status_code=404, detail="Entity not found")
 
         normalized = canonicalize_entity_name(req.alias)
         await db.insert_alias(
@@ -2857,14 +2757,12 @@ def create_admin_app(
     ):
         """Remove an alias from an entity."""
         normalized = canonicalize_entity_name(alias)
-        async with db._write_lock:
-            result = await db.db.execute(
-                "DELETE FROM entity_aliases WHERE alias_normalized = ? AND canonical_id = ?",
-                (normalized, entity_id),
-            )
-            await db.db.commit()
-            if result.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Alias not found")
+        removed = await db.remove_entity_alias(
+            entity_id=entity_id,
+            alias_normalized=normalized,
+        )
+        if not removed:
+            raise HTTPException(status_code=404, detail="Alias not found")
 
         return {"ok": True}
 
@@ -2933,6 +2831,7 @@ def create_admin_app(
         try:
             _validate_source_config(name, req.config)
             preview_config = dict(req.config)
+            preview_config["_memforge_preview_limit"] = req.limit + 1
             # Browser-session sources keep the cookie in the auth store, not the
             # source config. Inject it the same way a real sync does (no-op for
             # source types that do not use a browser session).

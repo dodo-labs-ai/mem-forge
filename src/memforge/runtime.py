@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from memforge.config import AppConfig
 from memforge.auth import browser_session
 from memforge.genes import GENE_REGISTRY, create_gene
+from memforge.llm.providers import is_litellm_provider_model
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
@@ -97,6 +98,12 @@ async def get_effective_llm_config(db: "Database", config: AppConfig) -> Effecti
     )
 
 
+def _has_structured_llm_credentials(llm: EffectiveLlmConfig) -> bool:
+    return bool(llm.enrichment_api_key) or is_litellm_provider_model(
+        llm.enrichment_model
+    )
+
+
 async def build_search_engine(
     db: "Database",
     config: AppConfig,
@@ -122,12 +129,12 @@ async def build_search_engine(
         "model": llm.embedding_model,
     }
     structured_llm_client = None
-    if llm.enrichment_api_key:
+    if _has_structured_llm_credentials(llm):
         structured_llm_client = LiteLlmStructuredClient(
             StructuredLlmConfig(
                 model=llm.enrichment_model,
                 base_url=llm.enrichment_base_url or None,
-                api_key=llm.enrichment_api_key,
+                api_key=llm.enrichment_api_key or None,
                 timeout_s=llm.request_timeout_s,
             )
         )
@@ -146,12 +153,12 @@ async def build_search_engine(
 async def build_sync_runtime(db: "Database", config: AppConfig) -> SyncRuntime:
     llm = await get_effective_llm_config(db, config)
     structured_llm_client = None
-    if llm.enrichment_api_key:
+    if _has_structured_llm_credentials(llm):
         structured_llm_client = LiteLlmStructuredClient(
             StructuredLlmConfig(
                 model=llm.enrichment_model,
                 base_url=llm.enrichment_base_url or None,
-                api_key=llm.enrichment_api_key,
+                api_key=llm.enrichment_api_key or None,
                 timeout_s=llm.request_timeout_s,
             )
         )

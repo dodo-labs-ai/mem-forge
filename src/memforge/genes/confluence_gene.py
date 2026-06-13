@@ -36,6 +36,7 @@ from memforge.pipeline.normalizer_utils import html_to_markdown, strip_boilerpla
 
 logger = logging.getLogger(__name__)
 CONFLUENCE_REQUEST_INTERVAL_SECONDS = 2.0
+PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY = "_memforge_preview_limit"
 
 __all__ = ["ConfluenceGene"]
 
@@ -327,11 +328,16 @@ class ConfluenceGene(Gene):
     ) -> AsyncIterator[ContentItem]:
         """Discover pages by traversing the child tree of a root page."""
         exclude_labels = set(self.config.get("exclude_labels", []))
+        preview_limit = self._preview_discovery_limit()
+        emitted = 0
 
         # Get the root page first
         root_item = await self._get_page_as_content_item(root_id, since, exclude_labels)
         if root_item:
             yield root_item
+            emitted += 1
+            if preview_limit is not None and emitted >= preview_limit:
+                return
 
         if not include_children:
             return
@@ -341,7 +347,7 @@ class ConfluenceGene(Gene):
         while queue:
             parent_id = queue.pop(0)
             start = 0
-            limit = 50
+            limit = self._page_request_limit(preview_limit, emitted)
             while True:
                 try:
                     resp = await self._get(
@@ -361,6 +367,9 @@ class ConfluenceGene(Gene):
                     item = self._parse_page(page, since, exclude_labels)
                     if item:
                         yield item
+                        emitted += 1
+                        if preview_limit is not None and emitted >= preview_limit:
+                            return
                     if not self._has_excluded_label(page, exclude_labels):
                         page_id = page.get("id", "")
                         if page_id:
@@ -369,6 +378,7 @@ class ConfluenceGene(Gene):
                 if len(results) < limit:
                     break
                 start += limit
+                limit = self._page_request_limit(preview_limit, emitted)
 
     async def _get_page_as_content_item(
         self, page_id: str, since: datetime | None, exclude_labels: set
@@ -427,10 +437,12 @@ class ConfluenceGene(Gene):
         exclude_labels = set(self.config.get("exclude_labels", []))
         if isinstance(exclude_labels, str):
             exclude_labels = {label.strip() for label in exclude_labels.split(",") if label.strip()}
+        preview_limit = self._preview_discovery_limit()
+        emitted = 0
 
         logger.info("Discovering pages in space: %s", space_key)
         start = 0
-        limit = 50
+        limit = self._page_request_limit(preview_limit, emitted)
 
         while True:
             try:
@@ -457,10 +469,14 @@ class ConfluenceGene(Gene):
                 item = self._parse_page(page, since, exclude_labels)
                 if item:
                     yield item
+                    emitted += 1
+                    if preview_limit is not None and emitted >= preview_limit:
+                        return
 
             if len(results) < limit:
                 break
             start += limit
+            limit = self._page_request_limit(preview_limit, emitted)
 
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full page content (XHTML body)."""
@@ -538,6 +554,22 @@ class ConfluenceGene(Gene):
             for label in page.get("metadata", {}).get("labels", {}).get("results", [])
         }
         return bool(labels & exclude_labels)
+
+    def _preview_discovery_limit(self) -> int | None:
+        value = self.config.get(PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY)
+        if value is None:
+            return None
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            return None
+        return limit if limit > 0 else None
+
+    @staticmethod
+    def _page_request_limit(preview_limit: int | None, emitted: int) -> int:
+        if preview_limit is None:
+            return 50
+        return max(1, min(50, preview_limit - emitted))
 
     async def health_check(self) -> dict:
         """Check Confluence connectivity."""

@@ -10,6 +10,8 @@ from typing import Literal, Protocol, get_args, get_origin
 import litellm
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from memforge.llm.providers import litellm_optional_kwargs
+
 logger = logging.getLogger(__name__)
 
 
@@ -237,7 +239,7 @@ class AgentSessionPackageResponse(StructuredResponseModel):
 class StructuredLlmConfig:
     model: str
     base_url: str | None
-    api_key: str
+    api_key: str | None
     timeout_s: float
     # Transparently retry transient gateway/connection blips (e.g. a stale
     # keep-alive connection through an Envoy gateway closed on idle timeout, or a
@@ -356,6 +358,18 @@ def _json_text_prompt(prompt: str, response_format: type[BaseModel]) -> str:
         f"{prompt}\n\nReturn ONLY a single JSON object that matches this JSON Schema, "
         f"with no markdown fences and no commentary:\n{schema}"
     )
+
+
+def _supports_native_response_schema(model_name: str) -> bool:
+    try:
+        return bool(litellm.supports_response_schema(model=model_name))
+    except Exception:
+        logger.debug(
+            "Unable to determine native response_schema support for model %s",
+            model_name,
+            exc_info=True,
+        )
+        return False
 
 
 def _strip_json_fences(text: str) -> str:
@@ -516,6 +530,24 @@ class LiteLlmStructuredClient:
         model: str | None = None,
     ):
         model_name = litellm_model_name(model or self.config.model)
+        if not _supports_native_response_schema(model_name):
+            logger.debug(
+                "Structured LLM model %s does not advertise native response_schema support; "
+                "using JSON-text schema for %s",
+                model_name,
+                response_format.__name__,
+            )
+            try:
+                return await self._attempt_schema(
+                    prompt=prompt,
+                    response_format=response_format,
+                    model_name=model_name,
+                    max_tokens=max_tokens,
+                    native_schema=False,
+                )
+            except Exception as exc:
+                raise StructuredLlmError(str(exc)) from exc
+
         try:
             return await self._attempt_schema(
                 prompt=prompt,
@@ -558,11 +590,13 @@ class LiteLlmStructuredClient:
         response = await litellm.acompletion(
             model=model_name,
             messages=[{"role": "user", "content": request_prompt}],
-            api_base=self.config.base_url,
-            api_key=self.config.api_key,
             timeout=self.config.timeout_s,
             max_tokens=max_tokens,
             num_retries=self.config.num_retries,
+            **litellm_optional_kwargs(
+                api_base=self.config.base_url,
+                api_key=self.config.api_key,
+            ),
             **({"response_format": response_format} if native_schema else {}),
         )
         raw_content = _message_content(response)

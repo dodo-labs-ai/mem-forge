@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import {
   __resetCloudExtensionForTests,
   getExtensionAccountSurface,
+  getExtensionHiddenReservedNavItems,
   getExtensionNavItems,
+  getExtensionReservedRouteRedirects,
   getExtensionRoutes,
   getExtensionShell,
   getExtensionTopbarSlots,
@@ -17,6 +19,8 @@ __resetCloudExtensionForTests();
 assert.deepEqual(getExtensionRoutes(), []);
 assert.deepEqual(getExtensionNavItems(), []);
 assert.deepEqual(getExtensionTopbarSlots(), []);
+assert.deepEqual(getExtensionReservedRouteRedirects(), []);
+assert.deepEqual(getExtensionHiddenReservedNavItems(), []);
 assert.equal(getExtensionAccountSurface(), null);
 assert.equal(getExtensionShell(), null);
 
@@ -47,6 +51,8 @@ const registered = mountCloudExtension({
     { id: "principal-menu", render: () => null },
     { id: "principal-menu-2", render: () => null, placement: "before-account" },
   ],
+  reservedRouteRedirects: [{ from: "settings", to: "/cloud/settings" }],
+  hiddenReservedNavItems: ["settings"],
   accountSurface: {
     topbar: () => "topbar-account",
     sidebarFooter: () => "sidebar-account",
@@ -63,6 +69,10 @@ const visibleNavItems = getExtensionNavItems().filter((item) => item.visibleWhen
 assert.equal(visibleNavItems.length, 1);
 assert.equal(visibleNavItems[0]!.to, "/extension/usage");
 assert.equal(getExtensionTopbarSlots().length, 2);
+assert.deepEqual(getExtensionReservedRouteRedirects(), [
+  { from: "settings", to: "/cloud/settings" },
+]);
+assert.deepEqual(getExtensionHiddenReservedNavItems(), ["settings"]);
 assert.equal(getExtensionAccountSurface()?.topbar?.(), "topbar-account");
 assert.equal(getExtensionAccountSurface()?.sidebarFooter?.(), "sidebar-account");
 assert.notEqual(getExtensionShell(), null);
@@ -101,6 +111,14 @@ mountCloudExtension({
     { to: "/memories", label: "Hijacked Memories" }, // dropped
     { to: "/extension/safe", label: "Extension Safe" }, // kept
   ],
+  reservedRouteRedirects: [
+    { from: "settings", to: "/cloud/settings" }, // kept
+    { from: "review", to: "/settings" }, // dropped (target reserved)
+    { from: "entities", to: "/entities" }, // dropped (target reserved)
+    { from: "projects", to: "cloud/projects" }, // dropped (target not absolute)
+    { from: "not-reserved" as never, to: "/cloud/invalid" }, // dropped
+  ],
+  hiddenReservedNavItems: ["settings", "settings", "not-reserved" as never],
 });
 const safeRoutes = getExtensionRoutes();
 assert.equal(safeRoutes.length, 1);
@@ -109,12 +127,18 @@ assert.equal(safeRoutes[0]!.path, "/extension/safe");
 const safeNav = getExtensionNavItems();
 assert.equal(safeNav.length, 1);
 assert.equal(safeNav[0]!.to, "/extension/safe");
+assert.deepEqual(getExtensionReservedRouteRedirects(), [
+  { from: "settings", to: "/cloud/settings" },
+]);
+assert.deepEqual(getExtensionHiddenReservedNavItems(), ["settings"]);
 
 // Empty/missing id is rejected so the registration is intentional.
 __resetCloudExtensionForTests();
 const missingId = mountCloudExtension({ id: "" });
 assert.equal(missingId, false);
 assert.deepEqual(getExtensionRoutes(), []);
+assert.deepEqual(getExtensionReservedRouteRedirects(), []);
+assert.deepEqual(getExtensionHiddenReservedNavItems(), []);
 
 // Mounting with no contributions still succeeds (a shell-only wrapper is a
 // valid extension shape).
@@ -127,6 +151,8 @@ assert.equal(wrapperOnly, true);
 assert.deepEqual(getExtensionRoutes(), []);
 assert.deepEqual(getExtensionNavItems(), []);
 assert.deepEqual(getExtensionTopbarSlots(), []);
+assert.deepEqual(getExtensionReservedRouteRedirects(), []);
+assert.deepEqual(getExtensionHiddenReservedNavItems(), []);
 assert.equal(getExtensionAccountSurface(), null);
 assert.notEqual(getExtensionShell(), null);
 
