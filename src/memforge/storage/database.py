@@ -2630,6 +2630,47 @@ class Database:
                 results.append(d)
         return results
 
+    async def count_source_memories(self, source_id: str) -> int:
+        async with self.db.execute(
+            """
+            SELECT COUNT(DISTINCT ms.memory_id)
+            FROM memory_sources ms
+            JOIN documents d ON ms.doc_id = d.doc_id
+            WHERE d.source = ?
+            """,
+            (source_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+
+    async def list_source_projects(self, source_id: str) -> list[dict[str, Any]]:
+        projects: list[dict[str, Any]] = []
+        async with self.db.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(TRIM(d.space_or_project), ''), 'Unspecified') AS project,
+                COUNT(DISTINCT d.doc_id) AS document_count,
+                COUNT(DISTINCT ms.memory_id) AS memory_count,
+                MAX(d.last_modified) AS last_observed_at
+            FROM documents d
+            LEFT JOIN memory_sources ms ON ms.doc_id = d.doc_id
+            WHERE d.source = ?
+            GROUP BY COALESCE(NULLIF(TRIM(d.space_or_project), ''), 'Unspecified')
+            ORDER BY last_observed_at DESC, project ASC
+            """,
+            (source_id,),
+        ) as cursor:
+            async for row in cursor:
+                projects.append(
+                    {
+                        "project": str(row["project"]),
+                        "document_count": int(row["document_count"]),
+                        "memory_count": int(row["memory_count"]),
+                        "last_observed_at": row["last_observed_at"],
+                    }
+                )
+        return projects
+
     async def list_resolved_projects_for_source(
         self, source_id: str
     ) -> list[tuple[str, int]]:
