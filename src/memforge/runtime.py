@@ -76,6 +76,7 @@ class SyncRuntime:
             vector_store=self.vector_store,
             embed_cfg=self.embed_cfg,
             source_support_detector=self.source_support_detector,
+            max_concurrent=self.config.llm.enrichment_max_concurrent,
         )
 
 

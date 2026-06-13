@@ -299,7 +299,7 @@ class BlockingUnitMemoryExtractor(RecordingMemoryExtractor):
     def __init__(self) -> None:
         super().__init__()
         self.release = asyncio.Event()
-        self.started_five = asyncio.Event()
+        self.started_two = asyncio.Event()
         self.active = 0
         self.max_active = 0
 
@@ -307,8 +307,8 @@ class BlockingUnitMemoryExtractor(RecordingMemoryExtractor):
         self.unit_calls.append({"context": context, **kwargs})
         self.active += 1
         self.max_active = max(self.max_active, self.active)
-        if self.max_active >= 5:
-            self.started_five.set()
+        if self.max_active >= 2:
+            self.started_two.set()
         try:
             await self.release.wait()
             return MemoryExtractionResult(memories=[])
@@ -1242,7 +1242,7 @@ async def test_large_full_document_uses_deterministic_units(db: Database):
 
 
 @pytest.mark.asyncio
-async def test_full_document_unit_extraction_runs_five_units_concurrently(db: Database):
+async def test_full_document_unit_extraction_honors_orchestrator_concurrency(db: Database):
     markdown = "# Design Doc\n\nIntro.\n\n" + "\n\n".join(
         f"## Section {index}\n\n" + ("Durable design detail. " * 900)
         for index in range(8)
@@ -1272,8 +1272,9 @@ async def test_full_document_unit_extraction_runs_five_units_concurrently(db: Da
     )
 
     try:
-        await asyncio.wait_for(extractor.started_five.wait(), timeout=0.2)
-        assert extractor.max_active == 5
+        await asyncio.sleep(0.2)
+        assert not extractor.started_two.is_set()
+        assert extractor.max_active == 1
     finally:
         extractor.release.set()
         await task

@@ -1260,8 +1260,7 @@ class GeneSyncOrchestrator:
         unitization_policy = UnitizationPolicy()
         units = unitize_markdown(markdown_body, doc_id=doc_id, policy=unitization_policy)
         packer = ExtractionContextPacker()
-        unit_concurrency = 5
-        unit_semaphore = asyncio.Semaphore(unit_concurrency)
+        unit_semaphore = asyncio.Semaphore(self.max_concurrent)
 
         async def extract_one(unit) -> MemoryExtractionResult:
             context = packer.pack(
