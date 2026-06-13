@@ -43,6 +43,7 @@ from memforge.memory.index_payloads import (
     document_embedding_text,
     embedding_text_hash,
 )
+from memforge.llm.providers import is_litellm_provider_model
 from memforge.memory.project_resolver import resolve_project_key
 from memforge.memory.visibility_policy import default_visibility
 
@@ -1807,7 +1808,15 @@ class GeneSyncOrchestrator:
     def _has_embedding_config(self) -> bool:
         if not self.embed_cfg:
             return False
-        return all(str(self.embed_cfg.get(key) or "").strip() for key in ("base_url", "api_key", "model"))
+        model = str(self.embed_cfg.get("model") or "").strip()
+        if not model:
+            return False
+        if is_litellm_provider_model(model):
+            return True
+        return all(
+            str(self.embed_cfg.get(key) or "").strip()
+            for key in ("base_url", "api_key", "model")
+        )
 
     def _document_metadata_from_enrichment(
         self,

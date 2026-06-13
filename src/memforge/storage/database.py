@@ -34,6 +34,7 @@ from memforge.models import (
     SyncState,
     UNSORTED_PROJECT_KEY,
     Visibility,
+    canonicalize_entity_name,
 )
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
@@ -2244,6 +2245,111 @@ class Database:
             async for row in cursor:
                 results.append(_entity_from_row(dict(row)))
         return results
+
+    async def list_entities(
+        self,
+        *,
+        tag: str | None = None,
+        search: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[Entity], int]:
+        """List entities for the admin API without exposing the DB connection."""
+        query = "SELECT * FROM entities WHERE 1=1"
+        params: list[Any] = []
+        if tag:
+            query += " AND tags LIKE ?"
+            params.append(f'%"{tag}"%')
+        if search:
+            query += " AND (canonical_name LIKE ? OR display_name LIKE ?)"
+            like = f"%{search}%"
+            params.extend([like, like])
+
+        count_q = query.replace("SELECT *", "SELECT COUNT(*)")
+        async with self.db.execute(count_q, params) as cursor:
+            total_row = await cursor.fetchone()
+            total = total_row[0] if total_row else 0
+
+        query += " ORDER BY display_name LIMIT ? OFFSET ?"
+        page_params = [*params, limit, offset]
+        entities: list[Entity] = []
+        async with self.db.execute(query, page_params) as cursor:
+            async for row in cursor:
+                entities.append(_entity_from_row(dict(row)))
+        return entities, total
+
+    async def get_entity(self, entity_id: int) -> Entity | None:
+        async with self.db.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return _entity_from_row(dict(row)) if row else None
+
+    async def count_memories_for_entity(self, entity_id: int) -> int:
+        async with self.db.execute(
+            "SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?", (entity_id,)
+        ) as cursor:
+            count_row = await cursor.fetchone()
+            return count_row[0] if count_row else 0
+
+    async def merge_entities(self, *, source_id: int, target_id: int) -> dict:
+        """Merge one entity into another and return source/target names."""
+        source = await self.get_entity(source_id)
+        if source is None:
+            raise LookupError("Source entity not found")
+        target = await self.get_entity(target_id)
+        if target is None:
+            raise LookupError("Target entity not found")
+
+        async with self._write_lock:
+            await self.db.execute(
+                """UPDATE OR IGNORE memory_entities
+                   SET entity_id = ?
+                   WHERE entity_id = ?""",
+                (target_id, source_id),
+            )
+            await self.db.execute(
+                "DELETE FROM memory_entities WHERE entity_id = ?",
+                (source_id,),
+            )
+            await self.db.execute(
+                """UPDATE OR IGNORE entity_aliases
+                   SET canonical_id = ?
+                   WHERE canonical_id = ?""",
+                (target_id, source_id),
+            )
+            await self.db.execute(
+                "DELETE FROM entity_aliases WHERE canonical_id = ?",
+                (source_id,),
+            )
+            await self.db.execute(
+                """INSERT OR IGNORE INTO entity_aliases
+                   (alias, alias_normalized, canonical_id, source)
+                   VALUES (?, ?, ?, 'admin_manual')""",
+                (
+                    source.canonical_name,
+                    canonicalize_entity_name(source.canonical_name),
+                    target_id,
+                ),
+            )
+            await self.db.execute("DELETE FROM entities WHERE id = ?", (source_id,))
+            await self.db.commit()
+
+        return {
+            "source_id": source_id,
+            "source_name": source.canonical_name,
+            "target_id": target_id,
+            "target_name": target.canonical_name,
+        }
+
+    async def remove_entity_alias(self, *, entity_id: int, alias_normalized: str) -> bool:
+        async with self._write_lock:
+            result = await self.db.execute(
+                "DELETE FROM entity_aliases WHERE alias_normalized = ? AND canonical_id = ?",
+                (alias_normalized, entity_id),
+            )
+            await self.db.commit()
+            return result.rowcount > 0
 
     async def insert_alias(
         self,

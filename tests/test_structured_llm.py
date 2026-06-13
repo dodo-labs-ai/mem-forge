@@ -37,6 +37,16 @@ class CompletionResponse:
         self.choices = [Choice(content)]
 
 
+def set_native_schema_support(monkeypatch, supported: bool) -> None:
+    def fake_supports_response_schema(*, model: str, custom_llm_provider=None) -> bool:
+        return supported
+
+    monkeypatch.setattr(
+        "memforge.llm.structured.litellm.supports_response_schema",
+        fake_supports_response_schema,
+    )
+
+
 def test_source_support_response_accepts_decision_list():
     response = SourceSupportResponse.model_validate({
         "decisions": [
@@ -125,6 +135,7 @@ async def test_litellm_structured_client_uses_response_schema_for_source_support
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
@@ -159,6 +170,7 @@ async def test_litellm_structured_client_uses_response_schema_for_memory_extract
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
@@ -179,7 +191,7 @@ async def test_litellm_structured_client_uses_response_schema_for_memory_extract
 
 
 @pytest.mark.asyncio
-async def test_litellm_structured_client_prefers_response_schema_without_registry_support(monkeypatch):
+async def test_litellm_structured_client_skips_response_schema_without_registry_support(monkeypatch, caplog):
     calls = []
 
     async def fake_acompletion(**kwargs):
@@ -188,14 +200,9 @@ async def test_litellm_structured_client_prefers_response_schema_without_registr
             '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact","confidence":0.9}]}'
         )
 
-    def fail_if_registry_is_used(model):
-        raise AssertionError(f"registry is not authoritative for {model}")
-
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
-    monkeypatch.setattr(
-        "memforge.llm.structured.litellm.supports_response_schema",
-        fail_if_registry_is_used,
-    )
+    set_native_schema_support(monkeypatch, False)
+    caplog.set_level(logging.DEBUG, logger="memforge.llm.structured")
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
@@ -208,15 +215,23 @@ async def test_litellm_structured_client_prefers_response_schema_without_registr
     response = await client.extract_memories("prompt", max_tokens=8192)
 
     assert response.memories[0].content == "Service A uses PostgreSQL 16."
+    assert len(calls) == 1
     assert calls[0]["model"] == "anthropic/anthropic--claude-sonnet-latest"
     assert calls[0]["api_base"] == "http://localhost:6655/anthropic"
     assert calls[0]["api_key"] == "local-key"
     assert calls[0]["timeout"] == 120.0
     assert calls[0]["max_tokens"] == 8192
-    assert calls[0]["messages"] == [{"role": "user", "content": "prompt"}]
-    assert calls[0]["response_format"] is MemoryExtractionResponse
+    assert calls[0]["messages"][0]["content"].startswith("prompt\n\nReturn ONLY")
+    assert "response_format" not in calls[0]
     assert "tools" not in calls[0]
     assert "tool_choice" not in calls[0]
+    [fallback_log] = [
+        record
+        for record in caplog.records
+        if "does not advertise native response_schema support" in record.message
+    ]
+    assert fallback_log.levelno == logging.DEBUG
+    assert "anthropic/anthropic--claude-sonnet-latest" in fallback_log.message
 
 
 @pytest.mark.asyncio
@@ -239,6 +254,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         raise AssertionError(f"unexpected schema {schema}")
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
@@ -277,6 +293,7 @@ async def test_litellm_structured_client_falls_back_once_to_json_text(monkeypatc
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
     caplog.set_level(logging.WARNING, logger="memforge.llm.structured")
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
@@ -315,6 +332,7 @@ async def test_litellm_structured_client_fails_closed_after_both_strategies_are_
         return CompletionResponse("{}")
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
