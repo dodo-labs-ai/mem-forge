@@ -360,6 +360,18 @@ def _json_text_prompt(prompt: str, response_format: type[BaseModel]) -> str:
     )
 
 
+def _supports_native_response_schema(model_name: str) -> bool:
+    try:
+        return bool(litellm.supports_response_schema(model=model_name))
+    except Exception:
+        logger.debug(
+            "Unable to determine native response_schema support for model %s",
+            model_name,
+            exc_info=True,
+        )
+        return False
+
+
 def _strip_json_fences(text: str) -> str:
     """Drop a leading ```/```json fence and trailing ``` if the model adds them."""
     stripped = text.strip()
@@ -518,6 +530,24 @@ class LiteLlmStructuredClient:
         model: str | None = None,
     ):
         model_name = litellm_model_name(model or self.config.model)
+        if not _supports_native_response_schema(model_name):
+            logger.debug(
+                "Structured LLM model %s does not advertise native response_schema support; "
+                "using JSON-text schema for %s",
+                model_name,
+                response_format.__name__,
+            )
+            try:
+                return await self._attempt_schema(
+                    prompt=prompt,
+                    response_format=response_format,
+                    model_name=model_name,
+                    max_tokens=max_tokens,
+                    native_schema=False,
+                )
+            except Exception as exc:
+                raise StructuredLlmError(str(exc)) from exc
+
         try:
             return await self._attempt_schema(
                 prompt=prompt,
