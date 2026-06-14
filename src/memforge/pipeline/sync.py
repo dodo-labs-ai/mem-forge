@@ -89,8 +89,40 @@ def _plural(count: int, singular: str, plural: str | None = None) -> str:
     return f"{count} {singular if count == 1 else plural or singular + 's'}"
 
 
+def _is_provider_unreachable(error: str) -> bool:
+    normalized = error.lower()
+    # Keep this list aligned with admin-ui/src/components/admin/syncFailureDetails.ts.
+    return any(
+        marker in normalized
+        for marker in (
+            "all connection attempts failed",
+            "cannot connect to host",
+            "connect call failed",
+            "connect timeout",
+            "connection refused",
+            "connection timed out",
+            "failed to connect",
+            "name or service not known",
+            "network is unreachable",
+            "no route to host",
+            "nodename nor servname",
+            "temporary failure in name resolution",
+        )
+    )
+
+
 def _failure_category(error: str) -> str:
     normalized = error.lower()
+    if "embedding provider unreachable" in normalized:
+        return "embedding_provider_unreachable"
+    if "llm provider unreachable" in normalized:
+        return "llm_provider_unreachable"
+    if _is_provider_unreachable(error) and (
+        "litellm" in normalized
+        or "anthropicexception" in normalized
+        or "openaiexception" in normalized
+    ):
+        return "llm_provider_unreachable"
     if "rate limit" in normalized or "429" in normalized:
         return "rate_limit"
     if "pdf export" in normalized or "did not produce a pdf" in normalized:
@@ -108,6 +140,34 @@ def summarize_failed_documents(docs_failed: int, failed_docs: list[FailedDoc]) -
     for failed_doc in failed_docs:
         category = _failure_category(failed_doc.error)
         counts[category] = counts.get(category, 0) + 1
+
+    if counts.get("embedding_provider_unreachable") or counts.get("llm_provider_unreachable"):
+        parts = [f"{_plural(docs_failed, 'document')} could not be synced."]
+        details: list[str] = []
+        if counts.get("embedding_provider_unreachable"):
+            details.append(
+                f"Embedding provider was unreachable for "
+                f"{_plural(counts['embedding_provider_unreachable'], 'document')}"
+            )
+        if counts.get("llm_provider_unreachable"):
+            details.append(
+                f"LLM provider was unreachable for "
+                f"{_plural(counts['llm_provider_unreachable'], 'document')}"
+            )
+        if counts.get("pdf_export"):
+            details.append(f"PDF export was unavailable for {_plural(counts['pdf_export'], 'document')}")
+        if counts.get("rate_limit"):
+            details.append(f"Confluence rate limited {_plural(counts['rate_limit'], 'document')}")
+        if counts.get("certificate"):
+            details.append(f"certificate verification failed for {_plural(counts['certificate'], 'document')}")
+        if counts.get("other"):
+            details.append(f"{_plural(counts['other'], 'document')} failed for other reasons")
+        if details:
+            parts.append("; ".join(details) + ".")
+        if counts.get("rate_limit"):
+            parts.append("Wait a few minutes, then retry the sync.")
+        parts.append("Check the provider endpoint, network access, and service status, then retry the sync.")
+        return " ".join(parts)
 
     if counts.get("pdf_export") or counts.get("rate_limit") or counts.get("certificate"):
         parts = [f"{_plural(docs_failed, 'Confluence document')} could not be imported."]
@@ -1721,13 +1781,18 @@ class GeneSyncOrchestrator:
             embedding_text = document_embedding_text(metadata)
 
             async with self._llm_semaphore:
-                vectors = await asyncio.to_thread(
-                    embed_texts,
-                    [embedding_text],
-                    self.embed_cfg["base_url"],
-                    self.embed_cfg["api_key"],
-                    self.embed_cfg["model"],
-                )
+                try:
+                    vectors = await asyncio.to_thread(
+                        embed_texts,
+                        [embedding_text],
+                        self.embed_cfg["base_url"],
+                        self.embed_cfg["api_key"],
+                        self.embed_cfg["model"],
+                    )
+                except Exception as e:
+                    if _is_provider_unreachable(str(e)):
+                        raise RuntimeError(f"Embedding provider unreachable: {e}") from e
+                    raise
 
             await asyncio.to_thread(
                 self.document_index.upsert,

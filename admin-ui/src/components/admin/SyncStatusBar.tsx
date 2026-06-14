@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { AlertCircle, Check, Loader2, RotateCw, X } from "lucide-react";
 import type { SyncStatus } from "@/api/types";
+import { buildFailureDetails } from "@/components/admin/syncFailureDetails";
 import { formatDuration, formatElapsed } from "@/utils/date";
 
 export function SyncStatusBar({
@@ -222,59 +223,4 @@ function runningProgressLabel(sync: SyncStatus, itemLabel: string) {
   }
 
   return `Syncing ${itemLabel}`;
-}
-
-function buildFailureDetails(sync: SyncStatus) {
-  const failedDocs = sync.failed_docs ?? [];
-  if (failedDocs.length === 0) return null;
-
-  const groups = new Map<string, FailureGroup>();
-  for (const doc of failedDocs) {
-    const key = failureCategory(doc.error);
-    if (!groups.has(key)) {
-      groups.set(key, failureGroup(key));
-    }
-    groups.get(key)?.items.push({ title: doc.title, error: doc.error });
-  }
-
-  return { groups: Array.from(groups.values()) };
-}
-
-function failureCategory(error: string) {
-  const normalized = error.toLowerCase();
-  if (normalized.includes("rate limit") || normalized.includes("429")) return "rate_limit";
-  if (normalized.includes("pdf export") || normalized.includes("did not produce a pdf")) return "pdf_export";
-  if (normalized.includes("certificate_verify_failed") || normalized.includes("certificate verify")) return "certificate";
-  return "other";
-}
-
-type FailureGroup = { label: string; help: string; items: { title: string; error: string }[] };
-
-function failureGroup(key: string): FailureGroup {
-  if (key === "rate_limit") {
-    return {
-      label: "Rate limited by Confluence",
-      help: "Confluence temporarily limited export requests. Wait a few minutes, then retry the sync.",
-      items: [],
-    };
-  }
-  if (key === "pdf_export") {
-    return {
-      label: "PDF export unavailable",
-      help: "Confluence did not return a usable PDF for these documents.",
-      items: [],
-    };
-  }
-  if (key === "certificate") {
-    return {
-      label: "Certificate verification failed",
-      help: "The local Python runtime could not verify the Confluence certificate chain.",
-      items: [],
-    };
-  }
-  return {
-    label: "Other sync errors",
-    help: "These documents failed for another reason.",
-    items: [],
-  };
 }
