@@ -1,7 +1,7 @@
 export type SourceActionTone = "neutral" | "primary" | "destructive";
 
 export interface SourceAction {
-  id: "configure" | "sync" | "force-resync" | "delete";
+  id: "configure" | "sync" | "toggle-status" | "force-resync" | "delete";
   label: string;
   description?: string;
   tone: SourceActionTone;
@@ -15,6 +15,13 @@ export const sourceActionLayout = {
     { id: "sync", label: "Sync", tone: "primary" },
   ],
   menu: [
+    {
+      id: "toggle-status",
+      label: "Pause source",
+      description:
+        "Pause or resume source discovery without deleting configuration or extracted memories.",
+      tone: "neutral",
+    },
     {
       id: "force-resync",
       label: "Refresh source",

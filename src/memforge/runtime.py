@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from memforge.config import AppConfig
@@ -37,6 +38,27 @@ logger = logging.getLogger(__name__)
 
 class SyncAlreadyRunningError(RuntimeError):
     """Raised when a source already has an active sync task."""
+
+
+class SourcePausedError(RuntimeError):
+    """Raised when sync is requested for a paused source."""
+
+
+@dataclass
+class RuntimeHealthComponent:
+    status: str
+    detail: str | None = None
+    payload: dict[str, Any] | None = None
+
+
+@dataclass
+class RuntimeHealthReport:
+    status: str
+    database: RuntimeHealthComponent
+    vector_store: RuntimeHealthComponent
+    index_consistency: RuntimeHealthComponent | None = None
+    audit_failures: RuntimeHealthComponent | None = None
+    genes: dict[str, RuntimeHealthComponent] = field(default_factory=dict)
 
 
 @dataclass
@@ -102,6 +124,8 @@ class RuntimeProvider(Protocol):
         audit_logger: MemoryAuditLogger | None = None,
     ) -> Any: ...
 
+    async def check_health(self, db: "Database", config: AppConfig) -> RuntimeHealthReport: ...
+
     async def build_sync_runtime(self, db: "Database", config: AppConfig) -> SyncRuntime: ...
 
     async def run_source_sync(
@@ -143,6 +167,9 @@ class DefaultRuntimeProvider:
     async def build_sync_runtime(self, db: "Database", config: AppConfig) -> SyncRuntime:
         return await build_sync_runtime(db=db, config=config)
 
+    async def check_health(self, db: "Database", config: AppConfig) -> RuntimeHealthReport:
+        return await check_runtime_health(db, config)
+
     async def run_source_sync(
         self,
         db: "Database",
@@ -179,6 +206,168 @@ async def get_effective_llm_config(db: "Database", config: AppConfig) -> Effecti
         embedding_base_url=value("embedding_base_url", config.llm.embedding_base_url),
         embedding_api_key=value("embedding_api_key", config.llm.embedding_api_key),
     )
+
+
+AUDIT_HEALTH_FAILURE_EVENTS = (
+    "source_support_verification_failed",
+    "contradiction_detection_failed",
+    "reconciliation_failed",
+    "reconciliation_action_failed",
+    "index_operation_failed",
+    "review_resolution_failed",
+)
+AUDIT_HEALTH_WINDOW_HOURS = 24
+
+
+async def check_runtime_health(db: "Database", config: AppConfig) -> RuntimeHealthReport:
+    """Run the default SQLite/Chroma health checks for the OSS runtime."""
+    overall = "healthy"
+
+    database = RuntimeHealthComponent(status="ok")
+    try:
+        memory_count = await db.count_memories()
+        database.detail = f"{memory_count} memories"
+    except Exception as exc:
+        database = RuntimeHealthComponent(status="error", detail=str(exc))
+        overall = "degraded"
+
+    vector_store = RuntimeHealthComponent(status="ok")
+    try:
+        import chromadb
+
+        chroma_path = config.storage.chroma_path
+        if Path(chroma_path).exists():
+            client = chromadb.PersistentClient(path=chroma_path)
+            collections = client.list_collections()
+            vector_store.detail = f"{len(collections)} collection(s)"
+        else:
+            vector_store = RuntimeHealthComponent(
+                status="not_configured",
+                detail="ChromaDB path does not exist",
+            )
+    except ImportError:
+        vector_store = RuntimeHealthComponent(
+            status="not_available",
+            detail="chromadb not installed",
+        )
+    except Exception as exc:
+        vector_store = RuntimeHealthComponent(status="error", detail=str(exc))
+        overall = "degraded"
+
+    index_consistency: RuntimeHealthComponent | None = None
+    try:
+        if Path(config.storage.chroma_path).exists():
+            memory_collection = get_chroma_collection(
+                config.storage.chroma_path,
+                name="memories",
+            )
+            document_collection = get_chroma_collection(
+                config.storage.chroma_path,
+                name="documents",
+            )
+            report = await MemoryIndexHealthChecker(
+                db=db,
+                memory_collection=memory_collection,
+                document_collection=document_collection,
+            ).check()
+            if report.ok:
+                index_consistency = RuntimeHealthComponent(
+                    status="ok",
+                    detail="No index consistency issues",
+                )
+            else:
+                overall = "degraded"
+                index_consistency = RuntimeHealthComponent(
+                    status="error",
+                    detail=f"{len(report.issues)} consistency issue(s)",
+                )
+        else:
+            index_consistency = RuntimeHealthComponent(
+                status="not_configured",
+                detail="ChromaDB path does not exist",
+            )
+    except Exception as exc:
+        overall = "degraded"
+        index_consistency = RuntimeHealthComponent(status="error", detail=str(exc))
+
+    audit_failures: RuntimeHealthComponent | None = None
+    try:
+        audit_failures = await _recent_audit_failure_health(db)
+    except Exception as exc:
+        audit_failures = RuntimeHealthComponent(status="warning", detail=str(exc))
+
+    genes: dict[str, RuntimeHealthComponent] = {}
+    try:
+        sources = await db.list_sources()
+        for src in sources:
+            source_id = src["id"]
+            source_name = src.get("name", source_id)
+            sync_state = await db.get_sync_state(source_id)
+            if sync_state and sync_state.last_sync_status:
+                genes[source_name] = RuntimeHealthComponent(
+                    status=sync_state.last_sync_status,
+                    detail=_dt_iso(sync_state.last_sync_at),
+                )
+            else:
+                genes[source_name] = RuntimeHealthComponent(status="never_synced")
+    except Exception as exc:
+        logger.warning("Failed to check gene connectivity: %s", exc)
+
+    return RuntimeHealthReport(
+        status=overall,
+        database=database,
+        vector_store=vector_store,
+        index_consistency=index_consistency,
+        audit_failures=audit_failures,
+        genes=genes,
+    )
+
+
+async def _recent_audit_failure_health(db: "Database") -> RuntimeHealthComponent:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=AUDIT_HEALTH_WINDOW_HOURS)
+    since = cutoff.isoformat()
+    placeholders = ", ".join("?" for _ in AUDIT_HEALTH_FAILURE_EVENTS)
+    params: list[Any] = [*AUDIT_HEALTH_FAILURE_EVENTS, since]
+    async with db.db.execute(
+        f"""SELECT event_type, COUNT(*), MAX(occurred_at)
+            FROM memory_audit_events
+            WHERE event_type IN ({placeholders})
+              AND occurred_at >= ?
+              AND (status = 'failed' OR error IS NOT NULL)
+            GROUP BY event_type
+            ORDER BY event_type""",
+        params,
+    ) as cursor:
+        rows = await cursor.fetchall()
+
+    counts_by_event_type = {str(row[0]): int(row[1]) for row in rows}
+    payload = {
+        "window_hours": AUDIT_HEALTH_WINDOW_HOURS,
+        "since": since,
+        "counts_by_event_type": counts_by_event_type,
+        "total": sum(counts_by_event_type.values()),
+        "last_seen_at": max((row[2] for row in rows if row[2]), default=None),
+    }
+    if not rows:
+        return RuntimeHealthComponent(
+            status="ok",
+            detail=f"No audit failures in the last {AUDIT_HEALTH_WINDOW_HOURS}h",
+            payload=payload,
+        )
+    summary = ", ".join(f"{row[0]}={row[1]}" for row in rows)
+    return RuntimeHealthComponent(
+        status="warning",
+        detail=f"Recent audit failures in the last {AUDIT_HEALTH_WINDOW_HOURS}h: {summary}",
+        payload=payload,
+    )
+
+
+def _dt_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
 
 
 def _has_structured_llm_credentials(llm: EffectiveLlmConfig) -> bool:
@@ -369,15 +558,28 @@ class SyncService:
         task = self.tasks.get(source_id)
         return bool(task and not task.done())
 
-    def start_source(self, source_id: str, *, force_full_sync: bool = False) -> asyncio.Task:
+    async def _ensure_source_can_sync(self, source_id: str) -> dict:
+        source = await self.db.get_source(source_id)
+        if source is None:
+            raise ValueError(f"Source not found: {source_id}")
+        if source.get("status") == "paused":
+            raise SourcePausedError(f"Source is paused: {source_id}")
+        return source
+
+    async def start_source(self, source_id: str, *, force_full_sync: bool = False) -> asyncio.Task:
+        await self._ensure_source_can_sync(source_id)
         if self.is_running(source_id):
             raise SyncAlreadyRunningError(f"Sync already running for {source_id}")
         task = asyncio.create_task(self._run_source_task(source_id, force_full_sync=force_full_sync))
         self.tasks[source_id] = task
         return task
 
-    def request_source_sync(self, source_id: str, *, delay_seconds: float = 1.0) -> bool:
+    async def request_source_sync(self, source_id: str, *, delay_seconds: float = 1.0) -> bool:
         """Queue one service-owned sync pass for a source, coalescing duplicates."""
+        try:
+            await self._ensure_source_can_sync(source_id)
+        except SourcePausedError:
+            return False
         queued = self.queued_tasks.get(source_id)
         if queued and not queued.done():
             return False
@@ -392,8 +594,8 @@ class SyncService:
             if active and not active.done():
                 await active
             try:
-                self.start_source(source_id)
-            except SyncAlreadyRunningError:
+                await self.start_source(source_id)
+            except (SourcePausedError, SyncAlreadyRunningError):
                 return
         except asyncio.CancelledError:
             raise
@@ -409,7 +611,8 @@ class SyncService:
                 continue
             if self.is_running(source["id"]):
                 continue
-            await self.start_source(source["id"])
+            task = await self.start_source(source["id"])
+            await task
 
     async def retire_expired_memories(self) -> int:
         runtime = await self.runtime_provider.build_sync_runtime(self.db, self.config)

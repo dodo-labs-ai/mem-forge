@@ -873,6 +873,12 @@ async def test_scheduled_sync_uses_tracked_source_tasks(db: Database, monkeypatc
 @pytest.mark.asyncio
 async def test_sync_service_passes_force_full_sync_to_source_task(db: Database, monkeypatch):
     source_id = "src-force-service"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Force Service",
+        config_json="{}",
+    )
     service = SyncService(db, AppConfig())
     captured: dict[str, object] = {}
 
@@ -882,7 +888,7 @@ async def test_sync_service_passes_force_full_sync_to_source_task(db: Database, 
 
     monkeypatch.setattr(service, "_run_source_task", fake_run_source_task)
 
-    task = service.start_source(source_id, force_full_sync=True)
+    task = await service.start_source(source_id, force_full_sync=True)
     await task
 
     assert captured == {"source_id": source_id, "force_full_sync": True}
@@ -891,6 +897,12 @@ async def test_sync_service_passes_force_full_sync_to_source_task(db: Database, 
 @pytest.mark.asyncio
 async def test_requested_sync_runs_after_active_source_sync_finishes(db: Database, monkeypatch):
     source_id = "src-queued-after-active"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Queued Source",
+        config_json="{}",
+    )
     service = SyncService(db, AppConfig())
     first_release = asyncio.Event()
     followup_started = asyncio.Event()
@@ -908,10 +920,10 @@ async def test_requested_sync_runs_after_active_source_sync_finishes(db: Databas
 
     monkeypatch.setattr(service, "_run_source_task", fake_run_source_task)
 
-    first_task = service.start_source(source_id)
+    first_task = await service.start_source(source_id)
     await asyncio.sleep(0)
 
-    assert service.request_source_sync(source_id, delay_seconds=0) is True
+    assert await service.request_source_sync(source_id, delay_seconds=0) is True
     await asyncio.sleep(0)
     assert calls == [source_id]
 

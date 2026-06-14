@@ -1,7 +1,7 @@
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Files, Info, Loader2, MoreHorizontal, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Files, Info, Loader2, MoreHorizontal, Pause, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
 import client from "@/api/client";
 import type {
   AgentSessionCompleteness,
@@ -149,6 +149,15 @@ export function SourcesPage() {
     },
   });
 
+  const setSourceStatus = useMutation({
+    mutationFn: ({ sourceId, status }: { sourceId: string; status: Source["status"] }) =>
+      client.put(`/api/sources/${sourceId}`, { status }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["sources"] });
+      queryClient.invalidateQueries({ queryKey: ["stats"] });
+    },
+  });
+
   const sources = normalizeSources(sourcesQuery.data);
   const genes = genesQuery.data ?? [];
   const geneByName = new Map(genes.map((gene) => [gene.name, gene]));
@@ -268,6 +277,9 @@ export function SourcesPage() {
                   {group.sources.map(({ source, memory_count }) => {
                     const isSyncing = source.sync?.status === "running" || pendingSyncIds.has(source.id);
                     const isDeleting = deleteSource.isPending && sourcePendingDelete?.id === source.id;
+                    const isUpdatingStatus =
+                      setSourceStatus.isPending &&
+                      setSourceStatus.variables?.sourceId === source.id;
                     const canConfigure = canConfigureSourceType(source.type);
                     const isManaged = isManagedSourceType(source.type) || isManagedSourceId(source.id);
                     const gene = geneByName.get(source.type);
@@ -287,6 +299,7 @@ export function SourcesPage() {
                         perGroupMemoryCount={memory_count}
                         isSyncing={isSyncing}
                         isDeleting={isDeleting}
+                        isUpdatingStatus={isUpdatingStatus}
                         canConfigure={canConfigure}
                         isManaged={isManaged}
                         sourceLabel={sourceLabel}
@@ -300,6 +313,9 @@ export function SourcesPage() {
                           })
                         }
                         onSync={() => syncSource.mutate({ sourceId: source.id })}
+                        onResume={() =>
+                          setSourceStatus.mutate({ sourceId: source.id, status: "active" })
+                        }
                         onShowDetails={() => setDetailsSource(source)}
                         actionsMenu={
                           <SourceActionsMenu
@@ -316,7 +332,16 @@ export function SourcesPage() {
                               setOpenMenuSourceId(null);
                               forceResyncSource.mutate(source.id);
                             }}
-                            disableForceResync={isSyncing || isDeleting}
+                            onToggleStatus={() => {
+                              setOpenMenuSourceId(null);
+                              setSourceStatus.mutate({
+                                sourceId: source.id,
+                                status: source.status === "paused" ? "active" : "paused",
+                              });
+                            }}
+                            disableForceResync={isSyncing || isDeleting || source.status === "paused"}
+                            disableToggleStatus={isSyncing || isDeleting || isUpdatingStatus}
+                            isUpdatingStatus={isUpdatingStatus}
                           />
                         }
                       />
@@ -394,21 +419,34 @@ function SourceActionsMenu({
   onOpenChange,
   onDelete,
   onForceResync,
+  onToggleStatus,
   disableForceResync,
+  disableToggleStatus,
+  isUpdatingStatus,
 }: {
   source: Source;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onDelete: () => void;
   onForceResync: () => void;
+  onToggleStatus: () => void;
   disableForceResync: boolean;
+  disableToggleStatus: boolean;
+  isUpdatingStatus: boolean;
 }) {
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
+  const toggleStatus = sourceActionLayout.menu.find((action) => action.id === "toggle-status");
   const forceResync = sourceActionLayout.menu.find((action) => action.id === "force-resync");
   const deleteAction = sourceActionLayout.menu.find((action) => action.id === "delete");
   const canDelete = canDeleteSourceType(source.type);
+  const isPaused = source.status === "paused";
+  const toggleStatusLabel = isPaused ? "Resume source" : "Pause source";
+  const ToggleStatusIcon = isPaused ? Play : Pause;
+  const forceResyncDisabledHint = isPaused
+    ? "Resume the source first to refresh."
+    : undefined;
 
   useLayoutEffect(() => {
     if (!open || !triggerRef.current || !menuRef.current) return;
@@ -464,7 +502,7 @@ function SourceActionsMenu({
               triggerBottom: rect.bottom,
               viewportWidth: window.innerWidth,
               viewportHeight: window.innerHeight,
-              menuHeight: canDelete ? 224 : 96,
+              menuHeight: canDelete ? 288 : 160,
             }));
           }
           onOpenChange(!open);
@@ -483,14 +521,36 @@ function SourceActionsMenu({
           <button
             type="button"
             role="menuitem"
+            disabled={disableToggleStatus}
+            className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+            onClick={onToggleStatus}
+          >
+            {isUpdatingStatus ? (
+              <Loader2 className="mt-0.5 size-4 animate-spin" />
+            ) : (
+              <ToggleStatusIcon className="mt-0.5 size-4" />
+            )}
+            <span>
+              <span className="block font-medium text-foreground">{toggleStatusLabel}</span>
+              <span className="mt-0.5 block text-xs">{toggleStatus?.description}</span>
+            </span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
             disabled={disableForceResync}
+            title={forceResyncDisabledHint}
             className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
             onClick={onForceResync}
           >
             <RefreshCw className="mt-0.5 size-4" />
             <span>
               <span className="block font-medium text-foreground">{forceResync?.label}</span>
-              <span className="mt-0.5 block text-xs">{forceResync?.description}</span>
+              <span className="mt-0.5 block text-xs">
+                {isPaused
+                  ? "Resume the source first to look for new, changed, or removed documents."
+                  : forceResync?.description}
+              </span>
             </span>
           </button>
           {canDelete && (
