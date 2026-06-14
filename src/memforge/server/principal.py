@@ -13,6 +13,8 @@ from fastapi import Request
 
 from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 
+LOCAL_DEV_WORKSPACE_ROLE = "workspace_admin"
+
 
 def resolve_principal(request: Request) -> str:
     """Return the authenticated user id for this request.
@@ -21,3 +23,13 @@ def resolve_principal(request: Request) -> str:
     the principal from a verified JWT or session here.
     """
     return LOCAL_DEV_USER_ID
+
+
+def resolve_workspace_role(request: Request) -> str:
+    """Return the caller's workspace role for source-management decisions.
+
+    Standalone OSS is a single-user admin surface, so the local principal
+    retains full source-management capabilities. Cloud deployments inject a
+    resolver through ``create_admin_app`` instead of trusting client input.
+    """
+    return LOCAL_DEV_WORKSPACE_ROLE

@@ -141,6 +141,32 @@ def _admin_like_pattern(value: str) -> str:
     return f"%{escaped}%"
 
 
+def _enabled_source_visibility_condition(
+    disabled_source_ids: list[str],
+) -> tuple[str | None, list[str]]:
+    if not disabled_source_ids:
+        return None, []
+    placeholders = ", ".join("?" for _ in disabled_source_ids)
+    return (
+        f"""(
+            NOT EXISTS (
+                SELECT 1
+                FROM memory_sources ms_any
+                JOIN documents d_any ON ms_any.doc_id = d_any.doc_id
+                WHERE ms_any.memory_id = m.id
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM memory_sources ms_enabled
+                JOIN documents d_enabled ON ms_enabled.doc_id = d_enabled.doc_id
+                WHERE ms_enabled.memory_id = m.id
+                  AND d_enabled.source NOT IN ({placeholders})
+            )
+        )""",
+        list(disabled_source_ids),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Schema (v1)
 # ---------------------------------------------------------------------------
@@ -291,7 +317,17 @@ CREATE TABLE IF NOT EXISTS sources (
     last_sync       TEXT,
     doc_count       INTEGER DEFAULT 0,
     project_binding TEXT,                    -- JSON: {"mode": "fixed", ...} or {"mode": "by_field", ...}
+    created_by_user_id TEXT,
     created_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS source_subscriptions (
+    source_id   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    user_id     TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (source_id, user_id)
 );
 
 CREATE TABLE IF NOT EXISTS auth_sessions (
@@ -450,6 +486,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_sources_doc ON memory_sources(doc_id);
 CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_id);
 CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized ON entity_aliases(alias_normalized);
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_status ON auth_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_source_subscriptions_user ON source_subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_agent_session_receipts_session ON agent_session_receipts(session_id);
 CREATE INDEX IF NOT EXISTS idx_agent_session_receipts_source ON agent_session_receipts(source_id);
 CREATE INDEX IF NOT EXISTS idx_agent_hook_receipts_session ON agent_hook_receipts(session_id);
@@ -866,6 +903,20 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         ),
         # The sources table gains project_binding. Legacy rows read NULL.
         "ALTER TABLE sources ADD COLUMN project_binding TEXT",
+    ]),
+    (18, "Track source creator for shared source management", [
+        "ALTER TABLE sources ADD COLUMN created_by_user_id TEXT",
+    ]),
+    (19, "Track per-user source subscriptions", [
+        """CREATE TABLE IF NOT EXISTS source_subscriptions (
+            source_id   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            user_id     TEXT NOT NULL,
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (source_id, user_id)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_source_subscriptions_user ON source_subscriptions(user_id)",
     ]),
 ]
 
@@ -1831,6 +1882,9 @@ class Database:
         offset: int,
     ) -> MemoryAdminQueryPage:
         predicate_sql, predicate_params = visible_sql(scope, "m")
+        subscription_condition, subscription_params = _enabled_source_visibility_condition(
+            await self.list_disabled_source_ids_for_user(scope.user_id)
+        )
         if filters.search:
             fts_query = _admin_fts_query(filters.search)
             like_query = _admin_like_pattern(filters.search)
@@ -1862,6 +1916,9 @@ class Database:
                 like_query,
                 like_query,
             ]
+            if subscription_condition:
+                conditions.append(subscription_condition)
+                params.extend(subscription_params)
 
             if filters.source:
                 conditions.append(
@@ -1906,6 +1963,9 @@ class Database:
         joins: list[str] = []
         conditions: list[str] = [predicate_sql]
         params = list(predicate_params)
+        if subscription_condition:
+            conditions.append(subscription_condition)
+            params.extend(subscription_params)
 
         if filters.source:
             joins.append("JOIN memory_sources ms ON m.id = ms.memory_id")
@@ -2552,6 +2612,7 @@ class Database:
         config_json: str,
         status: str | None = None,
         project_binding: Mapping[str, Any] | None = None,
+        created_by_user_id: str | None = None,
     ) -> None:
         """Insert or update a source row.
 
@@ -2564,8 +2625,8 @@ class Database:
         )
         async with self._write_lock:
             await self.db.execute(
-                """INSERT INTO sources (id, type, name, config, status, project_binding)
-                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?)
+                """INSERT INTO sources (id, type, name, config, status, project_binding, created_by_user_id)
+                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                    type=excluded.type,
                    name=excluded.name,
@@ -2574,8 +2635,9 @@ class Database:
                        WHEN ? IS NULL THEN sources.status
                        ELSE excluded.status
                    END,
-                   project_binding=excluded.project_binding""",
-                (id, type, name, config_json, status, binding_json, status),
+                   project_binding=excluded.project_binding,
+                   created_by_user_id=COALESCE(sources.created_by_user_id, excluded.created_by_user_id)""",
+                (id, type, name, config_json, status, binding_json, created_by_user_id, status),
             )
             await self.db.commit()
 
@@ -2598,8 +2660,9 @@ class Database:
         async with self._write_lock:
             await self.db.execute(
                 """INSERT INTO sources
-                   (id, type, name, config, status, last_sync, doc_count, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   (id, type, name, config, status, last_sync, doc_count, project_binding,
+                    created_by_user_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                    type=excluded.type,
                    name=excluded.name,
@@ -2607,6 +2670,8 @@ class Database:
                    status=excluded.status,
                    last_sync=excluded.last_sync,
                    doc_count=excluded.doc_count,
+                   project_binding=excluded.project_binding,
+                   created_by_user_id=excluded.created_by_user_id,
                    created_at=excluded.created_at""",
                 (
                     source["id"],
@@ -2616,6 +2681,12 @@ class Database:
                     source["status"],
                     source["last_sync"],
                     source["doc_count"],
+                    (
+                        json.dumps(source["project_binding"])
+                        if source.get("project_binding")
+                        else None
+                    ),
+                    source.get("created_by_user_id"),
                     source["created_at"],
                 ),
             )
@@ -2633,6 +2704,41 @@ class Database:
                     json.loads(d["project_binding"]) if d.get("project_binding") else None
                 )
                 results.append(d)
+        return results
+
+    async def is_source_enabled_for_user(self, source_id: str, user_id: str) -> bool:
+        async with self.db.execute(
+            "SELECT enabled FROM source_subscriptions WHERE source_id = ? AND user_id = ?",
+            (source_id, user_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return True
+            return bool(row["enabled"])
+
+    async def set_source_subscription(
+        self, source_id: str, user_id: str, enabled: bool
+    ) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT INTO source_subscriptions
+                   (source_id, user_id, enabled, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(source_id, user_id) DO UPDATE SET
+                   enabled=excluded.enabled,
+                   updated_at=excluded.updated_at""",
+                (source_id, user_id, int(enabled), _now_iso()),
+            )
+            await self.db.commit()
+
+    async def list_disabled_source_ids_for_user(self, user_id: str) -> list[str]:
+        results: list[str] = []
+        async with self.db.execute(
+            "SELECT source_id FROM source_subscriptions WHERE user_id = ? AND enabled = 0",
+            (user_id,),
+        ) as cursor:
+            async for row in cursor:
+                results.append(str(row["source_id"]))
         return results
 
     async def count_source_memories(self, source_id: str) -> int:

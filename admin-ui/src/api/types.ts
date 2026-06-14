@@ -96,12 +96,59 @@ export interface SyncStatus {
   }>;
 }
 
+/**
+ * Workspace role of the viewer that fetched the source list. The backend
+ * normalises any non-admin role to "member" before returning rows; "viewer"
+ * is reserved for read-only roles introduced by hosted deployments.
+ */
+export type ViewerRole = "workspace_admin" | "member" | "viewer";
+
+/**
+ * Relationship between the viewer and a particular source. "creator" is set
+ * for the user who created the source, including a workspace admin who owns
+ * the row. "workspace_admin" is used when an admin manages someone else's
+ * source.
+ */
+export type SourceViewerRelationship = ViewerRole | "creator";
+
+export interface SourceOwnership {
+  created_by_user_id: string | null;
+  viewer_role: ViewerRole;
+  viewer_relationship: SourceViewerRelationship;
+}
+
+/**
+ * Per-row authority flags computed by the backend. The UI must render row
+ * actions exclusively from these flags rather than rederiving role/creator
+ * locally; backend remains authoritative on the wire.
+ */
+export interface SourceCapabilities {
+  can_subscribe: boolean;
+  can_configure: boolean;
+  can_sync: boolean;
+  can_force_resync: boolean;
+  can_delete: boolean;
+}
+
+/**
+ * Per-viewer subscription state. Disabling a source removes its memories
+ * from this viewer's lists without affecting other workspace members.
+ */
+export interface SourceSubscription {
+  enabled: boolean;
+}
+
 export interface Source {
   id: string;
   type: string;
   /** For agent_session sources, identifies the plugin client: "codex" or "claude-code". */
   client?: string | null;
   name: string;
+  /**
+   * Full redacted config. The backend returns `{}` for sources where the
+   * viewer cannot configure (`capabilities.can_configure === false`); the
+   * config dialog must not open or submit in that case.
+   */
   config: Record<string, unknown>;
   status: "active" | "paused";
   last_sync: string | null;
@@ -116,6 +163,11 @@ export interface Source {
    * the Unmapped backlog until an admin classifies them.
    */
   project_binding?: ProjectBinding | null;
+  ownership?: SourceOwnership;
+  capabilities?: SourceCapabilities;
+  subscription?: SourceSubscription;
+  /** Convenience mirror of `subscription.enabled` for the current viewer. */
+  enabled_for_me?: boolean;
 }
 
 export interface SourceProject {

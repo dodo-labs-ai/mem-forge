@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -710,7 +711,7 @@ def _agent_worker_timeout() -> float:
 
 
 def _post_json(path: str, payload: dict[str, Any], *, api_url: str, timeout: float) -> dict[str, Any]:
-    url = _admin_api_base_url(api_url) + path
+    url = _admin_api_request_url(path, api_url=api_url)
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     api_token = os.getenv("MEMFORGE_API_TOKEN")
@@ -741,6 +742,23 @@ def _admin_api_base_url(api_url: str) -> str:
     if base_url.endswith("/api"):
         return base_url[:-4]
     return base_url
+
+
+def _workspace_id() -> str:
+    return os.getenv("MEMFORGE_WORKSPACE_ID", "").strip()
+
+
+def _admin_api_request_url(path: str, *, api_url: str) -> str:
+    base_url = _admin_api_base_url(api_url)
+    workspace_id = _workspace_id()
+    if not workspace_id or not path.startswith("/api"):
+        return f"{base_url}{path}"
+    quoted_workspace = urllib.parse.quote(workspace_id, safe="")
+    if path == "/api":
+        return f"{base_url}/api/workspaces/{quoted_workspace}/api"
+    if path.startswith("/api/"):
+        return f"{base_url}/api/workspaces/{quoted_workspace}/api/{path[len('/api/'):]}"
+    return f"{base_url}{path}"
 
 
 def _event_name(payload: dict[str, Any]) -> str:

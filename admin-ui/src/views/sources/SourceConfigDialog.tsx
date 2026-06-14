@@ -63,14 +63,26 @@ export function SourceConfigDialog({
   // instead of a config form.
   const isNewLocalRepo = sourceType === "local_markdown" && !source;
 
+  // Backend authority: an existing source the viewer cannot configure should
+  // not open the form. Type-level managed sources (agent_session) are also
+  // blocked. New-source flows have no source row yet, so the type check is
+  // the only gate there.
+  const canConfigureExisting = source ? source.capabilities?.can_configure !== false : true;
+
   const schemaQuery = useQuery<GeneConfigSchema>({
     queryKey: ["gene-config-schema", sourceType],
     queryFn: () =>
       client.get(`/api/genes/${sourceType}/config-schema`).then((response) => response.data),
-    enabled: open && Boolean(sourceType) && canConfigureSourceType(sourceType ?? "") && !isNewLocalRepo,
+    enabled:
+      open
+      && Boolean(sourceType)
+      && canConfigureSourceType(sourceType ?? "")
+      && canConfigureExisting
+      && !isNewLocalRepo,
   });
 
   if (!sourceType || !canConfigureSourceType(sourceType)) return null;
+  if (!canConfigureExisting) return null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

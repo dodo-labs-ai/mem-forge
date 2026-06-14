@@ -6,6 +6,9 @@ It also registers a thin local MCP proxy for explicit memory tools.
 Set `MEMFORGE_API_URL` if the API is not running at
 `http://127.0.0.1:8765`. The URL can point at a local instance or a hosted
 service. Set `MEMFORGE_API_TOKEN` when the service requires bearer auth.
+For hosted multi-workspace deployments, also set `MEMFORGE_WORKSPACE_ID` so
+the proxy targets `/api/workspaces/<workspace>/api/...` while the token remains
+a user identity credential.
 
 The bundled MCP proxy does not need a local MemForge CLI or local-DB MCP
 process. It forwards search, memory detail, recent-change, and session
