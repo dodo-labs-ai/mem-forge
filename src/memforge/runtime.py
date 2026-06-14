@@ -7,7 +7,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from memforge.config import AppConfig
 from memforge.auth import browser_session
@@ -64,8 +64,11 @@ class SyncRuntime:
     structured_llm_client: LiteLlmStructuredClient | None
     llm_model: str
     source_support_detector: SourceSupportDetector | None
+    orchestrator_factory: Callable[["SyncRuntime"], GeneSyncOrchestrator] | None = None
 
     def orchestrator(self) -> GeneSyncOrchestrator:
+        if self.orchestrator_factory is not None:
+            return self.orchestrator_factory(self)
         return GeneSyncOrchestrator(
             db=self.db,
             doc_store=self.doc_store,
@@ -77,6 +80,85 @@ class SyncRuntime:
             embed_cfg=self.embed_cfg,
             source_support_detector=self.source_support_detector,
             max_concurrent=self.config.llm.enrichment_max_concurrent,
+        )
+
+
+class RuntimeProvider(Protocol):
+    """Runtime construction seam for admin apps with non-SQLite stores."""
+
+    def build_adapters(
+        self,
+        db: "Database",
+        memory_collection: Any,
+        *,
+        audit_logger: MemoryAuditLogger | None = None,
+    ) -> Any: ...
+
+    async def build_search_engine(
+        self,
+        db: "Database",
+        config: AppConfig,
+        *,
+        audit_logger: MemoryAuditLogger | None = None,
+    ) -> Any: ...
+
+    async def build_sync_runtime(self, db: "Database", config: AppConfig) -> SyncRuntime: ...
+
+    async def run_source_sync(
+        self,
+        db: "Database",
+        config: AppConfig,
+        source: dict,
+        runtime: SyncRuntime | None = None,
+        progress_callback: Callable[[dict], None] | None = None,
+        force_full_sync: bool = False,
+    ) -> SyncState: ...
+
+
+class DefaultRuntimeProvider:
+    """Default SQLite-backed runtime provider."""
+
+    def build_adapters(
+        self,
+        db: "Database",
+        memory_collection: Any,
+        *,
+        audit_logger: MemoryAuditLogger | None = None,
+    ) -> Any:
+        return build_sqlite_adapters(db, memory_collection, audit_logger=audit_logger)
+
+    async def build_search_engine(
+        self,
+        db: "Database",
+        config: AppConfig,
+        *,
+        audit_logger: MemoryAuditLogger | None = None,
+    ) -> Any:
+        return await build_search_engine(
+            db=db,
+            config=config,
+            audit_logger=audit_logger,
+        )
+
+    async def build_sync_runtime(self, db: "Database", config: AppConfig) -> SyncRuntime:
+        return await build_sync_runtime(db=db, config=config)
+
+    async def run_source_sync(
+        self,
+        db: "Database",
+        config: AppConfig,
+        source: dict,
+        runtime: SyncRuntime | None = None,
+        progress_callback: Callable[[dict], None] | None = None,
+        force_full_sync: bool = False,
+    ) -> SyncState:
+        return await run_source_sync(
+            db=db,
+            config=config,
+            source=source,
+            runtime=runtime,
+            progress_callback=progress_callback,
+            force_full_sync=force_full_sync,
         )
 
 
@@ -270,9 +352,15 @@ async def run_source_sync(
 class SyncService:
     """App-scoped sync runner with task tracking and shutdown cleanup."""
 
-    def __init__(self, db: "Database", config: AppConfig) -> None:
+    def __init__(
+        self,
+        db: "Database",
+        config: AppConfig,
+        runtime_provider: RuntimeProvider | None = None,
+    ) -> None:
         self.db = db
         self.config = config
+        self.runtime_provider = runtime_provider or DefaultRuntimeProvider()
         self.tasks: dict[str, asyncio.Task] = {}
         self.queued_tasks: dict[str, asyncio.Task] = {}
         self.progress: dict[str, dict] = {}
@@ -324,11 +412,11 @@ class SyncService:
             await self.start_source(source["id"])
 
     async def retire_expired_memories(self) -> int:
-        runtime = await build_sync_runtime(self.db, self.config)
+        runtime = await self.runtime_provider.build_sync_runtime(self.db, self.config)
         return await runtime.memory_store.retire_expired_memories()
 
     async def check_memory_index_health(self) -> MemoryIndexHealthReport:
-        runtime = await build_sync_runtime(self.db, self.config)
+        runtime = await self.runtime_provider.build_sync_runtime(self.db, self.config)
         checker = MemoryIndexHealthChecker(
             db=self.db,
             memory_collection=runtime.memory_store.collection,
@@ -379,7 +467,7 @@ class SyncService:
             if not source:
                 raise ValueError(f"Source not found: {source_id}")
 
-            runtime = await build_sync_runtime(self.db, self.config)
+            runtime = await self.runtime_provider.build_sync_runtime(self.db, self.config)
 
             def on_progress(progress: dict) -> None:
                 current = progress.get("current", 0)
@@ -401,7 +489,7 @@ class SyncService:
                 )
                 self.progress[source_id]["title"] = progress.get("title")
 
-            return await run_source_sync(
+            return await self.runtime_provider.run_source_sync(
                 db=self.db,
                 config=self.config,
                 source=source,
