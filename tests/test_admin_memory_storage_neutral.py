@@ -103,3 +103,44 @@ def test_memory_list_route_uses_storage_neutral_admin_reader(tmp_path):
     )
     assert limit == 3
     assert offset == 2
+
+
+def test_memory_list_route_uses_injected_principal_resolver(tmp_path):
+    class FakeAdminReader:
+        def __init__(self) -> None:
+            self.scope: AccessScope | None = None
+
+        async def get_schedule_config(self) -> dict:
+            return {"enabled": False}
+
+        async def query_memory_admin_page(
+            self,
+            *,
+            scope: AccessScope,
+            filters: MemoryAdminListFilters,
+            limit: int,
+            offset: int,
+        ) -> MemoryAdminQueryPage:
+            self.scope = scope
+            return MemoryAdminQueryPage(memories=[], total=0)
+
+        async def get_origin_source_pairs(self, memory_ids: list[str]):
+            return {}
+
+    reader = FakeAdminReader()
+    app = create_admin_app(
+        db=reader,
+        config=_config(tmp_path),
+        principal_resolver=lambda request: request.headers["x-cloud-user-id"],
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/memories",
+            headers={"x-cloud-user-id": "cloud-user-1"},
+            params={"include_private": "true"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert reader.scope is not None
+    assert reader.scope.user_id == "cloud-user-1"

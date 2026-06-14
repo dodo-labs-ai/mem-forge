@@ -726,7 +726,6 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from memforge import runtime
     from memforge.memory.lifecycle import allowed_search_statuses
     from memforge.models import SearchResult
     from memforge.server.admin_api import create_admin_app
@@ -753,12 +752,15 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
                 ],
             }
 
-    async def fake_build_search_engine(_db, _config, *, audit_logger=None):
-        return FakeSearchEngine()
+    class FakeRuntimeProvider:
+        async def build_search_engine(self, _db, _config, *, audit_logger=None):
+            return FakeSearchEngine()
 
-    monkeypatch.setattr(runtime, "build_search_engine", fake_build_search_engine)
-
-    app = create_admin_app(db=db, config=_config(tmp_path))
+    app = create_admin_app(
+        db=db,
+        config=_config(tmp_path),
+        runtime_provider=FakeRuntimeProvider(),
+    )
     with TestClient(app) as client:
         response = client.post(
             "/api/memories/search",

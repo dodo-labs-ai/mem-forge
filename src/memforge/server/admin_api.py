@@ -16,7 +16,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -66,7 +66,12 @@ from memforge.provenance import (
     list_document_artifacts,
     select_document_artifact,
 )
-from memforge.runtime import SyncAlreadyRunningError, SyncService
+from memforge.runtime import (
+    DefaultRuntimeProvider,
+    RuntimeProvider,
+    SyncAlreadyRunningError,
+    SyncService,
+)
 from memforge.scheduler import SyncScheduler
 from memforge.source_secrets import (
     decrypt_secret,
@@ -96,16 +101,25 @@ def _workspace_default_scope(request: Request, *, include_private: bool):
     ``project-first``: cross-project rows stay visible and the ranker
     handles the affinity weighting.
     """
-    from memforge.server.principal import resolve_principal
     from memforge.storage.adapters.context import AccessScope
 
     return AccessScope(
-        user_id=resolve_principal(request),
+        user_id=resolve_request_principal(request),
         include_private=include_private,
         allowed_statuses=("active",),
         active_project=None,
         scope_mode="project-first",
     )
+
+
+def resolve_request_principal(request: Request) -> str:
+    """Resolve the request principal through the app-scoped resolver."""
+    resolver = getattr(request.app.state, "principal_resolver", None)
+    if resolver is None:
+        from memforge.server.principal import resolve_principal
+
+        resolver = resolve_principal
+    return resolver(request)
 
 
 async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
@@ -1606,14 +1620,17 @@ async def _build_memory_summary(
     )
 
 
-async def _build_memory_store(db: Database, config: AppConfig) -> MemoryStore:
+async def _build_memory_store(
+    db: Database,
+    config: AppConfig,
+    runtime_provider: RuntimeProvider | None = None,
+) -> MemoryStore:
     """Build a request-scoped memory store with effective embedding settings."""
 
     from memforge.memory.audit import AuditContext, MemoryAuditLogger
     from memforge.retrieval.document_index import DocumentVectorIndex
     from memforge.retrieval.embeddings import get_chroma_collection
     from memforge.runtime import get_effective_llm_config
-    from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
     llm = await get_effective_llm_config(db, config)
     memory_collection = get_chroma_collection(
@@ -1629,7 +1646,8 @@ async def _build_memory_store(db: Database, config: AppConfig) -> MemoryStore:
         "api_key": llm.embedding_api_key,
         "model": llm.embedding_model,
     }
-    adapters = build_sqlite_adapters(
+    provider = runtime_provider or DefaultRuntimeProvider()
+    adapters = provider.build_adapters(
         db,
         memory_collection,
         audit_logger=MemoryAuditLogger(
@@ -1646,7 +1664,11 @@ async def _build_memory_store(db: Database, config: AppConfig) -> MemoryStore:
     )
 
 
-async def _build_project_adapters(db: Database, config: AppConfig):
+async def _build_project_adapters(
+    db: Database,
+    config: AppConfig,
+    runtime_provider: RuntimeProvider | None = None,
+):
     """Build the storage adapters for project CRUD requests.
 
     The relational handle owns project rows; the vector handle is bound to
@@ -1655,13 +1677,13 @@ async def _build_project_adapters(db: Database, config: AppConfig):
     """
     from memforge.memory.audit import AuditContext, MemoryAuditLogger
     from memforge.retrieval.embeddings import get_chroma_collection
-    from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
     memory_collection = get_chroma_collection(
         chroma_path=config.storage.chroma_path,
         name="memories",
     )
-    return build_sqlite_adapters(
+    provider = runtime_provider or DefaultRuntimeProvider()
+    return provider.build_adapters(
         db,
         memory_collection,
         audit_logger=MemoryAuditLogger(
@@ -1703,14 +1725,18 @@ def _project_to_response(project: Project) -> ProjectResponse:
     )
 
 
-async def _build_review_service(db: Database, config: AppConfig) -> ReviewService:
+async def _build_review_service(
+    db: Database,
+    config: AppConfig,
+    runtime_provider: RuntimeProvider | None = None,
+) -> ReviewService:
     """Build a request-scoped review service.
 
     Embedding configuration comes from the same effective resolution that the
     sync runtime uses, so admin overrides flow through to approve-time
     re-embedding instead of going to a stale process default.
     """
-    memory_store = await _build_memory_store(db, config)
+    memory_store = await _build_memory_store(db, config, runtime_provider)
     return ReviewService(db=db, memory_store=memory_store)
 
 
@@ -1760,6 +1786,11 @@ def get_sync_scheduler(request: Request) -> SyncScheduler | None:
     return getattr(request.app.state, "sync_scheduler", None)
 
 
+def get_runtime_provider(request: Request) -> RuntimeProvider:
+    """FastAPI dependency: retrieve the app-scoped runtime provider."""
+    return request.app.state.runtime_provider
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -1768,6 +1799,8 @@ def get_sync_scheduler(request: Request) -> SyncScheduler | None:
 def create_admin_app(
     db: Database | None = None,
     config: AppConfig | None = None,
+    runtime_provider: RuntimeProvider | None = None,
+    principal_resolver: Callable[[Request], str] | None = None,
 ) -> FastAPI:
     """Create and configure the MemForge Admin API FastAPI application.
 
@@ -1785,6 +1818,7 @@ def create_admin_app(
     """
     if config is None:
         raise ValueError("config is required")
+    runtime_provider = runtime_provider or DefaultRuntimeProvider()
 
     owned_db: Database | None = None
 
@@ -1800,7 +1834,11 @@ def create_admin_app(
             app.state.db = db
 
         app.state.config = config
-        app.state.sync_service = SyncService(app.state.db, config)
+        app.state.runtime_provider = runtime_provider
+        app.state.principal_resolver = principal_resolver
+        app.state.sync_service = SyncService(
+            app.state.db, config, runtime_provider=runtime_provider
+        )
         app.state.sync_scheduler = SyncScheduler(app.state.db, app.state.sync_service)
         await app.state.sync_scheduler.start()
 
@@ -1820,9 +1858,11 @@ def create_admin_app(
     )
     if db is not None:
         app.state.db = db
-        app.state.sync_service = SyncService(db, config)
+        app.state.sync_service = SyncService(db, config, runtime_provider=runtime_provider)
         app.state.sync_scheduler = SyncScheduler(db, app.state.sync_service)
     app.state.config = config
+    app.state.runtime_provider = runtime_provider
+    app.state.principal_resolver = principal_resolver
 
     # -- CORS --
     cors_origins = config.server.cors_origins.split(",") if config.server.cors_origins != "*" else ["*"]
@@ -1987,11 +2027,11 @@ def create_admin_app(
 
     async def get_search_engine(request: Request, db: Database, config: AppConfig):
         from memforge.memory.audit import AuditContext, MemoryAuditLogger
-        from memforge.runtime import build_search_engine
 
         engine = getattr(request.app.state, "memory_search_engine", None)
         if engine is None:
-            engine = await build_search_engine(
+            runtime_provider = request.app.state.runtime_provider
+            engine = await runtime_provider.build_search_engine(
                 db,
                 config,
                 audit_logger=MemoryAuditLogger(
@@ -2252,12 +2292,11 @@ def create_admin_app(
     ):
         """Service-owned memory search used by local agent MCP proxies."""
         from memforge.memory.lifecycle import allowed_search_statuses
-        from memforge.server.principal import resolve_principal
         from memforge.storage.adapters.context import AccessScope
 
         try:
             engine = await get_search_engine(request, db, config)
-            user_id = resolve_principal(request)
+            user_id = resolve_request_principal(request)
             # `project-first` and `workspace` modes weight cross-project hits
             # but keep them visible at the predicate. `project` mode is the
             # only mode that narrows the workspace branch, and it narrows to
@@ -2388,6 +2427,7 @@ def create_admin_app(
         req: MemoryUpdateRequest = Body(...),
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
         """Update a memory's content, confidence, or status (admin override)."""
         memory = await db.get_memory(memory_id)
@@ -2395,7 +2435,7 @@ def create_admin_app(
             raise HTTPException(status_code=404, detail="Memory not found")
 
         if req.content is not None or req.confidence is not None:
-            memory_store = await _build_memory_store(db, config)
+            memory_store = await _build_memory_store(db, config, runtime_provider)
             await memory_store.update_memory(
                 memory_id,
                 new_content=req.content or memory.content,
@@ -2406,7 +2446,7 @@ def create_admin_app(
             if req.status not in ("active", "superseded", "retired", "decayed", "pending_review"):
                 raise HTTPException(status_code=400, detail=f"Invalid status: {req.status}")
             status = normalize_memory_status(req.status)
-            memory_store = await _build_memory_store(db, config)
+            memory_store = await _build_memory_store(db, config, runtime_provider)
             if status == "retired":
                 await memory_store.retire_memory(memory_id, reason="admin_hidden")
             elif status == "pending_review":
@@ -2430,12 +2470,13 @@ def create_admin_app(
         memory_id: str,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
         """Soft-delete a memory (mark as retired and hide from search)."""
         memory = await db.get_memory(memory_id)
         if not memory:
             raise HTTPException(status_code=404, detail="Memory not found")
-        memory_store = await _build_memory_store(db, config)
+        memory_store = await _build_memory_store(db, config, runtime_provider)
         await memory_store.retire_memory(memory_id, reason="admin_hidden")
         return {"status": "deleted", "memory_id": memory_id}
 
@@ -2444,13 +2485,14 @@ def create_admin_app(
         memory_id: str,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
         """Hard-purge a memory for privacy/compliance removal."""
         memory = await db.get_memory(memory_id)
         if not memory:
             raise HTTPException(status_code=404, detail="Memory not found")
 
-        memory_store = await _build_memory_store(db, config)
+        memory_store = await _build_memory_store(db, config, runtime_provider)
         purged = await memory_store.purge_memory(memory_id)
         if not purged:
             raise HTTPException(status_code=404, detail="Memory not found")
@@ -3260,6 +3302,7 @@ def create_admin_app(
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         sync_service: SyncService = Depends(get_sync_service),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
         """Delete a source, its documents, and retire memories left without support."""
         existing = await db.get_source(source_id)
@@ -3279,7 +3322,7 @@ def create_admin_app(
         for doc in await db.list_documents(source=source_id, limit=100000):
             doc_store.delete_document_files(source_name=existing["name"], title=doc.title)
 
-        memory_store = await _build_memory_store(db, config)
+        memory_store = await _build_memory_store(db, config, runtime_provider)
         await memory_store.delete_source_cascade(source_id)
         return {"ok": True, "deleted_source": source_id}
 
@@ -3533,9 +3576,7 @@ def create_admin_app(
             AgentHookContextRequest as HookContextRequest,
             build_agent_hook_context,
         )
-        from memforge.server.principal import resolve_principal
-
-        principal_user_id = resolve_principal(request)
+        principal_user_id = resolve_request_principal(request)
         engine = await get_search_engine(request, db, config)
 
         hook_request = HookContextRequest(
@@ -3675,8 +3716,9 @@ def create_admin_app(
     async def list_projects_route(
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        adapters = await _build_project_adapters(db, config)
+        adapters = await _build_project_adapters(db, config, runtime_provider)
         rows = await adapters.relational.list_projects()
         return [_project_to_response(p) for p in rows]
 
@@ -3687,8 +3729,9 @@ def create_admin_app(
         req: ProjectCreateRequest,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        adapters = await _build_project_adapters(db, config)
+        adapters = await _build_project_adapters(db, config, runtime_provider)
         key = (req.key or _derive_project_key(req.name)).strip()
         if not key:
             raise HTTPException(status_code=400, detail="project key cannot be empty")
@@ -3709,8 +3752,9 @@ def create_admin_app(
         req: ProjectUpdateRequest,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        adapters = await _build_project_adapters(db, config)
+        adapters = await _build_project_adapters(db, config, runtime_provider)
         existing = await adapters.relational.get_project(project_id)
         if existing is None:
             raise HTTPException(status_code=404, detail="project not found")
@@ -3729,15 +3773,16 @@ def create_admin_app(
         project_id: str,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        adapters = await _build_project_adapters(db, config)
+        adapters = await _build_project_adapters(db, config, runtime_provider)
         try:
             affected = await adapters.relational.list_project_memory_ids(project_id)
         except LookupError:
             raise HTTPException(status_code=404, detail="project not found")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        memory_store = await _build_memory_store(db, config)
+        memory_store = await _build_memory_store(db, config, runtime_provider)
         # Vector metadata moves first so a failure here aborts the
         # transaction with both stores still pointing at the original
         # project. Only after the vector channel reports success do we
@@ -3816,8 +3861,9 @@ def create_admin_app(
         req: MemoryReviewDecisionRequest = MemoryReviewDecisionRequest(),
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        service = await _build_review_service(db, config)
+        service = await _build_review_service(db, config, runtime_provider)
         try:
             result = await service.approve(
                 review_id,
@@ -3863,11 +3909,12 @@ def create_admin_app(
         req: MemoryReviewDecisionRequest,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
         if not req.note or not req.note.strip():
             raise HTTPException(status_code=400, detail="A note is required to reject a review")
 
-        service = await _build_review_service(db, config)
+        service = await _build_review_service(db, config, runtime_provider)
         try:
             result = await service.reject(
                 review_id,
@@ -3910,8 +3957,9 @@ def create_admin_app(
         review_id: str,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        service = await _build_review_service(db, config)
+        service = await _build_review_service(db, config, runtime_provider)
         try:
             result = await service.refresh(review_id)
         except ReviewNotFound:

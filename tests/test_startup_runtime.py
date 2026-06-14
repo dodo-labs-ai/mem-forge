@@ -182,6 +182,32 @@ def test_enrichment_and_extraction_clients_bound_request_timeout(monkeypatch):
     assert extractor.structured_llm_client.config.timeout_s == 42.0
 
 
+def test_sync_runtime_uses_injected_orchestrator_factory():
+    from memforge.runtime import SyncRuntime
+
+    class SentinelOrchestrator:
+        pass
+
+    sentinel = SentinelOrchestrator()
+    runtime = SyncRuntime(
+        db=object(),
+        config=AppConfig(),
+        doc_store=object(),
+        enricher=object(),
+        memory_extractor=object(),
+        memory_store=object(),
+        memory_engine=object(),
+        vector_store=object(),
+        embed_cfg={},
+        structured_llm_client=None,
+        llm_model="test-model",
+        source_support_detector=None,
+        orchestrator_factory=lambda _runtime: sentinel,
+    )
+
+    assert runtime.orchestrator() is sentinel
+
+
 def test_admin_app_lifespan_owns_database_and_sync_service(tmp_path):
     """The API startup path should open/close DB resources through FastAPI lifespan."""
     from memforge.server.admin_api import create_admin_app
