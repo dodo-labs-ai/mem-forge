@@ -16,8 +16,15 @@ assert.deepEqual(
 
 assert.deepEqual(
   sourceActionLayout.menu.map((action) => action.id),
-  ["force-resync", "delete"],
-  "source cards should move expensive and destructive actions into the overflow menu",
+  ["toggle-status", "force-resync", "delete"],
+  "source cards should move source lifecycle, expensive, and destructive actions into the overflow menu",
+);
+
+const toggleStatus = sourceActionLayout.menu.find((action) => action.id === "toggle-status");
+assert.equal(toggleStatus?.tone, "neutral");
+assert.equal(
+  toggleStatus?.description,
+  "Pause or resume source discovery without deleting configuration or extracted memories.",
 );
 
 const forceResync = sourceActionLayout.menu.find((action) => action.id === "force-resync");
@@ -84,6 +91,39 @@ assert.deepEqual(
 );
 
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
+const sourceRowSource = readFileSync("src/views/sources/SourceRow.tsx", "utf8");
+
+assert.match(
+  sourcesPageSource,
+  /setSourceStatus\s*=\s*useMutation/,
+  "SourcesPage should update source lifecycle through the generic source update endpoint",
+);
+assert.match(
+  sourcesPageSource,
+  /client\.put\(`\/api\/sources\/\$\{sourceId\}`,\s*\{\s*status\s*\}\)/,
+  "Pause and resume should use PUT /api/sources/{id} with a status body",
+);
+assert.match(
+  sourcesPageSource,
+  /onToggleStatus=\{\(\)\s*=>\s*\{/,
+  "SourceActionsMenu should receive a pause/resume action per source row",
+);
+assert.match(
+  sourceRowSource,
+  /const isPaused = source\.status === "paused";/,
+  "SourceRow should derive paused state from the source status",
+);
+assert.match(
+  sourceRowSource,
+  /disabled=\{isSyncing \|\| isDeleting \|\| isPaused\}/,
+  "Paused sources should not expose an enabled primary Sync button",
+);
+assert.match(
+  sourceRowSource,
+  /onRetry=\{isPaused \? undefined : onSync\}/,
+  "Paused sources should not expose retry sync from the status bar",
+);
+
 assert.match(
   sourcesPageSource,
   /className="[^"]*cursor-pointer[^"]*disabled:cursor-not-allowed[^"]*"/,

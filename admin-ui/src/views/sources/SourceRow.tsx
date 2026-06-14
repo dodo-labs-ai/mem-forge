@@ -1,11 +1,12 @@
 import type { ReactNode } from "react";
-import { Info, Loader2, Play, SlidersHorizontal } from "lucide-react";
+import { Info, Loader2, Pause, Play, SlidersHorizontal } from "lucide-react";
 import type { Source } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
 import { SyncStatusBar } from "@/components/admin/SyncStatusBar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { SourceIcon } from "@/components/sources/SourceIcon";
+import { cn } from "@/lib/utils";
 import { timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
 
@@ -28,6 +29,7 @@ export function SourceRow({
   perGroupMemoryCount,
   isSyncing,
   isDeleting,
+  isUpdatingStatus = false,
   canConfigure,
   isManaged,
   sourceLabel,
@@ -35,6 +37,7 @@ export function SourceRow({
   authSessionLabel,
   onConfigure,
   onSync,
+  onResume,
   onShowDetails,
   actionsMenu,
 }: {
@@ -42,6 +45,7 @@ export function SourceRow({
   perGroupMemoryCount: number;
   isSyncing: boolean;
   isDeleting: boolean;
+  isUpdatingStatus?: boolean;
   canConfigure: boolean;
   isManaged: boolean;
   sourceLabel: SourceRowLabels;
@@ -49,9 +53,13 @@ export function SourceRow({
   authSessionLabel: (status: string) => string;
   onConfigure: () => void;
   onSync: () => void;
+  onResume?: () => void;
   onShowDetails: () => void;
   actionsMenu: ReactNode;
 }) {
+  const isPaused = source.status === "paused";
+  const pausedSyncHint = "Source is paused. Resume the source to sync again.";
+
   return (
     <div className="space-y-3 p-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -60,8 +68,16 @@ export function SourceRow({
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="truncate text-sm font-medium">{source.name}</h3>
-              <StatusDot status={source.status} />
-              <Badge variant={source.status === "active" ? "secondary" : "outline"}>
+              <StatusDot
+                status={source.status}
+                className={isPaused ? "bg-amber-500" : undefined}
+              />
+              <Badge
+                variant={isPaused ? "outline" : source.status === "active" ? "secondary" : "outline"}
+                className={cn(
+                  isPaused && "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-900/30 dark:text-amber-200",
+                )}
+              >
                 {source.status}
               </Badge>
             </div>
@@ -127,7 +143,19 @@ export function SourceRow({
             </Button>
           )}
           {!isManaged && (
-            <Button type="button" disabled={isSyncing || isDeleting} onClick={onSync}>
+            <Button
+              type="button"
+              disabled={isSyncing || isDeleting || isPaused}
+              onClick={onSync}
+              title={isPaused ? pausedSyncHint : undefined}
+              aria-label={
+                isPaused
+                  ? pausedSyncHint
+                  : isSyncing
+                    ? "Sync in progress"
+                    : sourceActionLayout.primary[1].label
+              }
+            >
               {isSyncing ? (
                 <Loader2 className="size-4 animate-spin" />
               ) : (
@@ -140,7 +168,39 @@ export function SourceRow({
         </div>
       </div>
 
-      <SyncStatusBar sync={source.sync} itemLabel={itemLabel} onRetry={onSync} />
+      {isPaused && !isManaged && (
+        <div
+          role="status"
+          className="flex flex-col gap-2 rounded-md border border-amber-200 bg-amber-50/70 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-100 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div className="flex items-start gap-2">
+            <Pause className="mt-0.5 size-4 shrink-0" />
+            <span>
+              Sync is paused. New {itemLabel} are not discovered, and existing memories stay in place.
+            </span>
+          </div>
+          {onResume && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={onResume}
+              disabled={isUpdatingStatus || isDeleting}
+              className="border-amber-300 bg-background text-amber-900 hover:bg-amber-100 dark:border-amber-800 dark:text-amber-100 dark:hover:bg-amber-900/40"
+              aria-label={`Resume sync for ${source.name}`}
+            >
+              {isUpdatingStatus ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Play className="size-4" />
+              )}
+              Resume
+            </Button>
+          )}
+        </div>
+      )}
+
+      <SyncStatusBar sync={source.sync} itemLabel={itemLabel} onRetry={isPaused ? undefined : onSync} />
     </div>
   );
 }

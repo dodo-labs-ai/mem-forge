@@ -68,9 +68,11 @@ from memforge.provenance import (
 )
 from memforge.runtime import (
     DefaultRuntimeProvider,
+    RuntimeHealthComponent,
     RuntimeProvider,
     SyncAlreadyRunningError,
     SyncService,
+    SourcePausedError,
 )
 from memforge.scheduler import SyncScheduler
 from memforge.source_secrets import (
@@ -89,6 +91,12 @@ from memforge.storage.admin_memory import MemoryAdminListFilters
 from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
+
+SOURCE_ACTIVE_STATUS = "active"
+SOURCE_PAUSED_STATUS = "paused"
+# Source lifecycle is deliberately closed for now. A paused source keeps its
+# configuration and existing memories but cannot accept new sync work.
+SOURCE_STATUSES = {SOURCE_ACTIVE_STATUS, SOURCE_PAUSED_STATUS}
 
 
 def _workspace_default_scope(request: Request, *, include_private: bool):
@@ -132,56 +140,6 @@ async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
     return await SqliteRelationalStore(db).filter_visible_ids(list(ids), scope)
 
 
-AUDIT_HEALTH_FAILURE_EVENTS = (
-    "source_support_verification_failed",
-    "contradiction_detection_failed",
-    "reconciliation_failed",
-    "reconciliation_action_failed",
-    "index_operation_failed",
-    "review_resolution_failed",
-)
-AUDIT_HEALTH_WINDOW_HOURS = 24
-
-
-async def _recent_audit_failure_health(db: Database) -> ComponentHealth:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=AUDIT_HEALTH_WINDOW_HOURS)
-    since = cutoff.isoformat()
-    placeholders = ", ".join("?" for _ in AUDIT_HEALTH_FAILURE_EVENTS)
-    params: list[Any] = [*AUDIT_HEALTH_FAILURE_EVENTS, since]
-    async with db.db.execute(
-        f"""SELECT event_type, COUNT(*), MAX(occurred_at)
-            FROM memory_audit_events
-            WHERE event_type IN ({placeholders})
-              AND occurred_at >= ?
-              AND (status = 'failed' OR error IS NOT NULL)
-            GROUP BY event_type
-            ORDER BY event_type""",
-        params,
-    ) as cursor:
-        rows = await cursor.fetchall()
-
-    counts_by_event_type = {str(row[0]): int(row[1]) for row in rows}
-    payload = {
-        "window_hours": AUDIT_HEALTH_WINDOW_HOURS,
-        "since": since,
-        "counts_by_event_type": counts_by_event_type,
-        "total": sum(counts_by_event_type.values()),
-        "last_seen_at": max((row[2] for row in rows if row[2]), default=None),
-    }
-    if not rows:
-        return ComponentHealth(
-            status="ok",
-            detail=f"No audit failures in the last {AUDIT_HEALTH_WINDOW_HOURS}h",
-            payload=payload,
-        )
-    summary = ", ".join(f"{row[0]}={row[1]}" for row in rows)
-    return ComponentHealth(
-        status="warning",
-        detail=f"Recent audit failures in the last {AUDIT_HEALTH_WINDOW_HOURS}h: {summary}",
-        payload=payload,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Pydantic request / response models
 # ---------------------------------------------------------------------------
@@ -202,6 +160,14 @@ class HealthResponse(BaseModel):
     index_consistency: ComponentHealth | None = None
     audit_failures: ComponentHealth | None = None
     genes: dict[str, ComponentHealth] = {}
+
+
+def _runtime_component_to_response(component: RuntimeHealthComponent) -> ComponentHealth:
+    return ComponentHealth(
+        status=component.status,
+        detail=component.detail,
+        payload=component.payload,
+    )
 
 
 class MemoryStatEntry(BaseModel):
@@ -570,6 +536,29 @@ def _validate_source_project_binding(binding: dict | None) -> None:
             raise ValueError("field project binding requires field and default")
         return
     raise ValueError("project binding mode must be fixed or by_field")
+
+
+def _validate_source_status(status: str | None) -> None:
+    if status is None:
+        return
+    if status not in SOURCE_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid source status: "
+                f"{status}. Expected one of {', '.join(sorted(SOURCE_STATUSES))}"
+            ),
+        )
+
+
+def _source_paused_http_error() -> HTTPException:
+    return HTTPException(status_code=400, detail="Source is paused")
+
+
+async def _raise_if_source_paused(db: Database, source_id: str) -> None:
+    source = await db.get_source(source_id)
+    if source and source.get("status") == SOURCE_PAUSED_STATUS:
+        raise _source_paused_http_error()
 
 
 class AgentSessionDocumentRequest(BaseModel):
@@ -2046,96 +2035,28 @@ def create_admin_app(
     # ===================================================================
 
     @health_router.get("/api/health", response_model=HealthResponse)
-    async def health(db: Database = Depends(get_db)):
-        """System health check: database, ChromaDB, and gene connectivity."""
-        overall = "healthy"
-
-        # Database health
-        db_health = ComponentHealth(status="ok")
-        try:
-            memory_count = await db.count_memories()
-            db_health.detail = f"{memory_count} memories"
-        except Exception as e:
-            db_health = ComponentHealth(status="error", detail=str(e))
-            overall = "degraded"
-
-        # ChromaDB / vector store health
-        vector_health = ComponentHealth(status="ok")
-        try:
-            import chromadb
-            chroma_path = config.storage.chroma_path
-            if Path(chroma_path).exists():
-                client = chromadb.PersistentClient(path=chroma_path)
-                collections = client.list_collections()
-                vector_health.detail = f"{len(collections)} collection(s)"
-            else:
-                vector_health = ComponentHealth(status="not_configured", detail="ChromaDB path does not exist")
-        except ImportError:
-            vector_health = ComponentHealth(status="not_available", detail="chromadb not installed")
-        except Exception as e:
-            vector_health = ComponentHealth(status="error", detail=str(e))
-            overall = "degraded"
-
-        index_health: ComponentHealth | None = None
-        try:
-            from memforge.memory.health import MemoryIndexHealthChecker
-            from memforge.retrieval.embeddings import get_chroma_collection
-
-            if Path(config.storage.chroma_path).exists():
-                memory_collection = get_chroma_collection(config.storage.chroma_path, name="memories")
-                document_collection = get_chroma_collection(config.storage.chroma_path, name="documents")
-                report = await MemoryIndexHealthChecker(
-                    db=db,
-                    memory_collection=memory_collection,
-                    document_collection=document_collection,
-                ).check()
-                if report.ok:
-                    index_health = ComponentHealth(status="ok", detail="No index consistency issues")
-                else:
-                    overall = "degraded"
-                    index_health = ComponentHealth(
-                        status="error",
-                        detail=f"{len(report.issues)} consistency issue(s)",
-                    )
-            else:
-                index_health = ComponentHealth(status="not_configured", detail="ChromaDB path does not exist")
-        except Exception as e:
-            overall = "degraded"
-            index_health = ComponentHealth(status="error", detail=str(e))
-
-        audit_health: ComponentHealth | None = None
-        try:
-            audit_health = await _recent_audit_failure_health(db)
-        except Exception as e:
-            audit_health = ComponentHealth(status="warning", detail=str(e))
-
-        # Gene connectivity (check sync state for each configured source)
-        gene_health: dict[str, ComponentHealth] = {}
-        try:
-            sources = await db.list_sources()
-            for src in sources:
-                source_id = src["id"]
-                source_name = src.get("name", source_id)
-                sync_state = await db.get_sync_state(source_id)
-                if sync_state and sync_state.last_sync_status:
-                    gene_health[source_name] = ComponentHealth(
-                        status=sync_state.last_sync_status,
-                        detail=_dt_iso(sync_state.last_sync_at),
-                    )
-                else:
-                    gene_health[source_name] = ComponentHealth(
-                        status="never_synced",
-                    )
-        except Exception as e:
-            logger.warning("Failed to check gene connectivity: %s", e)
-
+    async def health(request: Request, db: Database = Depends(get_db)):
+        """System health check through the active runtime provider."""
+        runtime_provider = request.app.state.runtime_provider
+        report = await runtime_provider.check_health(db, config)
         return HealthResponse(
-            status=overall,
-            database=db_health,
-            vector_store=vector_health,
-            index_consistency=index_health,
-            audit_failures=audit_health,
-            genes=gene_health,
+            status=report.status,
+            database=_runtime_component_to_response(report.database),
+            vector_store=_runtime_component_to_response(report.vector_store),
+            index_consistency=(
+                _runtime_component_to_response(report.index_consistency)
+                if report.index_consistency
+                else None
+            ),
+            audit_failures=(
+                _runtime_component_to_response(report.audit_failures)
+                if report.audit_failures
+                else None
+            ),
+            genes={
+                name: _runtime_component_to_response(component)
+                for name, component in report.genes.items()
+            },
         )
 
     @health_router.get("/api/stats", response_model=StatsResponse)
@@ -3240,6 +3161,7 @@ def create_admin_app(
         if not existing:
             raise HTTPException(status_code=404, detail="Source not found")
 
+        _validate_source_status(req.status)
         name = req.name or existing["name"]
         if req.config is not None:
             try:
@@ -3284,6 +3206,7 @@ def create_admin_app(
             type=existing["type"],
             name=name,
             config_json=json.dumps(src_config),
+            status=req.status if _request_includes_field(req, "status") else None,
             project_binding=(
                 req.project_binding
                 if _request_includes_field(req, "project_binding")
@@ -3337,11 +3260,15 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-
         try:
-            sync_service.start_source(source_id, force_full_sync=bool(req and req.force_full_sync))
+            await sync_service.start_source(
+                source_id,
+                force_full_sync=bool(req and req.force_full_sync),
+            )
         except SyncAlreadyRunningError:
             raise HTTPException(status_code=409, detail="Sync already running for this source")
+        except SourcePausedError:
+            raise _source_paused_http_error()
         return {"ok": True, "message": "Sync started", "source_id": source_id}
 
     @source_router.post("/{source_id}/force-resync")
@@ -3354,15 +3281,16 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-
         if sync_service.is_running(source_id):
             raise HTTPException(status_code=409, detail="Sync already running for this source")
 
         await db.reset_source_sync_cursor(source_id)
         try:
-            sync_service.start_source(source_id)
+            await sync_service.start_source(source_id)
         except SyncAlreadyRunningError:
             raise HTTPException(status_code=409, detail="Sync already running for this source")
+        except SourcePausedError:
+            raise _source_paused_http_error()
         return {"ok": True, "message": "Force resync started", "source_id": source_id}
 
     @source_router.post("/{source_id}/adapter/documents")
@@ -3385,6 +3313,8 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
+        if source.get("status") == SOURCE_PAUSED_STATUS:
+            raise HTTPException(status_code=400, detail="Source is paused")
 
         try:
             result = await submit_local_markdown_document(
@@ -3406,10 +3336,12 @@ def create_admin_app(
         sync_started = False
         if req.process_now:
             try:
-                sync_service.start_source(source_id)
+                await sync_service.start_source(source_id)
                 sync_started = True
             except SyncAlreadyRunningError:
                 sync_started = True
+            except SourcePausedError:
+                raise _source_paused_http_error()
 
         return {**result, "sync_started": sync_started}
 
@@ -3425,7 +3357,9 @@ def create_admin_app(
         sync_service: SyncService = Depends(get_sync_service),
     ):
         """Submit a client-generated agent session summary document."""
-        from memforge.agent_sessions import submit_agent_session_document
+        from memforge.agent_sessions import agent_session_source_id, submit_agent_session_document
+
+        await _raise_if_source_paused(db, agent_session_source_id(req.client))
 
         try:
             result = await submit_agent_session_document(
@@ -3453,10 +3387,12 @@ def create_admin_app(
         sync_started = False
         if req.process_now:
             try:
-                sync_service.start_source(result["source_id"])
+                await sync_service.start_source(result["source_id"])
                 sync_started = True
             except SyncAlreadyRunningError:
                 sync_started = True
+            except SourcePausedError:
+                raise _source_paused_http_error()
 
         return {
             **result,
@@ -3483,10 +3419,12 @@ def create_admin_app(
         sync_service: SyncService = Depends(get_sync_service),
     ):
         """Submit a client transcript window for server-side package generation."""
-        from memforge.agent_sessions import submit_agent_session_window
+        from memforge.agent_sessions import agent_session_source_id, submit_agent_session_window
 
         if req.schema_version != "agent-session-window/v1":
             raise HTTPException(status_code=400, detail=f"unsupported schema_version: {req.schema_version}")
+
+        await _raise_if_source_paused(db, agent_session_source_id(req.client))
 
         structured_client = getattr(request.app.state, "agent_session_window_client", None)
         if structured_client is None:
@@ -3523,12 +3461,14 @@ def create_admin_app(
         sync_queued = False
         if result.get("result") == "package_created" and req.process_now:
             try:
-                sync_service.start_source(result["source_id"])
+                await sync_service.start_source(result["source_id"])
                 sync_started = True
             except SyncAlreadyRunningError:
                 sync_started = True
+            except SourcePausedError:
+                raise _source_paused_http_error()
         elif result.get("result") == "package_created":
-            sync_queued = sync_service.request_source_sync(result["source_id"])
+            sync_queued = await sync_service.request_source_sync(result["source_id"])
 
         return {
             **result,

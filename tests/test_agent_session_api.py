@@ -374,11 +374,11 @@ def test_agent_session_window_api_queues_service_owned_sync(tmp_path):
         def __init__(self):
             self.queued: list[str] = []
 
-        def request_source_sync(self, source_id: str) -> bool:
+        async def request_source_sync(self, source_id: str) -> bool:
             self.queued.append(source_id)
             return True
 
-        def start_source(self, source_id: str, *, force_full_sync: bool = False):
+        async def start_source(self, source_id: str, *, force_full_sync: bool = False):
             raise AssertionError("plugin-style immediate sync should not be used")
 
         async def shutdown(self):

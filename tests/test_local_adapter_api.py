@@ -222,6 +222,32 @@ def test_local_adapter_push_rejects_path_traversal(tmp_path):
         asyncio.run(database.close())
 
 
+def test_local_adapter_push_rejects_paused_source(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            created = _create_local_markdown_source(client)
+            source_id = created["id"]
+            assert client.put(f"/api/sources/{source_id}", json={"status": "paused"}).status_code == 200
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "vault_id": "engineering",
+                    "relative_path": "notes.md",
+                    "markdown_body": "# Notes",
+                    "process_now": False,
+                },
+            )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Source is paused"
+    finally:
+        asyncio.run(database.close())
+
+
 def test_local_adapter_push_requires_local_markdown_source(tmp_path):
     """Pushing to a non-local-markdown source must be rejected."""
     from memforge.server.admin_api import create_admin_app

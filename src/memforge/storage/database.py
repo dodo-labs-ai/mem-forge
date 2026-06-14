@@ -2550,6 +2550,7 @@ class Database:
         type: str,
         name: str,
         config_json: str,
+        status: str | None = None,
         project_binding: Mapping[str, Any] | None = None,
     ) -> None:
         """Insert or update a source row.
@@ -2563,14 +2564,18 @@ class Database:
         )
         async with self._write_lock:
             await self.db.execute(
-                """INSERT INTO sources (id, type, name, config, project_binding)
-                   VALUES (?, ?, ?, ?, ?)
+                """INSERT INTO sources (id, type, name, config, status, project_binding)
+                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?)
                    ON CONFLICT(id) DO UPDATE SET
                    type=excluded.type,
                    name=excluded.name,
                    config=excluded.config,
+                   status=CASE
+                       WHEN ? IS NULL THEN sources.status
+                       ELSE excluded.status
+                   END,
                    project_binding=excluded.project_binding""",
-                (id, type, name, config_json, binding_json),
+                (id, type, name, config_json, status, binding_json, status),
             )
             await self.db.commit()
 
