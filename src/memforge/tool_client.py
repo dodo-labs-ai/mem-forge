@@ -39,10 +39,13 @@ class ToolClient:
         *,
         api_url: str | None = None,
         api_token: str | None = None,
+        workspace_id: str | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self.api_url = (api_url or os.getenv("MEMFORGE_API_URL") or DEFAULT_API_URL).rstrip("/")
         self.api_token = api_token if api_token is not None else os.getenv("MEMFORGE_API_TOKEN")
+        self.workspace_id = workspace_id if workspace_id is not None else os.getenv("MEMFORGE_WORKSPACE_ID")
+        self.workspace_id = (self.workspace_id or "").strip()
         self.timeout_seconds = timeout_seconds
 
     def search(
@@ -182,7 +185,11 @@ class ToolClient:
         if isinstance(parsed_max_chars, dict):
             return parsed_max_chars
 
-        target = _parse_resource_url(str(url or "").strip(), self.api_url)
+        target = _parse_resource_url(
+            str(url or "").strip(),
+            self.api_url,
+            self._request_url,
+        )
         if target is None:
             return {
                 "error": "unsupported resource URL",
@@ -223,7 +230,7 @@ class ToolClient:
     def _http_json(self, method: str, path: str, body: dict[str, Any] | None) -> dict[str, Any]:
         data = None if body is None else json.dumps(body).encode("utf-8")
         request = Request(
-            f"{self.api_url}{path}",
+            self._request_url(path),
             data=data,
             headers=self._headers(json_body=body is not None),
             method=method,
@@ -315,8 +322,22 @@ class ToolClient:
                 tmp_path.unlink(missing_ok=True)
             raise
 
+    def _request_url(self, path: str) -> str:
+        if not self.workspace_id or not path.startswith("/api"):
+            return f"{self.api_url}{path}"
+        quoted_workspace = quote(self.workspace_id, safe="")
+        if path == "/api":
+            return f"{self.api_url}/api/workspaces/{quoted_workspace}/api"
+        if path.startswith("/api/"):
+            return f"{self.api_url}/api/workspaces/{quoted_workspace}/api/{path[len('/api/'):]}"
+        return f"{self.api_url}{path}"
 
-def _parse_resource_url(url: str, api_base_url: str) -> ResourceTarget | None:
+
+def _parse_resource_url(
+    url: str,
+    api_base_url: str,
+    request_url_for_path,
+) -> ResourceTarget | None:
     parsed = urlparse(url)
     base = urlparse(api_base_url)
     if parsed.query or parsed.fragment:
@@ -338,11 +359,11 @@ def _parse_resource_url(url: str, api_base_url: str) -> ResourceTarget | None:
     if any(part in {".", ".."} or "/" in part or "\\" in part for part in parts):
         return None
     if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "content":
-        return ResourceTarget(parts[2], "content", path, f"{api_base_url}{path}")
+        return ResourceTarget(parts[2], "content", path, request_url_for_path(path))
     if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "pdf":
-        return ResourceTarget(parts[2], "pdf", path, f"{api_base_url}{path}")
+        return ResourceTarget(parts[2], "pdf", path, request_url_for_path(path))
     if len(parts) == 5 and parts[:2] == ["api", "documents"] and parts[3] == "artifacts":
-        return ResourceTarget(parts[2], parts[4], path, f"{api_base_url}{path}")
+        return ResourceTarget(parts[2], parts[4], path, request_url_for_path(path))
     return None
 
 

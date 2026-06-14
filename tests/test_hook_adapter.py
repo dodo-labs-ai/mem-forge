@@ -884,6 +884,80 @@ def test_mcp_proxy_forwards_search_to_service_with_token(monkeypatch):
     assert json.loads(captured["body"].decode()) == {"query": "artifact cache"}
 
 
+def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["url"] = request.full_url
+            captured["authorization"] = request.get_header("Authorization")
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    result = proxy._call_tool("search", {"query": "artifact cache"})
+
+    assert result == {"results": []}
+    assert captured["url"] == "https://memforge.example/api/workspaces/mount_tai/api/memories/search"
+    assert captured["authorization"] == "Bearer token-123"
+    assert json.loads(captured["body"].decode()) == {"query": "artifact cache"}
+
+
+def test_mcp_proxy_fetches_resource_through_hosted_workspace(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "text/markdown"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b"# Source"
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["url"] = request.full_url
+            captured["authorization"] = request.get_header("Authorization")
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    result = proxy._call_tool(
+        "get_resource",
+        {"url": "/api/documents/doc-1/content", "mode": "text"},
+    )
+
+    assert result["text"] == "# Source"
+    assert result["url"] == "/api/documents/doc-1/content"
+    assert captured["url"] == "https://memforge.example/api/workspaces/mount_tai/api/documents/doc-1/content"
+    assert captured["authorization"] == "Bearer token-123"
+
+
 def test_mcp_proxy_downloads_resource_to_local_cache(monkeypatch, tmp_path):
     proxy = _load_plugin_mcp_proxy()
     captured = {}
@@ -1023,6 +1097,37 @@ def test_post_json_accepts_admin_api_url_with_or_without_api_suffix(monkeypatch)
     assert urls == [
         "http://127.0.0.1:8766/api/hooks/context",
         "http://127.0.0.1:8766/api/hooks/context",
+    ]
+
+
+def test_post_json_targets_hosted_workspace_when_configured(monkeypatch):
+    from memforge import hook_adapter
+
+    urls: list[str] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def fake_urlopen(request, timeout: float):
+        urls.append(request.full_url)
+        return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
+
+    hook_adapter._post_json("/api/hooks/context", {}, api_url="https://memforge.example", timeout=1)
+    hook_adapter._post_json("/api/agent-sessions/windows", {}, api_url="https://memforge.example/api", timeout=1)
+
+    assert urls == [
+        "https://memforge.example/api/workspaces/mount_tai/api/hooks/context",
+        "https://memforge.example/api/workspaces/mount_tai/api/agent-sessions/windows",
     ]
 
 

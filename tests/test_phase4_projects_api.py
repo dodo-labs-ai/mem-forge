@@ -201,6 +201,23 @@ def test_derive_project_key_collapses_punctuation():
     assert _derive_project_key("a" * 100) == "A" * 32
 
 
+def _local_markdown_source_payload(
+    *,
+    name: str = "Engineering Notes",
+    project_binding: dict | None = None,
+) -> dict:
+    payload = {
+        "type": "local_markdown",
+        "name": name,
+        "config": {
+            "vault_id": "engineering-notes",
+        },
+    }
+    if project_binding is not None:
+        payload["project_binding"] = project_binding
+    return payload
+
+
 def test_create_source_round_trips_project_binding(tmp_path):
     """A binding sent on POST /api/sources is persisted and surfaces on GET."""
     app, database = _make_app(tmp_path)
@@ -214,12 +231,7 @@ def test_create_source_round_trips_project_binding(tmp_path):
             }
             resp = client.post(
                 "/api/sources",
-                json={
-                    "type": "agent_session",
-                    "name": "codex sessions",
-                    "config": {"client": "codex", "documents_dir": str(tmp_path / "in")},
-                    "project_binding": binding,
-                },
+                json=_local_markdown_source_payload(project_binding=binding),
             )
             assert resp.status_code == 200, resp.text
             source_id = resp.json()["id"]
@@ -240,12 +252,8 @@ def test_create_source_without_project_binding_lands_in_unmapped(tmp_path):
         with TestClient(app) as client:
             resp = client.post(
                 "/api/sources",
-                json={
-                    "type": "agent_session",
-                    "name": "codex sessions",
-                        "config": {"client": "codex", "documents_dir": str(tmp_path / "in")},
-                    },
-                )
+                json=_local_markdown_source_payload(),
+            )
             assert resp.status_code == 200, resp.text
             source_id = resp.json()["id"]
 
@@ -267,12 +275,7 @@ def test_update_source_replaces_and_preserves_project_binding(tmp_path):
             initial = {"mode": "fixed", "project_key": "PAY"}
             create = client.post(
                 "/api/sources",
-                json={
-                    "type": "agent_session",
-                    "name": "codex sessions",
-                    "config": {"client": "codex", "documents_dir": str(tmp_path / "in")},
-                    "project_binding": initial,
-                },
+                json=_local_markdown_source_payload(project_binding=initial),
             )
             source_id = create.json()["id"]
 
@@ -309,12 +312,9 @@ def test_update_source_can_clear_project_binding_to_unmapped(tmp_path):
         with TestClient(app) as client:
             create = client.post(
                 "/api/sources",
-                json={
-                    "type": "agent_session",
-                    "name": "codex sessions",
-                    "config": {"client": "codex", "documents_dir": str(tmp_path / "in")},
-                    "project_binding": {"mode": "fixed", "project_key": "PAY"},
-                },
+                json=_local_markdown_source_payload(
+                    project_binding={"mode": "fixed", "project_key": "PAY"}
+                ),
             )
             source_id = create.json()["id"]
 

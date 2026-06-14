@@ -57,8 +57,17 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
                     "memories_extracted": 4,
                     "error_message": "one failed",
                     "failed_docs": [{"doc_id": "doc-1", "error": "boom"}],
-                }
-            ]
+                    }
+                ]
+
+        async def is_source_enabled_for_user(self, source_id: str, user_id: str) -> bool:
+            assert source_id == "src-neutral"
+            return True
+
+        async def set_source_subscription(
+            self, source_id: str, user_id: str, enabled: bool
+        ) -> None:
+            raise AssertionError("not used by source list")
 
     app = create_admin_app(db=FakeSourceReader(), config=_config(tmp_path))
 

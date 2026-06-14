@@ -86,7 +86,11 @@ from memforge.server.memory_admin_service import (
     list_memory_admin_page,
     pick_origin_source_type,
 )
-from memforge.server.source_admin_service import list_source_admin_rows
+from memforge.server.source_admin_service import (
+    can_manage_source,
+    list_source_admin_rows,
+    normalize_workspace_role,
+)
 from memforge.storage.admin_memory import MemoryAdminListFilters
 from memforge.storage.database import Database
 
@@ -128,6 +132,35 @@ def resolve_request_principal(request: Request) -> str:
 
         resolver = resolve_principal
     return resolver(request)
+
+
+def resolve_request_workspace_role(request: Request) -> str:
+    """Resolve the caller's workspace role through the app-scoped resolver."""
+    resolver = getattr(request.app.state, "workspace_role_resolver", None)
+    if resolver is None:
+        from memforge.server.principal import resolve_workspace_role
+
+        resolver = resolve_workspace_role
+    return normalize_workspace_role(resolver(request))
+
+
+def _source_management_forbidden() -> HTTPException:
+    return HTTPException(
+        status_code=403,
+        detail={
+            "error": "source_management_forbidden",
+            "message": "Only the source creator or a workspace admin can manage this source.",
+        },
+    )
+
+
+def _require_source_management(request: Request, source: dict[str, Any]) -> None:
+    if not can_manage_source(
+        source,
+        viewer_id=resolve_request_principal(request),
+        viewer_role=resolve_request_workspace_role(request),
+    ):
+        raise _source_management_forbidden()
 
 
 async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
@@ -504,6 +537,10 @@ class CreateSourceRequest(BaseModel):
 
 class SourceSyncRequest(BaseModel):
     force_full_sync: bool = False
+
+
+class SourceSubscriptionRequest(BaseModel):
+    enabled: bool
 
 
 class UpdateSourceRequest(BaseModel):
@@ -1790,6 +1827,7 @@ def create_admin_app(
     config: AppConfig | None = None,
     runtime_provider: RuntimeProvider | None = None,
     principal_resolver: Callable[[Request], str] | None = None,
+    workspace_role_resolver: Callable[[Request], str] | None = None,
 ) -> FastAPI:
     """Create and configure the MemForge Admin API FastAPI application.
 
@@ -1825,6 +1863,7 @@ def create_admin_app(
         app.state.config = config
         app.state.runtime_provider = runtime_provider
         app.state.principal_resolver = principal_resolver
+        app.state.workspace_role_resolver = workspace_role_resolver
         app.state.sync_service = SyncService(
             app.state.db, config, runtime_provider=runtime_provider
         )
@@ -1852,6 +1891,7 @@ def create_admin_app(
     app.state.config = config
     app.state.runtime_provider = runtime_provider
     app.state.principal_resolver = principal_resolver
+    app.state.workspace_role_resolver = workspace_role_resolver
 
     # -- CORS --
     cors_origins = config.server.cors_origins.split(",") if config.server.cors_origins != "*" else ["*"]
@@ -2933,11 +2973,17 @@ def create_admin_app(
 
     @source_router.get("")
     async def list_sources(
+        request: Request,
         db: Database = Depends(get_db),
         sync_service: SyncService = Depends(get_sync_service),
     ):
         """List all configured sources with per-source memory counts and sync status."""
-        sources = await list_source_admin_rows(db, sync_service=sync_service)
+        sources = await list_source_admin_rows(
+            db,
+            sync_service=sync_service,
+            viewer_id=resolve_request_principal(request),
+            viewer_role=resolve_request_workspace_role(request),
+        )
 
         # Attach memory_count and sync status to each source
         from memforge.agent_sessions import (
@@ -2949,11 +2995,14 @@ def create_admin_app(
         for s in sources:
             original_config = s.get("config", {})
             jira_auth_mode = _jira_auth_mode(original_config) if s["type"] == "jira" else None
-            s["config"] = redact_source_config(
-                original_config,
-                secret_fields=_source_secret_fields(s["type"]),
-                validate_encryption=True,
-            )
+            if s.get("capabilities", {}).get("can_configure"):
+                s["config"] = redact_source_config(
+                    original_config,
+                    secret_fields=_source_secret_fields(s["type"]),
+                    validate_encryption=True,
+                )
+            else:
+                s["config"] = {}
             # Surface the originating client for agent-session sources so the UI
             # can pick a per-client brand mark without re-deriving from the id.
             if s["type"] == AGENT_SESSION_SOURCE_TYPE:
@@ -3021,6 +3070,28 @@ def create_admin_app(
             for key, count in rows
         ]
         return ResolvedProjectsResponse(source_id=source_id, projects=projects)
+
+    @source_router.put("/{source_id}/subscription")
+    async def set_source_subscription(
+        request: Request,
+        source_id: str,
+        req: SourceSubscriptionRequest,
+        db: Database = Depends(get_db),
+    ):
+        """Set the caller's per-source subscription preference."""
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        await db.set_source_subscription(
+            source_id,
+            resolve_request_principal(request),
+            req.enabled,
+        )
+        return {
+            "ok": True,
+            "source_id": source_id,
+            "subscription": {"enabled": req.enabled},
+        }
 
     # ===================================================================
     # 4c. Recent Changes
@@ -3113,6 +3184,7 @@ def create_admin_app(
 
     @source_router.post("")
     async def create_source(
+        request: Request,
         req: CreateSourceRequest,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
@@ -3145,11 +3217,13 @@ def create_admin_app(
             name=req.name,
             config_json=json.dumps(source_config),
             project_binding=req.project_binding,
+            created_by_user_id=resolve_request_principal(request),
         )
         return {"id": source_id, "name": req.name, "type": req.type}
 
     @source_router.put("/{source_id}")
     async def update_source(
+        request: Request,
         source_id: str,
         req: UpdateSourceRequest,
         db: Database = Depends(get_db),
@@ -3160,6 +3234,7 @@ def create_admin_app(
         existing = await db.get_source(source_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, existing)
 
         _validate_source_status(req.status)
         name = req.name or existing["name"]
@@ -3221,6 +3296,7 @@ def create_admin_app(
 
     @source_router.delete("/{source_id}")
     async def delete_source(
+        request: Request,
         source_id: str,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
@@ -3231,6 +3307,7 @@ def create_admin_app(
         existing = await db.get_source(source_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, existing)
 
         # Cancel running sync task if any
         await sync_service.cancel_source(source_id)
@@ -3251,6 +3328,7 @@ def create_admin_app(
 
     @source_router.post("/{source_id}/sync")
     async def trigger_sync(
+        request: Request,
         source_id: str,
         req: SourceSyncRequest | None = Body(default=None),
         db: Database = Depends(get_db),
@@ -3260,6 +3338,8 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+
         try:
             await sync_service.start_source(
                 source_id,
@@ -3273,6 +3353,7 @@ def create_admin_app(
 
     @source_router.post("/{source_id}/force-resync")
     async def trigger_force_resync(
+        request: Request,
         source_id: str,
         db: Database = Depends(get_db),
         sync_service: SyncService = Depends(get_sync_service),
@@ -3281,6 +3362,8 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+
         if sync_service.is_running(source_id):
             raise HTTPException(status_code=409, detail="Sync already running for this source")
 

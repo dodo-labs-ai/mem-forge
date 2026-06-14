@@ -226,6 +226,23 @@ def _api_base_url() -> str:
     return os.getenv("MEMFORGE_API_URL", DEFAULT_API_URL).rstrip("/")
 
 
+def _workspace_id() -> str:
+    return os.getenv("MEMFORGE_WORKSPACE_ID", "").strip()
+
+
+def _api_request_url(path: str) -> str:
+    base_url = _api_base_url()
+    workspace_id = _workspace_id()
+    if not workspace_id or not path.startswith("/api"):
+        return f"{base_url}{path}"
+    quoted_workspace = quote(workspace_id, safe="")
+    if path == "/api":
+        return f"{base_url}/api/workspaces/{quoted_workspace}/api"
+    if path.startswith("/api/"):
+        return f"{base_url}/api/workspaces/{quoted_workspace}/api/{path[len('/api/'):]}"
+    return f"{base_url}{path}"
+
+
 def _api_headers(*, json_body: bool = False) -> dict[str, str]:
     headers = {"Accept": "application/json"}
     if json_body:
@@ -239,7 +256,7 @@ def _api_headers(*, json_body: bool = False) -> dict[str, str]:
 def _http_json(method: str, path: str, body: dict[str, Any] | None) -> dict[str, Any]:
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = Request(
-        f"{_api_base_url()}{path}",
+        _api_request_url(path),
         data=data,
         headers=_api_headers(json_body=body is not None),
         method=method,
@@ -410,11 +427,11 @@ def _parse_resource_url(url: str, api_base_url: str) -> ResourceTarget | None:
     if any(part in {".", ".."} or "/" in part or "\\" in part for part in parts):
         return None
     if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "content":
-        return ResourceTarget(parts[2], "content", path, f"{api_base_url}{path}")
+        return ResourceTarget(parts[2], "content", path, _api_request_url(path))
     if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "pdf":
-        return ResourceTarget(parts[2], "pdf", path, f"{api_base_url}{path}")
+        return ResourceTarget(parts[2], "pdf", path, _api_request_url(path))
     if len(parts) == 5 and parts[:2] == ["api", "documents"] and parts[3] == "artifacts":
-        return ResourceTarget(parts[2], parts[4], path, f"{api_base_url}{path}")
+        return ResourceTarget(parts[2], parts[4], path, _api_request_url(path))
     return None
 
 

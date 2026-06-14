@@ -1494,15 +1494,20 @@ async def test_source_base_url_update_releases_old_atlassian_limiter(db, tmp_pat
 async def test_non_secret_source_noop_update_preserves_sync_cursor(db, tmp_path):
     from datetime import datetime, timezone
 
+    from memforge.local_adapter import default_local_adapter_inbox
     from memforge.models import SyncState
     from memforge.server.admin_api import create_admin_app
 
-    source_id = "src-agent-sessions"
-    source_config = {"documents_dir": str(tmp_path / "sessions")}
+    source_id = "src-local-markdown"
+    cfg = _config(tmp_path)
+    source_config = {
+        "vault_id": "engineering-notes",
+        "documents_dir": str(default_local_adapter_inbox(cfg, source_id)),
+    }
     await db.upsert_source(
         id=source_id,
-        type="agent_session",
-        name="Agent Sessions",
+        type="local_markdown",
+        name="Engineering Notes",
         config_json=json.dumps(source_config),
     )
     await db.upsert_sync_state(
@@ -1515,12 +1520,12 @@ async def test_non_secret_source_noop_update_preserves_sync_cursor(db, tmp_path)
         ),
     )
 
-    app = create_admin_app(db=db, config=_config(tmp_path))
+    app = create_admin_app(db=db, config=cfg)
     with TestClient(app) as client:
         response = client.put(
             f"/api/sources/{source_id}",
             json={
-                "name": "Agent Sessions",
+                "name": "Engineering Notes",
                 "config": source_config,
             },
         )

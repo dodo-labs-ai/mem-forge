@@ -182,11 +182,13 @@ codex plugin add memory@memforge
 For normal self-hosted use, the plugin talks to the running MemForge API at
 `http://127.0.0.1:8765`. Set `MEMFORGE_API_URL` and optional
 `MEMFORGE_API_TOKEN` only when pointing the plugin at another local or hosted
-service.
+service. Hosted multi-workspace deployments also need `MEMFORGE_WORKSPACE_ID`
+so MCP calls target the workspace-scoped API path.
 
 ```bash
 export MEMFORGE_API_URL=https://api.example.memforge
 export MEMFORGE_API_TOKEN=...
+export MEMFORGE_WORKSPACE_ID=team_workspace
 ```
 
 After installing, talk to your agent like a teammate with project memory:

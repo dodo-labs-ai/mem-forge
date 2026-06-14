@@ -1,7 +1,7 @@
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Files, Info, Loader2, MoreHorizontal, Pause, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Files, Info, Loader2, MoreHorizontal, Pause, Play, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import client from "@/api/client";
 import type {
   AgentSessionCompleteness,
@@ -9,6 +9,7 @@ import type {
   Project,
   ResolvedProjectsResponse,
   Source,
+  SourceCapabilities,
   SourceProjectsResponse,
 } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
@@ -27,7 +28,7 @@ import {
 import { timeAgo } from "@/utils/date";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { SourceConfigDialog } from "./SourceConfigDialog";
-import { canConfigureSourceType, canDeleteSourceType, isManagedSourceId, isManagedSourceType, isPushBasedSourceType, userConfigurableGenes } from "./managedSources";
+import { isManagedSourceId, isManagedSourceType, isPushBasedSourceType, userConfigurableGenes } from "./managedSources";
 import { getSourceActionEndpoint, getSourceMenuStyle, sourceActionLayout } from "./sourceActions";
 import { ProjectGroup } from "./ProjectGroup";
 import {
@@ -87,6 +88,22 @@ export function SourcesPage() {
   const [sourcePendingDelete, setSourcePendingDelete] = useState<Source | null>(null);
   const [pendingSyncIds, setPendingSyncIds] = useState<Set<string>>(new Set());
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
+  const [pendingSubscriptionIds, setPendingSubscriptionIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [authorityMessage, setAuthorityMessage] = useState<string | null>(null);
+
+  const handleAuthorityError = (error: unknown, fallback: string) => {
+    if (isForbiddenError(error)) {
+      setAuthorityMessage(
+        "You no longer have permission to manage this source. The list has been refreshed.",
+      );
+      queryClient.invalidateQueries({ queryKey: ["sources"] });
+      return true;
+    }
+    setAuthorityMessage(fallback);
+    return false;
+  };
 
   const genesQuery = useQuery<GeneMetadata[]>({
     queryKey: ["genes"],
@@ -112,6 +129,7 @@ export function SourcesPage() {
       setPendingSyncIds((current) => new Set(current).add(sourceId));
       return client.post(`/api/sources/${sourceId}/sync`, { force_full_sync: forceFullSync });
     },
+    onError: (error) => handleAuthorityError(error, "Failed to start sync."),
     onSettled: (_data, _error, variables) => {
       setPendingSyncIds((current) => {
         const next = new Set(current);
@@ -125,6 +143,7 @@ export function SourcesPage() {
 
   const deleteSource = useMutation({
     mutationFn: (sourceId: string) => client.delete(getSourceActionEndpoint(sourceId, "delete")),
+    onError: (error) => handleAuthorityError(error, "Failed to delete source."),
     onSuccess: () => {
       setSourcePendingDelete(null);
       queryClient.invalidateQueries({ queryKey: ["sources"] });
@@ -138,6 +157,7 @@ export function SourcesPage() {
       setPendingSyncIds((current) => new Set(current).add(sourceId));
       return client.post(getSourceActionEndpoint(sourceId, "force-resync"));
     },
+    onError: (error) => handleAuthorityError(error, "Failed to start refresh."),
     onSettled: (_data, _error, sourceId) => {
       setPendingSyncIds((current) => {
         const next = new Set(current);
@@ -155,6 +175,23 @@ export function SourcesPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sources"] });
       queryClient.invalidateQueries({ queryKey: ["stats"] });
+    },
+  });
+
+  const setSubscription = useMutation({
+    mutationFn: ({ sourceId, enabled }: { sourceId: string; enabled: boolean }) => {
+      setPendingSubscriptionIds((current) => new Set(current).add(sourceId));
+      return client.put(`/api/sources/${sourceId}/subscription`, { enabled });
+    },
+    onError: (error) => handleAuthorityError(error, "Failed to update subscription."),
+    onSettled: (_data, _error, variables) => {
+      setPendingSubscriptionIds((current) => {
+        const next = new Set(current);
+        next.delete(variables.sourceId);
+        return next;
+      });
+      queryClient.invalidateQueries({ queryKey: ["sources"] });
+      queryClient.invalidateQueries({ queryKey: ["memories"] });
     },
   });
 
@@ -242,6 +279,24 @@ export function SourcesPage() {
             {sources.length.toLocaleString()} configured ingestion sources.
           </p>
         </div>
+        {authorityMessage && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex items-start justify-between gap-3 border-b bg-amber-50/60 px-4 py-2 text-sm text-amber-900 dark:bg-amber-900/20 dark:text-amber-100"
+          >
+            <span>{authorityMessage}</span>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              aria-label="Dismiss notice"
+              onClick={() => setAuthorityMessage(null)}
+            >
+              <X className="size-4" />
+            </Button>
+          </div>
+        )}
         <AsyncBoundary
           isLoading={sourcesQuery.isLoading}
           isError={sourcesQuery.isError}
@@ -280,7 +335,13 @@ export function SourcesPage() {
                     const isUpdatingStatus =
                       setSourceStatus.isPending &&
                       setSourceStatus.variables?.sourceId === source.id;
-                    const canConfigure = canConfigureSourceType(source.type);
+                    const capabilities: SourceCapabilities = source.capabilities ?? {
+                      can_subscribe: false,
+                      can_configure: false,
+                      can_sync: false,
+                      can_force_resync: false,
+                      can_delete: false,
+                    };
                     const isManaged = isManagedSourceType(source.type) || isManagedSourceId(source.id);
                     const gene = geneByName.get(source.type);
                     const sourceLabel = SOURCE_LABELS[source.id] ?? SOURCE_LABELS[source.type] ?? {
@@ -291,6 +352,11 @@ export function SourcesPage() {
                       SOURCE_ITEM_LABELS[source.id] ??
                       SOURCE_ITEM_LABELS[source.type] ??
                       "documents";
+                    const showActionsMenu =
+                      capabilities.can_configure ||
+                      capabilities.can_force_resync ||
+                      capabilities.can_delete;
+                    const enabledForMe = source.enabled_for_me ?? source.subscription?.enabled ?? true;
 
                     return (
                       <SourceRow
@@ -300,49 +366,61 @@ export function SourcesPage() {
                         isSyncing={isSyncing}
                         isDeleting={isDeleting}
                         isUpdatingStatus={isUpdatingStatus}
-                        canConfigure={canConfigure}
                         isManaged={isManaged}
                         sourceLabel={sourceLabel}
                         itemLabel={itemLabel}
                         authSessionLabel={authSessionLabel}
-                        onConfigure={() =>
+                        enabledForMe={enabledForMe}
+                        isSubscriptionPending={pendingSubscriptionIds.has(source.id)}
+                        onConfigure={() => {
+                          if (!capabilities.can_configure) return;
                           setConfigDialog({
                             sourceType: source.type,
                             source,
                             initialFocus: isUnmappedGroup ? { step: "project" } : undefined,
-                          })
-                        }
-                        onSync={() => syncSource.mutate({ sourceId: source.id })}
+                          });
+                        }}
+                        onSync={() => {
+                          if (!capabilities.can_sync || source.status === "paused") return;
+                          syncSource.mutate({ sourceId: source.id });
+                        }}
                         onResume={() =>
                           setSourceStatus.mutate({ sourceId: source.id, status: "active" })
                         }
                         onShowDetails={() => setDetailsSource(source)}
+                        onSubscriptionChange={(enabled) => {
+                          if (!capabilities.can_subscribe) return;
+                          setSubscription.mutate({ sourceId: source.id, enabled });
+                        }}
                         actionsMenu={
-                          <SourceActionsMenu
-                            source={source}
-                            open={openMenuSourceId === source.id}
-                            onOpenChange={(open) =>
-                              setOpenMenuSourceId(open ? source.id : null)
-                            }
-                            onDelete={() => {
-                              setOpenMenuSourceId(null);
-                              setSourcePendingDelete(source);
-                            }}
-                            onForceResync={() => {
-                              setOpenMenuSourceId(null);
-                              forceResyncSource.mutate(source.id);
-                            }}
-                            onToggleStatus={() => {
-                              setOpenMenuSourceId(null);
-                              setSourceStatus.mutate({
-                                sourceId: source.id,
-                                status: source.status === "paused" ? "active" : "paused",
-                              });
-                            }}
-                            disableForceResync={isSyncing || isDeleting || source.status === "paused"}
-                            disableToggleStatus={isSyncing || isDeleting || isUpdatingStatus}
-                            isUpdatingStatus={isUpdatingStatus}
-                          />
+                          showActionsMenu ? (
+                            <SourceActionsMenu
+                              source={source}
+                              capabilities={capabilities}
+                              open={openMenuSourceId === source.id}
+                              onOpenChange={(open) =>
+                                setOpenMenuSourceId(open ? source.id : null)
+                              }
+                              onDelete={() => {
+                                setOpenMenuSourceId(null);
+                                setSourcePendingDelete(source);
+                              }}
+                              onForceResync={() => {
+                                setOpenMenuSourceId(null);
+                                forceResyncSource.mutate(source.id);
+                              }}
+                              onToggleStatus={() => {
+                                setOpenMenuSourceId(null);
+                                setSourceStatus.mutate({
+                                  sourceId: source.id,
+                                  status: source.status === "paused" ? "active" : "paused",
+                                });
+                              }}
+                              disableForceResync={isSyncing || isDeleting || source.status === "paused"}
+                              disableToggleStatus={isSyncing || isDeleting || isUpdatingStatus}
+                              isUpdatingStatus={isUpdatingStatus}
+                            />
+                          ) : null
                         }
                       />
                     );
@@ -415,6 +493,7 @@ export function SourcesPage() {
 
 function SourceActionsMenu({
   source,
+  capabilities,
   open,
   onOpenChange,
   onDelete,
@@ -425,6 +504,7 @@ function SourceActionsMenu({
   isUpdatingStatus,
 }: {
   source: Source;
+  capabilities: SourceCapabilities;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onDelete: () => void;
@@ -440,8 +520,10 @@ function SourceActionsMenu({
   const toggleStatus = sourceActionLayout.menu.find((action) => action.id === "toggle-status");
   const forceResync = sourceActionLayout.menu.find((action) => action.id === "force-resync");
   const deleteAction = sourceActionLayout.menu.find((action) => action.id === "delete");
-  const canDelete = canDeleteSourceType(source.type);
   const isPaused = source.status === "paused";
+  const canToggleStatus = capabilities.can_configure;
+  const canForceResync = capabilities.can_force_resync;
+  const canDelete = capabilities.can_delete;
   const toggleStatusLabel = isPaused ? "Resume source" : "Pause source";
   const ToggleStatusIcon = isPaused ? Play : Pause;
   const forceResyncDisabledHint = isPaused
@@ -502,7 +584,7 @@ function SourceActionsMenu({
               triggerBottom: rect.bottom,
               viewportWidth: window.innerWidth,
               viewportHeight: window.innerHeight,
-              menuHeight: canDelete ? 288 : 160,
+              menuHeight: canDelete ? 288 : 180,
             }));
           }
           onOpenChange(!open);
@@ -518,44 +600,48 @@ function SourceActionsMenu({
           className="z-50 rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg"
           style={menuStyle}
         >
-          <button
-            type="button"
-            role="menuitem"
-            disabled={disableToggleStatus}
-            className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
-            onClick={onToggleStatus}
-          >
-            {isUpdatingStatus ? (
-              <Loader2 className="mt-0.5 size-4 animate-spin" />
-            ) : (
-              <ToggleStatusIcon className="mt-0.5 size-4" />
-            )}
-            <span>
-              <span className="block font-medium text-foreground">{toggleStatusLabel}</span>
-              <span className="mt-0.5 block text-xs">{toggleStatus?.description}</span>
-            </span>
-          </button>
-          <button
-            type="button"
-            role="menuitem"
-            disabled={disableForceResync}
-            title={forceResyncDisabledHint}
-            className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
-            onClick={onForceResync}
-          >
-            <RefreshCw className="mt-0.5 size-4" />
-            <span>
-              <span className="block font-medium text-foreground">{forceResync?.label}</span>
-              <span className="mt-0.5 block text-xs">
-                {isPaused
-                  ? "Resume the source first to look for new, changed, or removed documents."
-                  : forceResync?.description}
+          {canToggleStatus && (
+            <button
+              type="button"
+              role="menuitem"
+              disabled={disableToggleStatus}
+              className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={onToggleStatus}
+            >
+              {isUpdatingStatus ? (
+                <Loader2 className="mt-0.5 size-4 animate-spin" />
+              ) : (
+                <ToggleStatusIcon className="mt-0.5 size-4" />
+              )}
+              <span>
+                <span className="block font-medium text-foreground">{toggleStatusLabel}</span>
+                <span className="mt-0.5 block text-xs">{toggleStatus?.description}</span>
               </span>
-            </span>
-          </button>
+            </button>
+          )}
+          {canForceResync && (
+            <button
+              type="button"
+              role="menuitem"
+              disabled={disableForceResync}
+              title={forceResyncDisabledHint}
+              className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={onForceResync}
+            >
+              <RefreshCw className="mt-0.5 size-4" />
+              <span>
+                <span className="block font-medium text-foreground">{forceResync?.label}</span>
+                <span className="mt-0.5 block text-xs">
+                  {isPaused
+                    ? "Resume the source first to look for new, changed, or removed documents."
+                    : forceResync?.description}
+                </span>
+              </span>
+            </button>
+          )}
           {canDelete && (
             <>
-              <div className="my-1 h-px bg-border" />
+              {(canToggleStatus || canForceResync) && <div className="my-1 h-px bg-border" />}
               <button
                 type="button"
                 role="menuitem"
@@ -994,7 +1080,11 @@ function AgentSessionSetupDialog({
               <code className="rounded bg-muted px-1 font-mono text-[11px]">MEMFORGE_API_URL</code>{" "}
               and optionally{" "}
               <code className="rounded bg-muted px-1 font-mono text-[11px]">MEMFORGE_API_TOKEN</code>{" "}
-              when the plugin should reach a non-default or hosted MemForge instance. See{" "}
+              when the plugin should reach a non-default MemForge instance. Hosted
+              multi-workspace deployments also need{" "}
+              <code className="rounded bg-muted px-1 font-mono text-[11px]">
+                MEMFORGE_WORKSPACE_ID
+              </code>. See{" "}
               <span className="font-medium text-foreground">
                 docs/design/agent-session-saas-plugin-flow.md
               </span>{" "}
@@ -1076,6 +1166,13 @@ function DeleteSourceDialog({
 }) {
   const itemLabel = source ? SOURCE_ITEM_LABELS[source.type] ?? "documents" : "documents";
   const memoryCount = source?.memory_count ?? 0;
+  const ownership = source?.ownership;
+  const creatorLabel = (() => {
+    if (!ownership) return null;
+    if (ownership.viewer_relationship === "creator") return "Created by you";
+    if (ownership.created_by_user_id) return `Created by ${ownership.created_by_user_id}`;
+    return null;
+  })();
   return (
     <Dialog open={Boolean(source)} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
@@ -1093,6 +1190,9 @@ function DeleteSourceDialog({
             <div className="mt-1 text-muted-foreground">
               {source.doc_count.toLocaleString()} {itemLabel} · {memoryCount.toLocaleString()} memories
             </div>
+            {creatorLabel && (
+              <div className="mt-1 text-xs text-muted-foreground">{creatorLabel}</div>
+            )}
           </div>
         )}
 
@@ -1114,4 +1214,11 @@ function DeleteSourceDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+function isForbiddenError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const status = (error as { response?: { status?: number }; status?: number }).response?.status
+    ?? (error as { status?: number }).status;
+  return status === 403;
 }

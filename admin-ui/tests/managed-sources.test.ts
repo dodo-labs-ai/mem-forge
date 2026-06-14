@@ -31,14 +31,26 @@ assert.match(
 
 assert.match(
   sourcesPageSource,
-  /canConfigureSourceType\(source\.type\)/,
-  "source cards should check whether a source type is configurable before rendering Configure",
+  /capabilities\.can_configure/,
+  "source cards should gate Configure on backend-issued capabilities, not by deriving role/creator locally",
 );
 
 assert.match(
   sourcesPageSource,
-  /canDeleteSourceType\(source\.type\)/,
-  "source action menus should check whether a source type can be deleted before rendering Delete",
+  /capabilities\.can_delete/,
+  "source action menus should gate Delete on backend-issued capabilities, not by deriving role/creator locally",
+);
+
+assert.match(
+  sourcesPageSource,
+  /capabilities\.can_subscribe/,
+  "source rows should expose a per-viewer subscription affordance when the backend allows it",
+);
+
+assert.match(
+  sourcesPageSource,
+  /\/api\/sources\/\$\{[^}]+\}\/subscription/,
+  "the page should call the per-source subscription endpoint when a viewer toggles their subscription",
 );
 
 assert.match(

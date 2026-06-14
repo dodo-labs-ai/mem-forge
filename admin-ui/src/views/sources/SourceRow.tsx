@@ -1,10 +1,11 @@
 import type { ReactNode } from "react";
 import { Info, Loader2, Pause, Play, SlidersHorizontal } from "lucide-react";
-import type { Source } from "@/api/types";
+import type { Source, SourceCapabilities, SourceOwnership } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
 import { SyncStatusBar } from "@/components/admin/SyncStatusBar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { cn } from "@/lib/utils";
 import { timeAgo } from "@/utils/date";
@@ -16,6 +17,11 @@ import { sourceActionLayout } from "./sourceActions";
  * counts, sync bar, and the primary configure / sync controls. The overflow
  * menu lives outside this component because its kebab affordance is shared
  * styling that other tests depend on staying in the page module.
+ *
+ * Action visibility is driven entirely by `source.capabilities` returned by
+ * the backend. When the viewer can only subscribe (a non-manager looking at
+ * a shared source), the row collapses to a subscription-oriented card
+ * without management controls.
  */
 
 export interface SourceRowLabels {
@@ -24,21 +30,31 @@ export interface SourceRowLabels {
   description?: string;
 }
 
+const DEFAULT_CAPABILITIES: SourceCapabilities = {
+  can_subscribe: false,
+  can_configure: false,
+  can_sync: false,
+  can_force_resync: false,
+  can_delete: false,
+};
+
 export function SourceRow({
   source,
   perGroupMemoryCount,
   isSyncing,
   isDeleting,
   isUpdatingStatus = false,
-  canConfigure,
   isManaged,
   sourceLabel,
   itemLabel,
   authSessionLabel,
+  enabledForMe,
+  isSubscriptionPending,
   onConfigure,
   onSync,
   onResume,
   onShowDetails,
+  onSubscriptionChange,
   actionsMenu,
 }: {
   source: Source;
@@ -46,19 +62,25 @@ export function SourceRow({
   isSyncing: boolean;
   isDeleting: boolean;
   isUpdatingStatus?: boolean;
-  canConfigure: boolean;
   isManaged: boolean;
   sourceLabel: SourceRowLabels;
   itemLabel: string;
   authSessionLabel: (status: string) => string;
+  enabledForMe: boolean;
+  isSubscriptionPending: boolean;
   onConfigure: () => void;
   onSync: () => void;
   onResume?: () => void;
   onShowDetails: () => void;
+  onSubscriptionChange: (enabled: boolean) => void;
   actionsMenu: ReactNode;
 }) {
   const isPaused = source.status === "paused";
   const pausedSyncHint = "Source is paused. Resume the source to sync again.";
+  const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
+  const ownershipText = formatOwnership(source.ownership);
+  const hasManagementControl =
+    capabilities.can_configure || capabilities.can_sync || isManaged;
 
   return (
     <div className="space-y-3 p-4">
@@ -85,6 +107,9 @@ export function SourceRow({
               {sourceLabel.name}
               {sourceLabel.subtitle ? ` · ${sourceLabel.subtitle}` : ""}
             </p>
+            {ownershipText && (
+              <p className="mt-1 text-xs text-muted-foreground">{ownershipText}</p>
+            )}
             {source.type === "agent_session" && (
               <p className="mt-1 text-xs text-muted-foreground">
                 Populated automatically by the plugin. No manual sync needed.
@@ -102,7 +127,7 @@ export function SourceRow({
                   ? "Syncing now"
                   : `Last synced: ${timeAgo(source.last_sync)}`}
               </span>
-              {source.type === "jira" && source.auth_session && (
+              {source.type === "jira" && source.auth_session && hasManagementControl && (
                 <span
                   className={
                     source.auth_session.status === "active"
@@ -118,6 +143,14 @@ export function SourceRow({
         </div>
 
         <div className="flex items-center justify-end gap-2 sm:shrink-0">
+          {capabilities.can_subscribe && (
+            <SubscriptionToggle
+              sourceName={source.name}
+              enabled={enabledForMe}
+              pending={isSubscriptionPending}
+              onChange={onSubscriptionChange}
+            />
+          )}
           {isManaged && (
             <Button
               type="button"
@@ -130,7 +163,7 @@ export function SourceRow({
               <span className="hidden lg:inline">Details</span>
             </Button>
           )}
-          {canConfigure && (
+          {capabilities.can_configure && (
             <Button
               type="button"
               variant="outline"
@@ -142,7 +175,7 @@ export function SourceRow({
               <span className="hidden lg:inline">{sourceActionLayout.primary[0].label}</span>
             </Button>
           )}
-          {!isManaged && (
+          {capabilities.can_sync && !isManaged && (
             <Button
               type="button"
               disabled={isSyncing || isDeleting || isPaused}
@@ -168,7 +201,7 @@ export function SourceRow({
         </div>
       </div>
 
-      {isPaused && !isManaged && (
+      {isPaused && capabilities.can_sync && !isManaged && (
         <div
           role="status"
           className="flex flex-col gap-2 rounded-md border border-amber-200 bg-amber-50/70 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-100 sm:flex-row sm:items-center sm:justify-between"
@@ -200,7 +233,52 @@ export function SourceRow({
         </div>
       )}
 
-      <SyncStatusBar sync={source.sync} itemLabel={itemLabel} onRetry={isPaused ? undefined : onSync} />
+      {hasManagementControl && (
+        <SyncStatusBar sync={source.sync} itemLabel={itemLabel} onRetry={isPaused ? undefined : onSync} />
+      )}
     </div>
   );
+}
+
+function SubscriptionToggle({
+  sourceName,
+  enabled,
+  pending,
+  onChange,
+}: {
+  sourceName: string;
+  enabled: boolean;
+  pending: boolean;
+  onChange: (enabled: boolean) => void;
+}) {
+  const label = pending ? "Saving..." : enabled ? "Enabled for me" : "Disabled for me";
+
+  return (
+    <label
+      className="inline-flex h-8 cursor-pointer items-center gap-2 rounded-md border bg-background px-2.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 has-data-[disabled]:cursor-not-allowed has-data-[disabled]:opacity-60"
+      title={`Toggle whether memories from "${sourceName}" appear in your views`}
+    >
+      <Switch
+        aria-label={`${enabled ? "Disable" : "Enable"} "${sourceName}" for me`}
+        checked={enabled}
+        disabled={pending}
+        onCheckedChange={onChange}
+      />
+      <span>{label}</span>
+    </label>
+  );
+}
+
+function formatOwnership(ownership: SourceOwnership | undefined): string {
+  if (!ownership) return "";
+  const creator = ownership.created_by_user_id;
+  if (ownership.viewer_relationship === "creator") {
+    return "Created by you";
+  }
+  if (ownership.viewer_relationship === "workspace_admin") {
+    if (!creator) return "You manage as workspace admin";
+    return `Created by ${creator} · You manage as workspace admin`;
+  }
+  if (creator) return `Created by ${creator}`;
+  return "";
 }
