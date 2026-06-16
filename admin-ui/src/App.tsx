@@ -17,6 +17,7 @@ import { ProjectsPage } from "@/views/projects/ProjectsPage";
 import { ReviewQueuePage } from "@/views/review/ReviewQueuePage";
 import { ReviewDetailPage } from "@/views/review/ReviewDetailPage";
 import { SourcesPage } from "@/views/sources/SourcesPage";
+import { SchedulesPage } from "@/views/schedules/SchedulesPage";
 import { SettingsPage } from "@/views/settings/SettingsPage";
 
 const queryClient = new QueryClient({
@@ -53,6 +54,7 @@ export default function App() {
               <Route path="/entities" element={<EntitiesPage />} />
               <Route path="/entities/:id" element={<EntityDetailPage />} />
               <Route path="/sources" element={<SourcesPage />} />
+              <Route path="/schedules" element={<SchedulesPage />} />
               <Route path="/projects" element={<ProjectsPage />} />
               <Route path="/projects/:key" element={<ProjectDetailPage />} />
               <Route

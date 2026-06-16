@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { ComponentType } from "react";
 import {
   Brain,
+  CalendarClock,
   Database,
   Files,
   FolderKanban,
@@ -43,6 +44,7 @@ const navGroups: NavGroup[] = [
       { to: "/review", label: "Review", icon: ShieldCheck, badgeKey: "pending-reviews" as const },
       { to: "/entities", label: "Entities", icon: Database },
       { to: "/sources", label: "Sources", icon: Files },
+      { to: "/schedules", label: "Scheduled Syncs", icon: CalendarClock },
       { to: "/projects", label: "Project setup", icon: FolderKanban },
     ],
   },

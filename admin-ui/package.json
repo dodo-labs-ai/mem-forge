@@ -7,7 +7,7 @@
     "dev": "vite --port 5174",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "test": "npm run test:brand && npm run test:source-icons && npm run test:memory-type-icons && npm run test:lifecycle && npm run test:sidebar-layout && npm run test:source-actions && npm run test:managed-sources && npm run test:confluence-config && npm run test:local-markdown-config && npm run test:project-binding && npm run test:memories-project-filter && npm run test:sync-status && npm run test:button-interaction && npm run test:pagination && npm run test:extension",
+    "test": "npm run test:brand && npm run test:source-icons && npm run test:memory-type-icons && npm run test:lifecycle && npm run test:sidebar-layout && npm run test:source-actions && npm run test:managed-sources && npm run test:confluence-config && npm run test:local-markdown-config && npm run test:project-binding && npm run test:memories-project-filter && npm run test:sync-status && npm run test:button-interaction && npm run test:pagination && npm run test:extension && npm run test:schedules",
     "test:brand": "rm -rf .tmp-test && tsc --target ES2023 --module NodeNext --moduleResolution NodeNext --types node --strict --esModuleInterop --skipLibCheck --outDir .tmp-test tests/brand.test.ts && node .tmp-test/tests/brand.test.js",
     "test:source-icons": "rm -rf .tmp-test && tsc --target ES2023 --module NodeNext --moduleResolution NodeNext --types node --strict --esModuleInterop --skipLibCheck --outDir .tmp-test tests/source-icons.test.ts && node .tmp-test/tests/source-icons.test.js",
     "test:memory-type-icons": "rm -rf .tmp-test && tsc --target ES2023 --module NodeNext --moduleResolution NodeNext --types node --strict --esModuleInterop --skipLibCheck --outDir .tmp-test tests/memory-type-icons.test.ts && node .tmp-test/tests/memory-type-icons.test.js",
@@ -23,6 +23,7 @@
     "test:button-interaction": "rm -rf .tmp-test && tsc --target ES2023 --module NodeNext --moduleResolution NodeNext --types node --strict --esModuleInterop --skipLibCheck --outDir .tmp-test tests/button-interaction.test.ts && node .tmp-test/button-interaction.test.js",
     "test:pagination": "rm -rf .tmp-test && tsc --target ES2023 --module NodeNext --moduleResolution NodeNext --types node --strict --esModuleInterop --skipLibCheck --outDir .tmp-test tests/pagination.test.ts && node .tmp-test/tests/pagination.test.js",
     "test:extension": "rm -rf .tmp-test && tsc --target ES2023 --module NodeNext --moduleResolution NodeNext --types node --strict --esModuleInterop --skipLibCheck --outDir .tmp-test tests/extension.test.ts && node .tmp-test/tests/extension.test.js",
+    "test:schedules": "rm -rf .tmp-test && tsc --target ES2023 --module NodeNext --moduleResolution NodeNext --types node --strict --esModuleInterop --skipLibCheck --outDir .tmp-test tests/schedules.test.ts && node .tmp-test/schedules.test.js",
     "preview": "vite preview --port 4174"
   },
   "dependencies": {

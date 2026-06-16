@@ -27,7 +27,7 @@ assert.equal(getExtensionShell(), null);
 // The reserved-route set is the OSS-owned product-memory surface plus settings.
 assert.deepEqual(
   [...RESERVED_OSS_ROUTE_SEGMENTS].sort(),
-  ["entities", "memories", "projects", "review", "settings", "sources"],
+  ["entities", "memories", "projects", "review", "schedules", "settings", "sources"],
 );
 
 // First mount succeeds and exposes the additive contributions.
@@ -101,6 +101,7 @@ mountCloudExtension({
     { path: "/memories/:id/edit", element: placeholderElement }, // dropped (segment)
     { path: "/review", element: placeholderElement }, // dropped
     { path: "/sources", element: placeholderElement }, // dropped
+    { path: "/schedules", element: placeholderElement }, // dropped
     { path: "/projects/:key", element: placeholderElement }, // dropped (segment)
     { path: "/settings", element: placeholderElement }, // dropped
     { path: "/entities", element: placeholderElement }, // dropped
@@ -109,6 +110,7 @@ mountCloudExtension({
   ],
   navItems: [
     { to: "/memories", label: "Hijacked Memories" }, // dropped
+    { to: "/schedules", label: "Hijacked Schedules" }, // dropped
     { to: "/extension/safe", label: "Extension Safe" }, // kept
   ],
   reservedRouteRedirects: [
