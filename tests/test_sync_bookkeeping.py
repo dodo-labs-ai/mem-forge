@@ -31,6 +31,7 @@ from memforge.runtime import SyncService
 from memforge.config import AppConfig, SyncConfig
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from memforge.scheduler import SyncScheduler
 
 
 @pytest.fixture
@@ -1105,6 +1106,160 @@ async def test_scheduled_sync_uses_tracked_source_tasks(db: Database, monkeypatc
     release.set()
     await run_task
     assert source_id not in service.tasks
+
+
+@pytest.mark.asyncio
+async def test_source_sync_schedule_round_trips_and_claims_due_sources(db: Database):
+    claim_time = datetime(2026, 6, 16, tzinfo=timezone.utc)
+    due_at = claim_time - timedelta(minutes=1)
+    future_at = claim_time + timedelta(hours=1)
+    await db.upsert_source(
+        id="src-due",
+        type="jira",
+        name="Due Source",
+        config_json="{}",
+    )
+    await db.upsert_source(
+        id="src-future",
+        type="jira",
+        name="Future Source",
+        config_json="{}",
+    )
+    await db.set_source_sync_schedule(
+        "src-due",
+        enabled=True,
+        interval_minutes=30,
+        next_run_at=due_at,
+    )
+    await db.set_source_sync_schedule(
+        "src-future",
+        enabled=True,
+        interval_minutes=30,
+        next_run_at=future_at,
+    )
+
+    stored = await db.get_source("src-due")
+    assert stored is not None
+    assert stored["sync_schedule"]["enabled"] is True
+    assert stored["sync_schedule"]["interval_minutes"] == 30
+    assert stored["sync_schedule"]["next_run_at"] == due_at.isoformat()
+
+    await db.set_source_sync_schedule(
+        "src-due",
+        enabled=True,
+        interval_minutes=30,
+    )
+    still_due_before_claim = await db.get_source("src-due")
+    assert still_due_before_claim is not None
+    assert still_due_before_claim["sync_schedule"]["next_run_at"] == due_at.isoformat()
+
+    claimed_sources = await db.claim_due_scheduled_sources(
+        now=claim_time
+    )
+    assert [source["id"] for source in claimed_sources] == ["src-due"]
+    assert (
+        claimed_sources[0]["sync_schedule"]["next_run_at"]
+        == "2026-06-16T00:30:00+00:00"
+    )
+
+    claimed_again = await db.claim_due_scheduled_sources(
+        now=claim_time
+    )
+    assert claimed_again == []
+
+    await db.set_source_sync_schedule(
+        "src-due",
+        enabled=True,
+        interval_minutes=30,
+    )
+    unchanged = await db.get_source("src-due")
+    assert unchanged is not None
+    assert unchanged["sync_schedule"]["next_run_at"] == "2026-06-16T00:30:00+00:00"
+
+    await db.set_source_sync_schedule(
+        "src-due",
+        enabled=True,
+        interval_minutes=30,
+        next_run_at=due_at,
+    )
+    excluded = await db.claim_due_scheduled_sources(
+        now=claim_time,
+        exclude_source_ids={"src-due"},
+    )
+    assert excluded == []
+    still_due = await db.get_source("src-due")
+    assert still_due is not None
+    assert still_due["sync_schedule"]["next_run_at"] == due_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_starts_due_source_and_advances_next_run(db: Database, monkeypatch):
+    source_id = "src-scheduled-due"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Scheduled Due Source",
+        config_json="{}",
+    )
+    await db.set_source_sync_schedule(
+        source_id,
+        enabled=True,
+        interval_minutes=30,
+        next_run_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    service = SyncService(db, AppConfig())
+    scheduler = SyncScheduler(db, service)
+    started: list[str] = []
+
+    async def fake_start_source(started_source_id: str, *, force_full_sync: bool = False):
+        started.append(started_source_id)
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(service, "start_source", fake_start_source)
+
+    await scheduler._sync_due_sources()
+
+    assert started == [source_id]
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["sync_schedule"]["next_run_at"] is not None
+    assert (
+        datetime.fromisoformat(source["sync_schedule"]["next_run_at"])
+        > datetime.now(timezone.utc)
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_leaves_running_due_source_due(db: Database, monkeypatch):
+    source_id = "src-scheduled-running"
+    due_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Scheduled Running Source",
+        config_json="{}",
+    )
+    await db.set_source_sync_schedule(
+        source_id,
+        enabled=True,
+        interval_minutes=30,
+        next_run_at=due_at,
+    )
+    service = SyncService(db, AppConfig())
+    scheduler = SyncScheduler(db, service)
+
+    monkeypatch.setattr(service, "running_source_ids", lambda: {source_id})
+
+    async def fail_start_source(started_source_id: str, *, force_full_sync: bool = False):
+        raise AssertionError("running scheduled source should not be started")
+
+    monkeypatch.setattr(service, "start_source", fail_start_source)
+
+    await scheduler._sync_due_sources()
+
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["sync_schedule"]["next_run_at"] == due_at.isoformat()
 
 
 @pytest.mark.asyncio

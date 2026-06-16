@@ -136,6 +136,28 @@ class ToolClient:
             {"type": source_type, "name": name, "config": config},
         )
 
+    def get_source_schedule(self, source_id: str) -> dict[str, Any]:
+        source_id = source_id.strip()
+        if not source_id:
+            return {"error": "source_id is required"}
+        return self._http_json("GET", f"/api/sources/{quote(source_id, safe='')}/schedule", None)
+
+    def update_source_schedule(
+        self,
+        *,
+        source_id: str,
+        enabled: bool,
+        interval_minutes: int,
+    ) -> dict[str, Any]:
+        source_id = source_id.strip()
+        if not source_id:
+            return {"error": "source_id is required"}
+        return self._http_json(
+            "PUT",
+            f"/api/sources/{quote(source_id, safe='')}/schedule",
+            {"enabled": enabled, "interval_minutes": interval_minutes},
+        )
+
     def get_jira_session(self, base_url: str) -> dict[str, Any]:
         return self._http_json("GET", f"/api/auth/jira-session?base_url={quote(base_url, safe='')}", None)
 

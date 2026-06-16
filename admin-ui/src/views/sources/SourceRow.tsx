@@ -128,6 +128,14 @@ export function SourceRow({
                   ? "Syncing now"
                   : <LastSyncDetails source={source} itemLabel={itemLabel} />}
               </span>
+              {source.sync_schedule?.enabled && (
+                <span>
+                  Auto sync: {formatScheduleInterval(source.sync_schedule.interval_minutes)}
+                  {source.sync_schedule.next_run_at
+                    ? `, next ${formatRelativeFuture(source.sync_schedule.next_run_at)}`
+                    : ""}
+                </span>
+              )}
               {source.type === "jira" && source.auth_session && hasManagementControl && (
                 <span
                   className={
@@ -329,6 +337,32 @@ function LastSyncDetails({
 function capitalize(value: string): string {
   if (!value) return value;
   return value[0].toUpperCase() + value.slice(1);
+}
+
+function formatScheduleInterval(minutes: number): string {
+  if (minutes % 1440 === 0) {
+    const days = minutes / 1440;
+    return days === 1 ? "daily" : `every ${days} days`;
+  }
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return hours === 1 ? "hourly" : `every ${hours} hours`;
+  }
+  return `every ${minutes} minutes`;
+}
+
+function formatRelativeFuture(dateString: string): string {
+  const date = new Date(dateString);
+  const seconds = Math.ceil((date.getTime() - Date.now()) / 1000);
+  if (Number.isNaN(seconds)) return "-";
+  if (seconds <= 0) return "due now";
+  if (seconds < 60) return "in less than 1m";
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `in ${minutes}m`;
+  const hours = Math.ceil(minutes / 60);
+  if (hours < 24) return `in ${hours}h`;
+  const days = Math.ceil(hours / 24);
+  return `in ${days}d`;
 }
 
 function SubscriptionToggle({

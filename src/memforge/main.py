@@ -28,6 +28,10 @@ from rich.table import Table
 
 from memforge.auth import browser_session
 from memforge.config import AppConfig, load_config
+from memforge.storage.admin_source import (
+    SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
+    SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES,
+)
 from memforge.tool_client import ToolClient
 
 console = Console()
@@ -889,6 +893,39 @@ def sources_list(ctx):
         console.print(table)
 
     asyncio.run(_run())
+
+
+@sources.command("schedule")
+@click.argument("source_id")
+@click.option("--every-minutes", type=int, default=1440, show_default=True, help="Automatic sync interval.")
+@click.option("--disable", is_flag=True, help="Disable automatic sync for this source.")
+@click.pass_context
+def sources_schedule(ctx, source_id: str, every_minutes: int, disable: bool):
+    """Configure automatic sync for one source over the active API target."""
+    if every_minutes < SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES:
+        raise click.ClickException(
+            f"--every-minutes must be at least {SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES}."
+        )
+    if every_minutes > SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES:
+        raise click.ClickException(
+            f"--every-minutes must be at most {SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES}."
+        )
+    client = _tool_client(ctx)
+    payload = client.update_source_schedule(
+        source_id=source_id,
+        enabled=not disable,
+        interval_minutes=every_minutes,
+    )
+    _emit_tool_payload(ctx, payload)
+
+
+@sources.command("schedule-show")
+@click.argument("source_id")
+@click.pass_context
+def sources_schedule_show(ctx, source_id: str):
+    """Show automatic sync schedule for one source over the active API target."""
+    payload = _tool_client(ctx).get_source_schedule(source_id)
+    _emit_tool_payload(ctx, payload)
 
 
 # ---------------------------------------------------------------------------

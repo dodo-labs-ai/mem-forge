@@ -149,6 +149,12 @@ function SourceConfigForm({
   const [binding, setBinding] = useState<ProjectBinding | null>(
     () => source?.project_binding ?? null,
   );
+  const [scheduleEnabled, setScheduleEnabled] = useState(
+    () => Boolean(source?.sync_schedule?.enabled),
+  );
+  const [scheduleInterval, setScheduleInterval] = useState(
+    () => String(source?.sync_schedule?.interval_minutes ?? 1440),
+  );
   const projectSectionRef = useRef<HTMLDivElement | null>(null);
   const authMode = stringValue(config.auth_mode) || "browser_cookie";
   const jiraBaseUrl = stringValue(config.base_url).trim();
@@ -174,18 +180,28 @@ function SourceConfigForm({
   });
 
   const saveSource = useMutation({
-    mutationFn: (payload: {
+    mutationFn: async (payload: {
       name: string;
       config: ConfigForm;
       project_binding: ProjectBinding | null;
     }) => {
-      if (source) {
-        return client.put(`/api/sources/${source.id}`, payload);
-      }
-      return client.post("/api/sources", {
-        type: sourceType,
+      const intervalMinutes = parseScheduleInterval(scheduleInterval);
+      const payloadWithSchedule = {
         ...payload,
+        sync_schedule: {
+          enabled: scheduleEnabled,
+          interval_minutes: intervalMinutes,
+        },
+      };
+      if (source) {
+        await client.put(`/api/sources/${source.id}`, payloadWithSchedule);
+        return { id: source.id };
+      }
+      const response = await client.post("/api/sources", {
+        type: sourceType,
+        ...payloadWithSchedule,
       });
+      return { id: String(response.data.id) };
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sources"] });
@@ -226,7 +242,8 @@ function SourceConfigForm({
   const canSave =
     name.trim().length > 0 &&
     requiredFieldsAreFilled(sourceType, schema.fields, config) &&
-    projectBindingIsComplete(binding);
+    projectBindingIsComplete(binding) &&
+    parseScheduleInterval(scheduleInterval) >= 5;
 
   const previewReady = requiredFieldsAreFilled(sourceType, schema.fields, config);
 
@@ -343,6 +360,47 @@ function SourceConfigForm({
                 onChange={setBinding}
               />
             </div>
+
+            <section className="space-y-3">
+              <h3 className="text-sm font-semibold">Automatic sync</h3>
+              <label className="flex items-start gap-3 rounded-lg border p-3">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 size-4"
+                  checked={scheduleEnabled}
+                  onChange={(event) => setScheduleEnabled(event.target.checked)}
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-medium">Sync on a schedule</span>
+                  <span className="mt-1 block text-xs text-muted-foreground">
+                    Runs through the same queue as manual syncs.
+                  </span>
+                </span>
+              </label>
+              <Field
+                label="Interval"
+                helpText="Minimum 5 minutes. Existing syncs are not interrupted."
+              >
+                <Select<string>
+                  value={scheduleInterval}
+                  onValueChange={(value) => {
+                    if (value) setScheduleInterval(value);
+                  }}
+                >
+                  <SelectTrigger>
+                    <SelectValue>{scheduleIntervalLabel(scheduleInterval)}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="30">Every 30 minutes</SelectItem>
+                    <SelectItem value="60">Hourly</SelectItem>
+                    <SelectItem value="360">Every 6 hours</SelectItem>
+                    <SelectItem value="720">Every 12 hours</SelectItem>
+                    <SelectItem value="1440">Daily</SelectItem>
+                    <SelectItem value="10080">Weekly</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+            </section>
           </div>
 
           {saveSource.isError && (
@@ -1000,6 +1058,29 @@ function stringValue(value: ConfigValue | undefined): string {
   if (Array.isArray(value)) return value.join(", ");
   if (value == null) return "";
   return String(value);
+}
+
+function parseScheduleInterval(value: string): number {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : 1440;
+}
+
+function scheduleIntervalLabel(value: string): string {
+  switch (value) {
+    case "30":
+      return "Every 30 minutes";
+    case "60":
+      return "Hourly";
+    case "360":
+      return "Every 6 hours";
+    case "720":
+      return "Every 12 hours";
+    case "10080":
+      return "Weekly";
+    case "1440":
+    default:
+      return "Daily";
+  }
 }
 
 function extractSaveError(error: unknown): string {

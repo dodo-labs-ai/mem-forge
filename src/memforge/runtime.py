@@ -592,6 +592,13 @@ class SyncService:
         task = self.tasks.get(source_id)
         return bool(task and not task.done())
 
+    def running_source_ids(self) -> set[str]:
+        return {
+            source_id
+            for source_id, task in self.tasks.items()
+            if task and not task.done()
+        }
+
     async def _ensure_source_can_sync(self, source_id: str) -> dict:
         source = await self.db.get_source(source_id)
         if source is None:

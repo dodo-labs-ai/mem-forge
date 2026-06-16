@@ -59,6 +59,34 @@ def test_list_sources_gets_sources_collection():
     assert client.calls == [("GET", "/api/sources", None)]
 
 
+def test_get_source_schedule_uses_source_schedule_endpoint():
+    client = _RecordingClient({"enabled": True, "interval_minutes": 60})
+
+    result = client.get_source_schedule("src-1")
+
+    assert result["enabled"] is True
+    assert client.calls == [("GET", "/api/sources/src-1/schedule", None)]
+
+
+def test_update_source_schedule_puts_source_schedule_payload():
+    client = _RecordingClient({"ok": True})
+
+    result = client.update_source_schedule(
+        source_id="src-1",
+        enabled=True,
+        interval_minutes=60,
+    )
+
+    assert result["ok"] is True
+    assert client.calls == [
+        (
+            "PUT",
+            "/api/sources/src-1/schedule",
+            {"enabled": True, "interval_minutes": 60},
+        )
+    ]
+
+
 def test_tool_client_forwards_search_to_hosted_workspace(monkeypatch):
     captured = {}
 
