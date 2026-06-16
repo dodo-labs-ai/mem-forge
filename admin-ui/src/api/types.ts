@@ -138,6 +138,13 @@ export interface SourceSubscription {
   enabled: boolean;
 }
 
+export interface SourceSyncSchedule {
+  enabled: boolean;
+  interval_minutes: number;
+  next_run_at: string | null;
+  updated_at: string | null;
+}
+
 export interface Source {
   id: string;
   type: string;
@@ -168,6 +175,7 @@ export interface Source {
   subscription?: SourceSubscription;
   /** Convenience mirror of `subscription.enabled` for the current viewer. */
   enabled_for_me?: boolean;
+  sync_schedule?: SourceSyncSchedule | null;
 }
 
 export interface SourceProject {

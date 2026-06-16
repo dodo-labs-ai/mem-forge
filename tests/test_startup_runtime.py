@@ -352,6 +352,62 @@ def test_admin_source_create_encrypts_and_redacts_pat(tmp_path, monkeypatch):
     assert source_payload["config"]["pat_configured"] is True
 
 
+def test_admin_source_create_and_update_persist_sync_schedule(tmp_path, monkeypatch):
+    from memforge.server.admin_api import create_admin_app
+
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
+    cfg = _config(tmp_path)
+    app = create_admin_app(config=cfg)
+
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/api/sources",
+            json={
+                "type": "confluence",
+                "name": "Scheduled Wiki",
+                "config": {
+                    "base_url": "https://wiki.example.test",
+                    "spaces": ["PAY"],
+                    "pat": "wiki-pat-secret",
+                },
+                "project_binding": _project_binding(),
+                "sync_schedule": {"enabled": True, "interval_minutes": 60},
+            },
+        )
+        assert create_response.status_code == 200, create_response.text
+        source_id = create_response.json()["id"]
+        created_sources = client.get("/api/sources").json()["data"]
+        created = next(source for source in created_sources if source["id"] == source_id)
+        next_run_at = created["sync_schedule"]["next_run_at"]
+
+        update_response = client.put(
+            f"/api/sources/{source_id}",
+            json={
+                "name": "Scheduled Wiki Renamed",
+                "sync_schedule": {"enabled": True, "interval_minutes": 60},
+            },
+        )
+        assert update_response.status_code == 200, update_response.text
+        updated_sources = client.get("/api/sources").json()["data"]
+        updated = next(source for source in updated_sources if source["id"] == source_id)
+
+        disable_response = client.put(
+            f"/api/sources/{source_id}",
+            json={"sync_schedule": None},
+        )
+        assert disable_response.status_code == 200, disable_response.text
+        disabled_sources = client.get("/api/sources").json()["data"]
+        disabled = next(source for source in disabled_sources if source["id"] == source_id)
+
+    assert created["sync_schedule"]["enabled"] is True
+    assert created["sync_schedule"]["interval_minutes"] == 60
+    assert next_run_at is not None
+    assert updated["name"] == "Scheduled Wiki Renamed"
+    assert updated["sync_schedule"]["next_run_at"] == next_run_at
+    assert disabled["sync_schedule"]["enabled"] is False
+    assert disabled["sync_schedule"]["next_run_at"] is None
+
+
 def test_admin_source_update_preserves_encrypted_pat_when_blank(tmp_path, monkeypatch):
     import sqlite3
 

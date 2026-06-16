@@ -92,6 +92,15 @@ class AdapterOnlyEntityDb:
     async def get_schedule_config(self) -> dict:
         return {"enabled": False}
 
+    async def claim_due_scheduled_sources(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 50,
+        exclude_source_ids: set[str] | None = None,
+    ) -> list[dict]:
+        return []
+
     async def get_memory(self, memory_id: str) -> Memory | None:
         return self.memory if memory_id == self.memory.id else None
 

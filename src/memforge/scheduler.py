@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from memforge.runtime import SyncService
+from memforge.runtime import SyncAlreadyRunningError, SyncService
 
 if TYPE_CHECKING:
     from memforge.storage.database import Database
@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 SYNC_JOB_ID = "memforge-sync-all"
 EXPIRY_JOB_ID = "memforge-retire-expired"
 INDEX_HEALTH_JOB_ID = "memforge-index-health"
+SOURCE_SCHEDULE_SCAN_JOB_ID = "memforge-source-schedule-scan"
 
 
 def build_schedule_trigger(schedule: dict) -> CronTrigger:
@@ -52,6 +53,7 @@ class SyncScheduler:
         self.scheduler.start()
         self._ensure_expiry_job()
         self._ensure_index_health_job()
+        self._ensure_source_schedule_scan_job()
         await self.reload()
 
     async def reload(self) -> None:
@@ -101,6 +103,18 @@ class SyncScheduler:
             max_instances=1,
         )
 
+    def _ensure_source_schedule_scan_job(self) -> None:
+        if self.scheduler.get_job(SOURCE_SCHEDULE_SCAN_JOB_ID):
+            return
+        self.scheduler.add_job(
+            self._sync_due_sources,
+            trigger=CronTrigger(minute="*", timezone="UTC"),
+            id=SOURCE_SCHEDULE_SCAN_JOB_ID,
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+
     async def _retire_expired_memories(self) -> None:
         retired_count = await self.sync_service.retire_expired_memories()
         if retired_count:
@@ -115,6 +129,20 @@ class SyncScheduler:
         for issue in report.issues:
             issue_counts[issue.kind] = issue_counts.get(issue.kind, 0) + 1
         logger.error("Memory index health check found issues: %s", issue_counts)
+
+    async def _sync_due_sources(self) -> None:
+        running_source_ids = self.sync_service.running_source_ids()
+        for source in await self.db.claim_due_scheduled_sources(
+            limit=50,
+            exclude_source_ids=running_source_ids,
+        ):
+            source_id = str(source["id"])
+            try:
+                await self.sync_service.start_source(source_id)
+            except SyncAlreadyRunningError:
+                logger.info("Scheduled source sync skipped because %s is already running", source_id)
+            except Exception:
+                logger.exception("Scheduled source sync failed to start for %s", source_id)
 
     async def shutdown(self) -> None:
         if self.scheduler.running:

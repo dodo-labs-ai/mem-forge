@@ -12,7 +12,7 @@ import json
 import logging
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -42,6 +42,11 @@ from memforge.retrieval.access_predicate import visible_sql
 from memforge.storage.admin_memory import (
     MemoryAdminListFilters,
     MemoryAdminQueryPage,
+)
+from memforge.storage.admin_source import (
+    SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES,
+    SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
+    SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,6 +83,18 @@ def _parse_dt(s: str | None) -> datetime | None:
     if not s:
         return None
     return datetime.fromisoformat(s)
+
+
+def _source_schedule_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled": bool(row.get("sync_schedule_enabled")),
+        "interval_minutes": int(
+            row.get("sync_schedule_interval_minutes")
+            or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+        ),
+        "next_run_at": row.get("sync_schedule_next_at"),
+        "updated_at": row.get("sync_schedule_updated_at"),
+    }
 
 
 _VALID_VISIBILITIES = frozenset({Visibility.WORKSPACE.value, Visibility.PRIVATE.value})
@@ -318,6 +335,10 @@ CREATE TABLE IF NOT EXISTS sources (
     doc_count       INTEGER DEFAULT 0,
     project_binding TEXT,                    -- JSON: {"mode": "fixed", ...} or {"mode": "by_field", ...}
     created_by_user_id TEXT,
+    sync_schedule_enabled INTEGER NOT NULL DEFAULT 0,
+    sync_schedule_interval_minutes INTEGER NOT NULL DEFAULT 1440,
+    sync_schedule_next_at TEXT,
+    sync_schedule_updated_at TEXT,
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -329,6 +350,9 @@ CREATE TABLE IF NOT EXISTS source_subscriptions (
     updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (source_id, user_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_sources_sync_schedule_due
+    ON sources(sync_schedule_enabled, sync_schedule_next_at);
 
 CREATE TABLE IF NOT EXISTS auth_sessions (
     provider            TEXT NOT NULL,
@@ -917,6 +941,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             PRIMARY KEY (source_id, user_id)
         )""",
         "CREATE INDEX IF NOT EXISTS idx_source_subscriptions_user ON source_subscriptions(user_id)",
+    ]),
+    (20, "Add per-source sync schedules", [
+        "ALTER TABLE sources ADD COLUMN sync_schedule_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sources ADD COLUMN sync_schedule_interval_minutes INTEGER NOT NULL DEFAULT 1440",
+        "ALTER TABLE sources ADD COLUMN sync_schedule_next_at TEXT",
+        "ALTER TABLE sources ADD COLUMN sync_schedule_updated_at TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_sources_sync_schedule_due ON sources(sync_schedule_enabled, sync_schedule_next_at)",
     ]),
 ]
 
@@ -2653,6 +2684,7 @@ class Database:
             d["project_binding"] = (
                 json.loads(d["project_binding"]) if d.get("project_binding") else None
             )
+            d["sync_schedule"] = _source_schedule_from_row(d)
             return d
 
     async def restore_source_snapshot(self, source: dict) -> None:
@@ -2661,8 +2693,10 @@ class Database:
             await self.db.execute(
                 """INSERT INTO sources
                    (id, type, name, config, status, last_sync, doc_count, project_binding,
-                    created_by_user_id, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_by_user_id, sync_schedule_enabled,
+                    sync_schedule_interval_minutes, sync_schedule_next_at,
+                    sync_schedule_updated_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                    type=excluded.type,
                    name=excluded.name,
@@ -2672,6 +2706,10 @@ class Database:
                    doc_count=excluded.doc_count,
                    project_binding=excluded.project_binding,
                    created_by_user_id=excluded.created_by_user_id,
+                   sync_schedule_enabled=excluded.sync_schedule_enabled,
+                   sync_schedule_interval_minutes=excluded.sync_schedule_interval_minutes,
+                   sync_schedule_next_at=excluded.sync_schedule_next_at,
+                   sync_schedule_updated_at=excluded.sync_schedule_updated_at,
                    created_at=excluded.created_at""",
                 (
                     source["id"],
@@ -2687,6 +2725,10 @@ class Database:
                         else None
                     ),
                     source.get("created_by_user_id"),
+                    int((source.get("sync_schedule") or {}).get("enabled") or 0),
+                    int((source.get("sync_schedule") or {}).get("interval_minutes") or 1440),
+                    (source.get("sync_schedule") or {}).get("next_run_at"),
+                    (source.get("sync_schedule") or {}).get("updated_at"),
                     source["created_at"],
                 ),
             )
@@ -2703,7 +2745,131 @@ class Database:
                 d["project_binding"] = (
                     json.loads(d["project_binding"]) if d.get("project_binding") else None
                 )
+                d["sync_schedule"] = _source_schedule_from_row(d)
                 results.append(d)
+        return results
+
+    async def set_source_sync_schedule(
+        self,
+        source_id: str,
+        *,
+        enabled: bool,
+        interval_minutes: int,
+        next_run_at: datetime | None = None,
+    ) -> None:
+        if interval_minutes < SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES:
+            raise ValueError(
+                f"source sync schedule interval must be at least "
+                f"{SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES} minutes"
+            )
+        if interval_minutes > SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES:
+            raise ValueError(
+                f"source sync schedule interval must be at most "
+                f"{SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES} minutes"
+            )
+        async with self._write_lock:
+            async with self.db.execute(
+                """SELECT sync_schedule_enabled, sync_schedule_interval_minutes,
+                          sync_schedule_next_at
+                   FROM sources WHERE id = ?""",
+                (source_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                raise ValueError(f"Source not found: {source_id}")
+            existing = dict(row)
+            existing_enabled = bool(existing.get("sync_schedule_enabled"))
+            existing_interval = int(
+                existing.get("sync_schedule_interval_minutes")
+                or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+            )
+            existing_next_at = existing.get("sync_schedule_next_at")
+            if not enabled:
+                stored_next_at = None
+            elif next_run_at is not None:
+                stored_next_at = next_run_at.isoformat()
+            elif existing_enabled and existing_interval == interval_minutes and existing_next_at:
+                stored_next_at = existing_next_at
+            else:
+                stored_next_at = (
+                    datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
+                ).isoformat()
+            await self.db.execute(
+                """UPDATE sources SET
+                   sync_schedule_enabled = ?,
+                   sync_schedule_interval_minutes = ?,
+                   sync_schedule_next_at = ?,
+                   sync_schedule_updated_at = ?
+                   WHERE id = ?""",
+                (
+                    int(enabled),
+                    interval_minutes,
+                    stored_next_at,
+                    _now_iso(),
+                    source_id,
+                ),
+            )
+            await self.db.commit()
+
+    async def claim_due_scheduled_sources(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 50,
+        exclude_source_ids: set[str] | None = None,
+    ) -> list[dict]:
+        claim_time = now or datetime.now(timezone.utc)
+        due_at = claim_time.isoformat()
+        exclude_ids = tuple(sorted(exclude_source_ids or ()))
+        exclude_sql = ""
+        if exclude_ids:
+            exclude_sql = " AND id NOT IN (" + ", ".join("?" for _ in exclude_ids) + ")"
+        results: list[dict] = []
+        async with self._write_lock:
+            async with self.db.execute(
+                f"""SELECT * FROM sources
+                   WHERE status = 'active'
+                     AND sync_schedule_enabled = 1
+                     AND sync_schedule_next_at IS NOT NULL
+                     AND sync_schedule_next_at <= ?
+                     {exclude_sql}
+                   ORDER BY sync_schedule_next_at, created_at
+                   LIMIT ?""",
+                (due_at, *exclude_ids, limit),
+            ) as cursor:
+                rows = [dict(row) async for row in cursor]
+            for d in rows:
+                interval_minutes = int(
+                    d.get("sync_schedule_interval_minutes")
+                    or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+                )
+                next_at = claim_time + timedelta(minutes=interval_minutes)
+                updated_at = _now_iso()
+                update_cursor = await self.db.execute(
+                    """UPDATE sources SET
+                       sync_schedule_next_at = ?,
+                       sync_schedule_updated_at = ?
+                       WHERE id = ?
+                         AND status = 'active'
+                         AND sync_schedule_enabled = 1
+                         AND sync_schedule_next_at = ?""",
+                    (
+                        next_at.isoformat(),
+                        updated_at,
+                        d["id"],
+                        d["sync_schedule_next_at"],
+                    ),
+                )
+                if update_cursor.rowcount:
+                    d["sync_schedule_next_at"] = next_at.isoformat()
+                    d["sync_schedule_updated_at"] = updated_at
+                    d["config"] = json.loads(d["config"])
+                    d["project_binding"] = (
+                        json.loads(d["project_binding"]) if d.get("project_binding") else None
+                    )
+                    d["sync_schedule"] = _source_schedule_from_row(d)
+                    results.append(d)
+            await self.db.commit()
         return results
 
     async def is_source_enabled_for_user(self, source_id: str, user_id: str) -> bool:

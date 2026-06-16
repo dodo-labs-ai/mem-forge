@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
@@ -18,6 +20,15 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
         async def get_schedule_config(self) -> dict:
             return {"enabled": False}
 
+        async def claim_due_scheduled_sources(
+            self,
+            *,
+            now: datetime | None = None,
+            limit: int = 50,
+            exclude_source_ids: set[str] | None = None,
+        ) -> list[dict]:
+            return []
+
         async def list_sources(self) -> list[dict]:
             return [
                 {
@@ -30,6 +41,12 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
                     "doc_count": 99,
                     "created_at": "2026-06-13T00:00:00+00:00",
                     "updated_at": "2026-06-13T00:00:00+00:00",
+                    "sync_schedule": {
+                        "enabled": True,
+                        "interval_minutes": 60,
+                        "next_run_at": "2026-06-13T01:00:00+00:00",
+                        "updated_at": "2026-06-13T00:00:00+00:00",
+                    },
                 }
             ]
 
@@ -69,6 +86,16 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
         ) -> None:
             raise AssertionError("not used by source list")
 
+        async def set_source_sync_schedule(
+            self,
+            source_id: str,
+            *,
+            enabled: bool,
+            interval_minutes: int,
+            next_run_at: datetime | None = None,
+        ) -> None:
+            raise AssertionError("not used by source list")
+
     app = create_admin_app(db=FakeSourceReader(), config=_config(tmp_path))
 
     with TestClient(app) as client:
@@ -95,12 +122,27 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
         "error_message": "one failed",
         "failed_docs": [{"doc_id": "doc-1", "error": "boom"}],
     }
+    assert source["sync_schedule"] == {
+        "enabled": True,
+        "interval_minutes": 60,
+        "next_run_at": "2026-06-13T01:00:00+00:00",
+        "updated_at": "2026-06-13T00:00:00+00:00",
+    }
 
 
 def test_source_projects_route_uses_storage_neutral_admin_reader(tmp_path):
     class FakeSourceReader:
         async def get_schedule_config(self) -> dict:
             return {"enabled": False}
+
+        async def claim_due_scheduled_sources(
+            self,
+            *,
+            now: datetime | None = None,
+            limit: int = 50,
+            exclude_source_ids: set[str] | None = None,
+        ) -> list[dict]:
+            return []
 
         async def get_source(self, source_id: str) -> dict | None:
             assert source_id == "src-neutral"
@@ -116,6 +158,16 @@ def test_source_projects_route_uses_storage_neutral_admin_reader(tmp_path):
                     "last_observed_at": "2026-06-13T00:00:00+00:00",
                 }
             ]
+
+        async def set_source_sync_schedule(
+            self,
+            source_id: str,
+            *,
+            enabled: bool,
+            interval_minutes: int,
+            next_run_at: datetime | None = None,
+        ) -> None:
+            raise AssertionError("not used by source projects")
 
     app = create_admin_app(db=FakeSourceReader(), config=_config(tmp_path))
 
@@ -134,3 +186,70 @@ def test_source_projects_route_uses_storage_neutral_admin_reader(tmp_path):
             }
         ],
     }
+
+
+def test_source_schedule_routes_use_storage_neutral_store(tmp_path):
+    class FakeSourceReader:
+        def __init__(self) -> None:
+            self.updated: tuple[str, bool, int] | None = None
+
+        async def get_schedule_config(self) -> dict:
+            return {"enabled": False}
+
+        async def claim_due_scheduled_sources(
+            self,
+            *,
+            now: datetime | None = None,
+            limit: int = 50,
+            exclude_source_ids: set[str] | None = None,
+        ) -> list[dict]:
+            return []
+
+        async def get_source(self, source_id: str) -> dict | None:
+            assert source_id == "src-neutral"
+            return {
+                "id": source_id,
+                "type": "confluence",
+                "name": "Neutral Source",
+                "created_by_user_id": "user-a",
+                "sync_schedule": {
+                    "enabled": False,
+                    "interval_minutes": 1440,
+                    "next_run_at": None,
+                    "updated_at": None,
+                },
+            }
+
+        async def set_source_sync_schedule(
+            self,
+            source_id: str,
+            *,
+            enabled: bool,
+            interval_minutes: int,
+            next_run_at: datetime | None = None,
+        ) -> None:
+            self.updated = (source_id, enabled, interval_minutes)
+
+    reader = FakeSourceReader()
+    app = create_admin_app(
+        db=reader,
+        config=_config(tmp_path),
+        principal_resolver=lambda request: "user-a",
+    )
+
+    with TestClient(app) as client:
+        get_response = client.get("/api/sources/src-neutral/schedule")
+        put_response = client.put(
+            "/api/sources/src-neutral/schedule",
+            json={"enabled": True, "interval_minutes": 60},
+        )
+
+    assert get_response.status_code == 200, get_response.text
+    assert get_response.json() == {
+        "enabled": False,
+        "interval_minutes": 1440,
+        "next_run_at": None,
+        "updated_at": None,
+    }
+    assert put_response.status_code == 200, put_response.text
+    assert reader.updated == ("src-neutral", True, 60)

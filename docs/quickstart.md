@@ -94,6 +94,11 @@ docker compose up --build
 Use the Sources screen to add a source and run a sync. Settings values saved in
 the UI are stored in the local database and are used by the next sync.
 
+Each source can also run on its own server-side schedule. Open the source's
+**Configure** dialog, enable **Sync on a schedule**, and choose an interval.
+Scheduled runs use the same backend queue and source permissions as a manual
+**Sync** click; an already-running source is skipped until the next interval.
+
 ## 4. Install Agent Plugins
 
 Agent clients call MemForge through a plugin-local MCP proxy. The proxy does
@@ -170,6 +175,14 @@ plugins before running these commands:
 ```bash
 export MEMFORGE_API_URL=https://api.example.memforge
 export MEMFORGE_API_TOKEN=...
+```
+
+You can configure the same per-source automatic sync from the CLI:
+
+```bash
+uv run memforge sources schedule src-123 --every-minutes 60
+uv run memforge sources schedule-show src-123
+uv run memforge sources schedule src-123 --disable
 ```
 
 ## 7. Development From Source

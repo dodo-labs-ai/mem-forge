@@ -123,6 +123,16 @@ assert.match(
   /onRetry=\{isPaused \? undefined : onSync\}/,
   "Paused sources should not expose retry sync from the status bar",
 );
+assert.match(
+  sourceRowSource,
+  /source\.sync_schedule\?\.enabled/,
+  "SourceRow should show automatic sync metadata when a source schedule is enabled",
+);
+assert.match(
+  sourceRowSource,
+  /formatRelativeFuture\(source\.sync_schedule\.next_run_at\)/,
+  "SourceRow should format the next scheduled sync as a future time instead of using the last-sync formatter",
+);
 
 assert.match(
   sourcesPageSource,
@@ -150,4 +160,24 @@ assert.match(
   sourceConfigDialogSource,
   /jiraSessionQuery\.refetch\(\)/,
   "Jira browser-session guidance should allow users to re-check after running the CLI refresh",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /const payloadWithSchedule = \{/,
+  "Source saves should bundle automatic sync settings into the source payload",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /sync_schedule:\s*\{\s*enabled: scheduleEnabled,\s*interval_minutes: intervalMinutes,\s*\}/,
+  "Source saves should send the schedule shape expected by the source API",
+);
+assert.doesNotMatch(
+  sourceConfigDialogSource,
+  /\/api\/sources\/[^`]+\/schedule/,
+  "SourceConfigDialog should not split config and schedule persistence into two requests",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /<span className="block text-sm font-medium">Sync on a schedule<\/span>/,
+  "Source configuration should expose a clear automatic sync control",
 );

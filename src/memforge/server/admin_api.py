@@ -92,6 +92,11 @@ from memforge.server.source_admin_service import (
     normalize_workspace_role,
 )
 from memforge.storage.admin_memory import MemoryAdminListFilters
+from memforge.storage.admin_source import (
+    SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES,
+    SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
+    SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES,
+)
 from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -464,6 +469,22 @@ class JiraSessionStatusResponse(BaseModel):
     sources_reset: list[str] = []
 
 
+class SourceSyncScheduleResponse(BaseModel):
+    enabled: bool = False
+    interval_minutes: int = SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+    next_run_at: str | None = None
+    updated_at: str | None = None
+
+
+class SourceSyncScheduleRequest(BaseModel):
+    enabled: bool = False
+    interval_minutes: int = Field(
+        default=SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES,
+        ge=SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES,
+        le=SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
+    )
+
+
 class SourceResponse(BaseModel):
     id: str
     type: str
@@ -474,6 +495,7 @@ class SourceResponse(BaseModel):
     doc_count: int = 0
     created_at: str | None = None
     project_binding: dict | None = None
+    sync_schedule: SourceSyncScheduleResponse | None = None
 
 
 class SourceProjectResponse(BaseModel):
@@ -533,6 +555,7 @@ class CreateSourceRequest(BaseModel):
     name: str
     config: dict
     project_binding: dict | None = None
+    sync_schedule: SourceSyncScheduleRequest | None = None
 
 
 class SourceSyncRequest(BaseModel):
@@ -548,6 +571,7 @@ class UpdateSourceRequest(BaseModel):
     config: dict | None = None
     status: str | None = None
     project_binding: dict | None = None
+    sync_schedule: SourceSyncScheduleRequest | None = None
 
 
 def _request_includes_field(model: BaseModel, field_name: str) -> bool:
@@ -3219,6 +3243,12 @@ def create_admin_app(
             project_binding=req.project_binding,
             created_by_user_id=resolve_request_principal(request),
         )
+        if req.sync_schedule is not None:
+            await db.set_source_sync_schedule(
+                source_id,
+                enabled=req.sync_schedule.enabled,
+                interval_minutes=req.sync_schedule.interval_minutes,
+            )
         return {"id": source_id, "name": req.name, "type": req.type}
 
     @source_router.put("/{source_id}")
@@ -3288,6 +3318,13 @@ def create_admin_app(
                 else existing.get("project_binding")
             ),
         )
+        if _request_includes_field(req, "sync_schedule"):
+            schedule = req.sync_schedule or SourceSyncScheduleRequest()
+            await db.set_source_sync_schedule(
+                source_id,
+                enabled=schedule.enabled,
+                interval_minutes=schedule.interval_minutes,
+            )
         if base_url_changed:
             release_atlassian_request_limiter(old_base_url, owner_id=source_id)
         if scope_changed or auth_secret_changed:
@@ -3375,6 +3412,38 @@ def create_admin_app(
         except SourcePausedError:
             raise _source_paused_http_error()
         return {"ok": True, "message": "Force resync started", "source_id": source_id}
+
+    @source_router.get("/{source_id}/schedule", response_model=SourceSyncScheduleResponse)
+    async def get_source_sync_schedule(
+        request: Request,
+        source_id: str,
+        db: Database = Depends(get_db),
+    ):
+        """Return the per-source automatic sync schedule."""
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        return SourceSyncScheduleResponse(**(source.get("sync_schedule") or {}))
+
+    @source_router.put("/{source_id}/schedule")
+    async def update_source_sync_schedule(
+        request: Request,
+        source_id: str,
+        req: SourceSyncScheduleRequest,
+        db: Database = Depends(get_db),
+    ):
+        """Update the per-source automatic sync schedule."""
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        await db.set_source_sync_schedule(
+            source_id,
+            enabled=req.enabled,
+            interval_minutes=req.interval_minutes,
+        )
+        return {"ok": True, "source_id": source_id}
 
     @source_router.post("/{source_id}/adapter/documents")
     async def push_local_adapter_document(

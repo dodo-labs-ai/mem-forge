@@ -44,6 +44,15 @@ def test_memory_list_route_uses_storage_neutral_admin_reader(tmp_path):
         async def get_schedule_config(self) -> dict:
             return {"enabled": False}
 
+        async def claim_due_scheduled_sources(
+            self,
+            *,
+            now: datetime | None = None,
+            limit: int = 50,
+            exclude_source_ids: set[str] | None = None,
+        ) -> list[dict]:
+            return []
+
         async def query_memory_admin_page(
             self,
             *,
@@ -112,6 +121,15 @@ def test_memory_list_route_uses_injected_principal_resolver(tmp_path):
 
         async def get_schedule_config(self) -> dict:
             return {"enabled": False}
+
+        async def claim_due_scheduled_sources(
+            self,
+            *,
+            now: datetime | None = None,
+            limit: int = 50,
+            exclude_source_ids: set[str] | None = None,
+        ) -> list[dict]:
+            return []
 
         async def query_memory_admin_page(
             self,

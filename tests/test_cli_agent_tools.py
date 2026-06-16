@@ -33,6 +33,17 @@ class FakeToolClient:
         self.calls.append(("create_source", {"api_url": self.api_url, "api_token": self.api_token, **kwargs}))
         return self.create_response
 
+    def get_source_schedule(self, source_id: str):
+        self.calls.append((
+            "get_source_schedule",
+            {"api_url": self.api_url, "api_token": self.api_token, "source_id": source_id},
+        ))
+        return self.response
+
+    def update_source_schedule(self, **kwargs):
+        self.calls.append(("update_source_schedule", {"api_url": self.api_url, "api_token": self.api_token, **kwargs}))
+        return self.response
+
     def search(self, **kwargs):
         self.calls.append(("search", {"api_url": self.api_url, "api_token": self.api_token, **kwargs}))
         return self.response
@@ -116,7 +127,8 @@ def test_get_memory_cli_fetches_memory_detail(monkeypatch):
     assert FakeToolClient.calls[0][1]["memory_id"] == "mem-123"
 
 
-def test_get_resource_cli_supports_file_mode(monkeypatch):
+def test_get_resource_cli_supports_file_mode(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "cli.toml"))
     FakeToolClient.reset(
         {
             "doc_id": "doc-456",
@@ -170,6 +182,56 @@ def test_memory_group_keeps_read_tools_api_backed(monkeypatch):
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["memory_id"] == "mem-456"
     assert FakeToolClient.calls[0][0] == "get_memory"
+
+
+def test_sources_schedule_cli_updates_active_api_target(monkeypatch):
+    FakeToolClient.reset({"ok": True, "source_id": "src-1"})
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient, raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        ["sources", "schedule", "src-1", "--every-minutes", "60"],
+        env={"MEMFORGE_API_URL": "https://memforge.example.test", "MEMFORGE_API_TOKEN": "token-1"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["ok"] is True
+    assert FakeToolClient.calls == [
+        (
+            "update_source_schedule",
+            {
+                "api_url": "https://memforge.example.test",
+                "api_token": "token-1",
+                "source_id": "src-1",
+                "enabled": True,
+                "interval_minutes": 60,
+            },
+        )
+    ]
+
+
+def test_sources_schedule_show_cli_reads_active_api_target(monkeypatch):
+    FakeToolClient.reset({"enabled": True, "interval_minutes": 60})
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient, raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        ["sources", "schedule-show", "src-1"],
+        env={"MEMFORGE_API_URL": "https://memforge.example.test", "MEMFORGE_API_TOKEN": "token-1"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["interval_minutes"] == 60
+    assert FakeToolClient.calls == [
+        (
+            "get_source_schedule",
+            {
+                "api_url": "https://memforge.example.test",
+                "api_token": "token-1",
+                "source_id": "src-1",
+            },
+        )
+    ]
 
 
 def test_target_profile_sets_default_api_url(monkeypatch, tmp_path: Path):
