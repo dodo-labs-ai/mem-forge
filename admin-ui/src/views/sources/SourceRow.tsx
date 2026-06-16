@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 import { Info, Loader2, Pause, Play, SlidersHorizontal } from "lucide-react";
 import type { Source, SourceCapabilities, SourceOwnership } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
@@ -8,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { cn } from "@/lib/utils";
-import { timeAgo } from "@/utils/date";
+import { formatDuration, timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
 
 /**
@@ -125,7 +126,7 @@ export function SourceRow({
               <span>
                 {source.sync?.status === "running"
                   ? "Syncing now"
-                  : `Last synced: ${timeAgo(source.last_sync)}`}
+                  : <LastSyncDetails source={source} itemLabel={itemLabel} />}
               </span>
               {source.type === "jira" && source.auth_session && hasManagementControl && (
                 <span
@@ -238,6 +239,96 @@ export function SourceRow({
       )}
     </div>
   );
+}
+
+function LastSyncDetails({
+  source,
+  itemLabel,
+}: {
+  source: Source;
+  itemLabel: string;
+}) {
+  const label = `Last synced: ${timeAgo(source.last_sync)}`;
+  const sync = source.sync;
+
+  if (!sync) {
+    return <span>{label}</span>;
+  }
+
+  const duration =
+    sync.started_at && sync.finished_at
+      ? formatDuration(sync.started_at, sync.finished_at)
+      : null;
+  const failedCount = sync.docs_failed ?? 0;
+  const isProblemStatus = sync.status === "partial" || sync.status === "failed";
+
+  return (
+    <PopoverPrimitive.Root>
+      <PopoverPrimitive.Trigger
+        render={
+          <button
+            type="button"
+            className={cn(
+              "inline-flex cursor-pointer items-center gap-1 rounded-sm text-muted-foreground outline-none transition-colors hover:text-foreground",
+              "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+            )}
+            aria-label={`Show last sync details for ${source.name}`}
+          />
+        }
+      >
+        <span>{label}</span>
+        <Info className="size-3.5 opacity-65" />
+      </PopoverPrimitive.Trigger>
+      <PopoverPrimitive.Portal>
+        <PopoverPrimitive.Positioner sideOffset={6} align="start">
+          <PopoverPrimitive.Popup
+            className={cn(
+              "z-50 w-72 rounded-lg border bg-popover p-3 text-sm text-popover-foreground shadow-md outline-none",
+              "data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0",
+            )}
+          >
+            <div className="space-y-2">
+              <div className="font-medium text-foreground">Last sync details</div>
+              <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 text-xs">
+                <dt className="text-muted-foreground">Status</dt>
+                <dd className={isProblemStatus ? "font-medium text-destructive" : "font-medium text-foreground"}>
+                  {sync.status}
+                </dd>
+                <dt className="text-muted-foreground">{capitalize(itemLabel)} checked</dt>
+                <dd className="font-medium text-foreground">{sync.docs_processed}</dd>
+                <dt className="text-muted-foreground">Updated</dt>
+                <dd className="font-medium text-foreground">{sync.docs_updated}</dd>
+                {failedCount > 0 && (
+                  <>
+                    <dt className="text-muted-foreground">Failed</dt>
+                    <dd className="font-medium text-destructive">{failedCount}</dd>
+                  </>
+                )}
+                <dt className="text-muted-foreground">New memories</dt>
+                <dd className="font-medium text-foreground">{sync.memories_extracted}</dd>
+                {duration && (
+                  <>
+                    <dt className="text-muted-foreground">Duration</dt>
+                    <dd className="font-medium text-foreground">{duration}</dd>
+                  </>
+                )}
+              </dl>
+              {sync.error_message && (
+                <p className="rounded-md bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+                  {sync.error_message}
+                </p>
+              )}
+            </div>
+          </PopoverPrimitive.Popup>
+        </PopoverPrimitive.Positioner>
+      </PopoverPrimitive.Portal>
+    </PopoverPrimitive.Root>
+  );
+}
+
+function capitalize(value: string): string {
+  if (!value) return value;
+  return value[0].toUpperCase() + value.slice(1);
 }
 
 function SubscriptionToggle({

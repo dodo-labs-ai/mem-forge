@@ -288,6 +288,9 @@ function SourceConfigForm({
                           session={jiraSessionQuery.data}
                           loading={jiraSessionQuery.isFetching}
                           error={jiraSessionQuery.error}
+                          onRefresh={() => {
+                            void jiraSessionQuery.refetch();
+                          }}
                         />
                       )}
                       {sourceType === "local_markdown" && field.key === "vault_id" && (
@@ -544,11 +547,13 @@ function JiraBrowserSessionPanel({
   session,
   loading,
   error,
+  onRefresh,
 }: {
   baseUrl: string;
   session?: JiraAuthSession;
   loading: boolean;
   error: unknown;
+  onRefresh: () => void;
 }) {
   const status = session?.status ?? "missing";
   const isActive = status === "active";
@@ -559,7 +564,7 @@ function JiraBrowserSessionPanel({
           "Missing";
   const principal = session?.principal_name || session?.principal_id || "unknown user";
   const errorText = error ? extractSaveError(error) : session?.last_error || "";
-  const command = `memforge adapter auth jira --base-url ${baseUrl || "<jira-base-url>"}`;
+  const command = `memforge adapter auth jira refresh --base-url ${baseUrl || "<jira-base-url>"}`;
   const handleCopy = () => {
     if (typeof navigator === "undefined" || !navigator.clipboard) return;
     void navigator.clipboard.writeText(command);
@@ -584,6 +589,9 @@ function JiraBrowserSessionPanel({
         <code className="flex-1 break-all font-mono text-[11px] text-foreground">{command}</code>
         <Button type="button" variant="outline" size="sm" onClick={handleCopy}>
           Copy
+        </Button>
+        <Button type="button" variant="outline" size="sm" onClick={onRefresh} disabled={loading}>
+          {loading ? <Loader2 className="size-3.5 animate-spin" /> : "Refresh"}
         </Button>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">

@@ -3369,7 +3369,7 @@ def create_admin_app(
 
         await db.reset_source_sync_cursor(source_id)
         try:
-            await sync_service.start_source(source_id)
+            await sync_service.start_source(source_id, force_full_sync=True)
         except SyncAlreadyRunningError:
             raise HTTPException(status_code=409, detail="Sync already running for this source")
         except SourcePausedError:

@@ -1984,13 +1984,13 @@ async def test_force_resync_resets_cursor_and_starts_source_sync(db, tmp_path):
 
     class FakeSyncService:
         def __init__(self):
-            self.started: list[str] = []
+            self.started: list[tuple[str, bool]] = []
 
         def is_running(self, source_id: str):
             return False
 
-        async def start_source(self, started_source_id: str):
-            self.started.append(started_source_id)
+        async def start_source(self, started_source_id: str, *, force_full_sync: bool = False):
+            self.started.append((started_source_id, force_full_sync))
 
         async def shutdown(self):
             return None
@@ -2004,7 +2004,7 @@ async def test_force_resync_resets_cursor_and_starts_source_sync(db, tmp_path):
 
     assert response.status_code == 200
     assert response.json() == {"ok": True, "message": "Force resync started", "source_id": source_id}
-    assert fake_sync_service.started == [source_id]
+    assert fake_sync_service.started == [(source_id, True)]
     assert await db.get_sync_state(source_id) is None
     source_payload = next(s for s in sources_response.json()["data"] if s["id"] == source_id)
     assert source_payload["sync"] is None

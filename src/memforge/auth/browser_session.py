@@ -19,8 +19,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol, runtime_checkable
 
-from memforge.storage.database import Database
-
 
 class BrowserSessionError(RuntimeError):
     """A browser-session capture or validation failed."""
@@ -58,6 +56,61 @@ class BrowserSessionService(Protocol):
     async def mark_expired(self, base_url: str, error: str) -> None: ...
 
 
+@runtime_checkable
+class BrowserSessionStore(Protocol):
+    """Storage contract required by browser-session auth providers."""
+
+    async def list_sources(self) -> list[dict[str, Any]]: ...
+
+    async def get_auth_session(self, provider: str, origin: str) -> dict[str, Any] | None: ...
+
+    async def list_auth_sessions(self, provider: str | None = None) -> list[dict[str, Any]]: ...
+
+    async def upsert_auth_session(
+        self,
+        *,
+        provider: str,
+        origin: str,
+        secret_encrypted: str,
+        principal_id: str | None,
+        principal_name: str | None,
+        principal_email: str | None,
+        browser: str | None,
+        status: str,
+        captured_at: str,
+        validated_at: str | None,
+        last_error: str | None,
+    ) -> None: ...
+
+    async def upsert_auth_session_and_reset_sources(
+        self,
+        *,
+        provider: str,
+        origin: str,
+        secret_encrypted: str,
+        principal_id: str | None,
+        principal_name: str | None,
+        principal_email: str | None,
+        browser: str | None,
+        status: str,
+        captured_at: str,
+        validated_at: str | None,
+        last_error: str | None,
+        reset_source_ids: list[str],
+    ) -> None: ...
+
+    async def mark_auth_session_status(
+        self,
+        *,
+        provider: str,
+        origin: str,
+        status: str,
+        last_error: str | None,
+    ) -> None: ...
+
+    async def delete_auth_session(self, provider: str, origin: str) -> bool: ...
+
+
 @dataclass(frozen=True)
 class BrowserSessionProvider:
     """Everything the generic layer needs to manage one provider's sessions."""
@@ -67,7 +120,7 @@ class BrowserSessionProvider:
     label: str
     cookie_config_key: str
     canonical_origin: Callable[[str], str]
-    service_factory: Callable[[Database], BrowserSessionService]
+    service_factory: Callable[[BrowserSessionStore], BrowserSessionService]
     uses_browser_session: Callable[[dict], bool]
 
 
@@ -104,7 +157,7 @@ def ensure_builtin_providers() -> None:
     import memforge.auth.jira_auth  # noqa: F401  (registers the jira provider)
 
 
-async def list_origins(db: Database, provider: str) -> list[dict[str, Any]]:
+async def list_origins(db: BrowserSessionStore, provider: str) -> list[dict[str, Any]]:
     """Known origins for a provider: authenticated sessions + configured sources.
 
     Only safe fields are returned; the encrypted cookie is never included.
@@ -142,12 +195,12 @@ async def list_origins(db: Database, provider: str) -> list[dict[str, Any]]:
     return sorted(entries.values(), key=lambda item: item["origin"])
 
 
-async def status(db: Database, provider: str, base_url: str) -> dict[str, Any]:
+async def status(db: BrowserSessionStore, provider: str, base_url: str) -> dict[str, Any]:
     descriptor = get_provider(provider)
     return await descriptor.service_factory(db).get_status(base_url)
 
 
-async def forget(db: Database, provider: str, base_url: str) -> dict[str, Any]:
+async def forget(db: BrowserSessionStore, provider: str, base_url: str) -> dict[str, Any]:
     descriptor = get_provider(provider)
     origin = descriptor.canonical_origin(base_url)
     removed = await db.delete_auth_session(provider, origin)
@@ -155,7 +208,7 @@ async def forget(db: Database, provider: str, base_url: str) -> dict[str, Any]:
 
 
 async def store_uploaded(
-    db: Database,
+    db: BrowserSessionStore,
     provider: str,
     *,
     base_url: str,
@@ -172,7 +225,7 @@ async def store_uploaded(
     )
 
 
-async def inject_cookie_for_source(db: Database, source_type: str, config: dict[str, Any]) -> bool:
+async def inject_cookie_for_source(db: BrowserSessionStore, source_type: str, config: dict[str, Any]) -> bool:
     """Inject a captured session cookie into a source config before sync.
 
     No-op for source types that do not use a browser session, or whose config
@@ -189,7 +242,7 @@ async def inject_cookie_for_source(db: Database, source_type: str, config: dict[
     return True
 
 
-async def mark_expired_for_source(db: Database, source_type: str, base_url: str, error: str) -> bool:
+async def mark_expired_for_source(db: BrowserSessionStore, source_type: str, base_url: str, error: str) -> bool:
     """Mark a source's browser session expired after a sync failure. No-op for non-providers."""
     descriptor = provider_for_source_type(source_type)
     if descriptor is None:

@@ -22,11 +22,11 @@ from memforge.auth.browser_session import (
     BrowserSessionMissingError,
     BrowserSessionPrincipalChangedError,
     BrowserSessionProvider,
+    BrowserSessionStore,
     register_provider,
 )
 from memforge.genes.atlassian_auth import require_https_base_url, tls_verify
 from memforge.source_secrets import decrypt_secret, encrypt_secret
-from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ class JiraAuthSessionService:
 
     def __init__(
         self,
-        db: Database,
+        db: BrowserSessionStore,
         *,
         session_validator: SessionValidator | None = None,
     ) -> None:

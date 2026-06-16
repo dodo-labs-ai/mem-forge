@@ -13,6 +13,7 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from memforge.config import DEFAULT_ENRICHMENT_MAX_TOKENS
 from memforge.llm.structured import StructuredLlmError
 from memforge.models import (
     Memory,
@@ -118,7 +119,7 @@ async def detect_cross_doc_contradictions(
     try:
         response = await structured_llm_client.detect_contradictions(
             prompt,
-            max_tokens=64000,
+            max_tokens=DEFAULT_ENRICHMENT_MAX_TOKENS,
             model=llm_model,
         )
         decisions = [decision.model_dump() for decision in response.decisions]
