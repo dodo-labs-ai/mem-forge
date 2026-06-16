@@ -31,6 +31,7 @@ const RESERVED_ROUTE_SEGMENTS = Object.freeze([
   "review",
   "entities",
   "sources",
+  "schedules",
   "projects",
   "settings",
 ] as const);
