@@ -235,6 +235,59 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
 
 
 @pytest.mark.asyncio
+async def test_litellm_structured_client_uses_response_schema_for_sap_anthropic_alias(monkeypatch):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse(
+            '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact","confidence":0.9}]}'
+        )
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="sap/anthropic--claude-4.6-sonnet",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+        )
+    )
+
+    response = await client.extract_memories("prompt", max_tokens=8192)
+
+    assert response.memories[0].content == "Service A uses PostgreSQL 16."
+    assert len(calls) == 1
+    assert calls[0]["model"] == "sap/anthropic--claude-4.6-sonnet"
+    assert calls[0]["messages"] == [{"role": "user", "content": "prompt"}]
+    assert calls[0]["response_format"] is MemoryExtractionResponse
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_repairs_invalid_json_backslash_escapes(monkeypatch):
+    async def fake_acompletion(**kwargs):
+        return CompletionResponse(
+            r'{"memories":[{"content":"Use regex \s+ for whitespace.","memory_type":"fact","confidence":0.8}]}'
+        )
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+        )
+    )
+
+    response = await client.extract_memories("prompt", max_tokens=8192)
+
+    assert response.memories[0].content == r"Use regex \s+ for whitespace."
+
+
+@pytest.mark.asyncio
 async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypatch):
     calls = []
 

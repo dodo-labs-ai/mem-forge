@@ -22,9 +22,13 @@ from memforge.models import (
     FailedDoc,
     content_hash,
 )
-from memforge.pipeline.sync import GeneSyncOrchestrator, summarize_failed_documents
+from memforge.pipeline.sync import (
+    ExtractionWorkPool,
+    GeneSyncOrchestrator,
+    summarize_failed_documents,
+)
 from memforge.runtime import SyncService
-from memforge.config import AppConfig
+from memforge.config import AppConfig, SyncConfig
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
@@ -80,6 +84,132 @@ def test_failed_document_summary_identifies_llm_provider_outage():
         "1 document could not be synced. LLM provider was unreachable for 1 document. "
         "Check the provider endpoint, network access, and service status, then retry the sync."
     )
+
+
+@pytest.mark.asyncio
+async def test_extraction_work_pool_allows_one_source_to_use_all_workers():
+    pool = ExtractionWorkPool(max_workers=6)
+    entered = 0
+    release = asyncio.Event()
+
+    async def hold_slot() -> None:
+        nonlocal entered
+        async with pool.slot("src-a"):
+            entered += 1
+            await release.wait()
+
+    tasks = [asyncio.create_task(hold_slot()) for _ in range(6)]
+    for _ in range(20):
+        if entered == 6:
+            break
+        await asyncio.sleep(0.01)
+
+    assert entered == 6
+
+    release.set()
+    await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_extraction_work_pool_favors_waiting_source_over_extra_borrowed_work():
+    pool = ExtractionWorkPool(max_workers=6)
+    release_a = asyncio.Event()
+    entered: list[str] = []
+
+    async def hold_source_a() -> None:
+        async with pool.slot("src-a"):
+            entered.append("a")
+            await release_a.wait()
+
+    source_a_tasks = [asyncio.create_task(hold_source_a()) for _ in range(6)]
+    for _ in range(20):
+        if entered.count("a") == 6:
+            break
+        await asyncio.sleep(0.01)
+    assert entered.count("a") == 6
+
+    source_b_entered = asyncio.Event()
+    release_b = asyncio.Event()
+    extra_a_entered = asyncio.Event()
+
+    async def wait_source_b() -> None:
+        async with pool.slot("src-b"):
+            entered.append("b")
+            source_b_entered.set()
+            await release_b.wait()
+
+    async def wait_extra_source_a() -> None:
+        async with pool.slot("src-a"):
+            entered.append("extra-a")
+            extra_a_entered.set()
+
+    source_b_task = asyncio.create_task(wait_source_b())
+    extra_a_task = asyncio.create_task(wait_extra_source_a())
+    await asyncio.sleep(0)
+
+    source_a_tasks[0].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await source_a_tasks[0]
+
+    await asyncio.wait_for(source_b_entered.wait(), timeout=1)
+    assert not extra_a_entered.is_set()
+
+    release_b.set()
+    release_a.set()
+    await asyncio.gather(*source_a_tasks[1:], source_b_task, extra_a_task)
+
+
+@pytest.mark.asyncio
+async def test_shared_extraction_pool_caps_orchestrator_work_across_sources(db: Database):
+    for source_id in ("src-pool-a", "src-pool-b"):
+        await db.upsert_source(
+            id=source_id,
+            type="jira",
+            name=f"Source {source_id}",
+            config_json="{}",
+        )
+
+    pool = ExtractionWorkPool(max_workers=4)
+    release_enrichment = asyncio.Event()
+    release_fetch = asyncio.Event()
+    release_fetch.set()
+    enricher = BlockingEnricher(release=release_enrichment, target_entries=4)
+
+    def make_orchestrator() -> GeneSyncOrchestrator:
+        return GeneSyncOrchestrator(
+            db=db,
+            doc_store=StubDocumentStore(),
+            enricher=enricher,
+            memory_extractor=NoopMemoryExtractor(),
+            memory_engine=NoopMemoryEngine(),
+            memory_store=None,
+            max_concurrent=4,
+            extraction_pool=pool,
+        )
+
+    task_a = asyncio.create_task(
+        make_orchestrator().sync_gene(
+            gene=BlockingFetchGene(item_count=4, release=release_fetch),
+            source_name="Source A",
+            source_id="src-pool-a",
+        )
+    )
+    task_b = asyncio.create_task(
+        make_orchestrator().sync_gene(
+            gene=BlockingFetchGene(item_count=4, release=release_fetch),
+            source_name="Source B",
+            source_id="src-pool-b",
+        )
+    )
+
+    await asyncio.wait_for(enricher.target_reached.wait(), timeout=2)
+    await asyncio.sleep(0.05)
+
+    assert enricher.max_active == 4
+
+    release_enrichment.set()
+    states = await asyncio.gather(task_a, task_b)
+    assert [state.last_sync_status for state in states] == ["success", "success"]
 
 
 def test_failed_document_summary_keeps_rate_limit_precedence_over_llm_timeout_text():
@@ -551,6 +681,36 @@ class EntityMentioningEnricher:
         )
 
 
+class BlockingEnricher:
+    def __init__(self, release: asyncio.Event, target_entries: int):
+        self.release = release
+        self.target_entries = target_entries
+        self.entered = 0
+        self.active = 0
+        self.max_active = 0
+        self.target_reached = asyncio.Event()
+
+    async def enrich_document(self, *, doc_id, content, source_type):
+        del doc_id, content, source_type
+        self.entered += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        if self.entered >= self.target_entries:
+            self.target_reached.set()
+        try:
+            await self.release.wait()
+            return EnrichmentResult(
+                summary="Summary",
+                tags=[],
+                entities=[],
+                relationships=[],
+                doc_type="jira_issue",
+                complexity="low",
+            )
+        finally:
+            self.active -= 1
+
+
 class ExplodingEnricher:
     async def enrich_document(self, *, doc_id, content, source_type):
         raise AssertionError("unchanged document should not be enriched")
@@ -972,6 +1132,193 @@ async def test_sync_service_passes_force_full_sync_to_source_task(db: Database, 
 
 
 @pytest.mark.asyncio
+async def test_sync_service_limits_active_sources_without_rejecting_queued_sources(
+    db: Database,
+    monkeypatch,
+):
+    await db.upsert_source(
+        id="src-a",
+        type="jira",
+        name="Source A",
+        config_json="{}",
+    )
+    await db.upsert_source(
+        id="src-b",
+        type="jira",
+        name="Source B",
+        config_json="{}",
+    )
+    service = SyncService(
+        db,
+        AppConfig(sync=SyncConfig(max_active_sources=1)),
+    )
+    release = asyncio.Event()
+    started: list[str] = []
+
+    async def fake_run_source_task(running_source_id: str, *, force_full_sync: bool = False):
+        del force_full_sync
+        started.append(running_source_id)
+        try:
+            await release.wait()
+        finally:
+            service.tasks.pop(running_source_id, None)
+            service.progress.pop(running_source_id, None)
+
+    monkeypatch.setattr(service, "_run_source_task", fake_run_source_task)
+
+    task_a = await service.start_source("src-a")
+    task_b = await service.start_source("src-b")
+    await asyncio.sleep(0)
+
+    assert service.is_running("src-a")
+    assert service.is_running("src-b")
+    assert started == ["src-a"]
+    assert service.progress["src-b"]["phase"] == "queued"
+
+    release.set()
+    await asyncio.gather(task_a, task_b)
+    assert started == ["src-a", "src-b"]
+
+
+@pytest.mark.asyncio
+async def test_sync_service_queues_ten_requested_sources_with_two_active(
+    db: Database,
+    monkeypatch,
+):
+    source_ids = [f"src-{idx}" for idx in range(10)]
+    for source_id in source_ids:
+        await db.upsert_source(
+            id=source_id,
+            type="jira",
+            name=f"Source {source_id}",
+            config_json="{}",
+        )
+    service = SyncService(
+        db,
+        AppConfig(sync=SyncConfig(max_active_sources=2)),
+    )
+    release = asyncio.Event()
+    started: list[str] = []
+
+    async def fake_run_source_task(running_source_id: str, *, force_full_sync: bool = False):
+        del force_full_sync
+        started.append(running_source_id)
+        try:
+            await release.wait()
+        finally:
+            service.tasks.pop(running_source_id, None)
+            service.progress.pop(running_source_id, None)
+
+    monkeypatch.setattr(service, "_run_source_task", fake_run_source_task)
+
+    tasks = [await service.start_source(source_id) for source_id in source_ids]
+    await asyncio.sleep(0)
+
+    assert started == source_ids[:2]
+    assert all(service.progress[source_id]["phase"] == "queued" for source_id in source_ids[2:])
+
+    release.set()
+    await asyncio.gather(*tasks)
+    assert started == source_ids
+
+
+@pytest.mark.asyncio
+async def test_cancel_queued_source_clears_progress(db: Database, monkeypatch):
+    await db.upsert_source(
+        id="src-active",
+        type="jira",
+        name="Active Source",
+        config_json="{}",
+    )
+    await db.upsert_source(
+        id="src-queued",
+        type="jira",
+        name="Queued Source",
+        config_json="{}",
+    )
+    service = SyncService(
+        db,
+        AppConfig(sync=SyncConfig(max_active_sources=1)),
+    )
+    release = asyncio.Event()
+
+    async def fake_run_source_task(running_source_id: str, *, force_full_sync: bool = False):
+        del force_full_sync
+        if running_source_id == "src-active":
+            await release.wait()
+
+    monkeypatch.setattr(service, "_run_source_task", fake_run_source_task)
+
+    task_active = await service.start_source("src-active")
+    await service.start_source("src-queued")
+    await asyncio.sleep(0)
+
+    assert service.progress["src-queued"]["phase"] == "queued"
+
+    await service.cancel_source("src-queued")
+
+    assert "src-queued" not in service.tasks
+    assert "src-queued" not in service.progress
+
+    release.set()
+    await task_active
+
+
+def test_sync_max_active_sources_can_be_set_from_env(monkeypatch):
+    monkeypatch.setenv("MEMFORGE_SYNC_MAX_ACTIVE_SOURCES", "2")
+
+    assert AppConfig().sync.max_active_sources == 2
+
+
+def test_sync_max_extraction_workers_can_be_set_from_env(monkeypatch):
+    monkeypatch.setenv("MEMFORGE_SYNC_MAX_EXTRACTION_WORKERS", "6")
+
+    assert AppConfig().sync.max_extraction_workers == 6
+
+
+@pytest.mark.asyncio
+async def test_sync_service_passes_shared_extraction_pool_to_runtime_provider(db: Database):
+    source_id = "src-shared-pool"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Shared Pool Source",
+        config_json="{}",
+    )
+
+    class CapturingRuntimeProvider:
+        def __init__(self) -> None:
+            self.extraction_pools: list[ExtractionWorkPool | None] = []
+
+        async def build_sync_runtime(
+            self,
+            db: Database,
+            config: AppConfig,
+            *,
+            extraction_pool: ExtractionWorkPool | None = None,
+        ):
+            del db, config
+            self.extraction_pools.append(extraction_pool)
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            return None
+
+    provider = CapturingRuntimeProvider()
+    service = SyncService(
+        db,
+        AppConfig(sync=SyncConfig(max_extraction_workers=6)),
+        runtime_provider=provider,
+    )
+
+    task = await service.start_source(source_id)
+    await task
+
+    assert provider.extraction_pools == [service._extraction_pool]
+
+
+@pytest.mark.asyncio
 async def test_requested_sync_runs_after_active_source_sync_finishes(db: Database, monkeypatch):
     source_id = "src-queued-after-active"
     await db.upsert_source(
@@ -1096,9 +1443,13 @@ async def test_full_document_extraction_failure_is_audited(db: Database):
     )
 
     rows = await db.list_memory_audit_events(event_type="memory_extraction_failed")
-    assert state.last_sync_status == "success"
-    assert state.docs_updated == 1
-    assert len(rows) == 1
+    assert state.last_sync_status == "failed"
+    assert state.docs_updated == 0
+    assert state.docs_failed == 1
+    assert state.failed_docs
+    assert "json_parse_error" in state.failed_docs[0].error
+    assert await db.count_documents(source=source_id) == 0
+    assert len(rows) == 3
     assert rows[0].doc_id == "doc-1"
     assert rows[0].source_id == source_id
     assert rows[0].reason == "json_parse_error"
@@ -1355,6 +1706,7 @@ async def test_full_document_unit_extraction_honors_orchestrator_concurrency(db:
             entity_names=[],
             existing_memories=[],
             doc_id="doc-large",
+            source_id="src-large-doc-full",
             document_title="Design Doc",
             document_url="https://example.test/design",
         )
@@ -1416,10 +1768,13 @@ async def test_partial_unit_extraction_failure_skips_reconciliation(db: Database
     audit_rows = await db.list_memory_audit_events(
         event_type="memory_extraction_failed",
     )
-    assert state.last_sync_status == "success"
-    assert state.docs_updated == 1
+    assert state.last_sync_status == "failed"
+    assert state.docs_updated == 0
+    assert state.docs_failed == 1
+    assert state.failed_docs
+    assert "partial_unit_failure" in state.failed_docs[0].error
     assert len(memory_engine.reconcile_calls) == 0
-    assert len(audit_rows) == 1
+    assert len(audit_rows) == 3
     assert audit_rows[0].reason == "partial_unit_failure"
     assert audit_rows[0].payload["failed_unit_count"] == 1
     assert audit_rows[0].payload["extracted_count"] == 0

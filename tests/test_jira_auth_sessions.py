@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from memforge.auth.browser_session import BrowserSessionStore
 from memforge.config import AppConfig
 from memforge.models import SyncState
 from memforge.storage.database import Database
@@ -55,6 +56,21 @@ def _cookie(
         rest={},
         rfc2109=False,
     )
+
+
+def test_sqlite_database_satisfies_browser_session_store_contract() -> None:
+    required = [
+        "list_sources",
+        "get_auth_session",
+        "list_auth_sessions",
+        "upsert_auth_session",
+        "upsert_auth_session_and_reset_sources",
+        "mark_auth_session_status",
+        "delete_auth_session",
+    ]
+
+    assert all(callable(getattr(Database, method, None)) for method in required)
+    assert BrowserSessionStore
 
 
 def test_cookie_header_post_filters_domain_path_and_secure_scope():

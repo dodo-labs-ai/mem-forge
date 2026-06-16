@@ -252,10 +252,11 @@ class JiraGene(Gene):
                     default=JIRA_AUTH_MODE_COOKIE,
                     help_text=(
                         "Browser session uses the local CLI adapter "
-                        "(`memforge adapter auth jira --base-url ...`) to capture cookies "
-                        "from your signed-in browser. Use this for Enterprise Jira where "
-                        "REST API quota is not available. PAT mode is only for Jira "
-                        "deployments that grant the user REST API quota."
+                        "(`memforge adapter auth jira refresh --base-url ...`) to "
+                        "capture cookies from your signed-in browser. Use this for "
+                        "Enterprise Jira where REST API quota is not available. PAT "
+                        "mode is only for Jira deployments that grant the user REST API "
+                        "quota."
                     ),
                     group="connection", order=1,
                 ),

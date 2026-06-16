@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Literal, Protocol, get_args, get_origin
 
 import litellm
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from memforge.llm.providers import litellm_optional_kwargs
 
@@ -361,6 +362,8 @@ def _json_text_prompt(prompt: str, response_format: type[BaseModel]) -> str:
 
 
 def _supports_native_response_schema(model_name: str) -> bool:
+    if _is_sap_anthropic_model(model_name):
+        return True
     try:
         return bool(litellm.supports_response_schema(model=model_name))
     except Exception:
@@ -372,6 +375,11 @@ def _supports_native_response_schema(model_name: str) -> bool:
         return False
 
 
+def _is_sap_anthropic_model(model_name: str) -> bool:
+    """Return true for SAP GenAI Hub Anthropic aliases that accept response_format."""
+    return model_name.lower().startswith("sap/anthropic--")
+
+
 def _strip_json_fences(text: str) -> str:
     """Drop a leading ```/```json fence and trailing ``` if the model adds them."""
     stripped = text.strip()
@@ -381,6 +389,25 @@ def _strip_json_fences(text: str) -> str:
         if stripped.rstrip().endswith("```"):
             stripped = stripped.rstrip()[: -len("```")]
     return stripped.strip()
+
+
+_INVALID_JSON_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrtu])')
+
+
+def _escape_invalid_json_backslashes(text: str) -> str:
+    """Preserve literal backslashes that models sometimes emit inside JSON strings."""
+    return _INVALID_JSON_ESCAPE_RE.sub(r"\\\\", text)
+
+
+def _validate_structured_json_text(text: str, response_format: type[BaseModel]):
+    stripped = _strip_json_fences(text)
+    try:
+        return response_format.model_validate_json(stripped)
+    except ValidationError as exc:
+        repaired = _escape_invalid_json_backslashes(stripped)
+        if repaired == stripped or "Invalid JSON" not in str(exc):
+            raise
+        return response_format.model_validate_json(repaired)
 
 
 class LiteLlmStructuredClient:
@@ -604,4 +631,4 @@ class LiteLlmStructuredClient:
             return raw_content
         if isinstance(raw_content, dict):
             return response_format.model_validate(raw_content)
-        return response_format.model_validate_json(_strip_json_fences(str(raw_content)))
+        return _validate_structured_json_text(str(raw_content), response_format)

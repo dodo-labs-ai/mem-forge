@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
+from collections import defaultdict
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -60,13 +63,88 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["GeneSyncOrchestrator"]
+__all__ = ["ExtractionWorkPool", "GeneSyncOrchestrator"]
 
 DEFAULT_INCREMENTAL_SYNC_OVERLAP = timedelta(minutes=10)
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class ExtractionWorkPool:
+    """Work-conserving fair pool for app-wide heavy extraction work."""
+
+    def __init__(self, max_workers: int) -> None:
+        self.max_workers = max(1, int(max_workers))
+        self._condition = asyncio.Condition()
+        self._active_by_source: dict[str, int] = defaultdict(int)
+        self._waiting_by_source: dict[str, int] = defaultdict(int)
+        self._total_active = 0
+
+    @asynccontextmanager
+    async def slot(self, source_id: str):
+        await self.acquire(source_id)
+        try:
+            yield
+        finally:
+            await self.release(source_id)
+
+    async def acquire(self, source_id: str) -> None:
+        async with self._condition:
+            self._waiting_by_source[source_id] += 1
+            try:
+                while not self._can_acquire(source_id):
+                    await self._condition.wait()
+                self._waiting_by_source[source_id] -= 1
+                if self._waiting_by_source[source_id] <= 0:
+                    self._waiting_by_source.pop(source_id, None)
+                self._active_by_source[source_id] += 1
+                self._total_active += 1
+            except BaseException:
+                self._waiting_by_source[source_id] -= 1
+                if self._waiting_by_source[source_id] <= 0:
+                    self._waiting_by_source.pop(source_id, None)
+                self._condition.notify_all()
+                raise
+
+    async def release(self, source_id: str) -> None:
+        async with self._condition:
+            if self._active_by_source[source_id] <= 0:
+                raise RuntimeError(f"Extraction work slot was not held by {source_id}")
+            self._active_by_source[source_id] -= 1
+            if self._active_by_source[source_id] <= 0:
+                self._active_by_source.pop(source_id, None)
+            self._total_active -= 1
+            self._condition.notify_all()
+
+    def _can_acquire(self, source_id: str) -> bool:
+        if self._total_active >= self.max_workers:
+            return False
+
+        source_count = len(
+            {
+                source
+                for source, count in self._active_by_source.items()
+                if count > 0
+            }
+            | {
+                source
+                for source, count in self._waiting_by_source.items()
+                if count > 0
+            }
+        )
+        fair_share = max(1, math.ceil(self.max_workers / max(1, source_count)))
+
+        if self._active_by_source[source_id] < fair_share:
+            return True
+
+        for waiting_source, waiting_count in self._waiting_by_source.items():
+            if waiting_source == source_id or waiting_count <= 0:
+                continue
+            if self._active_by_source[waiting_source] < fair_share:
+                return False
+        return True
 
 MAX_RETRIES = 3
 """Number of retry attempts per content item before marking as failed."""
@@ -241,6 +319,7 @@ class GeneSyncOrchestrator:
         embed_cfg: dict | None = None,
         source_support_detector: SourceSupportDetector | None = None,
         max_concurrent: int = 3,
+        extraction_pool: ExtractionWorkPool | None = None,
     ) -> None:
         self.db = db
         self.doc_store = doc_store
@@ -253,6 +332,7 @@ class GeneSyncOrchestrator:
         self.embed_cfg = embed_cfg
         self.source_support_detector = source_support_detector
         self.max_concurrent = max(1, max_concurrent)
+        self.extraction_pool = extraction_pool
 
         self._llm_semaphore = asyncio.Semaphore(self.max_concurrent)
         self._db_lock = asyncio.Lock()
@@ -274,6 +354,20 @@ class GeneSyncOrchestrator:
     def _release_llm_slot(self) -> None:
         """Release semaphore after an LLM call."""
         self._llm_semaphore.release()
+
+    def _source_parallelism_limit(self) -> int:
+        if self.extraction_pool is not None:
+            return self.extraction_pool.max_workers
+        return self.max_concurrent
+
+    @asynccontextmanager
+    async def _heavy_work_slot(self, source_id: str):
+        if self.extraction_pool is not None:
+            async with self.extraction_pool.slot(source_id):
+                yield
+            return
+        async with self._llm_semaphore:
+            yield
 
     # ==================================================================
     # Public: sync_gene
@@ -412,7 +506,7 @@ class GeneSyncOrchestrator:
             progress_counter = 0
             docs_updated_counter = 0
             memories_extracted_counter = 0
-            item_semaphore = asyncio.Semaphore(self.max_concurrent)
+            item_semaphore = asyncio.Semaphore(self._source_parallelism_limit())
 
             async def _process_one(item: ContentItem) -> dict:
                 """Process a single item with retry logic and error isolation."""
@@ -928,6 +1022,7 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         # 5. Store document record before expensive enrichment/memory work
         # ------------------------------------------------------------------
+        document_vector_snapshot = await self._document_vector_snapshot(doc_id)
         async with self._db_lock:
             await self.db.upsert_document(doc_record)
 
@@ -936,7 +1031,7 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         enrichment: EnrichmentResult
 
-        async with self._llm_semaphore:
+        async with self._heavy_work_slot(source_id):
             enrichment = await self.enricher.enrich_document(
                 doc_id=doc_id,
                 content=markdown_body,
@@ -963,7 +1058,6 @@ class GeneSyncOrchestrator:
             raise RuntimeError(f"Cannot index document vector for {doc_id}: embedding config is missing")
 
         if self.document_index.enabled:
-            document_vector_snapshot = await self._document_vector_snapshot(doc_id)
             try:
                 await self._upsert_document_embedding(
                     doc_id=doc_id,
@@ -1026,22 +1120,32 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         # 7. Call 2: Extract memories (under semaphore)
         # ------------------------------------------------------------------
-        async with self._llm_semaphore:
-            extraction_result = await self._extract_for_document_update(
-                update_plan=update_plan,
-                markdown_body=markdown_body,
-                source_type=source_type,
-                doc_type=enrichment.doc_type,
-                entity_names=entity_names,
-                existing_memories=existing_memories,
-                doc_id=doc_id,
-                source_id=source_id,
-                run_id=run_id,
-                document_title=item.title,
-                document_url=item.source_url,
-            )
+        extraction_result = await self._extract_for_document_update(
+            update_plan=update_plan,
+            markdown_body=markdown_body,
+            source_type=source_type,
+            doc_type=enrichment.doc_type,
+            entity_names=entity_names,
+            existing_memories=existing_memories,
+            doc_id=doc_id,
+            source_id=source_id,
+            run_id=run_id,
+            document_title=item.title,
+            document_url=item.source_url,
+        )
 
         raw_memories = extraction_result.memories
+        if extraction_result.error_type:
+            await self._restore_document_processing_snapshot(
+                doc_id=doc_id,
+                existing_doc=existing_doc,
+                document_vector_snapshot=document_vector_snapshot,
+            )
+            error_detail = extraction_result.error or ""
+            raise RuntimeError(
+                f"memory extraction failed for {doc_id}: "
+                f"{extraction_result.error_type}: {error_detail}"
+            )
         logger.debug(
             "Extracted %d raw memories from %s",
             len(raw_memories),
@@ -1084,13 +1188,7 @@ class GeneSyncOrchestrator:
         # write-time signal only: read-time visibility is decided by the access
         # predicate, never by this hint.
         uploader_user_id = normalized.source_semantics.get("uploader_user_id")
-        if extraction_result.error_type:
-            logger.warning(
-                "Skipping memory persistence for %s after extraction failure: %s",
-                doc_id,
-                extraction_result.error_type,
-            )
-        elif change_type == "updated":
+        if change_type == "updated":
             memory_stats = await self.memory_engine.reconcile_and_persist(
                 doc_id=doc_id,
                 raw_memories=raw_memories,
@@ -1124,7 +1222,7 @@ class GeneSyncOrchestrator:
             writer_visibility, writer_owner_user_id = default_visibility(
                 source_type, user_id=uploader_user_id,
             )
-            async with self._llm_semaphore:
+            async with self._heavy_work_slot(source_id):
                 support_stats = await self.source_support_detector.detect_and_persist(
                     doc_id=doc_id,
                     source_type=source_type,
@@ -1211,14 +1309,15 @@ class GeneSyncOrchestrator:
         ):
             try:
                 same_document_memories = await self._get_existing_document_memories(doc_id)
-                result = await self.memory_extractor.extract_memory_changes(
-                    changed_hunks=update_plan.changed_hunks or "",
-                    updated_document=markdown_body,
-                    source_type=source_type,
-                    doc_type=doc_type,
-                    entities=entity_names,
-                    existing_memories=same_document_memories,
-                )
+                async with self._heavy_work_slot(source_id):
+                    result = await self.memory_extractor.extract_memory_changes(
+                        changed_hunks=update_plan.changed_hunks or "",
+                        updated_document=markdown_body,
+                        source_type=source_type,
+                        doc_type=doc_type,
+                        entities=entity_names,
+                        existing_memories=same_document_memories,
+                    )
                 await self._record_memory_extraction_result(
                     mode=update_plan.mode,
                     plan=update_plan,
@@ -1260,6 +1359,7 @@ class GeneSyncOrchestrator:
                 entity_names=entity_names,
                 existing_memories=existing_memories,
                 doc_id=doc_id,
+                source_id=source_id,
                 document_title=document_title,
                 document_url=document_url,
             )
@@ -1287,13 +1387,14 @@ class GeneSyncOrchestrator:
             )
             return result
 
-        result = await self.memory_extractor.extract_memories(
-            content=markdown_body,
-            source_type=source_type,
-            doc_type=doc_type,
-            entities=entity_names,
-            existing_memories=existing_memories,
-        )
+        async with self._heavy_work_slot(source_id):
+            result = await self.memory_extractor.extract_memories(
+                content=markdown_body,
+                source_type=source_type,
+                doc_type=doc_type,
+                entities=entity_names,
+                existing_memories=existing_memories,
+            )
         await self._record_memory_extraction_result(
             mode="full_document",
             plan=update_plan,
@@ -1313,6 +1414,7 @@ class GeneSyncOrchestrator:
         entity_names: list[str],
         existing_memories: list[Memory],
         doc_id: str,
+        source_id: str,
         document_title: str,
         document_url: str,
     ) -> MemoryExtractionResult:
@@ -1320,7 +1422,7 @@ class GeneSyncOrchestrator:
         unitization_policy = UnitizationPolicy()
         units = unitize_markdown(markdown_body, doc_id=doc_id, policy=unitization_policy)
         packer = ExtractionContextPacker()
-        unit_semaphore = asyncio.Semaphore(self.max_concurrent)
+        unit_semaphore = asyncio.Semaphore(self._source_parallelism_limit())
 
         async def extract_one(unit) -> MemoryExtractionResult:
             context = packer.pack(
@@ -1332,11 +1434,12 @@ class GeneSyncOrchestrator:
                 entities=entity_names,
             )
             async with unit_semaphore:
-                return await self.memory_extractor.extract_unit_memories(
-                    context,
-                    doc_type=doc_type,
-                    existing_memories=existing_memories,
-                )
+                async with self._heavy_work_slot(source_id):
+                    return await self.memory_extractor.extract_unit_memories(
+                        context,
+                        doc_type=doc_type,
+                        existing_memories=existing_memories,
+                    )
 
         results = await asyncio.gather(*(extract_one(unit) for unit in units))
 
@@ -1780,7 +1883,7 @@ class GeneSyncOrchestrator:
             # happen before any durable memory-layer mutations.
             embedding_text = document_embedding_text(metadata)
 
-            async with self._llm_semaphore:
+            async with self._heavy_work_slot(source_id):
                 try:
                     vectors = await asyncio.to_thread(
                         embed_texts,
@@ -1868,6 +1971,20 @@ class GeneSyncOrchestrator:
         if not self.document_index.enabled:
             return
         await asyncio.to_thread(self.document_index.restore, doc_id, snapshot)
+
+    async def _restore_document_processing_snapshot(
+        self,
+        *,
+        doc_id: str,
+        existing_doc: DocumentRecord | None,
+        document_vector_snapshot: dict | None,
+    ) -> None:
+        await self._restore_document_vector_snapshot(doc_id, document_vector_snapshot)
+        async with self._db_lock:
+            if existing_doc:
+                await self.db.restore_document_snapshot(existing_doc)
+            else:
+                await self.db.delete_document(doc_id)
 
     def _has_embedding_config(self) -> bool:
         if not self.embed_cfg:

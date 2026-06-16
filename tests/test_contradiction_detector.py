@@ -328,7 +328,7 @@ class TestDetectCrossDocContradictions:
 
         assert stats["contradictions"] == 1
         assert stats["checked"] == 1
-        assert mock_client.detect_contradictions.call_args.kwargs["max_tokens"] == 64000
+        assert mock_client.detect_contradictions.call_args.kwargs["max_tokens"] == 8192
 
         # Verify counts incremented
         m_a = await db.get_memory(mem_a.id)

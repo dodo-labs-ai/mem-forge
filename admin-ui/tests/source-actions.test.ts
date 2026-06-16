@@ -141,3 +141,13 @@ assert.match(
   /limit: DISCOVERY_PREVIEW_LIMIT/,
   "source discovery preview requests should send the bounded limit to the API",
 );
+assert.match(
+  sourceConfigDialogSource,
+  /memforge adapter auth jira refresh --base-url/,
+  "Jira browser-session guidance should use the refresh subcommand that uploads the local browser session",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /jiraSessionQuery\.refetch\(\)/,
+  "Jira browser-session guidance should allow users to re-check after running the CLI refresh",
+);
