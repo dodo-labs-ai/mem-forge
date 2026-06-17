@@ -114,13 +114,6 @@ class ConfluenceGene(Gene):
                     help_text="Stored encrypted in MemForge and sent as a bearer token",
                     group="connection", order=1,
                 ),
-                ConfigField(
-                    key="api_prefix", label="REST API Path",
-                    field_type=ConfigFieldType.STRING, required=False,
-                    placeholder="/wiki",
-                    help_text="Advanced override for Confluence deployments that serve REST below a path",
-                    group="connection", order=2, advanced=True,
-                ),
             ],
         )
 
