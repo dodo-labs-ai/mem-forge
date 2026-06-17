@@ -10,7 +10,7 @@ from memforge.genes.jira_gene import JiraGene
 from memforge.models import ContentItem
 
 
-def test_jira_schema_hides_custom_ca_bundle_from_ui():
+def test_jira_schema_hides_runtime_transport_fields_from_ui():
     fields = {field.key: field for field in JiraGene.config_schema().fields}
 
     assert fields["auth_mode"].required is True
@@ -19,7 +19,7 @@ def test_jira_schema_hides_custom_ca_bundle_from_ui():
     assert fields["pat"].required is False
     assert fields["pat"].advanced is False
     assert "tls_ca_bundle" not in fields
-    assert fields["request_interval_ms"].advanced is True
+    assert "request_interval_ms" not in fields
 
 
 class JsonResponse:

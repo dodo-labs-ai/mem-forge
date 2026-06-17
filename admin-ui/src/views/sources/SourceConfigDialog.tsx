@@ -367,7 +367,9 @@ function SourceConfigForm({
           ))}
           {advancedFields.length > 0 && (
             <details className="space-y-3">
-              <summary className="cursor-pointer text-sm font-semibold">Advanced</summary>
+              <summary className="inline-flex cursor-pointer select-none rounded-md px-1 py-0.5 text-sm font-semibold hover:bg-muted focus:outline-none focus-visible:ring-1 focus-visible:ring-ring/40">
+                Advanced
+              </summary>
               <div className="space-y-3 pt-2">
                 {advancedFields.map((field) => (
                   <ConfigFieldInput
