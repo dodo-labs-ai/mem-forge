@@ -175,6 +175,9 @@ def test_github_pages_gene_is_registered_and_schema_is_practical():
     assert fields["root_url"].required is False
     assert fields["pages"].required is False
     assert fields["max_pages"].default == "200"
+    assert fields["max_depth"].advanced is True
+    assert fields["max_pages"].advanced is True
+    assert fields["exclude_url_patterns"].advanced is True
 
 
 @pytest.mark.asyncio
