@@ -27,6 +27,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
 import {
   applyConfluenceUrlInference,
   isConfluenceFieldRequired,
@@ -155,7 +156,11 @@ function SourceConfigForm({
   const [scheduleInterval, setScheduleInterval] = useState(
     () => String(source?.sync_schedule?.interval_minutes ?? 1440),
   );
+  const [validationMessage, setValidationMessage] = useState<string | null>(null);
+  const sourceNameRef = useRef<HTMLDivElement | null>(null);
+  const configFieldsRef = useRef<HTMLDivElement | null>(null);
   const projectSectionRef = useRef<HTMLDivElement | null>(null);
+  const scheduleSectionRef = useRef<HTMLDetailsElement | null>(null);
   const authMode = stringValue(config.auth_mode) || "browser_cookie";
   const jiraBaseUrl = stringValue(config.base_url).trim();
   const confluenceUrlInfo = useMemo(
@@ -238,16 +243,19 @@ function SourceConfigForm({
       .sort((a, b) => a.order - b.order),
     [config, schema, sourceType],
   );
+  const previewGroupKey = fieldsByGroup.some((group) => group.key === "connection")
+    ? "connection"
+    : fieldsByGroup[0]?.key;
+  const firstMissingField = firstMissingRequiredField(sourceType, schema.fields, config);
+  const scheduleIntervalValid = parseScheduleInterval(scheduleInterval) >= 5;
 
-  const canSave =
-    name.trim().length > 0 &&
-    requiredFieldsAreFilled(sourceType, schema.fields, config) &&
-    projectBindingIsComplete(binding) &&
-    parseScheduleInterval(scheduleInterval) >= 5;
-
-  const previewReady = requiredFieldsAreFilled(sourceType, schema.fields, config);
+  const previewReady = firstMissingField === null;
+  const scheduleSummary = scheduleEnabled
+    ? `Scheduled: ${scheduleIntervalLabel(scheduleInterval)}`
+    : "Manual sync only";
 
   const updateField = (field: ConfigField, value: ConfigValue) => {
+    setValidationMessage(null);
     setConfig((current) => {
       const next = { ...current, [field.key]: value };
       if (sourceType === "confluence" && field.key === "base_url") {
@@ -258,6 +266,26 @@ function SourceConfigForm({
   };
 
   const handleSave = () => {
+    if (name.trim().length === 0) {
+      setValidationMessage("Enter a source name before saving.");
+      sourceNameRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    if (firstMissingField) {
+      setValidationMessage(`Complete ${firstMissingField.label} before saving.`);
+      configFieldsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    if (!projectBindingIsComplete(binding)) {
+      setValidationMessage("Choose where this source should land, or leave it unmapped.");
+      projectSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    if (!scheduleIntervalValid) {
+      setValidationMessage("Choose an automatic sync interval of at least 5 minutes.");
+      scheduleSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
     saveSource.mutate({
       name: name.trim(),
       config: serializeConfig(schema.fields, config),
@@ -267,67 +295,34 @@ function SourceConfigForm({
 
   return (
     <>
-        <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
-          <DialogHeader>
-            <DialogTitle>
-              {isEdit ? "Configure source" : `Configure ${sourceType ?? "source"}`}
-            </DialogTitle>
-          </DialogHeader>
+      <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
+        <DialogHeader>
+          <DialogTitle>
+            {isEdit ? "Configure source" : `Configure ${sourceType ?? "source"}`}
+          </DialogTitle>
+        </DialogHeader>
 
+        <div ref={sourceNameRef}>
           <Field label="Source name" required>
-            <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="Source name" />
+            <Input
+              value={name}
+              onChange={(event) => {
+                setValidationMessage(null);
+                setName(event.target.value);
+              }}
+              placeholder="Source name"
+            />
           </Field>
+        </div>
 
-          <div className="min-h-0 flex-1 space-y-5 overflow-y-auto pr-1">
-            {fieldsByGroup.map((group) => (
-              <section key={group.key} className="space-y-3">
-                <h3 className="text-sm font-semibold">{group.label}</h3>
-                <div className="space-y-3">
-                  {group.fields.map((field) => (
-                    <div key={field.key} className="space-y-3">
-                      <ConfigFieldInput
-                        field={field}
-                        value={config[field.key]}
-                        hasExistingSecret={Boolean(config[`${field.key}_configured`])}
-                        decryptFailed={Boolean(config[`${field.key}_decrypt_failed`])}
-                        required={isFieldRequired(sourceType, field, config)}
-                        onChange={(value) => updateField(field, value)}
-                      />
-                      {sourceType === "confluence" && field.key === "base_url" && confluenceUrlInfo && (
-                        <ConfluenceDetectedPanel info={confluenceUrlInfo} />
-                      )}
-                      {sourceType === "jira" && field.key === "jql" && (
-                        <JiraEffectiveQueryPanel jql={stringValue(config.jql)} />
-                      )}
-                      {sourceType === "jira" && field.key === "auth_mode" && authMode === "browser_cookie" && (
-                        <JiraBrowserSessionPanel
-                          baseUrl={jiraBaseUrl}
-                          session={jiraSessionQuery.data}
-                          loading={jiraSessionQuery.isFetching}
-                          error={jiraSessionQuery.error}
-                          onRefresh={() => {
-                            void jiraSessionQuery.refetch();
-                          }}
-                        />
-                      )}
-                      {sourceType === "local_markdown" && field.key === "vault_id" && (
-                        <LocalMarkdownPushPanel
-                          sourceId={source?.id ?? null}
-                          vaultId={stringValue(config.vault_id).trim()}
-                        />
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </section>
-            ))}
-            {advancedFields.length > 0 && (
-              <details className="space-y-3">
-                <summary className="cursor-pointer text-sm font-semibold">Advanced</summary>
-                <div className="space-y-3 pt-2">
-                  {advancedFields.map((field) => (
+        <div ref={configFieldsRef} className="min-h-0 flex-1 space-y-5 overflow-y-auto pr-1">
+          {fieldsByGroup.map((group) => (
+            <section key={group.key} className="space-y-3">
+              <h3 className="text-sm font-semibold">{group.label}</h3>
+              <div className="space-y-3">
+                {group.fields.map((field) => (
+                  <div key={field.key} className="space-y-3">
                     <ConfigFieldInput
-                      key={field.key}
                       field={field}
                       value={config[field.key]}
                       hasExistingSecret={Boolean(config[`${field.key}_configured`])}
@@ -335,40 +330,90 @@ function SourceConfigForm({
                       required={isFieldRequired(sourceType, field, config)}
                       onChange={(value) => updateField(field, value)}
                     />
-                  ))}
-                </div>
-              </details>
-            )}
+                    {sourceType === "confluence" && field.key === "base_url" && confluenceUrlInfo && (
+                      <ConfluenceDetectedPanel info={confluenceUrlInfo} />
+                    )}
+                    {sourceType === "jira" && field.key === "jql" && (
+                      <JiraEffectiveQueryPanel jql={stringValue(config.jql)} />
+                    )}
+                    {sourceType === "jira" && field.key === "auth_mode" && authMode === "browser_cookie" && (
+                      <JiraBrowserSessionPanel
+                        baseUrl={jiraBaseUrl}
+                        session={jiraSessionQuery.data}
+                        loading={jiraSessionQuery.isFetching}
+                        error={jiraSessionQuery.error}
+                        onRefresh={() => {
+                          void jiraSessionQuery.refetch();
+                        }}
+                      />
+                    )}
+                    {sourceType === "local_markdown" && field.key === "vault_id" && (
+                      <LocalMarkdownPushPanel
+                        sourceId={source?.id ?? null}
+                        vaultId={stringValue(config.vault_id).trim()}
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+              {sourceType !== "local_markdown" && group.key === previewGroupKey && (
+                <DiscoveryPreviewPanel
+                  ready={previewReady}
+                  isPending={previewDiscovery.isPending}
+                  error={previewDiscovery.isError ? previewDiscovery.error : null}
+                  data={previewDiscovery.data}
+                  onPreview={() => previewDiscovery.mutate()}
+                />
+              )}
+            </section>
+          ))}
+          {advancedFields.length > 0 && (
+            <details className="space-y-3">
+              <summary className="cursor-pointer text-sm font-semibold">Advanced</summary>
+              <div className="space-y-3 pt-2">
+                {advancedFields.map((field) => (
+                  <ConfigFieldInput
+                    key={field.key}
+                    field={field}
+                    value={config[field.key]}
+                    hasExistingSecret={Boolean(config[`${field.key}_configured`])}
+                    decryptFailed={Boolean(config[`${field.key}_decrypt_failed`])}
+                    required={isFieldRequired(sourceType, field, config)}
+                    onChange={(value) => updateField(field, value)}
+                  />
+                ))}
+              </div>
+            </details>
+          )}
 
-            {/* Local repositories are pushed from the CLI, not discovered server-side,
-                so the discovery preview does not apply (and its inbox is empty here). */}
-            {sourceType !== "local_markdown" && (
-              <DiscoveryPreviewPanel
-                ready={previewReady}
-                isPending={previewDiscovery.isPending}
-                error={previewDiscovery.isError ? previewDiscovery.error : null}
-                data={previewDiscovery.data}
-                onPreview={() => previewDiscovery.mutate()}
-              />
-            )}
+          <div ref={projectSectionRef} className="space-y-4 pt-1">
+            <Separator />
+            <ProjectBindingFields
+              schema={schema}
+              sourceId={source?.id ?? null}
+              value={binding}
+              onChange={(nextBinding) => {
+                setValidationMessage(null);
+                setBinding(nextBinding);
+              }}
+            />
+          </div>
 
-            <div ref={projectSectionRef}>
-              <ProjectBindingFields
-                schema={schema}
-                sourceId={source?.id ?? null}
-                value={binding}
-                onChange={setBinding}
-              />
-            </div>
-
-            <section className="space-y-3">
-              <h3 className="text-sm font-semibold">Automatic sync</h3>
+          <details ref={scheduleSectionRef} className="space-y-3">
+            <summary className="cursor-pointer text-sm font-semibold">
+              Automatic sync
+              <span className="ml-2 text-xs font-normal text-muted-foreground">{scheduleSummary}</span>
+            </summary>
+            <div className="space-y-3 pt-2">
               <label className="flex items-start gap-3 rounded-lg border p-3">
                 <input
                   type="checkbox"
                   className="mt-0.5 size-4"
                   checked={scheduleEnabled}
-                  onChange={(event) => setScheduleEnabled(event.target.checked)}
+                  onChange={(event) => {
+                    setValidationMessage(null);
+                    setScheduleEnabled(event.target.checked);
+                  }}
                 />
                 <span className="min-w-0 flex-1">
                   <span className="block text-sm font-medium">Sync on a schedule</span>
@@ -384,7 +429,10 @@ function SourceConfigForm({
                 <Select<string>
                   value={scheduleInterval}
                   onValueChange={(value) => {
-                    if (value) setScheduleInterval(value);
+                    if (value) {
+                      setValidationMessage(null);
+                      setScheduleInterval(value);
+                    }
                   }}
                 >
                   <SelectTrigger>
@@ -400,25 +448,32 @@ function SourceConfigForm({
                   </SelectContent>
                 </Select>
               </Field>
-            </section>
-          </div>
-
-          {saveSource.isError && (
-            <div className="rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
-              {extractSaveError(saveSource.error)}
             </div>
-          )}
+          </details>
         </div>
 
-        <DialogFooter className="mx-0 mb-0 flex-row justify-between rounded-none rounded-b-xl bg-background p-3 sm:justify-between">
-          <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
-          <Button type="button" onClick={handleSave} disabled={!canSave || saveSource.isPending}>
-            {saveSource.isPending ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
-            {isEdit ? "Save Changes" : "Create Source"}
-          </Button>
-        </DialogFooter>
+        {saveSource.isError && (
+          <div className="rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
+            {extractSaveError(saveSource.error)}
+          </div>
+        )}
+        {validationMessage && (
+          <div className="flex items-start gap-2 rounded-lg bg-muted/50 p-3 text-sm text-muted-foreground">
+            <AlertCircle className="mt-0.5 size-4 shrink-0" />
+            <span>{validationMessage}</span>
+          </div>
+        )}
+      </div>
+
+      <DialogFooter className="mx-0 mb-0 flex-row justify-between rounded-none rounded-b-xl bg-background p-3 sm:justify-between">
+        <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+          Cancel
+        </Button>
+        <Button type="button" onClick={handleSave} disabled={saveSource.isPending}>
+          {saveSource.isPending ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
+          {isEdit ? "Save Changes" : "Create Source"}
+        </Button>
+      </DialogFooter>
     </>
   );
 }
@@ -927,19 +982,25 @@ function serializeConfig(fields: ConfigField[], config: ConfigForm): ConfigForm 
   }, {});
 }
 
-function requiredFieldsAreFilled(sourceType: string, fields: ConfigField[], config: ConfigForm): boolean {
-  return fields.every((field) => {
-    if (!isFieldVisible(sourceType, field, config)) return true;
-    if (!isFieldRequired(sourceType, field, config)) return true;
+function firstMissingRequiredField(
+  sourceType: string,
+  fields: ConfigField[],
+  config: ConfigForm,
+): ConfigField | null {
+  for (const field of fields) {
+    if (!isFieldVisible(sourceType, field, config)) continue;
+    if (!isFieldRequired(sourceType, field, config)) continue;
     const value = config[field.key];
     if (field.field_type === "tag_list" || field.field_type === "multi_select") {
-      return listValue(value).length > 0;
+      if (listValue(value).length === 0) return field;
+      continue;
     }
     if (field.field_type === "secret" && config[`${field.key}_configured`]) {
-      return true;
+      continue;
     }
-    return stringValue(value).trim().length > 0;
-  });
+    if (stringValue(value).trim().length === 0) return field;
+  }
+  return null;
 }
 
 function isFieldVisible(sourceType: string, field: ConfigField, config: ConfigForm): boolean {
