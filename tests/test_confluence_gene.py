@@ -8,7 +8,7 @@ import pytest
 from memforge.genes.confluence_gene import ConfluenceGene, PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY
 
 
-def test_confluence_schema_marks_tls_ca_bundle_as_advanced():
+def test_confluence_schema_hides_custom_ca_bundle_from_ui():
     fields = {field.key: field for field in ConfluenceGene.config_schema().fields}
 
     assert fields["pat"].required is True
@@ -16,7 +16,7 @@ def test_confluence_schema_marks_tls_ca_bundle_as_advanced():
     assert fields["base_url"].label == "Wiki URL"
     assert fields["spaces"].required is False
     assert fields["sync_mode"].advanced is False
-    assert fields["tls_ca_bundle"].advanced is True
+    assert "tls_ca_bundle" not in fields
 
 
 def test_confluence_normalizes_corporate_wiki_page_url_to_page_tree_scope():

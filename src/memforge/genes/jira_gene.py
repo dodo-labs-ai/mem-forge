@@ -315,18 +315,11 @@ class JiraGene(Gene):
                     group="connection", order=2,
                 ),
                 ConfigField(
-                    key="tls_ca_bundle", label="Custom CA Bundle",
-                    field_type=ConfigFieldType.STRING, required=False,
-                    placeholder="/path/to/company-ca.pem",
-                    help_text="Optional. Use only when your Jira server uses a private certificate authority.",
-                    group="connection", order=3, advanced=True,
-                ),
-                ConfigField(
                     key="request_interval_ms", label="Request Interval",
                     field_type=ConfigFieldType.INTEGER, required=False,
                     default=str(DEFAULT_REQUEST_INTERVAL_MS),
                     help_text="Minimum delay between Jira REST requests to the same Atlassian origin",
-                    group="connection", order=4, advanced=True,
+                    group="connection", order=3, advanced=True,
                 ),
             ],
         )
