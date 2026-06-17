@@ -26,6 +26,8 @@ from memforge.models import (
     Entity,
     EntityAlias,
     Memory,
+    MemoryCurationRun,
+    MemoryDerivation,
     MemoryReview,
     MemoryReviewRelatedChallenger,
     MemorySource,
@@ -279,6 +281,9 @@ CREATE TABLE IF NOT EXISTS memories (
     visibility          TEXT NOT NULL DEFAULT 'workspace',
     owner_user_id       TEXT,
     project_key         TEXT,
+    repo_identifier     TEXT,
+    memory_level        TEXT NOT NULL DEFAULT 'atomic',
+    curation_cluster_id TEXT,
     confidence          REAL NOT NULL DEFAULT 0.7,
     corroboration_count INTEGER NOT NULL DEFAULT 1,
     contradiction_count INTEGER NOT NULL DEFAULT 0,
@@ -305,6 +310,29 @@ CREATE TABLE IF NOT EXISTS memory_sources (
     support_kind TEXT NOT NULL DEFAULT 'extracted',
     added_at    TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (memory_id, doc_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_derivations (
+    parent_memory_id TEXT NOT NULL REFERENCES memories(id),
+    child_memory_id  TEXT NOT NULL REFERENCES memories(id),
+    relation         TEXT NOT NULL DEFAULT 'summarizes',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (parent_memory_id, child_memory_id, relation)
+);
+
+CREATE TABLE IF NOT EXISTS memory_curation_runs (
+    id                   TEXT PRIMARY KEY,
+    policy_id            TEXT NOT NULL,
+    source_type          TEXT NOT NULL,
+    client               TEXT,
+    repo_identifier      TEXT,
+    project_key          TEXT,
+    candidate_count      INTEGER NOT NULL,
+    created_memory_count INTEGER NOT NULL,
+    skipped_reason       TEXT,
+    error                TEXT,
+    started_at           TEXT NOT NULL,
+    completed_at         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS memory_entities (
@@ -502,11 +530,13 @@ CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(canonical_name);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
 CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_key);
--- idx_memories_access and idx_memories_owner index the visibility and owner_user_id
--- columns and are created in migration 14, which adds those columns. SCHEMA runs
--- before migrations, so an upgrading database does not have those columns here yet.
+-- Indexes for columns added after the initial schema, including visibility and
+-- curation metadata, are created by their migrations. SCHEMA runs before
+-- migrations, so upgrading databases may not have those columns here yet.
 CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash);
 CREATE INDEX IF NOT EXISTS idx_memory_sources_doc ON memory_sources(doc_id);
+CREATE INDEX IF NOT EXISTS idx_memory_derivations_child ON memory_derivations(child_memory_id);
+CREATE INDEX IF NOT EXISTS idx_memory_curation_runs_scope ON memory_curation_runs(source_type, client, repo_identifier, project_key);
 CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_id);
 CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized ON entity_aliases(alias_normalized);
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_status ON auth_sessions(status);
@@ -949,6 +979,36 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         "ALTER TABLE sources ADD COLUMN sync_schedule_updated_at TEXT",
         "CREATE INDEX IF NOT EXISTS idx_sources_sync_schedule_due ON sources(sync_schedule_enabled, sync_schedule_next_at)",
     ]),
+    (21, "Add memory curation lineage metadata", [
+        "ALTER TABLE memories ADD COLUMN repo_identifier TEXT",
+        "ALTER TABLE memories ADD COLUMN memory_level TEXT NOT NULL DEFAULT 'atomic'",
+        "ALTER TABLE memories ADD COLUMN curation_cluster_id TEXT",
+        """CREATE TABLE IF NOT EXISTS memory_derivations (
+            parent_memory_id TEXT NOT NULL REFERENCES memories(id),
+            child_memory_id  TEXT NOT NULL REFERENCES memories(id),
+            relation         TEXT NOT NULL DEFAULT 'summarizes',
+            created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (parent_memory_id, child_memory_id, relation)
+        )""",
+        """CREATE TABLE IF NOT EXISTS memory_curation_runs (
+            id                   TEXT PRIMARY KEY,
+            policy_id            TEXT NOT NULL,
+            source_type          TEXT NOT NULL,
+            client               TEXT,
+            repo_identifier      TEXT,
+            project_key          TEXT,
+            candidate_count      INTEGER NOT NULL,
+            created_memory_count INTEGER NOT NULL,
+            skipped_reason       TEXT,
+            error                TEXT,
+            started_at           TEXT NOT NULL,
+            completed_at         TEXT
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_memories_repo ON memories(repo_identifier)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_curation_cluster ON memories(curation_cluster_id)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_derivations_child ON memory_derivations(child_memory_id)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_curation_runs_scope ON memory_curation_runs(source_type, client, repo_identifier, project_key)",
+    ]),
 ]
 
 
@@ -1358,15 +1418,17 @@ class Database:
             await self.db.execute(
                 """INSERT INTO memories (
                     id, memory_type, content, content_hash, tags, visibility, owner_user_id,
-                    project_key, confidence, corroboration_count,
+                    project_key, repo_identifier, memory_level, curation_cluster_id,
+                    confidence, corroboration_count,
                     contradiction_count, valid_from, valid_until,
                     superseded_by, status, retirement_reason, retired_at,
                     superseded_at, replacement_reason, extraction_context,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     mem.id, mem.memory_type, mem.content, mem.content_hash,
                     json.dumps(mem.tags), mem.visibility, mem.owner_user_id, project_key,
+                    mem.repo_identifier, mem.memory_level, mem.curation_cluster_id,
                     mem.confidence, mem.corroboration_count,
                     mem.contradiction_count,
                     mem.valid_from.isoformat() if mem.valid_from else None,
@@ -1643,7 +1705,9 @@ class Database:
             await self.db.execute(
                 """UPDATE memories SET
                     memory_type = ?, content = ?, content_hash = ?, tags = ?,
-                    visibility = ?, owner_user_id = ?, project_key = ?, confidence = ?,
+                    visibility = ?, owner_user_id = ?, project_key = ?,
+                    repo_identifier = ?, memory_level = ?, curation_cluster_id = ?,
+                    confidence = ?,
                     corroboration_count = ?, contradiction_count = ?,
                     valid_from = ?, valid_until = ?, superseded_by = ?,
                     status = ?, retirement_reason = ?, retired_at = ?,
@@ -1658,6 +1722,9 @@ class Database:
                     memory.visibility,
                     memory.owner_user_id,
                     project_key,
+                    memory.repo_identifier,
+                    memory.memory_level,
+                    memory.curation_cluster_id,
                     memory.confidence,
                     memory.corroboration_count,
                     memory.contradiction_count,
@@ -1765,16 +1832,19 @@ class Database:
             await self.db.execute(
                 """INSERT INTO memories (
                     id, memory_type, content, content_hash, tags, visibility, owner_user_id,
-                    project_key, confidence, corroboration_count,
+                    project_key, repo_identifier, memory_level, curation_cluster_id,
+                    confidence, corroboration_count,
                     contradiction_count, valid_from, valid_until,
                     superseded_by, status, retirement_reason, retired_at,
                     superseded_at, replacement_reason, extraction_context,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     new_memory.id, new_memory.memory_type, new_memory.content,
                     new_memory.content_hash, json.dumps(new_memory.tags),
                     new_memory.visibility, new_memory.owner_user_id, project_key,
+                    new_memory.repo_identifier, new_memory.memory_level,
+                    new_memory.curation_cluster_id,
                     new_memory.confidence, new_memory.corroboration_count,
                     new_memory.contradiction_count,
                     new_memory.valid_from.isoformat() if new_memory.valid_from else None,
@@ -2159,6 +2229,90 @@ class Database:
                     added_at=_parse_dt(d["added_at"]),
                 ))
         return results
+
+    async def add_memory_derivation(
+        self,
+        parent_memory_id: str,
+        child_memory_id: str,
+        *,
+        relation: str = "summarizes",
+    ) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT OR IGNORE INTO memory_derivations (
+                    parent_memory_id, child_memory_id, relation, created_at
+                ) VALUES (?, ?, ?, ?)""",
+                (parent_memory_id, child_memory_id, relation, _now_iso()),
+            )
+            await self.db.commit()
+
+    async def get_memory_derivation_children(
+        self,
+        parent_memory_id: str,
+    ) -> list[MemoryDerivation]:
+        results: list[MemoryDerivation] = []
+        async with self.db.execute(
+            """SELECT parent_memory_id, child_memory_id, relation, created_at
+               FROM memory_derivations
+               WHERE parent_memory_id = ?
+               ORDER BY created_at, child_memory_id""",
+            (parent_memory_id,),
+        ) as cursor:
+            async for row in cursor:
+                results.append(MemoryDerivation(
+                    parent_memory_id=row["parent_memory_id"],
+                    child_memory_id=row["child_memory_id"],
+                    relation=row["relation"],
+                    created_at=_parse_dt(row["created_at"]),
+                ))
+        return results
+
+    async def record_memory_curation_run(self, run: MemoryCurationRun) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT INTO memory_curation_runs (
+                    id, policy_id, source_type, client, repo_identifier,
+                    project_key, candidate_count, created_memory_count,
+                    skipped_reason, error, started_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    policy_id=excluded.policy_id,
+                    source_type=excluded.source_type,
+                    client=excluded.client,
+                    repo_identifier=excluded.repo_identifier,
+                    project_key=excluded.project_key,
+                    candidate_count=excluded.candidate_count,
+                    created_memory_count=excluded.created_memory_count,
+                    skipped_reason=excluded.skipped_reason,
+                    error=excluded.error,
+                    started_at=excluded.started_at,
+                    completed_at=excluded.completed_at""",
+                (
+                    run.id,
+                    run.policy_id,
+                    run.source_type,
+                    run.client,
+                    run.repo_identifier,
+                    run.project_key,
+                    run.candidate_count,
+                    run.created_memory_count,
+                    run.skipped_reason,
+                    run.error,
+                    _utc_iso(run.started_at),
+                    _utc_iso(run.completed_at) if run.completed_at else None,
+                ),
+            )
+            await self.db.commit()
+
+    async def get_memory_curation_run(self, run_id: str) -> MemoryCurationRun | None:
+        async with self.db.execute(
+            "SELECT * FROM memory_curation_runs WHERE id = ?",
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return self._row_to_memory_curation_run(row)
 
     async def get_origin_source_pairs(
         self, memory_ids: list[str]
@@ -4330,6 +4484,7 @@ class Database:
             visibility=d["visibility"],
             owner_user_id=d["owner_user_id"],
             project_key=d["project_key"],
+            repo_identifier=d.get("repo_identifier"),
             confidence=d["confidence"],
             corroboration_count=d["corroboration_count"],
             contradiction_count=d["contradiction_count"],
@@ -4342,8 +4497,30 @@ class Database:
             superseded_at=_parse_dt(d.get("superseded_at")),
             replacement_reason=d.get("replacement_reason"),
             extraction_context=d.get("extraction_context"),
+            memory_level=d.get("memory_level") or "atomic",
+            curation_cluster_id=d.get("curation_cluster_id"),
             created_at=_parse_dt(d.get("created_at")),
             updated_at=_parse_dt(d.get("updated_at")),
+        )
+
+    def _row_to_memory_curation_run(self, row) -> MemoryCurationRun:
+        d = dict(row)
+        started_at = _parse_dt(d["started_at"])
+        if started_at is None:
+            started_at = datetime.now(timezone.utc)
+        return MemoryCurationRun(
+            id=d["id"],
+            policy_id=d["policy_id"],
+            source_type=d["source_type"],
+            client=d.get("client"),
+            repo_identifier=d.get("repo_identifier"),
+            project_key=d.get("project_key"),
+            candidate_count=d["candidate_count"],
+            created_memory_count=d["created_memory_count"],
+            skipped_reason=d.get("skipped_reason"),
+            error=d.get("error"),
+            started_at=started_at,
+            completed_at=_parse_dt(d.get("completed_at")),
         )
 
     def _row_to_agent_session_receipt(self, row) -> dict:

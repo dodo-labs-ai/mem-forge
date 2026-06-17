@@ -638,7 +638,6 @@ class AgentSessionDocumentRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     submitted_at: str | None = None
     process_now: bool = True
-    user_id: str | None = None
 
 
 class LocalAdapterDocumentRequest(BaseModel):
@@ -677,7 +676,6 @@ class AgentSessionWindowRequest(BaseModel):
     retention: str = "none"
     submitted_at: str | None = None
     process_now: bool = False
-    user_id: str | None = None
 
 
 class AgentHookReceiptRequest(BaseModel):
@@ -3449,6 +3447,7 @@ def create_admin_app(
     async def push_local_adapter_document(
         source_id: str,
         req: LocalAdapterDocumentRequest,
+        request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         sync_service: SyncService = Depends(get_sync_service),
@@ -3460,11 +3459,23 @@ def create_admin_app(
         the service creates a stable doc id, atomically writes the package, and
         leaves the rest of ingestion to the source's sync pipeline.
         """
-        from memforge.local_adapter import submit_local_markdown_document
+        from memforge.local_adapter import (
+            LOCAL_MARKDOWN_SOURCE_TYPE,
+            submit_local_markdown_document,
+        )
 
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
+        if source.get("type") != LOCAL_MARKDOWN_SOURCE_TYPE:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"source {source_id} is type {source.get('type')!r}, "
+                    "not 'local_markdown'"
+                ),
+            )
+        _require_source_management(request, source)
         if source.get("status") == SOURCE_PAUSED_STATUS:
             raise HTTPException(status_code=400, detail="Source is paused")
 
@@ -3504,6 +3515,7 @@ def create_admin_app(
     @agent_session_router.post("/documents")
     async def submit_agent_session_summary(
         req: AgentSessionDocumentRequest,
+        request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         sync_service: SyncService = Depends(get_sync_service),
@@ -3531,7 +3543,7 @@ def create_admin_app(
                 title=req.title,
                 metadata=req.metadata,
                 submitted_at=req.submitted_at,
-                user_id=req.user_id,
+                user_id=resolve_request_principal(request),
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -3601,7 +3613,7 @@ def create_admin_app(
                 retention=req.retention,
                 submitted_at=req.submitted_at,
                 process_now=req.process_now,
-                user_id=req.user_id,
+                user_id=resolve_request_principal(request),
             )
         except ValueError as e:
             detail = str(e)

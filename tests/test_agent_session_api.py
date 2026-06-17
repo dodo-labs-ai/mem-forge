@@ -137,6 +137,110 @@ def test_agent_session_document_submit_api_records_generated_source(tmp_path):
         asyncio.run(database.close())
 
 
+def test_agent_session_document_submit_uses_server_principal(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+
+    async def _setup():
+        await database.connect()
+
+    import asyncio
+
+    asyncio.run(_setup())
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            principal_resolver=lambda request: "u-authorized",
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/agent-sessions/documents",
+                json={
+                    "client": "codex",
+                    "session_id": "sess-principal",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "repo": "mem-forge",
+                    "document_markdown": "# Summary\n\nThe route pins owner identity.",
+                    "process_now": False,
+                    "user_id": "u-spoofed",
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        receipt = asyncio.run(
+            database.get_agent_session_receipt(response.json()["doc_id"])
+        )
+        assert receipt is not None
+        assert receipt["metadata"]["user_id"] == "u-authorized"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_agent_session_window_submit_uses_server_principal(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    class PackageClient:
+        async def generate_agent_session_package(self, prompt: str, **kwargs):
+            return SimpleNamespace(
+                result="package_created",
+                title="Principal package",
+                summary_markdown="# Summary\n\nThe window route pins owner identity.",
+                reason=None,
+            )
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+
+    async def _setup():
+        await database.connect()
+
+    import asyncio
+
+    asyncio.run(_setup())
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            principal_resolver=lambda request: "u-authorized",
+        )
+        app.state.agent_session_window_client = PackageClient()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/agent-sessions/windows",
+                json={
+                    "schema_version": "agent-session-window/v1",
+                    "client": "codex",
+                    "session_id": "sess-window-principal",
+                    "trigger": "PreCompact",
+                    "workspace": "/workspace/mem-forge",
+                    "repo": "mem-forge",
+                    "events": [
+                        {
+                            "kind": "assistant_message",
+                            "actor": "assistant",
+                            "text": "Implemented the durable rule.",
+                        }
+                    ],
+                    "retention": "none",
+                    "process_now": False,
+                    "user_id": "u-spoofed",
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        receipt = asyncio.run(
+            database.get_agent_session_receipt(response.json()["doc_id"])
+        )
+        assert receipt is not None
+        assert receipt["metadata"]["user_id"] == "u-authorized"
+    finally:
+        asyncio.run(database.close())
+
+
 def test_source_projects_endpoint_groups_agent_session_memory_by_project(tmp_path):
     from memforge.server.admin_api import create_admin_app
 

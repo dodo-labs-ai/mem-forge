@@ -169,6 +169,7 @@ async def _submit_and_normalize(
     session_id: str,
     user_id: str,
     fact: str,
+    repo: str = "mem-forge",
     submitted_at: str | None = None,
 ):
     """Run the production write path and return (submitted, item, normalized)."""
@@ -180,7 +181,7 @@ async def _submit_and_normalize(
         trigger="Stop",
         document_markdown=f"## Durable Findings\n- {fact}\n",
         workspace="/workspace/mem-forge",
-        repo="mem-forge",
+        repo=repo,
         branch="main",
         commit_sha="abc",
         history_window_kind="session",
@@ -228,6 +229,32 @@ async def test_agent_session_gene_exposes_uploader_on_normalize(
 
     assert normalized_u1.source_semantics.get("uploader_user_id") == U1_USER
     assert normalized_u2.source_semantics.get("uploader_user_id") == U2_USER
+
+
+@pytest.mark.asyncio
+async def test_agent_session_gene_exposes_normalized_repo_identifier(
+    database_fixture, tmp_path
+):
+    """Gene boundary: repo identity must survive the package read path.
+
+    Curator grouping depends on repo_identifier at memory persistence time. A
+    receipt-only value is insufficient because sync rereads the generated
+    package through the gene before extraction.
+    """
+    database = database_fixture
+    cfg = _config(tmp_path)
+
+    _, _, normalized = await _submit_and_normalize(
+        db=database,
+        cfg=cfg,
+        client="codex",
+        session_id="sess-repo",
+        user_id=U1_USER,
+        fact="agent-session memories are repo-first",
+        repo="git@github.com:shno-labs/mem-forge.git",
+    )
+
+    assert normalized.source_semantics["repo_identifier"] == "github.com/shno-labs/mem-forge"
 
 
 @pytest.mark.asyncio
@@ -301,6 +328,8 @@ async def test_orchestrator_forwards_uploader_user_id_on_new_documents(
     assert item_u2.item_id in by_doc
     assert by_doc[item_u1.item_id]["user_id"] == U1_USER
     assert by_doc[item_u2.item_id]["user_id"] == U2_USER
+    assert by_doc[item_u1.item_id]["repo_identifier"] == "mem-forge"
+    assert by_doc[item_u2.item_id]["repo_identifier"] == "mem-forge"
     assert spy.reconcile_calls == []
 
 
@@ -390,3 +419,4 @@ async def test_orchestrator_forwards_uploader_user_id_on_document_updates(
     forwarded = update_spy.reconcile_calls[0]
     assert forwarded["doc_id"] == item_second.item_id
     assert forwarded["user_id"] == U1_USER
+    assert forwarded["repo_identifier"] == "mem-forge"

@@ -152,6 +152,7 @@ class MemoryEngine:
         raw_memories: list[RawMemory],
         source_type: str,
         project_key: str | None = None,
+        repo_identifier: str | None = None,
         entity_ids: list[int] | None = None,
         audit_context: Any | None = None,
         user_id: str | None = None,
@@ -176,6 +177,7 @@ class MemoryEngine:
                 visibility=visibility,
                 owner_user_id=owner_user_id,
                 project_key=project_key,
+                repo_identifier=repo_identifier,
                 entity_refs=raw.entity_refs,
                 tags=raw.tags,
                 confidence=raw.confidence,
@@ -260,6 +262,7 @@ class MemoryEngine:
         source_type: str,
         doc_type: str,
         project_key: str | None = None,
+        repo_identifier: str | None = None,
         entity_ids: list[int] | None = None,
         document_content: str | None = None,
         update_mode: str = "full_document",
@@ -303,6 +306,7 @@ class MemoryEngine:
                 raw_memories=raw_memories,
                 source_type=source_type,
                 project_key=project_key,
+                repo_identifier=repo_identifier,
                 entity_ids=entity_ids,
                 audit_context=audit_context,
                 user_id=user_id,
@@ -335,6 +339,7 @@ class MemoryEngine:
                 raw_memories=filtered_memories,
                 source_type=source_type,
                 project_key=project_key,
+                repo_identifier=repo_identifier,
                 entity_ids=entity_ids,
                 audit_context=audit_context,
                 user_id=user_id,
@@ -479,7 +484,13 @@ class MemoryEngine:
                 if op.action == ReconcileAction.ADD and op.memory:
                     if not self._candidate_can_persist(op.memory, stats):
                         continue
-                    memory = self._build_memory(op.memory, project_key, source_type, user_id=user_id)
+                    memory = self._build_memory(
+                        op.memory,
+                        project_key,
+                        source_type,
+                        user_id=user_id,
+                        repo_identifier=repo_identifier,
+                    )
                     memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
                     result = await self.memory_store.deduplicate_and_insert(
                         memory=memory,
@@ -506,7 +517,13 @@ class MemoryEngine:
                 elif op.action == ReconcileAction.SUPERSEDE and op.memory_id and op.memory:
                     if not self._candidate_can_persist(op.memory, stats):
                         continue
-                    new_memory = self._build_memory(op.memory, project_key, source_type, user_id=user_id)
+                    new_memory = self._build_memory(
+                        op.memory,
+                        project_key,
+                        source_type,
+                        user_id=user_id,
+                        repo_identifier=repo_identifier,
+                    )
                     memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
                     await self.memory_store.supersede_memory(
                         old_memory_id=op.memory_id,
@@ -796,6 +813,7 @@ class MemoryEngine:
         project_key: str | None,
         source_type: str,
         user_id: str | None = None,
+        repo_identifier: str | None = None,
     ) -> Memory:
         """Build a Memory object from a RawMemory."""
         visibility, owner_user_id = default_visibility(source_type, user_id=user_id)
@@ -807,6 +825,7 @@ class MemoryEngine:
             visibility=visibility,
             owner_user_id=owner_user_id,
             project_key=project_key,
+            repo_identifier=repo_identifier,
             entity_refs=raw.entity_refs,
             tags=raw.tags,
             confidence=raw.confidence,

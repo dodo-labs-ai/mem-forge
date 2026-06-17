@@ -15,6 +15,8 @@ from memforge.models import (
     Entity,
     EntityAlias,
     Memory,
+    MemoryCurationRun,
+    MemoryDerivation,
     MemorySource,
     Project,
 )
@@ -31,6 +33,10 @@ class RankingMetadata(TypedDict, total=False):
 
     updated_at: datetime | None
     project_key: str | None
+    repo_identifier: str | None
+    memory_level: str | None
+    curation_cluster_id: str | None
+    covered_memory_count: int
 
 
 @runtime_checkable
@@ -86,6 +92,25 @@ class RelationalStore(Protocol):
         excerpt: str | None,
         support_kind: str = "extracted",
     ) -> None: ...
+    async def add_memory_derivation(
+        self,
+        parent_memory_id: str,
+        child_memory_id: str,
+        *,
+        relation: str = "summarizes",
+    ) -> None: ...
+    async def get_memory_derivation_children(
+        self,
+        parent_memory_id: str,
+    ) -> list[MemoryDerivation]: ...
+    async def record_memory_curation_run(
+        self,
+        run: MemoryCurationRun,
+    ) -> None: ...
+    async def get_memory_curation_run(
+        self,
+        run_id: str,
+    ) -> MemoryCurationRun | None: ...
     async def promote_to_workspace(
         self,
         memory_id: str,

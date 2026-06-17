@@ -85,5 +85,11 @@ async def test_process_memories_inserts_through_the_adapters(db, monkeypatch):
         doc_id="doc1",
         raw_memories=[RawMemory(content="deploy via ArgoCD", memory_type="fact")],
         source_type="manual",
+        repo_identifier="github.com/shno-labs/mem-forge",
     )
     assert stats["inserted"] == 1
+    rows = await db.get_memories_by_source_doc("doc1")
+    assert rows[0].repo_identifier == "github.com/shno-labs/mem-forge"
+    assert collection.upserted[rows[0].id]["repo_identifier"] == (
+        "github.com/shno-labs/mem-forge"
+    )

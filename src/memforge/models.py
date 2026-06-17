@@ -68,6 +68,11 @@ class MemoryStatus(str, Enum):
     PENDING_REVIEW = "pending_review"
 
 
+class MemoryLevel(str, Enum):
+    ATOMIC = "atomic"
+    CONSOLIDATED = "consolidated"
+
+
 class Visibility(str, Enum):
     """Per-row access tier within one datastore. 'org' is reserved (strict silos)."""
 
@@ -159,6 +164,7 @@ class Memory:
     visibility: str = Visibility.WORKSPACE.value  # team-visible by default
     owner_user_id: str | None = None              # set iff visibility is private
     project_key: str | None = None
+    repo_identifier: str | None = None
 
     # Entity linkage
     entity_refs: list[str] = field(default_factory=list)
@@ -181,6 +187,8 @@ class Memory:
     superseded_at: datetime | None = None
     replacement_reason: str | None = None
     extraction_context: str | None = None
+    memory_level: str = MemoryLevel.ATOMIC.value
+    curation_cluster_id: str | None = None
 
 
 @dataclass
@@ -207,6 +215,34 @@ class MemorySource:
     excerpt: str | None = None
     support_kind: str = "extracted"
     added_at: datetime | None = None
+
+
+@dataclass
+class MemoryDerivation:
+    """Lineage edge from a consolidated memory to an atomic child memory."""
+
+    parent_memory_id: str
+    child_memory_id: str
+    relation: str = "summarizes"
+    created_at: datetime | None = None
+
+
+@dataclass
+class MemoryCurationRun:
+    """Audit record for one Curator execution."""
+
+    id: str
+    policy_id: str
+    source_type: str
+    client: str | None
+    repo_identifier: str | None
+    project_key: str | None
+    candidate_count: int
+    created_memory_count: int
+    skipped_reason: str | None
+    error: str | None
+    started_at: datetime
+    completed_at: datetime | None = None
 
 
 @dataclass
@@ -524,6 +560,10 @@ class SearchResult:
     contradiction_warning: str | None = None
     is_document_result: bool = False
     status: str = "active"  # mirrors Memory.status; "active" for document fallbacks
+    memory_level: str = MemoryLevel.ATOMIC.value
+    curation_cluster_id: str | None = None
+    covered_memory_count: int = 0
+    repo_identifier: str | None = None
 
 
 @dataclass

@@ -13,6 +13,7 @@ from memforge.agent_session_contract import (
     AGENT_SESSION_CONTENT_ROLE,
     AGENT_SESSION_PACKAGE_KIND,
 )
+from memforge.agent_sessions import normalize_repo_identifier
 from memforge.genes.base import Gene
 from memforge.models import (
     ConfigField,
@@ -230,6 +231,10 @@ class AgentSessionGene(Gene):
                 "trigger": receipt.get("trigger"),
                 "workspace": receipt.get("workspace"),
                 "repo": receipt.get("repo"),
+                "repo_identifier": (
+                    receipt_metadata.get("repo_identifier")
+                    or normalize_repo_identifier(receipt.get("repo"))
+                ),
                 "branch": receipt.get("branch"),
                 "commit_sha": receipt.get("commit_sha"),
                 "history_window_kind": receipt.get("history_window_kind"),

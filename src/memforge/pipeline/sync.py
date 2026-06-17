@@ -1188,6 +1188,7 @@ class GeneSyncOrchestrator:
         # write-time signal only: read-time visibility is decided by the access
         # predicate, never by this hint.
         uploader_user_id = normalized.source_semantics.get("uploader_user_id")
+        repo_identifier = normalized.source_semantics.get("repo_identifier")
         if change_type == "updated":
             memory_stats = await self.memory_engine.reconcile_and_persist(
                 doc_id=doc_id,
@@ -1195,6 +1196,7 @@ class GeneSyncOrchestrator:
                 source_type=source_type,
                 doc_type=enrichment.doc_type,
                 project_key=project_key,
+                repo_identifier=repo_identifier,
                 entity_ids=entity_ids,
                 document_content=markdown_body,
                 update_mode=update_plan.mode if update_plan else "full_document",
@@ -1211,6 +1213,7 @@ class GeneSyncOrchestrator:
                 raw_memories=raw_memories,
                 source_type=source_type,
                 project_key=project_key,
+                repo_identifier=repo_identifier,
                 entity_ids=entity_ids,
                 audit_context=memory_context,
                 user_id=uploader_user_id,
