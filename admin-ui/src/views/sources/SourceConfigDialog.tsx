@@ -243,9 +243,7 @@ function SourceConfigForm({
       .sort((a, b) => a.order - b.order),
     [config, schema, sourceType],
   );
-  const previewGroupKey = fieldsByGroup.some((group) => group.key === "connection")
-    ? "connection"
-    : fieldsByGroup[0]?.key;
+  const previewGroupKey = discoveryPreviewGroupKey(fieldsByGroup);
   const firstMissingField = firstMissingRequiredField(sourceType, schema.fields, config);
   const scheduleIntervalValid = parseScheduleInterval(scheduleInterval) >= 5;
 
@@ -900,6 +898,12 @@ function DiscoveryPreviewPanel({
       )}
     </section>
   );
+}
+
+function discoveryPreviewGroupKey(groups: Array<{ key: string }>): string | undefined {
+  if (groups.some((group) => group.key === "scope")) return "scope";
+  if (groups.some((group) => group.key === "connection")) return "connection";
+  return groups[0]?.key;
 }
 
 function formatPreviewDate(value: string): string {
