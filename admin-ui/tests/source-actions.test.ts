@@ -148,6 +148,16 @@ assert.match(
 );
 assert.match(
   sourceConfigDialogSource,
+  /function discoveryPreviewGroupKey/,
+  "source discovery preview placement should be centralized instead of hard-coded inline",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /group\.key === "scope"/,
+  "source discovery preview should appear after the scope fields when a source has a What to Sync group",
+);
+assert.match(
+  sourceConfigDialogSource,
   /limit: DISCOVERY_PREVIEW_LIMIT/,
   "source discovery preview requests should send the bounded limit to the API",
 );
@@ -180,4 +190,11 @@ assert.match(
   sourceConfigDialogSource,
   /<span className="block text-sm font-medium">Sync on a schedule<\/span>/,
   "Source configuration should expose a clear automatic sync control",
+);
+
+const projectBindingSource = readFileSync("src/views/sources/ProjectBindingFields.tsx", "utf8");
+assert.match(
+  projectBindingSource,
+  /focus-visible:ring-1 focus-visible:ring-ring\/40/,
+  "project picker focus styling should be visible without creating a heavy shadow around the dropdown",
 );
