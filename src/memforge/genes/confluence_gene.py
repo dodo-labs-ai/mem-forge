@@ -121,13 +121,6 @@ class ConfluenceGene(Gene):
                     help_text="Advanced override for Confluence deployments that serve REST below a path",
                     group="connection", order=2, advanced=True,
                 ),
-                ConfigField(
-                    key="tls_ca_bundle", label="Custom CA Bundle",
-                    field_type=ConfigFieldType.STRING, required=False,
-                    placeholder="/path/to/company-ca.pem",
-                    help_text="Optional. Use only when your Confluence server uses a private certificate authority.",
-                    group="connection", order=3, advanced=True,
-                ),
             ],
         )
 

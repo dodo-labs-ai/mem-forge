@@ -294,7 +294,7 @@ def test_admin_app_scheduler_registers_expiry_maintenance(tmp_path):
         assert app.state.sync_scheduler.scheduler.get_job(EXPIRY_JOB_ID) is not None
 
 
-def test_gene_config_schema_marks_advanced_source_fields(tmp_path):
+def test_gene_config_schema_hides_custom_ca_bundle_from_ui(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     app = create_admin_app(config=_config(tmp_path))
@@ -305,7 +305,7 @@ def test_gene_config_schema_marks_advanced_source_fields(tmp_path):
     assert response.status_code == 200
     fields = {field["key"]: field for field in response.json()["fields"]}
     assert fields["pat"]["advanced"] is False
-    assert fields["tls_ca_bundle"]["advanced"] is True
+    assert "tls_ca_bundle" not in fields
 
 
 def test_admin_source_create_encrypts_and_redacts_pat(tmp_path, monkeypatch):

@@ -10,7 +10,7 @@ from memforge.genes.jira_gene import JiraGene
 from memforge.models import ContentItem
 
 
-def test_jira_schema_marks_tls_ca_bundle_as_advanced():
+def test_jira_schema_hides_custom_ca_bundle_from_ui():
     fields = {field.key: field for field in JiraGene.config_schema().fields}
 
     assert fields["auth_mode"].required is True
@@ -18,7 +18,7 @@ def test_jira_schema_marks_tls_ca_bundle_as_advanced():
     assert "jira_cookie" not in fields
     assert fields["pat"].required is False
     assert fields["pat"].advanced is False
-    assert fields["tls_ca_bundle"].advanced is True
+    assert "tls_ca_bundle" not in fields
     assert fields["request_interval_ms"].advanced is True
 
 
