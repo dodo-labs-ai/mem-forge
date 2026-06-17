@@ -314,13 +314,6 @@ class JiraGene(Gene):
                     help_text="Stored encrypted and sent as a bearer token when PAT mode is selected",
                     group="connection", order=2,
                 ),
-                ConfigField(
-                    key="request_interval_ms", label="Request Interval",
-                    field_type=ConfigFieldType.INTEGER, required=False,
-                    default=str(DEFAULT_REQUEST_INTERVAL_MS),
-                    help_text="Minimum delay between Jira REST requests to the same Atlassian origin",
-                    group="connection", order=3, advanced=True,
-                ),
             ],
         )
 
