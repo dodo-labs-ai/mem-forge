@@ -10,6 +10,17 @@ from pathlib import Path
 import pytest
 
 
+def _init_git_repo_with_origin(path: Path, origin_url: str) -> None:
+    subprocess.run(["git", "init"], cwd=path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(
+        ["git", "remote", "add", "origin", origin_url],
+        cwd=path,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
 def test_hook_adapter_returns_additional_context_for_prompt_hook(monkeypatch, capsys):
     from memforge import hook_adapter
 
@@ -42,6 +53,33 @@ def test_hook_adapter_returns_additional_context_for_prompt_hook(monkeypatch, ca
     output = json.loads(capsys.readouterr().out)
     assert output["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
     assert "MemoryStore" in output["hookSpecificOutput"]["additionalContext"]
+
+
+def test_hook_adapter_context_sends_canonical_remote_repo_for_claude(monkeypatch, tmp_path, capsys):
+    from memforge import hook_adapter
+
+    _init_git_repo_with_origin(tmp_path, "git@github.tools.sap:HCM/memforge-cloud.git")
+    requests: list[tuple[str, dict]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, payload))
+        return {"should_inject": False}
+
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "sess-claude-repo",
+        "cwd": str(tmp_path),
+        "prompt": "What do we know about this repo?",
+    }))
+
+    exit_code = hook_adapter.main(["context", "--client", "claude-code"])
+
+    assert exit_code == 0
+    assert requests[0][0] == "/api/hooks/context"
+    assert requests[0][1]["client"] == "claude-code"
+    assert requests[0][1]["repo"] == "github.tools.sap/hcm/memforge-cloud"
+    assert capsys.readouterr().out == ""
 
 
 def test_hook_adapter_injects_session_start_memforge_usage_guidance_without_api(monkeypatch, capsys):
@@ -1193,6 +1231,26 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
     assert payload["plugin_version"]
     assert payload["receipt"]["metadata"]["uploaded_to_line"] == 2
     assert payload["receipt"]["metadata"]["observed_to_line"] == 2
+
+
+def test_session_window_payload_sends_canonical_remote_repo_for_codex(tmp_path):
+    from memforge import hook_adapter
+
+    _init_git_repo_with_origin(tmp_path, "https://github.com/shno-labs/mem-forge.git")
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"tool","name":"apply_patch","input":"edit"}\n', encoding="utf-8")
+
+    payload = hook_adapter._session_window_payload(
+        client="codex",
+        session_id="sess-codex-repo",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        from_line=0,
+        to_line=1,
+        trigger="REQUIRED_CAPTURE",
+    )
+
+    assert payload["repo"] == "github.com/shno-labs/mem-forge"
 
 
 def test_bounded_transcript_slice_never_advances_past_lines_read(tmp_path):

@@ -775,11 +775,38 @@ def _workspace(payload: dict[str, Any]) -> str:
 
 
 def _repo_name(payload: dict[str, Any]) -> str | None:
+    remote = _git_value(payload, ["git", "remote", "get-url", "origin"])
+    normalized_remote = _normalize_repo_identifier(remote)
+    if normalized_remote:
+        return normalized_remote
     root = _git_value(payload, ["git", "rev-parse", "--show-toplevel"])
     if root:
         return Path(root).name
     workspace = _workspace(payload)
     return Path(workspace).name if workspace else None
+
+
+def _normalize_repo_identifier(repo: str | None) -> str | None:
+    """Normalize a VCS remote or repo slug to the stable session repo key."""
+    if repo is None:
+        return None
+    value = repo.strip()
+    if not value:
+        return None
+
+    ssh_match = re.match(r"^[^/@]+@([^:/]+):(.+)$", value)
+    if ssh_match:
+        host, path = ssh_match.groups()
+        value = f"{host}/{path}"
+    else:
+        value = re.sub(r"^[a-z][a-z0-9+.-]*://", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"^[^@/]+@", "", value)
+
+    value = value.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    if value.endswith(".git"):
+        value = value[:-4]
+    value = re.sub(r"/+", "/", value)
+    return value.lower() or None
 
 
 def _git_value(payload: dict[str, Any], command: list[str]) -> str | None:

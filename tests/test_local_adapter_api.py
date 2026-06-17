@@ -119,6 +119,51 @@ def test_local_adapter_document_push_writes_package(tmp_path):
         asyncio.run(database.close())
 
 
+def test_local_adapter_document_push_requires_source_management(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+
+    async def _seed_source() -> None:
+        await database.upsert_source(
+            id="src-owned-local",
+            type="local_markdown",
+            name="Owned notes",
+            config_json=json.dumps(
+                {
+                    "vault_id": "engineering",
+                    "documents_dir": str(tmp_path / "local-inbox"),
+                }
+            ),
+            created_by_user_id="alice",
+        )
+
+    asyncio.run(_seed_source())
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            principal_resolver=lambda request: "bob",
+            workspace_role_resolver=lambda request: "member",
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/sources/src-owned-local/adapter/documents",
+                json={
+                    "vault_id": "engineering",
+                    "relative_path": "decisions/cutoff.md",
+                    "markdown_body": "# Cutoff\n\nDeploy on Tuesday.",
+                    "process_now": False,
+                },
+            )
+
+        assert response.status_code == 403
+        assert response.json()["detail"]["error"] == "source_management_forbidden"
+    finally:
+        asyncio.run(database.close())
+
+
 def test_local_adapter_document_push_allows_unmapped_source(tmp_path):
     from memforge.server.admin_api import create_admin_app
 

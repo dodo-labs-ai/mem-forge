@@ -52,6 +52,33 @@ def agent_session_source_name(client: str) -> str:
     return _KNOWN_CLIENT_SOURCE_NAMES.get(client, f"{client.title()} Session")
 
 
+def normalize_repo_identifier(repo: str | None) -> str | None:
+    """Return the stable repository identity used for agent-session grouping.
+
+    Remote URLs are normalized to ``host/org/repo`` without protocol, user, or
+    ``.git`` suffix. Plain repo slugs are lower-cased and returned unchanged.
+    """
+    if repo is None:
+        return None
+    value = repo.strip()
+    if not value:
+        return None
+
+    ssh_match = re.match(r"^[^/@]+@([^:/]+):(.+)$", value)
+    if ssh_match:
+        host, path = ssh_match.groups()
+        value = f"{host}/{path}"
+    else:
+        value = re.sub(r"^[a-z][a-z0-9+.-]*://", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"^[^@/]+@", "", value)
+
+    value = value.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    if value.endswith(".git"):
+        value = value[:-4]
+    value = re.sub(r"/+", "/", value)
+    return value.lower() or None
+
+
 # Reverse-lookup: given a per-client source id, return the originating client.
 # Used by /api/sources to attach `client` to each row so the UI can pick a brand.
 _AGENT_SESSION_ID_TO_CLIENT: dict[str, str] = {
@@ -649,6 +676,7 @@ async def submit_agent_session_document(
     receipt_metadata = dict(metadata or {})
     if user_id is not None:
         receipt_metadata["user_id"] = user_id
+    receipt_metadata.setdefault("repo_identifier", normalize_repo_identifier(repo))
 
     receipt = AgentSessionReceipt(
         doc_id=doc_id,

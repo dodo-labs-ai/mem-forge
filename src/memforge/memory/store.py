@@ -82,6 +82,9 @@ def _memory_metadata(
     base: dict[str, Any] = {
         "memory_type": memory.memory_type,
         "project_key": memory.project_key or "",
+        "repo_identifier": memory.repo_identifier or "",
+        "memory_level": memory.memory_level,
+        "curation_cluster_id": memory.curation_cluster_id or "",
         "visibility": memory.visibility,
         "owner_user_id": memory.owner_user_id or "",
         "confidence": memory.confidence,
@@ -106,6 +109,9 @@ def _normalize_snapshot_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     out.setdefault("visibility", Visibility.WORKSPACE.value)
     out.setdefault("owner_user_id", "")
     out.setdefault("project_key", "")
+    out.setdefault("repo_identifier", "")
+    out.setdefault("memory_level", "atomic")
+    out.setdefault("curation_cluster_id", "")
     return out
 
 

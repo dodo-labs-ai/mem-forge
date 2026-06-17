@@ -42,6 +42,7 @@ class AccessScope:
     allowed_statuses: tuple[str, ...]
     active_project: str | None
     scope_mode: ScopeMode
+    active_repo_identifier: str | None = None
 
     def __post_init__(self) -> None:
         # The Literal type alias is a static hint; this guard catches any

@@ -18,6 +18,8 @@ from memforge.models import (
     Entity,
     EntityAlias,
     Memory,
+    MemoryCurationRun,
+    MemoryDerivation,
     MemorySource,
     Project,
     Visibility,
@@ -86,6 +88,37 @@ class SqliteRelationalStore:
         await self._db.add_memory_source(
             memory_id, doc_id, source_type, excerpt, support_kind=support_kind
         )
+
+    async def add_memory_derivation(
+        self,
+        parent_memory_id: str,
+        child_memory_id: str,
+        *,
+        relation: str = "summarizes",
+    ) -> None:
+        await self._db.add_memory_derivation(
+            parent_memory_id,
+            child_memory_id,
+            relation=relation,
+        )
+
+    async def get_memory_derivation_children(
+        self,
+        parent_memory_id: str,
+    ) -> list[MemoryDerivation]:
+        return await self._db.get_memory_derivation_children(parent_memory_id)
+
+    async def record_memory_curation_run(
+        self,
+        run: MemoryCurationRun,
+    ) -> None:
+        await self._db.record_memory_curation_run(run)
+
+    async def get_memory_curation_run(
+        self,
+        run_id: str,
+    ) -> MemoryCurationRun | None:
+        return await self._db.get_memory_curation_run(run_id)
 
     async def promote_to_workspace(
         self,
@@ -311,11 +344,11 @@ class SqliteRelationalStore:
     async def fetch_ranking_metadata(
         self, ids: Sequence[str]
     ) -> dict[str, dict[str, Any]]:
-        """Return ``updated_at`` and ``project_key`` for each id in one read.
+        """Return ranking and curation metadata for each id in one read.
 
-        Both columns feed the ranker (recency curve and cross-project
-        affinity penalty), so a single batched ``SELECT`` keeps the per-
-        candidate roundtrip count at one regardless of the channel set.
+        The fields feed recency, project affinity, repo affinity, and
+        lineage-aware result shaping, so a single batched ``SELECT`` keeps the
+        per-candidate roundtrip count at one regardless of channel count.
         """
         ranked: dict[str, dict[str, Any]] = {}
         memory_ids = list(ids)
@@ -324,8 +357,13 @@ class SqliteRelationalStore:
             placeholders = ",".join("?" for _ in batch)
             try:
                 async with self._db.db.execute(
-                    f"SELECT id, updated_at, project_key FROM memories "
-                    f"WHERE id IN ({placeholders})",
+                    "SELECT m.id, m.updated_at, m.project_key, "
+                    "m.repo_identifier, m.memory_level, m.curation_cluster_id, "
+                    "COUNT(md.child_memory_id) AS covered_memory_count "
+                    "FROM memories m "
+                    "LEFT JOIN memory_derivations md ON md.parent_memory_id = m.id "
+                    f"WHERE m.id IN ({placeholders}) "
+                    "GROUP BY m.id",
                     batch,
                 ) as cursor:
                     async for row in cursor:
@@ -339,6 +377,10 @@ class SqliteRelationalStore:
                         ranked[row[0]] = {
                             "updated_at": parsed,
                             "project_key": row[2],
+                            "repo_identifier": row[3],
+                            "memory_level": row[4],
+                            "curation_cluster_id": row[5],
+                            "covered_memory_count": int(row[6] or 0),
                         }
             except Exception:
                 logger.exception("Failed to fetch ranking metadata for memory ids")
