@@ -33,12 +33,14 @@ from memforge.models import (
     UNSORTED_PROJECT_KEY,
     Visibility,
 )
+from memforge.retrieval.filters import MemorySourceFilter
 from memforge.storage.adapters.protocols import RelationalStore
 
 from tests.contracts._support import (
     AdaptersFactory,
     ContractAdapters,
     FactoryResult,
+    make_document,
     make_memory,
     make_scope,
 )
@@ -203,6 +205,52 @@ class RelationalStoreContract:
         meta = rows["m1"]
         assert isinstance(meta["updated_at"], datetime)
         assert meta["project_key"] == "PAY"
+
+    # -- Source facets ------------------------------------------------------
+
+    async def test_filter_ids_by_source_filter_matches_source_type_and_repo(
+        self, adapters: ContractAdapters
+    ) -> None:
+        store = adapters.relational
+        await store.insert_memory(
+            make_memory(
+                "m-agent-target",
+                repo_identifier="github.tools.sap/hcm/memforge-cloud",
+            )
+        )
+        await store.insert_memory(
+            make_memory(
+                "m-agent-other-repo",
+                repo_identifier="github.tools.sap/hcm/other",
+            )
+        )
+        await store.insert_memory(make_memory("m-jira"))
+        await store.upsert_document(make_document("doc-agent-target"))
+        await store.upsert_document(make_document("doc-agent-other-repo"))
+        await store.upsert_document(make_document("doc-jira"))
+        await store.add_memory_source(
+            "m-agent-target",
+            "doc-agent-target",
+            "agent_session",
+            None,
+        )
+        await store.add_memory_source(
+            "m-agent-other-repo",
+            "doc-agent-other-repo",
+            "agent_session",
+            None,
+        )
+        await store.add_memory_source("m-jira", "doc-jira", "jira", None)
+
+        matched = await store.filter_ids_by_source_filter(
+            ["m-agent-target", "m-agent-other-repo", "m-jira"],
+            MemorySourceFilter(
+                source_types=("agent_session",),
+                repo_identifiers=("github.tools.sap/hcm/memforge-cloud",),
+            ),
+        )
+
+        assert matched == {"m-agent-target"}
 
     # -- Project lifecycle --------------------------------------------------
 

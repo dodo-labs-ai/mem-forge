@@ -39,3 +39,51 @@ def test_workspace_mode_passes_through_without_active_project():
 def test_invalid_scope_mode_rejected_by_literal():
     with pytest.raises(Exception):
         MemorySearchRequest(query="test", scope_mode="bogus")  # type: ignore[arg-type]
+
+
+def test_source_filter_accepts_exact_registered_facets():
+    req = MemorySearchRequest(
+        query="agent memory last week",
+        include_private=True,
+        active_repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        source_filter={
+            "source_types": ["agent_session"],
+            "clients": ["codex"],
+            "repo_identifiers": ["github.tools.sap/hcm/memforge-cloud"],
+        },
+    )
+
+    assert req.include_private is True
+    assert req.active_repo_identifier == "github.tools.sap/hcm/memforge-cloud"
+    assert req.source_filter is not None
+    assert req.source_filter.source_types == ["agent_session"]
+    assert req.source_filter.clients == ["codex"]
+    assert req.source_filter.repo_identifiers == [
+        "github.tools.sap/hcm/memforge-cloud"
+    ]
+
+
+def test_source_filter_rejects_unknown_source_type():
+    with pytest.raises(Exception):
+        MemorySearchRequest(
+            query="agent memory last week",
+            source_filter={"source_types": ["agent-session"]},
+        )
+
+
+def test_source_filter_rejects_unknown_client():
+    with pytest.raises(Exception):
+        MemorySearchRequest(
+            query="agent memory last week",
+            source_filter={"clients": ["claude"]},
+        )
+
+
+def test_search_request_rejects_unknown_memory_type():
+    with pytest.raises(Exception):
+        MemorySearchRequest(query="test", memory_types=["bug"])  # type: ignore[list-item]
+
+
+def test_search_request_rejects_unknown_status():
+    with pytest.raises(Exception):
+        MemorySearchRequest(query="test", status="resolved")

@@ -8,6 +8,7 @@ import pytest
 
 from memforge.config import RetrievalConfig
 from memforge.models import DocumentRecord, Memory, content_hash
+from memforge.retrieval.filters import MemorySourceFilter
 from memforge.retrieval.search import SearchEngine
 from memforge.retrieval.query_analyzer import QueryAnalysis
 from memforge.storage.database import Database
@@ -31,7 +32,12 @@ class FakeCollection:
         return {"ids": []}
 
 
-def _memory(mem_id: str, content: str, status: str = "active") -> Memory:
+def _memory(
+    mem_id: str,
+    content: str,
+    status: str = "active",
+    repo_identifier: str | None = None,
+) -> Memory:
     now = datetime.now(timezone.utc)
     return Memory(
         id=mem_id,
@@ -42,17 +48,24 @@ def _memory(mem_id: str, content: str, status: str = "active") -> Memory:
         created_at=now,
         updated_at=now,
         status=status,
+        repo_identifier=repo_identifier,
     )
 
 
-async def _document(db: Database, doc_id: str, source: str) -> None:
+async def _document(
+    db: Database,
+    doc_id: str,
+    source: str,
+    *,
+    client: str | None = None,
+) -> None:
     now = datetime.now(timezone.utc)
     await db.upsert_document(DocumentRecord(
         doc_id=doc_id, source=source, source_url=f"https://x/{doc_id}", title="t",
         space_or_project="PAY", author="a", last_modified=now, labels=[],
         version="1", content_hash=f"h-{doc_id}", token_count=1, raw_content_uri=None,
         raw_content_type="text/html", normalized_content_uri=None,
-        pdf_content_uri=None, last_synced=now,
+        pdf_content_uri=None, last_synced=now, client=client,
     ))
 
 
@@ -120,3 +133,59 @@ async def test_source_filter_applies_to_vector_hits(db, monkeypatch):
 
     result = await engine.search("PostgreSQL", sources=["wiki"], top_k=10)
     assert [r.memory_id for r in result["results"]] == ["m-backed"]
+
+
+@pytest.mark.asyncio
+async def test_structured_source_filter_applies_to_vector_hits(db, monkeypatch):
+    codex = _memory(
+        "m-codex",
+        "Scheduler claim was patched by Codex",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+    )
+    jira = _memory("m-jira", "Scheduler issue from Jira")
+    other_repo = _memory(
+        "m-other-repo",
+        "Scheduler claim was patched elsewhere",
+        repo_identifier="github.tools.sap/hcm/other",
+    )
+    await db.insert_memory(codex)
+    await db.insert_memory(jira)
+    await db.insert_memory(other_repo)
+    await _document(db, "doc-codex", "src-agent-codex", client="codex")
+    await _document(db, "doc-jira", "src-jira")
+    await _document(db, "doc-other-repo", "src-agent-codex", client="codex")
+    await db.add_memory_source("m-codex", "doc-codex", "agent_session", None)
+    await db.add_memory_source("m-jira", "doc-jira", "jira", None)
+    await db.add_memory_source(
+        "m-other-repo", "doc-other-repo", "agent_session", None
+    )
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    adapters = build_sqlite_adapters(
+        db,
+        FakeCollection(["m-codex", "m-jira", "m-other-repo"]),
+    )
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search(
+        "Scheduler claim",
+        source_filter=MemorySourceFilter(
+            source_types=("agent_session",),
+            clients=("codex",),
+            repo_identifiers=("github.tools.sap/hcm/memforge-cloud",),
+        ),
+        top_k=10,
+    )
+
+    assert [r.memory_id for r in result["results"]] == ["m-codex"]

@@ -121,6 +121,42 @@ def test_tool_client_forwards_search_to_hosted_workspace(monkeypatch):
     assert json.loads(captured["body"].decode())["query"] == "artifact cache"
 
 
+def test_tool_client_forwards_structured_memory_search_facets():
+    client = _RecordingClient({"results": []})
+
+    client.search(
+        query="scheduler fixes last week",
+        source_filter={
+            "source_types": ["agent_session"],
+            "clients": ["codex"],
+            "repo_identifiers": ["github.tools.sap/hcm/memforge-cloud"],
+        },
+        include_private=True,
+        active_repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        status="active",
+    )
+
+    assert client.calls == [
+        (
+            "POST",
+            "/api/memories/search",
+            {
+                "query": "scheduler fixes last week",
+                "top_k": 10,
+                "include_superseded": False,
+                "source_filter": {
+                    "source_types": ["agent_session"],
+                    "clients": ["codex"],
+                    "repo_identifiers": ["github.tools.sap/hcm/memforge-cloud"],
+                },
+                "include_private": True,
+                "active_repo_identifier": "github.tools.sap/hcm/memforge-cloud",
+                "status": "active",
+            },
+        )
+    ]
+
+
 def test_tool_client_fetches_resource_through_hosted_workspace(monkeypatch):
     captured = {}
 

@@ -25,6 +25,7 @@ from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
 from memforge.provenance import document_content_url, document_pdf_url
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
+from memforge.retrieval.filters import MemorySourceFilter
 from memforge.retrieval.query_analyzer import QueryAnalysis, analyze_query
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
@@ -218,6 +219,7 @@ class SearchEngine:
         include_superseded: bool = False,
         top_k: int = 10,
         *,
+        source_filter: MemorySourceFilter | None = None,
         request_scope: AccessScope | None = None,
     ) -> dict:
         """Unified search: memories (primary) + documents (fallback).
@@ -333,6 +335,11 @@ class SearchEngine:
         if sources:
             supported = await self._relational.filter_ids_supported_by_sources(
                 [c.memory_id for c in fused], sources
+            )
+            fused = [c for c in fused if c.memory_id in supported]
+        if source_filter is not None and not source_filter.is_empty():
+            supported = await self._relational.filter_ids_by_source_filter(
+                [c.memory_id for c in fused], source_filter
             )
             fused = [c for c in fused if c.memory_id in supported]
         total_candidates = len(fused)

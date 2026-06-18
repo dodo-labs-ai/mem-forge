@@ -782,6 +782,7 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
         "query": "proxy search",
         "memory_types": None,
         "sources": None,
+        "source_filter": None,
         "time_range": None,
         "entities": None,
         "include_superseded": False,

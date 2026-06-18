@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
-from memforge.models import Memory, Visibility, content_hash
+from memforge.models import DocumentRecord, Memory, Visibility, content_hash
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import (
     KeywordSearch,
@@ -88,6 +88,7 @@ def make_memory(
     visibility: str = Visibility.WORKSPACE.value,
     owner_user_id: str | None = None,
     project_key: str | None = None,
+    repo_identifier: str | None = None,
 ) -> Memory:
     """Build a Memory with stamped timestamps and a derived content hash.
 
@@ -107,10 +108,39 @@ def make_memory(
         visibility=visibility,
         owner_user_id=owner_user_id,
         project_key=project_key,
+        repo_identifier=repo_identifier,
         confidence=0.9,
         created_at=now,
         updated_at=now,
         status=status,
+    )
+
+
+def make_document(
+    doc_id: str,
+    *,
+    source: str = "src-contract",
+    client: str | None = None,
+) -> DocumentRecord:
+    now = datetime.now(timezone.utc)
+    return DocumentRecord(
+        doc_id=doc_id,
+        source=source,
+        source_url=f"https://example.test/{doc_id}",
+        title=f"Document {doc_id}",
+        space_or_project="CONTRACT",
+        author="contract",
+        last_modified=now,
+        labels=[],
+        version="1",
+        content_hash=f"hash-{doc_id}",
+        token_count=1,
+        raw_content_uri=None,
+        raw_content_type="text/plain",
+        normalized_content_uri=None,
+        pdf_content_uri=None,
+        last_synced=now,
+        client=client,
     )
 
 
@@ -149,6 +179,7 @@ __all__ = [
     "ContractAdapters",
     "DEFAULT_EMBEDDING",
     "FactoryResult",
+    "make_document",
     "make_memory",
     "make_scope",
     "make_vector_metadata",

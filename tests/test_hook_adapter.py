@@ -912,6 +912,7 @@ def test_mcp_proxy_forwards_search_to_service_with_token(monkeypatch):
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
 
     result = proxy._call_tool("search", {"query": "artifact cache"})
 
@@ -920,6 +921,172 @@ def test_mcp_proxy_forwards_search_to_service_with_token(monkeypatch):
     assert captured["authorization"] == "Bearer token-123"
     assert captured["content_type"] == "application/json"
     assert json.loads(captured["body"].decode()) == {"query": "artifact cache"}
+
+
+def test_mcp_proxy_adds_detected_repo_as_ranking_hint_only(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv(
+        "MEMFORGE_ACTIVE_REPO_IDENTIFIER",
+        "github.tools.sap/hcm/memforge-cloud",
+    )
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    proxy._call_tool("search", {"query": "scheduler fix"})
+
+    body = json.loads(captured["body"].decode())
+    assert body["active_repo_identifier"] == "github.tools.sap/hcm/memforge-cloud"
+    assert "source_filter" not in body
+
+
+def test_mcp_proxy_converts_current_repo_only_to_detected_repo_filter(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv(
+        "MEMFORGE_ACTIVE_REPO_IDENTIFIER",
+        "github.tools.sap/hcm/memforge-cloud",
+    )
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    proxy._call_tool(
+        "search",
+        {
+            "query": "scheduler fix",
+            "source_filter": {
+                "source_types": ["agent_session"],
+                "current_repo_only": True,
+            },
+        },
+    )
+
+    body = json.loads(captured["body"].decode())
+    assert body["active_repo_identifier"] == "github.tools.sap/hcm/memforge-cloud"
+    assert body["source_filter"] == {
+        "source_types": ["agent_session"],
+        "repo_identifiers": ["github.tools.sap/hcm/memforge-cloud"],
+    }
+
+
+def test_mcp_proxy_rejects_unadvertised_search_source_ids(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool(
+        "search",
+        {"query": "scheduler fix", "sources": ["src-hidden"]},
+    )
+
+    assert result == {
+        "error": (
+            "Unsupported search parameter(s): sources. "
+            "Omit unknown filters instead of guessing."
+        )
+    }
+
+
+def test_mcp_proxy_keeps_explicit_repo_hint(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv(
+        "MEMFORGE_ACTIVE_REPO_IDENTIFIER",
+        "github.tools.sap/hcm/memforge-cloud",
+    )
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    proxy._call_tool(
+        "search",
+        {
+            "query": "scheduler fix",
+            "active_repo_identifier": "github.tools.sap/hcm/other",
+        },
+    )
+
+    body = json.loads(captured["body"].decode())
+    assert body["active_repo_identifier"] == "github.tools.sap/hcm/other"
+
+
+def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
+    proxy = _load_plugin_mcp_proxy()
+
+    tools = {tool["name"]: tool for tool in proxy.TOOLS}
+
+    assert "search" in tools
+    assert "list_recent_changes" not in tools
+
+    search_schema = tools["search"]["inputSchema"]
+    properties = search_schema["properties"]
+    assert properties["source_filter"]["properties"]["source_types"]["items"]["enum"] == [
+        "agent_session",
+        "confluence",
+        "github_pages",
+        "jira",
+        "local_markdown",
+        "teams",
+    ]
+    assert properties["source_filter"]["properties"]["clients"]["items"]["enum"] == [
+        "claude-code",
+        "codex",
+    ]
+    assert "current_repo_only" in properties["source_filter"]["properties"]
+    assert "repo_identifiers" not in properties["source_filter"]["properties"]
+    assert "source_instance_ids" not in properties["source_filter"]["properties"]
+    assert "sources" not in properties
+    assert "include_private" in properties
+    assert "active_repo_identifier" in properties
 
 
 def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
@@ -949,6 +1116,7 @@ def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
 
     result = proxy._call_tool("search", {"query": "artifact cache"})
 
