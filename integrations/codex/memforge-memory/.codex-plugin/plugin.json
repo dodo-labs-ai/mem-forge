@@ -1,6 +1,6 @@
 {
   "name": "memory",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MemForge hook integration for Codex.",
   "author": {
     "name": "MemForge Team"
@@ -12,7 +12,7 @@
   "interface": {
     "displayName": "MemForge Memory",
     "shortDescription": "Connects Codex to MemForge hooks and MCP memory tools.",
-    "longDescription": "Connects Codex to a local MemForge instance. Hooks receive compact memory context and submit lifecycle receipts, while bundled MCP tools support explicit memory search, memory detail lookup, recent changes, and agent-session document submission.",
+    "longDescription": "Connects Codex to a local or cloud MemForge instance. Hooks receive compact memory context and submit lifecycle receipts, while bundled MCP tools support explicit memory search facets, memory detail lookup, source artifact retrieval, and agent-session document submission.",
     "developerName": "MemForge Team",
     "category": "Productivity",
     "capabilities": ["Hooks", "Read", "Write"],
