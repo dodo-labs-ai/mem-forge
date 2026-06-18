@@ -3580,9 +3580,9 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
-        sync_service: SyncService = Depends(get_sync_service),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        """Submit a client transcript window for server-side package generation."""
+        """Submit a client transcript window for private agent-knowledge patching."""
         from memforge.agent_sessions import agent_session_source_id, submit_agent_session_window
 
         if req.schema_version != "agent-session-window/v1":
@@ -3593,11 +3593,13 @@ def create_admin_app(
         structured_client = getattr(request.app.state, "agent_session_window_client", None)
         if structured_client is None:
             structured_client = await _build_agent_session_window_client(db, config)
+        memory_store = await _build_memory_store(db, config, runtime_provider)
 
         try:
             result = await submit_agent_session_window(
                 db=db,
                 config=config,
+                memory_store=memory_store,
                 structured_llm_client=structured_client,
                 client=req.client,
                 session_id=req.session_id,
@@ -3621,23 +3623,10 @@ def create_admin_app(
                 raise HTTPException(status_code=503, detail=detail)
             raise HTTPException(status_code=400, detail=detail)
 
-        sync_started = False
-        sync_queued = False
-        if result.get("result") == "package_created" and req.process_now:
-            try:
-                await sync_service.start_source(result["source_id"])
-                sync_started = True
-            except SyncAlreadyRunningError:
-                sync_started = True
-            except SourcePausedError:
-                raise _source_paused_http_error()
-        elif result.get("result") == "package_created":
-            sync_queued = await sync_service.request_source_sync(result["source_id"])
-
         return {
             **result,
-            "sync_started": sync_started,
-            "sync_queued": sync_queued,
+            "sync_started": False,
+            "sync_queued": False,
         }
 
     @hook_router.post("/receipts")
