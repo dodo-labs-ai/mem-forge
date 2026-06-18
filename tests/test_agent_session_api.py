@@ -3,13 +3,22 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
+from memforge.agent_knowledge import AgentKnowledgePatchProposal
 from memforge.config import AppConfig
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.storage.database import Database
+
+
+@pytest.fixture(autouse=True)
+def _stub_memory_embedding(monkeypatch):
+    async def _fake_embed(self, text: str) -> list[float]:
+        return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr("memforge.memory.store.MemoryStore._embed", _fake_embed)
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -18,6 +27,21 @@ def _config(tmp_path: Path) -> AppConfig:
     cfg.llm.enrichment_api_key = ""
     cfg.llm.embedding_api_key = ""
     return cfg
+
+
+def _knowledge_patch(**overrides) -> AgentKnowledgePatchProposal:
+    data = {
+        "action": "create_new_concept",
+        "concept_type": "debugging_takeaway",
+        "title": "Agent session durable rule",
+        "claim_text": "The agent session window recorded a durable implementation rule.",
+        "memory_type": "procedure",
+        "tags": ["agent-session"],
+        "confidence": 0.9,
+        "reason": "durable implementation behavior",
+    }
+    data.update(overrides)
+    return AgentKnowledgePatchProposal(**data)
 
 
 async def _seed_source_project(
@@ -66,32 +90,6 @@ async def _seed_source_project(
         )
         await db.insert_memory(memory)
         await db.add_memory_source(memory.id, doc_id, "agent_session")
-
-
-def test_agent_session_window_prompt_uses_memory_quality_gate():
-    from memforge.agent_sessions import render_agent_session_window_prompt
-
-    prompt = render_agent_session_window_prompt(
-        client="codex",
-        session_id="sess-prompt",
-        trigger="REQUIRED_CAPTURE",
-        workspace="/workspace/mem-forge",
-        repo="mem-forge",
-        branch="main",
-        history_window={"from": 0, "to": 2},
-        events=[
-            {"kind": "user_message", "actor": "user", "text": "Please keep this clean and light."},
-            {"kind": "tool_result", "actor": "tool", "text": "uv run pytest -q passed."},
-        ],
-        transcript_markdown=None,
-    )
-
-    assert "A future agent would not act differently because this package exists." in prompt
-    assert "Your job is to COMPRESS, not to structure." in prompt
-    assert "A user-confirmed decision (with the WHY in the same sentence" in prompt
-    assert "A non-obvious tool-verified fact about how the system behaves end-to-end" in prompt
-    assert "Do NOT write bullets that a developer could verify by reading the current code" in prompt
-    assert "Fold rejected alternatives INTO the chosen decision" in prompt
 
 
 def test_agent_session_document_submit_api_records_generated_source(tmp_path):
@@ -184,12 +182,10 @@ def test_agent_session_window_submit_uses_server_principal(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     class PackageClient:
-        async def generate_agent_session_package(self, prompt: str, **kwargs):
-            return SimpleNamespace(
-                result="package_created",
-                title="Principal package",
-                summary_markdown="# Summary\n\nThe window route pins owner identity.",
-                reason=None,
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
+                title="Principal patch",
+                claim_text="The window route pins owner identity to the server principal.",
             )
 
     cfg = _config(tmp_path)
@@ -232,11 +228,10 @@ def test_agent_session_window_submit_uses_server_principal(tmp_path):
             )
 
         assert response.status_code == 200, response.text
-        receipt = asyncio.run(
-            database.get_agent_session_receipt(response.json()["doc_id"])
-        )
-        assert receipt is not None
-        assert receipt["metadata"]["user_id"] == "u-authorized"
+        body = response.json()
+        memory = asyncio.run(database.get_memory(body["memory_id"]))
+        assert memory is not None
+        assert memory.owner_user_id == "u-authorized"
     finally:
         asyncio.run(database.close())
 
@@ -313,22 +308,18 @@ def test_agent_session_window_api_generates_package_and_discards_raw_window(tmp_
     from memforge.server.admin_api import create_admin_app
 
     class FakeWindowClient:
-        async def generate_agent_session_package(self, prompt: str, **kwargs):
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
             assert "Canonical evidence" in prompt
             assert "api_key: [REDACTED]" in prompt
             assert "token: secret-value" not in prompt
             assert "raw-api-secret" not in prompt
             assert "history-secret" not in prompt
-            return SimpleNamespace(
-                result="package_created",
+            return _knowledge_patch(
                 title="Agent Session: useful implementation window",
-                summary_markdown=(
-                    "## Tool-Verified Implementation Facts\n"
-                    "- The agent updated the window upload endpoint.\n\n"
-                    "## Verification Evidence\n"
-                    "- Unit tests covered the generated package path."
+                claim_text=(
+                    "The agent updated the window upload endpoint and unit tests "
+                    "covered the knowledge patch path."
                 ),
-                reason=None,
             )
 
     cfg = _config(tmp_path)
@@ -376,17 +367,17 @@ def test_agent_session_window_api_generates_package_and_discards_raw_window(tmp_
 
         assert response.status_code == 200
         body = response.json()
-        assert body["result"] == "package_created"
+        assert body["result"] == "knowledge_patched"
+        assert body["patch_outcome"] == "applied"
         assert body["source_id"] == "src-agent-sessions-codex"
         assert body["sync_started"] is False
         assert body["window_hash"].startswith("sha256:")
-
-        package = json.loads(Path(body["document_uri"]).read_text(encoding="utf-8"))
-        assert "window upload endpoint" in package["markdown"]
-        assert "secret-value" not in package["markdown"]
-        assert package["receipt"]["source_kind"] == "generated_agent_window_summary"
-        assert package["receipt"]["metadata"]["window_retention"] == "none"
-        assert package["receipt"]["metadata"]["window_hash"] == body["window_hash"]
+        memory = asyncio.run(database.get_memory(body["memory_id"]))
+        assert memory is not None
+        assert "window upload endpoint" in memory.content
+        assert "secret-value" not in memory.content
+        receipt = asyncio.run(database.get_agent_session_receipt(body["concept_id"]))
+        assert receipt is None
     finally:
         asyncio.run(database.close())
 
@@ -395,7 +386,7 @@ def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_pa
     from memforge.server.admin_api import create_admin_app
 
     class FakeWindowClient:
-        async def generate_agent_session_package(self, prompt: str, **kwargs):
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
             assert "Canonical evidence" in prompt
             assert "apply_patch" in prompt
             assert "Edited src/memforge/hook_adapter.py" in prompt
@@ -403,11 +394,9 @@ def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_pa
             assert "session_meta" not in prompt
             assert "private developer bootstrap" not in prompt
             assert "raw JSONL prefix" not in prompt
-            return SimpleNamespace(
-                result="package_created",
+            return _knowledge_patch(
                 title="Agent Session: canonical evidence",
-                summary_markdown="## Tool-Verified Implementation Facts\n- Canonical evidence was packaged.",
-                reason=None,
+                claim_text="Canonical evidence is filtered before generating agent knowledge patches.",
             )
 
     cfg = _config(tmp_path)
@@ -457,7 +446,7 @@ def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_pa
             )
 
         assert response.status_code == 200
-        assert response.json()["result"] == "package_created"
+        assert response.json()["result"] == "knowledge_patched"
     finally:
         asyncio.run(database.close())
 
@@ -466,12 +455,10 @@ def test_agent_session_window_api_queues_service_owned_sync(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     class FakeWindowClient:
-        async def generate_agent_session_package(self, prompt: str, **kwargs):
-            return SimpleNamespace(
-                result="package_created",
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
                 title="Agent Session: queued service sync",
-                summary_markdown="## Tool-Verified Implementation Facts\n- Service queued sync.",
-                reason=None,
+                claim_text="Agent session windows write knowledge directly without queuing source sync.",
             )
 
     class FakeSyncService:
@@ -518,10 +505,10 @@ def test_agent_session_window_api_queues_service_owned_sync(tmp_path):
 
         assert response.status_code == 200
         body = response.json()
-        assert body["result"] == "package_created"
+        assert body["result"] == "knowledge_patched"
         assert body["sync_started"] is False
-        assert body["sync_queued"] is True
-        assert fake_sync.queued == ["src-agent-sessions-codex"]
+        assert body["sync_queued"] is False
+        assert fake_sync.queued == []
     finally:
         asyncio.run(database.close())
 
@@ -530,7 +517,7 @@ def test_agent_session_window_api_rejects_unknown_schema_version(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     class UnexpectedWindowClient:
-        async def generate_agent_session_package(self, prompt: str, **kwargs):
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
             raise AssertionError("unsupported schema should fail before LLM")
 
     cfg = _config(tmp_path)
@@ -570,11 +557,12 @@ def test_agent_session_window_api_accepts_no_output_without_creating_source(tmp_
     from memforge.server.admin_api import create_admin_app
 
     class NoOutputClient:
-        async def generate_agent_session_package(self, prompt: str, **kwargs):
-            return SimpleNamespace(
-                result="no_output",
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
+                action="no_output",
                 title=None,
-                summary_markdown="",
+                concept_type=None,
+                claim_text="",
                 reason="trivial explanation",
             )
 
@@ -649,17 +637,62 @@ def test_agent_session_window_api_reports_missing_llm(tmp_path):
         asyncio.run(database.close())
 
 
+def test_agent_session_window_api_records_failed_outcome_for_invalid_patch(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    class InvalidPatchClient:
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return {"action": "unsupported_action", "claim_text": "Invalid action."}
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+
+    async def _setup():
+        await database.connect()
+
+    import asyncio
+
+    asyncio.run(_setup())
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        app.state.agent_session_window_client = InvalidPatchClient()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/agent-sessions/windows",
+                json={
+                    "client": "codex",
+                    "session_id": "sess-window-bad-patch",
+                    "trigger": "PreCompact",
+                    "workspace": "/workspace/mem-forge",
+                    "events": [{"role": "tool", "name": "apply_patch", "summary": "Edited code."}],
+                    "process_now": False,
+                },
+            )
+
+        assert response.status_code == 400
+        assert "agent knowledge patch validation failed" in response.json()["detail"]
+
+        async def _assert_failed_receipt():
+            summary = await database.summarize_agent_session_outcomes(
+                session_id="sess-window-bad-patch"
+            )
+            assert summary["counts"]["failed"] == 1
+            assert summary["latest_failure"]["reason"].startswith("ValidationError:")
+
+        asyncio.run(_assert_failed_receipt())
+    finally:
+        asyncio.run(database.close())
+
+
 def test_agent_session_window_api_keeps_windows_distinct_and_idempotent(tmp_path):
-    """Windows of one session/trigger get distinct, idempotent doc_ids (no overwrite)."""
+    """Windows of one session/trigger get distinct, idempotent memory patches."""
     from memforge.server.admin_api import create_admin_app
 
     class EchoWindowClient:
-        async def generate_agent_session_package(self, prompt: str, **kwargs):
-            return SimpleNamespace(
-                result="package_created",
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
                 title="Agent Session Window",
-                summary_markdown="## Tool-Verified Implementation Facts\n- Window content recorded.",
-                reason=None,
+                claim_text="Window content recorded as a durable private agent memory.",
             )
 
     cfg = _config(tmp_path)
@@ -701,15 +734,14 @@ def test_agent_session_window_api_keeps_windows_distinct_and_idempotent(tmp_path
                 json=_window([{"role": "tool", "name": "apply_patch", "summary": "Edited module A."}]),
             ).json()
 
-        # Different window content -> different doc_id and a separate file (no overwrite).
-        assert first["doc_id"] != second["doc_id"]
-        assert first["document_uri"] != second["document_uri"]
-        assert Path(first["document_uri"]).exists()
-        assert Path(second["document_uri"]).exists()
+        # Different window content -> different memory patch.
+        assert first["window_hash"] != second["window_hash"]
+        assert first["memory_id"] != second["memory_id"]
 
-        # Identical window content -> same doc_id (idempotent retry).
-        assert repeat_first["doc_id"] == first["doc_id"]
-        assert repeat_first["document_uri"] == first["document_uri"]
+        # Identical window content -> same memory patch (idempotent retry).
+        assert repeat_first["window_hash"] == first["window_hash"]
+        assert repeat_first["memory_id"] == first["memory_id"]
+        assert repeat_first["idempotent"] is True
     finally:
         asyncio.run(database.close())
 
@@ -719,12 +751,10 @@ def test_agent_session_window_api_same_range_different_content_is_distinct(tmp_p
     from memforge.server.admin_api import create_admin_app
 
     class EchoWindowClient:
-        async def generate_agent_session_package(self, prompt: str, **kwargs):
-            return SimpleNamespace(
-                result="package_created",
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
                 title="Agent Session Window",
-                summary_markdown="## Tool-Verified Implementation Facts\n- recorded.",
-                reason=None,
+                claim_text="A reused event range with different content creates a distinct memory patch.",
             )
 
     cfg = _config(tmp_path)
@@ -763,12 +793,11 @@ def test_agent_session_window_api_same_range_different_content_is_distinct(tmp_p
                 json=_window([{"role": "tool", "name": "apply_patch", "summary": "edited A"}]),
             ).json()
 
-        # Same [evt-1, evt-9] range, different content -> distinct doc_id, both files kept.
-        assert a["doc_id"] != b["doc_id"]
-        assert Path(a["document_uri"]).exists()
-        assert Path(b["document_uri"]).exists()
-        # Identical content -> same doc_id (idempotent).
-        assert repeat_a["doc_id"] == a["doc_id"]
+        # Same [evt-1, evt-9] range, different content -> distinct memory patches.
+        assert a["window_hash"] != b["window_hash"]
+        assert a["memory_id"] != b["memory_id"]
+        # Identical content -> same memory patch (idempotent).
+        assert repeat_a["memory_id"] == a["memory_id"]
     finally:
         asyncio.run(database.close())
 
@@ -778,12 +807,10 @@ def test_agent_session_window_retry_identity_ignores_receipt_and_submission_date
     from memforge.server.admin_api import create_admin_app
 
     class EchoWindowClient:
-        async def generate_agent_session_package(self, prompt: str, **kwargs):
-            return SimpleNamespace(
-                result="package_created",
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
                 title="Agent Session Window",
-                summary_markdown="## Tool-Verified Implementation Facts\n- retry recorded.",
-                reason=None,
+                claim_text="The same range and content retry reuses the existing memory patch.",
             )
 
     cfg = _config(tmp_path)
@@ -819,8 +846,79 @@ def test_agent_session_window_retry_identity_ignores_receipt_and_submission_date
                 json=_window(receipt={"attempt": 2}, submitted_at="2026-05-31T00:01:00+00:00"),
             ).json()
 
-        assert retry["doc_id"] == first["doc_id"]
-        assert retry["document_uri"] == first["document_uri"]
+        assert retry["window_hash"] == first["window_hash"]
+        assert retry["memory_id"] == first["memory_id"]
+        assert retry["idempotent"] is True
+    finally:
+        asyncio.run(database.close())
+
+
+def test_agent_session_window_can_patch_existing_private_claim(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    class PatchClient:
+        def __init__(self):
+            self.created_concept_id: str | None = None
+            self.created_claim_id: str | None = None
+
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            if self.created_concept_id is None:
+                return _knowledge_patch(
+                    title="Scheduler lifecycle",
+                    claim_text="Workspace source schedulers must start during app startup.",
+                )
+            assert f"concept_id={self.created_concept_id}" in prompt
+            assert f"claim_id={self.created_claim_id}" in prompt
+            return _knowledge_patch(
+                action="update_existing_claim",
+                concept_id=self.created_concept_id,
+                claim_id=self.created_claim_id,
+                claim_text=(
+                    "Workspace source schedulers must start during app startup "
+                    "and advance next_run_at after claiming overdue schedules."
+                ),
+            )
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+    import asyncio
+
+    asyncio.run(database.connect())
+
+    def _window(summary: str):
+        return {
+            "client": "codex",
+            "session_id": "sess-patch-existing",
+            "trigger": "Stop",
+            "workspace": "/workspace/memforge-cloud",
+            "repo": "github.tools.sap/hcm/memforge-cloud",
+            "events": [{"role": "tool", "name": "apply_patch", "summary": summary}],
+            "history_window": {"kind": "transcript_window", "start": summary, "end": summary},
+            "retention": "none",
+        }
+
+    try:
+        app = create_admin_app(db=database, config=cfg, principal_resolver=lambda request: "u-authorized")
+        fake_client = PatchClient()
+        app.state.agent_session_window_client = fake_client
+        with TestClient(app) as client:
+            first = client.post(
+                "/api/agent-sessions/windows",
+                json=_window("scheduler startup rule"),
+            ).json()
+            fake_client.created_concept_id = first["concept_id"]
+            fake_client.created_claim_id = first["claim_id"]
+            second = client.post(
+                "/api/agent-sessions/windows",
+                json=_window("scheduler next_run_at rule"),
+            ).json()
+
+        assert second["concept_id"] == first["concept_id"]
+        assert second["claim_id"] == first["claim_id"]
+        assert second["memory_id"] == first["memory_id"]
+        memory = asyncio.run(database.get_memory(first["memory_id"]))
+        assert memory is not None
+        assert "advance next_run_at" in memory.content
     finally:
         asyncio.run(database.close())
 
@@ -830,9 +928,13 @@ def test_agent_session_window_api_records_no_output_receipt(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     class NoOutputClient:
-        async def generate_agent_session_package(self, prompt: str, **kwargs):
-            return SimpleNamespace(
-                result="no_output", title=None, summary_markdown="", reason="trivial chat"
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
+                action="no_output",
+                title=None,
+                concept_type=None,
+                claim_text="",
+                reason="trivial chat",
             )
 
     cfg = _config(tmp_path)
@@ -876,7 +978,7 @@ def test_agent_session_window_api_records_failed_receipt(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     class FailingClient:
-        async def generate_agent_session_package(self, prompt: str, **kwargs):
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
             raise RuntimeError("llm exploded")
 
     cfg = _config(tmp_path)
@@ -1006,7 +1108,7 @@ def test_summarize_agent_session_outcomes_counts_and_fraction(tmp_path):
     async def _run():
         await database.connect()
         try:
-            outcomes = ["package_created", "package_created", "no_output", "failed"]
+            outcomes = ["knowledge_patched", "package_created", "no_output", "failed"]
             for index, outcome in enumerate(outcomes):
                 await database.upsert_agent_session_receipt(
                     _make_receipt(doc_id=f"doc-{index}", session_id="sess-sum", outcome=outcome)
@@ -1015,7 +1117,7 @@ def test_summarize_agent_session_outcomes_counts_and_fraction(tmp_path):
             assert summary["session_id"] == "sess-sum"
             assert summary["total"] == 4
             assert summary["processed_total"] == 3
-            assert summary["counts"] == {"package_created": 2, "no_output": 1, "failed": 1}
+            assert summary["counts"] == {"knowledge_patched": 2, "no_output": 1, "failed": 1}
             assert summary["no_output_fraction"] == 1 / 3
         finally:
             await database.close()
@@ -1033,7 +1135,7 @@ def test_summarize_empty_session_returns_zero_fraction(tmp_path):
             summary = await database.summarize_agent_session_outcomes(session_id="nobody")
             assert summary["total"] == 0
             assert summary["processed_total"] == 0
-            assert summary["counts"] == {"package_created": 0, "no_output": 0, "failed": 0}
+            assert summary["counts"] == {"knowledge_patched": 0, "no_output": 0, "failed": 0}
             assert summary["no_output_fraction"] == 0.0
             assert summary["latest_failure"] is None
         finally:
@@ -1071,7 +1173,7 @@ def test_summarize_agent_session_outcomes_includes_latest_failure(tmp_path):
                 _make_receipt(
                     doc_id="ok-1",
                     session_id="sess-fail",
-                    outcome="package_created",
+                    outcome="knowledge_patched",
                 )
             )
             summary = await database.summarize_agent_session_outcomes(session_id="sess-fail")
@@ -1097,7 +1199,7 @@ def test_agent_session_completeness_endpoint(tmp_path):
     asyncio.run(database.connect())
     try:
         async def _seed():
-            for index, outcome in enumerate(["package_created", "no_output"]):
+            for index, outcome in enumerate(["knowledge_patched", "no_output"]):
                 await database.upsert_agent_session_receipt(
                     _make_receipt(doc_id=f"ep-{index}", session_id="sess-ep", outcome=outcome)
                 )
@@ -1113,7 +1215,7 @@ def test_agent_session_completeness_endpoint(tmp_path):
         body = response.json()
         assert body["total"] == 2
         assert body["processed_total"] == 2
-        assert body["counts"] == {"package_created": 1, "no_output": 1, "failed": 0}
+        assert body["counts"] == {"knowledge_patched": 1, "no_output": 1, "failed": 0}
         assert body["no_output_fraction"] == 0.5
         assert body["latest_failure"] is None
     finally:
@@ -1131,7 +1233,7 @@ def test_summarize_agent_session_outcomes_ignores_explicit_document_metadata(tmp
                 _make_receipt(
                     doc_id="window-doc",
                     session_id="sess-filter",
-                    outcome="package_created",
+                    outcome="knowledge_patched",
                 )
             )
             await database.upsert_agent_session_receipt(
@@ -1145,7 +1247,7 @@ def test_summarize_agent_session_outcomes_ignores_explicit_document_metadata(tmp
             summary = await database.summarize_agent_session_outcomes(session_id="sess-filter")
             assert summary["total"] == 1
             assert summary["processed_total"] == 1
-            assert summary["counts"] == {"package_created": 1, "no_output": 0, "failed": 0}
+            assert summary["counts"] == {"knowledge_patched": 1, "no_output": 0, "failed": 0}
             assert summary["no_output_fraction"] == 0.0
         finally:
             await database.close()
@@ -1153,19 +1255,14 @@ def test_summarize_agent_session_outcomes_ignores_explicit_document_metadata(tmp
     asyncio.run(_run())
 
 
-def test_package_write_is_atomic_no_temp_left(tmp_path):
+def test_agent_window_patch_writes_memory_without_package_file(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     class FakeWindowClient:
-        async def generate_agent_session_package(self, prompt: str, **kwargs):
-            return SimpleNamespace(
-                result="package_created",
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
                 title="Agent Session: atomic write",
-                summary_markdown=(
-                    "## Tool-Verified Implementation Facts\n"
-                    "- The package was written atomically."
-                ),
-                reason=None,
+                claim_text="The agent-session window was written directly as a private memory patch.",
             )
 
     cfg = _config(tmp_path)
@@ -1190,10 +1287,11 @@ def test_package_write_is_atomic_no_temp_left(tmp_path):
             )
 
         assert response.status_code == 200
-        package_path = Path(response.json()["document_uri"])
-        assert package_path.exists()
-        json.loads(package_path.read_text(encoding="utf-8"))  # complete, valid JSON
-        assert list(package_path.parent.glob("*.tmp")) == []  # no leftover temp file
+        body = response.json()
+        assert "document_uri" not in body
+        memory = asyncio.run(database.get_memory(body["memory_id"]))
+        assert memory is not None
+        assert "private memory patch" in memory.content
     finally:
         asyncio.run(database.close())
 
