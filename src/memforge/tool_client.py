@@ -57,7 +57,11 @@ class ToolClient:
         sources: list[str] | tuple[str, ...] | None = None,
         time_range: dict[str, Any] | None = None,
         entities: list[str] | tuple[str, ...] | None = None,
+        source_filter: dict[str, Any] | None = None,
+        include_private: bool = False,
         include_superseded: bool = False,
+        active_repo_identifier: str | None = None,
+        status: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "query": query,
@@ -72,6 +76,14 @@ class ToolClient:
             body["time_range"] = time_range
         if entities:
             body["entities"] = list(entities)
+        if source_filter:
+            body["source_filter"] = source_filter
+        if include_private:
+            body["include_private"] = True
+        if active_repo_identifier:
+            body["active_repo_identifier"] = active_repo_identifier
+        if status:
+            body["status"] = status
         return self._http_json("POST", "/api/memories/search", body)
 
     def get_memory(self, memory_id: str) -> dict[str, Any]:

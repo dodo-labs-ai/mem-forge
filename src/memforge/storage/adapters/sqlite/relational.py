@@ -25,6 +25,7 @@ from memforge.models import (
     Visibility,
 )
 from memforge.retrieval.access_predicate import visible_sql
+from memforge.retrieval.filters import MemorySourceFilter
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope
 
@@ -64,6 +65,9 @@ class SqliteRelationalStore:
 
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]:
         return await self._db.get_memory_sources(memory_id)
+
+    async def upsert_document(self, doc: DocumentRecord) -> None:
+        await self._db.upsert_document(doc)
 
     async def get_document(self, doc_id: str) -> DocumentRecord | None:
         return await self._db.get_document(doc_id)
@@ -212,6 +216,51 @@ class SqliteRelationalStore:
             logger.exception("Failed to filter ids by supporting sources")
             return set()
         return supported
+
+    async def filter_ids_by_source_filter(
+        self, ids: Sequence[str], source_filter: MemorySourceFilter
+    ) -> set[str]:
+        memory_ids = list(ids)
+        if not memory_ids:
+            return set()
+        if source_filter.is_empty():
+            return set(memory_ids)
+
+        clauses = []
+        params: list[Any] = []
+        if source_filter.source_types:
+            placeholders = ",".join("?" for _ in source_filter.source_types)
+            clauses.append(f"ms.source_type IN ({placeholders})")
+            params.extend(source_filter.source_types)
+        if source_filter.clients:
+            placeholders = ",".join("?" for _ in source_filter.clients)
+            clauses.append(f"d.client IN ({placeholders})")
+            params.extend(source_filter.clients)
+        if source_filter.repo_identifiers:
+            placeholders = ",".join("?" for _ in source_filter.repo_identifiers)
+            clauses.append(f"m.repo_identifier IN ({placeholders})")
+            params.extend(source_filter.repo_identifiers)
+
+        matched: set[str] = set()
+        for start in range(0, len(memory_ids), _BATCH_SIZE):
+            batch = memory_ids[start : start + _BATCH_SIZE]
+            id_placeholders = ",".join("?" for _ in batch)
+            sql = (
+                "SELECT DISTINCT m.id "
+                "FROM memories m "
+                "JOIN memory_sources ms ON m.id = ms.memory_id "
+                "LEFT JOIN documents d ON ms.doc_id = d.doc_id "
+                f"WHERE m.id IN ({id_placeholders}) "
+                f"AND {' AND '.join(clauses)}"
+            )
+            try:
+                async with self._db.db.execute(sql, [*batch, *params]) as cursor:
+                    async for row in cursor:
+                        matched.add(row[0])
+            except Exception:
+                logger.exception("Failed to filter ids by structured source facets")
+                return set()
+        return matched
 
     async def graph_search(
         self,

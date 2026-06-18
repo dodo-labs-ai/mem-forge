@@ -10,16 +10,40 @@ import os
 from pathlib import Path
 import re
 import sys
+import subprocess
 import tempfile
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
 SERVER_VERSION = "0.1.1"
+SOURCE_TYPE_VALUES = [
+    "agent_session",
+    "confluence",
+    "github_pages",
+    "jira",
+    "local_markdown",
+    "teams",
+]
+AGENT_CLIENT_VALUES = ["claude-code", "codex"]
+SEARCH_ALLOWED_KEYS = frozenset({
+    "query",
+    "memory_types",
+    "source_filter",
+    "time_range",
+    "entities",
+    "include_private",
+    "include_superseded",
+    "active_project",
+    "scope_mode",
+    "active_repo_identifier",
+    "status",
+    "top_k",
+})
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -37,7 +61,32 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "array",
                     "items": {"type": "string", "enum": ["fact", "decision", "convention", "procedure"]},
                 },
-                "sources": {"type": "array", "items": {"type": "string"}},
+                "source_filter": {
+                    "type": "object",
+                    "description": (
+                        "Optional exact source facets. Omit a facet when unsure; "
+                        "MemForge searches all visible memories when no facet is provided. "
+                        "Do not invent source ids or fuzzy names."
+                    ),
+                    "properties": {
+                        "source_types": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": SOURCE_TYPE_VALUES},
+                        },
+                        "clients": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": AGENT_CLIENT_VALUES},
+                        },
+                        "current_repo_only": {
+                            "type": "boolean",
+                            "description": (
+                                "Restrict to the current git repository. The local proxy "
+                                "resolves the exact repo identifier; do not provide repo ids."
+                            ),
+                        },
+                    },
+                    "additionalProperties": False,
+                },
                 "time_range": {
                     "type": "object",
                     "properties": {
@@ -46,10 +95,17 @@ TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "entities": {"type": "array", "items": {"type": "string"}},
+                "include_private": {"type": "boolean", "default": False},
                 "include_superseded": {"type": "boolean", "default": False},
+                "active_repo_identifier": {"type": "string"},
+                "status": {
+                    "type": "string",
+                    "enum": ["active", "superseded", "retired", "decayed", "pending_review"],
+                },
                 "top_k": {"type": "integer", "default": 10},
             },
             "required": ["query"],
+            "additionalProperties": False,
         },
     },
     {
@@ -92,18 +148,6 @@ TOOLS: list[dict[str, Any]] = [
                 "max_bytes": {"type": "integer", "default": 2000000},
             },
             "required": ["url"],
-        },
-    },
-    {
-        "name": "list_recent_changes",
-        "description": "List recent source-document changes and optionally new or updated memories.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "since": {"type": "string", "description": "ISO date. Defaults to 7 days ago."},
-                "source": {"type": "string", "description": "Filter to a source ID"},
-                "include_memories": {"type": "boolean", "default": True},
-            },
         },
     },
     {
@@ -195,24 +239,100 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | None:
 
 def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "search":
-        return _http_json("POST", "/api/memories/search", args)
+        try:
+            body = _search_args_with_context(args)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return _http_json("POST", "/api/memories/search", body)
     if name == "get_memory":
         memory_id = str(args.get("memory_id") or "").strip()
         if not memory_id:
             return {"error": "memory_id is required"}
         return _http_json("GET", f"/api/memories/{quote(memory_id, safe='')}", None)
-    if name == "list_recent_changes":
-        query: dict[str, Any] = {}
-        for key in ("since", "source", "include_memories"):
-            if key in args and args[key] is not None:
-                query[key] = args[key]
-        suffix = f"?{urlencode(query)}" if query else ""
-        return _http_json("GET", f"/api/recent-changes{suffix}", None)
     if name == "submit_agent_session_document":
         return _http_json("POST", "/api/agent-sessions/documents", args)
     if name == "get_resource":
         return _handle_get_resource(args)
     return {"error": f"Unknown tool: {name}"}
+
+
+def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
+    unknown = sorted(set(args) - SEARCH_ALLOWED_KEYS)
+    if unknown:
+        raise ValueError(
+            "Unsupported search parameter(s): "
+            + ", ".join(unknown)
+            + ". Omit unknown filters instead of guessing."
+        )
+    body = dict(args)
+    repo_identifier = str(body.get("active_repo_identifier") or "").strip() or None
+    if repo_identifier is None:
+        repo_identifier = _active_repo_identifier()
+        if repo_identifier:
+            body["active_repo_identifier"] = repo_identifier
+    source_filter = body.get("source_filter")
+    if isinstance(source_filter, dict):
+        current_repo_only = bool(source_filter.pop("current_repo_only", False))
+        if current_repo_only:
+            if not repo_identifier:
+                raise ValueError(
+                    "current_repo_only requires a detectable git repository. "
+                    "Omit the filter to search all visible memories."
+                )
+            source_filter["repo_identifiers"] = [repo_identifier]
+        body["source_filter"] = source_filter
+    return body
+
+
+def _active_repo_identifier() -> str | None:
+    configured = os.getenv("MEMFORGE_ACTIVE_REPO_IDENTIFIER", "").strip()
+    if configured:
+        return _normalize_repo_identifier(configured)
+    remote = _git_value(["git", "remote", "get-url", "origin"])
+    normalized_remote = _normalize_repo_identifier(remote)
+    if normalized_remote:
+        return normalized_remote
+    root = _git_value(["git", "rev-parse", "--show-toplevel"])
+    return Path(root).name if root else None
+
+
+def _normalize_repo_identifier(repo: str | None) -> str | None:
+    if repo is None:
+        return None
+    value = repo.strip()
+    if not value:
+        return None
+
+    ssh_match = re.match(r"^[^/@]+@([^:/]+):(.+)$", value)
+    if ssh_match:
+        host, path = ssh_match.groups()
+        value = f"{host}/{path}"
+    else:
+        value = re.sub(r"^[a-z][a-z0-9+.-]*://", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"^[^@/]+@", "", value)
+
+    value = value.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    if value.endswith(".git"):
+        value = value[:-4]
+    value = re.sub(r"/+", "/", value)
+    return value.lower() or None
+
+
+def _git_value(command: list[str]) -> str | None:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=os.getcwd(),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return None
+    value = result.stdout.strip()
+    return value or None
 
 
 def _tool_result(payload: dict[str, Any]) -> dict[str, Any]:

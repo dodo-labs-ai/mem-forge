@@ -24,7 +24,7 @@ from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from memforge.config import AppConfig
 from memforge.auth import browser_session
@@ -55,6 +55,8 @@ from memforge.models import (
     ConfigField,
     ConfigFieldType,
     Memory,
+    MemoryStatus,
+    MemoryType,
     MemoryReview,
     Project,
     UNSORTED_PROJECT_KEY,
@@ -66,6 +68,7 @@ from memforge.provenance import (
     list_document_artifacts,
     select_document_artifact,
 )
+from memforge.retrieval.filters import MemorySourceFilter
 from memforge.runtime import (
     DefaultRuntimeProvider,
     RuntimeHealthComponent,
@@ -100,6 +103,8 @@ from memforge.storage.admin_source import (
 from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
+
+SEARCH_CLIENTS = ("claude-code", "codex")
 
 SOURCE_ACTIVE_STATUS = "active"
 SOURCE_PAUSED_STATUS = "paused"
@@ -290,6 +295,49 @@ class MemoryUpdateRequest(BaseModel):
     status: str | None = None  # active, superseded, retired, decayed, pending_review
 
 
+class SourceFacetFilterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_types: list[str] | None = None
+    clients: list[str] | None = None
+    repo_identifiers: list[str] | None = None
+
+    @field_validator("source_types")
+    @classmethod
+    def _validate_source_types(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        allowed = set(GENE_REGISTRY)
+        invalid = [item for item in value if item not in allowed]
+        if invalid:
+            raise ValueError(
+                "source_types must exactly match registered source types: "
+                + ", ".join(sorted(allowed))
+            )
+        return value
+
+    @field_validator("clients")
+    @classmethod
+    def _validate_clients(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        allowed = set(SEARCH_CLIENTS)
+        invalid = [item for item in value if item not in allowed]
+        if invalid:
+            raise ValueError(
+                "clients must exactly match supported clients: "
+                + ", ".join(SEARCH_CLIENTS)
+            )
+        return value
+
+    def to_source_filter(self) -> MemorySourceFilter:
+        return MemorySourceFilter(
+            source_types=tuple(self.source_types or ()),
+            clients=tuple(self.clients or ()),
+            repo_identifiers=tuple(self.repo_identifiers or ()),
+        )
+
+
 class MemorySearchRequest(BaseModel):
     query: str
     memory_types: list[str] | None = None
@@ -299,12 +347,41 @@ class MemorySearchRequest(BaseModel):
     include_superseded: bool = False
     top_k: int = Field(default=10, ge=1, le=50)
     active_project: str | None = None
+    active_repo_identifier: str | None = None
     scope_mode: Literal["project", "project-first", "workspace"] = "project-first"
     include_private: bool = False
     status: str | None = None  # post-rank row-status filter; mirrors GET /api/memories
+    source_filter: SourceFacetFilterRequest | None = None
     # NO user_id field. The caller's identity is server-derived from
     # resolve_principal(request); a body-supplied user_id is never used as
     # access authority.
+
+    @field_validator("memory_types")
+    @classmethod
+    def _validate_memory_types(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        allowed = {item.value for item in MemoryType}
+        invalid = [item for item in value if item not in allowed]
+        if invalid:
+            raise ValueError(
+                "memory_types must exactly match supported memory types: "
+                + ", ".join(sorted(allowed))
+            )
+        return value
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        allowed = {item.value for item in MemoryStatus}
+        if value not in allowed:
+            raise ValueError(
+                "status must exactly match supported memory statuses: "
+                + ", ".join(sorted(allowed))
+            )
+        return value
 
     @model_validator(mode="after")
     def _coerce_scope_without_active_project(self) -> "MemorySearchRequest":
@@ -2290,6 +2367,7 @@ def create_admin_app(
                 allowed_statuses=allowed_search_statuses(req.include_superseded),
                 active_project=req.active_project,
                 scope_mode=req.scope_mode,
+                active_repo_identifier=req.active_repo_identifier,
             )
             result = await engine.search(
                 query=req.query,
@@ -2299,6 +2377,11 @@ def create_admin_app(
                 entities=req.entities,
                 include_superseded=req.include_superseded,
                 top_k=req.top_k,
+                source_filter=(
+                    req.source_filter.to_source_filter()
+                    if req.source_filter is not None
+                    else None
+                ),
                 request_scope=scope,
             )
             # Row-status filter is applied post-rank so the GET and POST
