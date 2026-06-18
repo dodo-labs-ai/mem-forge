@@ -53,13 +53,16 @@ from memforge.storage.admin_source import (
 
 logger = logging.getLogger(__name__)
 
-# The three real outcomes an uploaded agent-session window can record. Knowledge
-# completeness ("how much was kept vs dropped as no_output") is read from these.
-AGENT_SESSION_OUTCOME_PACKAGE_CREATED = "package_created"
+# The three current outcomes an uploaded agent-session window can record.
+# Knowledge completeness ("how much was kept vs dropped as no_output") is read
+# from these. Older receipts used "package_created"; reads normalize that value
+# into knowledge_patched.
+AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED = "knowledge_patched"
+AGENT_SESSION_OUTCOME_LEGACY_PACKAGE_CREATED = "package_created"
 AGENT_SESSION_OUTCOME_NO_OUTPUT = "no_output"
 AGENT_SESSION_OUTCOME_FAILED = "failed"
 AGENT_SESSION_OUTCOMES = (
-    AGENT_SESSION_OUTCOME_PACKAGE_CREATED,
+    AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED,
     AGENT_SESSION_OUTCOME_NO_OUTPUT,
     AGENT_SESSION_OUTCOME_FAILED,
 )
@@ -433,6 +436,46 @@ CREATE TABLE IF NOT EXISTS agent_hook_receipts (
     updated_at      TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_concepts (
+    id                  TEXT PRIMARY KEY,
+    source_id           TEXT NOT NULL,
+    owner_user_id       TEXT NOT NULL,
+    visibility          TEXT NOT NULL DEFAULT 'private',
+    workspace           TEXT NOT NULL,
+    repo_identifier     TEXT,
+    concept_type        TEXT NOT NULL,
+    concept_path        TEXT NOT NULL,
+    title               TEXT NOT NULL,
+    markdown_body       TEXT NOT NULL,
+    frontmatter_json    TEXT NOT NULL DEFAULT '{}',
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    last_observed_at    TEXT NOT NULL,
+    CHECK (visibility = 'private')
+);
+
+CREATE TABLE IF NOT EXISTS agent_claims (
+    id                  TEXT PRIMARY KEY,
+    concept_id          TEXT NOT NULL REFERENCES agent_concepts(id),
+    display_anchor      TEXT NOT NULL,
+    claim_text          TEXT NOT NULL,
+    memory_type         TEXT NOT NULL,
+    tags                TEXT NOT NULL DEFAULT '[]',
+    confidence          REAL NOT NULL DEFAULT 0.7,
+    memory_id           TEXT NOT NULL REFERENCES memories(id),
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    last_observed_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_claim_citations (
+    claim_id        TEXT NOT NULL REFERENCES agent_claims(id),
+    citation_url    TEXT NOT NULL,
+    observed_at     TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (claim_id, citation_url)
+);
+
 CREATE TABLE IF NOT EXISTS sync_state (
     source              TEXT PRIMARY KEY,
     last_sync_at        TEXT,
@@ -545,6 +588,9 @@ CREATE INDEX IF NOT EXISTS idx_agent_session_receipts_session ON agent_session_r
 CREATE INDEX IF NOT EXISTS idx_agent_session_receipts_source ON agent_session_receipts(source_id);
 CREATE INDEX IF NOT EXISTS idx_agent_hook_receipts_session ON agent_hook_receipts(session_id);
 CREATE INDEX IF NOT EXISTS idx_agent_hook_receipts_hook ON agent_hook_receipts(hook);
+CREATE INDEX IF NOT EXISTS idx_agent_concepts_owner_repo ON agent_concepts(owner_user_id, repo_identifier);
+CREATE INDEX IF NOT EXISTS idx_agent_claims_concept ON agent_claims(concept_id);
+CREATE INDEX IF NOT EXISTS idx_agent_claims_memory ON agent_claims(memory_id);
 
 -- Cross-document contradiction tracking
 CREATE TABLE IF NOT EXISTS memory_contradictions (
@@ -1008,6 +1054,48 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         "CREATE INDEX IF NOT EXISTS idx_memories_curation_cluster ON memories(curation_cluster_id)",
         "CREATE INDEX IF NOT EXISTS idx_memory_derivations_child ON memory_derivations(child_memory_id)",
         "CREATE INDEX IF NOT EXISTS idx_memory_curation_runs_scope ON memory_curation_runs(source_type, client, repo_identifier, project_key)",
+    ]),
+    (22, "Add private agent knowledge bundle concept claims", [
+        """CREATE TABLE IF NOT EXISTS agent_concepts (
+            id                  TEXT PRIMARY KEY,
+            source_id           TEXT NOT NULL,
+            owner_user_id       TEXT NOT NULL,
+            visibility          TEXT NOT NULL DEFAULT 'private',
+            workspace           TEXT NOT NULL,
+            repo_identifier     TEXT,
+            concept_type        TEXT NOT NULL,
+            concept_path        TEXT NOT NULL,
+            title               TEXT NOT NULL,
+            markdown_body       TEXT NOT NULL,
+            frontmatter_json    TEXT NOT NULL DEFAULT '{}',
+            created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+            last_observed_at    TEXT NOT NULL,
+            CHECK (visibility = 'private')
+        )""",
+        """CREATE TABLE IF NOT EXISTS agent_claims (
+            id                  TEXT PRIMARY KEY,
+            concept_id          TEXT NOT NULL REFERENCES agent_concepts(id),
+            display_anchor      TEXT NOT NULL,
+            claim_text          TEXT NOT NULL,
+            memory_type         TEXT NOT NULL,
+            tags                TEXT NOT NULL DEFAULT '[]',
+            confidence          REAL NOT NULL DEFAULT 0.7,
+            memory_id           TEXT NOT NULL REFERENCES memories(id),
+            created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+            last_observed_at    TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS agent_claim_citations (
+            claim_id        TEXT NOT NULL REFERENCES agent_claims(id),
+            citation_url    TEXT NOT NULL,
+            observed_at     TEXT NOT NULL,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (claim_id, citation_url)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_agent_concepts_owner_repo ON agent_concepts(owner_user_id, repo_identifier)",
+        "CREATE INDEX IF NOT EXISTS idx_agent_claims_concept ON agent_claims(concept_id)",
+        "CREATE INDEX IF NOT EXISTS idx_agent_claims_memory ON agent_claims(memory_id)",
     ]),
 ]
 
@@ -2229,6 +2317,221 @@ class Database:
                     added_at=_parse_dt(d["added_at"]),
                 ))
         return results
+
+    # ==================================================================
+    # Agent Knowledge Bundle
+    # ==================================================================
+
+    async def upsert_agent_concept(
+        self,
+        *,
+        concept_id: str,
+        source_id: str,
+        owner_user_id: str,
+        workspace: str,
+        repo_identifier: str | None,
+        concept_type: str,
+        concept_path: str,
+        title: str,
+        markdown_body: str,
+        frontmatter: dict[str, Any],
+        observed_at: datetime,
+    ) -> None:
+        """Insert or update a private agent-session concept."""
+        observed = _utc_iso(observed_at)
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT INTO agent_concepts (
+                    id, source_id, owner_user_id, visibility, workspace,
+                    repo_identifier, concept_type, concept_path, title,
+                    markdown_body, frontmatter_json, created_at, updated_at,
+                    last_observed_at
+                ) VALUES (?, ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    source_id=excluded.source_id,
+                    owner_user_id=excluded.owner_user_id,
+                    visibility='private',
+                    workspace=excluded.workspace,
+                    repo_identifier=excluded.repo_identifier,
+                    concept_type=excluded.concept_type,
+                    concept_path=excluded.concept_path,
+                    title=excluded.title,
+                    markdown_body=excluded.markdown_body,
+                    frontmatter_json=excluded.frontmatter_json,
+                    updated_at=excluded.updated_at,
+                    last_observed_at=excluded.last_observed_at""",
+                (
+                    concept_id,
+                    source_id,
+                    owner_user_id,
+                    workspace,
+                    repo_identifier,
+                    concept_type,
+                    concept_path,
+                    title,
+                    markdown_body,
+                    json.dumps(frontmatter, sort_keys=True),
+                    observed,
+                    observed,
+                    observed,
+                ),
+            )
+            await self.db.commit()
+
+    async def get_agent_concept(self, concept_id: str) -> dict[str, Any] | None:
+        async with self.db.execute(
+            "SELECT * FROM agent_concepts WHERE id = ?",
+            (concept_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_agent_concepts(
+        self,
+        *,
+        owner_user_id: str,
+        repo_identifier: str | None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        concepts: list[dict[str, Any]] = []
+        async with self.db.execute(
+            """SELECT * FROM agent_concepts
+               WHERE visibility = 'private'
+                 AND owner_user_id = ?
+                 AND COALESCE(repo_identifier, '') = COALESCE(?, '')
+               ORDER BY updated_at DESC, id
+               LIMIT ?""",
+            (owner_user_id, repo_identifier, limit),
+        ) as cursor:
+            async for row in cursor:
+                concepts.append(dict(row))
+        return concepts
+
+    async def update_agent_concept_markdown(
+        self,
+        *,
+        concept_id: str,
+        markdown_body: str,
+        observed_at: datetime,
+    ) -> None:
+        observed = _utc_iso(observed_at)
+        async with self._write_lock:
+            await self.db.execute(
+                """UPDATE agent_concepts SET
+                    markdown_body = ?,
+                    updated_at = ?,
+                    last_observed_at = ?
+                   WHERE id = ?""",
+                (markdown_body, observed, observed, concept_id),
+            )
+            await self.db.commit()
+
+    async def upsert_agent_claim(
+        self,
+        *,
+        claim_id: str,
+        concept_id: str,
+        display_anchor: str,
+        claim_text: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        memory_id: str,
+        observed_at: datetime,
+    ) -> None:
+        observed = _utc_iso(observed_at)
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT INTO agent_claims (
+                    id, concept_id, display_anchor, claim_text, memory_type,
+                    tags, confidence, memory_id, created_at, updated_at,
+                    last_observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    concept_id=excluded.concept_id,
+                    display_anchor=excluded.display_anchor,
+                    claim_text=excluded.claim_text,
+                    memory_type=excluded.memory_type,
+                    tags=excluded.tags,
+                    confidence=excluded.confidence,
+                    memory_id=excluded.memory_id,
+                    updated_at=excluded.updated_at,
+                    last_observed_at=excluded.last_observed_at""",
+                (
+                    claim_id,
+                    concept_id,
+                    display_anchor,
+                    claim_text,
+                    memory_type,
+                    json.dumps(tags),
+                    confidence,
+                    memory_id,
+                    observed,
+                    observed,
+                    observed,
+                ),
+            )
+            await self.db.commit()
+
+    async def get_agent_claim(self, claim_id: str) -> dict[str, Any] | None:
+        async with self.db.execute(
+            "SELECT * FROM agent_claims WHERE id = ?",
+            (claim_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        return self._row_to_agent_claim(row)
+
+    async def list_agent_claims(self, concept_id: str) -> list[dict[str, Any]]:
+        claims: list[dict[str, Any]] = []
+        async with self.db.execute(
+            "SELECT * FROM agent_claims WHERE concept_id = ? ORDER BY created_at, id",
+            (concept_id,),
+        ) as cursor:
+            async for row in cursor:
+                claims.append(self._row_to_agent_claim(row))
+        return claims
+
+    async def add_agent_claim_citation(
+        self,
+        *,
+        claim_id: str,
+        citation_url: str,
+        observed_at: datetime,
+    ) -> None:
+        observed = _utc_iso(observed_at)
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT INTO agent_claim_citations (
+                    claim_id, citation_url, observed_at, created_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(claim_id, citation_url) DO UPDATE SET
+                    observed_at=excluded.observed_at""",
+                (claim_id, citation_url, observed, observed),
+            )
+            await self.db.commit()
+
+    async def list_agent_claim_citations(self, claim_id: str) -> list[dict[str, Any]]:
+        citations: list[dict[str, Any]] = []
+        async with self.db.execute(
+            """SELECT claim_id, citation_url, observed_at, created_at
+               FROM agent_claim_citations
+               WHERE claim_id = ?
+               ORDER BY created_at, citation_url""",
+            (claim_id,),
+        ) as cursor:
+            async for row in cursor:
+                citations.append(dict(row))
+        return citations
+
+    def _row_to_agent_claim(self, row) -> dict[str, Any]:
+        data = dict(row)
+        try:
+            data["tags"] = json.loads(data.get("tags") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            data["tags"] = []
+        return data
 
     async def add_memory_derivation(
         self,
@@ -3629,7 +3932,7 @@ class Database:
         A read-only, on-demand pass over agent_session_receipts. Capture
         completeness is the client-side bookmark check; this is the other half,
         knowledge completeness: of the windows that were processed, how many kept
-        a package versus dropped everything as no_output. No stored verdict, no
+        a knowledge patch versus dropped everything as no_output. No stored verdict, no
         threshold, no background job. Explicit-document receipts and receipts
         without a recognized outcome are ignored so the fraction stays
         well-defined.
@@ -3660,6 +3963,8 @@ class Database:
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
                 outcome = metadata.get("outcome") if isinstance(metadata, dict) else None
+                if outcome == AGENT_SESSION_OUTCOME_LEGACY_PACKAGE_CREATED:
+                    outcome = AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED
                 if outcome in counts:
                     counts[outcome] += 1
                 if outcome == AGENT_SESSION_OUTCOME_FAILED:
@@ -3674,7 +3979,7 @@ class Database:
 
         total = sum(counts.values())
         processed_total = (
-            counts[AGENT_SESSION_OUTCOME_PACKAGE_CREATED]
+            counts[AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED]
             + counts[AGENT_SESSION_OUTCOME_NO_OUTPUT]
         )
         no_output_fraction = (

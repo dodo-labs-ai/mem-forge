@@ -616,7 +616,7 @@ async def test_agent_session_window_intake_rejects_paused_source_before_llm(
     )
 
     class FailingWindowClient:
-        async def generate_agent_session_package(self, *args, **kwargs):
+        async def generate_agent_knowledge_patch(self, *args, **kwargs):
             raise AssertionError("paused source should be rejected before LLM work")
 
     app = create_admin_app(db=db, config=_config(tmp_path))
