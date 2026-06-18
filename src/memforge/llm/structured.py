@@ -225,17 +225,6 @@ class RerankResponse(StructuredResponseModel):
     ranking: list[int] = Field(default_factory=list)
 
 
-class AgentSessionPackageResponse(StructuredResponseModel):
-    """Schema returned by agent-session window package generation."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    result: Literal["package_created", "no_output"] = "no_output"
-    title: str | None = None
-    summary_markdown: str = ""
-    reason: str | None = None
-
-
 @dataclass(frozen=True)
 class StructuredLlmConfig:
     model: str
@@ -321,14 +310,14 @@ class SourceSupportStructuredClient(Protocol):
     ) -> RerankResponse:
         """Return schema-validated reranking indices."""
 
-    async def generate_agent_session_package(
+    async def generate_agent_knowledge_patch(
         self,
         prompt: str,
         *,
-        max_tokens: int = 4096,
+        max_tokens: int = 2048,
         model: str | None = None,
-    ) -> AgentSessionPackageResponse:
-        """Return a generated package from one agent-session transcript window."""
+    ):
+        """Return a private agent-knowledge patch proposal."""
 
 
 class StructuredLlmError(RuntimeError):
@@ -534,16 +523,18 @@ class LiteLlmStructuredClient:
             model=model,
         )
 
-    async def generate_agent_session_package(
+    async def generate_agent_knowledge_patch(
         self,
         prompt: str,
         *,
-        max_tokens: int = 4096,
+        max_tokens: int = 2048,
         model: str | None = None,
-    ) -> AgentSessionPackageResponse:
+    ):
+        from memforge.agent_knowledge import AgentKnowledgePatchProposal
+
         return await self._call_schema(
             prompt=prompt,
-            response_format=AgentSessionPackageResponse,
+            response_format=AgentKnowledgePatchProposal,
             max_tokens=max_tokens,
             model=model,
         )
