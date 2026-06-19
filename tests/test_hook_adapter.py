@@ -1020,34 +1020,11 @@ def test_mcp_proxy_rejects_unadvertised_search_source_ids(monkeypatch):
     }
 
 
-def test_mcp_proxy_keeps_explicit_repo_hint(monkeypatch):
+def test_mcp_proxy_rejects_explicit_repo_hint(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
-    captured = {}
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
 
-    class FakeResponse:
-        headers = {"content-type": "application/json"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self, _size=-1):
-            return b'{"results":[]}'
-
-    class FakeOpener:
-        def open(self, request, timeout):
-            captured["body"] = request.data
-            return FakeResponse()
-
-    monkeypatch.setenv(
-        "MEMFORGE_ACTIVE_REPO_IDENTIFIER",
-        "github.tools.sap/hcm/memforge-cloud",
-    )
-    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
-
-    proxy._call_tool(
+    result = proxy._call_tool(
         "search",
         {
             "query": "scheduler fix",
@@ -1055,8 +1032,12 @@ def test_mcp_proxy_keeps_explicit_repo_hint(monkeypatch):
         },
     )
 
-    body = json.loads(captured["body"].decode())
-    assert body["active_repo_identifier"] == "github.tools.sap/hcm/other"
+    assert result == {
+        "error": (
+            "Unsupported search parameter(s): active_repo_identifier. "
+            "Omit unknown filters instead of guessing."
+        )
+    }
 
 
 def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
@@ -1086,7 +1067,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "source_instance_ids" not in properties["source_filter"]["properties"]
     assert "sources" not in properties
     assert "include_private" in properties
-    assert "active_repo_identifier" in properties
+    assert "active_repo_identifier" not in properties
 
 
 def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
