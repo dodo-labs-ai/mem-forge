@@ -236,6 +236,57 @@ def test_agent_session_window_submit_uses_server_principal(tmp_path):
         asyncio.run(database.close())
 
 
+def test_agent_session_window_uses_bounded_completion_budget(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    class RecordingWindowClient:
+        def __init__(self):
+            self.calls = []
+
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            self.calls.append(kwargs)
+            return _knowledge_patch(
+                title="Bounded patch",
+                claim_text="Agent-session patch generation uses a bounded completion budget.",
+            )
+
+    cfg = _config(tmp_path)
+    cfg.llm.enrichment_max_tokens = 64000
+    database = Database(str(tmp_path / "api.db"))
+    window_client = RecordingWindowClient()
+
+    import asyncio
+
+    asyncio.run(database.connect())
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        app.state.agent_session_window_client = window_client
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/agent-sessions/windows",
+                json={
+                    "client": "codex",
+                    "session_id": "sess-budget",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "events": [
+                        {
+                            "kind": "assistant_message",
+                            "actor": "assistant",
+                            "text": "Captured a durable design decision.",
+                        }
+                    ],
+                    "transcript_markdown": "Durable design decision worth keeping.",
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        assert window_client.calls
+        assert window_client.calls[0]["max_tokens"] == 8192
+    finally:
+        asyncio.run(database.close())
+
+
 def test_source_projects_endpoint_groups_agent_session_memory_by_project(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
