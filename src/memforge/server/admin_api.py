@@ -22,7 +22,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -63,8 +63,11 @@ from memforge.models import (
     canonicalize_entity_name,
 )
 from memforge.provenance import (
+    DocumentArtifactStore,
     document_content_url,
+    document_content_url_for_store,
     document_pdf_url,
+    document_pdf_url_for_store,
     list_document_artifacts,
     select_document_artifact,
 )
@@ -85,6 +88,7 @@ from memforge.source_secrets import (
     redact_source_config,
     source_secret_fields,
 )
+from memforge.storage.document_store import LocalDocumentStore
 from memforge.server.memory_admin_service import (
     list_memory_admin_page,
     pick_origin_source_type,
@@ -1605,7 +1609,16 @@ def _memory_source_detail(
     ms: Any,
     doc: Any | None,
     config: AppConfig | None = None,
+    artifact_store: DocumentArtifactStore | None = None,
 ) -> MemorySourceDetail:
+    content_url = None
+    pdf_url = None
+    if doc is not None and config is not None:
+        content_url = document_content_url_for_store(doc, config, artifact_store)
+        pdf_url = document_pdf_url_for_store(doc, config, artifact_store)
+    elif doc is not None:
+        content_url = document_content_url(doc, config)
+        pdf_url = document_pdf_url(doc, config)
     return MemorySourceDetail(
         doc_id=ms.doc_id,
         source_type=ms.source_type,
@@ -1613,8 +1626,8 @@ def _memory_source_detail(
         support_kind=ms.support_kind,
         doc_title=doc.title if doc else None,
         source_url=doc.source_url if doc else None,
-        content_url=document_content_url(doc, config),
-        pdf_url=document_pdf_url(doc, config),
+        content_url=content_url,
+        pdf_url=pdf_url,
         added_at=_dt_iso(ms.added_at),
     )
 
@@ -1720,13 +1733,14 @@ async def _build_memory_summary(
     db: Database,
     memory: Memory,
     config: AppConfig | None = None,
+    artifact_store: DocumentArtifactStore | None = None,
 ) -> MemoryReviewMemorySummary:
     """Hydrate a memory with provenance and entity refs for the review detail view."""
     raw_sources = await db.get_memory_sources(memory.id)
     sources: list[MemorySourceDetail] = []
     for ms in raw_sources:
         doc = await db.get_document(ms.doc_id)
-        sources.append(_memory_source_detail(ms, doc, config))
+        sources.append(_memory_source_detail(ms, doc, config, artifact_store))
 
     entity_names = await db.get_memory_entity_names(memory.id)
 
@@ -1901,6 +1915,11 @@ def get_config(request: Request) -> AppConfig:
     return request.app.state.config
 
 
+def get_document_store(request: Request) -> DocumentArtifactStore:
+    """FastAPI dependency: retrieve the configured document artifact store."""
+    return request.app.state.document_store
+
+
 def get_sync_service(request: Request) -> SyncService:
     """FastAPI dependency: retrieve the app-scoped sync service."""
     return request.app.state.sync_service
@@ -1927,6 +1946,7 @@ def create_admin_app(
     runtime_provider: RuntimeProvider | None = None,
     principal_resolver: Callable[[Request], str] | None = None,
     workspace_role_resolver: Callable[[Request], str] | None = None,
+    document_store: DocumentArtifactStore | None = None,
 ) -> FastAPI:
     """Create and configure the MemForge Admin API FastAPI application.
 
@@ -1960,6 +1980,9 @@ def create_admin_app(
             app.state.db = db
 
         app.state.config = config
+        app.state.document_store = document_store or LocalDocumentStore(
+            config.storage.docs_path
+        )
         app.state.runtime_provider = runtime_provider
         app.state.principal_resolver = principal_resolver
         app.state.workspace_role_resolver = workspace_role_resolver
@@ -1988,6 +2011,9 @@ def create_admin_app(
         app.state.sync_service = SyncService(db, config, runtime_provider=runtime_provider)
         app.state.sync_scheduler = SyncScheduler(db, app.state.sync_service)
     app.state.config = config
+    app.state.document_store = document_store or LocalDocumentStore(
+        config.storage.docs_path
+    )
     app.state.runtime_provider = runtime_provider
     app.state.principal_resolver = principal_resolver
     app.state.workspace_role_resolver = workspace_role_resolver
@@ -2240,13 +2266,14 @@ def create_admin_app(
         doc_id: str,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         """List service-readable artifacts for a stored source document."""
         doc = await db.get_document(doc_id)
         if doc is None:
             raise HTTPException(status_code=404, detail="Document not found")
 
-        artifacts = list_document_artifacts(doc, config)
+        artifacts = list_document_artifacts(doc, config, artifact_store)
         return {
             "doc_id": doc.doc_id,
             "title": doc.title,
@@ -2262,64 +2289,73 @@ def create_admin_app(
     async def get_document_artifact(
         doc_id: str,
         kind: str,
+        request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         """Serve an explicit source artifact kind through the API."""
         doc = await db.get_document(doc_id)
         if doc is None:
             raise HTTPException(status_code=404, detail="Document not found")
 
-        artifact = select_document_artifact(doc, kind, config)
+        artifact = select_document_artifact(doc, kind, config, artifact_store)
         if artifact is None:
             raise HTTPException(status_code=404, detail="Document artifact not found")
 
-        return FileResponse(
-            artifact.path,
+        content = b"" if request.method == "HEAD" else artifact_store.read_artifact(artifact.uri)
+        return Response(
+            content=content,
             media_type=artifact.media_type,
-            filename=artifact.filename,
+            headers={"Content-Disposition": f'inline; filename="{artifact.filename}"'},
         )
 
     @document_router.api_route("/{doc_id}/content", methods=["GET", "HEAD"])
     async def get_document_content(
         doc_id: str,
+        request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         """Serve normalized source content through the API for Docker/SaaS clients."""
         doc = await db.get_document(doc_id)
         if doc is None:
             raise HTTPException(status_code=404, detail="Document not found")
 
-        artifact = select_document_artifact(doc, "content", config)
+        artifact = select_document_artifact(doc, "content", config, artifact_store)
         if artifact is None:
             raise HTTPException(status_code=404, detail="Document content artifact not found")
 
-        return FileResponse(
-            artifact.path,
+        content = b"" if request.method == "HEAD" else artifact_store.read_artifact(artifact.uri)
+        return Response(
+            content=content,
             media_type=artifact.media_type,
-            filename=artifact.filename,
+            headers={"Content-Disposition": f'inline; filename="{artifact.filename}"'},
         )
 
     @document_router.api_route("/{doc_id}/pdf", methods=["GET", "HEAD"])
     async def get_document_pdf(
         doc_id: str,
+        request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         """Serve a stored source PDF through the API for Docker/SaaS clients."""
         doc = await db.get_document(doc_id)
         if doc is None:
             raise HTTPException(status_code=404, detail="Document not found")
 
-        artifact = select_document_artifact(doc, "pdf", config)
+        artifact = select_document_artifact(doc, "pdf", config, artifact_store)
         if artifact is None:
             raise HTTPException(status_code=404, detail="Document PDF artifact not found")
 
-        return FileResponse(
-            artifact.path,
+        content = b"" if request.method == "HEAD" else artifact_store.read_artifact(artifact.uri)
+        return Response(
+            content=content,
             media_type=artifact.media_type,
-            filename=artifact.filename,
+            headers={"Content-Disposition": f'inline; filename="{artifact.filename}"'},
         )
 
     # ===================================================================
@@ -2431,6 +2467,7 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         """Get full memory detail including provenance (linked source documents)."""
         scope = _workspace_default_scope(request, include_private=False)
@@ -2448,7 +2485,7 @@ def create_admin_app(
         source_details: list[MemorySourceDetail] = []
         for ms in raw_sources:
             doc = await db.get_document(ms.doc_id)
-            source_details.append(_memory_source_detail(ms, doc, config))
+            source_details.append(_memory_source_detail(ms, doc, config, artifact_store))
 
         # Fetch linked entity names.
         entity_names = await db.get_memory_entity_names(memory_id)
@@ -3418,6 +3455,7 @@ def create_admin_app(
         source_id: str,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        document_store: DocumentArtifactStore = Depends(get_document_store),
         sync_service: SyncService = Depends(get_sync_service),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
@@ -3434,11 +3472,8 @@ def create_admin_app(
             owner_id=source_id,
         )
 
-        from memforge.storage.document_store import LocalDocumentStore
-
-        doc_store = LocalDocumentStore(config.storage.docs_path)
         for doc in await db.list_documents(source=source_id, limit=100000):
-            doc_store.delete_document_files(source_name=existing["name"], title=doc.title)
+            document_store.delete_document_files(source_name=existing["name"], title=doc.title)
 
         memory_store = await _build_memory_store(db, config, runtime_provider)
         await memory_store.delete_source_cascade(source_id)
@@ -4008,6 +4043,7 @@ def create_admin_app(
         review_id: str,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         review = await db.get_memory_review(review_id)
         if review is None:
@@ -4016,14 +4052,22 @@ def create_admin_app(
         incumbent = await db.get_memory(review.incumbent_memory_id)
         challenger = await db.get_memory(review.challenger_memory_id)
         base = _review_to_response(review, incumbent=incumbent, challenger=challenger)
-        incumbent_summary = await _build_memory_summary(db, incumbent, config) if incumbent else None
-        challenger_summary = await _build_memory_summary(db, challenger, config) if challenger else None
+        incumbent_summary = (
+            await _build_memory_summary(db, incumbent, config, artifact_store)
+            if incumbent else None
+        )
+        challenger_summary = (
+            await _build_memory_summary(db, challenger, config, artifact_store)
+            if challenger else None
+        )
         related_challengers: list[MemoryReviewMemorySummary] = []
         for related in await db.list_memory_review_related_challengers(review.id):
             related_memory = await db.get_memory(related.challenger_memory_id)
             if related_memory is None:
                 continue
-            related_challengers.append(await _build_memory_summary(db, related_memory, config))
+            related_challengers.append(
+                await _build_memory_summary(db, related_memory, config, artifact_store)
+            )
         return MemoryReviewDetailResponse(
             **base.model_dump(),
             incumbent=incumbent_summary,
@@ -4037,6 +4081,7 @@ def create_admin_app(
         req: MemoryReviewDecisionRequest = MemoryReviewDecisionRequest(),
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
         service = await _build_review_service(db, config, runtime_provider)
@@ -4068,10 +4113,12 @@ def create_admin_app(
         assert review is not None
         base = _review_to_response(review, incumbent=result.incumbent, challenger=result.challenger)
         incumbent_summary = (
-            await _build_memory_summary(db, result.incumbent, config) if result.incumbent else None
+            await _build_memory_summary(db, result.incumbent, config, artifact_store)
+            if result.incumbent else None
         )
         challenger_summary = (
-            await _build_memory_summary(db, result.challenger, config) if result.challenger else None
+            await _build_memory_summary(db, result.challenger, config, artifact_store)
+            if result.challenger else None
         )
         return MemoryReviewDetailResponse(
             **base.model_dump(),
@@ -4085,6 +4132,7 @@ def create_admin_app(
         req: MemoryReviewDecisionRequest,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
         if not req.note or not req.note.strip():
@@ -4117,10 +4165,12 @@ def create_admin_app(
         assert review is not None
         base = _review_to_response(review, incumbent=result.incumbent, challenger=result.challenger)
         incumbent_summary = (
-            await _build_memory_summary(db, result.incumbent, config) if result.incumbent else None
+            await _build_memory_summary(db, result.incumbent, config, artifact_store)
+            if result.incumbent else None
         )
         challenger_summary = (
-            await _build_memory_summary(db, result.challenger, config) if result.challenger else None
+            await _build_memory_summary(db, result.challenger, config, artifact_store)
+            if result.challenger else None
         )
         return MemoryReviewDetailResponse(
             **base.model_dump(),
@@ -4133,6 +4183,7 @@ def create_admin_app(
         review_id: str,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
         service = await _build_review_service(db, config, runtime_provider)
@@ -4146,10 +4197,12 @@ def create_admin_app(
         review = result.review
         base = _review_to_response(review, incumbent=result.incumbent, challenger=result.challenger)
         incumbent_summary = (
-            await _build_memory_summary(db, result.incumbent, config) if result.incumbent else None
+            await _build_memory_summary(db, result.incumbent, config, artifact_store)
+            if result.incumbent else None
         )
         challenger_summary = (
-            await _build_memory_summary(db, result.challenger, config) if result.challenger else None
+            await _build_memory_summary(db, result.challenger, config, artifact_store)
+            if result.challenger else None
         )
         return MemoryReviewDetailResponse(
             **base.model_dump(),

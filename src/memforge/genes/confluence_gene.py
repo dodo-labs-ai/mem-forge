@@ -498,6 +498,22 @@ class ConfluenceGene(Gene):
             logger.warning("PDF export failed for %s: %s", item.title, e)
             return None
 
+    def requires_pdf_artifact(
+        self,
+        *,
+        item: ContentItem,
+        existing_doc: object | None,
+        existing_hash: str | None,
+        new_hash: str,
+    ) -> bool:
+        """Confluence pages require PDF provenance for user-facing source review."""
+        del item
+        return (
+            existing_doc is None
+            or existing_hash != new_hash
+            or not getattr(existing_doc, "pdf_content_uri", None)
+        )
+
     async def normalize(self, raw: RawContent) -> NormalizedContent:
         """Convert Confluence XHTML to comprehensive markdown."""
         html = raw.body.decode("utf-8", errors="replace")

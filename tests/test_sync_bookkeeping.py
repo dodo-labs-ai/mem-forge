@@ -43,6 +43,16 @@ async def db(tmp_path):
 
 
 class EmptyGene:
+    def requires_pdf_artifact(
+        self,
+        *,
+        item,
+        existing_doc,
+        existing_hash,
+        new_hash,
+    ) -> bool:
+        return False
+
     async def authenticate(self) -> None:
         return None
 
@@ -267,6 +277,16 @@ class IncrementalNewDocumentGene:
     def __init__(self) -> None:
         self.seen_since = None
 
+    def requires_pdf_artifact(
+        self,
+        *,
+        item,
+        existing_doc,
+        existing_hash,
+        new_hash,
+    ) -> bool:
+        return False
+
     @classmethod
     def metadata(cls):
         return GeneMetadata(
@@ -301,6 +321,16 @@ class IncrementalNewDocumentGene:
 
 
 class FailingAuthGene:
+    def requires_pdf_artifact(
+        self,
+        *,
+        item,
+        existing_doc,
+        existing_hash,
+        new_hash,
+    ) -> bool:
+        return False
+
     @classmethod
     def metadata(cls):
         return GeneMetadata(
@@ -317,12 +347,20 @@ class FailingAuthGene:
 
 
 class StubDocumentStore:
+    def __init__(self) -> None:
+        self.normalized_content: dict[str, str] = {}
+
     def store_raw(self, *, source_name, title, content, content_type, extension=None):
         suffix = extension or ".raw"
         return f"file:///tmp/{source_name}/{title}{suffix}"
 
     def store_normalized(self, *, source_name, title, markdown):
-        return f"file:///tmp/{source_name}/{title}.md"
+        uri = f"stub-doc://{source_name}/{title}.md"
+        self.normalized_content[uri] = markdown
+        return uri
+
+    def read_normalized(self, uri):
+        return self.normalized_content.get(uri)
 
     def delete_document_files(self, *, source_name, title):
         return None
@@ -531,6 +569,16 @@ class BlockingFetchGene:
         self.active_fetches = 0
         self.max_active_fetches = 0
 
+    def requires_pdf_artifact(
+        self,
+        *,
+        item,
+        existing_doc,
+        existing_hash,
+        new_hash,
+    ) -> bool:
+        return False
+
     @classmethod
     def metadata(cls):
         return GeneMetadata(
@@ -571,6 +619,21 @@ class BlockingFetchGene:
 
 
 class PdfBackfillGene(BlockingFetchGene):
+    def requires_pdf_artifact(
+        self,
+        *,
+        item,
+        existing_doc,
+        existing_hash,
+        new_hash,
+    ) -> bool:
+        del item
+        return (
+            existing_doc is None
+            or existing_hash != new_hash
+            or not getattr(existing_doc, "pdf_content_uri", None)
+        )
+
     @classmethod
     def metadata(cls):
         return GeneMetadata(
@@ -595,6 +658,16 @@ class UpdatingDocumentGene:
     def __init__(self, markdown: str, version: str = "2") -> None:
         self.markdown = markdown
         self.version = version
+
+    def requires_pdf_artifact(
+        self,
+        *,
+        item,
+        existing_doc,
+        existing_hash,
+        new_hash,
+    ) -> bool:
+        return False
 
     @classmethod
     def metadata(cls):
@@ -973,8 +1046,12 @@ async def test_force_full_sync_ignores_incremental_cursor(db: Database):
 async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_path):
     source_id = "src-force-reprocess"
     markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
-    previous_path = tmp_path / "design-doc.md"
-    previous_path.write_text(markdown, encoding="utf-8")
+    doc_store = StubDocumentStore()
+    normalized_content_uri = doc_store.store_normalized(
+        source_name="Documents",
+        title="Design Doc",
+        markdown=markdown,
+    )
     await _insert_document_with_metadata(
         db,
         source_id=source_id,
@@ -982,13 +1059,13 @@ async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_
         title="Design Doc",
         markdown=markdown,
         version="2",
-        normalized_content_uri=str(previous_path),
+        normalized_content_uri=normalized_content_uri,
     )
     extractor = RecordingMemoryExtractor()
     memory_engine = RecordingMemoryEngine()
     orchestrator = GeneSyncOrchestrator(
         db=db,
-        doc_store=StubDocumentStore(),
+        doc_store=doc_store,
         enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=extractor,
         memory_engine=memory_engine,
@@ -1620,8 +1697,12 @@ async def test_document_update_uses_diff_guided_extraction_and_audits_strategy(
     source_id = "src-diff-guided-update"
     old_markdown = "# Design Doc\n\nThe service uses PostgreSQL 14."
     new_markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
-    previous_path = tmp_path / "design-doc.md"
-    previous_path.write_text(old_markdown, encoding="utf-8")
+    doc_store = StubDocumentStore()
+    normalized_content_uri = doc_store.store_normalized(
+        source_name="Documents",
+        title="Design Doc",
+        markdown=old_markdown,
+    )
     await _insert_document_with_metadata(
         db,
         source_id=source_id,
@@ -1629,14 +1710,14 @@ async def test_document_update_uses_diff_guided_extraction_and_audits_strategy(
         title="Design Doc",
         markdown=old_markdown,
         version="1",
-        normalized_content_uri=str(previous_path),
+        normalized_content_uri=normalized_content_uri,
     )
     extractor = RecordingMemoryExtractor()
     memory_store = _audited_memory_store(db)
     memory_engine = RecordingMemoryEngine()
     orchestrator = GeneSyncOrchestrator(
         db=db,
-        doc_store=StubDocumentStore(),
+        doc_store=doc_store,
         enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=extractor,
         memory_engine=memory_engine,
@@ -1693,8 +1774,12 @@ async def test_structured_source_update_uses_diff_guided_extraction_and_audits_s
     source_id = "src-jira-diff-guided-update"
     old_markdown = "# [Story] PAY-123: Cutoff flow\n\n## Source Metadata\n- Status: In Progress"
     new_markdown = "# [Story] PAY-123: Cutoff flow\n\n## Source Metadata\n- Status: Done"
-    previous_path = tmp_path / "jira-ticket.md"
-    previous_path.write_text(old_markdown, encoding="utf-8")
+    doc_store = StubDocumentStore()
+    normalized_content_uri = doc_store.store_normalized(
+        source_name="Jira Board",
+        title="PAY-123",
+        markdown=old_markdown,
+    )
     await _insert_document_with_metadata(
         db,
         source_id=source_id,
@@ -1702,14 +1787,14 @@ async def test_structured_source_update_uses_diff_guided_extraction_and_audits_s
         title="PAY-123",
         markdown=old_markdown,
         version="1",
-        normalized_content_uri=str(previous_path),
+        normalized_content_uri=normalized_content_uri,
     )
     extractor = RecordingMemoryExtractor()
     memory_store = _audited_memory_store(db)
     memory_engine = RecordingMemoryEngine()
     orchestrator = GeneSyncOrchestrator(
         db=db,
-        doc_store=StubDocumentStore(),
+        doc_store=doc_store,
         enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=extractor,
         memory_engine=memory_engine,
@@ -1889,8 +1974,12 @@ async def test_partial_unit_extraction_failure_skips_reconciliation(db: Database
             " ".join(["section two durable design guidance"] * 2500),
         ]
     )
-    previous_path = tmp_path / "design-doc.md"
-    previous_path.write_text(markdown, encoding="utf-8")
+    doc_store = StubDocumentStore()
+    normalized_content_uri = doc_store.store_normalized(
+        source_name="Documents",
+        title="Design Doc",
+        markdown=markdown,
+    )
     await _insert_document_with_metadata(
         db,
         source_id=source_id,
@@ -1898,14 +1987,14 @@ async def test_partial_unit_extraction_failure_skips_reconciliation(db: Database
         title="Design Doc",
         markdown=markdown,
         version="1",
-        normalized_content_uri=str(previous_path),
+        normalized_content_uri=normalized_content_uri,
     )
     extractor = PartiallyFailingUnitMemoryExtractor()
     memory_engine = RecordingMemoryEngine()
     memory_store = _audited_memory_store(db)
     orchestrator = GeneSyncOrchestrator(
         db=db,
-        doc_store=StubDocumentStore(),
+        doc_store=doc_store,
         enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=extractor,
         memory_engine=memory_engine,

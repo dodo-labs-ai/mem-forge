@@ -392,6 +392,84 @@ class TestReviewCrud:
         assert "file_uri" not in incumbent_source
         assert "pdf_uri" not in incumbent_source
 
+    @pytest.mark.asyncio
+    async def test_review_detail_uses_injected_document_store_for_artifact_urls(
+        self,
+        db,
+        chroma,
+        tmp_path,
+    ):
+        from memforge.server.admin_api import create_admin_app
+        from memforge.storage.document_store import StoredDocumentArtifact
+
+        class MemoryBackedDocumentStore:
+            def __init__(self) -> None:
+                self.objects = {
+                    "mem://review-incumbent.md": b"# Incumbent object evidence"
+                }
+
+            def get_artifact(self, uri: str | None, media_type: str):
+                if uri not in self.objects:
+                    return None
+                return StoredDocumentArtifact(
+                    uri=uri,
+                    filename="review-incumbent.md",
+                    media_type=media_type,
+                    size_bytes=len(self.objects[uri]),
+                )
+
+            def read_artifact(self, uri: str) -> bytes:
+                return self.objects[uri]
+
+            def read_normalized(self, stored_path: str) -> str | None:
+                content = self.objects.get(stored_path)
+                return content.decode("utf-8") if content else None
+
+            def store_raw(self, *args, **kwargs) -> str:
+                raise AssertionError("not used")
+
+            def store_normalized(self, *args, **kwargs) -> str:
+                raise AssertionError("not used")
+
+            def store_pdf(self, *args, **kwargs) -> str:
+                raise AssertionError("not used")
+
+            def delete_document_files(self, *, source_name: str, title: str) -> None:
+                raise AssertionError("not used")
+
+        incumbent, challenger, review = await _seed_supersede_review(
+            db, chroma, suffix="objecturls"
+        )
+        await _upsert_doc_with_artifacts(
+            db,
+            tmp_path,
+            "doc-review-object-incumbent",
+            normalized_content_uri="mem://review-incumbent.md",
+        )
+        await db.add_memory_source(
+            incumbent.id,
+            "doc-review-object-incumbent",
+            "jira",
+            excerpt="incumbent source",
+        )
+
+        app = create_admin_app(
+            db=db,
+            config=_config(tmp_path),
+            document_store=MemoryBackedDocumentStore(),
+        )
+        with TestClient(app) as client:
+            detail = client.get(f"/api/memory-reviews/{review.id}")
+            content = client.get("/api/documents/doc-review-object-incumbent/content")
+
+        assert detail.status_code == 200
+        incumbent_source = detail.json()["incumbent"]["sources"][0]
+        assert incumbent_source["content_url"] == (
+            "/api/documents/doc-review-object-incumbent/content"
+        )
+        assert content.status_code == 200
+        assert content.text == "# Incumbent object evidence"
+
 
 # ---------------------------------------------------------------------------
 # Approve

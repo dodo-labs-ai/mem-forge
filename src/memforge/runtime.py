@@ -429,6 +429,7 @@ async def build_search_engine(
             )
         )
     adapters = build_sqlite_adapters(db, memory_collection, audit_logger=audit_logger)
+    doc_store = LocalDocumentStore(config.storage.docs_path)
     return SearchEngine(
         relational=adapters.relational,
         keyword=adapters.keyword,
@@ -437,6 +438,7 @@ async def build_search_engine(
         config=config.retrieval,
         structured_llm_client=structured_llm_client,
         artifact_config=config,
+        artifact_store=doc_store,
     )
 
 

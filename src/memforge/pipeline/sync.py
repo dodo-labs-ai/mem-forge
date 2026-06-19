@@ -21,9 +21,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
 
 import tiktoken
 
@@ -59,7 +57,7 @@ if TYPE_CHECKING:
     from memforge.pipeline.memory_extractor import MemoryExtractor
     from memforge.pipeline.source_support_detector import SourceSupportDetector
     from memforge.storage.database import Database
-    from memforge.storage.document_store import LocalDocumentStore
+    from memforge.storage.document_store import DocumentStore
 
 logger = logging.getLogger(__name__)
 
@@ -310,7 +308,7 @@ class GeneSyncOrchestrator:
     def __init__(
         self,
         db: Database,
-        doc_store: LocalDocumentStore,
+        doc_store: DocumentStore,
         enricher: Enricher,
         memory_extractor: MemoryExtractor,
         memory_engine: MemoryEngine,
@@ -884,8 +882,11 @@ class GeneSyncOrchestrator:
 
         source_type = gene.metadata().name
         source_shape = gene.metadata().data_shape
-        requires_pdf_uri = source_type == "confluence" and (
-            existing_doc is None or existing_hash != new_hash or not existing_doc.pdf_content_uri
+        requires_pdf_uri = gene.requires_pdf_artifact(
+            item=item,
+            existing_doc=existing_doc,
+            existing_hash=existing_hash,
+            new_hash=new_hash,
         )
 
         # ------------------------------------------------------------------
@@ -1508,13 +1509,6 @@ class GeneSyncOrchestrator:
             except Exception as e:
                 logger.warning("Failed to read previous normalized content via document store: %s", e)
 
-        parsed = urlparse(uri)
-        path = Path(parsed.path if parsed.scheme == "file" else uri)
-        try:
-            if path.exists():
-                return path.read_text(encoding="utf-8")
-        except Exception as e:
-            logger.warning("Failed to read previous normalized content from %s: %s", uri, e)
         return None
 
     async def _get_existing_document_memories(self, doc_id: str) -> list[Memory]:

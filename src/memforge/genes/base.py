@@ -66,6 +66,7 @@ class Gene(ABC):
 
     Subclasses **may** override:
     - ``health_check()``  -- connectivity / credential validity probe
+    - ``requires_pdf_artifact()`` -- whether a document must retain PDF provenance
     """
 
     # ------------------------------------------------------------------
@@ -89,6 +90,17 @@ class Gene(ABC):
         Each ``ConfigField`` describes one user-editable setting (base URL,
         API token, space keys, etc.).  Fields are grouped via ``ConfigGroup``.
         """
+
+    def requires_pdf_artifact(
+        self,
+        *,
+        item: ContentItem,
+        existing_doc: object | None,
+        existing_hash: str | None,
+        new_hash: str,
+    ) -> bool:
+        """Return whether sync should fail if a PDF artifact cannot be stored."""
+        return False
 
     # ------------------------------------------------------------------
     # Instance initialisation
