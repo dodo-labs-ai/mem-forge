@@ -157,6 +157,17 @@ def test_tool_client_forwards_structured_memory_search_facets():
     ]
 
 
+def test_tool_client_get_memory_uses_personalized_detail_route():
+    client = _RecordingClient({"id": "mem-private"})
+
+    result = client.get_memory("mem-private")
+
+    assert result["id"] == "mem-private"
+    assert client.calls == [
+        ("GET", "/api/memories/mem-private?include_private=true", None),
+    ]
+
+
 def test_tool_client_fetches_resource_through_hosted_workspace(monkeypatch):
     captured = {}
 

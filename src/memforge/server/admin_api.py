@@ -2465,12 +2465,13 @@ def create_admin_app(
     async def get_memory(
         memory_id: str,
         request: Request,
+        include_private: bool = False,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         """Get full memory detail including provenance (linked source documents)."""
-        scope = _workspace_default_scope(request, include_private=False)
+        scope = _workspace_default_scope(request, include_private=include_private)
         mem = await db.get_memory(memory_id)
         if not mem:
             raise HTTPException(status_code=404, detail="Memory not found")

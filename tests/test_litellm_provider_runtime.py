@@ -87,3 +87,25 @@ def test_provider_prefixed_embedding_uses_litellm_without_empty_credentials(monk
     assert captured["input"] == ["alpha", "beta"]
     assert "api_base" not in captured
     assert "api_key" not in captured
+
+
+def test_retrieval_assist_models_follow_effective_llm_config() -> None:
+    from memforge.config import AppConfig
+    from memforge.runtime import EffectiveLlmConfig, _retrieval_config_for_llm
+
+    config = AppConfig()
+    llm = EffectiveLlmConfig(
+        enrichment_model="sap/anthropic--claude-4.6-sonnet",
+        enrichment_base_url="",
+        enrichment_api_key="",
+        request_timeout_s=30.0,
+        embedding_model="sap/text-embedding-3-small",
+        embedding_base_url="",
+        embedding_api_key="",
+    )
+
+    retrieval = _retrieval_config_for_llm(config, llm)
+
+    assert retrieval.entity_model == "sap/anthropic--claude-4.6-sonnet"
+    assert retrieval.rerank_model == "sap/anthropic--claude-4.6-sonnet"
+    assert config.retrieval.entity_model != retrieval.entity_model

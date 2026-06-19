@@ -20,7 +20,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.3"
+SERVER_VERSION = "0.1.5"
 SOURCE_TYPE_VALUES = [
     "agent_session",
     "confluence",
@@ -32,16 +32,14 @@ SOURCE_TYPE_VALUES = [
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 SEARCH_ALLOWED_KEYS = frozenset({
     "query",
-    "memory_types",
     "source_filter",
     "time_range",
-    "entities",
-    "include_private",
-    "include_superseded",
-    "active_project",
-    "scope_mode",
-    "status",
     "top_k",
+})
+SOURCE_FILTER_ALLOWED_KEYS = frozenset({
+    "source_types",
+    "clients",
+    "current_repo_only",
 })
 
 
@@ -49,38 +47,44 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "search",
         "description": (
-            "Search the team memory layer for facts, decisions, conventions, and procedures. "
-            "Returns ranked results with provenance and source artifact URLs when available."
+            "Search all memories visible to the current principal, including the user's own "
+            "private agent-session memories. Returns ranked results with provenance and "
+            "source artifact URLs when available."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Natural language search query"},
-                "memory_types": {
-                    "type": "array",
-                    "items": {"type": "string", "enum": ["fact", "decision", "convention", "procedure"]},
-                },
                 "source_filter": {
                     "type": "object",
                     "description": (
-                        "Optional exact source facets. Omit a facet when unsure; "
-                        "MemForge searches all visible memories when no facet is provided. "
-                        "Do not invent source ids or fuzzy names."
+                        "Optional provenance facets. Omit this object when unsure; MemForge "
+                        "searches all visible memories when no facet is provided. Do not "
+                        "invent source ids, repo ids, or fuzzy source names."
                     ),
                     "properties": {
                         "source_types": {
                             "type": "array",
                             "items": {"type": "string", "enum": SOURCE_TYPE_VALUES},
+                            "description": (
+                                "Restrict by source category, such as jira, confluence, "
+                                "or agent_session."
+                            ),
                         },
                         "clients": {
                             "type": "array",
                             "items": {"type": "string", "enum": AGENT_CLIENT_VALUES},
+                            "description": (
+                                "Restrict agent-session memories by producer. Use only when "
+                                "the user explicitly names Codex or Claude Code."
+                            ),
                         },
                         "current_repo_only": {
                             "type": "boolean",
                             "description": (
-                                "Restrict to the current git repository. The local proxy "
-                                "resolves the exact repo identifier; do not provide repo ids."
+                                "Restrict to agent-session memories for the current git "
+                                "repository. The local proxy resolves the exact repo "
+                                "identifier; do not provide repo ids."
                             ),
                         },
                     },
@@ -92,13 +96,6 @@ TOOLS: list[dict[str, Any]] = [
                         "after": {"type": "string"},
                         "before": {"type": "string"},
                     },
-                },
-                "entities": {"type": "array", "items": {"type": "string"}},
-                "include_private": {"type": "boolean", "default": False},
-                "include_superseded": {"type": "boolean", "default": False},
-                "status": {
-                    "type": "string",
-                    "enum": ["active", "superseded", "retired", "decayed", "pending_review"],
                 },
                 "top_k": {"type": "integer", "default": 10},
             },
@@ -157,7 +154,7 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "client": {"type": "string"},
+                "client": {"type": "string", "enum": AGENT_CLIENT_VALUES},
                 "session_id": {"type": "string"},
                 "trigger": {"type": "string"},
                 "workspace": {"type": "string"},
@@ -246,7 +243,7 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         memory_id = str(args.get("memory_id") or "").strip()
         if not memory_id:
             return {"error": "memory_id is required"}
-        return _http_json("GET", f"/api/memories/{quote(memory_id, safe='')}", None)
+        return _http_json("GET", f"/api/memories/{quote(memory_id, safe='')}?include_private=true", None)
     if name == "submit_agent_session_document":
         return _http_json("POST", "/api/agent-sessions/documents", args)
     if name == "get_resource":
@@ -263,11 +260,20 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
             + ". Omit unknown filters instead of guessing."
         )
     body = dict(args)
+    body["include_private"] = True
+    body["include_superseded"] = False
     repo_identifier = _active_repo_identifier()
     if repo_identifier:
         body["active_repo_identifier"] = repo_identifier
     source_filter = body.get("source_filter")
     if isinstance(source_filter, dict):
+        unknown_filter_keys = sorted(set(source_filter) - SOURCE_FILTER_ALLOWED_KEYS)
+        if unknown_filter_keys:
+            raise ValueError(
+                "Unsupported source_filter parameter(s): "
+                + ", ".join(unknown_filter_keys)
+                + ". Use current_repo_only for repo-scoped search or omit the facet."
+            )
         current_repo_only = bool(source_filter.pop("current_repo_only", False))
         if current_repo_only:
             if not repo_identifier:

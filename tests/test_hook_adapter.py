@@ -920,7 +920,11 @@ def test_mcp_proxy_forwards_search_to_service_with_token(monkeypatch):
     assert captured["url"] == "https://memforge.example/api/memories/search"
     assert captured["authorization"] == "Bearer token-123"
     assert captured["content_type"] == "application/json"
-    assert json.loads(captured["body"].decode()) == {"query": "artifact cache"}
+    assert json.loads(captured["body"].decode()) == {
+        "query": "artifact cache",
+        "include_private": True,
+        "include_superseded": False,
+    }
 
 
 def test_mcp_proxy_adds_detected_repo_as_ranking_hint_only(monkeypatch):
@@ -1066,7 +1070,12 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "repo_identifiers" not in properties["source_filter"]["properties"]
     assert "source_instance_ids" not in properties["source_filter"]["properties"]
     assert "sources" not in properties
-    assert "include_private" in properties
+    assert set(properties) == {"query", "source_filter", "time_range", "top_k"}
+    assert "include_private" not in properties
+    assert "include_superseded" not in properties
+    assert "status" not in properties
+    assert "memory_types" not in properties
+    assert "entities" not in properties
     assert "active_repo_identifier" not in properties
 
 
@@ -1104,7 +1113,56 @@ def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
     assert result == {"results": []}
     assert captured["url"] == "https://memforge.example/api/workspaces/mount_tai/api/memories/search"
     assert captured["authorization"] == "Bearer token-123"
-    assert json.loads(captured["body"].decode()) == {"query": "artifact cache"}
+    assert json.loads(captured["body"].decode()) == {
+        "query": "artifact cache",
+        "include_private": True,
+        "include_superseded": False,
+    }
+
+
+def test_mcp_proxy_rejects_removed_backend_search_knobs(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "query": "private memories",
+            "include_private": True,
+            "status": "active",
+            "memory_types": ["decision"],
+        },
+    )
+
+    assert result == {
+        "error": (
+            "Unsupported search parameter(s): include_private, memory_types, status. "
+            "Omit unknown filters instead of guessing."
+        )
+    }
+
+
+def test_mcp_proxy_rejects_unadvertised_source_filter_facets(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "query": "scheduler fix",
+            "source_filter": {
+                "source_types": ["agent_session"],
+                "repo_identifiers": ["github.tools.sap/hcm/other"],
+            },
+        },
+    )
+
+    assert result == {
+        "error": (
+            "Unsupported source_filter parameter(s): repo_identifiers. "
+            "Use current_repo_only for repo-scoped search or omit the facet."
+        )
+    }
 
 
 def test_mcp_proxy_fetches_resource_through_hosted_workspace(monkeypatch):
