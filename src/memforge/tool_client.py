@@ -90,7 +90,7 @@ class ToolClient:
         memory_id = memory_id.strip()
         if not memory_id:
             return {"error": "memory_id is required"}
-        return self._http_json("GET", f"/api/memories/{quote(memory_id, safe='')}", None)
+        return self._http_json("GET", f"/api/memories/{quote(memory_id, safe='')}?include_private=true", None)
 
     def push_local_markdown_document(
         self,

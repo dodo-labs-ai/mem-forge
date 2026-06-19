@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -394,6 +394,15 @@ def _has_structured_llm_credentials(llm: EffectiveLlmConfig) -> bool:
     )
 
 
+def _retrieval_config_for_llm(config: AppConfig, llm: EffectiveLlmConfig):
+    """Use the effective enrichment model for optional LLM retrieval assists."""
+    return replace(
+        config.retrieval,
+        entity_model=llm.enrichment_model,
+        rerank_model=llm.enrichment_model,
+    )
+
+
 async def build_search_engine(
     db: "Database",
     config: AppConfig,
@@ -435,7 +444,7 @@ async def build_search_engine(
         keyword=adapters.keyword,
         vector=adapters.vector,
         embed_cfg=embed_cfg,
-        config=config.retrieval,
+        config=_retrieval_config_for_llm(config, llm),
         structured_llm_client=structured_llm_client,
         artifact_config=config,
         artifact_store=doc_store,

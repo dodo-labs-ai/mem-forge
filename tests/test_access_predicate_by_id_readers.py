@@ -99,6 +99,24 @@ async def test_get_memory_by_id_returns_404_for_other_users_private(seeded_app):
 
 
 @pytest.mark.asyncio
+async def test_get_memory_by_id_personalized_includes_only_owners_private(seeded_app):
+    app, _database = seeded_app
+    with TestClient(app) as client:
+        own = client.get(
+            "/api/memories/m-u1-private",
+            params={"include_private": "true"},
+        )
+        other = client.get(
+            "/api/memories/m-u2-private",
+            params={"include_private": "true"},
+        )
+
+    assert own.status_code == 200, own.text
+    assert own.json()["id"] == "m-u1-private"
+    assert other.status_code == 404, other.text
+
+
+@pytest.mark.asyncio
 async def test_list_memories_excludes_other_users_private(seeded_app):
     app, _database = seeded_app
     with TestClient(app) as client:
