@@ -31,6 +31,7 @@ AGENT_SESSION_SOURCE_ID = "src-agent-sessions"
 AGENT_SESSION_SOURCE_TYPE = "agent_session"
 AGENT_SESSION_SOURCE_KIND = "generated_agent_summary"
 AGENT_SESSION_WINDOW_SOURCE_KIND = "generated_agent_window_summary"
+AGENT_SESSION_KNOWLEDGE_PATCH_MAX_TOKENS = 8192
 
 # Whitelisted clients with well-known source ids and display names.
 _KNOWN_CLIENT_SOURCE_IDS: dict[str, str] = {
@@ -836,7 +837,10 @@ async def submit_agent_session_window(
     try:
         generated = await structured_llm_client.generate_agent_knowledge_patch(
             prompt,
-            max_tokens=config.llm.enrichment_max_tokens,
+            max_tokens=min(
+                config.llm.enrichment_max_tokens,
+                AGENT_SESSION_KNOWLEDGE_PATCH_MAX_TOKENS,
+            ),
         )
     except Exception as exc:
         await _record_window_outcome(
