@@ -693,6 +693,258 @@ async def test_admin_document_content_alias_falls_back_to_raw_source(db: Databas
 
 
 @pytest.mark.asyncio
+async def test_admin_document_artifacts_can_use_non_filesystem_store(db: Database, tmp_path: Path):
+    from memforge.server.admin_api import create_admin_app
+    from memforge.storage.document_store import StoredDocumentArtifact
+
+    class MemoryBackedDocumentStore:
+        def __init__(self):
+            self.objects = {
+                "mem://doc.md": (
+                    b"# Durable source\n\nEvidence from a durable object store.",
+                    "source.md",
+                )
+            }
+
+        def get_artifact(self, uri: str | None, media_type: str):
+            if uri not in self.objects:
+                return None
+            content, filename = self.objects[uri]
+            return StoredDocumentArtifact(
+                uri=uri,
+                filename=filename,
+                media_type=media_type,
+                size_bytes=len(content),
+            )
+
+        def read_artifact(self, uri: str) -> bytes:
+            return self.objects[uri][0]
+
+        def read_normalized(self, stored_path: str) -> str | None:
+            content = self.objects.get(stored_path)
+            return content[0].decode("utf-8") if content else None
+
+        def store_raw(self, *args, **kwargs) -> str:
+            raise AssertionError("not used")
+
+        def store_normalized(self, *args, **kwargs) -> str:
+            raise AssertionError("not used")
+
+        def store_pdf(self, *args, **kwargs) -> str:
+            raise AssertionError("not used")
+
+        def delete_document_files(self, *, source_name: str, title: str) -> None:
+            raise AssertionError("not used")
+
+    await _insert_document(
+        db,
+        doc_id="doc-object-artifact-url",
+        normalized_content_uri="mem://doc.md",
+        raw_content_uri=None,
+    )
+    memory = await _insert_memory(
+        db,
+        mem_id="mem-object-artifact-url",
+        content="A durable object artifact should be exposed through provenance URLs.",
+    )
+    await db.add_memory_source(memory.id, "doc-object-artifact-url", "jira", excerpt="source excerpt")
+
+    app = create_admin_app(
+        db=db,
+        config=_config(tmp_path),
+        document_store=MemoryBackedDocumentStore(),
+    )
+    with TestClient(app) as client:
+        detail = client.get(f"/api/memories/{memory.id}")
+        manifest = client.get("/api/documents/doc-object-artifact-url/artifacts")
+        content = client.get("/api/documents/doc-object-artifact-url/content")
+
+    assert detail.status_code == 200
+    source = detail.json()["sources"][0]
+    assert source["content_url"] == "/api/documents/doc-object-artifact-url/content"
+    assert manifest.status_code == 200
+    assert manifest.json()["artifacts"]["normalized_markdown"]["size_bytes"] == 55
+    assert content.status_code == 200
+    assert content.text == "# Durable source\n\nEvidence from a durable object store."
+
+
+@pytest.mark.asyncio
+async def test_admin_document_artifacts_reject_local_paths_outside_docs_root(
+    db: Database,
+    tmp_path: Path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    outside = tmp_path / "outside-secret.md"
+    outside.write_text("should not be served", encoding="utf-8")
+    await _insert_document(
+        db,
+        doc_id="doc-outside-artifact-root",
+        normalized_content_uri=str(outside),
+        raw_content_uri=None,
+    )
+
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        manifest = client.get("/api/documents/doc-outside-artifact-root/artifacts")
+        content = client.get("/api/documents/doc-outside-artifact-root/content")
+        artifact = client.get(
+            "/api/documents/doc-outside-artifact-root/artifacts/normalized_markdown"
+        )
+
+    assert manifest.status_code == 200
+    assert manifest.json()["artifacts"] == {}
+    assert content.status_code == 404
+    assert artifact.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_source_uses_injected_document_store(
+    db: Database,
+    tmp_path: Path,
+    monkeypatch,
+):
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    class RecordingDocumentStore:
+        def __init__(self) -> None:
+            self.deleted: list[tuple[str, str]] = []
+
+        def delete_document_files(self, *, source_name: str, title: str) -> None:
+            self.deleted.append((source_name, title))
+
+        def get_artifact(self, uri, media_type):
+            return None
+
+        def read_artifact(self, uri: str) -> bytes:
+            raise AssertionError("not used")
+
+        def read_normalized(self, stored_path: str) -> str | None:
+            return None
+
+        def store_raw(self, *args, **kwargs) -> str:
+            raise AssertionError("not used")
+
+        def store_normalized(self, *args, **kwargs) -> str:
+            raise AssertionError("not used")
+
+        def store_pdf(self, *args, **kwargs) -> str:
+            raise AssertionError("not used")
+
+    class NoopMemoryStore:
+        async def delete_source_cascade(self, source_id: str):
+            return []
+
+    async def fake_build_memory_store(*args, **kwargs):
+        return NoopMemoryStore()
+
+    monkeypatch.setattr(admin_api, "_build_memory_store", fake_build_memory_store)
+    await db.upsert_source("src-confluence", "confluence", "Delete Route Source", "{}")
+    await _insert_document(
+        db,
+        doc_id="doc-delete-route",
+        raw_content_uri=None,
+        normalized_content_uri="mem://doc.md",
+    )
+
+    store = RecordingDocumentStore()
+    app = create_admin_app(db=db, config=_config(tmp_path), document_store=store)
+    with TestClient(app) as client:
+        response = client.delete("/api/sources/src-confluence")
+
+    assert response.status_code == 200, response.text
+    assert store.deleted == [("Delete Route Source", "Payroll Processing V2")]
+
+
+def test_sync_previous_content_read_does_not_bypass_document_store(tmp_path: Path):
+    from memforge.pipeline.sync import GeneSyncOrchestrator
+
+    outside = tmp_path / "outside-previous.md"
+    outside.write_text("previous content", encoding="utf-8")
+
+    class RejectingDocumentStore:
+        def read_normalized(self, stored_path: str) -> str | None:
+            assert stored_path == str(outside)
+            return None
+
+    orchestrator = GeneSyncOrchestrator(
+        db=object(),
+        doc_store=RejectingDocumentStore(),
+        enricher=object(),
+        memory_extractor=object(),
+        memory_engine=object(),
+        memory_store=object(),
+    )
+    doc = DocumentRecord(
+        doc_id="doc-previous-outside-root",
+        source="src-confluence",
+        source_url="https://confluence.example/doc-previous-outside-root",
+        title="Previous Source",
+        space_or_project="PAY",
+        author="Sun, Youpeng",
+        last_modified=datetime.now(timezone.utc),
+        labels=[],
+        version="1",
+        content_hash="hash-doc-previous-outside-root",
+        token_count=100,
+        raw_content_uri=None,
+        raw_content_type="text/html",
+        normalized_content_uri=str(outside),
+        pdf_content_uri=None,
+        last_synced=datetime.now(timezone.utc),
+    )
+
+    assert orchestrator._read_previous_normalized_content(doc) is None
+
+
+def test_confluence_gene_declares_pdf_artifact_requirement() -> None:
+    from memforge.genes.confluence_gene import ConfluenceGene
+    from memforge.models import ContentItem
+
+    item = ContentItem(
+        item_id="confluence-1",
+        title="Source Page",
+        source_url="https://confluence.example/1",
+        last_modified=datetime.now(timezone.utc),
+        version="1",
+    )
+    existing = DocumentRecord(
+        doc_id="confluence-1",
+        source="src-confluence",
+        source_url="https://confluence.example/1",
+        title="Source Page",
+        space_or_project="PAY",
+        author="Sun, Youpeng",
+        last_modified=datetime.now(timezone.utc),
+        labels=[],
+        version="1",
+        content_hash="old-hash",
+        token_count=100,
+        raw_content_uri=None,
+        raw_content_type="text/html",
+        normalized_content_uri="mem://doc.md",
+        pdf_content_uri="mem://doc.pdf",
+        last_synced=datetime.now(timezone.utc),
+    )
+
+    assert ConfluenceGene.requires_pdf_artifact(
+        object(),
+        item=item,
+        existing_doc=None,
+        existing_hash=None,
+        new_hash="new-hash",
+    )
+    assert not ConfluenceGene.requires_pdf_artifact(
+        object(),
+        item=item,
+        existing_doc=existing,
+        existing_hash="old-hash",
+        new_hash="old-hash",
+    )
+
+
+@pytest.mark.asyncio
 async def test_admin_memory_list_search_accepts_hyphenated_jira_id(db: Database, tmp_path: Path):
     from memforge.server.admin_api import create_admin_app
 

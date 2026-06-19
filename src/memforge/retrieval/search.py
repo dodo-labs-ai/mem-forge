@@ -23,7 +23,11 @@ from memforge.config import AppConfig, RetrievalConfig
 from memforge.llm.structured import StructuredLlmError
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
-from memforge.provenance import document_content_url, document_pdf_url
+from memforge.provenance import (
+    DocumentArtifactStore,
+    document_content_url_for_store,
+    document_pdf_url_for_store,
+)
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.retrieval.filters import MemorySourceFilter
 from memforge.retrieval.query_analyzer import QueryAnalysis, analyze_query
@@ -193,6 +197,7 @@ class SearchEngine:
         config: RetrievalConfig,
         structured_llm_client: Any | None = None,
         artifact_config: AppConfig | None = None,
+        artifact_store: DocumentArtifactStore | None = None,
         document_vector: VectorStore | None = None,
     ) -> None:
         self._relational = relational
@@ -204,6 +209,7 @@ class SearchEngine:
         self._embed_cache = EmbeddingCache(max_size=config.embedding_cache_size)
         self._structured_llm_client = structured_llm_client
         self._artifact_config = artifact_config
+        self._artifact_store = artifact_store
 
     # ==================================================================
     # Public API
@@ -758,8 +764,17 @@ class SearchEngine:
                     doc = await self._relational.get_document(primary.doc_id)
                     if doc:
                         source_doc_title = doc.title
-                        content_url = document_content_url(doc, self._artifact_config)
-                        pdf_url = document_pdf_url(doc, self._artifact_config)
+                        if self._artifact_config is not None:
+                            content_url = document_content_url_for_store(
+                                doc,
+                                self._artifact_config,
+                                self._artifact_store,
+                            )
+                            pdf_url = document_pdf_url_for_store(
+                                doc,
+                                self._artifact_config,
+                                self._artifact_store,
+                            )
                         source_url = doc.source_url
             except Exception:
                 logger.exception("Failed to fetch sources for memory %s", mid)
@@ -873,8 +888,17 @@ class SearchEngine:
                 doc = await self._relational.get_document(doc_id)
                 if doc:
                     title = doc.title
-                    content_url = document_content_url(doc, self._artifact_config)
-                    pdf_url = document_pdf_url(doc, self._artifact_config)
+                    if self._artifact_config is not None:
+                        content_url = document_content_url_for_store(
+                            doc,
+                            self._artifact_config,
+                            self._artifact_store,
+                        )
+                        pdf_url = document_pdf_url_for_store(
+                            doc,
+                            self._artifact_config,
+                            self._artifact_store,
+                        )
                     source_url = doc.source_url
                     source_type = doc.source
             except Exception:

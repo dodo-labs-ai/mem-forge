@@ -8,6 +8,10 @@ from urllib.parse import quote
 
 from memforge.config import AppConfig
 from memforge.models import DocumentRecord
+from memforge.storage.document_store import DocumentStore, LocalDocumentStore, StoredDocumentArtifact
+
+
+DocumentArtifactStore = DocumentStore
 
 
 def document_content_uri(doc: DocumentRecord | None) -> str | None:
@@ -39,58 +43,101 @@ def document_pdf_url(doc: DocumentRecord | None, config: AppConfig | None = None
     return f"/api/documents/{quote(doc.doc_id, safe='')}/pdf"
 
 
+def document_content_url_for_store(
+    doc: DocumentRecord | None,
+    config: AppConfig,
+    artifact_store: DocumentArtifactStore | None,
+) -> str | None:
+    """Return a content URL when the configured store can serve content."""
+    if doc is None:
+        return None
+    if select_document_artifact(doc, "content", config, artifact_store) is None:
+        return None
+    return f"/api/documents/{quote(doc.doc_id, safe='')}/content"
+
+
+def document_pdf_url_for_store(
+    doc: DocumentRecord | None,
+    config: AppConfig,
+    artifact_store: DocumentArtifactStore | None,
+) -> str | None:
+    """Return a PDF URL when the configured store can serve a PDF."""
+    if doc is None:
+        return None
+    if select_document_artifact(doc, "pdf", config, artifact_store) is None:
+        return None
+    return f"/api/documents/{quote(doc.doc_id, safe='')}/pdf"
+
+
 @dataclass(frozen=True)
 class DocumentArtifact:
     kind: str
-    path: Path
+    stored: StoredDocumentArtifact
     media_type: str
     url: str
 
     @property
     def filename(self) -> str:
-        return self.path.name
+        return self.stored.filename
 
     @property
-    def size_bytes(self) -> int:
-        return self.path.stat().st_size
+    def size_bytes(self) -> int | None:
+        return self.stored.size_bytes
+
+    @property
+    def uri(self) -> str:
+        return self.stored.uri
 
     def metadata(self) -> dict[str, object]:
-        return {
+        data: dict[str, object] = {
             "kind": self.kind,
             "url": self.url,
             "content_type": self.media_type,
             "filename": self.filename,
-            "size_bytes": self.size_bytes,
         }
+        if self.size_bytes is not None:
+            data["size_bytes"] = self.size_bytes
+        return data
 
 
-def list_document_artifacts(doc: DocumentRecord, config: AppConfig) -> dict[str, DocumentArtifact]:
+def list_document_artifacts(
+    doc: DocumentRecord,
+    config: AppConfig,
+    artifact_store: DocumentArtifactStore | None = None,
+) -> dict[str, DocumentArtifact]:
     """Return available source artifacts keyed by explicit artifact kind."""
     artifacts: dict[str, DocumentArtifact] = {}
+    store = artifact_store or LocalDocumentStore(config.storage.docs_path)
 
-    normalized_path = resolve_document_artifact_path(doc.normalized_content_uri, config)
-    if normalized_path is not None:
+    normalized = store.get_artifact(
+        doc.normalized_content_uri,
+        "text/markdown; charset=utf-8",
+    )
+    if normalized is not None:
         artifacts["normalized_markdown"] = DocumentArtifact(
             kind="normalized_markdown",
-            path=normalized_path,
+            stored=normalized,
             media_type="text/markdown; charset=utf-8",
             url=_document_artifact_url(doc.doc_id, "normalized_markdown"),
         )
 
-    raw_path = resolve_document_artifact_path(doc.raw_content_uri, config)
-    if raw_path is not None:
+    raw = store.get_artifact(
+        doc.raw_content_uri,
+        doc.raw_content_type or "application/octet-stream",
+    )
+    if raw is not None:
         artifacts["raw_source"] = DocumentArtifact(
             kind="raw_source",
-            path=raw_path,
+            stored=raw,
             media_type=doc.raw_content_type or "application/octet-stream",
             url=_document_artifact_url(doc.doc_id, "raw_source"),
         )
 
-    pdf_path = resolve_document_artifact_path(doc.pdf_content_uri, config)
-    if pdf_path is not None:
+    pdf = store.get_artifact(doc.pdf_content_uri, "application/pdf")
+    if pdf is not None:
         artifacts["pdf"] = DocumentArtifact(
             kind="pdf",
-            path=pdf_path,
+            stored=pdf,
             media_type="application/pdf",
             url=_document_artifact_url(doc.doc_id, "pdf"),
         )
@@ -102,9 +149,10 @@ def select_document_artifact(
     doc: DocumentRecord,
     kind: str,
     config: AppConfig,
+    artifact_store: DocumentArtifactStore | None = None,
 ) -> DocumentArtifact | None:
     """Select an artifact by explicit kind, with a content alias for text fallback."""
-    artifacts = list_document_artifacts(doc, config)
+    artifacts = list_document_artifacts(doc, config, artifact_store)
     if kind == "content":
         return artifacts.get("normalized_markdown") or artifacts.get("raw_source")
     return artifacts.get(kind)
