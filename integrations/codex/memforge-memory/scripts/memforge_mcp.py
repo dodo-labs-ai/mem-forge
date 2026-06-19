@@ -20,7 +20,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.2"
+SERVER_VERSION = "0.1.3"
 SOURCE_TYPE_VALUES = [
     "agent_session",
     "confluence",
@@ -40,7 +40,6 @@ SEARCH_ALLOWED_KEYS = frozenset({
     "include_superseded",
     "active_project",
     "scope_mode",
-    "active_repo_identifier",
     "status",
     "top_k",
 })
@@ -97,7 +96,6 @@ TOOLS: list[dict[str, Any]] = [
                 "entities": {"type": "array", "items": {"type": "string"}},
                 "include_private": {"type": "boolean", "default": False},
                 "include_superseded": {"type": "boolean", "default": False},
-                "active_repo_identifier": {"type": "string"},
                 "status": {
                     "type": "string",
                     "enum": ["active", "superseded", "retired", "decayed", "pending_review"],
@@ -265,11 +263,9 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
             + ". Omit unknown filters instead of guessing."
         )
     body = dict(args)
-    repo_identifier = str(body.get("active_repo_identifier") or "").strip() or None
-    if repo_identifier is None:
-        repo_identifier = _active_repo_identifier()
-        if repo_identifier:
-            body["active_repo_identifier"] = repo_identifier
+    repo_identifier = _active_repo_identifier()
+    if repo_identifier:
+        body["active_repo_identifier"] = repo_identifier
     source_filter = body.get("source_filter")
     if isinstance(source_filter, dict):
         current_repo_only = bool(source_filter.pop("current_repo_only", False))
