@@ -50,8 +50,16 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
                 }
             ]
 
-        async def count_source_memories(self, source_id: str) -> int:
+        async def count_source_memories(
+            self,
+            source_id: str,
+            *,
+            include_private: bool = False,
+            owner_user_id: str | None = None,
+        ) -> int:
             assert source_id == "src-neutral"
+            assert include_private is True
+            assert owner_user_id == "dev"
             return 7
 
         async def count_documents(self, source: str | None = None) -> int:
@@ -148,8 +156,16 @@ def test_source_projects_route_uses_storage_neutral_admin_reader(tmp_path):
             assert source_id == "src-neutral"
             return {"id": source_id, "type": "confluence", "name": "Neutral Source"}
 
-        async def list_source_projects(self, source_id: str) -> list[dict]:
+        async def list_source_projects(
+            self,
+            source_id: str,
+            *,
+            include_private: bool = False,
+            owner_user_id: str | None = None,
+        ) -> list[dict]:
             assert source_id == "src-neutral"
+            assert include_private is True
+            assert owner_user_id == "dev"
             return [
                 {
                     "project": "PAY",

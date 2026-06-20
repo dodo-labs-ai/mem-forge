@@ -312,8 +312,6 @@ function LastSyncDetails({
                     <dd className="font-medium text-destructive">{failedCount}</dd>
                   </>
                 )}
-                <dt className="text-muted-foreground">New memories</dt>
-                <dd className="font-medium text-foreground">{sync.memories_extracted}</dd>
                 {duration && (
                   <>
                     <dt className="text-muted-foreground">Duration</dt>

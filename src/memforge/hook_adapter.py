@@ -24,6 +24,26 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from .plugin_config import configured_api_token, configured_api_url, configured_workspace_id
+except ImportError:  # pragma: no cover - copied plugin package or direct file load
+    try:
+        from memforge_plugin_config import configured_api_token, configured_api_url, configured_workspace_id
+    except ImportError:
+        import importlib.util
+
+        _config_spec = importlib.util.spec_from_file_location(
+            "memforge_plugin_config",
+            Path(__file__).with_name("plugin_config.py"),
+        )
+        if _config_spec is None or _config_spec.loader is None:
+            raise
+        _config_module = importlib.util.module_from_spec(_config_spec)
+        _config_spec.loader.exec_module(_config_module)
+        configured_api_token = _config_module.configured_api_token
+        configured_api_url = _config_module.configured_api_url
+        configured_workspace_id = _config_module.configured_workspace_id
+
+try:
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None
@@ -40,10 +60,24 @@ WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
 PLUGIN_VERSION = "0.1.0"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
-    "For non-trivial tasks involving this repo's prior decisions, architecture, "
-    "debugging history, reviews, conventions, source context, or consistency "
-    "with earlier work, use the MemForge MCP search tool before answering or "
-    "editing. Use get_memory and get_resource when you need source evidence.\n"
+    "MemForge is long-term memory for prior decisions, conventions, debugging "
+    "history, source context, and user preferences. Use it agentically:\n\n"
+    "- Before non-trivial repo or workspace work, use the MemForge MCP search "
+    "tool with a natural language query. Omit filters when unsure so you do not "
+    "accidentally hide relevant memories.\n"
+    "- Use source filters only when the user or task gives a clear facet: "
+    "`current_repo_only` for current-repo agent-session history, `clients` only "
+    "when the user names Codex or Claude Code, and `source_types` only when a "
+    "specific source category such as Jira, Confluence, or agent sessions is "
+    "actually relevant.\n"
+    "- If a memory affects an answer, review, or code change, call `get_memory` "
+    "for full content and provenance before relying on it.\n"
+    "- If `content_url` or `pdf_url` is returned and the user needs source "
+    "evidence, quotes, or exact document context, call `get_resource`.\n"
+    "- Treat memory as context, not current truth. Verify current files, tests, "
+    "runtime state, or external systems when facts may have changed.\n"
+    "- If no relevant memory is found, continue normally and say so only when it "
+    "matters to the user.\n"
 )
 
 _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -125,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="MemForge agent hook adapter")
     parser.add_argument("mode", choices=("context", "submit-session", "worker-run-once"))
     parser.add_argument("--client", default=os.getenv("MEMFORGE_HOOK_CLIENT", "codex"))
-    parser.add_argument("--api-url", default=os.getenv("MEMFORGE_API_URL", DEFAULT_API_URL))
+    parser.add_argument("--api-url", default=configured_api_url(DEFAULT_API_URL))
     parser.add_argument("--timeout", type=float, default=_env_float("MEMFORGE_HOOK_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS))
     args = parser.parse_args(argv)
 
@@ -714,7 +748,7 @@ def _post_json(path: str, payload: dict[str, Any], *, api_url: str, timeout: flo
     url = _admin_api_request_url(path, api_url=api_url)
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    api_token = os.getenv("MEMFORGE_API_TOKEN")
+    api_token = configured_api_token()
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
     request = urllib.request.Request(
@@ -745,7 +779,7 @@ def _admin_api_base_url(api_url: str) -> str:
 
 
 def _workspace_id() -> str:
-    return os.getenv("MEMFORGE_WORKSPACE_ID", "").strip()
+    return configured_workspace_id()
 
 
 def _admin_api_request_url(path: str, *, api_url: str) -> str:

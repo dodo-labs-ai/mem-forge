@@ -280,6 +280,7 @@ export function MemoriesPage() {
           status: status !== "all" ? status : undefined,
           active_project: effectiveProjectKey,
           scope_mode: narrowToggle ? PROJECT_SEARCH_SCOPE : RELEVANCE_SEARCH_SCOPE,
+          include_private: true,
           top_k: LIST_PAGE_SIZE,
         };
         const response = await client.post<SearchResponse>("/api/memories/search", body);
@@ -298,6 +299,7 @@ export function MemoriesPage() {
           status: status !== "all" ? status : undefined,
           source: source !== "all" ? source : undefined,
           project: effectiveProjectKey ?? undefined,
+          include_private: "true",
           limit: LIST_PAGE_SIZE,
           offset: page * LIST_PAGE_SIZE,
         },

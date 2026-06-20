@@ -71,8 +71,6 @@ export function SyncStatusBar({
               <span className="font-medium text-foreground">{sync.docs_processed}</span> {itemLabel} checked
               {" · "}
               <span className="font-medium text-foreground">{sync.docs_updated}</span> updated
-              {" · "}
-              <span className="font-medium text-foreground">{sync.memories_extracted}</span> new memories
             </>
           )}
           {duration && ` · ${duration}`}
@@ -202,18 +200,6 @@ function runningProgressLabel(sync: SyncStatus, itemLabel: string) {
             <>
               {" · "}
               <span className="font-medium text-foreground">{sync.docs_stored}</span> stored {itemLabel}
-            </>
-          )}
-          {sync.memories_extracted > 0 && (
-            <>
-              {" · "}
-              <span className="font-medium text-foreground">{sync.memories_extracted}</span> new memories
-            </>
-          )}
-          {typeof sync.memories_stored === "number" && sync.memories_stored > 0 && (
-            <>
-              {" · "}
-              <span className="font-medium text-foreground">{sync.memories_stored}</span> stored memories
             </>
           )}
         </>
