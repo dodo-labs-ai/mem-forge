@@ -4,9 +4,10 @@ A row that the caller cannot see by the workspace-default predicate must be
 returned as 404 for an id-based GET, never as 200. The list endpoints (both
 the search-mode list and the simple-filter list) must apply the same
 predicate, so another user's private rows never leak through pagination
-either. The personalized variant (``include_private=True``) is opt-in via a
-query parameter and only ever surfaces the resolved principal's own private
-rows.
+either. The by-id detail route is personalized by default: it includes the
+resolved principal's own private row, but still returns 404 for another user's
+private row. List/search routes keep the explicit ``include_private=True``
+opt-in.
 """
 
 from __future__ import annotations
@@ -99,17 +100,11 @@ async def test_get_memory_by_id_returns_404_for_other_users_private(seeded_app):
 
 
 @pytest.mark.asyncio
-async def test_get_memory_by_id_personalized_includes_only_owners_private(seeded_app):
+async def test_get_memory_by_id_includes_only_owners_private_by_default(seeded_app):
     app, _database = seeded_app
     with TestClient(app) as client:
-        own = client.get(
-            "/api/memories/m-u1-private",
-            params={"include_private": "true"},
-        )
-        other = client.get(
-            "/api/memories/m-u2-private",
-            params={"include_private": "true"},
-        )
+        own = client.get("/api/memories/m-u1-private")
+        other = client.get("/api/memories/m-u2-private")
 
     assert own.status_code == 200, own.text
     assert own.json()["id"] == "m-u1-private"
