@@ -28,7 +28,10 @@ export function MemoryDetailPage() {
 
   const memoryQuery = useQuery<Memory>({
     queryKey: ["memory", id],
-    queryFn: () => client.get(`/api/memories/${id}`).then((response) => response.data),
+    queryFn: () =>
+      client
+        .get(`/api/memories/${id}`, { params: { include_private: "true" } })
+        .then((response) => response.data),
     enabled: Boolean(id),
   });
 

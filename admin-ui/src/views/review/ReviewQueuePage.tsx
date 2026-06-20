@@ -66,7 +66,7 @@ function useMemorySnapshots(reviews: MemoryReviewSummary[]) {
       const entries = await Promise.all(
         ids.map((id) =>
           client
-            .get(`/api/memories/${id}`)
+            .get(`/api/memories/${id}`, { params: { include_private: "true" } })
             .then((response) => [id, response.data] as const)
             .catch(() => [id, null] as const)
         )
