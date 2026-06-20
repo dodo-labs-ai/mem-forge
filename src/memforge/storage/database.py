@@ -3364,23 +3364,47 @@ class Database:
                 results.append(str(row["source_id"]))
         return results
 
-    async def count_source_memories(self, source_id: str) -> int:
+    async def count_source_memories(
+        self,
+        source_id: str,
+        *,
+        include_private: bool = False,
+        owner_user_id: str | None = None,
+    ) -> int:
+        visibility_sql = "m.visibility <> ?"
+        params: list[Any] = [source_id, Visibility.PRIVATE.value]
+        if include_private and owner_user_id:
+            visibility_sql = "(m.visibility <> ? OR m.owner_user_id = ?)"
+            params = [source_id, Visibility.PRIVATE.value, owner_user_id]
         async with self.db.execute(
-            """
+            f"""
             SELECT COUNT(DISTINCT ms.memory_id)
             FROM memory_sources ms
             JOIN documents d ON ms.doc_id = d.doc_id
+            JOIN memories m ON m.id = ms.memory_id
             WHERE d.source = ?
+              AND {visibility_sql}
             """,
-            (source_id,),
+            params,
         ) as cursor:
             row = await cursor.fetchone()
             return int(row[0]) if row else 0
 
-    async def list_source_projects(self, source_id: str) -> list[dict[str, Any]]:
+    async def list_source_projects(
+        self,
+        source_id: str,
+        *,
+        include_private: bool = False,
+        owner_user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        visibility_sql = "m.id IS NULL OR m.visibility <> ?"
+        params: list[Any] = [source_id, Visibility.PRIVATE.value]
+        if include_private and owner_user_id:
+            visibility_sql = "m.id IS NULL OR m.visibility <> ? OR m.owner_user_id = ?"
+            params = [source_id, Visibility.PRIVATE.value, owner_user_id]
         projects: list[dict[str, Any]] = []
         async with self.db.execute(
-            """
+            f"""
             SELECT
                 COALESCE(NULLIF(TRIM(d.space_or_project), ''), 'Unspecified') AS project,
                 COUNT(DISTINCT d.doc_id) AS document_count,
@@ -3388,11 +3412,13 @@ class Database:
                 MAX(d.last_modified) AS last_observed_at
             FROM documents d
             LEFT JOIN memory_sources ms ON ms.doc_id = d.doc_id
+            LEFT JOIN memories m ON m.id = ms.memory_id
             WHERE d.source = ?
+              AND ({visibility_sql})
             GROUP BY COALESCE(NULLIF(TRIM(d.space_or_project), ''), 'Unspecified')
             ORDER BY last_observed_at DESC, project ASC
             """,
-            (source_id,),
+            params,
         ) as cursor:
             async for row in cursor:
                 projects.append(
@@ -3406,7 +3432,11 @@ class Database:
         return projects
 
     async def list_resolved_projects_for_source(
-        self, source_id: str
+        self,
+        source_id: str,
+        *,
+        include_private: bool = False,
+        owner_user_id: str | None = None,
     ) -> list[tuple[str, int]]:
         """Group memories from a source by their resolved `project_key`.
 
@@ -3416,19 +3446,25 @@ class Database:
         resolver's verdict on each memory, so the admin can see where
         writes actually landed under the active `project_binding`.
         """
+        visibility_sql = "m.visibility <> ?"
+        params: list[Any] = [source_id, Visibility.PRIVATE.value]
+        if include_private and owner_user_id:
+            visibility_sql = "(m.visibility <> ? OR m.owner_user_id = ?)"
+            params = [source_id, Visibility.PRIVATE.value, owner_user_id]
         rows: list[tuple[str, int]] = []
         async with self.db.execute(
-            """
+            f"""
             SELECT m.project_key AS project_key,
                    COUNT(DISTINCT m.id) AS memory_count
             FROM memories m
             JOIN memory_sources ms ON ms.memory_id = m.id
             JOIN documents d ON d.doc_id = ms.doc_id
             WHERE d.source = ?
+              AND {visibility_sql}
             GROUP BY m.project_key
             ORDER BY memory_count DESC, project_key ASC
             """,
-            (source_id,),
+            params,
         ) as cursor:
             async for row in cursor:
                 key = row["project_key"] or UNSORTED_PROJECT_KEY

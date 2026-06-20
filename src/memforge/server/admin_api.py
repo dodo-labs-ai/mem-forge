@@ -3170,6 +3170,7 @@ def create_admin_app(
     @source_router.get("/{source_id}/projects", response_model=SourceProjectsResponse)
     async def list_source_projects(
         source_id: str,
+        request: Request,
         db: Database = Depends(get_db),
     ):
         """List project buckets observed for one source."""
@@ -3184,7 +3185,11 @@ def create_admin_app(
                 memory_count=int(row["memory_count"]),
                 last_observed_at=row.get("last_observed_at"),
             )
-            for row in await db.list_source_projects(source_id)
+            for row in await db.list_source_projects(
+                source_id,
+                include_private=True,
+                owner_user_id=resolve_request_principal(request),
+            )
         ]
 
         return SourceProjectsResponse(source_id=source_id, projects=projects)
@@ -3194,6 +3199,7 @@ def create_admin_app(
     )
     async def list_source_resolved_projects(
         source_id: str,
+        request: Request,
         db: Database = Depends(get_db),
     ):
         """List the resolved `project_key` distribution for one source.
@@ -3207,7 +3213,11 @@ def create_admin_app(
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
 
-        rows = await db.list_resolved_projects_for_source(source_id)
+        rows = await db.list_resolved_projects_for_source(
+            source_id,
+            include_private=True,
+            owner_user_id=resolve_request_principal(request),
+        )
         projects = [
             ResolvedProjectResponse(project_key=key, memory_count=count)
             for key, count in rows

@@ -10,6 +10,20 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_memforge_plugin_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
+    monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
+    monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
+    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(tmp_path / "missing-codex-config.toml"))
+    try:
+        from memforge import plugin_config
+
+        monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
+    except Exception:
+        pass
+
+
 def _init_git_repo_with_origin(path: Path, origin_url: str) -> None:
     subprocess.run(["git", "init"], cwd=path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     subprocess.run(
@@ -819,6 +833,17 @@ def test_plugin_adapters_match_canonical_adapter():
         assert adapter.read_text() == canonical
 
 
+def test_plugin_config_helpers_match_canonical_config():
+    root = Path(__file__).resolve().parents[1]
+    canonical = (root / "src" / "memforge" / "plugin_config.py").read_text()
+
+    for helper in (
+        root / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
+        root / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
+    ):
+        assert helper.read_text() == canonical
+
+
 def test_plugin_mcp_launchers_match_each_other():
     root = Path(__file__).resolve().parents[1]
     canonical = root / "src" / "memforge" / "plugin_mcp_proxy.py"
@@ -1401,6 +1426,113 @@ def test_post_json_includes_configured_bearer_token(monkeypatch):
     hook_adapter._post_json("/api/hooks/context", {}, api_url="http://127.0.0.1:8766", timeout=1)
 
     assert auth_headers == ["Bearer secret-token"]
+
+
+def test_hook_adapter_uses_codex_mcp_config_when_hook_env_is_absent(monkeypatch, tmp_path, capsys):
+    from memforge import hook_adapter
+    from memforge import plugin_config
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        """
+[mcp_servers.memforge.env]
+MEMFORGE_API_URL = "https://memforge.example"
+MEMFORGE_API_TOKEN = "config-token"
+MEMFORGE_WORKSPACE_ID = "mount_tai"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
+    monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
+    monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
+    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(codex_home / "config.toml"))
+    monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
+
+    requests: list[tuple[str, str | None, float]] = []
+
+    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+        requests.append((path, api_url, timeout))
+        return {}
+
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
+        "hook_event_name": "Stop",
+        "session_id": "sess-config-fallback",
+        "cwd": str(tmp_path),
+    }))
+
+    exit_code = hook_adapter.main(["submit-session"])
+
+    assert exit_code == 0
+    assert requests == [("/api/hooks/receipts", "https://memforge.example", 5.0)]
+    assert capsys.readouterr().out == ""
+
+
+def test_post_json_uses_codex_mcp_config_for_workspace_and_token(monkeypatch, tmp_path):
+    from memforge import hook_adapter
+    from memforge import plugin_config
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        """
+[mcp_servers.memforge.env]
+MEMFORGE_API_URL = "https://memforge.example"
+MEMFORGE_API_TOKEN = "config-token"
+MEMFORGE_WORKSPACE_ID = "mount_tai"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
+    monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
+    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(codex_home / "config.toml"))
+    monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
+    observed: dict[str, str | None] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def fake_urlopen(request, timeout: float):
+        observed["url"] = request.full_url
+        observed["authorization"] = request.get_header("Authorization")
+        return FakeResponse()
+
+    monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
+
+    hook_adapter._post_json("/api/hooks/receipts", {}, api_url="https://memforge.example", timeout=1)
+
+    assert observed == {
+        "url": "https://memforge.example/api/workspaces/mount_tai/api/hooks/receipts",
+        "authorization": "Bearer config-token",
+    }
+
+
+def test_session_start_guidance_explains_agentic_memforge_usage(monkeypatch, capsys):
+    from memforge import hook_adapter
+
+    monkeypatch.setattr(hook_adapter, "_drain_pending_agent_windows_if_present", lambda **_: None)
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
+        "hook_event_name": "SessionStart",
+        "session_id": "sess-guidance",
+    }))
+
+    exit_code = hook_adapter.main(["context", "--api-url", "http://127.0.0.1:8765"])
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    guidance = output["hookSpecificOutput"]["additionalContext"]
+    assert "Use it agentically" in guidance
+    assert "get_memory" in guidance
+    assert "get_resource" in guidance
+    assert "Treat memory as context, not current truth" in guidance
 
 
 def test_session_window_payload_redacts_before_network_and_versions_contract(tmp_path):

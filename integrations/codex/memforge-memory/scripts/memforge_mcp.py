@@ -17,10 +17,30 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+try:
+    from .plugin_config import configured_api_token, configured_api_url, configured_workspace_id
+except ImportError:  # pragma: no cover - copied plugin package or direct file load
+    try:
+        from memforge_plugin_config import configured_api_token, configured_api_url, configured_workspace_id
+    except ImportError:
+        import importlib.util
+
+        _config_spec = importlib.util.spec_from_file_location(
+            "memforge_plugin_config",
+            Path(__file__).with_name("plugin_config.py"),
+        )
+        if _config_spec is None or _config_spec.loader is None:
+            raise
+        _config_module = importlib.util.module_from_spec(_config_spec)
+        _config_spec.loader.exec_module(_config_module)
+        configured_api_token = _config_module.configured_api_token
+        configured_api_url = _config_module.configured_api_url
+        configured_workspace_id = _config_module.configured_workspace_id
+
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.5"
+SERVER_VERSION = "0.1.6"
 SOURCE_TYPE_VALUES = [
     "agent_session",
     "confluence",
@@ -345,11 +365,11 @@ def _tool_result(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _api_base_url() -> str:
-    return os.getenv("MEMFORGE_API_URL", DEFAULT_API_URL).rstrip("/")
+    return configured_api_url(DEFAULT_API_URL)
 
 
 def _workspace_id() -> str:
-    return os.getenv("MEMFORGE_WORKSPACE_ID", "").strip()
+    return configured_workspace_id()
 
 
 def _api_request_url(path: str) -> str:
@@ -369,7 +389,7 @@ def _api_headers(*, json_body: bool = False) -> dict[str, str]:
     headers = {"Accept": "application/json"}
     if json_body:
         headers["Content-Type"] = "application/json"
-    token = os.getenv("MEMFORGE_API_TOKEN")
+    token = configured_api_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers

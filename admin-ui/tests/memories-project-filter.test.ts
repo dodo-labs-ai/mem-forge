@@ -33,4 +33,16 @@ assert.doesNotMatch(
   "the Memories page should not block the list behind the global project chip",
 );
 
+assert.match(
+  memoriesSource,
+  /include_private:\s*true,/,
+  "the Memories page should include the current user's private rows, including agent-session memories",
+);
+
+assert.match(
+  memoriesSource,
+  /include_private:\s*"true",/,
+  "the Memories list route should request current-user private rows for source filters",
+);
+
 console.log("memories-project-filter.test.ts: all assertions passed");
