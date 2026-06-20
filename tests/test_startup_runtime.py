@@ -11,6 +11,7 @@ from rich.logging import RichHandler
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
+from memforge.models import Memory, Visibility, content_hash
 from memforge.storage.database import Database
 
 TEST_SOURCE_KEY = "VV4JjZLLr2BcgRnhV90gCnxzchn43M900VQy3dXJI30="
@@ -1157,6 +1158,115 @@ async def test_admin_sources_exposes_running_stored_counts_separately(db, tmp_pa
     assert source["sync"]["memories_stored"] == 2
     assert "docs_committed" not in source["sync"]
     assert "memories_committed" not in source["sync"]
+
+
+@pytest.mark.asyncio
+async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(
+    db, tmp_path
+):
+    """Source counts and memory-list totals must share one visibility contract.
+
+    A sync history row reports how many memories the latest run extracted. The
+    source ``memory_count`` is different: it is the durable count visible to the
+    current viewer for that source. This pins the route-level contract so every
+    store adapter implements the same source-provenance + visibility semantics.
+    """
+
+    from memforge.server.admin_api import create_admin_app
+
+    source_id = "src-private-sessions"
+    now = "2026-06-20T10:00:00+00:00"
+    await db.upsert_source(
+        id=source_id,
+        type="agent_session",
+        name="Codex Session",
+        config_json=json.dumps({}),
+    )
+    for index, owner in enumerate(["viewer-a", "viewer-a", "viewer-b"], start=1):
+        doc_id = f"doc-private-{index}"
+        memory_id = f"mem-private-{index}"
+        await db.db.execute(
+            """INSERT INTO documents
+               (doc_id, source, source_url, title, space_or_project,
+                last_modified, version, content_hash, last_synced, client)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                doc_id,
+                source_id,
+                f"agent-session://codex/session-{index}",
+                f"Session {index}",
+                "github.com/example/repo",
+                now,
+                "1",
+                f"doc-hash-{index}",
+                now,
+                "codex",
+            ),
+        )
+        await db.insert_memory(
+            Memory(
+                id=memory_id,
+                memory_type="fact",
+                content=f"Private memory {index}",
+                content_hash=content_hash(f"Private memory {index}"),
+                visibility=Visibility.PRIVATE.value,
+                owner_user_id=owner,
+                confidence=0.9,
+                status="active",
+            )
+        )
+        await db.add_memory_source(
+            memory_id,
+            doc_id,
+            "agent_session",
+            f"Excerpt {index}",
+        )
+    await db.insert_sync_history(
+        source=source_id,
+        status="success",
+        docs_processed=1,
+        docs_updated=1,
+        docs_failed=0,
+        memories_extracted=3,
+        error_message=None,
+        failed_docs=[],
+        started_at="2026-06-20T10:01:00+00:00",
+        finished_at="2026-06-20T10:02:00+00:00",
+    )
+    await db.db.commit()
+
+    app = create_admin_app(
+        db=db,
+        config=_config(tmp_path),
+        principal_resolver=lambda request: "viewer-a",
+    )
+
+    with TestClient(app) as client:
+        sources_response = client.get("/api/sources")
+        memories_response = client.get(
+            "/api/memories",
+            params={
+                "source": source_id,
+                "include_private": "true",
+                "limit": 20,
+            },
+        )
+
+    assert sources_response.status_code == 200
+    assert memories_response.status_code == 200
+    source = next(
+        item
+        for item in sources_response.json()["data"]
+        if item["id"] == source_id
+    )
+    memories = memories_response.json()
+    assert source["sync"]["memories_extracted"] == 3
+    assert memories["total"] == 2
+    assert source["memory_count"] == 2
+    assert {item["id"] for item in memories["data"]} == {
+        "mem-private-1",
+        "mem-private-2",
+    }
 
 
 def test_source_secret_field_policy_is_gene_driven_for_known_sources():
