@@ -264,6 +264,7 @@ class MemoryResponse(BaseModel):
     retired_at: str | None = None
     superseded_at: str | None = None
     replacement_reason: str | None = None
+    replacement_kind: str | None = None
     extraction_context: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
@@ -1677,6 +1678,7 @@ def _memory_to_response(
         retired_at=_dt_iso(mem.retired_at),
         superseded_at=_dt_iso(mem.superseded_at),
         replacement_reason=mem.replacement_reason,
+        replacement_kind=mem.replacement_kind,
         extraction_context=mem.extraction_context,
         created_at=_dt_iso(mem.created_at),
         updated_at=_dt_iso(mem.updated_at),
@@ -2513,6 +2515,7 @@ def create_admin_app(
             retired_at=_dt_iso(mem.retired_at),
             superseded_at=_dt_iso(mem.superseded_at),
             replacement_reason=mem.replacement_reason,
+            replacement_kind=mem.replacement_kind,
             extraction_context=mem.extraction_context,
             created_at=_dt_iso(mem.created_at),
             updated_at=_dt_iso(mem.updated_at),
