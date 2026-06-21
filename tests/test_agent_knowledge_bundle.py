@@ -7,6 +7,7 @@ import pytest
 from memforge.agent_knowledge import (
     AgentKnowledgeBundleService,
     AgentKnowledgePatchProposal,
+    render_agent_knowledge_patch_prompt,
 )
 from memforge.memory.store import MemoryStore
 from memforge.models import Visibility
@@ -75,6 +76,7 @@ def _proposal(**overrides) -> AgentKnowledgePatchProposal:
             "Workspace source schedulers must start during app startup so overdue "
             "source schedules run without UI traffic."
         ),
+        "memory_content": "Workspace source schedulers must start during app startup so overdue schedules run without UI traffic.",
         "memory_type": "procedure",
         "tags": ["scheduler", "source-sync"],
         "reason": "The window confirms a durable scheduler invariant.",
@@ -123,12 +125,13 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
     assert memory.visibility == Visibility.PRIVATE.value
     assert memory.owner_user_id == "u-andrew"
     assert memory.repo_identifier == "github.tools.sap/hcm/memforge-cloud"
-    assert "overdue source schedules" in memory.content
+    assert memory.content == "Workspace source schedulers must start during app startup so overdue schedules run without UI traffic."
+    assert "overdue source schedules" in (memory.extraction_context or "")
     assert collection.upserted[result.memory_id]["owner_user_id"] == "u-andrew"
 
 
 @pytest.mark.asyncio
-async def test_update_existing_claim_updates_same_memory(bundle_stack):
+async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
     db, store, collection = bundle_stack
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
@@ -151,6 +154,8 @@ async def test_update_existing_claim_updates_same_memory(bundle_stack):
                 "Workspace source schedulers must start during app startup, claim due "
                 "source schedules, and advance next_run_at after a successful claim."
             ),
+            memory_content="Source schedulers start on app startup, claim due schedules, and advance next_run_at after success.",
+            reason="New evidence refines the scheduler lifecycle claim.",
             citations=["agent-window://codex/sess-2/sha256-window"],
         ),
         owner_user_id="u-andrew",
@@ -165,19 +170,195 @@ async def test_update_existing_claim_updates_same_memory(bundle_stack):
     assert updated.outcome == "applied"
     assert updated.concept_id == created.concept_id
     assert updated.claim_id == created.claim_id
-    assert updated.memory_id == created.memory_id
+    assert updated.memory_id != created.memory_id
 
-    memories = await db.list_memories(source="src-agent-sessions-codex", limit=10)
-    assert [memory.id for memory in memories] == [created.memory_id]
-    memory = memories[0]
-    assert "advance next_run_at" in memory.content
-    assert collection.upserted[created.memory_id]["content_hash"] == memory.content_hash
+    memory = await db.get_memory(updated.memory_id)
+    assert memory is not None
+    assert memory.content == "Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."
+    assert "advance next_run_at" in (memory.extraction_context or "")
+    assert collection.upserted[updated.memory_id]["content_hash"] == memory.content_hash
+    assert created.memory_id in collection.deleted
+
+    old_memory = await db.get_memory(created.memory_id)
+    assert old_memory is not None
+    assert old_memory.status == "superseded"
+    assert old_memory.superseded_by == updated.memory_id
+    assert old_memory.replacement_reason == "New evidence refines the scheduler lifecycle claim."
+    assert old_memory.replacement_kind == "revision"
+
+    claim = await db.get_agent_claim(created.claim_id)
+    assert claim is not None
+    assert claim["memory_id"] == updated.memory_id
+    assert "advance next_run_at" in claim["claim_text"]
 
     citations = await db.list_agent_claim_citations(created.claim_id)
     assert [citation["citation_url"] for citation in citations] == [
         "agent-window://codex/sess-1/sha256-window",
         "agent-window://codex/sess-2/sha256-window",
     ]
+
+
+@pytest.mark.asyncio
+async def test_supersede_existing_claim_records_memory_lifecycle(bundle_stack):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    created = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+
+    superseded = await service.apply_patch_proposal(
+        proposal=_proposal(
+            action="supersede_existing_claim",
+            concept_id=created.concept_id,
+            claim_id=created.claim_id,
+            claim_text=(
+                "The source scheduler startup claim is obsolete: the scheduler is "
+                "now started by the cloud app bootstrap during lifespan startup."
+            ),
+            memory_content="Source scheduler startup is owned by the cloud app bootstrap lifespan.",
+            reason="New implementation replaced the older scheduler startup claim.",
+        ),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-2",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+
+    assert superseded.outcome == "applied"
+    assert superseded.claim_id == created.claim_id
+    new_memory = await db.get_memory(superseded.memory_id)
+    old_memory = await db.get_memory(created.memory_id)
+    assert new_memory is not None
+    assert old_memory is not None
+    assert new_memory.status == "active"
+    assert old_memory.status == "superseded"
+    assert old_memory.superseded_by == new_memory.id
+    assert old_memory.replacement_reason == "New implementation replaced the older scheduler startup claim."
+    assert old_memory.replacement_kind == "supersession"
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_requires_structured_memory_projection(bundle_stack):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+
+    result = await service.apply_patch_proposal(
+        proposal=_proposal(memory_content=None),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+
+    assert result.outcome == "parse_failed"
+    assert result.reason == "memory_content is required"
+
+
+@pytest.mark.asyncio
+async def test_agent_patch_result_carries_explicit_result_bucket(bundle_stack):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+
+    parsed_failure = await service.apply_patch_proposal(
+        proposal=_proposal(memory_content=None),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+    no_output = await service.apply_patch_proposal(
+        proposal=_proposal(action="no_output", claim_text="", memory_content=None),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+
+    assert parsed_failure.result_bucket == "failed"
+    assert no_output.result_bucket == "no_output"
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_accepts_detailed_memory_projection(bundle_stack):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    detailed_projection = " ".join(["Detailed projection remains valid when the flow needs context."] * 40)
+
+    result = await service.apply_patch_proposal(
+        proposal=_proposal(memory_content=detailed_projection),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+
+    assert result.outcome == "applied"
+
+
+@pytest.mark.asyncio
+async def test_agent_memory_prompt_describes_durable_memory_not_retrieval_projection(bundle_stack):
+    db, _store, _collection = bundle_stack
+
+    prompt = await render_agent_knowledge_patch_prompt(
+        db=db,
+        owner_user_id="u-andrew",
+        client="codex",
+        session_id="sess-1",
+        trigger="stop",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        branch="main",
+        history_window={"kind": "transcript_window"},
+        events=[{"kind": "decision", "text": "Use immutable memory revisions."}],
+        transcript_markdown="",
+    )
+
+    assert "durable memory record" in prompt
+    assert "retrieval-ready" not in prompt
+    assert "memory projection" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_patch_missing_claim_text_is_failed_not_no_output(bundle_stack):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+
+    result = await service.apply_patch_proposal(
+        proposal=_proposal(claim_text=""),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+
+    assert result.outcome == "parse_failed"
+    assert result.result_bucket == "failed"
+    assert result.reason == "claim_text is required"
 
 
 @pytest.mark.asyncio

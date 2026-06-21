@@ -19,6 +19,7 @@ from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import (
     Memory,
     MemoryStatus,
+    ReplacementKind,
     UNSORTED_PROJECT_KEY,
     Visibility,
 )
@@ -589,6 +590,8 @@ class MemoryStore:
         new_memory: Memory,
         doc_id: str,
         source_type: str,
+        *,
+        replacement_kind: ReplacementKind,
         entity_ids: list[int] | None = None,
         excerpt: str | None = None,
         replacement_reason: str | None = None,
@@ -617,9 +620,22 @@ class MemoryStore:
                 old_memory_id,
                 new_memory,
                 replacement_reason=replacement_reason,
+                replacement_kind=replacement_kind,
             )
             await self._remove_from_search_indexes(old_memory_id, label="superseded", context=context)
 
+            if replacement_kind == "revision":
+                carried_sources = await self.db.get_memory_sources(old_memory_id)
+                for source in carried_sources:
+                    if source.doc_id == doc_id:
+                        continue
+                    await self.db.add_memory_source(
+                        new_memory.id,
+                        source.doc_id,
+                        source.source_type,
+                        source.excerpt,
+                        support_kind=source.support_kind,
+                    )
             await self.db.add_memory_source(
                 new_memory.id,
                 doc_id,
@@ -1101,6 +1117,7 @@ class MemoryStore:
         *,
         incumbent: Memory,
         challenger: Memory,
+        replacement_kind: ReplacementKind,
         replacement_reason: str | None = None,
         review_id: str | None = None,
         context: AuditContext | None = None,
@@ -1117,6 +1134,7 @@ class MemoryStore:
                 incumbent_id=incumbent.id,
                 challenger=challenger,
                 replacement_reason=replacement_reason,
+                replacement_kind=replacement_kind,
             )
             promotion_phase = "fts_upsert"
             await self._emit(

@@ -42,8 +42,6 @@ _KNOWN_CLIENT_SOURCE_NAMES: dict[str, str] = {
     "codex": "Codex Session",
     "claude-code": "Claude Code Session",
 }
-
-
 def agent_session_source_id(client: str) -> str:
     """Return the canonical source id for the given client.
 
@@ -931,10 +929,11 @@ async def submit_agent_session_window(
 
     if patch.outcome != "applied":
         reason = patch.reason or proposal.reason or "window had no durable memory value"
+        result = patch.result_bucket
         await _record_window_outcome(
             db=db,
             **outcome_identity,
-            outcome="no_output",
+            outcome=result,
             reason=reason,
             metadata={"patch_outcome": patch.outcome},
         )
@@ -942,7 +941,7 @@ async def submit_agent_session_window(
             "accepted": True,
             "window_hash": f"sha256:{window_hash}",
             "status": "processed",
-            "result": "no_output",
+            "result": result,
             "patch_outcome": patch.outcome,
             "reason": reason,
         }
