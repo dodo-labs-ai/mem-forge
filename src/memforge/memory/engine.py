@@ -506,13 +506,26 @@ class MemoryEngine:
                 elif op.action == ReconcileAction.UPDATE and op.memory_id and op.memory:
                     if not self._candidate_can_persist(op.memory, stats):
                         continue
-                    await self.memory_store.update_memory(
-                        memory_id=op.memory_id,
-                        new_content=op.memory.content,
-                        new_confidence=op.memory.confidence,
+                    new_memory = self._build_memory(
+                        op.memory,
+                        project_key,
+                        source_type,
+                        user_id=user_id,
+                        repo_identifier=repo_identifier,
+                    )
+                    memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
+                    await self.memory_store.supersede_memory(
+                        old_memory_id=op.memory_id,
+                        new_memory=new_memory,
+                        doc_id=doc_id,
+                        source_type=source_type,
+                        entity_ids=memory_entity_ids,
+                        excerpt=op.memory.extraction_context,
+                        replacement_reason=op.reason,
+                        replacement_kind="revision",
                     )
                     stats["updated"] += 1
-                    logger.info("RECONCILE UPDATE: %s - %s", op.memory_id, op.reason)
+                    logger.info("RECONCILE UPDATE: %s -> %s - %s", op.memory_id, new_memory.id, op.reason)
 
                 elif op.action == ReconcileAction.SUPERSEDE and op.memory_id and op.memory:
                     if not self._candidate_can_persist(op.memory, stats):
@@ -531,7 +544,9 @@ class MemoryEngine:
                         doc_id=doc_id,
                         source_type=source_type,
                         entity_ids=memory_entity_ids,
+                        excerpt=op.memory.extraction_context,
                         replacement_reason=op.reason,
+                        replacement_kind="supersession",
                     )
                     stats["superseded"] += 1
                     logger.info("RECONCILE SUPERSEDE: %s -> %s - %s", op.memory_id, new_memory.id, op.reason)

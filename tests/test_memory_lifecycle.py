@@ -189,7 +189,12 @@ class TestSupersessionMetadata:
         new = _make_memory("mem-new0001", "PostgreSQL version is 16")
         await db.insert_memory(old)
 
-        await db.supersede_memory(old.id, new, replacement_reason="same_source_replacement")
+        await db.supersede_memory(
+            old.id,
+            new,
+            replacement_reason="same_source_replacement",
+            replacement_kind="supersession",
+        )
 
         stored_old = await db.get_memory(old.id)
         stored_new = await db.get_memory(new.id)
@@ -198,7 +203,56 @@ class TestSupersessionMetadata:
         assert stored_old.valid_until is not None
         assert stored_old.superseded_at is not None
         assert stored_old.replacement_reason == "same_source_replacement"
+        assert stored_old.replacement_kind == "supersession"
         assert stored_new.status == "active"
+
+    @pytest.mark.asyncio
+    async def test_resolve_current_memory_id_walks_supersession_chain(self, db):
+        first = _make_memory("mem-chain-1", "First version")
+        second = _make_memory("mem-chain-2", "Second version")
+        third = _make_memory("mem-chain-3", "Third version")
+        await db.insert_memory(first)
+
+        await db.supersede_memory(first.id, second, replacement_reason="revision", replacement_kind="revision")
+        await db.supersede_memory(second.id, third, replacement_reason="revision", replacement_kind="revision")
+
+        assert await db.resolve_current_memory_id(first.id) == third.id
+        assert await db.resolve_current_memory_id(second.id) == third.id
+        assert await db.resolve_current_memory_id(third.id) == third.id
+        assert await db.resolve_current_memory_id("missing-memory") is None
+
+    @pytest.mark.asyncio
+    async def test_resolve_current_memory_id_rejects_cycles(self, db):
+        first = _make_memory("mem-cycle-1", "First version")
+        second = _make_memory("mem-cycle-2", "Second version")
+        await db.insert_memory(first)
+        await db.insert_memory(second)
+        await db.db.execute(
+            "UPDATE memories SET status = 'superseded', superseded_by = ? WHERE id = ?",
+            (second.id, first.id),
+        )
+        await db.db.execute(
+            "UPDATE memories SET status = 'superseded', superseded_by = ? WHERE id = ?",
+            (first.id, second.id),
+        )
+        await db.db.commit()
+
+        with pytest.raises(RuntimeError, match="cycle"):
+            await db.resolve_current_memory_id(first.id)
+
+    @pytest.mark.asyncio
+    async def test_supersede_rejects_invalid_replacement_kind(self, db):
+        old = _make_memory("mem-old-bad-kind", "Old fact")
+        new = _make_memory("mem-new-bad-kind", "New fact")
+        await db.insert_memory(old)
+
+        with pytest.raises(ValueError, match="replacement kind"):
+            await db.supersede_memory(
+                old.id,
+                new,
+                replacement_reason="typo",
+                replacement_kind="revison",  # type: ignore[arg-type]
+            )
 
 
 class TestExpiryRetirement:

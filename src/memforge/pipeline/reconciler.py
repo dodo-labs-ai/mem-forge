@@ -57,7 +57,8 @@ For each new extraction, decide ONE action:
 
 - ADD: Genuinely new information not covered by any existing memory.
 - UPDATE: An existing memory covers the same fact but needs minor refinement.
-  Provide the merged text. The core claim remains true.
+  Provide the merged current text. The core claim remains true. The old memory
+  will be preserved with a timestamp but hidden from default search.
 - SUPERSEDE: An existing memory covers the same topic but is now materially wrong.
   The old fact was true before but is no longer. The new fact replaces the old meaning.
   The old memory will be preserved with a timestamp but hidden from search.
@@ -95,8 +96,8 @@ the updated document excerpt may be incomplete.
 Rules:
 1. Each new extraction gets EXACTLY ONE action.
 2. For UPDATE and SUPERSEDE, specify which existing memory ID is affected.
-3. For UPDATE, provide the merged text as "updated_content".
-4. If uncertain between UPDATE and SUPERSEDE, prefer SUPERSEDE (preserves history).
+3. For UPDATE, provide the merged current text as "updated_content".
+4. If uncertain between UPDATE and SUPERSEDE, prefer SUPERSEDE when the old meaning is materially wrong.
 5. If an existing memory has corroboration_count >= 3 and you want to SUPERSEDE it,
    set "flag_for_review": true.
 6. For UPDATE updated_content and SUPERSEDE replacement memory content, write the

@@ -32,6 +32,7 @@ from memforge.models import (
     MemoryReviewRelatedChallenger,
     MemorySource,
     Project,
+    ReplacementKind,
     SHARED_PROJECT_KEY,
     SyncState,
     UNSORTED_PROJECT_KEY,
@@ -82,6 +83,12 @@ def _utc_iso(dt: datetime | None) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).isoformat()
+
+
+def _validate_replacement_kind(value: str) -> ReplacementKind:
+    if value not in {"revision", "supersession"}:
+        raise ValueError(f"Unsupported memory replacement kind: {value}")
+    return value  # type: ignore[return-value]
 
 
 def _parse_dt(s: str | None) -> datetime | None:
@@ -298,6 +305,7 @@ CREATE TABLE IF NOT EXISTS memories (
     retired_at          TEXT,
     superseded_at       TEXT,
     replacement_reason  TEXT,
+    replacement_kind    TEXT,
     extraction_context  TEXT,
     created_at          TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1097,6 +1105,9 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         "CREATE INDEX IF NOT EXISTS idx_agent_claims_concept ON agent_claims(concept_id)",
         "CREATE INDEX IF NOT EXISTS idx_agent_claims_memory ON agent_claims(memory_id)",
     ]),
+    (23, "Add structured memory replacement kind", [
+        "ALTER TABLE memories ADD COLUMN replacement_kind TEXT",
+    ]),
 ]
 
 
@@ -1510,9 +1521,9 @@ class Database:
                     confidence, corroboration_count,
                     contradiction_count, valid_from, valid_until,
                     superseded_by, status, retirement_reason, retired_at,
-                    superseded_at, replacement_reason, extraction_context,
+                    superseded_at, replacement_reason, replacement_kind, extraction_context,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     mem.id, mem.memory_type, mem.content, mem.content_hash,
                     json.dumps(mem.tags), mem.visibility, mem.owner_user_id, project_key,
@@ -1524,7 +1535,7 @@ class Database:
                     mem.superseded_by, status, mem.retirement_reason,
                     mem.retired_at.isoformat() if mem.retired_at else None,
                     mem.superseded_at.isoformat() if mem.superseded_at else None,
-                    mem.replacement_reason, mem.extraction_context,
+                    mem.replacement_reason, mem.replacement_kind, mem.extraction_context,
                     mem.created_at.isoformat() if mem.created_at else now,
                     mem.updated_at.isoformat() if mem.updated_at else now,
                 ),
@@ -1705,7 +1716,7 @@ class Database:
                     """UPDATE memories SET
                         status = ?, retirement_reason = NULL, retired_at = NULL,
                         superseded_by = NULL, superseded_at = NULL,
-                        replacement_reason = NULL, updated_at = ?
+                        replacement_reason = NULL, replacement_kind = NULL, updated_at = ?
                        WHERE id = ?""",
                     (canonical, now, memory_id),
                 )
@@ -1799,7 +1810,7 @@ class Database:
                     corroboration_count = ?, contradiction_count = ?,
                     valid_from = ?, valid_until = ?, superseded_by = ?,
                     status = ?, retirement_reason = ?, retired_at = ?,
-                    superseded_at = ?, replacement_reason = ?, extraction_context = ?,
+                    superseded_at = ?, replacement_reason = ?, replacement_kind = ?, extraction_context = ?,
                     updated_at = ?
                    WHERE id = ?""",
                 (
@@ -1824,6 +1835,7 @@ class Database:
                     memory.retired_at.isoformat() if memory.retired_at else None,
                     memory.superseded_at.isoformat() if memory.superseded_at else None,
                     memory.replacement_reason,
+                    memory.replacement_kind,
                     memory.extraction_context,
                     memory.updated_at.isoformat() if memory.updated_at else None,
                     memory.id,
@@ -1910,8 +1922,10 @@ class Database:
         new_memory: Memory,
         *,
         replacement_reason: str | None = None,
+        replacement_kind: ReplacementKind,
     ) -> None:
         """Mark old memory as superseded and insert the new one."""
+        replacement_kind = _validate_replacement_kind(replacement_kind)
         _validate_visibility(new_memory.visibility, new_memory.owner_user_id)
         project_key = _normalize_project_key(new_memory.project_key)
         async with self._write_lock:
@@ -1924,9 +1938,9 @@ class Database:
                     confidence, corroboration_count,
                     contradiction_count, valid_from, valid_until,
                     superseded_by, status, retirement_reason, retired_at,
-                    superseded_at, replacement_reason, extraction_context,
+                    superseded_at, replacement_reason, replacement_kind, extraction_context,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     new_memory.id, new_memory.memory_type, new_memory.content,
                     new_memory.content_hash, json.dumps(new_memory.tags),
@@ -1941,7 +1955,7 @@ class Database:
                     new_memory.retirement_reason,
                     new_memory.retired_at.isoformat() if new_memory.retired_at else None,
                     new_memory.superseded_at.isoformat() if new_memory.superseded_at else None,
-                    new_memory.replacement_reason, new_memory.extraction_context,
+                    new_memory.replacement_reason, new_memory.replacement_kind, new_memory.extraction_context,
                     new_memory.created_at.isoformat() if new_memory.created_at else now,
                     now,
                 ),
@@ -1949,9 +1963,9 @@ class Database:
             await self.db.execute(
                 """UPDATE memories SET
                     status = 'superseded', superseded_by = ?, valid_until = ?,
-                    superseded_at = ?, replacement_reason = ?, updated_at = ?
+                    superseded_at = ?, replacement_reason = ?, replacement_kind = ?, updated_at = ?
                    WHERE id = ?""",
-                (new_memory.id, now, now, replacement_reason, now, old_id),
+                (new_memory.id, now, now, replacement_reason, replacement_kind, now, old_id),
             )
             # FTS5 for new memory
             entities_text = " ".join(new_memory.entity_refs)
@@ -1963,12 +1977,34 @@ class Database:
             )
             await self.db.commit()
 
+    async def resolve_current_memory_id(self, memory_id: str) -> str | None:
+        """Return the active head of a memory supersession chain.
+
+        Memory IDs are immutable version IDs. Callers that hold an older ID can
+        use this resolver to reach the current version without guessing through
+        search results.
+        """
+        current = memory_id
+        seen: set[str] = set()
+        while current:
+            if current in seen:
+                raise RuntimeError(f"Memory supersession chain contains a cycle at {current}")
+            seen.add(current)
+            memory = await self.get_memory(current)
+            if memory is None:
+                return None
+            if memory.status != "superseded" or not memory.superseded_by:
+                return memory.id
+            current = memory.superseded_by
+        return None
+
     async def promote_quarantined_challenger(
         self,
         *,
         incumbent_id: str,
         challenger: Memory,
         replacement_reason: str | None = None,
+        replacement_kind: ReplacementKind,
     ) -> None:
         """Promote a pending_review challenger to active and supersede the incumbent.
 
@@ -1981,6 +2017,7 @@ class Database:
         time, even when the caller passed a Memory loaded via ``get_memory``
         (which leaves ``entity_refs`` empty by design).
         """
+        replacement_kind = _validate_replacement_kind(replacement_kind)
         async with self._write_lock:
             now = _now_iso()
             await self.db.execute(
@@ -1993,9 +2030,9 @@ class Database:
             await self.db.execute(
                 """UPDATE memories SET
                     status = 'superseded', superseded_by = ?, superseded_at = ?,
-                    valid_until = ?, replacement_reason = ?, updated_at = ?
+                    valid_until = ?, replacement_reason = ?, replacement_kind = ?, updated_at = ?
                    WHERE id = ?""",
-                (challenger.id, now, now, replacement_reason, now, incumbent_id),
+                (challenger.id, now, now, replacement_reason, replacement_kind, now, incumbent_id),
             )
             await self.db.execute(
                 "DELETE FROM memories_fts WHERE memory_id = ?", (incumbent_id,),
@@ -4837,6 +4874,7 @@ class Database:
             retired_at=_parse_dt(d.get("retired_at")),
             superseded_at=_parse_dt(d.get("superseded_at")),
             replacement_reason=d.get("replacement_reason"),
+            replacement_kind=d.get("replacement_kind"),
             extraction_context=d.get("extraction_context"),
             memory_level=d.get("memory_level") or "atomic",
             curation_cluster_id=d.get("curation_cluster_id"),

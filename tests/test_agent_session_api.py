@@ -30,11 +30,16 @@ def _config(tmp_path: Path) -> AppConfig:
 
 
 def _knowledge_patch(**overrides) -> AgentKnowledgePatchProposal:
+    claim_text = overrides.get(
+        "claim_text",
+        "The agent session window recorded a durable implementation rule.",
+    )
     data = {
         "action": "create_new_concept",
         "concept_type": "debugging_takeaway",
         "title": "Agent session durable rule",
-        "claim_text": "The agent session window recorded a durable implementation rule.",
+        "claim_text": claim_text,
+        "memory_content": claim_text,
         "memory_type": "procedure",
         "tags": ["agent-session"],
         "confidence": 0.9,
@@ -735,6 +740,52 @@ def test_agent_session_window_api_records_failed_outcome_for_invalid_patch(tmp_p
         asyncio.run(database.close())
 
 
+def test_agent_session_window_api_records_failed_outcome_for_parse_failed_patch(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    class ParseFailedPatchClient:
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(memory_content=None)
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+
+    import asyncio
+
+    asyncio.run(database.connect())
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        app.state.agent_session_window_client = ParseFailedPatchClient()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/agent-sessions/windows",
+                json={
+                    "client": "codex",
+                    "session_id": "sess-window-parse-failed",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "events": [{"role": "tool", "name": "apply_patch", "summary": "Edited code."}],
+                },
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["result"] == "failed"
+        assert body["patch_outcome"] == "parse_failed"
+        assert body["reason"] == "memory_content is required"
+
+        async def _assert_failed_receipt():
+            summary = await database.summarize_agent_session_outcomes(
+                session_id="sess-window-parse-failed"
+            )
+            assert summary["counts"]["failed"] == 1
+            assert summary["latest_failure"]["reason"] == "memory_content is required"
+
+        asyncio.run(_assert_failed_receipt())
+    finally:
+        asyncio.run(database.close())
+
+
 def test_agent_session_window_api_keeps_windows_distinct_and_idempotent(tmp_path):
     """Windows of one session/trigger get distinct, idempotent memory patches."""
     from memforge.server.admin_api import create_admin_app
@@ -917,6 +968,7 @@ def test_agent_session_window_can_patch_existing_private_claim(tmp_path):
                 return _knowledge_patch(
                     title="Scheduler lifecycle",
                     claim_text="Workspace source schedulers must start during app startup.",
+                    memory_content="Workspace source schedulers must start during app startup.",
                 )
             assert f"concept_id={self.created_concept_id}" in prompt
             assert f"claim_id={self.created_claim_id}" in prompt
@@ -928,6 +980,7 @@ def test_agent_session_window_can_patch_existing_private_claim(tmp_path):
                     "Workspace source schedulers must start during app startup "
                     "and advance next_run_at after claiming overdue schedules."
                 ),
+                memory_content="Workspace source schedulers start during app startup and advance next_run_at after claiming overdue schedules.",
             )
 
     cfg = _config(tmp_path)
@@ -966,8 +1019,12 @@ def test_agent_session_window_can_patch_existing_private_claim(tmp_path):
 
         assert second["concept_id"] == first["concept_id"]
         assert second["claim_id"] == first["claim_id"]
-        assert second["memory_id"] == first["memory_id"]
-        memory = asyncio.run(database.get_memory(first["memory_id"]))
+        assert second["memory_id"] != first["memory_id"]
+        old_memory = asyncio.run(database.get_memory(first["memory_id"]))
+        assert old_memory is not None
+        assert old_memory.status == "superseded"
+        assert old_memory.superseded_by == second["memory_id"]
+        memory = asyncio.run(database.get_memory(second["memory_id"]))
         assert memory is not None
         assert "advance next_run_at" in memory.content
     finally:

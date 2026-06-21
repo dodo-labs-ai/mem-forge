@@ -91,6 +91,7 @@ async def test_supersede_rejects_invalid_new_memory(db):
             "old-1",
             _mem(id="new-1", visibility=PRIVATE, owner_user_id=None),
             replacement_reason="x",
+            replacement_kind="supersession",
         )
 
 
