@@ -476,7 +476,14 @@ async def test_supersede_memory_records_old_and_new_index_audit(db: Database):
     collection = RecordingCollection()
     store = _store(db, collection)
 
-    await store.supersede_memory(old.id, new, "doc-1", "confluence", replacement_reason="newer source")
+    await store.supersede_memory(
+        old.id,
+        new,
+        "doc-1",
+        "confluence",
+        replacement_kind="supersession",
+        replacement_reason="newer source",
+    )
 
     old_rows = await db.list_memory_audit_events(memory_id=old.id)
     new_rows = await db.list_memory_audit_events(memory_id=new.id)
@@ -495,6 +502,76 @@ async def test_supersede_memory_records_old_and_new_index_audit(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_supersede_memory_carries_valid_support_to_replacement(db: Database):
+    await _insert_doc(db, "doc-current")
+    await _insert_doc(db, "doc-support")
+    old = _memory("mem-old-support", "Old supported fact")
+    await db.insert_memory(old)
+    await db.add_memory_source(old.id, "doc-current", "confluence", "Old excerpt", support_kind="extracted")
+    await db.add_memory_source(old.id, "doc-support", "jira", "Still valid support", support_kind="corroborated")
+    new = _memory("mem-new-support", "New supported fact")
+    collection = RecordingCollection()
+    store = _store(db, collection)
+
+    await store.supersede_memory(
+        old.id,
+        new,
+        "doc-current",
+        "confluence",
+        excerpt="New excerpt",
+        replacement_reason="source revision",
+        replacement_kind="revision",
+    )
+
+    old_sources = await db.get_memory_sources(old.id)
+    new_sources = await db.get_memory_sources(new.id)
+    stored_old = await db.get_memory(old.id)
+    assert stored_old.replacement_kind == "revision"
+    assert sorted((source.doc_id, source.source_type, source.support_kind, source.excerpt) for source in old_sources) == sorted(
+        [
+            ("doc-current", "confluence", "extracted", "Old excerpt"),
+            ("doc-support", "jira", "corroborated", "Still valid support"),
+        ]
+    )
+    assert sorted((source.doc_id, source.source_type, source.support_kind, source.excerpt) for source in new_sources) == sorted(
+        [
+            ("doc-current", "confluence", "extracted", "New excerpt"),
+            ("doc-support", "jira", "corroborated", "Still valid support"),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_supersession_does_not_carry_old_support_to_replacement(db: Database):
+    await _insert_doc(db, "doc-current")
+    await _insert_doc(db, "doc-support")
+    old = _memory("mem-old-supersession-support", "Old obsolete fact")
+    await db.insert_memory(old)
+    await db.add_memory_source(old.id, "doc-current", "confluence", "Old excerpt", support_kind="extracted")
+    await db.add_memory_source(old.id, "doc-support", "jira", "Old corroboration", support_kind="corroborated")
+    new = _memory("mem-new-supersession-support", "Replacement fact with different meaning")
+    collection = RecordingCollection()
+    store = _store(db, collection)
+
+    await store.supersede_memory(
+        old.id,
+        new,
+        "doc-current",
+        "confluence",
+        excerpt="Replacement excerpt",
+        replacement_reason="old claim invalidated",
+        replacement_kind="supersession",
+    )
+
+    new_sources = await db.get_memory_sources(new.id)
+    stored_old = await db.get_memory(old.id)
+    assert stored_old.replacement_kind == "supersession"
+    assert [(source.doc_id, source.source_type, source.support_kind, source.excerpt) for source in new_sources] == [
+        ("doc-current", "confluence", "extracted", "Replacement excerpt")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_supersede_memory_snapshots_array_like_chroma_embeddings(db: Database):
     await _insert_doc(db)
     old = _memory("mem-array-old", "Old array-like snapshot fact")
@@ -509,7 +586,14 @@ async def test_supersede_memory_snapshots_array_like_chroma_embeddings(db: Datab
     )
     store = _store(db, collection)
 
-    await store.supersede_memory(old.id, new, "doc-1", "confluence", replacement_reason="newer source")
+    await store.supersede_memory(
+        old.id,
+        new,
+        "doc-1",
+        "confluence",
+        replacement_kind="supersession",
+        replacement_reason="newer source",
+    )
 
     stored_old = await db.get_memory(old.id)
     stored_new = await db.get_memory(new.id)
@@ -526,7 +610,14 @@ async def test_supersede_audit_uses_old_memory_as_subject_and_new_memory_as_cand
     new = _memory("mem-newsem", "New fact")
     store = _store(db, RecordingCollection())
 
-    await store.supersede_memory(old.id, new, "doc-1", "confluence", replacement_reason="newer source")
+    await store.supersede_memory(
+        old.id,
+        new,
+        "doc-1",
+        "confluence",
+        replacement_kind="supersession",
+        replacement_reason="newer source",
+    )
 
     audit_rows = await db.list_memory_audit_events(event_type="memory_supersede_committed")
     assert [(row.memory_id, row.candidate_id, row.payload) for row in audit_rows] == [
@@ -542,7 +633,14 @@ async def test_supersede_audit_uses_stable_old_new_identity(db: Database):
     new = _memory("mem-newidentity", "New identity fact")
     store = _store(db, RecordingCollection())
 
-    await store.supersede_memory(old.id, new, "doc-1", "confluence", replacement_reason="newer source")
+    await store.supersede_memory(
+        old.id,
+        new,
+        "doc-1",
+        "confluence",
+        replacement_kind="supersession",
+        replacement_reason="newer source",
+    )
 
     supersede_rows = await db.list_memory_audit_events(event_type="memory_supersede_committed")
     assert [(row.memory_id, row.candidate_id, row.payload) for row in supersede_rows] == [
@@ -566,6 +664,7 @@ async def test_promote_quarantined_challenger_routes_indexes_and_audit(db: Datab
     await store.promote_quarantined_challenger(
         incumbent=incumbent,
         challenger=challenger,
+        replacement_kind="supersession",
         replacement_reason="review approved",
         review_id="rev-safe",
     )
@@ -595,6 +694,7 @@ async def test_promote_audit_uses_incumbent_as_subject_and_challenger_as_candida
     await store.promote_quarantined_challenger(
         incumbent=incumbent,
         challenger=challenger,
+        replacement_kind="supersession",
         replacement_reason="review approved",
         review_id="rev-semantics",
     )
@@ -616,6 +716,7 @@ async def test_promote_audit_uses_stable_old_new_identity(db: Database):
     await store.promote_quarantined_challenger(
         incumbent=incumbent,
         challenger=challenger,
+        replacement_kind="supersession",
         replacement_reason="review approved",
         review_id="rev-identity",
     )
@@ -1107,6 +1208,7 @@ async def test_supersede_memory_rebuilds_fts_from_canonical_entity_links(db: Dat
         new,
         "doc-1",
         "confluence",
+        replacement_kind="supersession",
         entity_ids=[alpha_id, beta_id],
         replacement_reason="newer source",
     )
@@ -1221,7 +1323,13 @@ async def test_supersede_memory_restores_sqlite_when_new_chroma_upsert_fails(db:
     store = _store(db, FailingSpecificUpsertCollection(new.id))
 
     with pytest.raises(RuntimeError, match="upsert failed"):
-        await store.supersede_memory(old.id, new, "doc-1", "confluence")
+        await store.supersede_memory(
+            old.id,
+            new,
+            "doc-1",
+            "confluence",
+            replacement_kind="supersession",
+        )
 
     stored_old = await db.get_memory(old.id)
     stored_new = await db.get_memory(new.id)
@@ -1244,7 +1352,13 @@ async def test_supersede_memory_cleans_new_chroma_when_source_link_fails(db: Dat
     store = _store(FailingSourceInsertDatabase(db), collection)  # type: ignore[arg-type]
 
     with pytest.raises(RuntimeError, match="source insert failed"):
-        await store.supersede_memory(old.id, new, "doc-1", "confluence")
+        await store.supersede_memory(
+            old.id,
+            new,
+            "doc-1",
+            "confluence",
+            replacement_kind="supersession",
+        )
 
     stored_old = await db.get_memory(old.id)
     stored_new = await db.get_memory(new.id)
@@ -1264,7 +1378,13 @@ async def test_supersede_memory_restores_sqlite_when_new_chroma_cleanup_fails(db
     store = _store(db, collection)
 
     with pytest.raises(RuntimeError, match="delete failed"):
-        await store.supersede_memory(old.id, new, "doc-1", "confluence")
+        await store.supersede_memory(
+            old.id,
+            new,
+            "doc-1",
+            "confluence",
+            replacement_kind="supersession",
+        )
 
     stored_old = await db.get_memory(old.id)
     stored_new = await db.get_memory(new.id)
@@ -1285,6 +1405,7 @@ async def test_promote_challenger_restores_sqlite_when_challenger_chroma_upsert_
         await store.promote_quarantined_challenger(
             incumbent=incumbent,
             challenger=challenger,
+            replacement_kind="supersession",
             replacement_reason="review approved",
             review_id="rev-failing",
         )
@@ -1321,6 +1442,7 @@ async def test_promote_challenger_cleans_challenger_when_upsert_mutates_then_fai
         await store.promote_quarantined_challenger(
             incumbent=incumbent,
             challenger=challenger,
+            replacement_kind="supersession",
             replacement_reason="review approved",
             review_id="rev-mutating-fail",
         )
@@ -1345,6 +1467,7 @@ async def test_promote_challenger_restores_sqlite_when_incumbent_chroma_delete_f
         await store.promote_quarantined_challenger(
             incumbent=incumbent,
             challenger=challenger,
+            replacement_kind="supersession",
             replacement_reason="review approved",
             review_id="rev-delete-failing",
         )

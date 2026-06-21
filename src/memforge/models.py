@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from typing import Literal
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +67,9 @@ class MemoryStatus(str, Enum):
     RETIRED = "retired"
     DECAYED = "decayed"
     PENDING_REVIEW = "pending_review"
+
+
+ReplacementKind = Literal["revision", "supersession"]
 
 
 class MemoryLevel(str, Enum):
@@ -186,6 +190,7 @@ class Memory:
     retired_at: datetime | None = None
     superseded_at: datetime | None = None
     replacement_reason: str | None = None
+    replacement_kind: ReplacementKind | None = None
     extraction_context: str | None = None
     memory_level: str = MemoryLevel.ATOMIC.value
     curation_cluster_id: str | None = None

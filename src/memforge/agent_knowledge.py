@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from memforge.models import (
     DocumentRecord,
     Memory,
+    ReplacementKind,
     Visibility,
     content_hash,
     generate_memory_id,
@@ -28,6 +29,7 @@ from memforge.models import (
 PatchAction = Literal[
     "create_new_concept",
     "update_existing_claim",
+    "supersede_existing_claim",
     "add_new_claim",
     "no_output",
 ]
@@ -39,6 +41,7 @@ PatchOutcome = Literal[
     "rejected_scope",
     "parse_failed",
 ]
+PatchResultBucket = Literal["applied", "failed", "no_output"]
 
 
 class AgentKnowledgePatchProposal(BaseModel):
@@ -59,6 +62,7 @@ class AgentKnowledgePatchProposal(BaseModel):
     ] | None = None
     title: str | None = None
     claim_text: str = ""
+    memory_content: str | None = None
     memory_type: Literal["fact", "decision", "convention", "procedure"] = "fact"
     tags: list[str] = Field(default_factory=list)
     reason: str = ""
@@ -69,6 +73,7 @@ class AgentKnowledgePatchProposal(BaseModel):
 @dataclass(frozen=True)
 class AgentKnowledgePatchResult:
     outcome: PatchOutcome
+    result_bucket: PatchResultBucket
     concept_id: str | None = None
     claim_id: str | None = None
     memory_id: str | None = None
@@ -105,18 +110,25 @@ class AgentKnowledgeBundleService:
         if proposal.action == "no_output":
             return AgentKnowledgePatchResult(
                 outcome="skipped_not_memory",
+                result_bucket="no_output",
                 reason=proposal.reason or "proposal returned no_output",
             )
         if not proposal.claim_text.strip():
             return AgentKnowledgePatchResult(
-                outcome="skipped_not_memory",
+                outcome="parse_failed",
+                result_bucket="failed",
                 reason="claim_text is required",
             )
+        text_error = _validate_memory_content(proposal)
+        if text_error:
+            return AgentKnowledgePatchResult(outcome="parse_failed", result_bucket="failed", reason=text_error)
+        memory_content = _memory_content_for(proposal)
 
         if proposal.action == "create_new_concept":
             if not proposal.title or not proposal.concept_type:
                 return AgentKnowledgePatchResult(
                     outcome="parse_failed",
+                    result_bucket="failed",
                     reason="create_new_concept requires title and concept_type",
                 )
             concept_id = proposal.concept_id or _new_id("akb_concept")
@@ -172,6 +184,7 @@ class AgentKnowledgeBundleService:
                 memory_id=memory_id,
                 concept_id=concept_id,
                 claim_text=proposal.claim_text,
+                memory_content=memory_content,
                 memory_type=proposal.memory_type,
                 tags=proposal.tags,
                 confidence=proposal.confidence,
@@ -194,18 +207,24 @@ class AgentKnowledgeBundleService:
             await self._append_citations(claim_id, proposal.citations, submitted_at)
             return AgentKnowledgePatchResult(
                 outcome="applied",
+                result_bucket="applied",
                 concept_id=concept_id,
                 claim_id=claim_id,
                 memory_id=memory_id,
             )
 
-        if proposal.action not in {"update_existing_claim", "add_new_claim"}:
-            return AgentKnowledgePatchResult(outcome="parse_failed", reason="unsupported action")
+        if proposal.action not in {"update_existing_claim", "supersede_existing_claim", "add_new_claim"}:
+            return AgentKnowledgePatchResult(
+                outcome="parse_failed",
+                result_bucket="failed",
+                reason="unsupported action",
+            )
 
         concept = await self.db.get_agent_concept(proposal.concept_id or "")
         if not self._can_patch_concept(concept, owner_user_id, repo_identifier):
             return AgentKnowledgePatchResult(
                 outcome="rejected_scope",
+                result_bucket="failed",
                 concept_id=proposal.concept_id,
                 claim_id=proposal.claim_id,
                 reason="private concept is outside the caller scope",
@@ -218,6 +237,7 @@ class AgentKnowledgeBundleService:
                 memory_id=memory_id,
                 concept_id=concept["id"],
                 claim_text=proposal.claim_text,
+                memory_content=memory_content,
                 memory_type=proposal.memory_type,
                 tags=proposal.tags,
                 confidence=proposal.confidence,
@@ -241,6 +261,7 @@ class AgentKnowledgeBundleService:
             await self._refresh_concept_markdown(concept["id"], observed_at=submitted_at)
             return AgentKnowledgePatchResult(
                 outcome="applied",
+                result_bucket="applied",
                 concept_id=concept["id"],
                 claim_id=claim_id,
                 memory_id=memory_id,
@@ -250,11 +271,29 @@ class AgentKnowledgeBundleService:
         if not claim or claim["concept_id"] != concept["id"]:
             return AgentKnowledgePatchResult(
                 outcome="rejected_scope",
+                result_bucket="failed",
                 concept_id=concept["id"],
                 claim_id=proposal.claim_id,
                 reason="claim is outside the target concept",
             )
 
+        memory_id = generate_memory_id()
+        await self._supersede_claim_memory(
+            old_memory_id=claim["memory_id"],
+            new_memory_id=memory_id,
+            concept_id=concept["id"],
+            claim_text=proposal.claim_text,
+            memory_content=memory_content,
+            memory_type=proposal.memory_type,
+            tags=proposal.tags,
+            confidence=proposal.confidence,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            project_key=project_key,
+            source_type="agent_session",
+            replacement_reason=proposal.reason or "agent claim updated",
+            replacement_kind=_replacement_kind_for_action(proposal.action),
+        )
         await self.db.upsert_agent_claim(
             claim_id=claim["id"],
             concept_id=concept["id"],
@@ -263,22 +302,17 @@ class AgentKnowledgeBundleService:
             memory_type=proposal.memory_type,
             tags=proposal.tags,
             confidence=proposal.confidence,
-            memory_id=claim["memory_id"],
+            memory_id=memory_id,
             observed_at=submitted_at,
-        )
-        await self.memory_store.update_memory(
-            claim["memory_id"],
-            proposal.claim_text.strip(),
-            proposal.confidence,
-            proposal.tags,
         )
         await self._append_citations(claim["id"], proposal.citations, submitted_at)
         await self._refresh_concept_markdown(concept["id"], observed_at=submitted_at)
         return AgentKnowledgePatchResult(
             outcome="applied",
+            result_bucket="applied",
             concept_id=concept["id"],
             claim_id=claim["id"],
-            memory_id=claim["memory_id"],
+            memory_id=memory_id,
         )
 
     def _can_patch_concept(
@@ -300,6 +334,7 @@ class AgentKnowledgeBundleService:
         memory_id: str,
         concept_id: str,
         claim_text: str,
+        memory_content: str,
         memory_type: str,
         tags: list[str],
         confidence: float,
@@ -308,11 +343,81 @@ class AgentKnowledgeBundleService:
         project_key: str | None,
         source_type: str,
     ) -> None:
-        memory = Memory(
+        memory = self._build_claim_memory(
+            memory_id=memory_id,
+            claim_text=claim_text,
+            memory_content=memory_content,
+            memory_type=memory_type,
+            tags=tags,
+            confidence=confidence,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            project_key=project_key,
+        )
+        await self.memory_store.insert_memory(
+            memory=memory,
+            doc_id=concept_id,
+            source_type=source_type,
+            excerpt=claim_text.strip(),
+        )
+
+    async def _supersede_claim_memory(
+        self,
+        *,
+        old_memory_id: str,
+        new_memory_id: str,
+        concept_id: str,
+        claim_text: str,
+        memory_content: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        owner_user_id: str,
+        repo_identifier: str | None,
+        project_key: str | None,
+        source_type: str,
+        replacement_reason: str,
+        replacement_kind: ReplacementKind,
+    ) -> None:
+        memory = self._build_claim_memory(
+            memory_id=new_memory_id,
+            claim_text=claim_text,
+            memory_content=memory_content,
+            memory_type=memory_type,
+            tags=tags,
+            confidence=confidence,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            project_key=project_key,
+        )
+        await self.memory_store.supersede_memory(
+            old_memory_id,
+            memory,
+            doc_id=concept_id,
+            source_type=source_type,
+            excerpt=claim_text.strip(),
+            replacement_reason=replacement_reason,
+            replacement_kind=replacement_kind,
+        )
+
+    def _build_claim_memory(
+        self,
+        *,
+        memory_id: str,
+        claim_text: str,
+        memory_content: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        owner_user_id: str,
+        repo_identifier: str | None,
+        project_key: str | None,
+    ) -> Memory:
+        return Memory(
             id=memory_id,
             memory_type=memory_type,
-            content=claim_text.strip(),
-            content_hash=content_hash(claim_text.strip()),
+            content=memory_content.strip(),
+            content_hash=content_hash(memory_content.strip()),
             visibility=Visibility.PRIVATE.value,
             owner_user_id=owner_user_id,
             project_key=project_key,
@@ -323,12 +428,6 @@ class AgentKnowledgeBundleService:
             updated_at=datetime.now(timezone.utc),
             status="active",
             extraction_context=claim_text.strip(),
-        )
-        await self.memory_store.insert_memory(
-            memory=memory,
-            doc_id=concept_id,
-            source_type=source_type,
-            excerpt=claim_text.strip(),
         )
 
     async def _write_concept_document(
@@ -469,9 +568,12 @@ Decision boundary:
 - Do not summarize ordinary progress, transient status, or facts a future agent can rediscover from the current repo.
 - Agent-session memories are private-only in this version.
 - If the evidence updates an existing claim, use update_existing_claim and copy the exact concept_id and claim_id.
+- If the evidence replaces or invalidates an existing claim, use supersede_existing_claim and copy the exact concept_id and claim_id. Lifecycle is represented only by action, not by claim_text or memory_content.
 - If it belongs in an existing concept but is a distinct durable claim, use add_new_claim and copy the exact concept_id.
 - If it is a new durable concept, use create_new_concept with a concise title and concept_type.
 - If nothing durable should be kept, use no_output.
+- claim_text is the detailed atomic evidence statement. It may contain the full corrected rule or runbook step.
+- memory_content is required for all non-no_output actions. It is the durable memory record to keep: self-contained, accurate, and useful when read later without the original conversation. Preserve the decision, rule, preference, procedure, or learned fact with enough qualifiers, scope, and operational context for a future agent to use it correctly. Exclude transcript narration, step-by-step investigation chatter, and obsolete alternatives unless they are necessary to explain the current rule.
 
 Caller:
 - owner_user_id: {owner_user_id}
@@ -496,6 +598,25 @@ def _utc(value: datetime | None) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _memory_content_for(proposal: AgentKnowledgePatchProposal) -> str:
+    return (proposal.memory_content or "").strip()
+
+
+def _validate_memory_content(proposal: AgentKnowledgePatchProposal) -> str | None:
+    memory_content = _memory_content_for(proposal)
+    if not memory_content:
+        return "memory_content is required"
+    return None
+
+
+def _replacement_kind_for_action(action: PatchAction) -> ReplacementKind:
+    if action == "update_existing_claim":
+        return "revision"
+    if action == "supersede_existing_claim":
+        return "supersession"
+    raise ValueError(f"action does not replace an existing claim: {action}")
 
 
 def _new_id(prefix: str) -> str:

@@ -31,6 +31,9 @@ class FakeCollection:
     def delete(self, ids):
         self.deleted.extend(ids)
 
+    def get(self, ids=None, include=None):
+        return {"ids": [], "embeddings": [], "metadatas": [], "documents": []}
+
 
 @pytest.fixture
 async def db(tmp_path):
@@ -543,6 +546,79 @@ async def test_reconciliation_decisions_are_audited_before_mutation(db, monkeypa
     assert rows[0].decision == "DELETE"
     assert rows[0].reason == "The updated document no longer supports this memory"
     assert rows[0].payload["update_mode"] == "diff_guided"
+
+
+@pytest.mark.parametrize("source_type", ["jira", "confluence", "teams", "github_pages", "local_markdown"])
+@pytest.mark.asyncio
+async def test_reconciliation_update_replaces_memory_lifecycle_for_document_sources(db, monkeypatch, source_type):
+    await _insert_doc(db, "doc-current")
+    old = _memory("mem-update-lifecycle", "Service A uses PostgreSQL 15.")
+    await db.insert_memory(old)
+    await db.add_memory_source(old.id, "doc-current", source_type, excerpt="Old extracted source.", support_kind="extracted")
+
+    collection = FakeCollection()
+    adapters = build_sqlite_adapters(db, collection)
+    store = MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        audit_logger=MemoryAuditLogger(db),
+    )
+    store._embed = AsyncMock(return_value=[0.1])
+    engine = MemoryEngine(
+        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+    )
+
+    async def fake_reconcile_memories(**kwargs):
+        return [
+            ReconcileOperation(
+                action=ReconcileAction.UPDATE,
+                memory_id=old.id,
+                memory=RawMemory(
+                    content="Service A uses PostgreSQL 16.",
+                    memory_type="fact",
+                    confidence=0.9,
+                    tags=["database"],
+                    extraction_context="The current design says Service A uses PostgreSQL 16.",
+                ),
+                reason="Current document refined the PostgreSQL version claim",
+            )
+        ]
+
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+
+    stats = await engine.reconcile_and_persist(
+        doc_id="doc-current",
+        raw_memories=[],
+        source_type=source_type,
+        doc_type="design-doc",
+        document_content="Service A uses PostgreSQL 16.",
+    )
+
+    stored_old = await db.get_memory(old.id)
+    active = [memory for memory in await db.list_memories(limit=10) if memory.status == "active"]
+    assert stats["updated"] == 1
+    assert stats["superseded"] == 0
+    assert stored_old is not None
+    assert stored_old.status == "superseded"
+    assert stored_old.superseded_by is not None
+    assert stored_old.replacement_reason == "Current document refined the PostgreSQL version claim"
+    assert stored_old.replacement_kind == "revision"
+
+    assert len(active) == 1
+    replacement = active[0]
+    assert replacement.id == stored_old.superseded_by
+    assert replacement.content == "Service A uses PostgreSQL 16."
+    assert replacement.extraction_context == "The current design says Service A uses PostgreSQL 16."
+    assert replacement.tags == ["database"]
+    assert collection.deleted == [old.id]
+    assert replacement.id in collection.upserted
+
+    sources = await db.get_memory_sources(replacement.id)
+    assert [(source.doc_id, source.source_type, source.support_kind, source.excerpt) for source in sources] == [
+        ("doc-current", source_type, "extracted", "The current design says Service A uses PostgreSQL 16.")
+    ]
 
 
 @pytest.mark.asyncio
