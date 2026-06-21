@@ -104,5 +104,17 @@ assert.match(
 assert.match(
   sourcesPageSource,
   /latest_failure/,
-  "agent-session details should consume the latest_failure summary so failures get an operational warning when non-zero",
+  "agent-session details should consume the latest_failure timestamp so retry backlog metadata stays visible",
+);
+
+assert.doesNotMatch(
+  sourcesPageSource,
+  /Latest retry reason/,
+  "agent-session details should not surface raw provider exception text in the product dialog",
+);
+
+assert.doesNotMatch(
+  sourcesPageSource,
+  /title=\{latestFailure\.reason\}/,
+  "agent-session details should not leak raw retry exceptions through hover text",
 );
