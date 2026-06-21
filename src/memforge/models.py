@@ -564,6 +564,7 @@ class SearchResult:
     curation_cluster_id: str | None = None
     covered_memory_count: int = 0
     repo_identifier: str | None = None
+    follow_up: dict[str, str] | None = None
 
 
 @dataclass

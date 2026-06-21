@@ -1102,6 +1102,8 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "memory_types" not in properties
     assert "entities" not in properties
     assert "active_repo_identifier" not in properties
+    assert "follow_up" in tools["search"]["description"]
+    assert "search -> get_memory -> get_resource" in tools["get_resource"]["description"]
 
 
 def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
