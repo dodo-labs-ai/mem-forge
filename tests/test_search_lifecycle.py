@@ -24,6 +24,14 @@ class FakeCollection:
         return {"ids": [self.ids], "distances": [[0.01 for _ in self.ids]]}
 
 
+class FakeVectorStore:
+    def __init__(self, ids: list[str]) -> None:
+        self.collection = FakeCollection(ids)
+
+    def similarity(self, distance: float) -> float:
+        return max(1.0 - distance, 0.0)
+
+
 class MemoryBackedDocumentStore:
     def __init__(self, artifacts: dict[str, bytes]) -> None:
         self._artifacts = artifacts
@@ -172,6 +180,76 @@ async def test_search_results_expose_service_artifact_urls_without_storage_uris(
 
 
 @pytest.mark.asyncio
+async def test_search_result_suggests_detail_for_procedure_memory(
+    db,
+    tmp_path,
+    monkeypatch,
+):
+    procedure = _memory(
+        "mem-procedure-follow-up",
+        "Run the deploy script, bootstrap the admin user, then smoke test.",
+        "active",
+    )
+    procedure.memory_type = "procedure"
+    await db.insert_memory(procedure)
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    adapters = build_sqlite_adapters(db, FakeCollection([procedure.id]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=_config(tmp_path).retrieval,
+        artifact_config=_config(tmp_path),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("deploy runbook", top_k=1)
+    search_result = result["results"][0]
+
+    assert search_result.follow_up == {
+        "suggested_tool": "get_memory",
+        "reason": "summary_may_omit_operational_steps",
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_result_omits_follow_up_for_simple_fact_memory(
+    db,
+    tmp_path,
+    monkeypatch,
+):
+    fact = _memory("mem-fact-no-follow-up", "Service uses HANA.", "active")
+    await db.insert_memory(fact)
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    adapters = build_sqlite_adapters(db, FakeCollection([fact.id]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=_config(tmp_path).retrieval,
+        artifact_config=_config(tmp_path),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("hana", top_k=1)
+    search_result = result["results"][0]
+
+    assert search_result.follow_up is None
+
+
+@pytest.mark.asyncio
 async def test_search_results_resolve_artifacts_through_configured_store(
     db,
     tmp_path,
@@ -228,6 +306,42 @@ async def test_search_results_resolve_artifacts_through_configured_store(
     assert search_result.source_doc_id == doc.doc_id
     assert search_result.content_url == "/api/documents/doc-object-search-artifact/content"
     assert search_result.pdf_url is None
+
+
+@pytest.mark.asyncio
+async def test_document_fallback_suggests_resource_when_artifact_is_available(
+    db,
+    tmp_path,
+    monkeypatch,
+):
+    doc = await _document(db, tmp_path, "doc-fallback-artifact")
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    adapters = build_sqlite_adapters(db, FakeCollection([]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=_config(tmp_path).retrieval,
+        artifact_config=_config(tmp_path),
+        document_vector=FakeVectorStore([doc.doc_id]),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("deployment", top_k=1)
+    search_result = result["results"][0]
+
+    assert search_result.memory_id is None
+    assert search_result.is_document_result is True
+    assert search_result.follow_up == {
+        "suggested_tool": "get_resource",
+        "reason": "document_result_needs_source_artifact",
+    }
 
 
 @pytest.mark.asyncio

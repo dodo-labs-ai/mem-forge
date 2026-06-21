@@ -119,6 +119,49 @@ def _recency_score(age_days: float, half_life: float = 90.0) -> float:
     return math.exp(-0.693 * age_days / half_life)
 
 
+def _search_follow_up_for_memory(
+    memory: Memory,
+    *,
+    contradiction_warning: str | None,
+) -> dict[str, str] | None:
+    """Return a small next-tool hint when summary-only use is likely weak."""
+    if contradiction_warning:
+        return {
+            "suggested_tool": "get_memory",
+            "reason": "result_has_contradiction_warning",
+        }
+    if memory.status != "active":
+        return {
+            "suggested_tool": "get_memory",
+            "reason": "memory_lifecycle_may_matter",
+        }
+    if memory.memory_type == "procedure":
+        return {
+            "suggested_tool": "get_memory",
+            "reason": "summary_may_omit_operational_steps",
+        }
+    if memory.memory_type in {"decision", "convention"}:
+        return {
+            "suggested_tool": "get_memory",
+            "reason": "provenance_or_lifecycle_may_matter",
+        }
+    return None
+
+
+def _search_follow_up_for_document_result(
+    *,
+    content_url: str | None,
+    pdf_url: str | None,
+) -> dict[str, str] | None:
+    """Document fallbacks have no memory_id, so point only to source artifacts."""
+    if content_url or pdf_url:
+        return {
+            "suggested_tool": "get_resource",
+            "reason": "document_result_needs_source_artifact",
+        }
+    return None
+
+
 def _sanitize_fts_query(text: str) -> str:
     """Escape characters that are special in FTS5 MATCH syntax.
 
@@ -818,6 +861,10 @@ class SearchEngine:
                 ),
                 covered_memory_count=candidate.covered_memory_count,
                 repo_identifier=candidate.repo_identifier or memory.repo_identifier,
+                follow_up=_search_follow_up_for_memory(
+                    memory,
+                    contradiction_warning=contradiction_warning,
+                ),
             ))
 
         return results
@@ -922,6 +969,10 @@ class SearchEngine:
                 freshness="unverified",
                 contradiction_warning=None,
                 is_document_result=True,
+                follow_up=_search_follow_up_for_document_result(
+                    content_url=content_url,
+                    pdf_url=pdf_url,
+                ),
             ))
 
         return results
