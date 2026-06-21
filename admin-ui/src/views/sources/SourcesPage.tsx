@@ -742,22 +742,15 @@ function AgentSessionDetailsDialog({
             <dd className="text-right font-medium text-foreground">{formatCount(skippedLowSignal)}</dd>
             <dt>Needs retry</dt>
             <dd className="text-right font-medium text-foreground">{formatCount(failedCount)}</dd>
+            {latestFailure?.last_seen_at && (
+              <>
+                <dt>Last retry seen</dt>
+                <dd className="text-right font-medium text-foreground">
+                  {timeAgo(latestFailure.last_seen_at)}
+                </dd>
+              </>
+            )}
           </dl>
-          {latestFailure && (
-            <div className="border-t px-3 py-2 text-muted-foreground">
-              <div className="font-medium text-foreground">Latest retry reason</div>
-              {latestFailure.reason && (
-                <div className="mt-1 truncate" title={latestFailure.reason}>
-                  {latestFailure.reason}
-                </div>
-              )}
-              {latestFailure.last_seen_at && (
-                <div className="mt-1">
-                  Last seen {timeAgo(latestFailure.last_seen_at)}
-                </div>
-              )}
-            </div>
-          )}
         </details>
 
         <div>
