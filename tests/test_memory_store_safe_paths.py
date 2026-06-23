@@ -21,7 +21,8 @@ from memforge.memory.evidence import (
     RelationType,
 )
 from memforge.memory.store import MemoryStore
-from memforge.models import Memory, content_hash
+from memforge.models import Memory, MemoryReview, content_hash
+from memforge.memory.review_service import ReviewKind, ReviewStatus
 from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -667,10 +668,10 @@ async def test_mark_pending_review_rolls_back_when_relation_bundle_fails(
     collection = RecordingCollection()
     store = _store(db, collection)
 
-    async def fail_relation_bundle(*args, **kwargs):
+    async def fail_status_with_relation(*args, **kwargs):
         raise RuntimeError("relation bundle failed")
 
-    monkeypatch.setattr(db, "record_relation_outcome_bundle", fail_relation_bundle)
+    monkeypatch.setattr(db, "update_memory_status_with_relation_outcome", fail_status_with_relation)
 
     with pytest.raises(RuntimeError, match="relation bundle failed"):
         await store.mark_pending_review(
@@ -692,6 +693,102 @@ async def test_mark_pending_review_rolls_back_when_relation_bundle_fails(
     assert stored is not None
     assert stored.status == "active"
     assert fts_count == 1
+
+
+@pytest.mark.asyncio
+async def test_mark_pending_review_with_relation_rejects_superseded_memory(db: Database):
+    await _insert_doc(db)
+    memory = _memory("mem-pending-superseded", "Superseded memory")
+    await db.insert_memory(memory)
+    replacement = _memory("mem-pending-replacement", "Replacement memory")
+    await db.supersede_memory(
+        memory.id,
+        replacement,
+        replacement_reason="newer evidence",
+        replacement_kind="revision",
+    )
+
+    store = _store(db, RecordingCollection())
+
+    with pytest.raises(RuntimeError, match="cannot transition to pending_review"):
+        await store.mark_pending_review(
+            memory.id,
+            reason="conflict after supersede",
+            relation_outcome=_relation_outcome_bundle(
+                unit_id="eu-pending-superseded",
+                run_id="relrun-pending-superseded",
+                doc_id="doc-1",
+                memory_id=memory.id,
+                relation_type=RelationType.CONTRADICTS,
+                action=LifecycleAction.CREATE_REVIEW,
+            ),
+        )
+
+    stored = await db.get_memory(memory.id)
+    assert stored is not None
+    assert stored.status == "superseded"
+    async with db.db.execute(
+        "SELECT COUNT(*) FROM relation_runs WHERE id = ?",
+        ("relrun-pending-superseded",),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_mark_pending_review_with_case_rejects_resolved_review_collision_and_restores_indexes(db: Database):
+    await _insert_doc(db)
+    memory = _memory("mem-pending-review-collision", "Needs review")
+    await db.insert_memory(memory)
+    review = MemoryReview(
+        id="review-resolved-collision",
+        kind=ReviewKind.SUPERSEDE.value,
+        status=ReviewStatus.APPROVED.value,
+        incumbent_memory_id=memory.id,
+        challenger_memory_id=memory.id,
+        reason="already resolved",
+        created_at=datetime.now(timezone.utc),
+        resolved_at=datetime.now(timezone.utc),
+    )
+    await db.insert_memory_review(review)
+    collection = RecordingCollection()
+    store = _store(db, collection)
+
+    with pytest.raises(RuntimeError, match="already exists with status approved"):
+        await store.mark_pending_review_with_case(
+            memory.id,
+            reason="conflict after resolved review",
+            relation_outcome=_relation_outcome_bundle(
+                unit_id="eu-pending-review-collision",
+                run_id="relrun-pending-review-collision",
+                doc_id="doc-1",
+                memory_id=memory.id,
+                relation_type=RelationType.CONTRADICTS,
+                action=LifecycleAction.CREATE_REVIEW,
+            ),
+            review=MemoryReview(
+                id=review.id,
+                kind=ReviewKind.SUPERSEDE.value,
+                status=ReviewStatus.PENDING.value,
+                incumbent_memory_id=memory.id,
+                challenger_memory_id=memory.id,
+                reason="new review",
+                created_at=datetime.now(timezone.utc),
+            ),
+        )
+
+    stored = await db.get_memory(memory.id)
+    async with db.db.execute("SELECT COUNT(*) FROM memories_fts WHERE memory_id = ?", (memory.id,)) as cursor:
+        fts_count = (await cursor.fetchone())[0]
+    assert stored is not None
+    assert stored.status == "active"
+    assert fts_count == 1
+    async with db.db.execute(
+        "SELECT COUNT(*) FROM relation_runs WHERE id = ?",
+        ("relrun-pending-review-collision",),
+    ) as cursor:
+        relation_count = (await cursor.fetchone())[0]
+    assert relation_count == 0
 
 
 @pytest.mark.asyncio

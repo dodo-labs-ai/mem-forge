@@ -27,6 +27,7 @@ from memforge.memory.evidence import (
     RelationOutcomeBundle,
     RelationRunRecord,
     RelationType,
+    ReviewCase,
     build_candidate_universe,
     build_mandatory_candidate_bucket_results,
     relation_run_id_for,
@@ -485,10 +486,26 @@ class MemoryEngine:
                             project_key=project_key,
                             stats=stats,
                             user_id=user_id,
+                            repo_identifier=repo_identifier,
+                            audit_context=audit_context,
                         ):
                             continue
                     else:
-                        await self.memory_store.mark_pending_review(op.memory_id, reason=shared_support_reason)
+                        await self.memory_store.mark_pending_review(
+                            op.memory_id,
+                            reason=shared_support_reason,
+                            relation_outcome=await self._pending_review_relation_outcome(
+                                op=op,
+                                existing_memory=existing_memory,
+                                doc_id=doc_id,
+                                source_type=source_type,
+                                project_key=project_key,
+                                repo_identifier=repo_identifier,
+                                user_id=user_id,
+                                reason=shared_support_reason,
+                                audit_context=audit_context,
+                            ),
+                        )
                     stats["pending_review"] += 1
                     logger.info(
                         "RECONCILE REVIEW: %s %s - %s",
@@ -506,7 +523,21 @@ class MemoryEngine:
                             update_mode=update_mode,
                             reason=op.reason,
                         )
-                        await self.memory_store.mark_pending_review(op.memory_id, reason=op.reason)
+                        await self.memory_store.mark_pending_review(
+                            op.memory_id,
+                            reason=op.reason,
+                            relation_outcome=await self._pending_review_relation_outcome(
+                                op=op,
+                                existing_memory=existing_memory,
+                                doc_id=doc_id,
+                                source_type=source_type,
+                                project_key=project_key,
+                                repo_identifier=repo_identifier,
+                                user_id=user_id,
+                                reason=op.reason,
+                                audit_context=audit_context,
+                            ),
+                        )
                         stats["pending_review"] += 1
                         logger.info(
                             "RECONCILE REVIEW: %s %s - %s",
@@ -538,10 +569,26 @@ class MemoryEngine:
                             project_key=project_key,
                             stats=stats,
                             user_id=user_id,
+                            repo_identifier=repo_identifier,
+                            audit_context=audit_context,
                         ):
                             continue
-                    elif op.memory_id:
-                        await self.memory_store.mark_pending_review(op.memory_id, reason=op.reason)
+                    elif op.memory_id and existing_memory:
+                        await self.memory_store.mark_pending_review(
+                            op.memory_id,
+                            reason=op.reason,
+                            relation_outcome=await self._pending_review_relation_outcome(
+                                op=op,
+                                existing_memory=existing_memory,
+                                doc_id=doc_id,
+                                source_type=source_type,
+                                project_key=project_key,
+                                repo_identifier=repo_identifier,
+                                user_id=user_id,
+                                reason=op.reason,
+                                audit_context=audit_context,
+                            ),
+                        )
                     stats["pending_review"] += 1
                     logger.info(
                         "RECONCILE REVIEW: %s %s - %s",
@@ -893,6 +940,8 @@ class MemoryEngine:
         project_key: str | None,
         stats: dict,
         user_id: str | None = None,
+        repo_identifier: str | None = None,
+        audit_context: Any | None = None,
     ) -> bool:
         """Insert a hidden challenger and create a review case for a replacement."""
         if not op.memory or not self._candidate_can_persist(op.memory, stats):
@@ -900,17 +949,76 @@ class MemoryEngine:
         challenger = self._build_memory(op.memory, project_key, source_type, user_id=user_id)
         challenger.status = "pending_review"
         memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
+        replacement_relation = RelationType.REFINES if op.action == ReconcileAction.UPDATE else RelationType.CONTRADICTS
+        (
+            unit,
+            _lifecycle,
+            relation_run_id,
+            candidates,
+            incomplete_buckets,
+            candidate_count,
+        ) = await self._derive_document_replacement_lifecycle(
+            op=op,
+            doc_id=doc_id,
+            source_type=source_type,
+            project_key=project_key,
+            repo_identifier=repo_identifier,
+            user_id=user_id,
+            replacement_relation=replacement_relation,
+            audit_context=audit_context,
+            lifecycle_action=LifecycleAction.CREATE_REVIEW,
+        )
+        existing_case = await self.db.get_open_review_for_incumbent_source_doc(
+            incumbent_memory_id=existing_memory.id,
+            doc_id=doc_id,
+            kind=ReviewKind.SUPERSEDE.value,
+        )
+        review = None
+        related_review_id = existing_case.id if existing_case else None
+        if existing_case is None:
+            review = MemoryReview(
+                id=generate_deterministic_review_id(
+                    kind=ReviewKind.SUPERSEDE.value,
+                    incumbent_memory_id=existing_memory.id,
+                    challenger_memory_id=challenger.id,
+                ),
+                kind=ReviewKind.SUPERSEDE.value,
+                status=ReviewStatus.PENDING.value,
+                incumbent_memory_id=existing_memory.id,
+                challenger_memory_id=challenger.id,
+                reason=op.reason,
+                expected_incumbent_updated_at=(
+                    existing_memory.updated_at.isoformat() if existing_memory.updated_at else None
+                ),
+                expected_challenger_updated_at=(challenger.updated_at.isoformat() if challenger.updated_at else None),
+                created_at=datetime.now(timezone.utc),
+            )
         await self.memory_store.insert_memory(
             memory=challenger,
             doc_id=doc_id,
             source_type=source_type,
             entity_ids=memory_entity_ids,
             excerpt=op.memory.extraction_context,
-        )
-        await self._record_supersede_review(
-            incumbent=existing_memory,
-            challenger_id=challenger.id,
-            reason=op.reason,
+            relation_outcome=self._document_relation_outcome_bundle(
+                unit=unit,
+                relation_run_id=relation_run_id,
+                lifecycle_action=LifecycleAction.CREATE_REVIEW,
+                memory_id=challenger.id,
+                status="review",
+                review_case=ReviewCase.MANUAL_REVIEW_GATE,
+                audit={
+                    "source": "memory_engine.reconcile_and_persist",
+                    "reconcile_action": op.action.value,
+                    "target_memory_id": op.memory_id,
+                    "manual_gate_reason": op.reason,
+                },
+                candidates=candidates,
+                incomplete_mandatory_buckets=incomplete_buckets,
+                candidate_count=candidate_count,
+            ),
+            review=review,
+            related_review_id=related_review_id,
+            related_review_reason=op.reason,
         )
         return True
 
@@ -1160,6 +1268,7 @@ class MemoryEngine:
         user_id: str | None,
         replacement_relation: RelationType,
         audit_context: Any | None,
+        lifecycle_action: LifecycleAction = LifecycleAction.SUPERSEDE_MEMORY,
     ) -> tuple[EvidenceUnit, LifecycleDecision, str, list[RelationCandidateRecord], tuple[str, ...], int]:
         assert op.memory is not None
         assert op.memory_id is not None
@@ -1174,7 +1283,7 @@ class MemoryEngine:
         )
         relation_run_id = _document_relation_run_id(
             unit,
-            LifecycleAction.SUPERSEDE_MEMORY,
+            lifecycle_action,
             candidate_memory_id=op.memory_id,
             relation_type=replacement_relation,
             authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
@@ -1306,56 +1415,109 @@ class MemoryEngine:
             relations=relations,
         )
 
-    async def _record_supersede_review(
+    async def _pending_review_relation_outcome(
         self,
         *,
-        incumbent: Memory,
-        challenger_id: str,
+        op: ReconcileOperation,
+        existing_memory: Memory,
+        doc_id: str,
+        source_type: str,
+        project_key: str | None,
+        repo_identifier: str | None,
+        user_id: str | None,
         reason: str | None,
-    ) -> None:
-        """Create a pending review tying an incumbent to a quarantined challenger.
+        audit_context: Any | None,
+    ) -> RelationOutcomeBundle:
+        if op.memory_id is None:
+            raise RuntimeError("pending-review relation outcome requires a target memory id")
 
-        The review pins the incumbent's ``updated_at`` and the challenger's
-        freshly-inserted state so later approval can detect drift.
-        """
-        existing = await self.db.get_pending_review_for_challenger(challenger_id)
-        if existing:
-            return
-
-        for source in await self.db.get_memory_sources(challenger_id):
-            existing_case = await self.db.get_open_review_for_incumbent_source_doc(
-                incumbent_memory_id=incumbent.id,
-                doc_id=source.doc_id,
-                kind=ReviewKind.SUPERSEDE.value,
-            )
-            if existing_case:
-                await self.db.add_memory_review_related_challenger(
-                    existing_case.id,
-                    challenger_id,
-                    reason=reason,
-                )
-                return
-
-        challenger = await self.db.get_memory(challenger_id)
-        review = MemoryReview(
-            id=generate_deterministic_review_id(
-                kind=ReviewKind.SUPERSEDE.value,
-                incumbent_memory_id=incumbent.id,
-                challenger_memory_id=challenger_id,
-            ),
-            kind=ReviewKind.SUPERSEDE.value,
-            status=ReviewStatus.PENDING.value,
-            incumbent_memory_id=incumbent.id,
-            challenger_memory_id=challenger_id,
-            reason=reason,
-            expected_incumbent_updated_at=(incumbent.updated_at.isoformat() if incumbent.updated_at else None),
-            expected_challenger_updated_at=(
-                challenger.updated_at.isoformat() if challenger and challenger.updated_at else None
-            ),
-            created_at=datetime.now(timezone.utc),
+        review_observation = (reason or f"Current document requires review for memory {op.memory_id}").strip()
+        raw = op.memory or RawMemory(
+            content=review_observation,
+            memory_type=existing_memory.memory_type,
+            confidence=existing_memory.confidence,
+            extraction_context=None,
         )
-        await self.db.insert_memory_review(review)
+        unit = await self._document_evidence_unit(
+            doc_id=doc_id,
+            raw=raw,
+            source_type=source_type,
+            project_key=project_key,
+            repo_identifier=repo_identifier,
+            user_id=user_id,
+            extractor_run_id=getattr(audit_context, "run_id", None),
+        )
+        relation_type = RelationType.REFINES if op.action == ReconcileAction.UPDATE else RelationType.CONTRADICTS
+        relation_run_id = _document_relation_run_id(
+            unit,
+            LifecycleAction.CREATE_REVIEW,
+            candidate_memory_id=op.memory_id,
+            relation_type=relation_type,
+            authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
+        )
+        buckets = await build_mandatory_candidate_bucket_results(
+            store=self.db,
+            unit=unit,
+            access_context=AccessContext(
+                actor_user_id=user_id,
+                source_subscriptions=(unit.source_id,),
+                repo_identifier=repo_identifier,
+                operation_type="document_review",
+            ),
+        )
+        universe = build_candidate_universe(
+            relation_run_id=relation_run_id,
+            evidence_unit_id=unit.id,
+            bucket_results=buckets,
+        )
+        target_candidate = next(
+            (candidate for candidate in universe.candidates if candidate.memory_id == op.memory_id),
+            None,
+        )
+        if target_candidate is None:
+            raise RuntimeError("pending-review target missing from mandatory candidate universe")
 
+        relation = EvidenceRelationRecord(
+            evidence_unit_id=unit.id,
+            memory_id=op.memory_id,
+            relation_type=relation_type,
+            authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
+            is_authoritative_support=True,
+            source_lineage_id=unit.source_lineage_id,
+            confidence=raw.confidence,
+            reason=reason,
+            proposed_memory_content=raw.content if op.memory else None,
+            excerpt=unit.excerpt,
+            classifier_version="memory-engine-v1",
+            relation_run_id=relation_run_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return RelationOutcomeBundle(
+            evidence_unit=unit,
+            relation_run=RelationRunRecord(
+                id=relation_run_id,
+                evidence_unit_id=unit.id,
+                access_context_hash=unit.access_context_hash,
+                candidate_count=universe.total_unique_candidates,
+                mandatory_candidate_count=universe.mandatory_candidate_count,
+                checked_candidate_count=universe.checked_candidate_count,
+                incomplete_mandatory_buckets=universe.incomplete_mandatory_buckets,
+                classifier_version="memory-engine-v1",
+                lifecycle_action=LifecycleAction.CREATE_REVIEW,
+                review_case=ReviewCase.MANUAL_REVIEW_GATE,
+                status="review",
+                result_memory_id=op.memory_id,
+                audit={
+                    "action": op.action.value,
+                    "reason": reason,
+                    "target_memory_id": op.memory_id,
+                    "relation_type": relation_type.value,
+                    "candidate_memory_ids": [candidate.memory_id for candidate in universe.candidates],
+                },
+            ),
+            candidates=tuple(universe.candidates),
+            relations=(relation,),
+        )
 
 def _document_evidence_unit_id(
     *,

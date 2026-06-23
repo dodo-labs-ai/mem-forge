@@ -9,10 +9,22 @@ import pytest
 
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.audit import MemoryAuditLogger
-from memforge.memory.evidence import CandidateBucket, LifecycleAction, RelationType
+from memforge.memory.evidence import (
+    AuthorityCase,
+    CandidateBucket,
+    EvidenceContentProvenance,
+    EvidenceRelationRecord,
+    EvidenceUnit,
+    LifecycleAction,
+    RelationOutcomeBundle,
+    RelationRunRecord,
+    RelationType,
+    ReviewCase,
+)
 from memforge.memory.store import MemoryStore
 from memforge.llm.structured import ReconciliationDecision, ReconciliationResponse, StructuredLlmError
-from memforge.models import Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
+from memforge.models import Memory, MemoryReview, RawMemory, ReconcileAction, ReconcileOperation, content_hash
+from memforge.memory.review_service import ReviewKind, ReviewStatus
 from memforge.pipeline.reconciler import _parse_decisions, reconcile_memories
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -287,6 +299,111 @@ async def test_flagged_supersede_inserts_challenger_pending_review_and_keeps_inc
     assert stored_old.status == "active"
     assert len(pending) == 1
     assert pending[0].content == "PostgreSQL version is 16"
+    async with db.db.execute(
+        """SELECT rr.*
+           FROM relation_runs rr
+           JOIN evidence_relations er ON er.relation_run_id = rr.id
+           WHERE er.memory_id = ?
+           ORDER BY rr.started_at""",
+        (pending[0].id,),
+    ) as cursor:
+        relation_runs = [dict(row) async for row in cursor]
+    assert len(relation_runs) == 1
+    assert relation_runs[0]["lifecycle_action"] == LifecycleAction.CREATE_REVIEW.value
+    assert relation_runs[0]["status"] == "review"
+    assert relation_runs[0]["result_memory_id"] == pending[0].id
+    candidates = await db.get_relation_candidates(relation_runs[0]["id"])
+    assert [(candidate.memory_id, candidate.bucket, candidate.was_checked) for candidate in candidates] == [
+        (old.id, CandidateBucket.SAME_DOC_LINEAGE, True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pending_review_challenger_insert_rolls_back_relation_when_review_insert_fails(db):
+    await _insert_doc(db, "doc-runbook")
+    challenger = _memory("mem-review-chal", "PostgreSQL version is 16")
+    challenger.status = "pending_review"
+    review = MemoryReview(
+        id="review-fails",
+        kind=ReviewKind.SUPERSEDE.value,
+        status=ReviewStatus.PENDING.value,
+        incumbent_memory_id="mem-old0001",
+        challenger_memory_id=challenger.id,
+        reason="Version changed",
+        created_at=datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc),
+    )
+    unit = EvidenceUnit(
+        id="eu-review-fails",
+        source_id="src-1",
+        doc_id="doc-runbook",
+        doc_revision_id="rev-1",
+        source_type="confluence",
+        source_anchor="doc-runbook",
+        source_lineage_id="doc-runbook",
+        source_metadata={},
+        project_key="UNSORTED",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        content="PostgreSQL version is 16",
+        excerpt="PostgreSQL version is 16",
+        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+    )
+    relation_outcome = RelationOutcomeBundle(
+        evidence_unit=unit,
+        relation_run=RelationRunRecord(
+            id="rel-run-review-fails",
+            evidence_unit_id=unit.id,
+            access_context_hash=None,
+            candidate_count=1,
+            mandatory_candidate_count=1,
+            checked_candidate_count=1,
+            incomplete_mandatory_buckets=(),
+            classifier_version="memory-engine-v1",
+            lifecycle_action=LifecycleAction.CREATE_REVIEW,
+            review_case=ReviewCase.MANUAL_REVIEW_GATE,
+            status="review",
+            result_memory_id=challenger.id,
+        ),
+        relations=[
+            EvidenceRelationRecord(
+                evidence_unit_id=unit.id,
+                memory_id=challenger.id,
+                relation_type=RelationType.CONTRADICTS,
+                authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
+                is_authoritative_support=True,
+                source_lineage_id=unit.source_lineage_id,
+                confidence=0.9,
+                reason="Version changed",
+                classifier_version="memory-engine-v1",
+                relation_run_id="rel-run-review-fails",
+            )
+        ],
+    )
+    await db.db.execute(
+        """CREATE TRIGGER fail_memory_review_insert
+           BEFORE INSERT ON memory_reviews
+           BEGIN
+             SELECT RAISE(ABORT, 'review insert failed');
+           END"""
+    )
+    await db.db.commit()
+
+    with pytest.raises(Exception, match="review insert failed"):
+        await db.insert_memory_with_source_and_relation(
+            challenger,
+            doc_id="doc-runbook",
+            source_type="confluence",
+            excerpt="PostgreSQL version is 16",
+            relation_outcome=relation_outcome,
+            review=review,
+        )
+
+    assert await db.get_memory(challenger.id) is None
+    assert await db.get_memory_review(review.id) is None
+    async with db.db.execute("SELECT COUNT(*) AS total FROM relation_runs WHERE id = ?", ("rel-run-review-fails",)) as cursor:
+        row = await cursor.fetchone()
+    assert row["total"] == 0
 
 
 @pytest.mark.asyncio
@@ -443,6 +560,78 @@ async def test_high_corroboration_delete_removes_current_support_when_other_supp
     assert stored_old.status == "active"
     assert [source.doc_id for source in sources] == ["doc-other", "doc-third"]
     assert review_rows == []
+
+
+@pytest.mark.asyncio
+async def test_high_corroboration_delete_review_records_relation_audit(db, monkeypatch):
+    await _insert_doc(db, "doc-runbook")
+    old = _memory("mem-old0001", "PostgreSQL version is 14", corroboration_count=3)
+    await db.insert_memory(old)
+    await db.add_memory_source(old.id, "doc-runbook", "confluence")
+
+    collection = FakeCollection()
+    adapters = build_sqlite_adapters(db, collection)
+    store = MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        audit_logger=MemoryAuditLogger(db),
+    )
+    store._embed = AsyncMock(return_value=[0.1])
+    engine = MemoryEngine(
+        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+    )
+
+    async def fake_reconcile_memories(**kwargs):
+        return [
+            ReconcileOperation(
+                action=ReconcileAction.DELETE,
+                memory_id=old.id,
+                reason="The updated document no longer supports this memory",
+            )
+        ]
+
+    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
+
+    stats = await engine.reconcile_and_persist(
+        doc_id="doc-runbook",
+        raw_memories=[],
+        source_type="confluence",
+        doc_type="runbook",
+        document_content="The updated runbook no longer mentions PostgreSQL 14.",
+    )
+
+    stored_old = await db.get_memory(old.id)
+    assert stats["pending_review"] == 1
+    assert stored_old.status == "pending_review"
+    async with db.db.execute(
+        """SELECT rr.*
+           FROM relation_runs rr
+           JOIN evidence_relations er ON er.relation_run_id = rr.id
+           WHERE er.memory_id = ?
+           ORDER BY rr.started_at""",
+        (old.id,),
+    ) as cursor:
+        relation_runs = [dict(row) async for row in cursor]
+    assert len(relation_runs) == 1
+    assert relation_runs[0]["lifecycle_action"] == LifecycleAction.CREATE_REVIEW.value
+    assert relation_runs[0]["status"] == "review"
+    assert relation_runs[0]["result_memory_id"] == old.id
+    assert relation_runs[0]["review_case"] == ReviewCase.MANUAL_REVIEW_GATE.value
+    relations = await db.get_evidence_relations(relation_runs[0]["evidence_unit_id"])
+    assert [(relation.memory_id, relation.relation_type) for relation in relations] == [
+        (old.id, RelationType.CONTRADICTS)
+    ]
+    unit = await db.get_evidence_unit(relation_runs[0]["evidence_unit_id"])
+    assert unit is not None
+    assert unit.content == "The updated document no longer supports this memory"
+    assert unit.content != old.content
+    assert unit.evidence_provenance == EvidenceContentProvenance.NO_EXCERPT
+    candidates = await db.get_relation_candidates(relation_runs[0]["id"])
+    assert [(candidate.memory_id, candidate.bucket, candidate.was_checked) for candidate in candidates] == [
+        (old.id, CandidateBucket.SAME_DOC_LINEAGE, True)
+    ]
 
 
 @pytest.mark.asyncio
