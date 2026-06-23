@@ -841,6 +841,43 @@ async def test_relation_outcome_bundle_rejects_same_run_id_candidate_payload_col
 
 
 @pytest.mark.asyncio
+async def test_relation_outcome_bundle_rejects_same_run_id_audit_payload_collision(
+    db: Database,
+) -> None:
+    unit = _unit()
+    run = RelationRunRecord(
+        id="rel-run-1",
+        evidence_unit_id="eu-1",
+        access_context_hash="ctx-1",
+        candidate_count=0,
+        mandatory_candidate_count=0,
+        checked_candidate_count=0,
+        incomplete_mandatory_buckets=(),
+        classifier_version="test-v1",
+        lifecycle_action=LifecycleAction.NONE,
+        review_case=None,
+        status="success",
+        result_memory_id=None,
+        audit={"batch": "one"},
+        started_at="2026-06-22T12:00:00+00:00",
+    )
+
+    await db.record_relation_outcome_bundle(
+        RelationOutcomeBundle(evidence_unit=unit, relation_run=run)
+    )
+
+    with pytest.raises(RuntimeError, match="relation_run_id collision"):
+        await db.record_relation_outcome_bundle(
+            RelationOutcomeBundle(
+                evidence_unit=unit,
+                relation_run=replace(run, audit={"batch": "two"}),
+            )
+        )
+
+    assert await db.get_relation_run("rel-run-1") == run
+
+
+@pytest.mark.asyncio
 async def test_relation_outcome_bundle_rejects_same_run_id_relation_payload_collision(
     db: Database,
 ) -> None:
