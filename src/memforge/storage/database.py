@@ -53,6 +53,9 @@ from memforge.memory.evidence import (
     RelationRunRecord,
     RelationType,
     ReviewCase,
+    evidence_relation_retry_identity,
+    relation_bundle_snapshot_audit,
+    relation_candidate_retry_identity,
 )
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
@@ -137,39 +140,6 @@ def _assert_relation_run_retry_matches(row: Mapping[str, Any], run: RelationRunR
             "relation_run_id collision for "
             f"{run.id}: existing run does not match retry payload (audit_json)"
         )
-
-
-def _candidate_retry_identity(candidate: RelationCandidateRecord) -> tuple[Any, ...]:
-    return (
-        candidate.relation_run_id,
-        candidate.evidence_unit_id,
-        candidate.memory_id,
-        candidate.bucket.value,
-        candidate.bucket_rank,
-        candidate.candidate_rank,
-        candidate.score,
-        bool(candidate.is_mandatory),
-        bool(candidate.bucket_complete),
-        bool(candidate.was_checked),
-        candidate.reason,
-    )
-
-
-def _relation_retry_identity(relation: EvidenceRelationRecord) -> tuple[Any, ...]:
-    return (
-        relation.evidence_unit_id,
-        relation.memory_id,
-        relation.relation_type.value,
-        relation.authority_case.value,
-        bool(relation.is_authoritative_support),
-        relation.source_lineage_id,
-        relation.confidence,
-        relation.reason,
-        relation.proposed_memory_content,
-        relation.excerpt,
-        relation.classifier_version,
-        relation.relation_run_id,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -2464,8 +2434,17 @@ class Database:
     async def _assert_relation_bundle_retry_matches_unlocked(self, bundle: RelationOutcomeBundle) -> None:
         stored_candidates = await self._get_relation_candidates_unlocked(bundle.relation_run.id)
         expected_candidates = list(bundle.candidates)
-        if [_candidate_retry_identity(candidate) for candidate in stored_candidates] != [
-            _candidate_retry_identity(candidate) for candidate in expected_candidates
+        committed_candidate_hash = bundle.relation_run.audit.get("candidate_snapshot_hash")
+        if committed_candidate_hash is not None:
+            candidate_hashes = relation_bundle_snapshot_audit(candidates=stored_candidates, relations=[])
+            if committed_candidate_hash != candidate_hashes["candidate_snapshot_hash"]:
+                raise RuntimeError(
+                    "relation_run_id collision for "
+                    f"{bundle.relation_run.id}: committed run snapshot was modified (relation_candidates)"
+                )
+
+        if [relation_candidate_retry_identity(candidate) for candidate in stored_candidates] != [
+            relation_candidate_retry_identity(candidate) for candidate in expected_candidates
         ]:
             raise RuntimeError(
                 "relation_run_id collision for "
@@ -2497,10 +2476,19 @@ class Database:
                         created_at=row["created_at"],
                     )
                 )
-        expected_relations = sorted(bundle.relations, key=_relation_retry_identity)
-        stored_relations = sorted(stored_relations, key=_relation_retry_identity)
-        if [_relation_retry_identity(relation) for relation in stored_relations] != [
-            _relation_retry_identity(relation) for relation in expected_relations
+        committed_relation_hash = bundle.relation_run.audit.get("relation_snapshot_hash")
+        if committed_relation_hash is not None:
+            relation_hashes = relation_bundle_snapshot_audit(candidates=[], relations=stored_relations)
+            if committed_relation_hash != relation_hashes["relation_snapshot_hash"]:
+                raise RuntimeError(
+                    "relation_run_id collision for "
+                    f"{bundle.relation_run.id}: committed run snapshot was modified (evidence_relations)"
+                )
+
+        expected_relations = sorted(bundle.relations, key=evidence_relation_retry_identity)
+        stored_relations = sorted(stored_relations, key=evidence_relation_retry_identity)
+        if [evidence_relation_retry_identity(relation) for relation in stored_relations] != [
+            evidence_relation_retry_identity(relation) for relation in expected_relations
         ]:
             raise RuntimeError(
                 "relation_run_id collision for "
