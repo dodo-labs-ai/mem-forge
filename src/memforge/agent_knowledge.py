@@ -30,6 +30,7 @@ from memforge.memory.evidence import (
     RelationType,
     build_candidate_universe,
     build_mandatory_candidate_bucket_results,
+    relation_bundle_snapshot_audit,
 )
 from memforge.models import (
     DocumentRecord,
@@ -486,6 +487,21 @@ class AgentKnowledgeBundleService:
                 raise RuntimeError("agent claim replacement retry is missing its relation run")
             if existing_run.result_memory_id != new_memory_id:
                 raise RuntimeError("agent claim replacement retry result memory does not match current claim")
+            stored_candidates = await self.db.get_relation_candidates(relation_run_id)
+            relation_outcome = self._relation_outcome_bundle(
+                unit=unit,
+                relation_run_id=relation_run_id,
+                lifecycle_action=LifecycleAction.SUPERSEDE_MEMORY,
+                review_case=None,
+                memory_id=new_memory_id,
+                candidates=stored_candidates,
+                incomplete_mandatory_buckets=existing_run.incomplete_mandatory_buckets,
+                candidate_count=existing_run.candidate_count,
+                confidence=confidence,
+                reason=replacement_reason,
+                submitted_at=submitted_at,
+            )
+            await self.db.record_relation_outcome_bundle(relation_outcome)
             await self.memory_store.ensure_agent_claim_memory_projection(
                 memory,
                 doc_id=concept_id,
@@ -595,6 +611,26 @@ class AgentKnowledgeBundleService:
         candidate_count: int | None = None,
     ) -> RelationOutcomeBundle:
         now = submitted_at.isoformat()
+        relations = (
+            EvidenceRelationRecord(
+                evidence_unit_id=unit.id,
+                memory_id=memory_id,
+                relation_type=RelationType.SUPPORTS,
+                authority_case=AuthorityCase.SAME_AGENT_CLAIM,
+                is_authoritative_support=True,
+                source_lineage_id=unit.source_lineage_id,
+                confidence=confidence,
+                reason=reason,
+                excerpt=unit.excerpt,
+                classifier_version="agent_session_intent_v1",
+                relation_run_id=relation_run_id,
+                created_at=now,
+            ),
+        )
+        audit = {
+            "source_patch_intent": unit.source_metadata.get("source_patch_intent"),
+            **relation_bundle_snapshot_audit(candidates=candidates, relations=relations),
+        }
         return RelationOutcomeBundle(
             evidence_unit=unit,
             relation_run=RelationRunRecord(
@@ -610,29 +646,12 @@ class AgentKnowledgeBundleService:
                 review_case=review_case,
                 status="applied",
                 result_memory_id=memory_id,
-                audit={
-                    "source_patch_intent": unit.source_metadata.get("source_patch_intent"),
-                },
+                audit=audit,
                 started_at=now,
                 completed_at=now,
             ),
             candidates=tuple(candidates),
-            relations=(
-                EvidenceRelationRecord(
-                    evidence_unit_id=unit.id,
-                    memory_id=memory_id,
-                    relation_type=RelationType.SUPPORTS,
-                    authority_case=AuthorityCase.SAME_AGENT_CLAIM,
-                    is_authoritative_support=True,
-                    source_lineage_id=unit.source_lineage_id,
-                    confidence=confidence,
-                    reason=reason,
-                    excerpt=unit.excerpt,
-                    classifier_version="agent_session_intent_v1",
-                    relation_run_id=relation_run_id,
-                    created_at=now,
-                ),
-            ),
+            relations=relations,
         )
 
     def _build_claim_memory(

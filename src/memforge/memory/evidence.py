@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
-from typing import Generic, Mapping, Protocol, TypeVar
+from typing import Any, Generic, Mapping, Protocol, TypeVar
 
 
 CandidateT = TypeVar("CandidateT")
@@ -291,6 +292,59 @@ class CandidateUniverse:
     total_unique_candidates: int
     mandatory_candidate_count: int
     checked_candidate_count: int
+
+
+def relation_candidate_retry_identity(candidate: RelationCandidateRecord) -> tuple[Any, ...]:
+    return (
+        candidate.relation_run_id,
+        candidate.evidence_unit_id,
+        candidate.memory_id,
+        candidate.bucket.value,
+        candidate.bucket_rank,
+        candidate.candidate_rank,
+        candidate.score,
+        bool(candidate.is_mandatory),
+        bool(candidate.bucket_complete),
+        bool(candidate.was_checked),
+        candidate.reason,
+    )
+
+
+def evidence_relation_retry_identity(relation: EvidenceRelationRecord) -> tuple[Any, ...]:
+    return (
+        relation.evidence_unit_id,
+        relation.memory_id,
+        relation.relation_type.value,
+        relation.authority_case.value,
+        bool(relation.is_authoritative_support),
+        relation.source_lineage_id,
+        relation.confidence,
+        relation.reason,
+        relation.proposed_memory_content,
+        relation.excerpt,
+        relation.classifier_version,
+        relation.relation_run_id,
+    )
+
+
+def relation_snapshot_hash(values: tuple[tuple[Any, ...], ...] | list[tuple[Any, ...]]) -> str:
+    payload = json.dumps(list(values), sort_keys=True, separators=(",", ":"))
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def relation_bundle_snapshot_audit(
+    *,
+    candidates: tuple[RelationCandidateRecord, ...] | list[RelationCandidateRecord],
+    relations: tuple[EvidenceRelationRecord, ...] | list[EvidenceRelationRecord],
+) -> dict[str, str]:
+    return {
+        "candidate_snapshot_hash": relation_snapshot_hash(
+            [relation_candidate_retry_identity(candidate) for candidate in candidates]
+        ),
+        "relation_snapshot_hash": relation_snapshot_hash(
+            sorted(evidence_relation_retry_identity(relation) for relation in relations)
+        ),
+    }
 
 
 @dataclass(frozen=True, slots=True)

@@ -596,6 +596,124 @@ async def test_update_existing_claim_retry_is_idempotent_after_replacement(bundl
 
 
 @pytest.mark.asyncio
+async def test_update_existing_claim_retry_rejects_changed_relation_payload(bundle_stack):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    created = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+    update = _proposal(
+        action="update_existing_claim",
+        concept_id=created.concept_id,
+        claim_id=created.claim_id,
+        claim_text=(
+            "Workspace source schedulers must start during app startup, claim due "
+            "source schedules, and advance next_run_at after a successful claim."
+        ),
+        memory_content="Source schedulers start on app startup, claim due schedules, and advance next_run_at after success.",
+        reason="New evidence refines the scheduler lifecycle claim.",
+    )
+    first_update = await service.apply_patch_proposal(
+        proposal=update,
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-2",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+
+    changed_retry = _proposal(
+        action="update_existing_claim",
+        concept_id=created.concept_id,
+        claim_id=created.claim_id,
+        claim_text=update.claim_text,
+        memory_content=update.memory_content,
+        reason="A different retry reason would change the relation payload.",
+    )
+    with pytest.raises(RuntimeError, match="relation_run_id collision"):
+        await service.apply_patch_proposal(
+            proposal=changed_retry,
+            owner_user_id="u-andrew",
+            source_id="src-agent-sessions-codex",
+            client="codex",
+            session_id="sess-2",
+            workspace="/workspace/memforge-cloud",
+            repo_identifier="github.tools.sap/hcm/memforge-cloud",
+            project_key="UNSORTED",
+        )
+
+    relation_runs = await _relation_runs_for_memory(db, first_update.memory_id)
+    assert len(relation_runs) == 1
+
+
+@pytest.mark.asyncio
+async def test_update_existing_claim_retry_rejects_committed_candidate_snapshot_change(bundle_stack):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    created = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+    update = _proposal(
+        action="update_existing_claim",
+        concept_id=created.concept_id,
+        claim_id=created.claim_id,
+        claim_text=(
+            "Workspace source schedulers must start during app startup, claim due "
+            "source schedules, and advance next_run_at after a successful claim."
+        ),
+        memory_content="Source schedulers start on app startup, claim due schedules, and advance next_run_at after success.",
+        reason="New evidence refines the scheduler lifecycle claim.",
+    )
+    first_update = await service.apply_patch_proposal(
+        proposal=update,
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-2",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+    relation_runs = await _relation_runs_for_memory(db, first_update.memory_id)
+    assert len(relation_runs) == 1
+
+    async with db._write_lock:
+        await db.db.execute(
+            "UPDATE relation_candidates SET reason = ? WHERE relation_run_id = ?",
+            ("tampered candidate snapshot", relation_runs[0]["id"]),
+        )
+        await db.db.commit()
+
+    with pytest.raises(RuntimeError, match="relation_run_id collision"):
+        await service.apply_patch_proposal(
+            proposal=update,
+            owner_user_id="u-andrew",
+            source_id="src-agent-sessions-codex",
+            client="codex",
+            session_id="sess-2",
+            workspace="/workspace/memforge-cloud",
+            repo_identifier="github.tools.sap/hcm/memforge-cloud",
+            project_key="UNSORTED",
+        )
+
+
+@pytest.mark.asyncio
 async def test_update_existing_claim_records_complete_mandatory_candidate_universe(bundle_stack):
     db, store, _collection = bundle_stack
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
