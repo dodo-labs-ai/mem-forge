@@ -19,6 +19,7 @@ from memforge.memory.evidence import (
     RelationRunRecord,
     RelationType,
     ReviewCase,
+    relation_bundle_snapshot_audit,
 )
 from memforge.models import DocumentRecord, Memory, MemoryReview, content_hash
 from memforge.storage.database import Database
@@ -269,7 +270,13 @@ async def test_relation_run_round_trips_candidate_completeness_and_apply_outcome
 
     await db.record_relation_run(run)
 
-    assert await db.get_relation_run("rel-run-1") == run
+    assert await db.get_relation_run("rel-run-1") == replace(
+        run,
+        audit={
+            **run.audit,
+            **relation_bundle_snapshot_audit(candidates=(), relations=()),
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -295,7 +302,13 @@ async def test_relation_run_exact_retry_is_idempotent(db: Database) -> None:
     await db.record_relation_run(run)
     await db.record_relation_run(run)
 
-    assert await db.get_relation_run("rel-run-1") == run
+    assert await db.get_relation_run("rel-run-1") == replace(
+        run,
+        audit={
+            **run.audit,
+            **relation_bundle_snapshot_audit(candidates=(), relations=()),
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -333,7 +346,13 @@ async def test_relation_run_rejects_id_collision_with_different_payload(db: Data
     with pytest.raises(RuntimeError, match="relation_run_id collision"):
         await db.record_relation_run(collision)
 
-    assert await db.get_relation_run("rel-run-1") == original
+    assert await db.get_relation_run("rel-run-1") == replace(
+        original,
+        audit={
+            **original.audit,
+            **relation_bundle_snapshot_audit(candidates=(), relations=()),
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -463,7 +482,16 @@ async def test_relation_outcome_bundle_exact_retry_is_idempotent(
     await db.record_relation_outcome_bundle(original_bundle)
     await db.record_relation_outcome_bundle(original_bundle)
 
-    assert await db.get_relation_run("rel-run-1") == original_run
+    assert await db.get_relation_run("rel-run-1") == replace(
+        original_run,
+        audit={
+            **original_run.audit,
+            **relation_bundle_snapshot_audit(
+                candidates=(original_candidate,),
+                relations=(_relation("mem-original"),),
+            ),
+        },
+    )
     assert await db.get_relation_candidates("rel-run-1") == [original_candidate]
     assert [relation.memory_id for relation in await db.get_evidence_relations_by_memory("mem-original")] == [
         "mem-original"
@@ -769,7 +797,16 @@ async def test_relation_outcome_bundle_rejects_run_id_collision(
             )
         )
 
-    assert await db.get_relation_run("rel-run-1") == original_run
+    assert await db.get_relation_run("rel-run-1") == replace(
+        original_run,
+        audit={
+            **original_run.audit,
+            **relation_bundle_snapshot_audit(
+                candidates=(original_candidate,),
+                relations=(_relation("mem-original"),),
+            ),
+        },
+    )
     assert await db.get_relation_candidates("rel-run-1") == [original_candidate]
     assert [relation.memory_id for relation in await db.get_evidence_relations_by_memory("mem-original")] == [
         "mem-original"
@@ -874,7 +911,13 @@ async def test_relation_outcome_bundle_rejects_same_run_id_audit_payload_collisi
             )
         )
 
-    assert await db.get_relation_run("rel-run-1") == run
+    assert await db.get_relation_run("rel-run-1") == replace(
+        run,
+        audit={
+            **run.audit,
+            **relation_bundle_snapshot_audit(candidates=(), relations=()),
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -1365,3 +1408,16 @@ async def test_supersede_preserves_evidence_relation_history_for_old_memory(
     assert [(source.doc_id, source.source_type, source.excerpt) for source in sources] == [
         ("doc-1", "confluence", "source excerpt")
     ]
+
+
+@pytest.mark.asyncio
+async def test_supersede_memory_rejects_self_supersede(db: Database) -> None:
+    memory = _memory("mem-self")
+
+    with pytest.raises(ValueError, match="cannot supersede a memory with itself"):
+        await db.supersede_memory(
+            "mem-self",
+            memory,
+            replacement_reason="same id",
+            replacement_kind="revision",
+        )

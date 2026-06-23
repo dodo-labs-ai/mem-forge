@@ -12,6 +12,7 @@ import json
 import logging
 import sqlite3
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -80,6 +81,37 @@ AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED = "knowledge_patched"
 AGENT_SESSION_OUTCOME_LEGACY_PACKAGE_CREATED = "package_created"
 AGENT_SESSION_OUTCOME_NO_OUTPUT = "no_output"
 AGENT_SESSION_OUTCOME_FAILED = "failed"
+
+
+def _with_relation_snapshot_audit(bundle: RelationOutcomeBundle) -> RelationOutcomeBundle:
+    """Return a bundle whose relation-run audit contains the canonical snapshot hashes."""
+    snapshot_audit = relation_bundle_snapshot_audit(candidates=bundle.candidates, relations=bundle.relations)
+    audit = dict(bundle.relation_run.audit)
+    for key, value in snapshot_audit.items():
+        existing = audit.get(key)
+        if existing is not None and existing != value:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{bundle.relation_run.id}: supplied audit does not match relation snapshot ({key})"
+            )
+        audit[key] = value
+    return replace(bundle, relation_run=replace(bundle.relation_run, audit=audit))
+
+
+def _with_empty_relation_snapshot_audit(run: RelationRunRecord) -> RelationRunRecord:
+    """Return a standalone relation run with the canonical empty snapshot audit."""
+    audit = dict(run.audit)
+    for key, value in relation_bundle_snapshot_audit(candidates=(), relations=()).items():
+        existing = audit.get(key)
+        if existing is not None and existing != value:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{run.id}: supplied audit does not match empty relation snapshot ({key})"
+            )
+        audit[key] = value
+    return replace(run, audit=audit)
+
+
 AGENT_SESSION_OUTCOMES = (
     AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED,
     AGENT_SESSION_OUTCOME_NO_OUTPUT,
@@ -92,6 +124,12 @@ _PERSISTED_RELATION_TYPES = {
     RelationType.REFINES,
     RelationType.CONTRADICTS,
 }
+_RELATION_SNAPSHOT_AUDIT_KEYS = frozenset(
+    {
+        "candidate_snapshot_hash",
+        "relation_snapshot_hash",
+    }
+)
 
 
 def _validate_persisted_evidence_relation(relation: EvidenceRelationRecord) -> None:
@@ -106,6 +144,10 @@ def _relation_result_memory_id(run: RelationRunRecord) -> str | None:
 
 def _relation_run_value(row: Mapping[str, Any], key: str) -> Any:
     return row[key]
+
+
+def _relation_run_user_audit(audit: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in audit.items() if key not in _RELATION_SNAPSHOT_AUDIT_KEYS}
 
 
 def _assert_relation_run_retry_matches(row: Mapping[str, Any], run: RelationRunRecord) -> None:
@@ -135,11 +177,17 @@ def _assert_relation_run_retry_matches(row: Mapping[str, Any], run: RelationRunR
             f"{run.id}: existing run does not match retry payload ({', '.join(mismatches)})"
         )
     existing_audit = json.loads(row["audit_json"] or "{}")
-    if existing_audit != dict(run.audit):
+    if _relation_run_user_audit(existing_audit) != _relation_run_user_audit(dict(run.audit)):
         raise RuntimeError(
             "relation_run_id collision for "
             f"{run.id}: existing run does not match retry payload (audit_json)"
         )
+    for key in _RELATION_SNAPSHOT_AUDIT_KEYS:
+        if key not in existing_audit:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{run.id}: committed audit is missing {key}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2119,6 +2167,7 @@ class Database:
                 raise
 
     async def record_relation_run(self, run: RelationRunRecord) -> None:
+        run = _with_empty_relation_snapshot_audit(run)
         lifecycle_action = run.lifecycle_action.value if run.lifecycle_action is not None else None
         review_case = run.review_case.value if run.review_case is not None else None
         async with self._write_lock:
@@ -2270,6 +2319,7 @@ class Database:
                 raise
 
     async def _record_relation_outcome_bundle_unlocked(self, bundle: RelationOutcomeBundle) -> None:
+        bundle = _with_relation_snapshot_audit(bundle)
         unit = bundle.evidence_unit
         run = bundle.relation_run
         async with self.db.execute(
@@ -2279,7 +2329,8 @@ class Database:
             existing_run = await cursor.fetchone()
         if existing_run is not None:
             _assert_relation_run_retry_matches(existing_run, run)
-            await self._assert_relation_bundle_retry_matches_unlocked(bundle)
+            existing_audit = json.loads(existing_run["audit_json"] or "{}")
+            await self._assert_relation_bundle_retry_matches_unlocked(bundle, existing_audit)
             return
 
         lifecycle_action = run.lifecycle_action.value if run.lifecycle_action is not None else None
@@ -2431,17 +2482,25 @@ class Database:
                 ),
             )
 
-    async def _assert_relation_bundle_retry_matches_unlocked(self, bundle: RelationOutcomeBundle) -> None:
+    async def _assert_relation_bundle_retry_matches_unlocked(
+        self,
+        bundle: RelationOutcomeBundle,
+        committed_audit: Mapping[str, object],
+    ) -> None:
         stored_candidates = await self._get_relation_candidates_unlocked(bundle.relation_run.id)
         expected_candidates = list(bundle.candidates)
-        committed_candidate_hash = bundle.relation_run.audit.get("candidate_snapshot_hash")
-        if committed_candidate_hash is not None:
-            candidate_hashes = relation_bundle_snapshot_audit(candidates=stored_candidates, relations=[])
-            if committed_candidate_hash != candidate_hashes["candidate_snapshot_hash"]:
-                raise RuntimeError(
-                    "relation_run_id collision for "
-                    f"{bundle.relation_run.id}: committed run snapshot was modified (relation_candidates)"
-                )
+        committed_candidate_hash = committed_audit.get("candidate_snapshot_hash")
+        if committed_candidate_hash is None:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{bundle.relation_run.id}: committed audit is missing candidate_snapshot_hash"
+            )
+        candidate_hashes = relation_bundle_snapshot_audit(candidates=stored_candidates, relations=[])
+        if committed_candidate_hash != candidate_hashes["candidate_snapshot_hash"]:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{bundle.relation_run.id}: committed run snapshot was modified (relation_candidates)"
+            )
 
         if [relation_candidate_retry_identity(candidate) for candidate in stored_candidates] != [
             relation_candidate_retry_identity(candidate) for candidate in expected_candidates
@@ -2476,14 +2535,18 @@ class Database:
                         created_at=row["created_at"],
                     )
                 )
-        committed_relation_hash = bundle.relation_run.audit.get("relation_snapshot_hash")
-        if committed_relation_hash is not None:
-            relation_hashes = relation_bundle_snapshot_audit(candidates=[], relations=stored_relations)
-            if committed_relation_hash != relation_hashes["relation_snapshot_hash"]:
-                raise RuntimeError(
-                    "relation_run_id collision for "
-                    f"{bundle.relation_run.id}: committed run snapshot was modified (evidence_relations)"
-                )
+        committed_relation_hash = committed_audit.get("relation_snapshot_hash")
+        if committed_relation_hash is None:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{bundle.relation_run.id}: committed audit is missing relation_snapshot_hash"
+            )
+        relation_hashes = relation_bundle_snapshot_audit(candidates=[], relations=stored_relations)
+        if committed_relation_hash != relation_hashes["relation_snapshot_hash"]:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{bundle.relation_run.id}: committed run snapshot was modified (evidence_relations)"
+            )
 
         expected_relations = sorted(bundle.relations, key=evidence_relation_retry_identity)
         stored_relations = sorted(stored_relations, key=evidence_relation_retry_identity)
@@ -3296,6 +3359,8 @@ class Database:
         replacement_reason: str | None = None,
         replacement_kind: ReplacementKind,
     ) -> None:
+        if old_id == new_memory.id:
+            raise ValueError("cannot supersede a memory with itself")
         replacement_kind = _validate_replacement_kind(replacement_kind)
         _validate_visibility(new_memory.visibility, new_memory.owner_user_id)
         now = _now_iso()
@@ -4002,6 +4067,8 @@ class Database:
         relation_outcome: RelationOutcomeBundle | None = None,
     ) -> None:
         """Supersede a memory and move its agent-claim projection atomically."""
+        if old_id == new_memory.id:
+            raise ValueError("cannot supersede a memory with itself")
         replacement_kind = _validate_replacement_kind(replacement_kind)
         _validate_visibility(new_memory.visibility, new_memory.owner_user_id)
         project_key = _normalize_project_key(new_memory.project_key)
