@@ -592,6 +592,114 @@ async def test_relation_outcome_bundle_retry_uses_immutable_relation_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_relation_run_snapshot_migration_backfills_legacy_audit(db: Database) -> None:
+    unit = _unit()
+    await db.upsert_evidence_unit(unit)
+    await db.insert_memory(_memory("mem-original"))
+    candidate = RelationCandidateRecord(
+        relation_run_id="rel-run-legacy",
+        evidence_unit_id=unit.id,
+        memory_id="mem-original",
+        bucket=CandidateBucket.EXACT_SOURCE_ANCHOR,
+        bucket_rank=0,
+        candidate_rank=0,
+        score=None,
+        is_mandatory=True,
+        bucket_complete=True,
+        was_checked=True,
+        reason="Legacy candidate snapshot.",
+    )
+    relation = _relation("mem-original", run_id="rel-run-legacy")
+    await db.db.execute(
+        """INSERT INTO relation_runs (
+            id, evidence_unit_id, access_context_hash, candidate_count,
+            mandatory_candidate_count, checked_candidate_count,
+            incomplete_mandatory_buckets_json, classifier_version,
+            lifecycle_action, review_case, status, result_memory_id,
+            audit_json, started_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "rel-run-legacy",
+            unit.id,
+            "ctx-1",
+            1,
+            1,
+            1,
+            "[]",
+            "test-v1",
+            LifecycleAction.CREATE_MEMORY.value,
+            None,
+            "success",
+            "mem-original",
+            "{}",
+            "2026-06-22T12:00:00+00:00",
+            "2026-06-22T12:00:01+00:00",
+        ),
+    )
+    await db.db.execute(
+        """INSERT INTO relation_candidates (
+            relation_run_id, evidence_unit_id, memory_id, bucket,
+            bucket_rank, candidate_rank, score, is_mandatory,
+            bucket_complete, was_checked, reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            candidate.relation_run_id,
+            candidate.evidence_unit_id,
+            candidate.memory_id,
+            candidate.bucket.value,
+            candidate.bucket_rank,
+            candidate.candidate_rank,
+            candidate.score,
+            1,
+            1,
+            1,
+            candidate.reason,
+        ),
+    )
+    await db.db.execute(
+        """INSERT INTO relation_run_relations (
+            relation_run_id, evidence_unit_id, memory_id, relation_type,
+            authority_case, is_authoritative_support, source_lineage_id,
+            confidence, reason, proposed_memory_content, excerpt,
+            classifier_version, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            relation.relation_run_id,
+            relation.evidence_unit_id,
+            relation.memory_id,
+            relation.relation_type.value,
+            relation.authority_case.value,
+            1,
+            relation.source_lineage_id,
+            relation.confidence,
+            relation.reason,
+            relation.proposed_memory_content,
+            relation.excerpt,
+            relation.classifier_version,
+            relation.created_at,
+        ),
+    )
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 26")
+    await db.db.commit()
+
+    await db._run_migrations()
+
+    expected_audit = relation_bundle_snapshot_audit(candidates=(candidate,), relations=(relation,))
+    stored_run = await db.get_relation_run("rel-run-legacy")
+    assert stored_run is not None
+    assert stored_run.audit["candidate_snapshot_hash"] == expected_audit["candidate_snapshot_hash"]
+    assert stored_run.audit["relation_snapshot_hash"] == expected_audit["relation_snapshot_hash"]
+    await db.record_relation_outcome_bundle(
+        RelationOutcomeBundle(
+            evidence_unit=unit,
+            relation_run=replace(stored_run, audit={}),
+            candidates=(candidate,),
+            relations=(relation,),
+        )
+    )
+
+
+@pytest.mark.asyncio
 async def test_insert_memory_with_relation_retry_is_idempotent_at_store_boundary(db: Database) -> None:
     await db.upsert_document(_document("doc-1"))
     unit = _unit()

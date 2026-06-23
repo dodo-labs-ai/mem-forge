@@ -519,6 +519,7 @@ class MemoryStore:
             lifecycle_action=lifecycle.action,
             review_case=lifecycle.review_case,
             status="applied" if lifecycle.action is LifecycleAction.ATTACH_SUPPORT else "review",
+            result_memory_id=target_memory.id,
             audit={
                 "source": "MemoryStore.deduplicate_and_insert",
                 "candidate_memory_id": candidate_memory.id,

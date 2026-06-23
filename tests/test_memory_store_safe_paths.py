@@ -457,6 +457,7 @@ async def test_dedup_corrobates_active_chroma_candidate(db: Database):
         relation_runs = [dict(row) async for row in cursor]
     assert len(relation_runs) == 1
     assert relation_runs[0]["lifecycle_action"] == LifecycleAction.ATTACH_SUPPORT.value
+    assert relation_runs[0]["result_memory_id"] == active.id
     evidence_unit = await db.get_evidence_unit(relation_runs[0]["evidence_unit_id"])
     assert evidence_unit is not None
     assert evidence_unit.doc_id == "doc-1"
