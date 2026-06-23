@@ -8,9 +8,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
+from hashlib import sha256
 from typing import Any, Sequence
 
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
+from memforge.memory.evidence import (
+    AuthorityCase,
+    CandidateBucket,
+    EvidenceContentProvenance,
+    EvidenceRelationRecord,
+    EvidenceUnit,
+    LifecycleAction,
+    MemoryRelationApplyService,
+    RelationCandidateRecord,
+    RelationDecision,
+    RelationOutcomeBundle,
+    RelationRunRecord,
+    RelationType,
+    relation_run_id_for,
+)
 from memforge.memory.index_payloads import (
     embedding_text_hash,
     memory_embedding_text,
@@ -18,6 +35,7 @@ from memforge.memory.index_payloads import (
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import (
     Memory,
+    MemoryReview,
     MemoryStatus,
     ReplacementKind,
     UNSORTED_PROJECT_KEY,
@@ -66,6 +84,52 @@ def _memory_embedding_text(memory: Memory) -> str:
     Type prefix causes memories of the same type to cluster in embedding space.
     """
     return memory_embedding_text(memory)
+
+
+def _parse_iso_datetime(value: str | None) -> datetime:
+    if not value:
+        return datetime.now(timezone.utc)
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _dedup_support_evidence_unit_id(
+    *,
+    source_id: str,
+    doc_id: str,
+    doc_revision_id: str | None,
+    candidate_memory_id: str,
+    target_memory_id: str,
+    content_hash: str,
+) -> str:
+    digest = sha256(
+        "\x1f".join(
+            [
+                source_id,
+                doc_id,
+                doc_revision_id or "",
+                candidate_memory_id,
+                target_memory_id,
+                content_hash,
+            ]
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"eu-dedup-support-{digest}"
+
+
+def _dedup_support_relation_run_id(unit: EvidenceUnit, target_memory_id: str) -> str:
+    return relation_run_id_for(
+        prefix="dedup-support",
+        unit=unit,
+        action=LifecycleAction.ATTACH_SUPPORT,
+        classifier_version="dedup-support-v1",
+        candidate_memory_id=target_memory_id,
+        relation_type=RelationType.SUPPORTS,
+        authority_case=AuthorityCase.INDEPENDENT_SUPPORT,
+        bucket=CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS,
+    )
 
 
 def _memory_metadata(
@@ -239,6 +303,7 @@ class MemoryStore:
         entity_ids: list[int] | None = None,
         excerpt: str | None = None,
         scope: AccessScope | None = None,
+        relation_outcome: RelationOutcomeBundle | None = None,
     ) -> str:
         """Check for near-duplicates, then insert or corroborate.
 
@@ -252,9 +317,7 @@ class MemoryStore:
         # Query the vector channel for near-duplicates.
         try:
             dedup_scope = scope or _writer_access_scope(memory)
-            candidates = await self.vector.query(
-                embedding, dedup_scope, None, DEDUP_CANDIDATE_LIMIT
-            )
+            candidates = await self.vector.query(embedding, dedup_scope, None, DEDUP_CANDIDATE_LIMIT)
         except Exception as e:
             await self._emit(
                 "index_operation_failed",
@@ -291,7 +354,9 @@ class MemoryStore:
                 )
                 logger.warning(
                     "Ignoring stale Chroma dedup candidate %s for %s (status=%s)",
-                    existing_id, memory.id, existing.status if existing else "missing",
+                    existing_id,
+                    memory.id,
+                    existing.status if existing else "missing",
                 )
                 continue
 
@@ -315,11 +380,18 @@ class MemoryStore:
                 candidate_project = existing.project_key or UNSORTED_PROJECT_KEY
                 if writer_project != candidate_project:
                     continue
-            if (memory.visibility == Visibility.PRIVATE.value
-                    and existing.owner_user_id != memory.owner_user_id):
+            if memory.visibility == Visibility.PRIVATE.value and existing.owner_user_id != memory.owner_user_id:
                 continue
 
             # Near-duplicate found, corroborate instead of creating.
+            support_relation_outcome = await self._dedup_support_relation_outcome_bundle(
+                candidate_memory=memory,
+                target_memory=existing,
+                doc_id=doc_id,
+                source_type=source_type,
+                excerpt=excerpt,
+                score=score,
+            )
             await self.add_source_support(
                 existing_id,
                 doc_id,
@@ -330,10 +402,13 @@ class MemoryStore:
                 writer_visibility=memory.visibility,
                 writer_owner_user_id=memory.owner_user_id,
                 writer_project_key=memory.project_key,
+                relation_outcome=support_relation_outcome,
             )
             logger.debug(
                 "Memory corroborated: %s (score=%.4f, doc=%s)",
-                existing_id, score, doc_id,
+                existing_id,
+                score,
+                doc_id,
             )
             return "corroborated"
 
@@ -345,6 +420,7 @@ class MemoryStore:
             entity_ids,
             excerpt,
             context,
+            relation_outcome=relation_outcome,
         )
         await self._emit(
             "memory_insert_committed",
@@ -358,6 +434,130 @@ class MemoryStore:
         )
         return "inserted"
 
+    async def _dedup_support_relation_outcome_bundle(
+        self,
+        *,
+        candidate_memory: Memory,
+        target_memory: Memory,
+        doc_id: str,
+        source_type: str,
+        excerpt: str | None,
+        score: float | None,
+    ) -> RelationOutcomeBundle:
+        document = await self.db.get_document(doc_id)
+        source_id = document.source if document is not None and document.source else source_type
+        doc_revision_id = None
+        if document is not None:
+            doc_revision_id = document.content_hash or document.version
+        unit = EvidenceUnit(
+            id=_dedup_support_evidence_unit_id(
+                source_id=source_id,
+                doc_id=doc_id,
+                doc_revision_id=doc_revision_id,
+                candidate_memory_id=candidate_memory.id,
+                target_memory_id=target_memory.id,
+                content_hash=candidate_memory.content_hash,
+            ),
+            source_id=source_id,
+            doc_id=doc_id,
+            doc_revision_id=doc_revision_id,
+            source_type=source_type,
+            source_anchor=candidate_memory.id,
+            source_lineage_id=doc_id,
+            project_key=candidate_memory.project_key,
+            visibility=candidate_memory.visibility,
+            owner_user_id=candidate_memory.owner_user_id,
+            repo_identifier=candidate_memory.repo_identifier,
+            content=candidate_memory.content,
+            excerpt=excerpt,
+            evidence_provenance=(
+                EvidenceContentProvenance.SOURCE_EXCERPT if excerpt else EvidenceContentProvenance.NO_EXCERPT
+            ),
+            source_metadata={
+                "candidate_memory_id": candidate_memory.id,
+                "supported_memory_id": target_memory.id,
+                "support_kind": "extracted",
+            },
+            observed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        relation_run_id = _dedup_support_relation_run_id(unit, target_memory.id)
+        reason = "deduplication candidate within threshold"
+        decision = RelationDecision(
+            candidate_memory_id=target_memory.id,
+            relation_type=RelationType.SUPPORTS,
+            authority_case=AuthorityCase.INDEPENDENT_SUPPORT,
+            confidence=1.0 if score is None else max(0.0, min(1.0, 1.0 - float(score))),
+            reason=reason,
+            evidence_excerpt=excerpt,
+            matched_bucket=CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS,
+            matched_bucket_complete=True,
+            classifier_batch_key=relation_run_id,
+        )
+        lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [decision])
+        candidate = RelationCandidateRecord(
+            relation_run_id=relation_run_id,
+            evidence_unit_id=unit.id,
+            memory_id=target_memory.id,
+            bucket=CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS,
+            bucket_rank=0,
+            candidate_rank=0,
+            score=score,
+            is_mandatory=False,
+            bucket_complete=True,
+            was_checked=True,
+            reason=reason,
+        )
+        relation_run = RelationRunRecord(
+            id=relation_run_id,
+            evidence_unit_id=unit.id,
+            access_context_hash=unit.access_context_hash,
+            candidate_count=1,
+            mandatory_candidate_count=0,
+            checked_candidate_count=1,
+            incomplete_mandatory_buckets=(),
+            classifier_version="dedup-support-v1",
+            lifecycle_action=lifecycle.action,
+            review_case=lifecycle.review_case,
+            status="applied" if lifecycle.action is LifecycleAction.ATTACH_SUPPORT else "review",
+            result_memory_id=target_memory.id,
+            audit={
+                "source": "MemoryStore.deduplicate_and_insert",
+                "candidate_memory_id": candidate_memory.id,
+                "target_memory_id": target_memory.id,
+                "dedup_score": score,
+            },
+        )
+        relations: tuple[EvidenceRelationRecord, ...] = ()
+        if lifecycle.action is not LifecycleAction.ATTACH_SUPPORT:
+            return RelationOutcomeBundle(
+                evidence_unit=unit,
+                relation_run=relation_run,
+                candidates=(candidate,),
+                relations=relations,
+            )
+        relations = (
+            EvidenceRelationRecord(
+                evidence_unit_id=unit.id,
+                memory_id=target_memory.id,
+                relation_type=RelationType.SUPPORTS,
+                authority_case=AuthorityCase.INDEPENDENT_SUPPORT,
+                is_authoritative_support=True,
+                source_lineage_id=unit.source_lineage_id,
+                confidence=decision.confidence,
+                reason=reason,
+                excerpt=excerpt,
+                classifier_version="dedup-support-v1",
+                relation_run_id=relation_run_id,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        return RelationOutcomeBundle(
+            evidence_unit=unit,
+            relation_run=relation_run,
+            candidates=(candidate,),
+            relations=relations,
+        )
+
     async def insert_memory(
         self,
         memory: Memory,
@@ -365,6 +565,7 @@ class MemoryStore:
         source_type: str,
         entity_ids: list[int] | None = None,
         excerpt: str | None = None,
+        relation_outcome: RelationOutcomeBundle | None = None,
     ) -> None:
         """Insert a memory without deduplication.
 
@@ -379,6 +580,7 @@ class MemoryStore:
             entity_ids,
             excerpt,
             context,
+            relation_outcome=relation_outcome,
         )
         await self._emit(
             "memory_insert_committed",
@@ -403,13 +605,23 @@ class MemoryStore:
         entity_ids: list[int] | None,
         excerpt: str | None,
         context: AuditContext,
+        *,
+        relation_outcome: RelationOutcomeBundle | None = None,
     ) -> None:
         """Insert memory into SQLite + FTS5 + ChromaDB + link entities and sources."""
         inserted = False
         chroma_upsert_started = False
         try:
-            # 1. SQLite: memories table + FTS5
-            await self.db.insert_memory(memory)
+            indexed_text = await self._canonical_memory_embedding_text(memory)
+            indexed_embedding = await self._embed(indexed_text)
+            await self.db.insert_memory_with_source_and_relation(
+                memory,
+                doc_id=doc_id,
+                source_type=source_type,
+                excerpt=excerpt,
+                entity_ids=entity_ids,
+                relation_outcome=relation_outcome,
+            )
             inserted = True
             await self._emit(
                 "fts_upsert_committed",
@@ -420,24 +632,6 @@ class MemoryStore:
                 payload={"operation": "memory_insert"},
             )
 
-            # 2. SQLite: memory_sources (provenance)
-            await self.db.add_memory_source(
-                memory.id,
-                doc_id,
-                source_type,
-                excerpt,
-            )
-
-            # 3. SQLite: memory_entities (entity links)
-            if entity_ids:
-                for entity_id in entity_ids:
-                    await self.db.link_memory_entity(memory.id, entity_id)
-            await self.db.rebuild_memory_fts(
-                memory.id,
-                search_visible_statuses=set(allowed_search_statuses()),
-            )
-
-            # 4. ChromaDB: vector embedding
             await self._emit(
                 "chroma_upsert_attempted",
                 "attempted",
@@ -447,16 +641,16 @@ class MemoryStore:
                 payload={"operation": "memory_insert"},
             )
             chroma_upsert_started = True
-            indexed_text = await self._canonical_memory_embedding_text(memory)
-            indexed_embedding = await self._embed(indexed_text)
             await self.vector.upsert(
                 ids=[memory.id],
                 embeddings=[indexed_embedding],
-                metadatas=[_memory_metadata(
-                    memory,
-                    embedding_text_hash=embedding_text_hash(indexed_text),
-                    extra={"source_doc_id": doc_id},
-                )],
+                metadatas=[
+                    _memory_metadata(
+                        memory,
+                        embedding_text_hash=embedding_text_hash(indexed_text),
+                        extra={"source_doc_id": doc_id},
+                    )
+                ],
             )
             await self._emit(
                 "chroma_upsert_committed",
@@ -541,10 +735,12 @@ class MemoryStore:
                 await self.vector.upsert(
                     ids=[memory_id],
                     embeddings=[embedding],
-                    metadatas=[_memory_metadata(
-                        memory,
-                        embedding_text_hash=embedding_text_hash(embedding_text),
-                    )],
+                    metadatas=[
+                        _memory_metadata(
+                            memory,
+                            embedding_text_hash=embedding_text_hash(embedding_text),
+                        )
+                    ],
                 )
                 await self._emit(
                     "chroma_upsert_committed",
@@ -595,6 +791,7 @@ class MemoryStore:
         entity_ids: list[int] | None = None,
         excerpt: str | None = None,
         replacement_reason: str | None = None,
+        relation_outcome: RelationOutcomeBundle | None = None,
     ) -> None:
         """Supersede an old memory with a new one, updating all stores.
 
@@ -604,6 +801,8 @@ class MemoryStore:
         """
         context = self._operation_context(doc_id=doc_id)
         old_snapshot = await self.db.get_memory(old_memory_id)
+        old_source_snapshots = await self.db.get_memory_sources(old_memory_id)
+        old_relation_snapshots = await self.db.get_evidence_relations_by_memory(old_memory_id)
         old_vector = await self._memory_vector_snapshot(old_memory_id)
         new_vector = await self._memory_vector_snapshot(new_memory.id)
         new_chroma_upsert_started = False
@@ -616,39 +815,21 @@ class MemoryStore:
             reason=replacement_reason,
         )
         try:
-            await self.db.supersede_memory(
+            embedding_text = await self._canonical_memory_embedding_text(new_memory)
+            embedding = await self._embed(embedding_text)
+            await self.db.supersede_memory_with_source_and_relation(
                 old_memory_id,
                 new_memory,
-                replacement_reason=replacement_reason,
                 replacement_kind=replacement_kind,
+                doc_id=doc_id,
+                source_type=source_type,
+                excerpt=excerpt,
+                replacement_reason=replacement_reason,
+                carry_revision_sources=replacement_kind == "revision",
+                entity_ids=entity_ids,
+                relation_outcome=relation_outcome,
             )
             await self._remove_from_search_indexes(old_memory_id, label="superseded", context=context)
-
-            if replacement_kind == "revision":
-                carried_sources = await self.db.get_memory_sources(old_memory_id)
-                for source in carried_sources:
-                    if source.doc_id == doc_id:
-                        continue
-                    await self.db.add_memory_source(
-                        new_memory.id,
-                        source.doc_id,
-                        source.source_type,
-                        source.excerpt,
-                        support_kind=source.support_kind,
-                    )
-            await self.db.add_memory_source(
-                new_memory.id,
-                doc_id,
-                source_type,
-                excerpt,
-            )
-            if entity_ids:
-                for entity_id in entity_ids:
-                    await self.db.link_memory_entity(new_memory.id, entity_id)
-            await self.db.rebuild_memory_fts(
-                new_memory.id,
-                search_visible_statuses=set(allowed_search_statuses()),
-            )
             await self._emit(
                 "fts_upsert_committed",
                 "committed",
@@ -658,8 +839,6 @@ class MemoryStore:
                 payload={"operation": "memory_supersede_insert"},
             )
 
-            embedding_text = await self._canonical_memory_embedding_text(new_memory)
-            embedding = await self._embed(embedding_text)
             try:
                 await self._emit(
                     "chroma_upsert_attempted",
@@ -673,11 +852,13 @@ class MemoryStore:
                 await self.vector.upsert(
                     ids=[new_memory.id],
                     embeddings=[embedding],
-                    metadatas=[_memory_metadata(
-                        new_memory,
-                        embedding_text_hash=embedding_text_hash(embedding_text),
-                        extra={"source_doc_id": doc_id},
-                    )],
+                    metadatas=[
+                        _memory_metadata(
+                            new_memory,
+                            embedding_text_hash=embedding_text_hash(embedding_text),
+                            extra={"source_doc_id": doc_id},
+                        )
+                    ],
                 )
                 await self._emit(
                     "chroma_upsert_committed",
@@ -711,10 +892,6 @@ class MemoryStore:
             )
         except Exception as exc:
             rollback_error: Exception | None = None
-            try:
-                await self.db.purge_memory(new_memory.id)
-            except Exception as cleanup_exc:
-                rollback_error = cleanup_exc
             if old_snapshot:
                 try:
                     await self._restore_memory_row(old_snapshot)
@@ -736,6 +913,20 @@ class MemoryStore:
                         )
                 except Exception as cleanup_exc:
                     rollback_error = rollback_error or cleanup_exc
+                for source in old_source_snapshots:
+                    try:
+                        await self.db.restore_memory_source_snapshot(source)
+                    except Exception as cleanup_exc:
+                        rollback_error = rollback_error or cleanup_exc
+                for relation in old_relation_snapshots:
+                    try:
+                        await self.db.restore_evidence_relation_snapshot(relation)
+                    except Exception as cleanup_exc:
+                        rollback_error = rollback_error or cleanup_exc
+            try:
+                await self.db.purge_memory(new_memory.id)
+            except Exception as cleanup_exc:
+                rollback_error = rollback_error or cleanup_exc
             if new_chroma_upsert_started or new_vector:
                 try:
                     await self._restore_memory_vector_snapshot(
@@ -752,8 +943,376 @@ class MemoryStore:
 
         logger.info(
             "Memory superseded: %s -> %s (%s)",
-            old_memory_id, new_memory.id, new_memory.memory_type,
+            old_memory_id,
+            new_memory.id,
+            new_memory.memory_type,
         )
+
+    async def insert_agent_claim_memory(
+        self,
+        memory: Memory,
+        doc_id: str,
+        source_type: str,
+        *,
+        claim_id: str,
+        concept_id: str,
+        display_anchor: str,
+        claim_text: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        observed_at: datetime,
+        citations: list[str] | None = None,
+        concept_projection: dict[str, Any] | None = None,
+        entity_ids: list[int] | None = None,
+        excerpt: str | None = None,
+        relation_outcome: RelationOutcomeBundle | None = None,
+    ) -> None:
+        """Insert an agent-session memory and claim projection as one DB mutation."""
+        context = self._operation_context(doc_id=doc_id)
+        vector_upsert_started = False
+        try:
+            embedding_text = await self._canonical_memory_embedding_text(memory)
+            embedding = await self._embed(embedding_text)
+            await self._emit(
+                "chroma_upsert_attempted",
+                "attempted",
+                context=context,
+                memory_id=memory.id,
+                doc_id=doc_id,
+                payload={"operation": "agent_claim_insert"},
+            )
+            vector_upsert_started = True
+            await self.vector.upsert(
+                ids=[memory.id],
+                embeddings=[embedding],
+                metadatas=[
+                    _memory_metadata(
+                        memory,
+                        embedding_text_hash=embedding_text_hash(embedding_text),
+                        extra={"source_doc_id": doc_id},
+                    )
+                ],
+            )
+            await self._emit(
+                "chroma_upsert_committed",
+                "committed",
+                context=context,
+                memory_id=memory.id,
+                doc_id=doc_id,
+                payload={"operation": "agent_claim_insert"},
+            )
+            await self.db.insert_memory_and_upsert_agent_claim(
+                memory,
+                doc_id=doc_id,
+                source_type=source_type,
+                excerpt=excerpt,
+                relation_outcome=relation_outcome,
+                claim_id=claim_id,
+                concept_id=concept_id,
+                display_anchor=display_anchor,
+                claim_text=claim_text,
+                memory_type=memory_type,
+                tags=tags,
+                confidence=confidence,
+                observed_at=observed_at,
+                citations=citations,
+                concept_projection=concept_projection,
+                entity_ids=entity_ids,
+            )
+            await self._emit(
+                "memory_insert_committed",
+                "committed",
+                context=context,
+                memory_id=memory.id,
+                doc_id=doc_id,
+                support_kind="extracted",
+                reason="agent claim memory inserted",
+                payload={"content_hash": memory.content_hash, "memory_type": memory.memory_type},
+            )
+        except Exception as exc:
+            await self._emit(
+                "index_operation_failed",
+                "failed",
+                context=context,
+                memory_id=memory.id,
+                doc_id=doc_id,
+                error=str(exc),
+                payload={"index": "chroma", "operation": "agent_claim_insert"},
+            )
+            if vector_upsert_started:
+                await self._restore_memory_vector_snapshot(
+                    None,
+                    memory_id=memory.id,
+                    context=context,
+                    label="agent_claim_insert_rollback",
+                )
+            raise
+
+    async def supersede_agent_claim_memory(
+        self,
+        old_memory_id: str,
+        new_memory: Memory,
+        doc_id: str,
+        source_type: str,
+        *,
+        replacement_kind: ReplacementKind,
+        claim_id: str,
+        concept_id: str,
+        display_anchor: str,
+        claim_text: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        observed_at: datetime,
+        entity_ids: list[int] | None = None,
+        excerpt: str | None = None,
+        replacement_reason: str | None = None,
+        relation_outcome: RelationOutcomeBundle | None = None,
+    ) -> None:
+        """Supersede an agent-session memory and move its claim projection together."""
+        context = self._operation_context(doc_id=doc_id)
+        old_snapshot = await self.db.get_memory(old_memory_id)
+        old_source_snapshots = await self.db.get_memory_sources(old_memory_id)
+        old_relation_snapshots = await self.db.get_evidence_relations_by_memory(old_memory_id)
+        old_claim_snapshot = await self.db.get_agent_claim(claim_id)
+        old_vector = await self._memory_vector_snapshot(old_memory_id)
+        new_vector = await self._memory_vector_snapshot(new_memory.id)
+        new_chroma_upsert_started = False
+        await self._emit(
+            "memory_supersede_attempted",
+            "attempted",
+            context=context,
+            memory_id=old_memory_id,
+            candidate_id=new_memory.id,
+            reason=replacement_reason,
+        )
+        try:
+            await self.db.supersede_memory_and_upsert_agent_claim(
+                old_memory_id,
+                new_memory,
+                doc_id=doc_id,
+                source_type=source_type,
+                excerpt=excerpt,
+                carry_revision_sources=replacement_kind == "revision",
+                entity_ids=entity_ids,
+                replacement_reason=replacement_reason,
+                replacement_kind=replacement_kind,
+                claim_id=claim_id,
+                concept_id=concept_id,
+                display_anchor=display_anchor,
+                claim_text=claim_text,
+                memory_type=memory_type,
+                tags=tags,
+                confidence=confidence,
+                observed_at=observed_at,
+                relation_outcome=relation_outcome,
+            )
+            await self._remove_from_search_indexes(old_memory_id, label="superseded", context=context)
+            await self._emit(
+                "fts_upsert_committed",
+                "committed",
+                context=context,
+                memory_id=new_memory.id,
+                doc_id=doc_id,
+                payload={"operation": "agent_claim_supersede_insert"},
+            )
+
+            embedding_text = await self._canonical_memory_embedding_text(new_memory)
+            embedding = await self._embed(embedding_text)
+            try:
+                await self._emit(
+                    "chroma_upsert_attempted",
+                    "attempted",
+                    context=context,
+                    memory_id=new_memory.id,
+                    doc_id=doc_id,
+                    payload={"operation": "agent_claim_supersede_insert"},
+                )
+                new_chroma_upsert_started = True
+                await self.vector.upsert(
+                    ids=[new_memory.id],
+                    embeddings=[embedding],
+                    metadatas=[
+                        _memory_metadata(
+                            new_memory,
+                            embedding_text_hash=embedding_text_hash(embedding_text),
+                            extra={"source_doc_id": doc_id},
+                        )
+                    ],
+                )
+                await self._emit(
+                    "chroma_upsert_committed",
+                    "committed",
+                    context=context,
+                    memory_id=new_memory.id,
+                    doc_id=doc_id,
+                    payload={"operation": "agent_claim_supersede_insert"},
+                )
+            except Exception as exc:
+                await self._emit(
+                    "index_operation_failed",
+                    "failed",
+                    context=context,
+                    memory_id=new_memory.id,
+                    doc_id=doc_id,
+                    error=str(exc),
+                    payload={"index": "chroma", "operation": "agent_claim_supersede_insert"},
+                )
+                raise
+
+            await self._emit(
+                "memory_supersede_committed",
+                "committed",
+                context=context,
+                memory_id=old_memory_id,
+                candidate_id=new_memory.id,
+                doc_id=doc_id,
+                reason=replacement_reason,
+                payload={"old_memory_id": old_memory_id, "new_memory_id": new_memory.id},
+            )
+        except Exception as exc:
+            rollback_error: Exception | None = None
+            try:
+                await self.db.purge_memory(new_memory.id)
+            except Exception as cleanup_exc:
+                rollback_error = cleanup_exc
+            if old_snapshot:
+                try:
+                    await self._restore_memory_row(old_snapshot)
+                except Exception as cleanup_exc:
+                    rollback_error = rollback_error or cleanup_exc
+                try:
+                    if old_vector:
+                        await self._restore_memory_vector_snapshot(
+                            old_vector,
+                            memory_id=old_memory_id,
+                            context=context,
+                            label="agent_claim_supersede_rollback",
+                        )
+                    else:
+                        await self._restore_search_indexes(
+                            old_snapshot,
+                            context=context,
+                            label="agent_claim_supersede_rollback",
+                        )
+                except Exception as cleanup_exc:
+                    rollback_error = rollback_error or cleanup_exc
+                for source in old_source_snapshots:
+                    try:
+                        await self.db.restore_memory_source_snapshot(source)
+                    except Exception as cleanup_exc:
+                        rollback_error = rollback_error or cleanup_exc
+                for relation in old_relation_snapshots:
+                    try:
+                        await self.db.restore_evidence_relation_snapshot(relation)
+                    except Exception as cleanup_exc:
+                        rollback_error = rollback_error or cleanup_exc
+            if old_claim_snapshot:
+                try:
+                    await self.db.upsert_agent_claim(
+                        claim_id=old_claim_snapshot["id"],
+                        concept_id=old_claim_snapshot["concept_id"],
+                        display_anchor=old_claim_snapshot["display_anchor"],
+                        claim_text=old_claim_snapshot["claim_text"],
+                        memory_type=old_claim_snapshot["memory_type"],
+                        tags=old_claim_snapshot["tags"],
+                        confidence=old_claim_snapshot["confidence"],
+                        memory_id=old_claim_snapshot["memory_id"],
+                        observed_at=_parse_iso_datetime(
+                            old_claim_snapshot["last_observed_at"]
+                            or old_claim_snapshot["updated_at"]
+                            or old_claim_snapshot["created_at"]
+                        ),
+                    )
+                except Exception as cleanup_exc:
+                    rollback_error = rollback_error or cleanup_exc
+            if new_chroma_upsert_started or new_vector:
+                try:
+                    await self._restore_memory_vector_snapshot(
+                        new_vector,
+                        memory_id=new_memory.id,
+                        context=context,
+                        label="agent_claim_supersede_rollback",
+                    )
+                except Exception as cleanup_exc:
+                    rollback_error = rollback_error or cleanup_exc
+            if rollback_error:
+                raise rollback_error
+            raise exc
+
+        logger.info(
+            "Agent claim memory superseded: %s -> %s (%s)",
+            old_memory_id,
+            new_memory.id,
+            new_memory.memory_type,
+        )
+
+    async def ensure_agent_claim_memory_projection(
+        self,
+        memory: Memory,
+        doc_id: str,
+        source_type: str,
+        *,
+        excerpt: str | None = None,
+    ) -> None:
+        """Converge a committed agent-claim memory with its searchable projections.
+
+        Agent claim replacement IDs are deterministic, so a retry can discover
+        that the durable DB lifecycle already committed. The retry must still
+        make the committed memory searchable before returning: SQLite source and
+        FTS rows are idempotent DB projections, while the vector index is the
+        external projection that can legitimately need a second write.
+        """
+        context = self._operation_context(doc_id=doc_id)
+        await self.db.add_memory_source(memory.id, doc_id, source_type, excerpt)
+        await self.db.rebuild_memory_fts(
+            memory.id,
+            search_visible_statuses=set(allowed_search_statuses()),
+        )
+        if memory.status not in set(allowed_search_statuses()):
+            return
+        try:
+            embedding_text = await self._canonical_memory_embedding_text(memory)
+            embedding = await self._embed(embedding_text)
+            await self._emit(
+                "chroma_upsert_attempted",
+                "attempted",
+                context=context,
+                memory_id=memory.id,
+                doc_id=doc_id,
+                payload={"operation": "agent_claim_projection_repair"},
+            )
+            await self.vector.upsert(
+                ids=[memory.id],
+                embeddings=[embedding],
+                metadatas=[
+                    _memory_metadata(
+                        memory,
+                        embedding_text_hash=embedding_text_hash(embedding_text),
+                        extra={"source_doc_id": doc_id},
+                    )
+                ],
+            )
+            await self._emit(
+                "chroma_upsert_committed",
+                "committed",
+                context=context,
+                memory_id=memory.id,
+                doc_id=doc_id,
+                payload={"operation": "agent_claim_projection_repair"},
+            )
+        except Exception as exc:
+            await self._emit(
+                "index_operation_failed",
+                "failed",
+                context=context,
+                memory_id=memory.id,
+                doc_id=doc_id,
+                error=str(exc),
+                payload={"index": "chroma", "operation": "agent_claim_projection_repair"},
+            )
+            raise
 
     # -------------------------------------------------------------------
     # Soft delete
@@ -810,6 +1369,7 @@ class MemoryStore:
         writer_visibility: str | None = None,
         writer_owner_user_id: str | None = None,
         writer_project_key: str | None = None,
+        relation_outcome: RelationOutcomeBundle | None = None,
     ) -> str:
         """Add or update source support for an existing memory.
 
@@ -825,10 +1385,7 @@ class MemoryStore:
             return "missing"
         if writer_visibility is not None and writer_visibility != target.visibility:
             return "rejected"
-        if (
-            writer_visibility == Visibility.PRIVATE.value
-            and writer_owner_user_id != target.owner_user_id
-        ):
+        if writer_visibility == Visibility.PRIVATE.value and writer_owner_user_id != target.owner_user_id:
             return "rejected"
         if writer_visibility == Visibility.WORKSPACE.value:
             # NULL project_key is normalized to UNSORTED at persistence time, so
@@ -847,13 +1404,23 @@ class MemoryStore:
             doc_id=doc_id,
             support_kind=support_kind,
         )
-        outcome = await self.db.corroborate_memory(
-            memory_id,
-            doc_id,
-            source_type,
-            excerpt,
-            support_kind=support_kind,
-        )
+        if relation_outcome is not None:
+            outcome = await self.db.corroborate_memory_with_relation_outcome(
+                memory_id,
+                doc_id,
+                source_type,
+                excerpt,
+                support_kind=support_kind,
+                relation_outcome=relation_outcome,
+            )
+        else:
+            outcome = await self.db.corroborate_memory(
+                memory_id,
+                doc_id,
+                source_type,
+                excerpt,
+                support_kind=support_kind,
+            )
         event_type = {
             "inserted": "source_support_added",
             "updated": "source_support_updated",
@@ -978,8 +1545,7 @@ class MemoryStore:
             source_id=source_id,
         )
         document_vector_snapshots = {
-            doc.doc_id: self._document_vector_snapshot(doc.doc_id)
-            for doc in document_snapshots
+            doc.doc_id: self._document_vector_snapshot(doc.doc_id) for doc in document_snapshots
         }
         memory_ids = await self._memory_ids_for_docs(doc_ids)
         memory_snapshots = await self._memory_snapshots(memory_ids)
@@ -1030,16 +1596,57 @@ class MemoryStore:
         )
         return retired_ids
 
-    async def mark_pending_review(self, memory_id: str, reason: str | None = None) -> None:
+    async def mark_pending_review(
+        self,
+        memory_id: str,
+        reason: str | None = None,
+        *,
+        relation_outcome: RelationOutcomeBundle | None = None,
+    ) -> None:
         """Quarantine a memory until a human or future workflow resolves it."""
         context = self._operation_context()
         previous = await self.db.get_memory(memory_id)
         await self.db.update_memory_status(memory_id, "pending_review", reason=reason)
         try:
             await self._remove_from_search_indexes(memory_id, label="pending_review", context=context)
+            if relation_outcome is not None:
+                await self.db.record_relation_outcome_bundle(relation_outcome)
         except Exception:
             if previous:
                 await self._restore_memory_row(previous)
+                await self._restore_search_indexes(previous, context=context, label="pending_review_rollback")
+            raise
+        await self._emit(
+            "memory_pending_review_committed",
+            "committed",
+            context=context,
+            memory_id=memory_id,
+            reason=reason,
+        )
+
+    async def mark_pending_review_with_case(
+        self,
+        memory_id: str,
+        reason: str | None = None,
+        *,
+        relation_outcome: RelationOutcomeBundle | None = None,
+        review: MemoryReview | None = None,
+        related_review_id: str | None = None,
+    ) -> None:
+        """Quarantine a memory and create/link its review work item as one DB mutation."""
+        context = self._operation_context()
+        previous = await self.db.get_memory(memory_id)
+        await self._remove_from_search_indexes(memory_id, label="pending_review", context=context)
+        try:
+            await self.db.mark_memory_pending_review_with_case(
+                memory_id,
+                reason=reason,
+                relation_outcome=relation_outcome,
+                review=review,
+                related_review_id=related_review_id,
+            )
+        except Exception:
+            if previous:
                 await self._restore_search_indexes(previous, context=context, label="pending_review_rollback")
             raise
         await self._emit(
@@ -1161,11 +1768,13 @@ class MemoryStore:
             await self.vector.upsert(
                 ids=[challenger.id],
                 embeddings=[embedding],
-                metadatas=[_memory_metadata(
-                    challenger,
-                    embedding_text_hash=embedding_text_hash(embedding_text),
-                    extra={"status": "active"},
-                )],
+                metadatas=[
+                    _memory_metadata(
+                        challenger,
+                        embedding_text_hash=embedding_text_hash(embedding_text),
+                        extra={"status": "active"},
+                    )
+                ],
             )
             await self._emit(
                 "chroma_upsert_committed",
@@ -1418,10 +2027,12 @@ class MemoryStore:
             await self.vector.upsert(
                 ids=[memory.id],
                 embeddings=[embedding],
-                metadatas=[_memory_metadata(
-                    memory,
-                    embedding_text_hash=embedding_text_hash(embedding_text),
-                )],
+                metadatas=[
+                    _memory_metadata(
+                        memory,
+                        embedding_text_hash=embedding_text_hash(embedding_text),
+                    )
+                ],
             )
             await self._emit(
                 "chroma_upsert_committed",

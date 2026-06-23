@@ -369,9 +369,10 @@ async def test_litellm_structured_client_falls_back_once_to_json_text(monkeypatc
         record for record in caplog.records if "retrying with JSON-text schema" in record.message
     ]
     assert fallback_log.levelno == logging.WARNING
-    assert fallback_log.exc_info[1] is first_error
+    assert fallback_log.exc_info is None
     assert "anthropic/anthropic--claude-sonnet-latest" in fallback_log.message
     assert "MemoryExtractionResponse" in fallback_log.message
+    assert "Exception: response_format unsupported" in fallback_log.message
     assert "local-key" not in fallback_log.message
     assert "prompt" not in fallback_log.message
 

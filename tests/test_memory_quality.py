@@ -59,8 +59,12 @@ class DirectInsertStore:
         source_type: str,
         entity_ids: list[int] | None = None,
         excerpt: str | None = None,
+        *,
+        relation_outcome=None,
     ) -> str:
         await self.db.insert_memory(memory)
+        if relation_outcome is not None:
+            await self.db.record_relation_outcome_bundle(relation_outcome)
         return "inserted"
 
 
@@ -196,10 +200,12 @@ def test_classifier_skips_unresolved_design_question():
 def test_classifier_skips_memory_system_narration():
     from memforge.memory.quality import classify_memory_candidate
 
-    quality = classify_memory_candidate(_raw(
-        "MemForge memories are loaded at SessionStart and used as warm context for l3-demo.",
-        "",
-    ))
+    quality = classify_memory_candidate(
+        _raw(
+            "MemForge memories are loaded at SessionStart and used as warm context for l3-demo.",
+            "",
+        )
+    )
 
     assert quality.keep is False
     assert quality.skip_reason == "self_referential"
@@ -208,10 +214,12 @@ def test_classifier_skips_memory_system_narration():
 def test_classifier_skips_candidate_citing_internal_memory_id():
     from memforge.memory.quality import classify_memory_candidate
 
-    quality = classify_memory_candidate(_raw(
-        "Prefer sum() over manual accumulator loops (project convention, mem-a2229a2c).",
-        "",
-    ))
+    quality = classify_memory_candidate(
+        _raw(
+            "Prefer sum() over manual accumulator loops (project convention, mem-a2229a2c).",
+            "",
+        )
+    )
 
     assert quality.keep is False
     assert quality.skip_reason == "self_referential"
@@ -246,7 +254,9 @@ def test_classifier_keeps_useful_memory_with_link_list_context():
 @pytest.mark.asyncio
 async def test_engine_skips_metadata_only_candidate(db: Database):
     adapters = build_sqlite_adapters(db, FakeCollection())
-    engine = MemoryEngine(relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db))
+    engine = MemoryEngine(
+        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db)
+    )
 
     stats = await engine.process_memories(
         doc_id="doc-acd",
@@ -261,7 +271,9 @@ async def test_engine_skips_metadata_only_candidate(db: Database):
 @pytest.mark.asyncio
 async def test_engine_skips_open_question_candidate(db: Database):
     adapters = build_sqlite_adapters(db, FakeCollection())
-    engine = MemoryEngine(relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db))
+    engine = MemoryEngine(
+        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db)
+    )
 
     stats = await engine.process_memories(
         doc_id="doc-acd",
@@ -276,7 +288,9 @@ async def test_engine_skips_open_question_candidate(db: Database):
 @pytest.mark.asyncio
 async def test_engine_keeps_conditional_ap_rule(db: Database):
     adapters = build_sqlite_adapters(db, FakeCollection())
-    engine = MemoryEngine(relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db))
+    engine = MemoryEngine(
+        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db)
+    )
 
     stats = await engine.process_memories(
         doc_id="doc-acd",
@@ -344,7 +358,11 @@ async def test_reconciliation_action_failure_is_audited_without_fallback(db: Dat
     store = FailingUpdateAuditStore(db)
     adapters = build_sqlite_adapters(db, FakeCollection())
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
     replacement = _raw("New fact", "new excerpt")
 
@@ -396,7 +414,11 @@ async def test_reconciliation_all_filtered_update_retires_sole_source_memory(db:
         embed_cfg={},
     )
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
 
     stats = await engine.reconcile_and_persist(
@@ -435,7 +457,11 @@ async def test_reconciliation_all_filtered_update_removes_one_source_but_keeps_s
         embed_cfg={},
     )
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
 
     stats = await engine.reconcile_and_persist(
@@ -643,9 +669,7 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
     assert "pdf_uri" not in source
     assert manifest.status_code == 200
     artifacts = manifest.json()["artifacts"]
-    assert artifacts["normalized_markdown"]["url"] == (
-        "/api/documents/doc-artifact-url/artifacts/normalized_markdown"
-    )
+    assert artifacts["normalized_markdown"]["url"] == ("/api/documents/doc-artifact-url/artifacts/normalized_markdown")
     assert artifacts["pdf"]["url"] == "/api/documents/doc-artifact-url/artifacts/pdf"
     assert markdown_artifact.status_code == 200
     assert markdown_artifact.text == "# Source\n\nDurable memory evidence."
@@ -788,9 +812,7 @@ async def test_admin_document_artifacts_reject_local_paths_outside_docs_root(
     with TestClient(app) as client:
         manifest = client.get("/api/documents/doc-outside-artifact-root/artifacts")
         content = client.get("/api/documents/doc-outside-artifact-root/content")
-        artifact = client.get(
-            "/api/documents/doc-outside-artifact-root/artifacts/normalized_markdown"
-        )
+        artifact = client.get("/api/documents/doc-outside-artifact-root/artifacts/normalized_markdown")
 
     assert manifest.status_code == 200
     assert manifest.json()["artifacts"] == {}
@@ -1030,17 +1052,19 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
         # falls back to flat workspace ranking.
         scope_mode="workspace",
     )
-    assert calls == [{
-        "query": "proxy search",
-        "memory_types": None,
-        "sources": None,
-        "source_filter": None,
-        "time_range": None,
-        "entities": None,
-        "include_superseded": False,
-        "top_k": 3,
-        "request_scope": expected_scope,
-    }]
+    assert calls == [
+        {
+            "query": "proxy search",
+            "memory_types": None,
+            "sources": None,
+            "source_filter": None,
+            "time_range": None,
+            "entities": None,
+            "include_superseded": False,
+            "top_k": 3,
+            "request_scope": expected_scope,
+        }
+    ]
     assert payload["results"][0]["memory_id"] == "mem-proxy-search"
     assert payload["results"][0]["pdf_url"] == "/api/documents/doc-proxy/pdf"
 
