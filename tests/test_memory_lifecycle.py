@@ -207,6 +207,32 @@ class TestSupersessionMetadata:
         assert stored_new.status == "active"
 
     @pytest.mark.asyncio
+    async def test_supersede_preserves_source_provenance_on_old_memory(self, db):
+        old = _make_memory("mem-oldsrc1", "PostgreSQL version is 14")
+        new = _make_memory("mem-newsrc1", "PostgreSQL version is 16")
+        await _insert_doc(db, "doc-postgres-14", source="confluence")
+        await db.insert_memory(old)
+        await db.corroborate_memory(
+            old.id,
+            "doc-postgres-14",
+            "confluence",
+            "PostgreSQL version is 14",
+            support_kind="extracted",
+        )
+
+        await db.supersede_memory(
+            old.id,
+            new,
+            replacement_reason="same_source_replacement",
+            replacement_kind="supersession",
+        )
+
+        sources = await db.get_memory_sources(old.id)
+        assert [(source.doc_id, source.source_type, source.support_kind, source.excerpt) for source in sources] == [
+            ("doc-postgres-14", "confluence", "extracted", "PostgreSQL version is 14")
+        ]
+
+    @pytest.mark.asyncio
     async def test_resolve_current_memory_id_walks_supersession_chain(self, db):
         first = _make_memory("mem-chain-1", "First version")
         second = _make_memory("mem-chain-2", "Second version")

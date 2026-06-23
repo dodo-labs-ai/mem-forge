@@ -9,9 +9,28 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 
 from memforge.memory.entity_resolver import EntityResolver, insert_llm_alias, resolve_entity
+from memforge.memory.evidence import (
+    AccessContext,
+    AuthorityCase,
+    EvidenceContentProvenance,
+    EvidenceRelationRecord,
+    EvidenceUnit,
+    LifecycleAction,
+    LifecycleDecision,
+    MemoryRelationApplyService,
+    RelationCandidateRecord,
+    RelationDecision,
+    RelationOutcomeBundle,
+    RelationRunRecord,
+    RelationType,
+    build_candidate_universe,
+    build_mandatory_candidate_bucket_results,
+    relation_run_id_for,
+)
 from memforge.memory.lifecycle import requires_human_review
 from memforge.memory.quality import classify_memory_candidate
 from memforge.memory.visibility_policy import default_visibility
@@ -25,7 +44,7 @@ from memforge.models import (
     ReviewStatus,
     content_hash,
     generate_memory_id,
-    generate_review_id,
+    generate_deterministic_review_id,
 )
 
 from memforge.storage.adapters.protocols import RelationalStore, VectorStore
@@ -167,10 +186,43 @@ class MemoryEngine:
             if not self._candidate_can_persist(raw, stats):
                 continue
 
+            unit = await self._document_evidence_unit(
+                doc_id=doc_id,
+                raw=raw,
+                source_type=source_type,
+                project_key=project_key,
+                repo_identifier=repo_identifier,
+                user_id=user_id,
+                extractor_run_id=getattr(audit_context, "run_id", None),
+            )
+            if await self._evidence_unit_has_materialized_memory(unit):
+                stats["skipped"] += 1
+                continue
+            lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [])
+            if lifecycle.action is not LifecycleAction.CREATE_MEMORY or not lifecycle.created_memory_id:
+                await self._record_document_relation_outcome(
+                    unit=unit,
+                    relation_run_id=_document_relation_run_id(
+                        unit,
+                        LifecycleAction.CREATE_REVIEW,
+                        relation_type=RelationType.SUPPORTS,
+                    ),
+                    lifecycle_action=lifecycle.action,
+                    memory_id=None,
+                    status="review",
+                    review_case=lifecycle.review_case,
+                    audit={
+                        "source": "memory_engine.process_memories",
+                        "review_case": lifecycle.review_case.value if lifecycle.review_case else None,
+                    },
+                )
+                stats["skipped"] += 1
+                continue
+
             # Build memory object
             visibility, owner_user_id = default_visibility(source_type, user_id=user_id)
             memory = Memory(
-                id=generate_memory_id(),
+                id=lifecycle.created_memory_id,
                 memory_type=raw.memory_type,
                 content=raw.content.strip(),
                 content_hash=content_hash(raw.content.strip()),
@@ -216,6 +268,19 @@ class MemoryEngine:
                 source_type=source_type,
                 entity_ids=memory_entity_ids,
                 excerpt=raw.extraction_context,
+                relation_outcome=self._document_relation_outcome_bundle(
+                    unit=unit,
+                    relation_run_id=_document_relation_run_id(
+                        unit,
+                        LifecycleAction.CREATE_MEMORY,
+                        relation_type=RelationType.SUPPORTS,
+                    ),
+                    lifecycle_action=lifecycle.action,
+                    memory_id=memory.id,
+                    status="applied",
+                    review_case=lifecycle.review_case,
+                    audit={"source": "memory_engine.process_memories"},
+                ),
             )
 
             if result == "inserted":
@@ -239,6 +304,7 @@ class MemoryEngine:
                 structured_llm_client=self.structured_llm_client,
                 llm_model=self.llm_model,
                 audit_context=audit_context,
+                actor_user_id=user_id,
             )
             stats["contradictions_found"] = contradiction_stats.get("contradictions", 0)
 
@@ -459,7 +525,11 @@ class MemoryEngine:
                     op,
                     corroboration_count=existing_memory.corroboration_count if existing_memory else 0,
                 ):
-                    if op.action in (ReconcileAction.UPDATE, ReconcileAction.SUPERSEDE) and op.memory and existing_memory:
+                    if (
+                        op.action in (ReconcileAction.UPDATE, ReconcileAction.SUPERSEDE)
+                        and op.memory
+                        and existing_memory
+                    ):
                         if not await self._stage_replacement_review(
                             op=op,
                             existing_memory=existing_memory,
@@ -484,12 +554,46 @@ class MemoryEngine:
                 if op.action == ReconcileAction.ADD and op.memory:
                     if not self._candidate_can_persist(op.memory, stats):
                         continue
+                    unit = await self._document_evidence_unit(
+                        doc_id=doc_id,
+                        raw=op.memory,
+                        source_type=source_type,
+                        project_key=project_key,
+                        repo_identifier=repo_identifier,
+                        user_id=user_id,
+                        extractor_run_id=getattr(audit_context, "run_id", None),
+                    )
+                    if await self._evidence_unit_has_materialized_memory(unit):
+                        stats["noop"] += 1
+                        continue
+                    lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [])
+                    if lifecycle.action is not LifecycleAction.CREATE_MEMORY or not lifecycle.created_memory_id:
+                        await self._record_document_relation_outcome(
+                            unit=unit,
+                            relation_run_id=_document_relation_run_id(
+                                unit,
+                                LifecycleAction.CREATE_REVIEW,
+                                relation_type=RelationType.SUPPORTS,
+                            ),
+                            lifecycle_action=lifecycle.action,
+                            memory_id=None,
+                            status="review",
+                            review_case=lifecycle.review_case,
+                            audit={
+                                "source": "memory_engine.reconcile_and_persist",
+                                "reconcile_action": op.action.value,
+                                "review_case": lifecycle.review_case.value if lifecycle.review_case else None,
+                            },
+                        )
+                        stats["pending_review"] += 1
+                        continue
                     memory = self._build_memory(
                         op.memory,
                         project_key,
                         source_type,
                         user_id=user_id,
                         repo_identifier=repo_identifier,
+                        memory_id=lifecycle.created_memory_id,
                     )
                     memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
                     result = await self.memory_store.deduplicate_and_insert(
@@ -498,6 +602,22 @@ class MemoryEngine:
                         source_type=source_type,
                         entity_ids=memory_entity_ids,
                         excerpt=op.memory.extraction_context,
+                        relation_outcome=self._document_relation_outcome_bundle(
+                            unit=unit,
+                            relation_run_id=_document_relation_run_id(
+                                unit,
+                                LifecycleAction.CREATE_MEMORY,
+                                relation_type=RelationType.SUPPORTS,
+                            ),
+                            lifecycle_action=lifecycle.action,
+                            memory_id=memory.id,
+                            status="applied",
+                            review_case=lifecycle.review_case,
+                            audit={
+                                "source": "memory_engine.reconcile_and_persist",
+                                "reconcile_action": op.action.value,
+                            },
+                        ),
                     )
                     if result == "inserted":
                         stats["added"] += 1
@@ -505,6 +625,43 @@ class MemoryEngine:
 
                 elif op.action == ReconcileAction.UPDATE and op.memory_id and op.memory:
                     if not self._candidate_can_persist(op.memory, stats):
+                        continue
+                    (
+                        unit,
+                        lifecycle,
+                        relation_run_id,
+                        candidates,
+                        incomplete_buckets,
+                        candidate_count,
+                    ) = await self._derive_document_replacement_lifecycle(
+                        op=op,
+                        doc_id=doc_id,
+                        source_type=source_type,
+                        project_key=project_key,
+                        repo_identifier=repo_identifier,
+                        user_id=user_id,
+                        replacement_relation=RelationType.REFINES,
+                        audit_context=audit_context,
+                    )
+                    if lifecycle.action is not LifecycleAction.SUPERSEDE_MEMORY:
+                        await self._record_document_relation_outcome(
+                            unit=unit,
+                            relation_run_id=relation_run_id,
+                            lifecycle_action=lifecycle.action,
+                            memory_id=None,
+                            status="review",
+                            review_case=lifecycle.review_case,
+                            audit={
+                                "source": "memory_engine.reconcile_and_persist",
+                                "reconcile_action": op.action.value,
+                                "target_memory_id": op.memory_id,
+                                "review_case": lifecycle.review_case.value if lifecycle.review_case else None,
+                            },
+                            candidates=candidates,
+                            incomplete_mandatory_buckets=incomplete_buckets,
+                            candidate_count=candidate_count,
+                        )
+                        stats["pending_review"] += 1
                         continue
                     new_memory = self._build_memory(
                         op.memory,
@@ -523,12 +680,65 @@ class MemoryEngine:
                         excerpt=op.memory.extraction_context,
                         replacement_reason=op.reason,
                         replacement_kind="revision",
+                        relation_outcome=self._document_relation_outcome_bundle(
+                            unit=unit,
+                            relation_run_id=relation_run_id,
+                            lifecycle_action=lifecycle.action,
+                            memory_id=new_memory.id,
+                            status="applied",
+                            review_case=lifecycle.review_case,
+                            audit={
+                                "source": "memory_engine.reconcile_and_persist",
+                                "reconcile_action": op.action.value,
+                                "target_memory_id": op.memory_id,
+                            },
+                            candidates=candidates,
+                            incomplete_mandatory_buckets=incomplete_buckets,
+                            candidate_count=candidate_count,
+                        ),
                     )
                     stats["updated"] += 1
                     logger.info("RECONCILE UPDATE: %s -> %s - %s", op.memory_id, new_memory.id, op.reason)
 
                 elif op.action == ReconcileAction.SUPERSEDE and op.memory_id and op.memory:
                     if not self._candidate_can_persist(op.memory, stats):
+                        continue
+                    (
+                        unit,
+                        lifecycle,
+                        relation_run_id,
+                        candidates,
+                        incomplete_buckets,
+                        candidate_count,
+                    ) = await self._derive_document_replacement_lifecycle(
+                        op=op,
+                        doc_id=doc_id,
+                        source_type=source_type,
+                        project_key=project_key,
+                        repo_identifier=repo_identifier,
+                        user_id=user_id,
+                        replacement_relation=RelationType.CONTRADICTS,
+                        audit_context=audit_context,
+                    )
+                    if lifecycle.action is not LifecycleAction.SUPERSEDE_MEMORY:
+                        await self._record_document_relation_outcome(
+                            unit=unit,
+                            relation_run_id=relation_run_id,
+                            lifecycle_action=lifecycle.action,
+                            memory_id=None,
+                            status="review",
+                            review_case=lifecycle.review_case,
+                            audit={
+                                "source": "memory_engine.reconcile_and_persist",
+                                "reconcile_action": op.action.value,
+                                "target_memory_id": op.memory_id,
+                                "review_case": lifecycle.review_case.value if lifecycle.review_case else None,
+                            },
+                            candidates=candidates,
+                            incomplete_mandatory_buckets=incomplete_buckets,
+                            candidate_count=candidate_count,
+                        )
+                        stats["pending_review"] += 1
                         continue
                     new_memory = self._build_memory(
                         op.memory,
@@ -547,6 +757,22 @@ class MemoryEngine:
                         excerpt=op.memory.extraction_context,
                         replacement_reason=op.reason,
                         replacement_kind="supersession",
+                        relation_outcome=self._document_relation_outcome_bundle(
+                            unit=unit,
+                            relation_run_id=relation_run_id,
+                            lifecycle_action=lifecycle.action,
+                            memory_id=new_memory.id,
+                            status="applied",
+                            review_case=lifecycle.review_case,
+                            audit={
+                                "source": "memory_engine.reconcile_and_persist",
+                                "reconcile_action": op.action.value,
+                                "target_memory_id": op.memory_id,
+                            },
+                            candidates=candidates,
+                            incomplete_mandatory_buckets=incomplete_buckets,
+                            candidate_count=candidate_count,
+                        ),
                     )
                     stats["superseded"] += 1
                     logger.info("RECONCILE SUPERSEDE: %s -> %s - %s", op.memory_id, new_memory.id, op.reason)
@@ -581,6 +807,7 @@ class MemoryEngine:
                 structured_llm_client=self.structured_llm_client,
                 llm_model=self.llm_model,
                 audit_context=audit_context,
+                actor_user_id=user_id,
             )
             stats["contradictions_found"] = contradiction_stats.get("contradictions", 0)
 
@@ -829,11 +1056,12 @@ class MemoryEngine:
         source_type: str,
         user_id: str | None = None,
         repo_identifier: str | None = None,
+        memory_id: str | None = None,
     ) -> Memory:
         """Build a Memory object from a RawMemory."""
         visibility, owner_user_id = default_visibility(source_type, user_id=user_id)
         return Memory(
-            id=generate_memory_id(),
+            id=memory_id or generate_memory_id(),
             memory_type=raw.memory_type,
             content=raw.content.strip(),
             content_hash=content_hash(raw.content.strip()),
@@ -864,6 +1092,219 @@ class MemoryEngine:
             except Exception as e:
                 logger.warning("Failed to resolve entity %r: %s", name, e)
         return ids
+
+    async def _document_evidence_unit(
+        self,
+        *,
+        doc_id: str,
+        raw: RawMemory,
+        source_type: str,
+        project_key: str | None,
+        repo_identifier: str | None,
+        user_id: str | None,
+        extractor_run_id: str | None,
+    ) -> EvidenceUnit:
+        document = await self.db.get_document(doc_id)
+        doc_revision_id = None
+        source_id = source_type
+        if document is not None:
+            doc_revision_id = document.content_hash or document.version
+            source_id = document.source or source_type
+        visibility, owner_user_id = default_visibility(source_type, user_id=user_id)
+        content = raw.content.strip()
+        evidence_id = _document_evidence_unit_id(
+            source_id=source_id,
+            doc_id=doc_id,
+            doc_revision_id=doc_revision_id,
+            source_type=source_type,
+            content=content,
+        )
+        return EvidenceUnit(
+            id=evidence_id,
+            source_id=source_id,
+            doc_id=doc_id,
+            doc_revision_id=doc_revision_id,
+            source_type=source_type,
+            source_anchor=evidence_id,
+            source_lineage_id=doc_id,
+            project_key=project_key,
+            visibility=visibility,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            content=content,
+            excerpt=raw.extraction_context,
+            evidence_provenance=(
+                EvidenceContentProvenance.SOURCE_EXCERPT
+                if raw.extraction_context
+                else EvidenceContentProvenance.NO_EXCERPT
+            ),
+            source_metadata={
+                "memory_type": raw.memory_type,
+                "content_hash": content_hash(content),
+            },
+            observed_at=datetime.now(timezone.utc).isoformat(),
+            extractor_run_id=extractor_run_id,
+        )
+
+    async def _evidence_unit_has_materialized_memory(self, unit: EvidenceUnit) -> bool:
+        return await self.db.has_materialized_evidence_unit(unit.id)
+
+    async def _derive_document_replacement_lifecycle(
+        self,
+        *,
+        op: ReconcileOperation,
+        doc_id: str,
+        source_type: str,
+        project_key: str | None,
+        repo_identifier: str | None,
+        user_id: str | None,
+        replacement_relation: RelationType,
+        audit_context: Any | None,
+    ) -> tuple[EvidenceUnit, LifecycleDecision, str, list[RelationCandidateRecord], tuple[str, ...], int]:
+        assert op.memory is not None
+        assert op.memory_id is not None
+        unit = await self._document_evidence_unit(
+            doc_id=doc_id,
+            raw=op.memory,
+            source_type=source_type,
+            project_key=project_key,
+            repo_identifier=repo_identifier,
+            user_id=user_id,
+            extractor_run_id=getattr(audit_context, "run_id", None),
+        )
+        relation_run_id = _document_relation_run_id(
+            unit,
+            LifecycleAction.SUPERSEDE_MEMORY,
+            candidate_memory_id=op.memory_id,
+            relation_type=replacement_relation,
+            authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
+        )
+        buckets = await build_mandatory_candidate_bucket_results(
+            store=self.db,
+            unit=unit,
+            access_context=AccessContext(
+                actor_user_id=user_id,
+                source_subscriptions=(unit.source_id,),
+                repo_identifier=repo_identifier,
+                operation_type="document_replacement",
+            ),
+        )
+        universe = build_candidate_universe(
+            relation_run_id=relation_run_id,
+            evidence_unit_id=unit.id,
+            bucket_results=buckets,
+        )
+        target_candidate = next(
+            (candidate for candidate in universe.candidates if candidate.memory_id == op.memory_id),
+            None,
+        )
+        if target_candidate is None:
+            raise RuntimeError("document replacement target missing from mandatory candidate universe")
+        decision = RelationDecision(
+            candidate_memory_id=op.memory_id,
+            relation_type=replacement_relation,
+            authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
+            confidence=op.memory.confidence,
+            reason=op.reason,
+            proposed_memory_content=op.memory.content,
+            evidence_excerpt=op.memory.extraction_context,
+            matched_bucket=target_candidate.bucket,
+            matched_bucket_complete=target_candidate.bucket_complete,
+            classifier_batch_key=relation_run_id,
+        )
+        lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [decision])
+        return (
+            unit,
+            lifecycle,
+            relation_run_id,
+            list(universe.candidates),
+            universe.incomplete_mandatory_buckets,
+            universe.total_unique_candidates,
+        )
+
+    async def _record_document_relation_outcome(
+        self,
+        *,
+        unit: EvidenceUnit,
+        relation_run_id: str,
+        lifecycle_action: LifecycleAction,
+        memory_id: str | None,
+        status: str,
+        review_case,
+        audit: dict[str, object],
+        candidates: list[RelationCandidateRecord] | None = None,
+        incomplete_mandatory_buckets: tuple[str, ...] = (),
+        candidate_count: int | None = None,
+    ) -> None:
+        await self.db.record_relation_outcome_bundle(
+            self._document_relation_outcome_bundle(
+                unit=unit,
+                relation_run_id=relation_run_id,
+                lifecycle_action=lifecycle_action,
+                memory_id=memory_id,
+                status=status,
+                review_case=review_case,
+                audit=audit,
+                candidates=candidates,
+                incomplete_mandatory_buckets=incomplete_mandatory_buckets,
+                candidate_count=candidate_count,
+            )
+        )
+
+    def _document_relation_outcome_bundle(
+        self,
+        *,
+        unit: EvidenceUnit,
+        relation_run_id: str,
+        lifecycle_action: LifecycleAction,
+        memory_id: str | None,
+        status: str,
+        review_case,
+        audit: dict[str, object],
+        candidates: list[RelationCandidateRecord] | None = None,
+        incomplete_mandatory_buckets: tuple[str, ...] = (),
+        candidate_count: int | None = None,
+    ) -> RelationOutcomeBundle:
+        candidates = candidates or []
+        run_audit = dict(audit)
+        relations: tuple[EvidenceRelationRecord, ...] = ()
+        if memory_id is not None:
+            relations = (
+                EvidenceRelationRecord(
+                    evidence_unit_id=unit.id,
+                    memory_id=memory_id,
+                    relation_type=RelationType.SUPPORTS,
+                    authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
+                    is_authoritative_support=True,
+                    source_lineage_id=unit.source_lineage_id,
+                    confidence=1.0,
+                    reason="Memory created from this source evidence unit.",
+                    excerpt=unit.excerpt,
+                    classifier_version="memory-engine-v1",
+                    relation_run_id=relation_run_id,
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+        return RelationOutcomeBundle(
+            evidence_unit=unit,
+            relation_run=RelationRunRecord(
+                id=relation_run_id,
+                evidence_unit_id=unit.id,
+                access_context_hash=unit.access_context_hash,
+                candidate_count=len(candidates) if candidate_count is None else candidate_count,
+                mandatory_candidate_count=sum(1 for candidate in candidates if candidate.is_mandatory),
+                checked_candidate_count=sum(1 for candidate in candidates if candidate.was_checked),
+                incomplete_mandatory_buckets=incomplete_mandatory_buckets,
+                classifier_version="memory-engine-v1",
+                lifecycle_action=lifecycle_action,
+                review_case=review_case,
+                status=status,
+                result_memory_id=memory_id,
+                audit=run_audit,
+            ),
+            candidates=tuple(candidates),
+            relations=relations,
+        )
 
     async def _record_supersede_review(
         self,
@@ -897,7 +1338,11 @@ class MemoryEngine:
 
         challenger = await self.db.get_memory(challenger_id)
         review = MemoryReview(
-            id=generate_review_id(),
+            id=generate_deterministic_review_id(
+                kind=ReviewKind.SUPERSEDE.value,
+                incumbent_memory_id=incumbent.id,
+                challenger_memory_id=challenger_id,
+            ),
             kind=ReviewKind.SUPERSEDE.value,
             status=ReviewStatus.PENDING.value,
             incumbent_memory_id=incumbent.id,
@@ -910,6 +1355,40 @@ class MemoryEngine:
             created_at=datetime.now(timezone.utc),
         )
         await self.db.insert_memory_review(review)
+
+
+def _document_evidence_unit_id(
+    *,
+    source_id: str,
+    doc_id: str,
+    doc_revision_id: str | None,
+    source_type: str,
+    content: str,
+) -> str:
+    digest = sha256(
+        "\x1f".join([source_id, doc_id, doc_revision_id or "", source_type, content_hash(content)]).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"eu-doc-{digest}"
+
+
+def _document_relation_run_id(
+    unit: EvidenceUnit,
+    action: str | LifecycleAction,
+    *,
+    classifier_version: str = "memory-engine-v1",
+    candidate_memory_id: str | None = None,
+    relation_type: RelationType | None = None,
+    authority_case: AuthorityCase | None = None,
+) -> str:
+    return relation_run_id_for(
+        prefix="doc",
+        unit=unit,
+        action=action,
+        classifier_version=classifier_version,
+        candidate_memory_id=candidate_memory_id,
+        relation_type=relation_type,
+        authority_case=authority_case,
+    )
 
 
 def _parse_datetime(value: str | None) -> datetime | None:

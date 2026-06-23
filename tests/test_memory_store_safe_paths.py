@@ -8,6 +8,18 @@ from typing import Any
 import pytest
 
 from memforge.memory.audit import AuditContext, MemoryAuditEvent, MemoryAuditLogger
+from memforge.memory.evidence import (
+    AuthorityCase,
+    CandidateBucket,
+    EvidenceContentProvenance,
+    EvidenceRelationRecord,
+    EvidenceUnit,
+    LifecycleAction,
+    RelationCandidateRecord,
+    RelationOutcomeBundle,
+    RelationRunRecord,
+    RelationType,
+)
 from memforge.memory.store import MemoryStore
 from memforge.models import Memory, content_hash
 from memforge.retrieval.document_index import DocumentVectorIndex
@@ -181,6 +193,12 @@ class FailingSourceInsertDatabase:
     async def add_memory_source(self, *args, **kwargs):
         raise RuntimeError("source insert failed")
 
+    async def insert_memory_with_source_and_relation(self, *args, **kwargs):
+        raise RuntimeError("source insert failed")
+
+    async def supersede_memory_with_source_and_relation(self, *args, **kwargs):
+        raise RuntimeError("source insert failed")
+
     def __getattr__(self, name: str):
         return getattr(self._db, name)
 
@@ -294,6 +312,80 @@ def _memory(mem_id: str, content: str, *, status: str = "active") -> Memory:
     )
 
 
+def _relation_outcome_bundle(
+    *,
+    unit_id: str,
+    run_id: str,
+    doc_id: str,
+    memory_id: str,
+    relation_type: RelationType = RelationType.SUPPORTS,
+    action: LifecycleAction = LifecycleAction.ATTACH_SUPPORT,
+) -> RelationOutcomeBundle:
+    unit = EvidenceUnit(
+        id=unit_id,
+        source_id="src-1",
+        doc_id=doc_id,
+        doc_revision_id="1",
+        source_type="confluence",
+        source_anchor=f"{doc_id}#claim",
+        source_lineage_id=doc_id,
+        project_key="TEST",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        content="Evidence excerpt",
+        excerpt="Evidence excerpt",
+        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+    )
+    run = RelationRunRecord(
+        id=run_id,
+        evidence_unit_id=unit.id,
+        access_context_hash=unit.access_context_hash,
+        candidate_count=1,
+        mandatory_candidate_count=1,
+        checked_candidate_count=1,
+        incomplete_mandatory_buckets=(),
+        classifier_version="test-v1",
+        lifecycle_action=action,
+        review_case=None,
+        status="applied",
+        audit={"source": "test"},
+    )
+    candidate = RelationCandidateRecord(
+        relation_run_id=run.id,
+        evidence_unit_id=unit.id,
+        memory_id=memory_id,
+        bucket=CandidateBucket.SAME_DOC_LINEAGE,
+        bucket_rank=0,
+        candidate_rank=0,
+        score=1.0,
+        is_mandatory=True,
+        bucket_complete=True,
+        was_checked=True,
+        reason="same doc lineage",
+    )
+    relation = EvidenceRelationRecord(
+        evidence_unit_id=unit.id,
+        memory_id=memory_id,
+        relation_type=relation_type,
+        authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
+        is_authoritative_support=True,
+        source_lineage_id=unit.source_lineage_id,
+        confidence=0.9,
+        reason="same claim",
+        proposed_memory_content="Evidence excerpt",
+        excerpt=unit.excerpt,
+        classifier_version="test-v1",
+        relation_run_id=run.id,
+    )
+    return RelationOutcomeBundle(
+        evidence_unit=unit,
+        relation_run=run,
+        candidates=(candidate,),
+        relations=(relation,),
+    )
+
+
 def _store(
     db: Database,
     collection: RecordingCollection,
@@ -354,6 +446,31 @@ async def test_dedup_corrobates_active_chroma_candidate(db: Database):
     assert stored_candidate is None
     assert [(source.doc_id, source.support_kind) for source in sources] == [("doc-1", "extracted")]
 
+    async with db.db.execute(
+        """SELECT rr.*
+           FROM relation_runs rr
+           JOIN evidence_relations er ON er.relation_run_id = rr.id
+           WHERE er.memory_id = ?
+           ORDER BY rr.started_at""",
+        (active.id,),
+    ) as cursor:
+        relation_runs = [dict(row) async for row in cursor]
+    assert len(relation_runs) == 1
+    assert relation_runs[0]["lifecycle_action"] == LifecycleAction.ATTACH_SUPPORT.value
+    evidence_unit = await db.get_evidence_unit(relation_runs[0]["evidence_unit_id"])
+    assert evidence_unit is not None
+    assert evidence_unit.doc_id == "doc-1"
+    assert evidence_unit.source_type == "confluence"
+    assert evidence_unit.excerpt == "same fact"
+    relations = await db.get_evidence_relations(evidence_unit.id)
+    assert [(relation.memory_id, relation.relation_type) for relation in relations] == [
+        (active.id, RelationType.SUPPORTS)
+    ]
+    candidates = await db.get_relation_candidates(relation_runs[0]["id"])
+    assert [(candidate.memory_id, candidate.bucket, candidate.was_checked) for candidate in candidates] == [
+        (active.id, CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS, True)
+    ]
+
 
 @pytest.mark.asyncio
 async def test_dedup_query_failure_aborts_and_records_failed_index_event(db: Database):
@@ -408,6 +525,77 @@ async def test_add_source_support_records_audit_event(db: Database):
     audit_rows = await db.list_memory_audit_events(event_type="source_support_added")
     assert result == "inserted"
     assert [(row.memory_id, row.support_kind) for row in audit_rows] == [(memory.id, "corroborated")]
+
+
+@pytest.mark.asyncio
+async def test_add_source_support_records_support_and_relation_atomically(db: Database):
+    await _insert_doc(db)
+    memory = _memory("mem-support-relation", "Supported fact")
+    await db.insert_memory(memory)
+    store = _store(db, RecordingCollection())
+
+    result = await store.add_source_support(
+        memory.id,
+        "doc-1",
+        "jira",
+        excerpt="Supported fact",
+        support_kind="corroborated",
+        relation_outcome=_relation_outcome_bundle(
+            unit_id="eu-support-relation",
+            run_id="relrun-support-relation",
+            doc_id="doc-1",
+            memory_id=memory.id,
+        ),
+    )
+
+    sources = await db.get_memory_sources(memory.id)
+    relation_run = await db.get_relation_run("relrun-support-relation")
+    relations = await db.get_evidence_relations("eu-support-relation")
+    assert result == "inserted"
+    assert [(source.memory_id, source.doc_id, source.support_kind) for source in sources] == [
+        (memory.id, "doc-1", "corroborated")
+    ]
+    assert relation_run is not None
+    assert [(relation.memory_id, relation.relation_type) for relation in relations] == [
+        (memory.id, RelationType.SUPPORTS)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_add_source_support_rolls_back_when_relation_bundle_fails(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    await _insert_doc(db)
+    memory = _memory("mem-support-relation-fail", "Supported fact")
+    await db.insert_memory(memory)
+    store = _store(db, RecordingCollection())
+
+    async def fail_relation_bundle(*args, **kwargs):
+        raise RuntimeError("relation bundle failed")
+
+    monkeypatch.setattr(db, "_record_relation_outcome_bundle_unlocked", fail_relation_bundle)
+
+    with pytest.raises(RuntimeError, match="relation bundle failed"):
+        await store.add_source_support(
+            memory.id,
+            "doc-1",
+            "jira",
+            excerpt="Supported fact",
+            support_kind="corroborated",
+            relation_outcome=_relation_outcome_bundle(
+                unit_id="eu-support-relation-fail",
+                run_id="relrun-support-relation-fail",
+                doc_id="doc-1",
+                memory_id=memory.id,
+            ),
+        )
+
+    stored = await db.get_memory(memory.id)
+    sources = await db.get_memory_sources(memory.id)
+    assert stored is not None
+    assert stored.corroboration_count == memory.corroboration_count
+    assert sources == []
 
 
 @pytest.mark.asyncio
@@ -468,6 +656,44 @@ async def test_mark_pending_review_removes_indexes_and_records_audit(db: Databas
 
 
 @pytest.mark.asyncio
+async def test_mark_pending_review_rolls_back_when_relation_bundle_fails(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    await _insert_doc(db)
+    memory = _memory("mem-pending-relation-fail", "Needs review")
+    await db.insert_memory(memory)
+    collection = RecordingCollection()
+    store = _store(db, collection)
+
+    async def fail_relation_bundle(*args, **kwargs):
+        raise RuntimeError("relation bundle failed")
+
+    monkeypatch.setattr(db, "record_relation_outcome_bundle", fail_relation_bundle)
+
+    with pytest.raises(RuntimeError, match="relation bundle failed"):
+        await store.mark_pending_review(
+            memory.id,
+            reason="conflict",
+            relation_outcome=_relation_outcome_bundle(
+                unit_id="eu-pending-relation-fail",
+                run_id="relrun-pending-relation-fail",
+                doc_id="doc-1",
+                memory_id=memory.id,
+                relation_type=RelationType.CONTRADICTS,
+                action=LifecycleAction.CREATE_REVIEW,
+            ),
+        )
+
+    stored = await db.get_memory(memory.id)
+    async with db.db.execute("SELECT COUNT(*) FROM memories_fts WHERE memory_id = ?", (memory.id,)) as cursor:
+        fts_count = (await cursor.fetchone())[0]
+    assert stored is not None
+    assert stored.status == "active"
+    assert fts_count == 1
+
+
+@pytest.mark.asyncio
 async def test_supersede_memory_records_old_and_new_index_audit(db: Database):
     await _insert_doc(db)
     old = _memory("mem-oldsup", "Old superseded fact")
@@ -502,7 +728,52 @@ async def test_supersede_memory_records_old_and_new_index_audit(db: Database):
 
 
 @pytest.mark.asyncio
-async def test_supersede_memory_carries_valid_support_to_replacement(db: Database):
+async def test_supersede_memory_rolls_back_when_relation_bundle_fails(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    await _insert_doc(db)
+    old = _memory("mem-old-relation-fail", "Old fact")
+    await db.insert_memory(old)
+    new = _memory("mem-new-relation-fail", "New fact")
+    collection = RecordingCollection()
+    store = _store(db, collection)
+
+    async def fail_relation_bundle(*args, **kwargs):
+        raise RuntimeError("relation bundle failed")
+
+    monkeypatch.setattr(db, "_record_relation_outcome_bundle_unlocked", fail_relation_bundle)
+
+    with pytest.raises(RuntimeError, match="relation bundle failed"):
+        await store.supersede_memory(
+            old.id,
+            new,
+            "doc-1",
+            "confluence",
+            replacement_kind="supersession",
+            replacement_reason="newer source",
+            relation_outcome=_relation_outcome_bundle(
+                unit_id="eu-supersede-relation-fail",
+                run_id="relrun-supersede-relation-fail",
+                doc_id="doc-1",
+                memory_id=new.id,
+                relation_type=RelationType.REFINES,
+                action=LifecycleAction.SUPERSEDE_MEMORY,
+            ),
+        )
+
+    stored_old = await db.get_memory(old.id)
+    stored_new = await db.get_memory(new.id)
+    async with db.db.execute("SELECT COUNT(*) FROM memories_fts WHERE memory_id = ?", (old.id,)) as cursor:
+        old_fts_count = (await cursor.fetchone())[0]
+    assert stored_old is not None
+    assert stored_old.status == "active"
+    assert stored_new is None
+    assert old_fts_count == 1
+
+
+@pytest.mark.asyncio
+async def test_supersede_memory_does_not_blindly_carry_support_to_revision(db: Database):
     await _insert_doc(db, "doc-current")
     await _insert_doc(db, "doc-support")
     old = _memory("mem-old-support", "Old supported fact")
@@ -527,18 +798,20 @@ async def test_supersede_memory_carries_valid_support_to_replacement(db: Databas
     new_sources = await db.get_memory_sources(new.id)
     stored_old = await db.get_memory(old.id)
     assert stored_old.replacement_kind == "revision"
-    assert sorted((source.doc_id, source.source_type, source.support_kind, source.excerpt) for source in old_sources) == sorted(
-        [
-            ("doc-current", "confluence", "extracted", "Old excerpt"),
-            ("doc-support", "jira", "corroborated", "Still valid support"),
-        ]
-    )
-    assert sorted((source.doc_id, source.source_type, source.support_kind, source.excerpt) for source in new_sources) == sorted(
-        [
-            ("doc-current", "confluence", "extracted", "New excerpt"),
-            ("doc-support", "jira", "corroborated", "Still valid support"),
-        ]
-    )
+    assert sorted(
+        (source.doc_id, source.source_type, source.support_kind, source.excerpt)
+        for source in old_sources
+    ) == [
+        ("doc-current", "confluence", "extracted", "Old excerpt"),
+        ("doc-support", "jira", "corroborated", "Still valid support"),
+    ]
+    assert sorted(
+        (source.doc_id, source.source_type, source.support_kind, source.excerpt)
+        for source in new_sources
+    ) == [
+        ("doc-current", "confluence", "extracted", "New excerpt"),
+        ("doc-support", "jira", "corroborated", "Still valid support"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -563,9 +836,17 @@ async def test_supersession_does_not_carry_old_support_to_replacement(db: Databa
         replacement_kind="supersession",
     )
 
+    old_sources = await db.get_memory_sources(old.id)
     new_sources = await db.get_memory_sources(new.id)
     stored_old = await db.get_memory(old.id)
     assert stored_old.replacement_kind == "supersession"
+    assert sorted(
+        (source.doc_id, source.source_type, source.support_kind, source.excerpt)
+        for source in old_sources
+    ) == [
+        ("doc-current", "confluence", "extracted", "Old excerpt"),
+        ("doc-support", "jira", "corroborated", "Old corroboration"),
+    ]
     assert [(source.doc_id, source.source_type, source.support_kind, source.excerpt) for source in new_sources] == [
         ("doc-current", "confluence", "extracted", "Replacement excerpt")
     ]
@@ -1238,6 +1519,36 @@ async def test_insert_memory_rolls_back_sqlite_when_source_link_fails(db: Databa
 
 
 @pytest.mark.asyncio
+async def test_insert_memory_rolls_back_when_relation_bundle_fails(db: Database, monkeypatch):
+    await _insert_doc(db)
+    memory = _memory("mem-create-relation-fail", "Create relation failure")
+    collection = RecordingCollection()
+    store = _store(db, collection)
+
+    async def fail_relation_bundle(*args, **kwargs):
+        raise RuntimeError("relation bundle failed")
+
+    monkeypatch.setattr(db, "_record_relation_outcome_bundle_unlocked", fail_relation_bundle)
+
+    with pytest.raises(RuntimeError, match="relation bundle failed"):
+        await store.insert_memory(
+            memory,
+            "doc-1",
+            "confluence",
+            relation_outcome=_relation_outcome_bundle(
+                unit_id="eu-create-relation-fail",
+                run_id="relrun-create-relation-fail",
+                doc_id="doc-1",
+                memory_id=memory.id,
+                action=LifecycleAction.CREATE_MEMORY,
+            ),
+        )
+
+    assert await db.get_memory(memory.id) is None
+    assert memory.id not in collection.upserted
+
+
+@pytest.mark.asyncio
 async def test_retire_memory_raises_and_avoids_committed_event_when_chroma_delete_fails(db: Database):
     memory = _memory("mem-delete-fail", "Cannot remove from index")
     await db.insert_memory(memory)
@@ -1319,6 +1630,38 @@ async def test_supersede_memory_restores_sqlite_when_new_chroma_upsert_fails(db:
     await _insert_doc(db)
     old = _memory("mem-sup-fail-old", "Old fact")
     await db.insert_memory(old)
+    unit = EvidenceUnit(
+        id="eu-sup-fail-old",
+        source_id="src-1",
+        doc_id="doc-1",
+        doc_revision_id="rev-1",
+        source_type="confluence",
+        source_anchor="page-1#old",
+        source_lineage_id="doc-1",
+        project_key="TEST",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        content="Old fact",
+        excerpt="Old fact excerpt",
+        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+    )
+    await db.upsert_evidence_unit(unit)
+    relation = EvidenceRelationRecord(
+        evidence_unit_id=unit.id,
+        memory_id=old.id,
+        relation_type=RelationType.SUPPORTS,
+        authority_case=AuthorityCase.SAME_DOCUMENT_REVISION,
+        is_authoritative_support=True,
+        source_lineage_id="doc-1",
+        confidence=0.93,
+        reason="original relation",
+        excerpt="Old fact excerpt",
+        classifier_version="test-v1",
+        relation_run_id="rel-run-sup-fail",
+        created_at="2026-06-22T12:00:00+00:00",
+    )
+    await db.replace_evidence_relations(unit.id, [relation])
     new = _memory("mem-sup-fail-new", "New fact")
     store = _store(db, FailingSpecificUpsertCollection(new.id))
 
@@ -1336,9 +1679,11 @@ async def test_supersede_memory_restores_sqlite_when_new_chroma_upsert_fails(db:
     audit_rows = await db.list_memory_audit_events(event_type="memory_supersede_committed")
     async with db.db.execute("SELECT COUNT(*) FROM memories_fts WHERE memory_id = ?", (old.id,)) as cursor:
         old_fts_count = (await cursor.fetchone())[0]
+    restored_relations = await db.get_evidence_relations(unit.id)
     assert stored_old.status == "active"
     assert stored_new is None
     assert old_fts_count == 1
+    assert restored_relations == [relation]
     assert audit_rows == []
 
 
