@@ -9,6 +9,7 @@ import pytest
 
 from memforge.llm.structured import SourceSupportDecision, SourceSupportResponse, StructuredLlmError
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
+from memforge.memory.evidence import CandidateBucket, LifecycleAction, RelationType
 from memforge.memory.store import MemoryStore
 from memforge.models import Memory, content_hash
 from memforge.pipeline.source_support_detector import SourceSupportDetector
@@ -24,7 +25,14 @@ async def db(tmp_path):
     await database.close()
 
 
-def _memory(mem_id: str, content: str, *, project_key: str = "PAY") -> Memory:
+def _memory(
+    mem_id: str,
+    content: str,
+    *,
+    project_key: str = "PAY",
+    visibility: str = "workspace",
+    owner_user_id: str | None = None,
+) -> Memory:
     now = datetime.now(timezone.utc)
     return Memory(
         id=mem_id,
@@ -37,6 +45,8 @@ def _memory(mem_id: str, content: str, *, project_key: str = "PAY") -> Memory:
         created_at=now,
         updated_at=now,
         status="active",
+        visibility=visibility,
+        owner_user_id=owner_user_id,
     )
 
 
@@ -179,7 +189,10 @@ async def test_detect_and_persist_routes_corroborated_support_through_store(db: 
             writer_visibility: str | None = None,
             writer_owner_user_id: str | None = None,
             writer_project_key: str | None = None,
+            relation_outcome=None,
         ) -> str:
+            assert relation_outcome is not None
+            await db.record_relation_outcome_bundle(relation_outcome)
             self.calls.append((memory_id, doc_id, source_type, excerpt, support_kind))
             return "inserted"
 
@@ -187,11 +200,15 @@ async def test_detect_and_persist_routes_corroborated_support_through_store(db: 
             return False
 
     excerpt = "The assignment transitions to ASSIGNED."
-    structured_client = FakeStructuredSupportClient([
-        _support_response([
-            {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "same rule"},
-        ])
-    ])
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "same rule"},
+                ]
+            )
+        ]
+    )
     detector = SourceSupportDetector(structured_llm_client=structured_client)
     store = RecordingStore()
 
@@ -207,6 +224,180 @@ async def test_detect_and_persist_routes_corroborated_support_through_store(db: 
 
     assert result["added"] == 1
     assert store.calls == [(memory.id, "doc-support", "confluence", excerpt, "corroborated")]
+
+    async with db.db.execute(
+        """SELECT rr.*
+           FROM relation_runs rr
+           JOIN evidence_relations er ON er.relation_run_id = rr.id
+           WHERE er.memory_id = ?
+           ORDER BY rr.started_at""",
+        (memory.id,),
+    ) as cursor:
+        relation_runs = [dict(row) async for row in cursor]
+    assert len(relation_runs) == 1
+    assert relation_runs[0]["lifecycle_action"] == LifecycleAction.ATTACH_SUPPORT.value
+    evidence_unit = await db.get_evidence_unit(relation_runs[0]["evidence_unit_id"])
+    assert evidence_unit is not None
+    assert evidence_unit.doc_id == "doc-support"
+    assert evidence_unit.source_type == "confluence"
+    assert evidence_unit.excerpt == excerpt
+    relations = await db.get_evidence_relations(evidence_unit.id)
+    assert [(relation.memory_id, relation.relation_type) for relation in relations] == [
+        (memory.id, RelationType.SUPPORTS)
+    ]
+    candidates = await db.get_relation_candidates(relation_runs[0]["id"])
+    assert [(candidate.memory_id, candidate.bucket, candidate.was_checked) for candidate in candidates] == [
+        (memory.id, CandidateBucket.SHARED_ENTITIES, True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_source_support_candidates_exclude_disabled_private_sources(db: Database):
+    await _insert_doc(db, "doc-origin", project="ORIGIN")
+    await _insert_doc(db, "doc-support", project="PAY")
+    await db.upsert_source("src-ORIGIN", "confluence", "Origin", "{}")
+    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle", tags=["feature"])
+    memory = _memory(
+        "mem-disabled-source-support",
+        "Period lifecycle assignment transitions to ASSIGNED.",
+        visibility="private",
+        owner_user_id="alice@example.com",
+    )
+    await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
+    await db.set_source_subscription("src-ORIGIN", "alice@example.com", enabled=False)
+
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {
+                        "memory_id": memory.id,
+                        "supported": True,
+                        "excerpt": "The assignment transitions to ASSIGNED.",
+                        "reason": "same rule",
+                    },
+                ]
+            )
+        ]
+    )
+    detector = SourceSupportDetector(structured_llm_client=structured_client)
+
+    result = await detector.detect_and_persist(
+        doc_id="doc-support",
+        source_type="confluence",
+        document="The assignment transitions to ASSIGNED.",
+        entity_ids=[entity_id],
+        project_key="PAY",
+        db=db,
+        memory_store=_memory_store(db),
+        writer_visibility="private",
+        writer_owner_user_id="alice@example.com",
+        writer_project_key="PAY",
+    )
+
+    assert result["checked"] == 0
+    assert result["added"] == 0
+    assert structured_client.prompts == []
+
+
+@pytest.mark.asyncio
+async def test_source_support_workspace_candidates_ignore_personal_disabled_sources(db: Database):
+    await _insert_doc(db, "doc-origin", project="PAY")
+    await _insert_doc(db, "doc-support", project="PAY")
+    await db.db.execute("UPDATE documents SET source = ? WHERE doc_id = ?", ("src-ORIGIN", "doc-origin"))
+    await db.db.commit()
+    await db.upsert_source("src-ORIGIN", "confluence", "Origin", "{}")
+    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle", tags=["feature"])
+    memory = _memory("mem-workspace-source-support", "Period lifecycle assignment transitions to ASSIGNED.")
+    await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
+    await db.set_source_subscription("src-ORIGIN", "alice@example.com", enabled=False)
+
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {
+                        "memory_id": memory.id,
+                        "supported": True,
+                        "excerpt": "The assignment transitions to ASSIGNED.",
+                        "reason": "same workspace rule",
+                    },
+                ]
+            )
+        ]
+    )
+    detector = SourceSupportDetector(structured_llm_client=structured_client)
+
+    result = await detector.detect_and_persist(
+        doc_id="doc-support",
+        source_type="confluence",
+        document="The assignment transitions to ASSIGNED.",
+        entity_ids=[entity_id],
+        project_key="PAY",
+        db=db,
+        memory_store=_memory_store(db),
+        writer_visibility="workspace",
+        writer_owner_user_id="alice@example.com",
+        writer_project_key="PAY",
+    )
+
+    assert result["checked"] == 1
+    assert result["added"] == 1
+    assert structured_client.prompts
+
+
+@pytest.mark.asyncio
+async def test_rejected_source_support_does_not_record_support_relation(db: Database):
+    await _insert_doc(db, "doc-origin")
+    await _insert_doc(db, "doc-support")
+    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle", tags=["feature"])
+    memory = _memory("mem-rejected-support", "Period lifecycle assignment transitions to ASSIGNED.")
+    await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
+
+    class RejectingStore:
+        def operation_context(self, **fields):
+            return None
+
+        async def record_audit_event(self, *args, **kwargs) -> None:
+            return None
+
+        async def add_source_support(self, *args, **kwargs) -> str:
+            return "rejected"
+
+        async def remove_source_support(self, memory_id: str, doc_id: str, reason: str = "no_support") -> bool:
+            return False
+
+    excerpt = "The assignment transitions to ASSIGNED."
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "same rule"},
+                ]
+            )
+        ]
+    )
+    detector = SourceSupportDetector(structured_llm_client=structured_client)
+
+    result = await detector.detect_and_persist(
+        doc_id="doc-support",
+        source_type="confluence",
+        document=excerpt,
+        entity_ids=[entity_id],
+        project_key="PAY",
+        db=db,
+        memory_store=RejectingStore(),  # type: ignore[arg-type]
+    )
+
+    async with db.db.execute(
+        "SELECT COUNT(*) FROM evidence_relations WHERE memory_id = ?",
+        (memory.id,),
+    ) as cursor:
+        relation_count = (await cursor.fetchone())[0]
+    assert result["added"] == 0
+    assert result["updated"] == 0
+    assert result["skipped"] == 1
+    assert relation_count == 0
 
 
 @pytest.mark.asyncio
@@ -246,7 +437,10 @@ async def test_existing_support_refresh_routes_through_store(db: Database):
             writer_visibility: str | None = None,
             writer_owner_user_id: str | None = None,
             writer_project_key: str | None = None,
+            relation_outcome=None,
         ) -> str:
+            assert relation_outcome is not None
+            await db.record_relation_outcome_bundle(relation_outcome)
             self.calls.append((memory_id, doc_id, source_type, excerpt, support_kind))
             return "updated"
 
@@ -254,11 +448,15 @@ async def test_existing_support_refresh_routes_through_store(db: Database):
             return False
 
     excerpt = "Existing support refresh stays audited."
-    structured_client = FakeStructuredSupportClient([
-        _support_response([
-            {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "same rule"},
-        ])
-    ])
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "same rule"},
+                ]
+            )
+        ]
+    )
     detector = SourceSupportDetector(structured_llm_client=structured_client)
     store = RecordingStore()
 
@@ -285,11 +483,15 @@ async def test_support_detection_adds_corroborated_source_with_validated_excerpt
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
 
     excerpt = "When the assignment is confirmed, the period lifecycle assignment transitions to ASSIGNED."
-    structured_client = FakeStructuredSupportClient([
-        _support_response([
-            {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "same rule"},
-        ])
-    ])
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "same rule"},
+                ]
+            )
+        ]
+    )
     detector = SourceSupportDetector(structured_llm_client=structured_client)
 
     result = await detector.detect_and_persist(
@@ -319,11 +521,15 @@ async def test_support_detection_audits_invalid_excerpt_rejection(db: Database):
     memory = _memory("mem-support-invalid", "Period lifecycle assignment must transition to ASSIGNED.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
 
-    structured_client = FakeStructuredSupportClient([
-        _support_response([
-            {"memory_id": memory.id, "supported": True, "excerpt": "not in document", "reason": "same rule"},
-        ])
-    ])
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {"memory_id": memory.id, "supported": True, "excerpt": "not in document", "reason": "same rule"},
+                ]
+            )
+        ]
+    )
     detector = SourceSupportDetector(structured_llm_client=structured_client)
 
     result = await detector.detect_and_persist(
@@ -339,9 +545,7 @@ async def test_support_detection_audits_invalid_excerpt_rejection(db: Database):
     audit_rows = await db.list_memory_audit_events(memory_id=memory.id)
     assert result["skipped"] == 1
     assert "source_support_rejected" in {row.event_type for row in audit_rows}
-    assert {row.reason for row in audit_rows if row.event_type == "source_support_rejected"} == {
-        "invalid_excerpt"
-    }
+    assert {row.reason for row in audit_rows if row.event_type == "source_support_rejected"} == {"invalid_excerpt"}
 
 
 @pytest.mark.asyncio
@@ -358,16 +562,20 @@ async def test_existing_support_refresh_audits_unsupported_decision(db: Database
         "old excerpt",
         support_kind="corroborated",
     )
-    structured_client = FakeStructuredSupportClient([
-        _support_response([
-            {
-                "memory_id": memory.id,
-                "supported": False,
-                "excerpt": "Existing support refresh stays audited.",
-                "reason": "not directly supported",
-            },
-        ])
-    ])
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {
+                        "memory_id": memory.id,
+                        "supported": False,
+                        "excerpt": "Existing support refresh stays audited.",
+                        "reason": "not directly supported",
+                    },
+                ]
+            )
+        ]
+    )
     detector = SourceSupportDetector(structured_llm_client=structured_client)
 
     result = await detector.detect_and_persist(
@@ -383,9 +591,7 @@ async def test_existing_support_refresh_audits_unsupported_decision(db: Database
     audit_rows = await db.list_memory_audit_events(memory_id=memory.id)
     assert result["removed_stale"] == 1
     assert "source_support_rejected" in {row.event_type for row in audit_rows}
-    assert {row.reason for row in audit_rows if row.event_type == "source_support_rejected"} == {
-        "unsupported"
-    }
+    assert {row.reason for row in audit_rows if row.event_type == "source_support_rejected"} == {"unsupported"}
 
 
 @pytest.mark.asyncio
@@ -397,11 +603,15 @@ async def test_support_detection_audits_verified_support_with_model_and_reason(d
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
 
     excerpt = "The period lifecycle assignment must transition to ASSIGNED before release."
-    structured_client = FakeStructuredSupportClient([
-        _support_response([
-            {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "direct statement"},
-        ])
-    ])
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "direct statement"},
+                ]
+            )
+        ]
+    )
     detector = SourceSupportDetector(structured_llm_client=structured_client, llm_model="claude-test")
 
     await detector.detect_and_persist(
@@ -432,11 +642,15 @@ async def test_support_detection_audits_supported_verifier_decision(db: Database
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
 
     excerpt = "Verified support is auditable."
-    structured_client = FakeStructuredSupportClient([
-        _support_response([
-            {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "direct support"},
-        ])
-    ])
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "direct support"},
+                ]
+            )
+        ]
+    )
     detector = SourceSupportDetector(structured_llm_client=structured_client, llm_model="claude-test")
 
     await detector.detect_and_persist(
@@ -534,11 +748,15 @@ async def test_support_detection_reprocessing_updates_better_excerpt_without_inc
     )
 
     better_excerpt = "The backend checks cutoff state before name duplication when creating an off-cycle payroll group."
-    structured_client = FakeStructuredSupportClient([
-        _support_response([
-            {"memory_id": memory.id, "supported": True, "excerpt": better_excerpt, "reason": "more specific"},
-        ])
-    ])
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {"memory_id": memory.id, "supported": True, "excerpt": better_excerpt, "reason": "more specific"},
+                ]
+            )
+        ]
+    )
     detector = SourceSupportDetector(structured_llm_client=structured_client)
 
     result = await detector.detect_and_persist(
@@ -696,16 +914,20 @@ async def test_support_detection_removes_existing_support_when_verifier_says_uns
         support_kind="corroborated",
     )
 
-    structured_client = FakeStructuredSupportClient([
-        _support_response([
-            {
-                "memory_id": memory.id,
-                "supported": False,
-                "excerpt": old_excerpt,
-                "reason": "context no longer matches",
-            },
-        ])
-    ])
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {
+                        "memory_id": memory.id,
+                        "supported": False,
+                        "excerpt": old_excerpt,
+                        "reason": "context no longer matches",
+                    },
+                ]
+            )
+        ]
+    )
     detector = SourceSupportDetector(structured_llm_client=structured_client)
 
     result = await detector.detect_and_persist(
@@ -747,12 +969,21 @@ async def test_existing_corroborated_support_is_revalidated_before_new_candidate
 
     updated_excerpt = "Ranking keeps existing corroborated rows in the verifier batch."
 
-    structured_client = FakeStructuredSupportClient([
-        _support_response([
-            {"memory_id": existing.id, "supported": True, "excerpt": updated_excerpt, "reason": "still supported"},
-        ]),
-        SourceSupportResponse(decisions=[]),
-    ])
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {
+                        "memory_id": existing.id,
+                        "supported": True,
+                        "excerpt": updated_excerpt,
+                        "reason": "still supported",
+                    },
+                ]
+            ),
+            SourceSupportResponse(decisions=[]),
+        ]
+    )
     detector = SourceSupportDetector(structured_llm_client=structured_client, max_candidates=1)
 
     result = await detector.detect_and_persist(
@@ -802,11 +1033,15 @@ async def test_support_detection_rejects_link_only_excerpt(db: Database):
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
     excerpt = "https://sonar.example.test/project/issues?id=payroll-processing"
 
-    structured_client = FakeStructuredSupportClient([
-        _support_response([
-            {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "link"},
-        ])
-    ])
+    structured_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "link"},
+                ]
+            )
+        ]
+    )
     detector = SourceSupportDetector(structured_llm_client=structured_client)
 
     result = await detector.detect_and_persist(

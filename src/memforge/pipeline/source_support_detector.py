@@ -12,9 +12,25 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from memforge.llm.structured import SourceSupportStructuredClient, StructuredLlmError
+from memforge.memory.evidence import (
+    AuthorityCase,
+    CandidateBucket,
+    EvidenceContentProvenance,
+    EvidenceRelationRecord,
+    EvidenceUnit,
+    LifecycleAction,
+    MemoryRelationApplyService,
+    RelationCandidateRecord,
+    RelationDecision,
+    RelationOutcomeBundle,
+    RelationRunRecord,
+    RelationType,
+    relation_run_id_for,
+)
 from memforge.models import Memory
 
 if TYPE_CHECKING:
@@ -166,6 +182,9 @@ class SourceSupportDetector:
                 remove_ids=set(),
             )
 
+        excluded_source_ids: list[str] = []
+        if writer_visibility == "private" and writer_owner_user_id:
+            excluded_source_ids = await db.list_disabled_source_ids_for_user(writer_owner_user_id)
         candidates = await db.get_source_support_candidates(
             doc_id=doc_id,
             entity_ids=entity_ids,
@@ -174,6 +193,7 @@ class SourceSupportDetector:
             writer_visibility=writer_visibility,
             writer_owner_user_id=writer_owner_user_id,
             writer_project_key=writer_project_key,
+            excluded_source_ids=excluded_source_ids,
         )
         candidates_by_id: dict[str, Memory] = {memory.id: memory for memory in candidates}
 
@@ -257,7 +277,28 @@ class SourceSupportDetector:
                 writer_visibility=writer_visibility,
                 writer_owner_user_id=writer_owner_user_id,
                 writer_project_key=writer_project_key,
+                relation_outcome=await self._support_relation_outcome_bundle(
+                    db=db,
+                    doc_id=doc_id,
+                    source_type=source_type,
+                    memory=candidates_by_id[memory_id],
+                    excerpt=excerpt,
+                    reason=str(decision.get("reason") or ""),
+                ),
             )
+            if outcome in {"rejected", "missing"}:
+                stats["skipped"] += 1
+                await memory_store.record_audit_event(
+                    "source_support_rejected",
+                    "skipped",
+                    context=audit_context,
+                    memory_id=memory_id,
+                    doc_id=doc_id,
+                    reason=f"store_{outcome}",
+                    payload={"verifier_reason": decision.get("reason")},
+                    evidence_refs=[{"excerpt": excerpt}],
+                )
+                continue
             stats["checked"] += 1
             if outcome == "inserted":
                 stats["added"] += 1
@@ -349,7 +390,28 @@ class SourceSupportDetector:
                 writer_visibility=writer_visibility,
                 writer_owner_user_id=writer_owner_user_id,
                 writer_project_key=writer_project_key,
+                relation_outcome=await self._support_relation_outcome_bundle(
+                    db=db,
+                    doc_id=doc_id,
+                    source_type=source_type,
+                    memory=existing_by_id[memory_id],
+                    excerpt=excerpt,
+                    reason=str(decision.get("reason") or ""),
+                ),
             )
+            if outcome in {"rejected", "missing"}:
+                stats["skipped"] += 1
+                await memory_store.record_audit_event(
+                    "source_support_rejected",
+                    "skipped",
+                    context=audit_context,
+                    memory_id=memory_id,
+                    doc_id=doc_id,
+                    reason=f"store_{outcome}",
+                    payload={"verifier_reason": decision.get("reason")},
+                    evidence_refs=[{"excerpt": excerpt}],
+                )
+                continue
             stats["checked"] += 1
             if outcome == "updated":
                 stats["updated"] += 1
@@ -427,6 +489,120 @@ class SourceSupportDetector:
             error=error,
         )
 
+    async def _support_relation_outcome_bundle(
+        self,
+        *,
+        db: Database,
+        doc_id: str,
+        source_type: str,
+        memory: Memory,
+        excerpt: str,
+        reason: str,
+    ) -> RelationOutcomeBundle:
+        document = await db.get_document(doc_id)
+        source_id = document.source if document is not None and document.source else source_type
+        doc_revision_id = None
+        if document is not None:
+            doc_revision_id = document.content_hash or document.version
+        unit_id = _support_evidence_unit_id(
+            source_id=source_id,
+            doc_id=doc_id,
+            doc_revision_id=doc_revision_id,
+            memory_id=memory.id,
+            excerpt=excerpt,
+        )
+        unit = EvidenceUnit(
+            id=unit_id,
+            source_id=source_id,
+            doc_id=doc_id,
+            doc_revision_id=doc_revision_id,
+            source_type=source_type,
+            source_anchor=unit_id,
+            source_lineage_id=doc_id,
+            project_key=memory.project_key,
+            visibility=memory.visibility,
+            owner_user_id=memory.owner_user_id,
+            repo_identifier=memory.repo_identifier,
+            content=excerpt,
+            excerpt=excerpt,
+            evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+            source_metadata={
+                "supported_memory_id": memory.id,
+                "support_kind": "corroborated",
+            },
+            observed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        relation_run_id = _support_relation_run_id(unit, memory.id)
+        decision = RelationDecision(
+            candidate_memory_id=memory.id,
+            relation_type=RelationType.SUPPORTS,
+            authority_case=AuthorityCase.INDEPENDENT_SUPPORT,
+            confidence=1.0,
+            reason=reason,
+            evidence_excerpt=excerpt,
+            matched_bucket=CandidateBucket.SHARED_ENTITIES,
+            matched_bucket_complete=True,
+            classifier_batch_key=relation_run_id,
+        )
+        lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [decision])
+        candidate = RelationCandidateRecord(
+            relation_run_id=relation_run_id,
+            evidence_unit_id=unit.id,
+            memory_id=memory.id,
+            bucket=CandidateBucket.SHARED_ENTITIES,
+            bucket_rank=0,
+            candidate_rank=0,
+            score=1.0,
+            is_mandatory=False,
+            bucket_complete=True,
+            was_checked=True,
+            reason=reason,
+        )
+        relation_run = RelationRunRecord(
+            id=relation_run_id,
+            evidence_unit_id=unit.id,
+            access_context_hash=unit.access_context_hash,
+            candidate_count=1,
+            mandatory_candidate_count=0,
+            checked_candidate_count=1,
+            incomplete_mandatory_buckets=(),
+            classifier_version="source-support-v1",
+            lifecycle_action=lifecycle.action,
+            review_case=lifecycle.review_case,
+            status="applied" if lifecycle.action is LifecycleAction.ATTACH_SUPPORT else "review",
+            audit={"source": "SourceSupportDetector.detect_and_persist"},
+        )
+        relations: list[EvidenceRelationRecord] = []
+        if lifecycle.action is not LifecycleAction.ATTACH_SUPPORT:
+            return RelationOutcomeBundle(
+                evidence_unit=unit,
+                relation_run=relation_run,
+                candidates=(candidate,),
+                relations=(),
+            )
+        relations.append(
+            EvidenceRelationRecord(
+                evidence_unit_id=unit.id,
+                memory_id=memory.id,
+                relation_type=RelationType.SUPPORTS,
+                authority_case=AuthorityCase.INDEPENDENT_SUPPORT,
+                is_authoritative_support=True,
+                source_lineage_id=unit.source_lineage_id,
+                confidence=1.0,
+                reason=reason,
+                excerpt=excerpt,
+                classifier_version="source-support-v1",
+                relation_run_id=relation_run_id,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+        return RelationOutcomeBundle(
+            evidence_unit=unit,
+            relation_run=relation_run,
+            candidates=(candidate,),
+            relations=tuple(relations),
+        )
+
     @staticmethod
     def _prompt_hash() -> str:
         return hashlib.sha256(SOURCE_SUPPORT_PROMPT.encode("utf-8")).hexdigest()
@@ -446,7 +622,11 @@ class SourceSupportDetector:
         for source in sources:
             if source.memory_id in refreshed_ids:
                 continue
-            if source.memory_id not in remove_ids and source.excerpt and self._excerpt_in_document(source.excerpt, document):
+            if (
+                source.memory_id not in remove_ids
+                and source.excerpt
+                and self._excerpt_in_document(source.excerpt, document)
+            ):
                 continue
             await self._remove_source_support(memory_store, source.memory_id, doc_id, context=audit_context)
             removed += 1
@@ -497,3 +677,30 @@ class SourceSupportDetector:
 
 def _normalize_ws(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _support_evidence_unit_id(
+    *,
+    source_id: str,
+    doc_id: str,
+    doc_revision_id: str | None,
+    memory_id: str,
+    excerpt: str,
+) -> str:
+    digest = hashlib.sha256(
+        "\x1f".join([source_id, doc_id, doc_revision_id or "", memory_id, excerpt]).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"eu-support-{digest}"
+
+
+def _support_relation_run_id(unit: EvidenceUnit, memory_id: str) -> str:
+    return relation_run_id_for(
+        prefix="support",
+        unit=unit,
+        action=LifecycleAction.ATTACH_SUPPORT,
+        classifier_version="source-support-v1",
+        candidate_memory_id=memory_id,
+        relation_type=RelationType.SUPPORTS,
+        authority_case=AuthorityCase.INDEPENDENT_SUPPORT,
+        bucket=CandidateBucket.SHARED_ENTITIES,
+    )

@@ -9,6 +9,7 @@ import pytest
 
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.audit import MemoryAuditLogger
+from memforge.memory.evidence import CandidateBucket, LifecycleAction, RelationType
 from memforge.memory.store import MemoryStore
 from memforge.llm.structured import ReconciliationDecision, ReconciliationResponse, StructuredLlmError
 from memforge.models import Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
@@ -618,6 +619,30 @@ async def test_reconciliation_update_replaces_memory_lifecycle_for_document_sour
     sources = await db.get_memory_sources(replacement.id)
     assert [(source.doc_id, source.source_type, source.support_kind, source.excerpt) for source in sources] == [
         ("doc-current", source_type, "extracted", "The current design says Service A uses PostgreSQL 16.")
+    ]
+
+    async with db.db.execute(
+        """SELECT rr.*
+           FROM relation_runs rr
+           JOIN evidence_relations er ON er.relation_run_id = rr.id
+           WHERE er.memory_id = ?
+           ORDER BY rr.started_at""",
+        (replacement.id,),
+    ) as cursor:
+        relation_runs = [dict(row) async for row in cursor]
+    assert len(relation_runs) == 1
+    assert relation_runs[0]["lifecycle_action"] == LifecycleAction.SUPERSEDE_MEMORY.value
+    evidence_unit = await db.get_evidence_unit(relation_runs[0]["evidence_unit_id"])
+    assert evidence_unit is not None
+    assert evidence_unit.source_type == source_type
+    assert evidence_unit.doc_id == "doc-current"
+    relations = await db.get_evidence_relations(evidence_unit.id)
+    assert [(relation.memory_id, relation.relation_type) for relation in relations] == [
+        (replacement.id, RelationType.SUPPORTS)
+    ]
+    candidates = await db.get_relation_candidates(relation_runs[0]["id"])
+    assert [(candidate.memory_id, candidate.bucket, candidate.was_checked) for candidate in candidates] == [
+        (old.id, CandidateBucket.SAME_DOC_LINEAGE, True)
     ]
 
 
