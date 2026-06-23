@@ -487,14 +487,14 @@ class AgentKnowledgeBundleService:
                 raise RuntimeError("agent claim replacement retry is missing its relation run")
             if existing_run.result_memory_id != new_memory_id:
                 raise RuntimeError("agent claim replacement retry result memory does not match current claim")
-            stored_candidates = await self.db.get_relation_candidates(relation_run_id)
+            committed_candidates = tuple(await self.db.get_relation_candidates(relation_run_id))
             relation_outcome = self._relation_outcome_bundle(
                 unit=unit,
                 relation_run_id=relation_run_id,
                 lifecycle_action=LifecycleAction.SUPERSEDE_MEMORY,
                 review_case=None,
                 memory_id=new_memory_id,
-                candidates=stored_candidates,
+                candidates=committed_candidates,
                 incomplete_mandatory_buckets=existing_run.incomplete_mandatory_buckets,
                 candidate_count=existing_run.candidate_count,
                 confidence=confidence,
