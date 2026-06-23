@@ -577,10 +577,11 @@ class LiteLlmStructuredClient:
         except Exception as schema_exc:
             logger.warning(
                 "Structured LLM response_schema attempt failed for model %s and schema %s; "
-                "retrying with JSON-text schema",
+                "retrying with JSON-text schema: %s: %s",
                 model_name,
                 response_format.__name__,
-                exc_info=True,
+                type(schema_exc).__name__,
+                schema_exc,
             )
             try:
                 return await self._attempt_schema(
