@@ -566,6 +566,9 @@ class MemoryStore:
         entity_ids: list[int] | None = None,
         excerpt: str | None = None,
         relation_outcome: RelationOutcomeBundle | None = None,
+        review: MemoryReview | None = None,
+        related_review_id: str | None = None,
+        related_review_reason: str | None = None,
     ) -> None:
         """Insert a memory without deduplication.
 
@@ -581,6 +584,9 @@ class MemoryStore:
             excerpt,
             context,
             relation_outcome=relation_outcome,
+            review=review,
+            related_review_id=related_review_id,
+            related_review_reason=related_review_reason,
         )
         await self._emit(
             "memory_insert_committed",
@@ -607,6 +613,9 @@ class MemoryStore:
         context: AuditContext,
         *,
         relation_outcome: RelationOutcomeBundle | None = None,
+        review: MemoryReview | None = None,
+        related_review_id: str | None = None,
+        related_review_reason: str | None = None,
     ) -> None:
         """Insert memory into SQLite + FTS5 + ChromaDB + link entities and sources."""
         inserted = False
@@ -621,6 +630,9 @@ class MemoryStore:
                 excerpt=excerpt,
                 entity_ids=entity_ids,
                 relation_outcome=relation_outcome,
+                review=review,
+                related_review_id=related_review_id,
+                related_review_reason=related_review_reason,
             )
             inserted = True
             await self._emit(
@@ -964,6 +976,7 @@ class MemoryStore:
         observed_at: datetime,
         citations: list[str] | None = None,
         concept_projection: dict[str, Any] | None = None,
+        concept_markdown_body: str | None = None,
         entity_ids: list[int] | None = None,
         excerpt: str | None = None,
         relation_outcome: RelationOutcomeBundle | None = None,
@@ -1018,6 +1031,7 @@ class MemoryStore:
                 observed_at=observed_at,
                 citations=citations,
                 concept_projection=concept_projection,
+                concept_markdown_body=concept_markdown_body,
                 entity_ids=entity_ids,
             )
             await self._emit(
@@ -1065,6 +1079,8 @@ class MemoryStore:
         tags: list[str],
         confidence: float,
         observed_at: datetime,
+        citations: list[str] | None = None,
+        concept_markdown_body: str | None = None,
         entity_ids: list[int] | None = None,
         excerpt: str | None = None,
         replacement_reason: str | None = None,
@@ -1106,6 +1122,8 @@ class MemoryStore:
                 tags=tags,
                 confidence=confidence,
                 observed_at=observed_at,
+                citations=citations,
+                concept_markdown_body=concept_markdown_body,
                 relation_outcome=relation_outcome,
             )
             await self._remove_from_search_indexes(old_memory_id, label="superseded", context=context)
@@ -1606,15 +1624,24 @@ class MemoryStore:
         """Quarantine a memory until a human or future workflow resolves it."""
         context = self._operation_context()
         previous = await self.db.get_memory(memory_id)
-        await self.db.update_memory_status(memory_id, "pending_review", reason=reason)
+        search_removed = False
         try:
             await self._remove_from_search_indexes(memory_id, label="pending_review", context=context)
+            search_removed = True
             if relation_outcome is not None:
-                await self.db.record_relation_outcome_bundle(relation_outcome)
+                await self.db.update_memory_status_with_relation_outcome(
+                    memory_id,
+                    "pending_review",
+                    reason=reason,
+                    relation_outcome=relation_outcome,
+                )
+            else:
+                await self.db.update_memory_status(memory_id, "pending_review", reason=reason)
         except Exception:
             if previous:
                 await self._restore_memory_row(previous)
-                await self._restore_search_indexes(previous, context=context, label="pending_review_rollback")
+                if search_removed:
+                    await self._restore_search_indexes(previous, context=context, label="pending_review_rollback")
             raise
         await self._emit(
             "memory_pending_review_committed",
@@ -1647,6 +1674,7 @@ class MemoryStore:
             )
         except Exception:
             if previous:
+                await self._restore_memory_row(previous)
                 await self._restore_search_indexes(previous, context=context, label="pending_review_rollback")
             raise
         await self._emit(

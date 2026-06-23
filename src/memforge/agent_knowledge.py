@@ -258,6 +258,12 @@ class AgentKnowledgeBundleService:
                 claim_text=proposal.claim_text,
                 citations=proposal.citations,
             )
+            concept_markdown_body = await self._render_concept_markdown_with_patch(
+                concept,
+                claim_id=claim_id,
+                claim_text=proposal.claim_text,
+                citations=proposal.citations,
+            )
             memory_id = await self._insert_claim_memory(
                 proposal=proposal,
                 concept_id=concept["id"],
@@ -278,8 +284,8 @@ class AgentKnowledgeBundleService:
                 source_type="agent_session",
                 submitted_at=submitted_at,
                 citations=proposal.citations,
+                concept_markdown_body=concept_markdown_body,
             )
-            await self._refresh_concept_markdown(concept["id"], observed_at=submitted_at)
             return AgentKnowledgePatchResult(
                 outcome="applied",
                 result_bucket="applied",
@@ -298,6 +304,12 @@ class AgentKnowledgeBundleService:
                 reason="claim is outside the target concept",
             )
 
+        concept_markdown_body = await self._render_concept_markdown_with_patch(
+            concept,
+            claim_id=claim["id"],
+            claim_text=proposal.claim_text,
+            citations=proposal.citations,
+        )
         memory_id = await self._supersede_claim_memory(
             proposal=proposal,
             old_memory_id=claim["memory_id"],
@@ -320,9 +332,9 @@ class AgentKnowledgeBundleService:
             replacement_reason=proposal.reason or "agent claim updated",
             replacement_kind=_replacement_kind_for_action(proposal.action),
             submitted_at=submitted_at,
+            citations=proposal.citations,
+            concept_markdown_body=concept_markdown_body,
         )
-        await self._append_citations(claim["id"], proposal.citations, submitted_at)
-        await self._refresh_concept_markdown(concept["id"], observed_at=submitted_at)
         return AgentKnowledgePatchResult(
             outcome="applied",
             result_bucket="applied",
@@ -367,6 +379,7 @@ class AgentKnowledgeBundleService:
         submitted_at: datetime,
         citations: list[str] | None = None,
         concept_projection: dict[str, object] | None = None,
+        concept_markdown_body: str | None = None,
     ) -> str:
         unit = _agent_evidence_unit(
             proposal=proposal,
@@ -423,6 +436,7 @@ class AgentKnowledgeBundleService:
                 observed_at=submitted_at,
                 citations=citations,
                 concept_projection=concept_projection,
+                concept_markdown_body=concept_markdown_body,
                 excerpt=claim_text.strip(),
                 relation_outcome=relation_outcome,
             )
@@ -454,6 +468,8 @@ class AgentKnowledgeBundleService:
         replacement_reason: str,
         replacement_kind: ReplacementKind,
         submitted_at: datetime,
+        citations: list[str] | None = None,
+        concept_markdown_body: str | None = None,
     ) -> str:
         unit = _agent_evidence_unit(
             proposal=proposal,
@@ -567,6 +583,8 @@ class AgentKnowledgeBundleService:
             confidence=confidence,
             observed_at=submitted_at,
             relation_outcome=relation_outcome,
+            citations=citations,
+            concept_markdown_body=concept_markdown_body,
         )
         return new_memory_id
 
@@ -721,38 +739,48 @@ class AgentKnowledgeBundleService:
             )
         )
 
-    async def _append_citations(
+    async def _render_concept_markdown_with_patch(
         self,
+        concept: dict,
+        *,
         claim_id: str,
+        claim_text: str,
         citations: list[str],
-        observed_at: datetime,
-    ) -> None:
-        for citation in citations:
-            if citation.strip():
-                await self.db.add_agent_claim_citation(
-                    claim_id=claim_id,
-                    citation_url=citation.strip(),
-                    observed_at=observed_at,
-                )
+    ) -> str:
+        claims = await self.db.list_agent_claims(concept["id"])
+        citations_by_claim = {
+            claim["id"]: await self.db.list_agent_claim_citations(claim["id"])
+            for claim in claims
+        }
+        patched_claims = []
+        claim_seen = False
+        for claim in claims:
+            if claim["id"] == claim_id:
+                patched_claims.append({**claim, "claim_text": claim_text})
+                claim_seen = True
+            else:
+                patched_claims.append(claim)
+        if not claim_seen:
+            patched_claims.append({"id": claim_id, "claim_text": claim_text})
 
-    async def _refresh_concept_markdown(self, concept_id: str, *, observed_at: datetime) -> None:
-        concept = await self.db.get_agent_concept(concept_id)
-        if not concept:
-            return
-        claims = await self.db.list_agent_claims(concept_id)
-        citations_by_claim = {claim["id"]: await self.db.list_agent_claim_citations(claim["id"]) for claim in claims}
-        markdown = _render_markdown(
+        merged_citations: dict[str, list[str]] = {}
+        for claim in patched_claims:
+            existing = [
+                citation["citation_url"]
+                for citation in citations_by_claim.get(claim["id"], [])
+                if citation["citation_url"].strip()
+            ]
+            if claim["id"] == claim_id:
+                existing.extend(citation.strip() for citation in citations if citation.strip())
+            merged_citations[claim["id"]] = list(dict.fromkeys(existing))
+
+        return _render_markdown(
             title=concept["title"],
             concept_type=concept["concept_type"],
             repo_identifier=concept.get("repo_identifier"),
-            claim_id=claims[0]["id"] if claims else "",
-            claim_text="\n\n".join(claim["claim_text"] for claim in claims),
-            citations=[citation["citation_url"] for claim in claims for citation in citations_by_claim[claim["id"]]],
-        )
-        await self.db.update_agent_concept_markdown(
-            concept_id=concept_id,
-            markdown_body=markdown,
-            observed_at=observed_at,
+            claim_id=patched_claims[0]["id"] if patched_claims else claim_id,
+            claim_text="\n\n".join(claim["claim_text"] for claim in patched_claims),
+            citations=[citation for claim in patched_claims for citation in merged_citations[claim["id"]]],
         )
 
 

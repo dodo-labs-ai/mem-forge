@@ -2742,8 +2742,13 @@ class Database:
         excerpt: str | None = None,
         entity_ids: Sequence[int] | None = None,
         relation_outcome: RelationOutcomeBundle | None = None,
+        review: MemoryReview | None = None,
+        related_review_id: str | None = None,
+        related_review_reason: str | None = None,
     ) -> str:
-        """Insert a memory, source provenance, entities, FTS, and relation audit atomically."""
+        """Insert a memory, source provenance, entities, relation audit, and optional review atomically."""
+        if review is not None and related_review_id is not None:
+            raise ValueError("review and related_review_id are mutually exclusive")
         async with self._write_lock:
             try:
                 await self._upsert_memory_preserving_created_at_unlocked(mem)
@@ -2755,6 +2760,70 @@ class Database:
                 )
                 if relation_outcome is not None:
                     await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                if related_review_id is not None:
+                    now = _now_iso()
+                    async with self.db.execute(
+                        """SELECT review_id FROM memory_review_related_challengers
+                           WHERE challenger_memory_id = ?""",
+                        (mem.id,),
+                    ) as cursor:
+                        existing = await cursor.fetchone()
+                    if existing:
+                        existing_review_id = existing["review_id"]
+                        if existing_review_id != related_review_id:
+                            raise ValueError(
+                                f"Challenger {mem.id} is already attached to review {existing_review_id}"
+                            )
+                        await self.db.execute(
+                            """UPDATE memory_review_related_challengers
+                               SET reason = COALESCE(?, reason)
+                               WHERE review_id = ? AND challenger_memory_id = ?""",
+                            (related_review_reason, related_review_id, mem.id),
+                        )
+                    else:
+                        await self.db.execute(
+                            """INSERT INTO memory_review_related_challengers (
+                                review_id, challenger_memory_id, reason, created_at
+                            ) VALUES (?, ?, ?, ?)""",
+                            (related_review_id, mem.id, related_review_reason, now),
+                        )
+                if review is not None:
+                    now = _now_iso()
+                    created_at = review.created_at.isoformat() if review.created_at else now
+                    await self.db.execute(
+                        """INSERT INTO memory_reviews (
+                            id, kind, status, incumbent_memory_id, challenger_memory_id,
+                            reason, review_note, reviewer,
+                            expected_incumbent_updated_at, expected_challenger_updated_at,
+                            created_at, resolved_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            kind=excluded.kind,
+                            status=excluded.status,
+                            incumbent_memory_id=excluded.incumbent_memory_id,
+                            challenger_memory_id=excluded.challenger_memory_id,
+                            reason=excluded.reason,
+                            review_note=excluded.review_note,
+                            reviewer=excluded.reviewer,
+                            expected_incumbent_updated_at=excluded.expected_incumbent_updated_at,
+                            expected_challenger_updated_at=excluded.expected_challenger_updated_at,
+                            resolved_at=excluded.resolved_at
+                        WHERE memory_reviews.status = 'pending'""",
+                        (
+                            review.id,
+                            review.kind,
+                            review.status,
+                            review.incumbent_memory_id,
+                            review.challenger_memory_id,
+                            review.reason,
+                            review.review_note,
+                            review.reviewer,
+                            review.expected_incumbent_updated_at,
+                            review.expected_challenger_updated_at,
+                            created_at,
+                            review.resolved_at.isoformat() if review.resolved_at else None,
+                        ),
+                    )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
@@ -2779,6 +2848,7 @@ class Database:
         observed_at: datetime,
         citations: list[str] | None = None,
         concept_projection: dict[str, Any] | None = None,
+        concept_markdown_body: str | None = None,
         entity_ids: list[int] | None = None,
     ) -> str:
         """Insert an agent-session memory and its claim projection atomically."""
@@ -2822,6 +2892,12 @@ class Database:
                     await self._add_agent_claim_citation_unlocked(
                         claim_id=claim_id,
                         citation_url=citation_url,
+                        observed=observed,
+                    )
+                if concept_markdown_body is not None:
+                    await self._update_agent_concept_markdown_unlocked(
+                        concept_id=concept_id,
+                        markdown_body=concept_markdown_body,
                         observed=observed,
                     )
                 await self.db.commit()
@@ -3098,31 +3174,78 @@ class Database:
         reason: str | None = None,
     ) -> None:
         async with self._write_lock:
-            canonical = normalize_memory_status(status)
-            now = _now_iso()
-            if canonical == "retired":
-                await self.db.execute(
-                    """UPDATE memories SET
-                        status = ?, retirement_reason = COALESCE(?, retirement_reason, 'admin_hidden'),
-                        retired_at = COALESCE(retired_at, ?), updated_at = ?
-                       WHERE id = ?""",
-                    (canonical, reason, now, now, memory_id),
+            await self._update_memory_status_unlocked(memory_id, status, reason=reason)
+            await self.db.commit()
+
+    async def update_memory_status_with_relation_outcome(
+        self,
+        memory_id: str,
+        status: str,
+        *,
+        reason: str | None = None,
+        relation_outcome: RelationOutcomeBundle,
+    ) -> None:
+        async with self._write_lock:
+            try:
+                await self._update_memory_status_unlocked(
+                    memory_id,
+                    status,
+                    reason=reason,
+                    allowed_current_statuses=("active", "pending_review"),
                 )
-            elif canonical == "active":
-                await self.db.execute(
-                    """UPDATE memories SET
-                        status = ?, retirement_reason = NULL, retired_at = NULL,
-                        superseded_by = NULL, superseded_at = NULL,
-                        replacement_reason = NULL, replacement_kind = NULL, updated_at = ?
-                       WHERE id = ?""",
-                    (canonical, now, memory_id),
+                await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def _update_memory_status_unlocked(
+        self,
+        memory_id: str,
+        status: str,
+        *,
+        reason: str | None = None,
+        allowed_current_statuses: Sequence[str] | None = None,
+    ) -> None:
+        canonical = normalize_memory_status(status)
+        now = _now_iso()
+        guard_clause = ""
+        guard_params: tuple[str, ...] = ()
+        if allowed_current_statuses:
+            placeholders = ", ".join("?" for _ in allowed_current_statuses)
+            guard_clause = f" AND status IN ({placeholders})"
+            guard_params = tuple(allowed_current_statuses)
+        if canonical == "retired":
+            cursor = await self.db.execute(
+                f"""UPDATE memories SET
+                    status = ?, retirement_reason = COALESCE(?, retirement_reason, 'admin_hidden'),
+                    retired_at = COALESCE(retired_at, ?), updated_at = ?
+                   WHERE id = ?{guard_clause}""",
+                (canonical, reason, now, now, memory_id, *guard_params),
+            )
+        elif canonical == "active":
+            cursor = await self.db.execute(
+                f"""UPDATE memories SET
+                    status = ?, retirement_reason = NULL, retired_at = NULL,
+                    superseded_by = NULL, superseded_at = NULL,
+                    replacement_reason = NULL, replacement_kind = NULL, updated_at = ?
+                   WHERE id = ?{guard_clause}""",
+                (canonical, now, memory_id, *guard_params),
+            )
+        else:
+            if allowed_current_statuses:
+                cursor = await self.db.execute(
+                    f"UPDATE memories SET status = ?, updated_at = ? WHERE id = ?{guard_clause}",
+                    (canonical, now, memory_id, *guard_params),
                 )
             else:
                 await self.db.execute(
                     "UPDATE memories SET status = ?, updated_at = ? WHERE id = ?",
                     (canonical, now, memory_id),
                 )
-            await self.db.commit()
+                return
+        if allowed_current_statuses and cursor.rowcount != 1:
+            raise RuntimeError(f"memory {memory_id} cannot transition to {canonical} from its current lifecycle state")
 
     async def purge_memory(self, memory_id: str) -> bool:
         """Hard-delete a memory and its local indexes/provenance."""
@@ -4004,15 +4127,40 @@ class Database:
     ) -> None:
         observed = _utc_iso(observed_at)
         async with self._write_lock:
-            await self.db.execute(
-                """UPDATE agent_concepts SET
-                    markdown_body = ?,
-                    updated_at = ?,
-                    last_observed_at = ?
-                   WHERE id = ?""",
-                (markdown_body, observed, observed, concept_id),
+            await self._update_agent_concept_markdown_unlocked(
+                concept_id=concept_id,
+                markdown_body=markdown_body,
+                observed=observed,
             )
             await self.db.commit()
+
+    async def _update_agent_concept_markdown_unlocked(
+        self,
+        *,
+        concept_id: str,
+        markdown_body: str,
+        observed: str,
+    ) -> None:
+        async with self.db.execute("SELECT 1 FROM agent_concepts WHERE id = ?", (concept_id,)) as cursor:
+            if await cursor.fetchone() is None:
+                raise RuntimeError(f"agent concept projection target missing: {concept_id}")
+        await self.db.execute(
+            """UPDATE agent_concepts SET
+                markdown_body = CASE
+                    WHEN updated_at IS NULL OR updated_at <= ? THEN ?
+                    ELSE markdown_body
+                END,
+                updated_at = CASE
+                    WHEN updated_at IS NULL OR updated_at <= ? THEN ?
+                    ELSE updated_at
+                END,
+                last_observed_at = CASE
+                    WHEN last_observed_at IS NULL OR last_observed_at <= ? THEN ?
+                    ELSE last_observed_at
+                END
+               WHERE id = ?""",
+            (observed, markdown_body, observed, observed, observed, observed, concept_id),
+        )
 
     async def upsert_agent_claim(
         self,
@@ -4106,6 +4254,8 @@ class Database:
         tags: list[str],
         confidence: float,
         observed_at: datetime,
+        citations: list[str] | None = None,
+        concept_markdown_body: str | None = None,
         relation_outcome: RelationOutcomeBundle | None = None,
     ) -> None:
         """Supersede a memory and move its agent-claim projection atomically."""
@@ -4116,16 +4266,17 @@ class Database:
         project_key = _normalize_project_key(new_memory.project_key)
         observed = _utc_iso(observed_at)
         async with self._write_lock:
-            async with self.db.execute(
-                "SELECT created_at FROM agent_claims WHERE id = ?",
-                (claim_id,),
-            ) as cursor:
-                existing_claim = await cursor.fetchone()
-            created_at = existing_claim["created_at"] if existing_claim else observed
-            now = _now_iso()
-            new_status = normalize_memory_status(new_memory.status)
-            await self.db.execute(
-                """INSERT INTO memories (
+            try:
+                async with self.db.execute(
+                    "SELECT created_at FROM agent_claims WHERE id = ?",
+                    (claim_id,),
+                ) as cursor:
+                    existing_claim = await cursor.fetchone()
+                created_at = existing_claim["created_at"] if existing_claim else observed
+                now = _now_iso()
+                new_status = normalize_memory_status(new_memory.status)
+                await self.db.execute(
+                    """INSERT INTO memories (
                     id, memory_type, content, content_hash, tags, visibility, owner_user_id,
                     project_key, repo_identifier, memory_level, curation_cluster_id,
                     confidence, corroboration_count,
@@ -4162,16 +4313,16 @@ class Database:
                     new_memory.created_at.isoformat() if new_memory.created_at else now,
                     now,
                 ),
-            )
-            await self.db.execute(
-                """UPDATE memories SET
+                )
+                await self.db.execute(
+                    """UPDATE memories SET
                     status = 'superseded', superseded_by = ?, valid_until = ?,
                     superseded_at = ?, replacement_reason = ?, replacement_kind = ?, updated_at = ?
                    WHERE id = ?""",
-                (new_memory.id, now, now, replacement_reason, replacement_kind, now, old_id),
-            )
-            await self.db.execute(
-                """INSERT INTO agent_claims (
+                    (new_memory.id, now, now, replacement_reason, replacement_kind, now, old_id),
+                )
+                await self.db.execute(
+                    """INSERT INTO agent_claims (
                     id, concept_id, display_anchor, claim_text, memory_type,
                     tags, confidence, memory_id, created_at, updated_at,
                     last_observed_at
@@ -4199,35 +4350,50 @@ class Database:
                     observed,
                     observed,
                 ),
-            )
-            if carry_revision_sources:
-                async with self.db.execute(
-                    "SELECT * FROM memory_sources WHERE memory_id = ? AND doc_id <> ?",
-                    (old_id, doc_id),
-                ) as cursor:
-                    async for row in cursor:
-                        await self._add_memory_source_unlocked(
-                            new_memory.id,
-                            row["doc_id"],
-                            row["source_type"],
-                            row["excerpt"],
-                            support_kind=row["support_kind"] or "extracted",
-                        )
-            await self._add_memory_source_unlocked(
-                new_memory.id,
-                doc_id,
-                source_type,
-                excerpt,
-                support_kind="extracted",
-            )
-            await self._link_memory_entities_unlocked(new_memory.id, entity_ids)
-            await self._rebuild_memory_fts_unlocked(
-                new_memory.id,
-                search_visible_statuses=set(allowed_search_statuses()),
-            )
-            if relation_outcome is not None:
-                await self._record_relation_outcome_bundle_unlocked(relation_outcome)
-            await self.db.commit()
+                )
+                if carry_revision_sources:
+                    async with self.db.execute(
+                        "SELECT * FROM memory_sources WHERE memory_id = ? AND doc_id <> ?",
+                        (old_id, doc_id),
+                    ) as cursor:
+                        async for row in cursor:
+                            await self._add_memory_source_unlocked(
+                                new_memory.id,
+                                row["doc_id"],
+                                row["source_type"],
+                                row["excerpt"],
+                                support_kind=row["support_kind"] or "extracted",
+                            )
+                await self._add_memory_source_unlocked(
+                    new_memory.id,
+                    doc_id,
+                    source_type,
+                    excerpt,
+                    support_kind="extracted",
+                )
+                await self._link_memory_entities_unlocked(new_memory.id, entity_ids)
+                await self._rebuild_memory_fts_unlocked(
+                    new_memory.id,
+                    search_visible_statuses=set(allowed_search_statuses()),
+                )
+                for citation_url in citations or []:
+                    await self._add_agent_claim_citation_unlocked(
+                        claim_id=claim_id,
+                        citation_url=citation_url,
+                        observed=observed,
+                    )
+                if concept_markdown_body is not None:
+                    await self._update_agent_concept_markdown_unlocked(
+                        concept_id=concept_id,
+                        markdown_body=concept_markdown_body,
+                        observed=observed,
+                    )
+                if relation_outcome is not None:
+                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def get_agent_claim(self, claim_id: str) -> dict[str, Any] | None:
         async with self.db.execute(
@@ -6293,8 +6459,9 @@ class Database:
                     ) as cursor:
                         existing_review = await cursor.fetchone()
                     if existing_review is not None and existing_review["status"] != "pending":
-                        await self.db.rollback()
-                        return
+                        raise RuntimeError(
+                            f"memory review {review.id} already exists with status {existing_review['status']}"
+                        )
                 now = _now_iso()
                 await self.db.execute(
                     """UPDATE memories
@@ -6332,7 +6499,7 @@ class Database:
                         )
                 if review is not None:
                     created_at = review.created_at.isoformat() if review.created_at else now
-                    await self.db.execute(
+                    cursor = await self.db.execute(
                         """INSERT INTO memory_reviews (
                             id, kind, status, incumbent_memory_id, challenger_memory_id,
                             reason, review_note, reviewer,
@@ -6366,6 +6533,8 @@ class Database:
                             review.resolved_at.isoformat() if review.resolved_at else None,
                         ),
                     )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError(f"memory review {review.id} was not created or refreshed")
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()

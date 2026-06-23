@@ -68,6 +68,7 @@ class ReviewCase(str, Enum):
     MANDATORY_INCOMPLETE = "mandatory_incomplete"
     CROSS_SCOPE_BLOCKED = "cross_scope_blocked"
     NON_AUTHORITATIVE_REFINEMENT = "non_authoritative_refinement"
+    MANUAL_REVIEW_GATE = "manual_review_gate"
 
 
 MANDATORY_CANDIDATE_BUCKETS = frozenset(

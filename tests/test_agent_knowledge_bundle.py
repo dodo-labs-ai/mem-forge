@@ -271,6 +271,58 @@ async def test_add_claim_does_not_commit_projection_before_memory_lifecycle(bund
 
 
 @pytest.mark.asyncio
+async def test_add_claim_writes_citations_and_markdown_inside_lifecycle_contract(bundle_stack, monkeypatch):
+    db, store, _ = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    created = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+
+    async def fail_public_citation_write(*args, **kwargs):
+        raise AssertionError("citation projection must be committed by the lifecycle store contract")
+
+    async def fail_public_markdown_write(*args, **kwargs):
+        raise AssertionError("concept markdown must be committed by the lifecycle store contract")
+
+    monkeypatch.setattr(db, "add_agent_claim_citation", fail_public_citation_write)
+    monkeypatch.setattr(db, "update_agent_concept_markdown", fail_public_markdown_write)
+
+    added = await service.apply_patch_proposal(
+        proposal=_proposal(
+            action="add_new_claim",
+            concept_id=created.concept_id,
+            claim_id="akb_claim_add_atomic",
+            claim_text="Scheduler claims are persisted with their concept markdown in one lifecycle commit.",
+            memory_content="Scheduler claims persist with their concept markdown in one lifecycle commit.",
+            citations=["agent-window://codex/sess-2/sha256-window"],
+        ),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-2",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+
+    assert added.outcome == "applied"
+    citations = await db.list_agent_claim_citations("akb_claim_add_atomic")
+    assert [citation["citation_url"] for citation in citations] == ["agent-window://codex/sess-2/sha256-window"]
+    concept = await db.get_agent_concept(created.concept_id)
+    assert concept is not None
+    assert "Workspace source schedulers must start during app startup" in concept["markdown_body"]
+    assert "Scheduler claims are persisted with their concept markdown" in concept["markdown_body"]
+    assert "agent-window://codex/sess-2/sha256-window" in concept["markdown_body"]
+
+
+@pytest.mark.asyncio
 async def test_update_claim_does_not_commit_projection_before_memory_lifecycle(bundle_stack, monkeypatch):
     db, store, _ = bundle_stack
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
@@ -315,6 +367,63 @@ async def test_update_claim_does_not_commit_projection_before_memory_lifecycle(b
     assert memory is not None
     assert memory.status == "active"
     assert memory.superseded_by is None
+
+
+@pytest.mark.asyncio
+async def test_update_claim_rolls_back_when_atomic_citation_projection_fails(bundle_stack, monkeypatch):
+    db, store, _ = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    created = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+    original_claim = await db.get_agent_claim(created.claim_id)
+    original_memory = await db.get_memory(created.memory_id)
+    original_concept = await db.get_agent_concept(created.concept_id)
+    original_citations = await db.list_agent_claim_citations(created.claim_id)
+    original_add_citation = db._add_agent_claim_citation_unlocked
+
+    async def fail_new_citation(*, claim_id: str, citation_url: str, observed: str):
+        if citation_url == "agent-window://codex/sess-2/sha256-window":
+            raise RuntimeError("atomic citation projection failed")
+        await original_add_citation(claim_id=claim_id, citation_url=citation_url, observed=observed)
+
+    monkeypatch.setattr(db, "_add_agent_claim_citation_unlocked", fail_new_citation)
+
+    with pytest.raises(RuntimeError, match="atomic citation projection failed"):
+        await service.apply_patch_proposal(
+            proposal=_proposal(
+                action="update_existing_claim",
+                concept_id=created.concept_id,
+                claim_id=created.claim_id,
+                claim_text="Workspace source schedulers advance next_run_at after a successful claim.",
+                memory_content="Workspace source schedulers advance next_run_at after a successful claim.",
+                reason="New evidence refines the scheduler lifecycle claim.",
+                citations=["agent-window://codex/sess-2/sha256-window"],
+            ),
+            owner_user_id="u-andrew",
+            source_id="src-agent-sessions-codex",
+            client="codex",
+            session_id="sess-2",
+            workspace="/workspace/memforge-cloud",
+            repo_identifier="github.tools.sap/hcm/memforge-cloud",
+            project_key="UNSORTED",
+        )
+
+    assert await db.get_agent_claim(created.claim_id) == original_claim
+    assert await db.list_agent_claim_citations(created.claim_id) == original_citations
+    assert await db.get_agent_concept(created.concept_id) == original_concept
+    restored_memory = await db.get_memory(created.memory_id)
+    assert original_memory is not None
+    assert restored_memory is not None
+    assert restored_memory.status == original_memory.status == "active"
+    assert restored_memory.superseded_by is None
 
 
 @pytest.mark.asyncio
@@ -370,6 +479,68 @@ async def test_update_existing_claim_rolls_back_if_claim_projection_commit_fails
     assert claim_after_failure == original_claim
     claims = await db.list_agent_claims(created.concept_id)
     assert [claim["id"] for claim in claims] == [created.claim_id]
+
+
+@pytest.mark.asyncio
+async def test_update_agent_concept_markdown_fails_if_projection_target_is_missing(bundle_stack):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    created = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+
+    with pytest.raises(RuntimeError, match="agent concept projection target missing"):
+        await db.update_agent_concept_markdown(
+            concept_id="missing-concept",
+            markdown_body="# Missing\n",
+            observed_at=datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc),
+        )
+
+    existing_concept = await db.get_agent_concept(created.concept_id)
+    assert existing_concept is not None
+    assert "Workspace source schedulers must start during app startup" in existing_concept["markdown_body"]
+
+
+@pytest.mark.asyncio
+async def test_update_agent_concept_markdown_ignores_stale_projection_body(bundle_stack):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    created = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+    )
+
+    newer_observed = datetime(2030, 6, 22, 12, 30, tzinfo=timezone.utc)
+    await db.update_agent_concept_markdown(
+        concept_id=created.concept_id,
+        markdown_body="# Scheduler\n\nNewer projection.",
+        observed_at=newer_observed,
+    )
+    older_observed = datetime(2030, 6, 22, 12, 0, tzinfo=timezone.utc)
+    await db.update_agent_concept_markdown(
+        concept_id=created.concept_id,
+        markdown_body="# Scheduler\n\nStale projection.",
+        observed_at=older_observed,
+    )
+
+    concept = await db.get_agent_concept(created.concept_id)
+    assert concept is not None
+    assert concept["markdown_body"] == "# Scheduler\n\nNewer projection."
+    assert concept["updated_at"] == "2030-06-22T12:30:00+00:00"
+    assert concept["last_observed_at"] == "2030-06-22T12:30:00+00:00"
 
 
 @pytest.mark.asyncio
@@ -492,6 +663,10 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
         "agent-window://codex/sess-1/sha256-window",
         "agent-window://codex/sess-2/sha256-window",
     ]
+    concept = await db.get_agent_concept(created.concept_id)
+    assert concept is not None
+    assert "Workspace source schedulers must start during app startup" in concept["markdown_body"]
+    assert "agent-window://codex/sess-2/sha256-window" in concept["markdown_body"]
 
     relation_runs = await _relation_runs_for_memory(db, updated.memory_id)
     assert relation_runs[-1]["lifecycle_action"] == LifecycleAction.SUPERSEDE_MEMORY.value

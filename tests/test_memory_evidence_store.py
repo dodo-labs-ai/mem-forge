@@ -1461,7 +1461,8 @@ async def test_mark_pending_review_does_not_reopen_resolved_review(db: Database)
         reason="retry conflict",
         created_at=datetime.fromisoformat("2026-06-23T12:00:00+00:00"),
     )
-    await db.mark_memory_pending_review_with_case("mem-review-resolved", reason="retry", review=retry)
+    with pytest.raises(RuntimeError, match="already exists with status approved"):
+        await db.mark_memory_pending_review_with_case("mem-review-resolved", reason="retry", review=retry)
 
     stored = await db.get_memory_review("rev-resolved")
     memory = await db.get_memory("mem-review-resolved")
