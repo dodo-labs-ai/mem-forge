@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 import pytest
 
 from memforge.memory.engine import MemoryEngine
+from memforge.memory.evidence import LifecycleAction, RelationType
 from memforge.memory.store import MemoryStore
-from memforge.models import DocumentRecord, RawMemory
+from memforge.models import DocumentRecord, Memory, RawMemory, content_hash
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
@@ -93,3 +94,72 @@ async def test_process_memories_inserts_through_the_adapters(db, monkeypatch):
     assert collection.upserted[rows[0].id]["repo_identifier"] == (
         "github.com/shno-labs/mem-forge"
     )
+
+    async with db.db.execute("SELECT * FROM relation_runs") as cursor:
+        relation_runs = [dict(row) async for row in cursor]
+    assert len(relation_runs) == 1
+    assert relation_runs[0]["evidence_unit_id"].startswith("eu-doc-")
+    assert relation_runs[0]["lifecycle_action"] == LifecycleAction.CREATE_MEMORY.value
+    evidence_unit = await db.get_evidence_unit(relation_runs[0]["evidence_unit_id"])
+    assert evidence_unit is not None
+    assert evidence_unit.source_type == "manual"
+    assert evidence_unit.doc_id == "doc1"
+    assert evidence_unit.repo_identifier == "github.com/shno-labs/mem-forge"
+    relations = await db.get_evidence_relations(evidence_unit.id)
+    assert [(relation.memory_id, relation.relation_type) for relation in relations] == [
+        (rows[0].id, RelationType.SUPPORTS)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_process_memories_does_not_rematerialize_superseded_evidence_unit(db, monkeypatch):
+    collection = RecordingCollection()
+    adapters = build_sqlite_adapters(db, collection)
+    store = MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+    )
+
+    async def fake_embed(text: str):
+        return [0.1]
+
+    monkeypatch.setattr(store, "_embed", fake_embed)
+    await _document(db, "doc1")
+
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+    )
+    raw = RawMemory(content="deploy via ArgoCD", memory_type="fact")
+    first = await engine.process_memories(doc_id="doc1", raw_memories=[raw], source_type="manual")
+    [old_memory] = await db.get_memories_by_source_doc("doc1")
+    now = datetime.now(timezone.utc)
+    replacement = Memory(
+        id="mem-replacement",
+        memory_type="fact",
+        content="deploy via ArgoCD with promotion gates",
+        content_hash=content_hash("deploy via ArgoCD with promotion gates"),
+        tags=[],
+        confidence=0.9,
+        created_at=now,
+        updated_at=now,
+    )
+    await db.supersede_memory(
+        old_memory.id,
+        replacement,
+        replacement_reason="newer source",
+        replacement_kind="revision",
+    )
+
+    second = await engine.process_memories(doc_id="doc1", raw_memories=[raw], source_type="manual")
+    async with db.db.execute("SELECT evidence_unit_id FROM relation_runs ORDER BY id LIMIT 1") as cursor:
+        row = await cursor.fetchone()
+
+    assert first["inserted"] == 1
+    assert second["skipped"] == 1
+    assert row is not None
+    assert await db.has_materialized_evidence_unit(row["evidence_unit_id"]) is True

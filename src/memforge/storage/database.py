@@ -12,6 +12,7 @@ import json
 import logging
 import sqlite3
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -39,6 +40,24 @@ from memforge.models import (
     Visibility,
     canonicalize_entity_name,
 )
+from memforge.memory.evidence import (
+    AuthorityCase,
+    CandidateBucket,
+    CandidateMemory,
+    CandidatePage,
+    EvidenceContentProvenance,
+    EvidenceRelationRecord,
+    EvidenceUnit,
+    LifecycleAction,
+    RelationCandidateRecord,
+    RelationOutcomeBundle,
+    RelationRunRecord,
+    RelationType,
+    ReviewCase,
+    evidence_relation_retry_identity,
+    relation_bundle_snapshot_audit,
+    relation_candidate_retry_identity,
+)
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
 from memforge.retrieval.access_predicate import visible_sql
@@ -62,12 +81,114 @@ AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED = "knowledge_patched"
 AGENT_SESSION_OUTCOME_LEGACY_PACKAGE_CREATED = "package_created"
 AGENT_SESSION_OUTCOME_NO_OUTPUT = "no_output"
 AGENT_SESSION_OUTCOME_FAILED = "failed"
+
+
+def _with_relation_snapshot_audit(bundle: RelationOutcomeBundle) -> RelationOutcomeBundle:
+    """Return a bundle whose relation-run audit contains the canonical snapshot hashes."""
+    snapshot_audit = relation_bundle_snapshot_audit(candidates=bundle.candidates, relations=bundle.relations)
+    audit = dict(bundle.relation_run.audit)
+    for key, value in snapshot_audit.items():
+        existing = audit.get(key)
+        if existing is not None and existing != value:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{bundle.relation_run.id}: supplied audit does not match relation snapshot ({key})"
+            )
+        audit[key] = value
+    return replace(bundle, relation_run=replace(bundle.relation_run, audit=audit))
+
+
+def _with_empty_relation_snapshot_audit(run: RelationRunRecord) -> RelationRunRecord:
+    """Return a standalone relation run with the canonical empty snapshot audit."""
+    audit = dict(run.audit)
+    for key, value in relation_bundle_snapshot_audit(candidates=(), relations=()).items():
+        existing = audit.get(key)
+        if existing is not None and existing != value:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{run.id}: supplied audit does not match empty relation snapshot ({key})"
+            )
+        audit[key] = value
+    return replace(run, audit=audit)
+
+
 AGENT_SESSION_OUTCOMES = (
     AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED,
     AGENT_SESSION_OUTCOME_NO_OUTPUT,
     AGENT_SESSION_OUTCOME_FAILED,
 )
 AGENT_SESSION_WINDOW_SOURCE_KIND = "generated_agent_window_summary"
+_PERSISTED_RELATION_TYPES = {
+    RelationType.SUPPORTS,
+    RelationType.EQUIVALENT,
+    RelationType.REFINES,
+    RelationType.CONTRADICTS,
+}
+_RELATION_SNAPSHOT_AUDIT_KEYS = frozenset(
+    {
+        "candidate_snapshot_hash",
+        "relation_snapshot_hash",
+    }
+)
+
+
+def _validate_persisted_evidence_relation(relation: EvidenceRelationRecord) -> None:
+    if relation.relation_type not in _PERSISTED_RELATION_TYPES:
+        raise ValueError(f"relation_type {relation.relation_type.value!r} is not a persisted evidence relation")
+
+
+def _relation_result_memory_id(run: RelationRunRecord) -> str | None:
+    value = run.result_memory_id
+    return value if isinstance(value, str) and value else None
+
+
+def _relation_run_value(row: Mapping[str, Any], key: str) -> Any:
+    return row[key]
+
+
+def _relation_run_user_audit(audit: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in audit.items() if key not in _RELATION_SNAPSHOT_AUDIT_KEYS}
+
+
+def _assert_relation_run_retry_matches(row: Mapping[str, Any], run: RelationRunRecord) -> None:
+    lifecycle_action = run.lifecycle_action.value if run.lifecycle_action is not None else None
+    review_case = run.review_case.value if run.review_case is not None else None
+    expected = {
+        "evidence_unit_id": run.evidence_unit_id,
+        "access_context_hash": run.access_context_hash,
+        "candidate_count": run.candidate_count,
+        "mandatory_candidate_count": run.mandatory_candidate_count,
+        "checked_candidate_count": run.checked_candidate_count,
+        "incomplete_mandatory_buckets_json": json.dumps(list(run.incomplete_mandatory_buckets), sort_keys=True),
+        "classifier_version": run.classifier_version,
+        "lifecycle_action": lifecycle_action,
+        "review_case": review_case,
+        "status": run.status,
+        "result_memory_id": _relation_result_memory_id(run),
+    }
+    mismatches = [
+        key
+        for key, value in expected.items()
+        if _relation_run_value(row, key) != value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "relation_run_id collision for "
+            f"{run.id}: existing run does not match retry payload ({', '.join(mismatches)})"
+        )
+    existing_audit = json.loads(row["audit_json"] or "{}")
+    if _relation_run_user_audit(existing_audit) != _relation_run_user_audit(dict(run.audit)):
+        raise RuntimeError(
+            "relation_run_id collision for "
+            f"{run.id}: existing run does not match retry payload (audit_json)"
+        )
+    for key in _RELATION_SNAPSHOT_AUDIT_KEYS:
+        if key not in existing_audit:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{run.id}: committed audit is missing {key}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -101,8 +222,7 @@ def _source_schedule_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "enabled": bool(row.get("sync_schedule_enabled")),
         "interval_minutes": int(
-            row.get("sync_schedule_interval_minutes")
-            or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+            row.get("sync_schedule_interval_minutes") or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
         ),
         "next_run_at": row.get("sync_schedule_next_at"),
         "updated_at": row.get("sync_schedule_updated_at"),
@@ -115,9 +235,7 @@ _VALID_VISIBILITIES = frozenset({Visibility.WORKSPACE.value, Visibility.PRIVATE.
 def _validate_visibility(visibility: str, owner_user_id: str | None) -> None:
     """Enforce the owner/visibility invariant before any memory write."""
     if visibility not in _VALID_VISIBILITIES:
-        raise ValueError(
-            f"visibility must be one of {sorted(_VALID_VISIBILITIES)}, got {visibility!r}"
-        )
+        raise ValueError(f"visibility must be one of {sorted(_VALID_VISIBILITIES)}, got {visibility!r}")
     if (visibility == Visibility.PRIVATE.value) != (owner_user_id is not None):
         raise ValueError(
             "owner_user_id must be set iff visibility is private "
@@ -161,12 +279,7 @@ def _admin_fts_query(value: str) -> str:
 
 
 def _admin_like_pattern(value: str) -> str:
-    escaped = (
-        value.strip()
-        .replace("\\", "\\\\")
-        .replace("%", "\\%")
-        .replace("_", "\\_")
-    )
+    escaped = value.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
 
 
@@ -181,15 +294,13 @@ def _enabled_source_visibility_condition(
             NOT EXISTS (
                 SELECT 1
                 FROM memory_sources ms_any
-                JOIN documents d_any ON ms_any.doc_id = d_any.doc_id
                 WHERE ms_any.memory_id = m.id
             )
             OR EXISTS (
                 SELECT 1
                 FROM memory_sources ms_enabled
-                JOIN documents d_enabled ON ms_enabled.doc_id = d_enabled.doc_id
                 WHERE ms_enabled.memory_id = m.id
-                  AND d_enabled.source NOT IN ({placeholders})
+                  AND (ms_enabled.source_id IS NULL OR ms_enabled.source_id NOT IN ({placeholders}))
             )
         )""",
         list(disabled_source_ids),
@@ -316,6 +427,7 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE TABLE IF NOT EXISTS memory_sources (
     memory_id   TEXT NOT NULL REFERENCES memories(id),
     doc_id      TEXT NOT NULL REFERENCES documents(doc_id),
+    source_id   TEXT,
     source_type TEXT NOT NULL,
     excerpt     TEXT,
     support_kind TEXT NOT NULL DEFAULT 'extracted',
@@ -344,6 +456,102 @@ CREATE TABLE IF NOT EXISTS memory_curation_runs (
     error                TEXT,
     started_at           TEXT NOT NULL,
     completed_at         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS evidence_units (
+    id                   TEXT PRIMARY KEY,
+    source_id            TEXT NOT NULL,
+    doc_id               TEXT,
+    doc_revision_id      TEXT,
+    source_type          TEXT NOT NULL,
+    client               TEXT,
+    repo_identifier      TEXT,
+    source_anchor        TEXT,
+    source_lineage_id    TEXT,
+    source_metadata_json TEXT NOT NULL DEFAULT '{}',
+    project_key          TEXT,
+    visibility           TEXT NOT NULL DEFAULT 'workspace',
+    owner_user_id        TEXT,
+    observed_at          TEXT,
+    extractor_run_id     TEXT,
+    access_context_hash  TEXT,
+    content              TEXT NOT NULL,
+    excerpt              TEXT,
+    evidence_provenance  TEXT NOT NULL,
+    created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK (visibility IN ('private','workspace')),
+    CHECK ((visibility = 'private') = (owner_user_id IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS evidence_relations (
+    evidence_unit_id        TEXT NOT NULL REFERENCES evidence_units(id),
+    memory_id               TEXT NOT NULL REFERENCES memories(id),
+    relation_type           TEXT NOT NULL,
+    authority_case          TEXT NOT NULL,
+    is_authoritative_support INTEGER NOT NULL DEFAULT 0,
+    source_lineage_id       TEXT,
+    confidence              REAL,
+    reason                  TEXT,
+    proposed_memory_content TEXT,
+    excerpt                 TEXT,
+    classifier_version      TEXT NOT NULL,
+    relation_run_id         TEXT NOT NULL,
+    created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (evidence_unit_id, memory_id),
+    CHECK (relation_type IN ('supports','equivalent','refines','contradicts'))
+);
+
+CREATE TABLE IF NOT EXISTS relation_runs (
+    id                                TEXT PRIMARY KEY,
+    evidence_unit_id                  TEXT NOT NULL REFERENCES evidence_units(id),
+    access_context_hash               TEXT,
+    candidate_count                   INTEGER NOT NULL DEFAULT 0,
+    mandatory_candidate_count         INTEGER NOT NULL DEFAULT 0,
+    checked_candidate_count           INTEGER NOT NULL DEFAULT 0,
+    incomplete_mandatory_buckets_json TEXT NOT NULL DEFAULT '[]',
+    classifier_version                TEXT,
+    lifecycle_action                  TEXT,
+    review_case                       TEXT,
+    status                            TEXT NOT NULL,
+    result_memory_id                  TEXT,
+    audit_json                        TEXT NOT NULL DEFAULT '{}',
+    started_at                        TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at                      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS relation_run_relations (
+    relation_run_id         TEXT NOT NULL REFERENCES relation_runs(id),
+    evidence_unit_id        TEXT NOT NULL REFERENCES evidence_units(id),
+    memory_id               TEXT NOT NULL REFERENCES memories(id),
+    relation_type           TEXT NOT NULL,
+    authority_case          TEXT NOT NULL,
+    is_authoritative_support INTEGER NOT NULL DEFAULT 0,
+    source_lineage_id       TEXT,
+    confidence              REAL,
+    reason                  TEXT,
+    proposed_memory_content TEXT,
+    excerpt                 TEXT,
+    classifier_version      TEXT NOT NULL,
+    created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (relation_run_id, evidence_unit_id, memory_id),
+    CHECK (relation_type IN ('supports','equivalent','refines','contradicts'))
+);
+
+CREATE TABLE IF NOT EXISTS relation_candidates (
+    relation_run_id TEXT NOT NULL REFERENCES relation_runs(id),
+    evidence_unit_id TEXT NOT NULL REFERENCES evidence_units(id),
+    memory_id       TEXT NOT NULL REFERENCES memories(id),
+    bucket          TEXT NOT NULL,
+    bucket_rank     INTEGER NOT NULL,
+    candidate_rank  INTEGER NOT NULL,
+    score           REAL,
+    is_mandatory    INTEGER NOT NULL DEFAULT 0,
+    bucket_complete INTEGER NOT NULL DEFAULT 0,
+    was_checked     INTEGER NOT NULL DEFAULT 0,
+    reason          TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (relation_run_id, bucket, memory_id)
 );
 
 CREATE TABLE IF NOT EXISTS memory_entities (
@@ -599,6 +807,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_hook_receipts_hook ON agent_hook_receipts(h
 CREATE INDEX IF NOT EXISTS idx_agent_concepts_owner_repo ON agent_concepts(owner_user_id, repo_identifier);
 CREATE INDEX IF NOT EXISTS idx_agent_claims_concept ON agent_claims(concept_id);
 CREATE INDEX IF NOT EXISTS idx_agent_claims_memory ON agent_claims(memory_id);
+CREATE INDEX IF NOT EXISTS idx_relation_runs_result_memory ON relation_runs(result_memory_id);
 
 -- Cross-document contradiction tracking
 CREATE TABLE IF NOT EXISTS memory_contradictions (
@@ -692,13 +901,20 @@ CREATE INDEX IF NOT EXISTS idx_memory_audit_type ON memory_audit_events(event_ty
 # ---------------------------------------------------------------------------
 
 MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
-    (1, "Add tags column to entities, deprecate entity_type", [
-        "ALTER TABLE entities ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'",
-        "UPDATE entities SET tags = json_array(entity_type) WHERE tags = '[]'",
-        "DROP INDEX IF EXISTS idx_entities_type",
-    ]),
-    (2, "Add memory_contradictions table", [
-        """CREATE TABLE IF NOT EXISTS memory_contradictions (
+    (
+        1,
+        "Add tags column to entities, deprecate entity_type",
+        [
+            "ALTER TABLE entities ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'",
+            "UPDATE entities SET tags = json_array(entity_type) WHERE tags = '[]'",
+            "DROP INDEX IF EXISTS idx_entities_type",
+        ],
+    ),
+    (
+        2,
+        "Add memory_contradictions table",
+        [
+            """CREATE TABLE IF NOT EXISTS memory_contradictions (
             memory_id_a TEXT NOT NULL REFERENCES memories(id),
             memory_id_b TEXT NOT NULL REFERENCES memories(id),
             classification TEXT NOT NULL,
@@ -708,16 +924,24 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             reason TEXT,
             PRIMARY KEY (memory_id_a, memory_id_b)
         )""",
-    ]),
-    (3, "Add lean memory lifecycle metadata", [
-        "ALTER TABLE memories ADD COLUMN retirement_reason TEXT",
-        "ALTER TABLE memories ADD COLUMN retired_at TEXT",
-        "ALTER TABLE memories ADD COLUMN superseded_at TEXT",
-        "ALTER TABLE memories ADD COLUMN replacement_reason TEXT",
-        "UPDATE memories SET status = 'retired' WHERE status = 'decayed'",
-    ]),
-    (4, "Add agent session receipt lineage", [
-        """CREATE TABLE IF NOT EXISTS agent_session_receipts (
+        ],
+    ),
+    (
+        3,
+        "Add lean memory lifecycle metadata",
+        [
+            "ALTER TABLE memories ADD COLUMN retirement_reason TEXT",
+            "ALTER TABLE memories ADD COLUMN retired_at TEXT",
+            "ALTER TABLE memories ADD COLUMN superseded_at TEXT",
+            "ALTER TABLE memories ADD COLUMN replacement_reason TEXT",
+            "UPDATE memories SET status = 'retired' WHERE status = 'decayed'",
+        ],
+    ),
+    (
+        4,
+        "Add agent session receipt lineage",
+        [
+            """CREATE TABLE IF NOT EXISTS agent_session_receipts (
             doc_id TEXT PRIMARY KEY,
             source_id TEXT NOT NULL,
             client TEXT NOT NULL,
@@ -737,11 +961,15 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             metadata TEXT NOT NULL DEFAULT '{}',
             updated_at TEXT NOT NULL
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_agent_session_receipts_session ON agent_session_receipts(session_id)",
-        "CREATE INDEX IF NOT EXISTS idx_agent_session_receipts_source ON agent_session_receipts(source_id)",
-    ]),
-    (5, "Add memory_reviews table for human-gated lifecycle decisions", [
-        """CREATE TABLE IF NOT EXISTS memory_reviews (
+            "CREATE INDEX IF NOT EXISTS idx_agent_session_receipts_session ON agent_session_receipts(session_id)",
+            "CREATE INDEX IF NOT EXISTS idx_agent_session_receipts_source ON agent_session_receipts(source_id)",
+        ],
+    ),
+    (
+        5,
+        "Add memory_reviews table for human-gated lifecycle decisions",
+        [
+            """CREATE TABLE IF NOT EXISTS memory_reviews (
             id                              TEXT PRIMARY KEY,
             kind                            TEXT NOT NULL,
             status                          TEXT NOT NULL,
@@ -755,16 +983,24 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             created_at                      TEXT NOT NULL,
             resolved_at                     TEXT
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_memory_reviews_status ON memory_reviews(status)",
-        "CREATE INDEX IF NOT EXISTS idx_memory_reviews_incumbent ON memory_reviews(incumbent_memory_id)",
-        "CREATE INDEX IF NOT EXISTS idx_memory_reviews_challenger ON memory_reviews(challenger_memory_id)",
-    ]),
-    (6, "Add provenance support ownership kind", [
-        "ALTER TABLE memory_sources ADD COLUMN support_kind TEXT NOT NULL DEFAULT 'extracted'",
-        "CREATE INDEX IF NOT EXISTS idx_memory_sources_doc_kind ON memory_sources(doc_id, support_kind)",
-    ]),
-    (7, "Add memory audit event ledger", [
-        """CREATE TABLE IF NOT EXISTS memory_audit_events (
+            "CREATE INDEX IF NOT EXISTS idx_memory_reviews_status ON memory_reviews(status)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_reviews_incumbent ON memory_reviews(incumbent_memory_id)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_reviews_challenger ON memory_reviews(challenger_memory_id)",
+        ],
+    ),
+    (
+        6,
+        "Add provenance support ownership kind",
+        [
+            "ALTER TABLE memory_sources ADD COLUMN support_kind TEXT NOT NULL DEFAULT 'extracted'",
+            "CREATE INDEX IF NOT EXISTS idx_memory_sources_doc_kind ON memory_sources(doc_id, support_kind)",
+        ],
+    ),
+    (
+        7,
+        "Add memory audit event ledger",
+        [
+            """CREATE TABLE IF NOT EXISTS memory_audit_events (
             event_id          TEXT PRIMARY KEY,
             operation_id      TEXT NOT NULL,
             parent_event_id   TEXT,
@@ -794,13 +1030,17 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             payload           TEXT NOT NULL DEFAULT '{}',
             error             TEXT
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_memory_audit_operation ON memory_audit_events(operation_id)",
-        "CREATE INDEX IF NOT EXISTS idx_memory_audit_memory ON memory_audit_events(memory_id)",
-        "CREATE INDEX IF NOT EXISTS idx_memory_audit_doc ON memory_audit_events(doc_id)",
-        "CREATE INDEX IF NOT EXISTS idx_memory_audit_type ON memory_audit_events(event_type)",
-    ]),
-    (8, "Add shared auth sessions", [
-        """CREATE TABLE IF NOT EXISTS auth_sessions (
+            "CREATE INDEX IF NOT EXISTS idx_memory_audit_operation ON memory_audit_events(operation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_audit_memory ON memory_audit_events(memory_id)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_audit_doc ON memory_audit_events(doc_id)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_audit_type ON memory_audit_events(event_type)",
+        ],
+    ),
+    (
+        8,
+        "Add shared auth sessions",
+        [
+            """CREATE TABLE IF NOT EXISTS auth_sessions (
             provider            TEXT NOT NULL,
             origin              TEXT NOT NULL,
             secret_encrypted    TEXT NOT NULL,
@@ -815,10 +1055,14 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             updated_at          TEXT NOT NULL,
             PRIMARY KEY (provider, origin)
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_auth_sessions_status ON auth_sessions(status)",
-    ]),
-    (9, "Add agent hook lifecycle receipts", [
-        """CREATE TABLE IF NOT EXISTS agent_hook_receipts (
+            "CREATE INDEX IF NOT EXISTS idx_auth_sessions_status ON auth_sessions(status)",
+        ],
+    ),
+    (
+        9,
+        "Add agent hook lifecycle receipts",
+        [
+            """CREATE TABLE IF NOT EXISTS agent_hook_receipts (
             receipt_id TEXT PRIMARY KEY,
             client TEXT NOT NULL,
             session_id TEXT NOT NULL,
@@ -831,11 +1075,15 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             metadata TEXT NOT NULL DEFAULT '{}',
             updated_at TEXT NOT NULL
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_agent_hook_receipts_session ON agent_hook_receipts(session_id)",
-        "CREATE INDEX IF NOT EXISTS idx_agent_hook_receipts_hook ON agent_hook_receipts(hook)",
-    ]),
-    (10, "Add related challengers for grouped review cases", [
-        """CREATE TABLE IF NOT EXISTS memory_review_related_challengers (
+            "CREATE INDEX IF NOT EXISTS idx_agent_hook_receipts_session ON agent_hook_receipts(session_id)",
+            "CREATE INDEX IF NOT EXISTS idx_agent_hook_receipts_hook ON agent_hook_receipts(hook)",
+        ],
+    ),
+    (
+        10,
+        "Add related challengers for grouped review cases",
+        [
+            """CREATE TABLE IF NOT EXISTS memory_review_related_challengers (
             review_id              TEXT NOT NULL REFERENCES memory_reviews(id),
             challenger_memory_id   TEXT NOT NULL REFERENCES memories(id),
             reason                 TEXT,
@@ -843,23 +1091,31 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             PRIMARY KEY (review_id, challenger_memory_id),
             UNIQUE (challenger_memory_id)
         )""",
-        """CREATE INDEX IF NOT EXISTS idx_memory_review_related_review
+            """CREATE INDEX IF NOT EXISTS idx_memory_review_related_review
            ON memory_review_related_challengers(review_id)""",
-    ]),
-    (11, "Add client column and index to documents table", [
-        "ALTER TABLE documents ADD COLUMN client TEXT",
-        "CREATE INDEX IF NOT EXISTS idx_documents_source_client ON documents(source, client)",
-    ]),
-    (12, "Split singleton agent-session source into per-client sources", [
-        # For each known client that has documents under the singleton source,
-        # upsert its per-client source row and re-point those documents to it.
-        # Documents whose client value is not a recognised slug are left under
-        # the singleton so no data is lost. The singleton row itself is removed
-        # only when it has zero documents remaining.
-        #
-        # Step 1: populate documents.client from agent_session_receipts for rows
-        # that are still under the singleton and do not yet have a client value.
-        """UPDATE documents
+        ],
+    ),
+    (
+        11,
+        "Add client column and index to documents table",
+        [
+            "ALTER TABLE documents ADD COLUMN client TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_documents_source_client ON documents(source, client)",
+        ],
+    ),
+    (
+        12,
+        "Split singleton agent-session source into per-client sources",
+        [
+            # For each known client that has documents under the singleton source,
+            # upsert its per-client source row and re-point those documents to it.
+            # Documents whose client value is not a recognised slug are left under
+            # the singleton so no data is lost. The singleton row itself is removed
+            # only when it has zero documents remaining.
+            #
+            # Step 1: populate documents.client from agent_session_receipts for rows
+            # that are still under the singleton and do not yet have a client value.
+            """UPDATE documents
            SET client = (
                SELECT asr.client
                FROM agent_session_receipts asr
@@ -868,8 +1124,8 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
            )
            WHERE documents.source = 'src-agent-sessions'
              AND documents.client IS NULL""",
-        # Step 2: upsert the codex per-client source (idempotent).
-        """INSERT INTO sources (id, type, name, config)
+            # Step 2: upsert the codex per-client source (idempotent).
+            """INSERT INTO sources (id, type, name, config)
            SELECT
                'src-agent-sessions-codex',
                'agent_session',
@@ -879,8 +1135,8 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                SELECT 1 FROM sources WHERE id = 'src-agent-sessions'
            )
            ON CONFLICT(id) DO NOTHING""",
-        # Step 3: upsert the claude-code per-client source (idempotent).
-        """INSERT INTO sources (id, type, name, config)
+            # Step 3: upsert the claude-code per-client source (idempotent).
+            """INSERT INTO sources (id, type, name, config)
            SELECT
                'src-agent-sessions-claude-code',
                'agent_session',
@@ -890,35 +1146,39 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                SELECT 1 FROM sources WHERE id = 'src-agent-sessions'
            )
            ON CONFLICT(id) DO NOTHING""",
-        # Step 4: re-point codex documents to the codex source.
-        """UPDATE documents
+            # Step 4: re-point codex documents to the codex source.
+            """UPDATE documents
            SET source = 'src-agent-sessions-codex'
            WHERE source = 'src-agent-sessions'
              AND client = 'codex'""",
-        # Step 5: re-point claude-code documents to the claude-code source.
-        """UPDATE documents
+            # Step 5: re-point claude-code documents to the claude-code source.
+            """UPDATE documents
            SET source = 'src-agent-sessions-claude-code'
            WHERE source = 'src-agent-sessions'
              AND client = 'claude-code'""",
-        # Step 6: remove the singleton source only when it has no remaining
-        # documents (clients other than the two known ones stay attached to it).
-        """DELETE FROM sources
+            # Step 6: remove the singleton source only when it has no remaining
+            # documents (clients other than the two known ones stay attached to it).
+            """DELETE FROM sources
            WHERE id = 'src-agent-sessions'
              AND NOT EXISTS (
                  SELECT 1 FROM documents WHERE source = 'src-agent-sessions'
              )""",
-    ]),
-    (13, "Rename agent-session sources to drop 'Summaries' and re-split any singleton remnants", [
-        # The display name was tightened from 'X Session Summaries' to 'X Session'.
-        # This migration also re-runs the singleton split because a server running
-        # the pre-split code path could recreate src-agent-sessions and write
-        # new documents to it before being restarted; the SQL below is identical
-        # to migration 12 and idempotent on a fully-split database.
-        """UPDATE sources SET name = 'Codex Session'
+        ],
+    ),
+    (
+        13,
+        "Rename agent-session sources to drop 'Summaries' and re-split any singleton remnants",
+        [
+            # The display name was tightened from 'X Session Summaries' to 'X Session'.
+            # This migration also re-runs the singleton split because a server running
+            # the pre-split code path could recreate src-agent-sessions and write
+            # new documents to it before being restarted; the SQL below is identical
+            # to migration 12 and idempotent on a fully-split database.
+            """UPDATE sources SET name = 'Codex Session'
            WHERE id = 'src-agent-sessions-codex'""",
-        """UPDATE sources SET name = 'Claude Code Session'
+            """UPDATE sources SET name = 'Claude Code Session'
            WHERE id = 'src-agent-sessions-claude-code'""",
-        """UPDATE documents
+            """UPDATE documents
            SET client = (
                SELECT asr.client
                FROM agent_session_receipts asr
@@ -927,7 +1187,7 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
            )
            WHERE documents.source = 'src-agent-sessions'
              AND documents.client IS NULL""",
-        """INSERT INTO sources (id, type, name, config)
+            """INSERT INTO sources (id, type, name, config)
            SELECT
                'src-agent-sessions-codex',
                'agent_session',
@@ -937,7 +1197,7 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                SELECT 1 FROM sources WHERE id = 'src-agent-sessions'
            )
            ON CONFLICT(id) DO NOTHING""",
-        """INSERT INTO sources (id, type, name, config)
+            """INSERT INTO sources (id, type, name, config)
            SELECT
                'src-agent-sessions-claude-code',
                'agent_session',
@@ -947,76 +1207,97 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                SELECT 1 FROM sources WHERE id = 'src-agent-sessions'
            )
            ON CONFLICT(id) DO NOTHING""",
-        """UPDATE documents
+            """UPDATE documents
            SET source = 'src-agent-sessions-codex'
            WHERE source = 'src-agent-sessions'
              AND client = 'codex'""",
-        """UPDATE documents
+            """UPDATE documents
            SET source = 'src-agent-sessions-claude-code'
            WHERE source = 'src-agent-sessions'
              AND client = 'claude-code'""",
-        """DELETE FROM sources
+            """DELETE FROM sources
            WHERE id = 'src-agent-sessions'
              AND NOT EXISTS (
                  SELECT 1 FROM documents WHERE source = 'src-agent-sessions'
              )""",
-    ]),
-    (14, "Add visibility and owner columns to memories", [
-        "ALTER TABLE memories ADD COLUMN visibility TEXT NOT NULL DEFAULT 'workspace'",
-        "ALTER TABLE memories ADD COLUMN owner_user_id TEXT",
-        "CREATE INDEX IF NOT EXISTS idx_memories_access ON memories(status, visibility)",
-        "CREATE INDEX IF NOT EXISTS idx_memories_owner ON memories(owner_user_id)",
-        "DROP INDEX IF EXISTS idx_memories_scope",
-    ]),
-    (15, "Backfill visibility and project_key from legacy scope", [
-        "UPDATE memories SET visibility = 'workspace' WHERE visibility IS NULL OR visibility = ''",
-        "UPDATE memories SET owner_user_id = NULL WHERE visibility = 'workspace'",
-        "UPDATE memories SET project_key = substr(scope, 9) "
-        "WHERE project_key IS NULL AND scope LIKE 'project:%'",
-        "UPDATE memories SET project_key = 'SHARED' "
-        "WHERE project_key IS NULL AND scope = 'team'",
-        "UPDATE memories SET project_key = 'UNSORTED' WHERE project_key IS NULL",
-    ]),
-    (16, "Backfill NULL project_key to UNSORTED and add the projects stub table", [
-        # The CREATE TABLE matches SCHEMA above; running it in a migration covers
-        # any database that already passed connect() before SCHEMA carried it.
-        "CREATE TABLE IF NOT EXISTS projects (project_key TEXT PRIMARY KEY)",
-        f"UPDATE memories SET project_key = '{UNSORTED_PROJECT_KEY}' "
-        "WHERE project_key IS NULL",
-    ]),
-    (17, "Replace stub projects table with full schema and seed reserved rows", [
-        # Rebuild the stub table under the full schema in one step. The
-        # two reserved rows are seeded immediately so the resolver's
-        # `UNSORTED` default and the SHARED bucket are valid foreign-key
-        # targets the moment the migration completes.
-        "DROP TABLE IF EXISTS projects",
-        (
-            "CREATE TABLE projects ("
-            "    id            TEXT PRIMARY KEY,"
-            "    key           TEXT NOT NULL UNIQUE,"
-            "    name          TEXT NOT NULL,"
-            "    is_shared     INTEGER NOT NULL DEFAULT 0,"
-            "    created_at    TEXT NOT NULL DEFAULT (datetime('now'))"
-            ")"
-        ),
-        # Seed the two reserved rows. INSERT OR IGNORE keeps the migration
-        # idempotent against any future re-application.
-        (
-            "INSERT OR IGNORE INTO projects (id, key, name, is_shared) "
-            f"VALUES ('proj-shared',   '{SHARED_PROJECT_KEY}',   'Shared',   1)"
-        ),
-        (
-            "INSERT OR IGNORE INTO projects (id, key, name, is_shared) "
-            f"VALUES ('proj-unsorted', '{UNSORTED_PROJECT_KEY}', 'Unsorted', 0)"
-        ),
-        # The sources table gains project_binding. Legacy rows read NULL.
-        "ALTER TABLE sources ADD COLUMN project_binding TEXT",
-    ]),
-    (18, "Track source creator for shared source management", [
-        "ALTER TABLE sources ADD COLUMN created_by_user_id TEXT",
-    ]),
-    (19, "Track per-user source subscriptions", [
-        """CREATE TABLE IF NOT EXISTS source_subscriptions (
+        ],
+    ),
+    (
+        14,
+        "Add visibility and owner columns to memories",
+        [
+            "ALTER TABLE memories ADD COLUMN visibility TEXT NOT NULL DEFAULT 'workspace'",
+            "ALTER TABLE memories ADD COLUMN owner_user_id TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_memories_access ON memories(status, visibility)",
+            "CREATE INDEX IF NOT EXISTS idx_memories_owner ON memories(owner_user_id)",
+            "DROP INDEX IF EXISTS idx_memories_scope",
+        ],
+    ),
+    (
+        15,
+        "Backfill visibility and project_key from legacy scope",
+        [
+            "UPDATE memories SET visibility = 'workspace' WHERE visibility IS NULL OR visibility = ''",
+            "UPDATE memories SET owner_user_id = NULL WHERE visibility = 'workspace'",
+            "UPDATE memories SET project_key = substr(scope, 9) WHERE project_key IS NULL AND scope LIKE 'project:%'",
+            "UPDATE memories SET project_key = 'SHARED' WHERE project_key IS NULL AND scope = 'team'",
+            "UPDATE memories SET project_key = 'UNSORTED' WHERE project_key IS NULL",
+        ],
+    ),
+    (
+        16,
+        "Backfill NULL project_key to UNSORTED and add the projects stub table",
+        [
+            # The CREATE TABLE matches SCHEMA above; running it in a migration covers
+            # any database that already passed connect() before SCHEMA carried it.
+            "CREATE TABLE IF NOT EXISTS projects (project_key TEXT PRIMARY KEY)",
+            f"UPDATE memories SET project_key = '{UNSORTED_PROJECT_KEY}' WHERE project_key IS NULL",
+        ],
+    ),
+    (
+        17,
+        "Replace stub projects table with full schema and seed reserved rows",
+        [
+            # Rebuild the stub table under the full schema in one step. The
+            # two reserved rows are seeded immediately so the resolver's
+            # `UNSORTED` default and the SHARED bucket are valid foreign-key
+            # targets the moment the migration completes.
+            "DROP TABLE IF EXISTS projects",
+            (
+                "CREATE TABLE projects ("
+                "    id            TEXT PRIMARY KEY,"
+                "    key           TEXT NOT NULL UNIQUE,"
+                "    name          TEXT NOT NULL,"
+                "    is_shared     INTEGER NOT NULL DEFAULT 0,"
+                "    created_at    TEXT NOT NULL DEFAULT (datetime('now'))"
+                ")"
+            ),
+            # Seed the two reserved rows. INSERT OR IGNORE keeps the migration
+            # idempotent against any future re-application.
+            (
+                "INSERT OR IGNORE INTO projects (id, key, name, is_shared) "
+                f"VALUES ('proj-shared',   '{SHARED_PROJECT_KEY}',   'Shared',   1)"
+            ),
+            (
+                "INSERT OR IGNORE INTO projects (id, key, name, is_shared) "
+                f"VALUES ('proj-unsorted', '{UNSORTED_PROJECT_KEY}', 'Unsorted', 0)"
+            ),
+            # The sources table gains project_binding. Legacy rows read NULL.
+            "ALTER TABLE sources ADD COLUMN project_binding TEXT",
+        ],
+    ),
+    (
+        18,
+        "Track source creator for shared source management",
+        [
+            "ALTER TABLE sources ADD COLUMN created_by_user_id TEXT",
+        ],
+    ),
+    (
+        19,
+        "Track per-user source subscriptions",
+        [
+            """CREATE TABLE IF NOT EXISTS source_subscriptions (
             source_id   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
             user_id     TEXT NOT NULL,
             enabled     INTEGER NOT NULL DEFAULT 1,
@@ -1024,27 +1305,35 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (source_id, user_id)
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_source_subscriptions_user ON source_subscriptions(user_id)",
-    ]),
-    (20, "Add per-source sync schedules", [
-        "ALTER TABLE sources ADD COLUMN sync_schedule_enabled INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE sources ADD COLUMN sync_schedule_interval_minutes INTEGER NOT NULL DEFAULT 1440",
-        "ALTER TABLE sources ADD COLUMN sync_schedule_next_at TEXT",
-        "ALTER TABLE sources ADD COLUMN sync_schedule_updated_at TEXT",
-        "CREATE INDEX IF NOT EXISTS idx_sources_sync_schedule_due ON sources(sync_schedule_enabled, sync_schedule_next_at)",
-    ]),
-    (21, "Add memory curation lineage metadata", [
-        "ALTER TABLE memories ADD COLUMN repo_identifier TEXT",
-        "ALTER TABLE memories ADD COLUMN memory_level TEXT NOT NULL DEFAULT 'atomic'",
-        "ALTER TABLE memories ADD COLUMN curation_cluster_id TEXT",
-        """CREATE TABLE IF NOT EXISTS memory_derivations (
+            "CREATE INDEX IF NOT EXISTS idx_source_subscriptions_user ON source_subscriptions(user_id)",
+        ],
+    ),
+    (
+        20,
+        "Add per-source sync schedules",
+        [
+            "ALTER TABLE sources ADD COLUMN sync_schedule_enabled INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sources ADD COLUMN sync_schedule_interval_minutes INTEGER NOT NULL DEFAULT 1440",
+            "ALTER TABLE sources ADD COLUMN sync_schedule_next_at TEXT",
+            "ALTER TABLE sources ADD COLUMN sync_schedule_updated_at TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_sources_sync_schedule_due ON sources(sync_schedule_enabled, sync_schedule_next_at)",
+        ],
+    ),
+    (
+        21,
+        "Add memory curation lineage metadata",
+        [
+            "ALTER TABLE memories ADD COLUMN repo_identifier TEXT",
+            "ALTER TABLE memories ADD COLUMN memory_level TEXT NOT NULL DEFAULT 'atomic'",
+            "ALTER TABLE memories ADD COLUMN curation_cluster_id TEXT",
+            """CREATE TABLE IF NOT EXISTS memory_derivations (
             parent_memory_id TEXT NOT NULL REFERENCES memories(id),
             child_memory_id  TEXT NOT NULL REFERENCES memories(id),
             relation         TEXT NOT NULL DEFAULT 'summarizes',
             created_at       TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (parent_memory_id, child_memory_id, relation)
         )""",
-        """CREATE TABLE IF NOT EXISTS memory_curation_runs (
+            """CREATE TABLE IF NOT EXISTS memory_curation_runs (
             id                   TEXT PRIMARY KEY,
             policy_id            TEXT NOT NULL,
             source_type          TEXT NOT NULL,
@@ -1058,13 +1347,17 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             started_at           TEXT NOT NULL,
             completed_at         TEXT
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_memories_repo ON memories(repo_identifier)",
-        "CREATE INDEX IF NOT EXISTS idx_memories_curation_cluster ON memories(curation_cluster_id)",
-        "CREATE INDEX IF NOT EXISTS idx_memory_derivations_child ON memory_derivations(child_memory_id)",
-        "CREATE INDEX IF NOT EXISTS idx_memory_curation_runs_scope ON memory_curation_runs(source_type, client, repo_identifier, project_key)",
-    ]),
-    (22, "Add private agent knowledge bundle concept claims", [
-        """CREATE TABLE IF NOT EXISTS agent_concepts (
+            "CREATE INDEX IF NOT EXISTS idx_memories_repo ON memories(repo_identifier)",
+            "CREATE INDEX IF NOT EXISTS idx_memories_curation_cluster ON memories(curation_cluster_id)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_derivations_child ON memory_derivations(child_memory_id)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_curation_runs_scope ON memory_curation_runs(source_type, client, repo_identifier, project_key)",
+        ],
+    ),
+    (
+        22,
+        "Add private agent knowledge bundle concept claims",
+        [
+            """CREATE TABLE IF NOT EXISTS agent_concepts (
             id                  TEXT PRIMARY KEY,
             source_id           TEXT NOT NULL,
             owner_user_id       TEXT NOT NULL,
@@ -1081,7 +1374,7 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             last_observed_at    TEXT NOT NULL,
             CHECK (visibility = 'private')
         )""",
-        """CREATE TABLE IF NOT EXISTS agent_claims (
+            """CREATE TABLE IF NOT EXISTS agent_claims (
             id                  TEXT PRIMARY KEY,
             concept_id          TEXT NOT NULL REFERENCES agent_concepts(id),
             display_anchor      TEXT NOT NULL,
@@ -1094,20 +1387,58 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
             last_observed_at    TEXT NOT NULL
         )""",
-        """CREATE TABLE IF NOT EXISTS agent_claim_citations (
+            """CREATE TABLE IF NOT EXISTS agent_claim_citations (
             claim_id        TEXT NOT NULL REFERENCES agent_claims(id),
             citation_url    TEXT NOT NULL,
             observed_at     TEXT NOT NULL,
             created_at      TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (claim_id, citation_url)
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_agent_concepts_owner_repo ON agent_concepts(owner_user_id, repo_identifier)",
-        "CREATE INDEX IF NOT EXISTS idx_agent_claims_concept ON agent_claims(concept_id)",
-        "CREATE INDEX IF NOT EXISTS idx_agent_claims_memory ON agent_claims(memory_id)",
-    ]),
-    (23, "Add structured memory replacement kind", [
-        "ALTER TABLE memories ADD COLUMN replacement_kind TEXT",
-    ]),
+            "CREATE INDEX IF NOT EXISTS idx_agent_concepts_owner_repo ON agent_concepts(owner_user_id, repo_identifier)",
+            "CREATE INDEX IF NOT EXISTS idx_agent_claims_concept ON agent_claims(concept_id)",
+            "CREATE INDEX IF NOT EXISTS idx_agent_claims_memory ON agent_claims(memory_id)",
+        ],
+    ),
+    (
+        23,
+        "Add structured memory replacement kind",
+        [
+            "ALTER TABLE memories ADD COLUMN replacement_kind TEXT",
+        ],
+    ),
+    (
+        24,
+        "Persist source identity on memory provenance rows",
+        [
+            "ALTER TABLE memory_sources ADD COLUMN source_id TEXT",
+            """UPDATE memory_sources
+           SET source_id = (
+               SELECT documents.source
+               FROM documents
+               WHERE documents.doc_id = memory_sources.doc_id
+               LIMIT 1
+           )
+           WHERE source_id IS NULL""",
+            "CREATE INDEX IF NOT EXISTS idx_memory_sources_source ON memory_sources(source_id)",
+        ],
+    ),
+    (
+        25,
+        "Project materialized memory id on relation runs",
+        [
+            "ALTER TABLE relation_runs ADD COLUMN result_memory_id TEXT",
+            """UPDATE relation_runs
+           SET result_memory_id = json_extract(audit_json, '$.result_memory_id')
+           WHERE result_memory_id IS NULL
+             AND audit_json IS NOT NULL""",
+            "CREATE INDEX IF NOT EXISTS idx_relation_runs_result_memory ON relation_runs(result_memory_id)",
+        ],
+    ),
+    (
+        26,
+        "Backfill relation-run candidate and relation snapshot audit hashes",
+        [],
+    ),
 ]
 
 
@@ -1155,25 +1486,51 @@ class Database:
                     await self.db.execute(sql)
                 except Exception as e:
                     message = str(e).lower()
-                    legacy_scope_backfill = (
-                        version == 15
-                        and "no such column" in message
-                        and "scope" in sql.lower()
-                    )
+                    legacy_scope_backfill = version == 15 and "no such column" in message and "scope" in sql.lower()
                     if "duplicate column" in message or legacy_scope_backfill:
                         logger.debug(
                             "Migration %d: expected-absent column on this DB, skipping: %s",
-                            version, sql,
+                            version,
+                            sql,
                         )
                     else:
                         raise
+            if version == 26:
+                await self._backfill_relation_run_snapshot_audit()
             await self.db.execute(
-                "INSERT INTO schema_migrations (version, description, applied_at) "
-                "VALUES (?, ?, ?)",
+                "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, _now_iso()),
             )
             await self.db.commit()
             logger.info("Applied migration %d: %s", version, description)
+
+    async def _backfill_relation_run_snapshot_audit(self) -> None:
+        """Backfill immutable retry snapshot hashes for pre-hardening relation runs."""
+
+        async with self.db.execute("SELECT id, audit_json FROM relation_runs") as cursor:
+            rows = [row async for row in cursor]
+        for row in rows:
+            run_id = row["id"]
+            audit = json.loads(row["audit_json"] or "{}")
+            candidates = await self._get_relation_candidates_unlocked(run_id)
+            relations = await self._get_relation_run_relations_unlocked(run_id)
+            snapshot_audit = relation_bundle_snapshot_audit(candidates=candidates, relations=relations)
+            changed = False
+            for key, value in snapshot_audit.items():
+                existing = audit.get(key)
+                if existing is not None and existing != value:
+                    raise RuntimeError(
+                        "relation_run_id collision for "
+                        f"{run_id}: committed audit does not match stored relation snapshot ({key})"
+                    )
+                if existing is None:
+                    audit[key] = value
+                    changed = True
+            if changed:
+                await self.db.execute(
+                    "UPDATE relation_runs SET audit_json = ? WHERE id = ?",
+                    (json.dumps(audit, sort_keys=True), run_id),
+                )
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -1214,12 +1571,21 @@ class Database:
                     client=COALESCE(excluded.client, documents.client),
                     updated_at=excluded.updated_at""",
                 (
-                    doc.doc_id, doc.source, doc.source_url, doc.title,
-                    doc.space_or_project, doc.author,
+                    doc.doc_id,
+                    doc.source,
+                    doc.source_url,
+                    doc.title,
+                    doc.space_or_project,
+                    doc.author,
                     doc.last_modified.isoformat(),
-                    json.dumps(doc.labels), doc.version, doc.content_hash,
-                    doc.token_count, doc.raw_content_uri, doc.raw_content_type,
-                    doc.normalized_content_uri, doc.pdf_content_uri,
+                    json.dumps(doc.labels),
+                    doc.version,
+                    doc.content_hash,
+                    doc.token_count,
+                    doc.raw_content_uri,
+                    doc.raw_content_type,
+                    doc.normalized_content_uri,
+                    doc.pdf_content_uri,
                     doc.last_synced.isoformat(),
                     doc.client,
                     _now_iso(),
@@ -1228,9 +1594,7 @@ class Database:
             await self.db.commit()
 
     async def get_document(self, doc_id: str) -> DocumentRecord | None:
-        async with self.db.execute(
-            "SELECT * FROM documents WHERE doc_id = ?", (doc_id,)
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,)) as cursor:
             row = await cursor.fetchone()
             if not row:
                 return None
@@ -1261,12 +1625,21 @@ class Database:
                     created_at=COALESCE(excluded.created_at, documents.created_at),
                     updated_at=excluded.updated_at""",
                 (
-                    doc.doc_id, doc.source, doc.source_url, doc.title,
-                    doc.space_or_project, doc.author,
-                    doc.last_modified.isoformat(), json.dumps(doc.labels),
-                    doc.version, doc.content_hash, doc.token_count,
-                    doc.raw_content_uri, doc.raw_content_type,
-                    doc.normalized_content_uri, doc.pdf_content_uri,
+                    doc.doc_id,
+                    doc.source,
+                    doc.source_url,
+                    doc.title,
+                    doc.space_or_project,
+                    doc.author,
+                    doc.last_modified.isoformat(),
+                    json.dumps(doc.labels),
+                    doc.version,
+                    doc.content_hash,
+                    doc.token_count,
+                    doc.raw_content_uri,
+                    doc.raw_content_type,
+                    doc.normalized_content_uri,
+                    doc.pdf_content_uri,
                     doc.last_synced.isoformat(),
                     doc.client,
                     doc.created_at.isoformat() if doc.created_at else None,
@@ -1369,9 +1742,7 @@ class Database:
             await self.db.commit()
 
     async def get_content_hash(self, doc_id: str) -> str | None:
-        async with self.db.execute(
-            "SELECT content_hash FROM documents WHERE doc_id = ?", (doc_id,)
-        ) as cursor:
+        async with self.db.execute("SELECT content_hash FROM documents WHERE doc_id = ?", (doc_id,)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else None
 
@@ -1428,26 +1799,17 @@ class Database:
                     async for row in cursor:
                         memory_ids.append(row[0])
 
-                await self.db.execute(
-                    "DELETE FROM memory_sources WHERE doc_id = ?", (doc_id,)
-                )
+                await self.db.execute("DELETE FROM memory_sources WHERE doc_id = ?", (doc_id,))
+                await self._delete_evidence_graph_for_doc_ids_unlocked([doc_id])
                 retired_ids = await self._refresh_support_after_source_removal_unlocked(memory_ids)
-                await self.db.execute(
-                    "DELETE FROM document_metadata WHERE doc_id = ?", (doc_id,)
-                )
+                await self.db.execute("DELETE FROM document_metadata WHERE doc_id = ?", (doc_id,))
                 await self.db.execute(
                     "DELETE FROM document_relationships WHERE source_doc_id = ? OR target_doc_id = ?",
                     (doc_id, doc_id),
                 )
-                await self.db.execute(
-                    "DELETE FROM changelog WHERE doc_id = ?", (doc_id,)
-                )
-                await self.db.execute(
-                    "DELETE FROM agent_session_receipts WHERE doc_id = ?", (doc_id,)
-                )
-                await self.db.execute(
-                    "DELETE FROM documents WHERE doc_id = ?", (doc_id,)
-                )
+                await self.db.execute("DELETE FROM changelog WHERE doc_id = ?", (doc_id,))
+                await self.db.execute("DELETE FROM agent_session_receipts WHERE doc_id = ?", (doc_id,))
+                await self.db.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
                 await self.db.commit()
                 return retired_ids
             except Exception:
@@ -1456,9 +1818,7 @@ class Database:
 
     async def upsert_metadata(self, meta: DocumentMetadata) -> None:
         async with self._write_lock:
-            entities_json = json.dumps(
-                [{"name": e.canonical_name, "tags": e.tags} for e in meta.entities]
-            )
+            entities_json = json.dumps([{"name": e.canonical_name, "tags": e.tags} for e in meta.entities])
             await self.db.execute(
                 """INSERT INTO document_metadata (
                     doc_id, summary, tags, entities, doc_type, complexity, enriched_at
@@ -1468,17 +1828,19 @@ class Database:
                     entities=excluded.entities, doc_type=excluded.doc_type,
                     complexity=excluded.complexity, enriched_at=excluded.enriched_at""",
                 (
-                    meta.doc_id, meta.summary, json.dumps(meta.tags),
-                    entities_json, meta.doc_type, meta.complexity,
+                    meta.doc_id,
+                    meta.summary,
+                    json.dumps(meta.tags),
+                    entities_json,
+                    meta.doc_type,
+                    meta.complexity,
                     meta.enriched_at.isoformat() if meta.enriched_at else _now_iso(),
                 ),
             )
             await self.db.commit()
 
     async def get_metadata(self, doc_id: str) -> DocumentMetadata | None:
-        async with self.db.execute(
-            "SELECT * FROM document_metadata WHERE doc_id = ?", (doc_id,)
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM document_metadata WHERE doc_id = ?", (doc_id,)) as cursor:
             row = await cursor.fetchone()
             if not row:
                 return None
@@ -1507,48 +1869,965 @@ class Database:
     # Memories
     # ==================================================================
 
-    async def insert_memory(self, mem: Memory) -> str:
-        """Insert a memory and its FTS5 row. Returns the memory id."""
-        _validate_visibility(mem.visibility, mem.owner_user_id)
-        project_key = _normalize_project_key(mem.project_key)
+    async def upsert_evidence_unit(self, unit: EvidenceUnit) -> None:
+        """Persist one scoped evidence item before relation classification."""
+        metadata_json = json.dumps(dict(unit.source_metadata), sort_keys=True)
+        provenance = unit.evidence_provenance.value
         async with self._write_lock:
             now = _now_iso()
-            status = normalize_memory_status(mem.status)
             await self.db.execute(
-                """INSERT INTO memories (
-                    id, memory_type, content, content_hash, tags, visibility, owner_user_id,
-                    project_key, repo_identifier, memory_level, curation_cluster_id,
-                    confidence, corroboration_count,
-                    contradiction_count, valid_from, valid_until,
-                    superseded_by, status, retirement_reason, retired_at,
-                    superseded_at, replacement_reason, replacement_kind, extraction_context,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO evidence_units (
+                    id, source_id, doc_id, doc_revision_id, source_type, client,
+                    repo_identifier, source_anchor, source_lineage_id,
+                    source_metadata_json, project_key, visibility, owner_user_id,
+                    observed_at, extractor_run_id, access_context_hash, content,
+                    excerpt, evidence_provenance, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    observed_at=excluded.observed_at,
+                    extractor_run_id=excluded.extractor_run_id,
+                    access_context_hash=excluded.access_context_hash,
+                    updated_at=excluded.updated_at""",
                 (
-                    mem.id, mem.memory_type, mem.content, mem.content_hash,
-                    json.dumps(mem.tags), mem.visibility, mem.owner_user_id, project_key,
-                    mem.repo_identifier, mem.memory_level, mem.curation_cluster_id,
-                    mem.confidence, mem.corroboration_count,
-                    mem.contradiction_count,
-                    mem.valid_from.isoformat() if mem.valid_from else None,
-                    mem.valid_until.isoformat() if mem.valid_until else None,
-                    mem.superseded_by, status, mem.retirement_reason,
-                    mem.retired_at.isoformat() if mem.retired_at else None,
-                    mem.superseded_at.isoformat() if mem.superseded_at else None,
-                    mem.replacement_reason, mem.replacement_kind, mem.extraction_context,
-                    mem.created_at.isoformat() if mem.created_at else now,
-                    mem.updated_at.isoformat() if mem.updated_at else now,
+                    unit.id,
+                    unit.source_id,
+                    unit.doc_id,
+                    unit.doc_revision_id,
+                    unit.source_type,
+                    unit.client,
+                    unit.repo_identifier,
+                    unit.source_anchor,
+                    unit.source_lineage_id,
+                    metadata_json,
+                    _normalize_project_key(unit.project_key),
+                    unit.visibility,
+                    unit.owner_user_id,
+                    unit.observed_at,
+                    unit.extractor_run_id,
+                    unit.access_context_hash,
+                    unit.content,
+                    unit.excerpt,
+                    provenance,
+                    now,
+                    now,
                 ),
             )
-            # Sync FTS5
-            entities_text = " ".join(mem.entity_refs)
-            tags_text = " ".join(mem.tags)
+            await self.db.commit()
+
+    async def get_evidence_unit(self, evidence_unit_id: str) -> EvidenceUnit | None:
+        async with self.db.execute(
+            "SELECT * FROM evidence_units WHERE id = ?",
+            (evidence_unit_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return EvidenceUnit(
+            id=row["id"],
+            source_id=row["source_id"],
+            doc_id=row["doc_id"],
+            doc_revision_id=row["doc_revision_id"],
+            source_type=row["source_type"],
+            client=row["client"],
+            repo_identifier=row["repo_identifier"],
+            source_anchor=row["source_anchor"],
+            source_lineage_id=row["source_lineage_id"],
+            source_metadata=json.loads(row["source_metadata_json"] or "{}"),
+            project_key=row["project_key"],
+            visibility=row["visibility"],
+            owner_user_id=row["owner_user_id"],
+            observed_at=row["observed_at"],
+            extractor_run_id=row["extractor_run_id"],
+            access_context_hash=row["access_context_hash"],
+            content=row["content"],
+            excerpt=row["excerpt"],
+            evidence_provenance=EvidenceContentProvenance(row["evidence_provenance"]),
+        )
+
+    async def replace_evidence_relations(
+        self,
+        evidence_unit_id: str,
+        relations: Sequence[EvidenceRelationRecord],
+    ) -> None:
+        """Replace the complete current relation set for one Evidence Unit."""
+        async with self._write_lock:
+            try:
+                await self.db.execute(
+                    "DELETE FROM evidence_relations WHERE evidence_unit_id = ?",
+                    (evidence_unit_id,),
+                )
+                for relation in relations:
+                    _validate_persisted_evidence_relation(relation)
+                    await self.db.execute(
+                        """INSERT INTO evidence_relations (
+                            evidence_unit_id, memory_id, relation_type, authority_case,
+                            is_authoritative_support, source_lineage_id, confidence,
+                            reason, proposed_memory_content, excerpt, classifier_version,
+                            relation_run_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            evidence_unit_id,
+                            relation.memory_id,
+                            relation.relation_type.value,
+                            relation.authority_case.value,
+                            1 if relation.is_authoritative_support else 0,
+                            relation.source_lineage_id,
+                            relation.confidence,
+                            relation.reason,
+                            relation.proposed_memory_content,
+                            relation.excerpt,
+                            relation.classifier_version,
+                            relation.relation_run_id,
+                            relation.created_at or _now_iso(),
+                        ),
+                    )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def get_evidence_relations(self, evidence_unit_id: str) -> list[EvidenceRelationRecord]:
+        rows: list[EvidenceRelationRecord] = []
+        async with self.db.execute(
+            "SELECT * FROM evidence_relations WHERE evidence_unit_id = ? ORDER BY memory_id",
+            (evidence_unit_id,),
+        ) as cursor:
+            async for row in cursor:
+                rows.append(
+                    EvidenceRelationRecord(
+                        evidence_unit_id=row["evidence_unit_id"],
+                        memory_id=row["memory_id"],
+                        relation_type=RelationType(row["relation_type"]),
+                        authority_case=AuthorityCase(row["authority_case"]),
+                        is_authoritative_support=bool(row["is_authoritative_support"]),
+                        source_lineage_id=row["source_lineage_id"],
+                        confidence=row["confidence"],
+                        reason=row["reason"],
+                        proposed_memory_content=row["proposed_memory_content"],
+                        excerpt=row["excerpt"],
+                        classifier_version=row["classifier_version"],
+                        relation_run_id=row["relation_run_id"],
+                        created_at=row["created_at"],
+                    )
+                )
+        return rows
+
+    async def get_evidence_relations_by_memory(self, memory_id: str) -> list[EvidenceRelationRecord]:
+        """Return current evidence-relation edges attached to one Memory."""
+        rows: list[EvidenceRelationRecord] = []
+        async with self.db.execute(
+            "SELECT * FROM evidence_relations WHERE memory_id = ? ORDER BY evidence_unit_id",
+            (memory_id,),
+        ) as cursor:
+            async for row in cursor:
+                rows.append(
+                    EvidenceRelationRecord(
+                        evidence_unit_id=row["evidence_unit_id"],
+                        memory_id=row["memory_id"],
+                        relation_type=RelationType(row["relation_type"]),
+                        authority_case=AuthorityCase(row["authority_case"]),
+                        is_authoritative_support=bool(row["is_authoritative_support"]),
+                        source_lineage_id=row["source_lineage_id"],
+                        confidence=row["confidence"],
+                        reason=row["reason"],
+                        proposed_memory_content=row["proposed_memory_content"],
+                        excerpt=row["excerpt"],
+                        classifier_version=row["classifier_version"],
+                        relation_run_id=row["relation_run_id"],
+                        created_at=row["created_at"],
+                    )
+                )
+        return rows
+
+    async def has_materialized_evidence_unit(self, evidence_unit_id: str) -> bool:
+        """Return true once an Evidence Unit has produced any durable Memory.
+
+        This is intentionally lifecycle-status agnostic. A superseded Memory is
+        still the historical materialization of the Evidence Unit, so retrying
+        the same Evidence Unit must not create a second Memory merely because
+        the first materialization is no longer active.
+        """
+        async with self.db.execute(
+            """SELECT 1
+               FROM relation_runs
+               WHERE evidence_unit_id = ?
+                 AND lifecycle_action IN (
+                     'attach_support', 'create_memory', 'create_revision',
+                     'supersede_memory', 'retire_memory'
+                 )
+               LIMIT 1""",
+            (evidence_unit_id,),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def _delete_evidence_graph_for_memory_unlocked(self, memory_id: str) -> None:
+        """Remove evidence graph content that materialized one Memory."""
+        async with self.db.execute(
+           """SELECT DISTINCT evidence_unit_id
+               FROM relation_runs
+               WHERE result_memory_id = ?
+                 AND lifecycle_action IN (
+                     'attach_support', 'create_memory', 'create_revision',
+                     'supersede_memory', 'retire_memory'
+                 )""",
+            (memory_id,),
+        ) as cursor:
+            unit_ids = [row[0] async for row in cursor]
+        await self._delete_evidence_graph_for_unit_ids_unlocked(unit_ids)
+        await self.db.execute("DELETE FROM evidence_relations WHERE memory_id = ?", (memory_id,))
+        await self.db.execute("DELETE FROM relation_run_relations WHERE memory_id = ?", (memory_id,))
+        await self.db.execute("DELETE FROM relation_candidates WHERE memory_id = ?", (memory_id,))
+
+    async def _delete_evidence_graph_for_memory_doc_unlocked(self, memory_id: str, doc_id: str) -> None:
+        """Remove evidence graph content for a single memory-source link."""
+        async with self.db.execute(
+            """SELECT DISTINCT eu.id
+               FROM evidence_units eu
+               JOIN relation_runs rr ON rr.evidence_unit_id = eu.id
+               WHERE eu.doc_id = ?
+                 AND rr.result_memory_id = ?
+                 AND rr.lifecycle_action IN (
+                     'attach_support', 'create_memory', 'create_revision',
+                     'supersede_memory', 'retire_memory'
+                 )""",
+            (doc_id, memory_id),
+        ) as cursor:
+            unit_ids = [row[0] async for row in cursor]
+        await self._delete_evidence_graph_for_unit_ids_unlocked(unit_ids)
+        await self.db.execute(
+            """DELETE FROM evidence_relations
+               WHERE memory_id = ?
+                 AND evidence_unit_id IN (
+                     SELECT id FROM evidence_units WHERE doc_id = ?
+                 )""",
+            (memory_id, doc_id),
+        )
+        await self.db.execute(
+            """DELETE FROM relation_run_relations
+               WHERE memory_id = ?
+                 AND evidence_unit_id IN (
+                     SELECT id FROM evidence_units WHERE doc_id = ?
+                 )""",
+            (memory_id, doc_id),
+        )
+        await self.db.execute(
+            """DELETE FROM relation_candidates
+               WHERE memory_id = ?
+                 AND evidence_unit_id IN (
+                     SELECT id FROM evidence_units WHERE doc_id = ?
+                 )""",
+            (memory_id, doc_id),
+        )
+
+    async def _delete_evidence_graph_for_doc_ids_unlocked(self, doc_ids: Sequence[str]) -> None:
+        """Remove evidence graph content derived from deleted documents."""
+        unique_doc_ids = tuple(dict.fromkeys(doc_ids))
+        if not unique_doc_ids:
+            return
+        placeholders = ", ".join("?" for _ in unique_doc_ids)
+        async with self.db.execute(
+            f"SELECT id FROM evidence_units WHERE doc_id IN ({placeholders})",
+            unique_doc_ids,
+        ) as cursor:
+            unit_ids = [row[0] async for row in cursor]
+        await self._delete_evidence_graph_for_unit_ids_unlocked(unit_ids)
+
+    async def _delete_evidence_graph_for_source_id_unlocked(self, source_id: str) -> None:
+        """Remove evidence graph content owned by a deleted source."""
+        async with self.db.execute(
+            "SELECT id FROM evidence_units WHERE source_id = ?",
+            (source_id,),
+        ) as cursor:
+            unit_ids = [row[0] async for row in cursor]
+        await self._delete_evidence_graph_for_unit_ids_unlocked(unit_ids)
+
+    async def _delete_evidence_graph_for_unit_ids_unlocked(self, unit_ids: Sequence[str]) -> None:
+        """Delete units plus their relation-run and candidate audit graph."""
+        unique_unit_ids = tuple(dict.fromkeys(unit_ids))
+        if not unique_unit_ids:
+            return
+        placeholders = ", ".join("?" for _ in unique_unit_ids)
+        await self.db.execute(
+            f"DELETE FROM relation_candidates WHERE evidence_unit_id IN ({placeholders})",
+            unique_unit_ids,
+        )
+        await self.db.execute(
+            f"DELETE FROM evidence_relations WHERE evidence_unit_id IN ({placeholders})",
+            unique_unit_ids,
+        )
+        await self.db.execute(
+            f"DELETE FROM relation_run_relations WHERE evidence_unit_id IN ({placeholders})",
+            unique_unit_ids,
+        )
+        await self.db.execute(
+            f"DELETE FROM relation_runs WHERE evidence_unit_id IN ({placeholders})",
+            unique_unit_ids,
+        )
+        await self.db.execute(
+            f"DELETE FROM evidence_units WHERE id IN ({placeholders})",
+            unique_unit_ids,
+        )
+
+    async def restore_evidence_relation_snapshot(self, relation: EvidenceRelationRecord) -> None:
+        """Restore one current evidence-relation edge during write rollback."""
+        _validate_persisted_evidence_relation(relation)
+        async with self._write_lock:
+            try:
+                await self.db.execute(
+                    """INSERT OR IGNORE INTO evidence_relations (
+                        evidence_unit_id, memory_id, relation_type, authority_case,
+                        is_authoritative_support, source_lineage_id, confidence,
+                        reason, proposed_memory_content, excerpt, classifier_version,
+                        relation_run_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        relation.evidence_unit_id,
+                        relation.memory_id,
+                        relation.relation_type.value,
+                        relation.authority_case.value,
+                        1 if relation.is_authoritative_support else 0,
+                        relation.source_lineage_id,
+                        relation.confidence,
+                        relation.reason,
+                        relation.proposed_memory_content,
+                        relation.excerpt,
+                        relation.classifier_version,
+                        relation.relation_run_id,
+                        relation.created_at or _now_iso(),
+                    ),
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def record_relation_run(self, run: RelationRunRecord) -> None:
+        run = _with_empty_relation_snapshot_audit(run)
+        lifecycle_action = run.lifecycle_action.value if run.lifecycle_action is not None else None
+        review_case = run.review_case.value if run.review_case is not None else None
+        async with self._write_lock:
+            async with self.db.execute(
+                "SELECT * FROM relation_runs WHERE id = ?",
+                (run.id,),
+            ) as cursor:
+                existing_run = await cursor.fetchone()
+            if existing_run is not None:
+                _assert_relation_run_retry_matches(existing_run, run)
+                return
             await self.db.execute(
-                "INSERT INTO memories_fts (memory_id, content, entities_text, tags_text) "
-                "VALUES (?, ?, ?, ?)",
-                (mem.id, mem.content, entities_text, tags_text),
+                """INSERT INTO relation_runs (
+                    id, evidence_unit_id, access_context_hash, candidate_count,
+                    mandatory_candidate_count, checked_candidate_count,
+                    incomplete_mandatory_buckets_json, classifier_version,
+                    lifecycle_action, review_case, status, result_memory_id,
+                    audit_json, started_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run.id,
+                    run.evidence_unit_id,
+                    run.access_context_hash,
+                    run.candidate_count,
+                    run.mandatory_candidate_count,
+                    run.checked_candidate_count,
+                    json.dumps(list(run.incomplete_mandatory_buckets), sort_keys=True),
+                    run.classifier_version,
+                    lifecycle_action,
+                    review_case,
+                    run.status,
+                    _relation_result_memory_id(run),
+                    json.dumps(dict(run.audit), sort_keys=True),
+                    run.started_at or _now_iso(),
+                    run.completed_at,
+                ),
             )
             await self.db.commit()
+
+    async def get_relation_run(self, relation_run_id: str) -> RelationRunRecord | None:
+        async with self.db.execute(
+            "SELECT * FROM relation_runs WHERE id = ?",
+            (relation_run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        lifecycle_action = LifecycleAction(row["lifecycle_action"]) if row["lifecycle_action"] is not None else None
+        review_case = ReviewCase(row["review_case"]) if row["review_case"] is not None else None
+        return RelationRunRecord(
+            id=row["id"],
+            evidence_unit_id=row["evidence_unit_id"],
+            access_context_hash=row["access_context_hash"],
+            candidate_count=row["candidate_count"],
+            mandatory_candidate_count=row["mandatory_candidate_count"],
+            checked_candidate_count=row["checked_candidate_count"],
+            incomplete_mandatory_buckets=tuple(json.loads(row["incomplete_mandatory_buckets_json"] or "[]")),
+            classifier_version=row["classifier_version"],
+            lifecycle_action=lifecycle_action,
+            review_case=review_case,
+            status=row["status"],
+            result_memory_id=row["result_memory_id"],
+            audit=json.loads(row["audit_json"] or "{}"),
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+        )
+
+    async def replace_relation_candidates(
+        self,
+        relation_run_id: str,
+        candidates: Sequence[RelationCandidateRecord],
+    ) -> None:
+        """Replace the auditable candidate universe for one relation run."""
+        async with self._write_lock:
+            try:
+                await self.db.execute(
+                    "DELETE FROM relation_candidates WHERE relation_run_id = ?",
+                    (relation_run_id,),
+                )
+                for candidate in candidates:
+                    await self.db.execute(
+                        """INSERT INTO relation_candidates (
+                            relation_run_id, evidence_unit_id, memory_id, bucket,
+                            bucket_rank, candidate_rank, score, is_mandatory,
+                            bucket_complete, was_checked, reason
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            relation_run_id,
+                            candidate.evidence_unit_id,
+                            candidate.memory_id,
+                            candidate.bucket.value,
+                            candidate.bucket_rank,
+                            candidate.candidate_rank,
+                            candidate.score,
+                            1 if candidate.is_mandatory else 0,
+                            1 if candidate.bucket_complete else 0,
+                            1 if candidate.was_checked else 0,
+                            candidate.reason,
+                        ),
+                    )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def get_relation_candidates(
+        self,
+        relation_run_id: str,
+    ) -> list[RelationCandidateRecord]:
+        return await self._get_relation_candidates_unlocked(relation_run_id)
+
+    async def _get_relation_candidates_unlocked(
+        self,
+        relation_run_id: str,
+    ) -> list[RelationCandidateRecord]:
+        rows: list[RelationCandidateRecord] = []
+        async with self.db.execute(
+            """SELECT * FROM relation_candidates
+               WHERE relation_run_id = ?
+               ORDER BY bucket_rank, candidate_rank, memory_id""",
+            (relation_run_id,),
+        ) as cursor:
+            async for row in cursor:
+                rows.append(
+                    RelationCandidateRecord(
+                        relation_run_id=row["relation_run_id"],
+                        evidence_unit_id=row["evidence_unit_id"],
+                        memory_id=row["memory_id"],
+                        bucket=CandidateBucket(row["bucket"]),
+                        bucket_rank=row["bucket_rank"],
+                        candidate_rank=row["candidate_rank"],
+                        score=row["score"],
+                        is_mandatory=bool(row["is_mandatory"]),
+                        bucket_complete=bool(row["bucket_complete"]),
+                        was_checked=bool(row["was_checked"]),
+                        reason=row["reason"],
+                    )
+                )
+        return rows
+
+    async def _get_relation_run_relations_unlocked(
+        self,
+        relation_run_id: str,
+    ) -> list[EvidenceRelationRecord]:
+        rows: list[EvidenceRelationRecord] = []
+        async with self.db.execute(
+            """SELECT * FROM relation_run_relations
+               WHERE relation_run_id = ?
+               ORDER BY memory_id, relation_type, relation_run_id""",
+            (relation_run_id,),
+        ) as cursor:
+            async for row in cursor:
+                rows.append(
+                    EvidenceRelationRecord(
+                        evidence_unit_id=row["evidence_unit_id"],
+                        memory_id=row["memory_id"],
+                        relation_type=RelationType(row["relation_type"]),
+                        authority_case=AuthorityCase(row["authority_case"]),
+                        is_authoritative_support=bool(row["is_authoritative_support"]),
+                        source_lineage_id=row["source_lineage_id"],
+                        confidence=row["confidence"],
+                        reason=row["reason"],
+                        proposed_memory_content=row["proposed_memory_content"],
+                        excerpt=row["excerpt"],
+                        classifier_version=row["classifier_version"],
+                        relation_run_id=row["relation_run_id"],
+                        created_at=row["created_at"],
+                    )
+                )
+        return rows
+
+    async def record_relation_outcome_bundle(self, bundle: RelationOutcomeBundle) -> None:
+        """Persist one complete relation outcome in a single transaction."""
+        async with self._write_lock:
+            try:
+                await self._record_relation_outcome_bundle_unlocked(bundle)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def _record_relation_outcome_bundle_unlocked(self, bundle: RelationOutcomeBundle) -> None:
+        bundle = _with_relation_snapshot_audit(bundle)
+        unit = bundle.evidence_unit
+        run = bundle.relation_run
+        async with self.db.execute(
+            "SELECT * FROM relation_runs WHERE id = ?",
+            (run.id,),
+        ) as cursor:
+            existing_run = await cursor.fetchone()
+        if existing_run is not None:
+            _assert_relation_run_retry_matches(existing_run, run)
+            existing_audit = json.loads(existing_run["audit_json"] or "{}")
+            await self._assert_relation_bundle_retry_matches_unlocked(bundle, existing_audit)
+            return
+
+        lifecycle_action = run.lifecycle_action.value if run.lifecycle_action is not None else None
+        review_case = run.review_case.value if run.review_case is not None else None
+        provenance = (
+            unit.evidence_provenance.value
+            if isinstance(unit.evidence_provenance, EvidenceContentProvenance)
+            else str(unit.evidence_provenance)
+        )
+        now = _now_iso()
+        await self.db.execute(
+            """INSERT INTO evidence_units (
+                        id, source_id, doc_id, doc_revision_id, source_type, client,
+                        repo_identifier, source_anchor, source_lineage_id,
+                        source_metadata_json, project_key, visibility, owner_user_id,
+                        observed_at, extractor_run_id, access_context_hash,
+                        content, excerpt, evidence_provenance, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        observed_at=excluded.observed_at,
+                        extractor_run_id=excluded.extractor_run_id,
+                        access_context_hash=excluded.access_context_hash,
+                        updated_at=excluded.updated_at""",
+            (
+                unit.id,
+                unit.source_id,
+                unit.doc_id,
+                unit.doc_revision_id,
+                unit.source_type,
+                unit.client,
+                unit.repo_identifier,
+                unit.source_anchor,
+                unit.source_lineage_id,
+                json.dumps(dict(unit.source_metadata), sort_keys=True),
+                _normalize_project_key(unit.project_key),
+                unit.visibility,
+                unit.owner_user_id,
+                unit.observed_at,
+                unit.extractor_run_id,
+                unit.access_context_hash,
+                unit.content,
+                unit.excerpt,
+                provenance,
+                now,
+                now,
+            ),
+        )
+        await self.db.execute(
+            """INSERT INTO relation_runs (
+                        id, evidence_unit_id, access_context_hash, candidate_count,
+                        mandatory_candidate_count, checked_candidate_count,
+                        incomplete_mandatory_buckets_json, classifier_version,
+                        lifecycle_action, review_case, status, result_memory_id,
+                        audit_json, started_at, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                run.id,
+                run.evidence_unit_id,
+                run.access_context_hash,
+                run.candidate_count,
+                run.mandatory_candidate_count,
+                run.checked_candidate_count,
+                json.dumps(list(run.incomplete_mandatory_buckets), sort_keys=True),
+                run.classifier_version,
+                lifecycle_action,
+                review_case,
+                run.status,
+                _relation_result_memory_id(run),
+                json.dumps(dict(run.audit), sort_keys=True),
+                run.started_at or now,
+                run.completed_at,
+            ),
+        )
+        await self.db.execute(
+            "DELETE FROM relation_candidates WHERE relation_run_id = ?",
+            (run.id,),
+        )
+        for candidate in bundle.candidates:
+            await self.db.execute(
+                """INSERT INTO relation_candidates (
+                            relation_run_id, evidence_unit_id, memory_id, bucket,
+                            bucket_rank, candidate_rank, score, is_mandatory,
+                            bucket_complete, was_checked, reason
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    candidate.relation_run_id,
+                    candidate.evidence_unit_id,
+                    candidate.memory_id,
+                    candidate.bucket.value,
+                    candidate.bucket_rank,
+                    candidate.candidate_rank,
+                    candidate.score,
+                    1 if candidate.is_mandatory else 0,
+                    1 if candidate.bucket_complete else 0,
+                    1 if candidate.was_checked else 0,
+                    candidate.reason,
+                ),
+            )
+        await self.db.execute(
+            "DELETE FROM evidence_relations WHERE evidence_unit_id = ?",
+            (unit.id,),
+        )
+        for relation in bundle.relations:
+            _validate_persisted_evidence_relation(relation)
+            await self.db.execute(
+                """INSERT INTO relation_run_relations (
+                            relation_run_id, evidence_unit_id, memory_id, relation_type,
+                            authority_case, is_authoritative_support, source_lineage_id,
+                            confidence, reason, proposed_memory_content, excerpt,
+                            classifier_version, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    relation.relation_run_id,
+                    relation.evidence_unit_id,
+                    relation.memory_id,
+                    relation.relation_type.value,
+                    relation.authority_case.value,
+                    1 if relation.is_authoritative_support else 0,
+                    relation.source_lineage_id,
+                    relation.confidence,
+                    relation.reason,
+                    relation.proposed_memory_content,
+                    relation.excerpt,
+                    relation.classifier_version,
+                    relation.created_at or now,
+                ),
+            )
+            await self.db.execute(
+                """INSERT INTO evidence_relations (
+                            evidence_unit_id, memory_id, relation_type, authority_case,
+                            is_authoritative_support, source_lineage_id, confidence,
+                            reason, proposed_memory_content, excerpt, classifier_version,
+                            relation_run_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    relation.evidence_unit_id,
+                    relation.memory_id,
+                    relation.relation_type.value,
+                    relation.authority_case.value,
+                    1 if relation.is_authoritative_support else 0,
+                    relation.source_lineage_id,
+                    relation.confidence,
+                    relation.reason,
+                    relation.proposed_memory_content,
+                    relation.excerpt,
+                    relation.classifier_version,
+                    relation.relation_run_id,
+                    relation.created_at or now,
+                ),
+            )
+
+    async def _assert_relation_bundle_retry_matches_unlocked(
+        self,
+        bundle: RelationOutcomeBundle,
+        committed_audit: Mapping[str, object],
+    ) -> None:
+        stored_candidates = await self._get_relation_candidates_unlocked(bundle.relation_run.id)
+        expected_candidates = list(bundle.candidates)
+        committed_candidate_hash = committed_audit.get("candidate_snapshot_hash")
+        if committed_candidate_hash is None:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{bundle.relation_run.id}: committed audit is missing candidate_snapshot_hash"
+            )
+        candidate_hashes = relation_bundle_snapshot_audit(candidates=stored_candidates, relations=[])
+        if committed_candidate_hash != candidate_hashes["candidate_snapshot_hash"]:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{bundle.relation_run.id}: committed run snapshot was modified (relation_candidates)"
+            )
+
+        if [relation_candidate_retry_identity(candidate) for candidate in stored_candidates] != [
+            relation_candidate_retry_identity(candidate) for candidate in expected_candidates
+        ]:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{bundle.relation_run.id}: existing run does not match retry payload (relation_candidates)"
+            )
+
+        stored_relations = await self._get_relation_run_relations_unlocked(bundle.relation_run.id)
+        committed_relation_hash = committed_audit.get("relation_snapshot_hash")
+        if committed_relation_hash is None:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{bundle.relation_run.id}: committed audit is missing relation_snapshot_hash"
+            )
+        relation_hashes = relation_bundle_snapshot_audit(candidates=[], relations=stored_relations)
+        if committed_relation_hash != relation_hashes["relation_snapshot_hash"]:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{bundle.relation_run.id}: committed run snapshot was modified (evidence_relations)"
+            )
+
+        expected_relations = sorted(bundle.relations, key=evidence_relation_retry_identity)
+        stored_relations = sorted(stored_relations, key=evidence_relation_retry_identity)
+        if [evidence_relation_retry_identity(relation) for relation in stored_relations] != [
+            evidence_relation_retry_identity(relation) for relation in expected_relations
+        ]:
+            raise RuntimeError(
+                "relation_run_id collision for "
+                f"{bundle.relation_run.id}: existing run does not match retry payload (evidence_relations)"
+            )
+
+    async def insert_memory(self, mem: Memory) -> str:
+        """Insert a memory and its FTS5 row. Returns the memory id."""
+        async with self._write_lock:
+            try:
+                await self._insert_memory_unlocked(mem)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return mem.id
+
+    async def _insert_memory_unlocked(self, mem: Memory) -> None:
+        _validate_visibility(mem.visibility, mem.owner_user_id)
+        project_key = _normalize_project_key(mem.project_key)
+        now = _now_iso()
+        status = normalize_memory_status(mem.status)
+        await self.db.execute(
+            """INSERT INTO memories (
+                id, memory_type, content, content_hash, tags, visibility, owner_user_id,
+                project_key, repo_identifier, memory_level, curation_cluster_id,
+                confidence, corroboration_count,
+                contradiction_count, valid_from, valid_until,
+                superseded_by, status, retirement_reason, retired_at,
+                superseded_at, replacement_reason, replacement_kind, extraction_context,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                mem.id,
+                mem.memory_type,
+                mem.content,
+                mem.content_hash,
+                json.dumps(mem.tags),
+                mem.visibility,
+                mem.owner_user_id,
+                project_key,
+                mem.repo_identifier,
+                mem.memory_level,
+                mem.curation_cluster_id,
+                mem.confidence,
+                mem.corroboration_count,
+                mem.contradiction_count,
+                mem.valid_from.isoformat() if mem.valid_from else None,
+                mem.valid_until.isoformat() if mem.valid_until else None,
+                mem.superseded_by,
+                status,
+                mem.retirement_reason,
+                mem.retired_at.isoformat() if mem.retired_at else None,
+                mem.superseded_at.isoformat() if mem.superseded_at else None,
+                mem.replacement_reason,
+                mem.replacement_kind,
+                mem.extraction_context,
+                mem.created_at.isoformat() if mem.created_at else now,
+                mem.updated_at.isoformat() if mem.updated_at else now,
+            ),
+        )
+        entities_text = " ".join(mem.entity_refs)
+        tags_text = " ".join(mem.tags)
+        await self.db.execute(
+            "INSERT INTO memories_fts (memory_id, content, entities_text, tags_text) VALUES (?, ?, ?, ?)",
+            (mem.id, mem.content, entities_text, tags_text),
+        )
+
+    async def _upsert_memory_preserving_created_at_unlocked(self, mem: Memory) -> None:
+        """Create or refresh a lifecycle-produced Memory without rewriting CREATED_AT."""
+        _validate_visibility(mem.visibility, mem.owner_user_id)
+        project_key = _normalize_project_key(mem.project_key)
+        now = _now_iso()
+        status = normalize_memory_status(mem.status)
+        await self.db.execute(
+            """INSERT INTO memories (
+                id, memory_type, content, content_hash, tags, visibility, owner_user_id,
+                project_key, repo_identifier, memory_level, curation_cluster_id,
+                confidence, corroboration_count,
+                contradiction_count, valid_from, valid_until,
+                superseded_by, status, retirement_reason, retired_at,
+                superseded_at, replacement_reason, replacement_kind, extraction_context,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                memory_type=excluded.memory_type,
+                content=excluded.content,
+                content_hash=excluded.content_hash,
+                tags=excluded.tags,
+                visibility=excluded.visibility,
+                owner_user_id=excluded.owner_user_id,
+                project_key=excluded.project_key,
+                repo_identifier=excluded.repo_identifier,
+                memory_level=excluded.memory_level,
+                curation_cluster_id=excluded.curation_cluster_id,
+                confidence=excluded.confidence,
+                corroboration_count=excluded.corroboration_count,
+                contradiction_count=excluded.contradiction_count,
+                valid_from=excluded.valid_from,
+                valid_until=excluded.valid_until,
+                superseded_by=excluded.superseded_by,
+                status=excluded.status,
+                retirement_reason=excluded.retirement_reason,
+                retired_at=excluded.retired_at,
+                superseded_at=excluded.superseded_at,
+                replacement_reason=excluded.replacement_reason,
+                replacement_kind=excluded.replacement_kind,
+                extraction_context=excluded.extraction_context,
+                updated_at=excluded.updated_at""",
+            (
+                mem.id,
+                mem.memory_type,
+                mem.content,
+                mem.content_hash,
+                json.dumps(mem.tags),
+                mem.visibility,
+                mem.owner_user_id,
+                project_key,
+                mem.repo_identifier,
+                mem.memory_level,
+                mem.curation_cluster_id,
+                mem.confidence,
+                mem.corroboration_count,
+                mem.contradiction_count,
+                mem.valid_from.isoformat() if mem.valid_from else None,
+                mem.valid_until.isoformat() if mem.valid_until else None,
+                mem.superseded_by,
+                status,
+                mem.retirement_reason,
+                mem.retired_at.isoformat() if mem.retired_at else None,
+                mem.superseded_at.isoformat() if mem.superseded_at else None,
+                mem.replacement_reason,
+                mem.replacement_kind,
+                mem.extraction_context,
+                mem.created_at.isoformat() if mem.created_at else now,
+                mem.updated_at.isoformat() if mem.updated_at else now,
+            ),
+        )
+
+    async def insert_memory_with_source_and_relation(
+        self,
+        mem: Memory,
+        *,
+        doc_id: str,
+        source_type: str,
+        excerpt: str | None = None,
+        entity_ids: Sequence[int] | None = None,
+        relation_outcome: RelationOutcomeBundle | None = None,
+    ) -> str:
+        """Insert a memory, source provenance, entities, FTS, and relation audit atomically."""
+        async with self._write_lock:
+            try:
+                await self._upsert_memory_preserving_created_at_unlocked(mem)
+                await self._add_memory_source_unlocked(mem.id, doc_id, source_type, excerpt)
+                await self._link_memory_entities_unlocked(mem.id, entity_ids)
+                await self._rebuild_memory_fts_unlocked(
+                    mem.id,
+                    search_visible_statuses=set(allowed_search_statuses()),
+                )
+                if relation_outcome is not None:
+                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return mem.id
+
+    async def insert_memory_and_upsert_agent_claim(
+        self,
+        mem: Memory,
+        *,
+        doc_id: str,
+        source_type: str,
+        excerpt: str | None,
+        relation_outcome: RelationOutcomeBundle | None,
+        claim_id: str,
+        concept_id: str,
+        display_anchor: str,
+        claim_text: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        observed_at: datetime,
+        citations: list[str] | None = None,
+        concept_projection: dict[str, Any] | None = None,
+        entity_ids: list[int] | None = None,
+    ) -> str:
+        """Insert an agent-session memory and its claim projection atomically."""
+        _validate_visibility(mem.visibility, mem.owner_user_id)
+        observed = _utc_iso(observed_at)
+        async with self._write_lock:
+            try:
+                await self._upsert_memory_preserving_created_at_unlocked(mem)
+                await self.db.execute(
+                    """INSERT OR IGNORE INTO memory_sources (
+                        memory_id, doc_id, source_id, source_type, excerpt, support_kind
+                    ) VALUES (?, ?, (SELECT source FROM documents WHERE doc_id = ?), ?, ?, 'extracted')""",
+                    (mem.id, doc_id, doc_id, source_type, excerpt),
+                )
+                if entity_ids:
+                    for entity_id in entity_ids:
+                        await self.db.execute(
+                            "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
+                            (mem.id, entity_id),
+                        )
+                await self._rebuild_memory_fts_unlocked(
+                    mem.id,
+                    search_visible_statuses=set(allowed_search_statuses()),
+                )
+                if relation_outcome is not None:
+                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                if concept_projection is not None:
+                    await self._upsert_agent_concept_unlocked(**concept_projection, observed=observed)
+                await self._upsert_agent_claim_unlocked(
+                    claim_id=claim_id,
+                    concept_id=concept_id,
+                    display_anchor=display_anchor,
+                    claim_text=claim_text,
+                    memory_type=memory_type,
+                    tags=tags,
+                    confidence=confidence,
+                    memory_id=mem.id,
+                    observed=observed,
+                )
+                for citation_url in citations or []:
+                    await self._add_agent_claim_citation_unlocked(
+                        claim_id=claim_id,
+                        citation_url=citation_url,
+                        observed=observed,
+                    )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
         return mem.id
 
     async def rebuild_memory_fts(
@@ -1596,8 +2875,7 @@ class Database:
 
             tags = json.loads(row["tags"] or "[]")
             await self.db.execute(
-                "INSERT INTO memories_fts (memory_id, content, entities_text, tags_text) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO memories_fts (memory_id, content, entities_text, tags_text) VALUES (?, ?, ?, ?)",
                 (memory_id, row["content"], " ".join(entity_names), " ".join(tags)),
             )
         return True
@@ -1615,9 +2893,7 @@ class Database:
             return cursor.rowcount if cursor.rowcount is not None else 0
 
     async def get_memory(self, memory_id: str) -> Memory | None:
-        async with self.db.execute(
-            "SELECT * FROM memories WHERE id = ?", (memory_id,)
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)) as cursor:
             row = await cursor.fetchone()
             if not row:
                 return None
@@ -1638,12 +2914,131 @@ class Database:
         async with self.db.execute(
             """SELECT m.* FROM memories m
                JOIN memory_sources ms ON m.id = ms.memory_id
-               WHERE ms.doc_id = ?""" + kind_clause,
+               WHERE ms.doc_id = ?"""
+            + kind_clause,
             params,
         ) as cursor:
             async for row in cursor:
                 results.append(self._row_to_memory(row))
         return results
+
+    async def get_candidate_memories_by_source_doc(
+        self,
+        *,
+        doc_id: str,
+        support_kind: str | None = None,
+    ) -> list[CandidateMemory]:
+        """Return complete same-document candidate Memories for relation checks."""
+        params: list[str] = [doc_id]
+        kind_clause = ""
+        if support_kind is not None:
+            kind_clause = " AND ms.support_kind = ?"
+            params.append(support_kind)
+        candidates: list[CandidateMemory] = []
+        async with self.db.execute(
+            """SELECT DISTINCT
+                      m.id, m.visibility, m.owner_user_id, m.repo_identifier,
+                      m.status, ms.source_id, ms.doc_id
+                 FROM memories m
+                 JOIN memory_sources ms ON m.id = ms.memory_id
+                WHERE ms.doc_id = ?
+                  AND m.status = 'active'"""
+            + kind_clause
+            + """
+                ORDER BY m.id""",
+            params,
+        ) as cursor:
+            async for row in cursor:
+                candidates.append(
+                    CandidateMemory(
+                        memory_id=row["id"],
+                        source_id=row["source_id"],
+                        doc_id=row["doc_id"],
+                        source_lineage_id=row["doc_id"],
+                        visibility=row["visibility"],
+                        owner_user_id=row["owner_user_id"],
+                        repo_identifier=row["repo_identifier"],
+                    )
+                )
+        return candidates
+
+    async def get_candidate_memories_by_source_anchor(
+        self,
+        *,
+        source_id: str,
+        source_anchor: str,
+    ) -> list[CandidateMemory]:
+        """Return complete exact-anchor candidates from current evidence relations."""
+        candidates: list[CandidateMemory] = []
+        async with self.db.execute(
+            """SELECT DISTINCT
+                      m.id AS memory_id, m.visibility, m.owner_user_id,
+                      m.repo_identifier, eu.source_id, eu.doc_id,
+                      eu.doc_revision_id, eu.source_anchor,
+                      eu.source_lineage_id, eu.source_metadata_json
+                 FROM evidence_units eu
+                 JOIN evidence_relations er ON er.evidence_unit_id = eu.id
+                 JOIN memories m ON m.id = er.memory_id
+                WHERE eu.source_id = ?
+                  AND eu.source_anchor = ?
+                  AND m.status = 'active'
+                ORDER BY m.id""",
+            (source_id, source_anchor),
+        ) as cursor:
+            async for row in cursor:
+                candidates.append(self._row_to_candidate_memory(row))
+        return candidates
+
+    async def get_candidate_memories_by_agent_claim(
+        self,
+        *,
+        claim_anchor: str,
+    ) -> list[CandidateMemory]:
+        """Return complete private same-agent-claim candidates."""
+        candidates: list[CandidateMemory] = []
+        async with self.db.execute(
+            """SELECT DISTINCT
+                      m.id AS memory_id, m.visibility, m.owner_user_id,
+                      m.repo_identifier, eu.source_id, eu.doc_id,
+                      eu.doc_revision_id, eu.source_anchor,
+                      eu.source_lineage_id, eu.source_metadata_json
+                 FROM evidence_units eu
+                 JOIN evidence_relations er ON er.evidence_unit_id = eu.id
+                 JOIN memories m ON m.id = er.memory_id
+                WHERE eu.source_type = 'agent_session'
+                  AND eu.source_lineage_id = ?
+                  AND m.status = 'active'
+                ORDER BY m.id""",
+            (claim_anchor,),
+        ) as cursor:
+            async for row in cursor:
+                candidates.append(self._row_to_candidate_memory(row))
+        return candidates
+
+    async def get_candidate_memories_by_existing_relation_graph(
+        self,
+        *,
+        evidence_unit_id: str,
+    ) -> list[CandidateMemory]:
+        """Return active candidates already related to this Evidence Unit."""
+        candidates: list[CandidateMemory] = []
+        async with self.db.execute(
+            """SELECT DISTINCT
+                      m.id AS memory_id, m.visibility, m.owner_user_id,
+                      m.repo_identifier, eu.source_id, eu.doc_id,
+                      eu.doc_revision_id, eu.source_anchor,
+                      eu.source_lineage_id, eu.source_metadata_json
+                 FROM evidence_units eu
+                 JOIN evidence_relations er ON er.evidence_unit_id = eu.id
+                 JOIN memories m ON m.id = er.memory_id
+                WHERE eu.id = ?
+                  AND m.status = 'active'
+                ORDER BY m.id""",
+            (evidence_unit_id,),
+        ) as cursor:
+            async for row in cursor:
+                candidates.append(self._row_to_candidate_memory(row))
+        return candidates
 
     async def get_memories_by_entity(self, entity_id: int) -> list[Memory]:
         results: list[Memory] = []
@@ -1667,9 +3062,7 @@ class Database:
         async with self._write_lock:
             from memforge.models import content_hash
 
-            async with self.db.execute(
-                "SELECT confidence, tags FROM memories WHERE id = ?", (memory_id,)
-            ) as cursor:
+            async with self.db.execute("SELECT confidence, tags FROM memories WHERE id = ?", (memory_id,)) as cursor:
                 row = await cursor.fetchone()
             if not row:
                 return
@@ -1683,8 +3076,12 @@ class Database:
                     tags = ?, updated_at = ?
                    WHERE id = ?""",
                 (
-                    new_content, content_hash(new_content), confidence,
-                    json.dumps(tags), now, memory_id,
+                    new_content,
+                    content_hash(new_content),
+                    confidence,
+                    json.dumps(tags),
+                    now,
+                    memory_id,
                 ),
             )
             await self._rebuild_memory_fts_unlocked(
@@ -1755,9 +3152,14 @@ class Database:
                 "DELETE FROM memory_sources WHERE memory_id = ?",
                 (memory_id,),
             )
+            await self._delete_evidence_graph_for_memory_unlocked(memory_id)
             await self.db.execute(
                 "DELETE FROM memory_entities WHERE memory_id = ?",
                 (memory_id,),
+            )
+            await self.db.execute(
+                "DELETE FROM memory_derivations WHERE parent_memory_id = ? OR child_memory_id = ?",
+                (memory_id, memory_id),
             )
             await self.db.execute(
                 "DELETE FROM memory_review_related_challengers WHERE challenger_memory_id = ?",
@@ -1778,6 +3180,17 @@ class Database:
             )
             await self.db.execute(
                 "DELETE FROM memories_fts WHERE memory_id = ?",
+                (memory_id,),
+            )
+            await self.db.execute(
+                """DELETE FROM agent_claim_citations
+                   WHERE claim_id IN (
+                       SELECT id FROM agent_claims WHERE memory_id = ?
+                   )""",
+                (memory_id,),
+            )
+            await self.db.execute(
+                "DELETE FROM agent_claims WHERE memory_id = ?",
                 (memory_id,),
             )
             await self.db.execute(
@@ -1844,8 +3257,7 @@ class Database:
             await self.db.execute("DELETE FROM memories_fts WHERE memory_id = ?", (memory.id,))
             if search_visible:
                 await self.db.execute(
-                    "INSERT INTO memories_fts (memory_id, content, entities_text, tags_text) "
-                    "VALUES (?, ?, ?, ?)",
+                    "INSERT INTO memories_fts (memory_id, content, entities_text, tags_text) VALUES (?, ?, ?, ?)",
                     (memory.id, memory.content, entities_text, tags_text),
                 )
             await self.db.commit()
@@ -1861,60 +3273,103 @@ class Database:
     ) -> str:
         """Add a supporting source and count only distinct source documents."""
         async with self._write_lock:
-            async with self.db.execute(
-                """SELECT excerpt, support_kind
-                   FROM memory_sources
-                   WHERE memory_id = ? AND doc_id = ?""",
-                (memory_id, doc_id),
-            ) as cursor:
-                existing = await cursor.fetchone()
-
-            if existing:
-                existing_excerpt = existing["excerpt"]
-                existing_kind = existing["support_kind"]
-                next_kind = existing_kind
-                if existing_kind == "corroborated" and support_kind == "extracted":
-                    next_kind = "extracted"
-
-                should_update_excerpt = bool(
-                    excerpt
-                    and excerpt != existing_excerpt
-                    and (not existing_excerpt or len(excerpt) > len(existing_excerpt))
-                )
-                if should_update_excerpt or next_kind != existing_kind:
-                    await self.db.execute(
-                        """UPDATE memory_sources
-                           SET source_type = ?, excerpt = ?, support_kind = ?
-                           WHERE memory_id = ? AND doc_id = ?""",
-                        (
-                            source_type,
-                            excerpt if should_update_excerpt else existing_excerpt,
-                            next_kind,
-                            memory_id,
-                            doc_id,
-                        ),
-                    )
-                    await self.db.commit()
-                    return "updated"
-                await self.db.commit()
-                return "unchanged"
-
-            cursor = await self.db.execute(
-                """INSERT OR IGNORE INTO memory_sources (
-                    memory_id, doc_id, source_type, excerpt, support_kind
-                ) VALUES (?, ?, ?, ?, ?)""",
-                (memory_id, doc_id, source_type, excerpt, support_kind),
+            outcome = await self._corroborate_memory_unlocked(
+                memory_id,
+                doc_id,
+                source_type,
+                excerpt,
+                support_kind=support_kind,
             )
-            if cursor.rowcount:
-                await self.db.execute(
-                    """UPDATE memories SET
-                        corroboration_count = corroboration_count + 1,
-                        updated_at = ?
-                       WHERE id = ?""",
-                    (_now_iso(), memory_id),
-                )
             await self.db.commit()
-            return "inserted" if cursor.rowcount else "unchanged"
+            return outcome
+
+    async def corroborate_memory_with_relation_outcome(
+        self,
+        memory_id: str,
+        doc_id: str,
+        source_type: str,
+        excerpt: str | None = None,
+        *,
+        support_kind: str = "extracted",
+        relation_outcome: RelationOutcomeBundle,
+    ) -> str:
+        """Add a supporting source and its Evidence Relation audit atomically."""
+        async with self._write_lock:
+            try:
+                outcome = await self._corroborate_memory_unlocked(
+                    memory_id,
+                    doc_id,
+                    source_type,
+                    excerpt,
+                    support_kind=support_kind,
+                )
+                await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                await self.db.commit()
+                return outcome
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def _corroborate_memory_unlocked(
+        self,
+        memory_id: str,
+        doc_id: str,
+        source_type: str,
+        excerpt: str | None = None,
+        *,
+        support_kind: str = "extracted",
+    ) -> str:
+        async with self.db.execute(
+            """SELECT excerpt, support_kind
+               FROM memory_sources
+               WHERE memory_id = ? AND doc_id = ?""",
+            (memory_id, doc_id),
+        ) as cursor:
+            existing = await cursor.fetchone()
+
+        if existing:
+            existing_excerpt = existing["excerpt"]
+            existing_kind = existing["support_kind"]
+            next_kind = existing_kind
+            if existing_kind == "corroborated" and support_kind == "extracted":
+                next_kind = "extracted"
+
+            should_update_excerpt = bool(
+                excerpt
+                and excerpt != existing_excerpt
+                and (not existing_excerpt or len(excerpt) > len(existing_excerpt))
+            )
+            if should_update_excerpt or next_kind != existing_kind:
+                await self.db.execute(
+                    """UPDATE memory_sources
+                       SET source_type = ?, excerpt = ?, support_kind = ?
+                       WHERE memory_id = ? AND doc_id = ?""",
+                    (
+                        source_type,
+                        excerpt if should_update_excerpt else existing_excerpt,
+                        next_kind,
+                        memory_id,
+                        doc_id,
+                    ),
+                )
+                return "updated"
+            return "unchanged"
+
+        cursor = await self.db.execute(
+            """INSERT OR IGNORE INTO memory_sources (
+                memory_id, doc_id, source_id, source_type, excerpt, support_kind
+            ) VALUES (?, ?, (SELECT source FROM documents WHERE doc_id = ?), ?, ?, ?)""",
+            (memory_id, doc_id, doc_id, source_type, excerpt, support_kind),
+        )
+        if cursor.rowcount:
+            await self.db.execute(
+                """UPDATE memories SET
+                    corroboration_count = corroboration_count + 1,
+                    updated_at = ?
+                   WHERE id = ?""",
+                (_now_iso(), memory_id),
+            )
+        return "inserted" if cursor.rowcount else "unchanged"
 
     async def supersede_memory(
         self,
@@ -1925,57 +3380,101 @@ class Database:
         replacement_kind: ReplacementKind,
     ) -> None:
         """Mark old memory as superseded and insert the new one."""
+        async with self._write_lock:
+            try:
+                await self._supersede_memory_unlocked(
+                    old_id,
+                    new_memory,
+                    replacement_reason=replacement_reason,
+                    replacement_kind=replacement_kind,
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def _supersede_memory_unlocked(
+        self,
+        old_id: str,
+        new_memory: Memory,
+        *,
+        replacement_reason: str | None = None,
+        replacement_kind: ReplacementKind,
+    ) -> None:
+        if old_id == new_memory.id:
+            raise ValueError("cannot supersede a memory with itself")
         replacement_kind = _validate_replacement_kind(replacement_kind)
         _validate_visibility(new_memory.visibility, new_memory.owner_user_id)
-        project_key = _normalize_project_key(new_memory.project_key)
+        now = _now_iso()
+        await self._upsert_memory_preserving_created_at_unlocked(new_memory)
+        await self.db.execute(
+            """UPDATE memories SET
+                status = 'superseded', superseded_by = ?, valid_until = ?,
+                superseded_at = ?, replacement_reason = ?, replacement_kind = ?, updated_at = ?
+               WHERE id = ?""",
+            (new_memory.id, now, now, replacement_reason, replacement_kind, now, old_id),
+        )
+        await self._rebuild_memory_fts_unlocked(
+            new_memory.id,
+            search_visible_statuses=set(allowed_search_statuses()),
+        )
+
+    async def supersede_memory_with_source_and_relation(
+        self,
+        old_id: str,
+        new_memory: Memory,
+        *,
+        replacement_kind: ReplacementKind,
+        doc_id: str,
+        source_type: str,
+        excerpt: str | None = None,
+        replacement_reason: str | None = None,
+        carry_revision_sources: bool = False,
+        entity_ids: Sequence[int] | None = None,
+        relation_outcome: RelationOutcomeBundle | None = None,
+    ) -> None:
+        """Supersede a memory and persist replacement provenance/relation audit atomically."""
         async with self._write_lock:
-            now = _now_iso()
-            new_status = normalize_memory_status(new_memory.status)
-            await self.db.execute(
-                """INSERT INTO memories (
-                    id, memory_type, content, content_hash, tags, visibility, owner_user_id,
-                    project_key, repo_identifier, memory_level, curation_cluster_id,
-                    confidence, corroboration_count,
-                    contradiction_count, valid_from, valid_until,
-                    superseded_by, status, retirement_reason, retired_at,
-                    superseded_at, replacement_reason, replacement_kind, extraction_context,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    new_memory.id, new_memory.memory_type, new_memory.content,
-                    new_memory.content_hash, json.dumps(new_memory.tags),
-                    new_memory.visibility, new_memory.owner_user_id, project_key,
-                    new_memory.repo_identifier, new_memory.memory_level,
-                    new_memory.curation_cluster_id,
-                    new_memory.confidence, new_memory.corroboration_count,
-                    new_memory.contradiction_count,
-                    new_memory.valid_from.isoformat() if new_memory.valid_from else None,
-                    new_memory.valid_until.isoformat() if new_memory.valid_until else None,
-                    new_memory.superseded_by, new_status,
-                    new_memory.retirement_reason,
-                    new_memory.retired_at.isoformat() if new_memory.retired_at else None,
-                    new_memory.superseded_at.isoformat() if new_memory.superseded_at else None,
-                    new_memory.replacement_reason, new_memory.replacement_kind, new_memory.extraction_context,
-                    new_memory.created_at.isoformat() if new_memory.created_at else now,
-                    now,
-                ),
-            )
-            await self.db.execute(
-                """UPDATE memories SET
-                    status = 'superseded', superseded_by = ?, valid_until = ?,
-                    superseded_at = ?, replacement_reason = ?, replacement_kind = ?, updated_at = ?
-                   WHERE id = ?""",
-                (new_memory.id, now, now, replacement_reason, replacement_kind, now, old_id),
-            )
-            # FTS5 for new memory
-            entities_text = " ".join(new_memory.entity_refs)
-            tags_text = " ".join(new_memory.tags)
-            await self.db.execute(
-                "INSERT INTO memories_fts (memory_id, content, entities_text, tags_text) "
-                "VALUES (?, ?, ?, ?)",
-                (new_memory.id, new_memory.content, entities_text, tags_text),
-            )
-            await self.db.commit()
+            try:
+                await self._supersede_memory_unlocked(
+                    old_id,
+                    new_memory,
+                    replacement_reason=replacement_reason,
+                    replacement_kind=replacement_kind,
+                )
+                if carry_revision_sources:
+                    async with self.db.execute(
+                        "SELECT * FROM memory_sources WHERE memory_id = ?",
+                        (old_id,),
+                    ) as cursor:
+                        async for row in cursor:
+                            d = dict(row)
+                            if d["doc_id"] == doc_id:
+                                continue
+                            await self._add_memory_source_unlocked(
+                                new_memory.id,
+                                d["doc_id"],
+                                d["source_type"],
+                                d["excerpt"],
+                                support_kind=d.get("support_kind", "extracted"),
+                            )
+                await self._add_memory_source_unlocked(
+                    new_memory.id,
+                    doc_id,
+                    source_type,
+                    excerpt,
+                )
+                await self._link_memory_entities_unlocked(new_memory.id, entity_ids)
+                await self._rebuild_memory_fts_unlocked(
+                    new_memory.id,
+                    search_visible_statuses=set(allowed_search_statuses()),
+                )
+                if relation_outcome is not None:
+                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def resolve_current_memory_id(self, memory_id: str) -> str | None:
         """Return the active head of a memory supersession chain.
@@ -2035,10 +3534,12 @@ class Database:
                 (challenger.id, now, now, replacement_reason, replacement_kind, now, incumbent_id),
             )
             await self.db.execute(
-                "DELETE FROM memories_fts WHERE memory_id = ?", (incumbent_id,),
+                "DELETE FROM memories_fts WHERE memory_id = ?",
+                (incumbent_id,),
             )
             await self.db.execute(
-                "DELETE FROM memories_fts WHERE memory_id = ?", (challenger.id,),
+                "DELETE FROM memories_fts WHERE memory_id = ?",
+                (challenger.id,),
             )
             entity_names: list[str] = []
             async with self.db.execute(
@@ -2054,8 +3555,7 @@ class Database:
             entities_text = " ".join(entity_names)
             tags_text = " ".join(challenger.tags)
             await self.db.execute(
-                "INSERT INTO memories_fts (memory_id, content, entities_text, tags_text) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO memories_fts (memory_id, content, entities_text, tags_text) VALUES (?, ?, ?, ?)",
                 (challenger.id, challenger.content, entities_text, tags_text),
             )
             await self.db.commit()
@@ -2170,16 +3670,13 @@ class Database:
             where_clause = " AND ".join(conditions)
             memories: list[Memory] = []
             query = (
-                f"SELECT DISTINCT m.* FROM memories m WHERE {where_clause} "
-                "ORDER BY m.updated_at DESC LIMIT ? OFFSET ?"
+                f"SELECT DISTINCT m.* FROM memories m WHERE {where_clause} ORDER BY m.updated_at DESC LIMIT ? OFFSET ?"
             )
             async with self.db.execute(query, [*params, limit, offset]) as cursor:
                 async for row in cursor:
                     memories.append(self._row_to_memory(row))
 
-            count_query = (
-                f"SELECT COUNT(DISTINCT m.id) FROM memories m WHERE {where_clause}"
-            )
+            count_query = f"SELECT COUNT(DISTINCT m.id) FROM memories m WHERE {where_clause}"
             async with self.db.execute(count_query, params) as cursor:
                 total_row = await cursor.fetchone()
                 total = total_row[0] if total_row else 0
@@ -2211,18 +3708,12 @@ class Database:
         join_clause = " ".join(joins)
         where_clause = " AND ".join(conditions)
 
-        count_q = (
-            f"SELECT COUNT(DISTINCT m.id) FROM memories m {join_clause} "
-            f"WHERE {where_clause}"
-        )
+        count_q = f"SELECT COUNT(DISTINCT m.id) FROM memories m {join_clause} WHERE {where_clause}"
         async with self.db.execute(count_q, params) as cursor:
             total_row = await cursor.fetchone()
             total = total_row[0] if total_row else 0
 
-        full_q = (
-            f"{query} {join_clause} WHERE {where_clause} "
-            "ORDER BY m.updated_at DESC LIMIT ? OFFSET ?"
-        )
+        full_q = f"{query} {join_clause} WHERE {where_clause} ORDER BY m.updated_at DESC LIMIT ? OFFSET ?"
         memories = []
         async with self.db.execute(full_q, [*params, limit, offset]) as cursor:
             async for row in cursor:
@@ -2307,22 +3798,51 @@ class Database:
         support_kind: str = "extracted",
     ) -> None:
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT OR IGNORE INTO memory_sources (
-                    memory_id, doc_id, source_type, excerpt, support_kind
-                ) VALUES (?, ?, ?, ?, ?)""",
-                (memory_id, doc_id, source_type, excerpt, support_kind),
+            await self._add_memory_source_unlocked(
+                memory_id,
+                doc_id,
+                source_type,
+                excerpt,
+                support_kind=support_kind,
             )
             await self.db.commit()
+
+    async def _add_memory_source_unlocked(
+        self,
+        memory_id: str,
+        doc_id: str,
+        source_type: str,
+        excerpt: str | None = None,
+        *,
+        support_kind: str = "extracted",
+    ) -> None:
+        await self.db.execute(
+            """INSERT OR IGNORE INTO memory_sources (
+                memory_id, doc_id, source_id, source_type, excerpt, support_kind
+            ) VALUES (?, ?, (SELECT source FROM documents WHERE doc_id = ?), ?, ?, ?)""",
+            (memory_id, doc_id, doc_id, source_type, excerpt, support_kind),
+        )
+
+    async def _link_memory_entities_unlocked(
+        self,
+        memory_id: str,
+        entity_ids: Sequence[int] | None,
+    ) -> None:
+        for entity_id in entity_ids or ():
+            await self.db.execute(
+                "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
+                (memory_id, entity_id),
+            )
 
     async def restore_memory_source_snapshot(self, source: MemorySource) -> None:
         """Restore one memory source row from a captured snapshot."""
         async with self._write_lock:
             await self.db.execute(
                 """INSERT INTO memory_sources (
-                    memory_id, doc_id, source_type, excerpt, support_kind, added_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    memory_id, doc_id, source_id, source_type, excerpt, support_kind, added_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(memory_id, doc_id) DO UPDATE SET
+                    source_id=excluded.source_id,
                     source_type=excluded.source_type,
                     excerpt=excluded.excerpt,
                     support_kind=excluded.support_kind,
@@ -2330,6 +3850,7 @@ class Database:
                 (
                     source.memory_id,
                     source.doc_id,
+                    source.source_id,
                     source.source_type,
                     source.excerpt,
                     source.support_kind,
@@ -2340,19 +3861,20 @@ class Database:
 
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]:
         results: list[MemorySource] = []
-        async with self.db.execute(
-            "SELECT * FROM memory_sources WHERE memory_id = ?", (memory_id,)
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM memory_sources WHERE memory_id = ?", (memory_id,)) as cursor:
             async for row in cursor:
                 d = dict(row)
-                results.append(MemorySource(
-                    memory_id=d["memory_id"],
-                    doc_id=d["doc_id"],
-                    source_type=d["source_type"],
-                    excerpt=d["excerpt"],
-                    support_kind=d.get("support_kind", "extracted"),
-                    added_at=_parse_dt(d["added_at"]),
-                ))
+                results.append(
+                    MemorySource(
+                        memory_id=d["memory_id"],
+                        doc_id=d["doc_id"],
+                        source_type=d["source_type"],
+                        source_id=d.get("source_id"),
+                        excerpt=d["excerpt"],
+                        support_kind=d.get("support_kind", "extracted"),
+                        added_at=_parse_dt(d["added_at"]),
+                    )
+                )
         return results
 
     # ==================================================================
@@ -2377,43 +3899,72 @@ class Database:
         """Insert or update a private agent-session concept."""
         observed = _utc_iso(observed_at)
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO agent_concepts (
-                    id, source_id, owner_user_id, visibility, workspace,
-                    repo_identifier, concept_type, concept_path, title,
-                    markdown_body, frontmatter_json, created_at, updated_at,
-                    last_observed_at
-                ) VALUES (?, ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    source_id=excluded.source_id,
-                    owner_user_id=excluded.owner_user_id,
-                    visibility='private',
-                    workspace=excluded.workspace,
-                    repo_identifier=excluded.repo_identifier,
-                    concept_type=excluded.concept_type,
-                    concept_path=excluded.concept_path,
-                    title=excluded.title,
-                    markdown_body=excluded.markdown_body,
-                    frontmatter_json=excluded.frontmatter_json,
-                    updated_at=excluded.updated_at,
-                    last_observed_at=excluded.last_observed_at""",
-                (
-                    concept_id,
-                    source_id,
-                    owner_user_id,
-                    workspace,
-                    repo_identifier,
-                    concept_type,
-                    concept_path,
-                    title,
-                    markdown_body,
-                    json.dumps(frontmatter, sort_keys=True),
-                    observed,
-                    observed,
-                    observed,
-                ),
+            await self._upsert_agent_concept_unlocked(
+                concept_id=concept_id,
+                source_id=source_id,
+                owner_user_id=owner_user_id,
+                workspace=workspace,
+                repo_identifier=repo_identifier,
+                concept_type=concept_type,
+                concept_path=concept_path,
+                title=title,
+                markdown_body=markdown_body,
+                frontmatter=frontmatter,
+                observed=observed,
             )
             await self.db.commit()
+
+    async def _upsert_agent_concept_unlocked(
+        self,
+        *,
+        concept_id: str,
+        source_id: str,
+        owner_user_id: str,
+        workspace: str,
+        repo_identifier: str | None,
+        concept_type: str,
+        concept_path: str,
+        title: str,
+        markdown_body: str,
+        frontmatter: dict[str, Any],
+        observed: str,
+    ) -> None:
+        await self.db.execute(
+            """INSERT INTO agent_concepts (
+                id, source_id, owner_user_id, visibility, workspace,
+                repo_identifier, concept_type, concept_path, title,
+                markdown_body, frontmatter_json, created_at, updated_at,
+                last_observed_at
+            ) VALUES (?, ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                source_id=excluded.source_id,
+                owner_user_id=excluded.owner_user_id,
+                visibility='private',
+                workspace=excluded.workspace,
+                repo_identifier=excluded.repo_identifier,
+                concept_type=excluded.concept_type,
+                concept_path=excluded.concept_path,
+                title=excluded.title,
+                markdown_body=excluded.markdown_body,
+                frontmatter_json=excluded.frontmatter_json,
+                updated_at=excluded.updated_at,
+                last_observed_at=excluded.last_observed_at""",
+            (
+                concept_id,
+                source_id,
+                owner_user_id,
+                workspace,
+                repo_identifier,
+                concept_type,
+                concept_path,
+                title,
+                markdown_body,
+                json.dumps(frontmatter, sort_keys=True),
+                observed,
+                observed,
+                observed,
+            ),
+        )
 
     async def get_agent_concept(self, concept_id: str) -> dict[str, Any] | None:
         async with self.db.execute(
@@ -2478,6 +4029,147 @@ class Database:
     ) -> None:
         observed = _utc_iso(observed_at)
         async with self._write_lock:
+            await self._upsert_agent_claim_unlocked(
+                claim_id=claim_id,
+                concept_id=concept_id,
+                display_anchor=display_anchor,
+                claim_text=claim_text,
+                memory_type=memory_type,
+                tags=tags,
+                confidence=confidence,
+                memory_id=memory_id,
+                observed=observed,
+            )
+            await self.db.commit()
+
+    async def _upsert_agent_claim_unlocked(
+        self,
+        *,
+        claim_id: str,
+        concept_id: str,
+        display_anchor: str,
+        claim_text: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        memory_id: str,
+        observed: str,
+    ) -> None:
+        await self.db.execute(
+            """INSERT INTO agent_claims (
+                id, concept_id, display_anchor, claim_text, memory_type,
+                tags, confidence, memory_id, created_at, updated_at,
+                last_observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                concept_id=excluded.concept_id,
+                display_anchor=excluded.display_anchor,
+                claim_text=excluded.claim_text,
+                memory_type=excluded.memory_type,
+                tags=excluded.tags,
+                confidence=excluded.confidence,
+                memory_id=excluded.memory_id,
+                updated_at=excluded.updated_at,
+                last_observed_at=excluded.last_observed_at""",
+            (
+                claim_id,
+                concept_id,
+                display_anchor,
+                claim_text,
+                memory_type,
+                json.dumps(tags),
+                confidence,
+                memory_id,
+                observed,
+                observed,
+                observed,
+            ),
+        )
+
+    async def supersede_memory_and_upsert_agent_claim(
+        self,
+        old_id: str,
+        new_memory: Memory,
+        *,
+        doc_id: str,
+        source_type: str,
+        excerpt: str | None,
+        carry_revision_sources: bool,
+        entity_ids: Sequence[int] | None = None,
+        replacement_reason: str | None,
+        replacement_kind: ReplacementKind,
+        claim_id: str,
+        concept_id: str,
+        display_anchor: str,
+        claim_text: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        observed_at: datetime,
+        relation_outcome: RelationOutcomeBundle | None = None,
+    ) -> None:
+        """Supersede a memory and move its agent-claim projection atomically."""
+        if old_id == new_memory.id:
+            raise ValueError("cannot supersede a memory with itself")
+        replacement_kind = _validate_replacement_kind(replacement_kind)
+        _validate_visibility(new_memory.visibility, new_memory.owner_user_id)
+        project_key = _normalize_project_key(new_memory.project_key)
+        observed = _utc_iso(observed_at)
+        async with self._write_lock:
+            async with self.db.execute(
+                "SELECT created_at FROM agent_claims WHERE id = ?",
+                (claim_id,),
+            ) as cursor:
+                existing_claim = await cursor.fetchone()
+            created_at = existing_claim["created_at"] if existing_claim else observed
+            now = _now_iso()
+            new_status = normalize_memory_status(new_memory.status)
+            await self.db.execute(
+                """INSERT INTO memories (
+                    id, memory_type, content, content_hash, tags, visibility, owner_user_id,
+                    project_key, repo_identifier, memory_level, curation_cluster_id,
+                    confidence, corroboration_count,
+                    contradiction_count, valid_from, valid_until,
+                    superseded_by, status, retirement_reason, retired_at,
+                    superseded_at, replacement_reason, replacement_kind, extraction_context,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    new_memory.id,
+                    new_memory.memory_type,
+                    new_memory.content,
+                    new_memory.content_hash,
+                    json.dumps(new_memory.tags),
+                    new_memory.visibility,
+                    new_memory.owner_user_id,
+                    project_key,
+                    new_memory.repo_identifier,
+                    new_memory.memory_level,
+                    new_memory.curation_cluster_id,
+                    new_memory.confidence,
+                    new_memory.corroboration_count,
+                    new_memory.contradiction_count,
+                    new_memory.valid_from.isoformat() if new_memory.valid_from else None,
+                    new_memory.valid_until.isoformat() if new_memory.valid_until else None,
+                    new_memory.superseded_by,
+                    new_status,
+                    new_memory.retirement_reason,
+                    new_memory.retired_at.isoformat() if new_memory.retired_at else None,
+                    new_memory.superseded_at.isoformat() if new_memory.superseded_at else None,
+                    new_memory.replacement_reason,
+                    new_memory.replacement_kind,
+                    new_memory.extraction_context,
+                    new_memory.created_at.isoformat() if new_memory.created_at else now,
+                    now,
+                ),
+            )
+            await self.db.execute(
+                """UPDATE memories SET
+                    status = 'superseded', superseded_by = ?, valid_until = ?,
+                    superseded_at = ?, replacement_reason = ?, replacement_kind = ?, updated_at = ?
+                   WHERE id = ?""",
+                (new_memory.id, now, now, replacement_reason, replacement_kind, now, old_id),
+            )
             await self.db.execute(
                 """INSERT INTO agent_claims (
                     id, concept_id, display_anchor, claim_text, memory_type,
@@ -2502,12 +4194,39 @@ class Database:
                     memory_type,
                     json.dumps(tags),
                     confidence,
-                    memory_id,
-                    observed,
+                    new_memory.id,
+                    created_at,
                     observed,
                     observed,
                 ),
             )
+            if carry_revision_sources:
+                async with self.db.execute(
+                    "SELECT * FROM memory_sources WHERE memory_id = ? AND doc_id <> ?",
+                    (old_id, doc_id),
+                ) as cursor:
+                    async for row in cursor:
+                        await self._add_memory_source_unlocked(
+                            new_memory.id,
+                            row["doc_id"],
+                            row["source_type"],
+                            row["excerpt"],
+                            support_kind=row["support_kind"] or "extracted",
+                        )
+            await self._add_memory_source_unlocked(
+                new_memory.id,
+                doc_id,
+                source_type,
+                excerpt,
+                support_kind="extracted",
+            )
+            await self._link_memory_entities_unlocked(new_memory.id, entity_ids)
+            await self._rebuild_memory_fts_unlocked(
+                new_memory.id,
+                search_visible_statuses=set(allowed_search_statuses()),
+            )
+            if relation_outcome is not None:
+                await self._record_relation_outcome_bundle_unlocked(relation_outcome)
             await self.db.commit()
 
     async def get_agent_claim(self, claim_id: str) -> dict[str, Any] | None:
@@ -2539,15 +4258,28 @@ class Database:
     ) -> None:
         observed = _utc_iso(observed_at)
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO agent_claim_citations (
-                    claim_id, citation_url, observed_at, created_at
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(claim_id, citation_url) DO UPDATE SET
-                    observed_at=excluded.observed_at""",
-                (claim_id, citation_url, observed, observed),
+            await self._add_agent_claim_citation_unlocked(
+                claim_id=claim_id,
+                citation_url=citation_url,
+                observed=observed,
             )
             await self.db.commit()
+
+    async def _add_agent_claim_citation_unlocked(
+        self,
+        *,
+        claim_id: str,
+        citation_url: str,
+        observed: str,
+    ) -> None:
+        await self.db.execute(
+            """INSERT INTO agent_claim_citations (
+                claim_id, citation_url, observed_at, created_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(claim_id, citation_url) DO UPDATE SET
+                observed_at=excluded.observed_at""",
+            (claim_id, citation_url, observed, observed),
+        )
 
     async def list_agent_claim_citations(self, claim_id: str) -> list[dict[str, Any]]:
         citations: list[dict[str, Any]] = []
@@ -2599,12 +4331,14 @@ class Database:
             (parent_memory_id,),
         ) as cursor:
             async for row in cursor:
-                results.append(MemoryDerivation(
-                    parent_memory_id=row["parent_memory_id"],
-                    child_memory_id=row["child_memory_id"],
-                    relation=row["relation"],
-                    created_at=_parse_dt(row["created_at"]),
-                ))
+                results.append(
+                    MemoryDerivation(
+                        parent_memory_id=row["parent_memory_id"],
+                        child_memory_id=row["child_memory_id"],
+                        relation=row["relation"],
+                        created_at=_parse_dt(row["created_at"]),
+                    )
+                )
         return results
 
     async def record_memory_curation_run(self, run: MemoryCurationRun) -> None:
@@ -2689,14 +4423,17 @@ class Database:
         ) as cursor:
             async for row in cursor:
                 d = dict(row)
-                results.append(MemorySource(
-                    memory_id=d["memory_id"],
-                    doc_id=d["doc_id"],
-                    source_type=d["source_type"],
-                    excerpt=d["excerpt"],
-                    support_kind=d.get("support_kind", "corroborated"),
-                    added_at=_parse_dt(d["added_at"]),
-                ))
+                results.append(
+                    MemorySource(
+                        memory_id=d["memory_id"],
+                        doc_id=d["doc_id"],
+                        source_type=d["source_type"],
+                        source_id=d.get("source_id"),
+                        excerpt=d["excerpt"],
+                        support_kind=d.get("support_kind", "corroborated"),
+                        added_at=_parse_dt(d["added_at"]),
+                    )
+                )
         return results
 
     async def get_source_support_candidates(
@@ -2709,6 +4446,7 @@ class Database:
         writer_visibility: str | None = None,
         writer_owner_user_id: str | None = None,
         writer_project_key: str | None = None,
+        excluded_source_ids: Sequence[str] = (),
     ) -> list[Memory]:
         """Rank active memories that may be supported by the current document.
 
@@ -2727,10 +4465,7 @@ class Database:
         if writer_visibility is not None:
             scope_clauses.append("AND m.visibility = ?")
             scope_params.append(writer_visibility)
-            if (
-                writer_visibility == Visibility.PRIVATE.value
-                and writer_owner_user_id is not None
-            ):
+            if writer_visibility == Visibility.PRIVATE.value and writer_owner_user_id is not None:
                 scope_clauses.append("AND m.owner_user_id = ?")
                 scope_params.append(writer_owner_user_id)
             if writer_visibility == Visibility.WORKSPACE.value:
@@ -2739,6 +4474,22 @@ class Database:
                 # pool stays inside one project boundary.
                 scope_clauses.append("AND m.project_key = ?")
                 scope_params.append(writer_project_key or UNSORTED_PROJECT_KEY)
+        if excluded_source_ids:
+            placeholders_sources = ",".join("?" for _ in excluded_source_ids)
+            scope_clauses.append(
+                f"""AND (
+                    NOT EXISTS (
+                        SELECT 1 FROM memory_sources ms_any
+                        WHERE ms_any.memory_id = m.id
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM memory_sources ms_enabled
+                        WHERE ms_enabled.memory_id = m.id
+                          AND (ms_enabled.source_id IS NULL OR ms_enabled.source_id NOT IN ({placeholders_sources}))
+                    )
+                )"""
+            )
+            scope_params.extend(excluded_source_ids)
         scope_sql = ("\n              " + "\n              ".join(scope_clauses)) if scope_clauses else ""
         sql = f"""
             SELECT m.*,
@@ -2779,6 +4530,7 @@ class Database:
         Returns ``True`` when the memory was retired.
         """
         async with self._write_lock:
+            await self._delete_evidence_graph_for_memory_doc_unlocked(memory_id, doc_id)
             await self.db.execute(
                 "DELETE FROM memory_sources WHERE memory_id = ? AND doc_id = ?",
                 (memory_id, doc_id),
@@ -2924,17 +4676,13 @@ class Database:
                 (canonical_name, entity_type, tags_json, display_name),
             )
             await self.db.commit()
-        async with self.db.execute(
-            "SELECT id FROM entities WHERE canonical_name = ?", (canonical_name,)
-        ) as cursor:
+        async with self.db.execute("SELECT id FROM entities WHERE canonical_name = ?", (canonical_name,)) as cursor:
             row = await cursor.fetchone()
             assert row is not None
             return row[0]
 
     async def get_entity_by_canonical(self, canonical_name: str) -> Entity | None:
-        async with self.db.execute(
-            "SELECT * FROM entities WHERE canonical_name = ?", (canonical_name,)
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM entities WHERE canonical_name = ?", (canonical_name,)) as cursor:
             row = await cursor.fetchone()
             if not row:
                 return None
@@ -2971,9 +4719,7 @@ class Database:
 
     async def get_all_entities(self) -> list[Entity]:
         results: list[Entity] = []
-        async with self.db.execute(
-            "SELECT * FROM entities ORDER BY canonical_name"
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM entities ORDER BY canonical_name") as cursor:
             async for row in cursor:
                 results.append(_entity_from_row(dict(row)))
         return results
@@ -3011,16 +4757,12 @@ class Database:
         return entities, total
 
     async def get_entity(self, entity_id: int) -> Entity | None:
-        async with self.db.execute(
-            "SELECT * FROM entities WHERE id = ?", (entity_id,)
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM entities WHERE id = ?", (entity_id,)) as cursor:
             row = await cursor.fetchone()
             return _entity_from_row(dict(row)) if row else None
 
     async def count_memories_for_entity(self, entity_id: int) -> int:
-        async with self.db.execute(
-            "SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?", (entity_id,)
-        ) as cursor:
+        async with self.db.execute("SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?", (entity_id,)) as cursor:
             count_row = await cursor.fetchone()
             return count_row[0] if count_row else 0
 
@@ -3101,26 +4843,24 @@ class Database:
 
     async def get_aliases_for_entity(self, entity_id: int) -> list[EntityAlias]:
         results: list[EntityAlias] = []
-        async with self.db.execute(
-            "SELECT * FROM entity_aliases WHERE canonical_id = ?", (entity_id,)
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM entity_aliases WHERE canonical_id = ?", (entity_id,)) as cursor:
             async for row in cursor:
                 d = dict(row)
-                results.append(EntityAlias(
-                    alias=d["alias"],
-                    alias_normalized=d["alias_normalized"],
-                    canonical_id=d["canonical_id"],
-                    source=d["source"],
-                    created_at=_parse_dt(d["created_at"]),
-                ))
+                results.append(
+                    EntityAlias(
+                        alias=d["alias"],
+                        alias_normalized=d["alias_normalized"],
+                        canonical_id=d["canonical_id"],
+                        source=d["source"],
+                        created_at=_parse_dt(d["created_at"]),
+                    )
+                )
         return results
 
     async def get_all_aliases(self) -> list[tuple[str, int]]:
         """Return all (alias_normalized, canonical_id) pairs for entity detection."""
         results: list[tuple[str, int]] = []
-        async with self.db.execute(
-            "SELECT alias_normalized, canonical_id FROM entity_aliases"
-        ) as cursor:
+        async with self.db.execute("SELECT alias_normalized, canonical_id FROM entity_aliases") as cursor:
             async for row in cursor:
                 results.append((row["alias_normalized"], row["canonical_id"]))
         return results
@@ -3145,9 +4885,7 @@ class Database:
         consults when memories are extracted from this source. `None`
         leaves the source unbound and resolves writes to `UNSORTED`.
         """
-        binding_json = (
-            json.dumps(dict(project_binding)) if project_binding else None
-        )
+        binding_json = json.dumps(dict(project_binding)) if project_binding else None
         async with self._write_lock:
             await self.db.execute(
                 """INSERT INTO sources (id, type, name, config, status, project_binding, created_by_user_id)
@@ -3167,17 +4905,13 @@ class Database:
             await self.db.commit()
 
     async def get_source(self, source_id: str) -> dict | None:
-        async with self.db.execute(
-            "SELECT * FROM sources WHERE id = ?", (source_id,)
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)) as cursor:
             row = await cursor.fetchone()
             if not row:
                 return None
             d = dict(row)
             d["config"] = json.loads(d["config"])
-            d["project_binding"] = (
-                json.loads(d["project_binding"]) if d.get("project_binding") else None
-            )
+            d["project_binding"] = json.loads(d["project_binding"]) if d.get("project_binding") else None
             d["sync_schedule"] = _source_schedule_from_row(d)
             return d
 
@@ -3213,11 +4947,7 @@ class Database:
                     source["status"],
                     source["last_sync"],
                     source["doc_count"],
-                    (
-                        json.dumps(source["project_binding"])
-                        if source.get("project_binding")
-                        else None
-                    ),
+                    (json.dumps(source["project_binding"]) if source.get("project_binding") else None),
                     source.get("created_by_user_id"),
                     int((source.get("sync_schedule") or {}).get("enabled") or 0),
                     int((source.get("sync_schedule") or {}).get("interval_minutes") or 1440),
@@ -3230,15 +4960,11 @@ class Database:
 
     async def list_sources(self) -> list[dict]:
         results: list[dict] = []
-        async with self.db.execute(
-            "SELECT * FROM sources ORDER BY created_at"
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM sources ORDER BY created_at") as cursor:
             async for row in cursor:
                 d = dict(row)
                 d["config"] = json.loads(d["config"])
-                d["project_binding"] = (
-                    json.loads(d["project_binding"]) if d.get("project_binding") else None
-                )
+                d["project_binding"] = json.loads(d["project_binding"]) if d.get("project_binding") else None
                 d["sync_schedule"] = _source_schedule_from_row(d)
                 results.append(d)
         return results
@@ -3253,13 +4979,11 @@ class Database:
     ) -> None:
         if interval_minutes < SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES:
             raise ValueError(
-                f"source sync schedule interval must be at least "
-                f"{SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES} minutes"
+                f"source sync schedule interval must be at least {SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES} minutes"
             )
         if interval_minutes > SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES:
             raise ValueError(
-                f"source sync schedule interval must be at most "
-                f"{SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES} minutes"
+                f"source sync schedule interval must be at most {SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES} minutes"
             )
         async with self._write_lock:
             async with self.db.execute(
@@ -3274,8 +4998,7 @@ class Database:
             existing = dict(row)
             existing_enabled = bool(existing.get("sync_schedule_enabled"))
             existing_interval = int(
-                existing.get("sync_schedule_interval_minutes")
-                or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+                existing.get("sync_schedule_interval_minutes") or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
             )
             existing_next_at = existing.get("sync_schedule_next_at")
             if not enabled:
@@ -3285,9 +5008,7 @@ class Database:
             elif existing_enabled and existing_interval == interval_minutes and existing_next_at:
                 stored_next_at = existing_next_at
             else:
-                stored_next_at = (
-                    datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
-                ).isoformat()
+                stored_next_at = (datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)).isoformat()
             await self.db.execute(
                 """UPDATE sources SET
                    sync_schedule_enabled = ?,
@@ -3334,8 +5055,7 @@ class Database:
                 rows = [dict(row) async for row in cursor]
             for d in rows:
                 interval_minutes = int(
-                    d.get("sync_schedule_interval_minutes")
-                    or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+                    d.get("sync_schedule_interval_minutes") or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
                 )
                 next_at = claim_time + timedelta(minutes=interval_minutes)
                 updated_at = _now_iso()
@@ -3358,9 +5078,7 @@ class Database:
                     d["sync_schedule_next_at"] = next_at.isoformat()
                     d["sync_schedule_updated_at"] = updated_at
                     d["config"] = json.loads(d["config"])
-                    d["project_binding"] = (
-                        json.loads(d["project_binding"]) if d.get("project_binding") else None
-                    )
+                    d["project_binding"] = json.loads(d["project_binding"]) if d.get("project_binding") else None
                     d["sync_schedule"] = _source_schedule_from_row(d)
                     results.append(d)
             await self.db.commit()
@@ -3376,9 +5094,7 @@ class Database:
                 return True
             return bool(row["enabled"])
 
-    async def set_source_subscription(
-        self, source_id: str, user_id: str, enabled: bool
-    ) -> None:
+    async def set_source_subscription(self, source_id: str, user_id: str, enabled: bool) -> None:
         async with self._write_lock:
             await self.db.execute(
                 """INSERT INTO source_subscriptions
@@ -3512,16 +5228,13 @@ class Database:
     # Projects
     # ------------------------------------------------------------------
 
-    async def create_project(
-        self, *, key: str, name: str, is_shared: bool = False
-    ) -> Project:
+    async def create_project(self, *, key: str, name: str, is_shared: bool = False) -> Project:
         """Insert a project row, raising ValueError if `key` already exists."""
         proj_id = f"proj-{uuid.uuid4().hex[:12]}"
         try:
             async with self._write_lock:
                 await self.db.execute(
-                    "INSERT INTO projects (id, key, name, is_shared) "
-                    "VALUES (?, ?, ?, ?)",
+                    "INSERT INTO projects (id, key, name, is_shared) VALUES (?, ?, ?, ?)",
                     (proj_id, key, name, 1 if is_shared else 0),
                 )
                 await self.db.commit()
@@ -3534,8 +5247,7 @@ class Database:
 
     async def get_project(self, project_id: str) -> Project | None:
         async with self.db.execute(
-            "SELECT id, key, name, is_shared, created_at "
-            "FROM projects WHERE id = ?",
+            "SELECT id, key, name, is_shared, created_at FROM projects WHERE id = ?",
             (project_id,),
         ) as cur:
             row = await cur.fetchone()
@@ -3551,10 +5263,7 @@ class Database:
 
     async def list_projects(self) -> list[Project]:
         out: list[Project] = []
-        async with self.db.execute(
-            "SELECT id, key, name, is_shared, created_at "
-            "FROM projects ORDER BY key"
-        ) as cur:
+        async with self.db.execute("SELECT id, key, name, is_shared, created_at FROM projects ORDER BY key") as cur:
             async for row in cur:
                 out.append(
                     Project(
@@ -3608,20 +5317,14 @@ class Database:
         if target is None:
             raise LookupError(f"project {project_id!r} not found")
         if target.key in (SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY):
-            raise ValueError(
-                f"project {target.key!r} is reserved and cannot be deleted"
-            )
+            raise ValueError(f"project {target.key!r} is reserved and cannot be deleted")
         affected_ids: list[str] = []
-        async with self.db.execute(
-            "SELECT id FROM memories WHERE project_key = ?", (target.key,)
-        ) as cur:
+        async with self.db.execute("SELECT id FROM memories WHERE project_key = ?", (target.key,)) as cur:
             async for row in cur:
                 affected_ids.append(row["id"])
         return affected_ids
 
-    async def commit_project_deletion(
-        self, project_id: str, affected_ids: Sequence[str]
-    ) -> None:
+    async def commit_project_deletion(self, project_id: str, affected_ids: Sequence[str]) -> None:
         """Rebucket the named memories to UNSORTED and drop the project
         row, in one transaction.
 
@@ -3639,20 +5342,15 @@ class Database:
         if target is None:
             return
         if target.key in (SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY):
-            raise ValueError(
-                f"project {target.key!r} is reserved and cannot be deleted"
-            )
+            raise ValueError(f"project {target.key!r} is reserved and cannot be deleted")
         async with self._write_lock:
             if affected_ids:
                 placeholders = ",".join("?" for _ in affected_ids)
                 await self.db.execute(
-                    f"UPDATE memories SET project_key = ? "
-                    f"WHERE id IN ({placeholders}) AND project_key = ?",
+                    f"UPDATE memories SET project_key = ? WHERE id IN ({placeholders}) AND project_key = ?",
                     (UNSORTED_PROJECT_KEY, *affected_ids, target.key),
                 )
-            await self.db.execute(
-                "DELETE FROM projects WHERE id = ?", (project_id,)
-            )
+            await self.db.execute("DELETE FROM projects WHERE id = ?", (project_id,))
             await self.db.commit()
 
     async def delete_source_cascade(self, source_id: str) -> list[str]:
@@ -3665,12 +5363,11 @@ class Database:
             try:
                 retired_ids: list[str] = []
                 doc_ids: list[str] = []
-                async with self.db.execute(
-                    "SELECT doc_id FROM documents WHERE source = ?", (source_id,)
-                ) as cursor:
+                async with self.db.execute("SELECT doc_id FROM documents WHERE source = ?", (source_id,)) as cursor:
                     async for row in cursor:
                         doc_ids.append(row[0])
 
+                await self._delete_evidence_graph_for_source_id_unlocked(source_id)
                 for doc_id in doc_ids:
                     memory_ids: list[str] = []
                     async with self.db.execute(
@@ -3680,43 +5377,24 @@ class Database:
                         async for row in cursor:
                             memory_ids.append(row[0])
 
-                    await self.db.execute(
-                        "DELETE FROM memory_sources WHERE doc_id = ?", (doc_id,)
-                    )
+                    await self.db.execute("DELETE FROM memory_sources WHERE doc_id = ?", (doc_id,))
+                    await self._delete_evidence_graph_for_doc_ids_unlocked([doc_id])
 
-                    retired_ids.extend(
-                        await self._refresh_support_after_source_removal_unlocked(memory_ids)
-                    )
+                    retired_ids.extend(await self._refresh_support_after_source_removal_unlocked(memory_ids))
 
-                    await self.db.execute(
-                        "DELETE FROM document_metadata WHERE doc_id = ?", (doc_id,)
-                    )
+                    await self.db.execute("DELETE FROM document_metadata WHERE doc_id = ?", (doc_id,))
                     await self.db.execute(
                         "DELETE FROM document_relationships WHERE source_doc_id = ? OR target_doc_id = ?",
                         (doc_id, doc_id),
                     )
-                    await self.db.execute(
-                        "DELETE FROM changelog WHERE doc_id = ?", (doc_id,)
-                    )
-                    await self.db.execute(
-                        "DELETE FROM agent_session_receipts WHERE doc_id = ?", (doc_id,)
-                    )
-                    await self.db.execute(
-                        "DELETE FROM documents WHERE doc_id = ?", (doc_id,)
-                    )
+                    await self.db.execute("DELETE FROM changelog WHERE doc_id = ?", (doc_id,))
+                    await self.db.execute("DELETE FROM agent_session_receipts WHERE doc_id = ?", (doc_id,))
+                    await self.db.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
 
-                await self.db.execute(
-                    "DELETE FROM agent_session_receipts WHERE source_id = ?", (source_id,)
-                )
-                await self.db.execute(
-                    "DELETE FROM sync_state WHERE source = ?", (source_id,)
-                )
-                await self.db.execute(
-                    "DELETE FROM sync_history WHERE source = ?", (source_id,)
-                )
-                await self.db.execute(
-                    "DELETE FROM sources WHERE id = ?", (source_id,)
-                )
+                await self.db.execute("DELETE FROM agent_session_receipts WHERE source_id = ?", (source_id,))
+                await self.db.execute("DELETE FROM sync_state WHERE source = ?", (source_id,))
+                await self.db.execute("DELETE FROM sync_history WHERE source = ?", (source_id,))
+                await self.db.execute("DELETE FROM sources WHERE id = ?", (source_id,))
                 await self.db.commit()
                 return list(dict.fromkeys(retired_ids))
             except Exception:
@@ -3963,7 +5641,8 @@ class Database:
     async def get_agent_session_receipt(self, doc_id: str) -> dict | None:
         """Return receipt metadata for one generated agent session document."""
         async with self.db.execute(
-            "SELECT * FROM agent_session_receipts WHERE doc_id = ?", (doc_id,),
+            "SELECT * FROM agent_session_receipts WHERE doc_id = ?",
+            (doc_id,),
         ) as cursor:
             row = await cursor.fetchone()
             if not row:
@@ -4014,10 +5693,7 @@ class Database:
         ``count``, ``reason`` (latest), and ``last_seen_at`` so the admin UI can
         surface an operational warning without a second query.
         """
-        query = (
-            "SELECT metadata, updated_at FROM agent_session_receipts "
-            "WHERE source_kind = ?"
-        )
+        query = "SELECT metadata, updated_at FROM agent_session_receipts WHERE source_kind = ?"
         params: list = [AGENT_SESSION_WINDOW_SOURCE_KIND]
         if session_id:
             query += " AND session_id = ?"
@@ -4042,24 +5718,14 @@ class Database:
                     counts[outcome] += 1
                 if outcome == AGENT_SESSION_OUTCOME_FAILED:
                     seen_at = row[1]
-                    if seen_at and (
-                        latest_failure_seen_at is None
-                        or seen_at > latest_failure_seen_at
-                    ):
+                    if seen_at and (latest_failure_seen_at is None or seen_at > latest_failure_seen_at):
                         latest_failure_seen_at = seen_at
                         reason = metadata.get("reason") if isinstance(metadata, dict) else None
                         latest_failure_reason = reason if isinstance(reason, str) else None
 
         total = sum(counts.values())
-        processed_total = (
-            counts[AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED]
-            + counts[AGENT_SESSION_OUTCOME_NO_OUTPUT]
-        )
-        no_output_fraction = (
-            counts[AGENT_SESSION_OUTCOME_NO_OUTPUT] / processed_total
-            if processed_total
-            else 0.0
-        )
+        processed_total = counts[AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED] + counts[AGENT_SESSION_OUTCOME_NO_OUTPUT]
+        no_output_fraction = counts[AGENT_SESSION_OUTCOME_NO_OUTPUT] / processed_total if processed_total else 0.0
         latest_failure: dict | None = None
         if counts[AGENT_SESSION_OUTCOME_FAILED]:
             latest_failure = {
@@ -4166,9 +5832,7 @@ class Database:
             await self.db.commit()
 
     async def get_sync_state(self, source: str) -> SyncState | None:
-        async with self.db.execute(
-            "SELECT * FROM sync_state WHERE source = ?", (source,)
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM sync_state WHERE source = ?", (source,)) as cursor:
             row = await cursor.fetchone()
             if not row:
                 return None
@@ -4204,10 +5868,17 @@ class Database:
                     started_at, finished_at, run_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    source, status, docs_processed, docs_updated, docs_failed,
-                    memories_extracted, error_message,
+                    source,
+                    status,
+                    docs_processed,
+                    docs_updated,
+                    docs_failed,
+                    memories_extracted,
+                    error_message,
                     json.dumps(failed_docs) if failed_docs else None,
-                    started_at, finished_at, run_id,
+                    started_at,
+                    finished_at,
+                    run_id,
                 ),
             )
             await self.db.commit()
@@ -4337,9 +6008,7 @@ class Database:
     # ==================================================================
 
     async def get_schedule_config(self) -> dict:
-        async with self.db.execute(
-            "SELECT * FROM schedule_config WHERE id = 1"
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM schedule_config WHERE id = 1") as cursor:
             row = await cursor.fetchone()
             if not row:
                 return {
@@ -4384,13 +6053,49 @@ class Database:
     # ==================================================================
 
     async def get_cross_doc_candidates(
-        self, memory_id: str, entity_ids: list[int], doc_id: str,
-    ) -> list[Memory]:
+        self,
+        memory_id: str,
+        entity_ids: list[int],
+        doc_id: str,
+        *,
+        owner_user_id: str | None = None,
+        visibility: str | None = None,
+        project_key: str | None = None,
+        excluded_source_ids: Sequence[str] = (),
+        limit: int = 200,
+    ) -> CandidatePage[Memory]:
         """Find active memories sharing entities with this memory but from different documents."""
         if not entity_ids:
-            return []
+            return CandidatePage(candidates=(), complete=True, requested_limit=limit)
+        if limit < 1:
+            return CandidatePage(candidates=(), complete=True, requested_limit=limit)
 
         placeholders = ",".join("?" for _ in entity_ids)
+        visibility_clause = "AND m.visibility != 'private'"
+        visibility_params: list[str] = []
+        if visibility == "private" and owner_user_id:
+            visibility_clause = "AND (m.visibility != 'private' OR m.owner_user_id = ?)"
+            visibility_params.append(owner_user_id)
+        scope_clause = ""
+        scope_params: list[Any] = []
+        if project_key:
+            scope_clause += " AND m.project_key = ?"
+            scope_params.append(project_key)
+        if excluded_source_ids:
+            source_placeholders = ",".join("?" for _ in excluded_source_ids)
+            scope_clause += f"""
+              AND (
+                  NOT EXISTS (
+                      SELECT 1 FROM memory_sources ms_any
+                      WHERE ms_any.memory_id = m.id
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM memory_sources ms_enabled
+                      WHERE ms_enabled.memory_id = m.id
+                        AND (ms_enabled.source_id IS NULL OR ms_enabled.source_id NOT IN ({source_placeholders}))
+                  )
+              )"""
+            scope_params.extend(excluded_source_ids)
         sql = f"""
             SELECT DISTINCT m.* FROM memories m
             JOIN memory_entities me ON m.id = me.memory_id
@@ -4399,14 +6104,28 @@ class Database:
               AND ms.doc_id != ?
               AND m.id != ?
               AND m.status = 'active'
-            LIMIT 20
+              {visibility_clause}
+              {scope_clause}
+            ORDER BY m.updated_at DESC, m.id
+            LIMIT ?
         """
-        params = [*entity_ids, doc_id, memory_id]
+        params = [
+            *entity_ids,
+            doc_id,
+            memory_id,
+            *visibility_params,
+            *scope_params,
+            limit + 1,
+        ]
         results: list[Memory] = []
         async with self.db.execute(sql, params) as cursor:
             async for row in cursor:
                 results.append(self._row_to_memory(row))
-        return results
+        return CandidatePage(
+            candidates=tuple(results[:limit]),
+            complete=len(results) <= limit,
+            requested_limit=limit,
+        )
 
     async def record_contradiction(
         self,
@@ -4447,9 +6166,14 @@ class Database:
                     created_at, resolved_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    review.id, review.kind, review.status,
-                    review.incumbent_memory_id, review.challenger_memory_id,
-                    review.reason, review.review_note, review.reviewer,
+                    review.id,
+                    review.kind,
+                    review.status,
+                    review.incumbent_memory_id,
+                    review.challenger_memory_id,
+                    review.reason,
+                    review.review_note,
+                    review.reviewer,
                     review.expected_incumbent_updated_at,
                     review.expected_challenger_updated_at,
                     created_at,
@@ -4461,7 +6185,8 @@ class Database:
 
     async def get_memory_review(self, review_id: str) -> MemoryReview | None:
         async with self.db.execute(
-            "SELECT * FROM memory_reviews WHERE id = ?", (review_id,),
+            "SELECT * FROM memory_reviews WHERE id = ?",
+            (review_id,),
         ) as cursor:
             row = await cursor.fetchone()
             if not row:
@@ -4529,8 +6254,7 @@ class Database:
                 existing_review_id = existing["review_id"]
                 if existing_review_id != review_id:
                     raise ValueError(
-                        f"Challenger {challenger_memory_id} is already attached "
-                        f"to review {existing_review_id}"
+                        f"Challenger {challenger_memory_id} is already attached to review {existing_review_id}"
                     )
                 await self.db.execute(
                     """UPDATE memory_review_related_challengers
@@ -4548,6 +6272,105 @@ class Database:
             )
             await self.db.commit()
 
+    async def mark_memory_pending_review_with_case(
+        self,
+        memory_id: str,
+        *,
+        reason: str | None = None,
+        relation_outcome: RelationOutcomeBundle | None = None,
+        review: MemoryReview | None = None,
+        related_review_id: str | None = None,
+    ) -> None:
+        """Atomically quarantine a memory and materialize its review work item."""
+        if review is not None and related_review_id is not None:
+            raise ValueError("review and related_review_id are mutually exclusive")
+        async with self._write_lock:
+            try:
+                if review is not None:
+                    async with self.db.execute(
+                        "SELECT status FROM memory_reviews WHERE id = ?",
+                        (review.id,),
+                    ) as cursor:
+                        existing_review = await cursor.fetchone()
+                    if existing_review is not None and existing_review["status"] != "pending":
+                        await self.db.rollback()
+                        return
+                now = _now_iso()
+                await self.db.execute(
+                    """UPDATE memories
+                       SET status = ?, updated_at = ?
+                       WHERE id = ? AND status IN ('active', 'pending_review')""",
+                    ("pending_review", now, memory_id),
+                )
+                if relation_outcome is not None:
+                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                if related_review_id is not None:
+                    async with self.db.execute(
+                        """SELECT review_id FROM memory_review_related_challengers
+                           WHERE challenger_memory_id = ?""",
+                        (memory_id,),
+                    ) as cursor:
+                        existing = await cursor.fetchone()
+                    if existing:
+                        existing_review_id = existing["review_id"]
+                        if existing_review_id != related_review_id:
+                            raise ValueError(
+                                f"Challenger {memory_id} is already attached to review {existing_review_id}"
+                            )
+                        await self.db.execute(
+                            """UPDATE memory_review_related_challengers
+                               SET reason = COALESCE(?, reason)
+                               WHERE review_id = ? AND challenger_memory_id = ?""",
+                            (reason, related_review_id, memory_id),
+                        )
+                    else:
+                        await self.db.execute(
+                            """INSERT INTO memory_review_related_challengers (
+                                review_id, challenger_memory_id, reason, created_at
+                            ) VALUES (?, ?, ?, ?)""",
+                            (related_review_id, memory_id, reason, now),
+                        )
+                if review is not None:
+                    created_at = review.created_at.isoformat() if review.created_at else now
+                    await self.db.execute(
+                        """INSERT INTO memory_reviews (
+                            id, kind, status, incumbent_memory_id, challenger_memory_id,
+                            reason, review_note, reviewer,
+                            expected_incumbent_updated_at, expected_challenger_updated_at,
+                            created_at, resolved_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            kind=excluded.kind,
+                            status=excluded.status,
+                            incumbent_memory_id=excluded.incumbent_memory_id,
+                            challenger_memory_id=excluded.challenger_memory_id,
+                            reason=excluded.reason,
+                            review_note=excluded.review_note,
+                            reviewer=excluded.reviewer,
+                            expected_incumbent_updated_at=excluded.expected_incumbent_updated_at,
+                            expected_challenger_updated_at=excluded.expected_challenger_updated_at,
+                            resolved_at=excluded.resolved_at
+                        WHERE memory_reviews.status = 'pending'""",
+                        (
+                            review.id,
+                            review.kind,
+                            review.status,
+                            review.incumbent_memory_id,
+                            review.challenger_memory_id,
+                            review.reason,
+                            review.review_note,
+                            review.reviewer,
+                            review.expected_incumbent_updated_at,
+                            review.expected_challenger_updated_at,
+                            created_at,
+                            review.resolved_at.isoformat() if review.resolved_at else None,
+                        ),
+                    )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
     async def list_memory_review_related_challengers(
         self,
         review_id: str,
@@ -4561,12 +6384,14 @@ class Database:
         ) as cursor:
             async for row in cursor:
                 d = dict(row)
-                results.append(MemoryReviewRelatedChallenger(
-                    review_id=d["review_id"],
-                    challenger_memory_id=d["challenger_memory_id"],
-                    reason=d["reason"],
-                    created_at=_parse_dt(d["created_at"]),
-                ))
+                results.append(
+                    MemoryReviewRelatedChallenger(
+                        review_id=d["review_id"],
+                        challenger_memory_id=d["challenger_memory_id"],
+                        reason=d["reason"],
+                        created_at=_parse_dt(d["created_at"]),
+                    )
+                )
         return results
 
     async def list_memory_reviews(
@@ -4726,9 +6551,7 @@ class Database:
     # ==================================================================
 
     async def get_llm_config(self) -> dict:
-        async with self.db.execute(
-            "SELECT * FROM llm_config WHERE id = 1"
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM llm_config WHERE id = 1") as cursor:
             row = await cursor.fetchone()
             if not row:
                 return {
@@ -4795,9 +6618,7 @@ class Database:
             return cursor.lastrowid or 0
 
     async def get_user_by_username(self, username: str) -> dict | None:
-        async with self.db.execute(
-            "SELECT * FROM users WHERE username = ?", (username,)
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM users WHERE username = ?", (username,)) as cursor:
             row = await cursor.fetchone()
             if not row:
                 return None
@@ -4818,9 +6639,7 @@ class Database:
 
     async def delete_user(self, user_id: int) -> None:
         async with self._write_lock:
-            await self.db.execute(
-                "DELETE FROM users WHERE id = ?", (user_id,)
-            )
+            await self.db.execute("DELETE FROM users WHERE id = ?", (user_id,))
             await self.db.commit()
 
     # ==================================================================
@@ -4880,6 +6699,25 @@ class Database:
             curation_cluster_id=d.get("curation_cluster_id"),
             created_at=_parse_dt(d.get("created_at")),
             updated_at=_parse_dt(d.get("updated_at")),
+        )
+
+    def _row_to_candidate_memory(self, row) -> CandidateMemory:
+        d = dict(row)
+        try:
+            source_metadata = json.loads(d.get("source_metadata_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            source_metadata = {}
+        return CandidateMemory(
+            memory_id=d["memory_id"],
+            source_id=d.get("source_id"),
+            doc_id=d.get("doc_id"),
+            source_lineage_id=d.get("source_lineage_id"),
+            visibility=d["visibility"],
+            owner_user_id=d.get("owner_user_id"),
+            repo_identifier=d.get("repo_identifier"),
+            doc_revision_id=d.get("doc_revision_id"),
+            source_anchor=d.get("source_anchor"),
+            source_metadata=source_metadata,
         )
 
     def _row_to_memory_curation_run(self, row) -> MemoryCurationRun:
