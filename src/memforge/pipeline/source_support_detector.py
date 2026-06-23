@@ -570,6 +570,7 @@ class SourceSupportDetector:
             lifecycle_action=lifecycle.action,
             review_case=lifecycle.review_case,
             status="applied" if lifecycle.action is LifecycleAction.ATTACH_SUPPORT else "review",
+            result_memory_id=memory.id,
             audit={"source": "SourceSupportDetector.detect_and_persist"},
         )
         relations: list[EvidenceRelationRecord] = []

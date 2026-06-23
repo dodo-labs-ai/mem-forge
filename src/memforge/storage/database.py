@@ -1434,6 +1434,11 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "CREATE INDEX IF NOT EXISTS idx_relation_runs_result_memory ON relation_runs(result_memory_id)",
         ],
     ),
+    (
+        26,
+        "Backfill relation-run candidate and relation snapshot audit hashes",
+        [],
+    ),
 ]
 
 
@@ -1490,12 +1495,42 @@ class Database:
                         )
                     else:
                         raise
+            if version == 26:
+                await self._backfill_relation_run_snapshot_audit()
             await self.db.execute(
                 "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, _now_iso()),
             )
             await self.db.commit()
             logger.info("Applied migration %d: %s", version, description)
+
+    async def _backfill_relation_run_snapshot_audit(self) -> None:
+        """Backfill immutable retry snapshot hashes for pre-hardening relation runs."""
+
+        async with self.db.execute("SELECT id, audit_json FROM relation_runs") as cursor:
+            rows = [row async for row in cursor]
+        for row in rows:
+            run_id = row["id"]
+            audit = json.loads(row["audit_json"] or "{}")
+            candidates = await self._get_relation_candidates_unlocked(run_id)
+            relations = await self._get_relation_run_relations_unlocked(run_id)
+            snapshot_audit = relation_bundle_snapshot_audit(candidates=candidates, relations=relations)
+            changed = False
+            for key, value in snapshot_audit.items():
+                existing = audit.get(key)
+                if existing is not None and existing != value:
+                    raise RuntimeError(
+                        "relation_run_id collision for "
+                        f"{run_id}: committed audit does not match stored relation snapshot ({key})"
+                    )
+                if existing is None:
+                    audit[key] = value
+                    changed = True
+            if changed:
+                await self.db.execute(
+                    "UPDATE relation_runs SET audit_json = ? WHERE id = ?",
+                    (json.dumps(audit, sort_keys=True), run_id),
+                )
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -2308,6 +2343,37 @@ class Database:
                 )
         return rows
 
+    async def _get_relation_run_relations_unlocked(
+        self,
+        relation_run_id: str,
+    ) -> list[EvidenceRelationRecord]:
+        rows: list[EvidenceRelationRecord] = []
+        async with self.db.execute(
+            """SELECT * FROM relation_run_relations
+               WHERE relation_run_id = ?
+               ORDER BY memory_id, relation_type, relation_run_id""",
+            (relation_run_id,),
+        ) as cursor:
+            async for row in cursor:
+                rows.append(
+                    EvidenceRelationRecord(
+                        evidence_unit_id=row["evidence_unit_id"],
+                        memory_id=row["memory_id"],
+                        relation_type=RelationType(row["relation_type"]),
+                        authority_case=AuthorityCase(row["authority_case"]),
+                        is_authoritative_support=bool(row["is_authoritative_support"]),
+                        source_lineage_id=row["source_lineage_id"],
+                        confidence=row["confidence"],
+                        reason=row["reason"],
+                        proposed_memory_content=row["proposed_memory_content"],
+                        excerpt=row["excerpt"],
+                        classifier_version=row["classifier_version"],
+                        relation_run_id=row["relation_run_id"],
+                        created_at=row["created_at"],
+                    )
+                )
+        return rows
+
     async def record_relation_outcome_bundle(self, bundle: RelationOutcomeBundle) -> None:
         """Persist one complete relation outcome in a single transaction."""
         async with self._write_lock:
@@ -2510,31 +2576,7 @@ class Database:
                 f"{bundle.relation_run.id}: existing run does not match retry payload (relation_candidates)"
             )
 
-        stored_relations: list[EvidenceRelationRecord] = []
-        async with self.db.execute(
-            """SELECT * FROM relation_run_relations
-               WHERE relation_run_id = ?
-               ORDER BY memory_id, relation_type, relation_run_id""",
-            (bundle.relation_run.id,),
-        ) as cursor:
-            async for row in cursor:
-                stored_relations.append(
-                    EvidenceRelationRecord(
-                        evidence_unit_id=row["evidence_unit_id"],
-                        memory_id=row["memory_id"],
-                        relation_type=RelationType(row["relation_type"]),
-                        authority_case=AuthorityCase(row["authority_case"]),
-                        is_authoritative_support=bool(row["is_authoritative_support"]),
-                        source_lineage_id=row["source_lineage_id"],
-                        confidence=row["confidence"],
-                        reason=row["reason"],
-                        proposed_memory_content=row["proposed_memory_content"],
-                        excerpt=row["excerpt"],
-                        classifier_version=row["classifier_version"],
-                        relation_run_id=row["relation_run_id"],
-                        created_at=row["created_at"],
-                    )
-                )
+        stored_relations = await self._get_relation_run_relations_unlocked(bundle.relation_run.id)
         committed_relation_hash = committed_audit.get("relation_snapshot_hash")
         if committed_relation_hash is None:
             raise RuntimeError(

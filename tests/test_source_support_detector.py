@@ -236,6 +236,7 @@ async def test_detect_and_persist_routes_corroborated_support_through_store(db: 
         relation_runs = [dict(row) async for row in cursor]
     assert len(relation_runs) == 1
     assert relation_runs[0]["lifecycle_action"] == LifecycleAction.ATTACH_SUPPORT.value
+    assert relation_runs[0]["result_memory_id"] == memory.id
     evidence_unit = await db.get_evidence_unit(relation_runs[0]["evidence_unit_id"])
     assert evidence_unit is not None
     assert evidence_unit.doc_id == "doc-support"
@@ -249,6 +250,36 @@ async def test_detect_and_persist_routes_corroborated_support_through_store(db: 
     assert [(candidate.memory_id, candidate.bucket, candidate.was_checked) for candidate in candidates] == [
         (memory.id, CandidateBucket.SHARED_ENTITIES, True)
     ]
+
+    run_id = relation_runs[0]["id"]
+    assert await db.remove_memory_source(memory.id, "doc-support") is False
+    assert await db.get_relation_run(run_id) is None
+    assert await db.get_evidence_unit(evidence_unit.id) is None
+
+    retry_client = FakeStructuredSupportClient(
+        [
+            _support_response(
+                [
+                    {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "same rule"},
+                ]
+            )
+        ]
+    )
+    retry_detector = SourceSupportDetector(structured_llm_client=retry_client)
+    retry_store = RecordingStore()
+
+    retry_result = await retry_detector.detect_and_persist(
+        doc_id="doc-support",
+        source_type="confluence",
+        document=excerpt,
+        entity_ids=[entity_id],
+        project_key="PAY",
+        db=db,
+        memory_store=retry_store,  # type: ignore[arg-type]
+    )
+
+    assert retry_result["added"] == 1
+    assert await db.get_relation_run(run_id) is not None
 
 
 @pytest.mark.asyncio
