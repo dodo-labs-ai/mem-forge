@@ -29,17 +29,27 @@ def _config(tmp_path: Path) -> AppConfig:
     return cfg
 
 
+def _durable(
+    rule: str,
+    *,
+    scope: str = "Agent-session memory extraction.",
+    rationale: str | None = None,
+) -> dict:
+    return {"rule": rule, "scope": scope, "rationale": rationale}
+
+
 def _knowledge_patch(**overrides) -> AgentKnowledgePatchProposal:
     claim_text = overrides.get(
         "claim_text",
         "The agent session window recorded a durable implementation rule.",
     )
+    action = overrides.get("action", "create_new_concept")
     data = {
         "action": "create_new_concept",
         "concept_type": "debugging_takeaway",
         "title": "Agent session durable rule",
         "claim_text": claim_text,
-        "memory_content": claim_text,
+        "durable_claim": None if action == "no_output" else _durable(claim_text),
         "memory_type": "procedure",
         "tags": ["agent-session"],
         "confidence": 0.9,
@@ -363,7 +373,7 @@ def test_agent_session_window_api_generates_package_and_discards_raw_window(tmp_
 
     class FakeWindowClient:
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
-            assert "Canonical evidence" in prompt
+            assert "<candidate_evidence>" in prompt
             assert "api_key: [REDACTED]" in prompt
             assert "token: secret-value" not in prompt
             assert "raw-api-secret" not in prompt
@@ -440,7 +450,7 @@ def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_pa
 
     class FakeWindowClient:
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
-            assert "Canonical evidence" in prompt
+            assert "<candidate_evidence>" in prompt
             assert "apply_patch" in prompt
             assert "Edited src/memforge/hook_adapter.py" in prompt
             assert "service-json-secret" not in prompt
@@ -740,7 +750,7 @@ def test_agent_session_window_api_records_failed_outcome_for_parse_failed_patch(
 
     class ParseFailedPatchClient:
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
-            return _knowledge_patch(memory_content=None)
+            return _knowledge_patch(durable_claim=None)
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "api.db"))
@@ -767,12 +777,12 @@ def test_agent_session_window_api_records_failed_outcome_for_parse_failed_patch(
         body = response.json()
         assert body["result"] == "failed"
         assert body["patch_outcome"] == "parse_failed"
-        assert body["reason"] == "memory_content is required"
+        assert body["reason"] == "durable_claim is required"
 
         async def _assert_failed_receipt():
             summary = await database.summarize_agent_session_outcomes(session_id="sess-window-parse-failed")
             assert summary["counts"]["failed"] == 1
-            assert summary["latest_failure"]["reason"] == "memory_content is required"
+            assert summary["latest_failure"]["reason"] == "durable_claim is required"
 
         asyncio.run(_assert_failed_receipt())
     finally:
@@ -961,7 +971,7 @@ def test_agent_session_window_can_patch_existing_private_claim(tmp_path):
                 return _knowledge_patch(
                     title="Scheduler lifecycle",
                     claim_text="Workspace source schedulers must start during app startup.",
-                    memory_content="Workspace source schedulers must start during app startup.",
+                    durable_claim=_durable("Workspace source schedulers must start during app startup."),
                 )
             assert f"concept_id={self.created_concept_id}" in prompt
             assert f"claim_id={self.created_claim_id}" in prompt
@@ -973,7 +983,7 @@ def test_agent_session_window_can_patch_existing_private_claim(tmp_path):
                     "Workspace source schedulers must start during app startup "
                     "and advance next_run_at after claiming overdue schedules."
                 ),
-                memory_content="Workspace source schedulers start during app startup and advance next_run_at after claiming overdue schedules.",
+                durable_claim=_durable("Workspace source schedulers start during app startup and advance next_run_at after claiming overdue schedules."),
             )
 
     cfg = _config(tmp_path)
@@ -1086,7 +1096,7 @@ def test_agent_session_memory_detail_exposes_source_updated_at(tmp_path):
             return _knowledge_patch(
                 title="Observed timestamp contract",
                 claim_text="Agent-session memory provenance keeps the source updated time separate.",
-                memory_content="Agent-session memory provenance keeps the source updated time separate.",
+                durable_claim=_durable("Agent-session memory provenance keeps the source updated time separate."),
             )
 
     cfg = _config(tmp_path)
@@ -1158,7 +1168,7 @@ def test_agent_session_window_rejects_naive_source_updated_at(tmp_path):
             return _knowledge_patch(
                 title="Naive timestamp rejected",
                 claim_text="Timezone-naive source timestamps must not be accepted.",
-                memory_content="Timezone-naive source timestamps must not be accepted.",
+                durable_claim=_durable("Timezone-naive source timestamps must not be accepted."),
             )
 
     cfg = _config(tmp_path)
@@ -1210,7 +1220,7 @@ def test_agent_session_memory_detail_does_not_fallback_source_updated_at(tmp_pat
             return _knowledge_patch(
                 title="No fallback timestamp",
                 claim_text="Agent-session provenance does not invent a source observation time.",
-                memory_content="Agent-session provenance does not invent a source observation time.",
+                durable_claim=_durable("Agent-session provenance does not invent a source observation time."),
             )
 
     cfg = _config(tmp_path)
