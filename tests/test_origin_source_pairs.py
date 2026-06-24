@@ -56,7 +56,7 @@ async def _add_source(
 ) -> None:
     await _insert_doc(db, doc_id, client=client)
     await db.add_memory_source(
-        memory_id, doc_id, source_type, "excerpt", support_kind=support_kind, source_observed_at=None
+        memory_id, doc_id, source_type, "excerpt", support_kind=support_kind, source_updated_at=None
     )
     # add_memory_source stamps added_at to now(); override it so ordering is testable.
     await db.db.execute(

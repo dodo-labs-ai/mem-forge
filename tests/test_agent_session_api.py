@@ -29,17 +29,27 @@ def _config(tmp_path: Path) -> AppConfig:
     return cfg
 
 
+def _durable(
+    rule: str,
+    *,
+    scope: str = "Agent-session memory extraction.",
+    rationale: str | None = None,
+) -> dict:
+    return {"rule": rule, "scope": scope, "rationale": rationale}
+
+
 def _knowledge_patch(**overrides) -> AgentKnowledgePatchProposal:
     claim_text = overrides.get(
         "claim_text",
         "The agent session window recorded a durable implementation rule.",
     )
+    action = overrides.get("action", "create_new_concept")
     data = {
         "action": "create_new_concept",
         "concept_type": "debugging_takeaway",
         "title": "Agent session durable rule",
         "claim_text": claim_text,
-        "memory_content": claim_text,
+        "durable_claim": None if action == "no_output" else _durable(claim_text),
         "memory_type": "procedure",
         "tags": ["agent-session"],
         "confidence": 0.9,
@@ -94,7 +104,7 @@ async def _seed_source_project(
             status="active",
         )
         await db.insert_memory(memory)
-        await db.add_memory_source(memory.id, doc_id, "agent_session", source_observed_at=None)
+        await db.add_memory_source(memory.id, doc_id, "agent_session", source_updated_at=None)
 
 
 def test_agent_session_document_submit_api_records_generated_source(tmp_path):
@@ -363,7 +373,7 @@ def test_agent_session_window_api_generates_package_and_discards_raw_window(tmp_
 
     class FakeWindowClient:
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
-            assert "Canonical evidence" in prompt
+            assert "<candidate_evidence>" in prompt
             assert "api_key: [REDACTED]" in prompt
             assert "token: secret-value" not in prompt
             assert "raw-api-secret" not in prompt
@@ -440,7 +450,7 @@ def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_pa
 
     class FakeWindowClient:
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
-            assert "Canonical evidence" in prompt
+            assert "<candidate_evidence>" in prompt
             assert "apply_patch" in prompt
             assert "Edited src/memforge/hook_adapter.py" in prompt
             assert "service-json-secret" not in prompt
@@ -740,7 +750,7 @@ def test_agent_session_window_api_records_failed_outcome_for_parse_failed_patch(
 
     class ParseFailedPatchClient:
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
-            return _knowledge_patch(memory_content=None)
+            return _knowledge_patch(durable_claim=None)
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "api.db"))
@@ -767,12 +777,12 @@ def test_agent_session_window_api_records_failed_outcome_for_parse_failed_patch(
         body = response.json()
         assert body["result"] == "failed"
         assert body["patch_outcome"] == "parse_failed"
-        assert body["reason"] == "memory_content is required"
+        assert body["reason"] == "durable_claim is required"
 
         async def _assert_failed_receipt():
             summary = await database.summarize_agent_session_outcomes(session_id="sess-window-parse-failed")
             assert summary["counts"]["failed"] == 1
-            assert summary["latest_failure"]["reason"] == "memory_content is required"
+            assert summary["latest_failure"]["reason"] == "durable_claim is required"
 
         asyncio.run(_assert_failed_receipt())
     finally:
@@ -961,7 +971,7 @@ def test_agent_session_window_can_patch_existing_private_claim(tmp_path):
                 return _knowledge_patch(
                     title="Scheduler lifecycle",
                     claim_text="Workspace source schedulers must start during app startup.",
-                    memory_content="Workspace source schedulers must start during app startup.",
+                    durable_claim=_durable("Workspace source schedulers must start during app startup."),
                 )
             assert f"concept_id={self.created_concept_id}" in prompt
             assert f"claim_id={self.created_claim_id}" in prompt
@@ -973,7 +983,7 @@ def test_agent_session_window_can_patch_existing_private_claim(tmp_path):
                     "Workspace source schedulers must start during app startup "
                     "and advance next_run_at after claiming overdue schedules."
                 ),
-                memory_content="Workspace source schedulers start during app startup and advance next_run_at after claiming overdue schedules.",
+                durable_claim=_durable("Workspace source schedulers start during app startup and advance next_run_at after claiming overdue schedules."),
             )
 
     cfg = _config(tmp_path)
@@ -1057,7 +1067,7 @@ def test_agent_session_window_api_records_no_output_receipt(tmp_path):
                     "workspace": "/workspace/mem-forge",
                     "events": [{"role": "assistant", "text": "Sure, that formats text."}],
                     "submitted_at": "2026-06-23T22:00:00+00:00",
-                    "source_observed_at": "2026-06-20T04:23:51Z",
+                    "source_updated_at": "2026-06-20T04:23:51Z",
                 },
             )
 
@@ -1070,23 +1080,23 @@ def test_agent_session_window_api_records_no_output_receipt(tmp_path):
             metadata = receipts[0]["metadata"]
             assert metadata["outcome"] == "no_output"
             assert metadata["reason"] == "trivial chat"
-            assert "source_observed_at" not in metadata
+            assert "source_updated_at" not in metadata
 
         asyncio.run(_check())
     finally:
         asyncio.run(database.close())
 
 
-def test_agent_session_memory_detail_exposes_source_observed_at(tmp_path):
-    """Memory provenance reports the source event time separately from link time."""
+def test_agent_session_memory_detail_exposes_source_updated_at(tmp_path):
+    """Memory provenance reports the source updated time separately from link time."""
     from memforge.server.admin_api import create_admin_app
 
     class PackageClient:
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
             return _knowledge_patch(
                 title="Observed timestamp contract",
-                claim_text="Agent-session memory provenance keeps the source event time separate.",
-                memory_content="Agent-session memory provenance keeps the source event time separate.",
+                claim_text="Agent-session memory provenance keeps the source updated time separate.",
+                durable_claim=_durable("Agent-session memory provenance keeps the source updated time separate."),
             )
 
     cfg = _config(tmp_path)
@@ -1107,7 +1117,7 @@ def test_agent_session_memory_detail_exposes_source_observed_at(tmp_path):
                 "/api/agent-sessions/windows",
                 json={
                     "client": "codex",
-                    "session_id": "sess-source-observed",
+                    "session_id": "sess-source-updated",
                     "trigger": "Stop",
                     "workspace": "/workspace/mem-forge",
                     "events": [
@@ -1119,7 +1129,7 @@ def test_agent_session_memory_detail_exposes_source_observed_at(tmp_path):
                         }
                     ],
                     "submitted_at": "2026-06-23T22:00:00+00:00",
-                    "source_observed_at": "2026-06-20T04:23:51Z",
+                    "source_updated_at": "2026-06-20T04:23:51Z",
                 },
             )
             assert response.status_code == 200, response.text
@@ -1130,8 +1140,8 @@ def test_agent_session_memory_detail_exposes_source_observed_at(tmp_path):
         assert detail.status_code == 200, detail.text
         body = detail.json()
         source = body["sources"][0]
-        assert source["source_observed_at"] == "2026-06-20T04:23:51+00:00"
-        assert source["added_at"] != source["source_observed_at"]
+        assert source["source_updated_at"] == "2026-06-20T04:23:51+00:00"
+        assert source["added_at"] != source["source_updated_at"]
         assert not body["created_at"].startswith("2026-06-20T04:23:51")
 
         async def _claim() -> dict:
@@ -1149,7 +1159,7 @@ def test_agent_session_memory_detail_exposes_source_observed_at(tmp_path):
         asyncio.run(database.close())
 
 
-def test_agent_session_window_rejects_naive_source_observed_at(tmp_path):
+def test_agent_session_window_rejects_naive_source_updated_at(tmp_path):
     """Source observation time must be timezone-explicit; it is never localized."""
     from memforge.server.admin_api import create_admin_app
 
@@ -1158,7 +1168,7 @@ def test_agent_session_window_rejects_naive_source_observed_at(tmp_path):
             return _knowledge_patch(
                 title="Naive timestamp rejected",
                 claim_text="Timezone-naive source timestamps must not be accepted.",
-                memory_content="Timezone-naive source timestamps must not be accepted.",
+                durable_claim=_durable("Timezone-naive source timestamps must not be accepted."),
             )
 
     cfg = _config(tmp_path)
@@ -1179,7 +1189,7 @@ def test_agent_session_window_rejects_naive_source_observed_at(tmp_path):
                 "/api/agent-sessions/windows",
                 json={
                     "client": "codex",
-                    "session_id": "sess-naive-source-observed",
+                    "session_id": "sess-naive-source-updated",
                     "trigger": "Stop",
                     "workspace": "/workspace/mem-forge",
                     "events": [
@@ -1191,18 +1201,18 @@ def test_agent_session_window_rejects_naive_source_observed_at(tmp_path):
                         }
                     ],
                     "submitted_at": "2026-06-23T22:00:00+00:00",
-                    "source_observed_at": "2026-06-20T04:23:51",
+                    "source_updated_at": "2026-06-20T04:23:51",
                 },
             )
 
         assert response.status_code == 400, response.text
-        assert "source_observed_at must include an explicit timezone offset" in response.text
+        assert "source_updated_at must include an explicit timezone offset" in response.text
     finally:
         asyncio.run(database.close())
 
 
-def test_agent_session_memory_detail_does_not_fallback_source_observed_at(tmp_path):
-    """Absent source event time stays unknown instead of copying submitted_at."""
+def test_agent_session_memory_detail_does_not_fallback_source_updated_at(tmp_path):
+    """Absent source updated time stays unknown instead of copying submitted_at."""
     from memforge.server.admin_api import create_admin_app
 
     class PackageClient:
@@ -1210,7 +1220,7 @@ def test_agent_session_memory_detail_does_not_fallback_source_observed_at(tmp_pa
             return _knowledge_patch(
                 title="No fallback timestamp",
                 claim_text="Agent-session provenance does not invent a source observation time.",
-                memory_content="Agent-session provenance does not invent a source observation time.",
+                durable_claim=_durable("Agent-session provenance does not invent a source observation time."),
             )
 
     cfg = _config(tmp_path)
@@ -1231,7 +1241,7 @@ def test_agent_session_memory_detail_does_not_fallback_source_observed_at(tmp_pa
                 "/api/agent-sessions/windows",
                 json={
                     "client": "codex",
-                    "session_id": "sess-no-source-observed",
+                    "session_id": "sess-no-source-updated",
                     "trigger": "Stop",
                     "workspace": "/workspace/mem-forge",
                     "events": [
@@ -1251,7 +1261,7 @@ def test_agent_session_memory_detail_does_not_fallback_source_observed_at(tmp_pa
 
         assert detail.status_code == 200, detail.text
         source = detail.json()["sources"][0]
-        assert source["source_observed_at"] is None
+        assert source["source_updated_at"] is None
         assert source["added_at"] != "2026-06-23T22:00:00+00:00"
     finally:
         asyncio.run(database.close())
@@ -1820,7 +1830,7 @@ def test_memories_endpoint_exposes_origin_client_for_agent_session_memories(tmp_
             status="active",
         )
         await database.insert_memory(jira_memory)
-        await database.add_memory_source(jira_memory.id, jira_doc_id, "jira", source_observed_at=None)
+        await database.add_memory_source(jira_memory.id, jira_doc_id, "jira", source_updated_at=None)
 
     import asyncio
 

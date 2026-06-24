@@ -127,8 +127,8 @@ async def test_source_filter_applies_to_vector_hits(db, monkeypatch):
     await db.insert_memory(unbacked)
     await _document(db, "doc-wiki", "wiki")
     await _document(db, "doc-other", "other")
-    await db.add_memory_source("m-backed", "doc-wiki", "wiki", None, source_observed_at=None)
-    await db.add_memory_source("m-unbacked", "doc-other", "other", None, source_observed_at=None)
+    await db.add_memory_source("m-backed", "doc-wiki", "wiki", None, source_updated_at=None)
+    await db.add_memory_source("m-unbacked", "doc-other", "other", None, source_updated_at=None)
 
     async def fake_analyze_query(*args, **kwargs):
         return QueryAnalysis()
@@ -168,14 +168,14 @@ async def test_structured_source_filter_applies_to_vector_hits(db, monkeypatch):
     await _document(db, "doc-codex", "src-agent-codex", client="codex")
     await _document(db, "doc-jira", "src-jira")
     await _document(db, "doc-other-repo", "src-agent-codex", client="codex")
-    await db.add_memory_source("m-codex", "doc-codex", "agent_session", None, source_observed_at=None)
-    await db.add_memory_source("m-jira", "doc-jira", "jira", None, source_observed_at=None)
+    await db.add_memory_source("m-codex", "doc-codex", "agent_session", None, source_updated_at=None)
+    await db.add_memory_source("m-jira", "doc-jira", "jira", None, source_updated_at=None)
     await db.add_memory_source(
         "m-other-repo",
         "doc-other-repo",
         "agent_session",
         None,
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     async def fake_analyze_query(*args, **kwargs):

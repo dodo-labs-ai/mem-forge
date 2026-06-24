@@ -509,7 +509,7 @@ def test_resolved_projects_endpoint_groups_memories_by_resolved_key(tmp_path):
                 doc_id=doc,
                 source_type="agent_session",
                 excerpt=None,
-                source_observed_at=None,
+                source_updated_at=None,
             )
 
     asyncio.run(_seed())

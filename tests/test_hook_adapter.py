@@ -1902,7 +1902,7 @@ def test_session_window_payload_filters_codex_bootstrap_before_budgeting(tmp_pat
     assert "private developer instruction" not in payload["transcript_markdown"]
     assert "AGENTS.md" not in payload["transcript_markdown"]
     assert "apply_patch" in payload["transcript_markdown"]
-    assert payload["source_observed_at"] == "2026-05-30T12:00:10+00:00"
+    assert payload["source_updated_at"] == "2026-05-30T12:00:10+00:00"
     assert payload["receipt"]["metadata"]["omissions"]["metadata_or_context"] == 5
 
 
@@ -1951,10 +1951,10 @@ def test_session_window_payload_uses_earliest_offset_aware_event_timestamp(tmp_p
         trigger="REQUIRED_CAPTURE",
     )
 
-    assert payload["source_observed_at"] == "2026-05-30T12:00:10+00:00"
+    assert payload["source_updated_at"] == "2026-05-30T12:00:10+00:00"
 
 
-def test_session_window_payload_rejects_naive_source_observed_at(tmp_path):
+def test_session_window_payload_rejects_naive_source_updated_at(tmp_path):
     from memforge import hook_adapter
 
     transcript = tmp_path / "codex-naive-timestamp.jsonl"
@@ -1986,7 +1986,7 @@ def test_session_window_payload_rejects_naive_source_observed_at(tmp_path):
         )
 
 
-def test_session_window_payload_rejects_invalid_source_observed_at(tmp_path):
+def test_session_window_payload_rejects_invalid_source_updated_at(tmp_path):
     from memforge import hook_adapter
 
     transcript = tmp_path / "codex-invalid-timestamp.jsonl"
@@ -2018,7 +2018,7 @@ def test_session_window_payload_rejects_invalid_source_observed_at(tmp_path):
         )
 
 
-def test_session_window_payload_omits_source_observed_at_without_event_timestamp(tmp_path):
+def test_session_window_payload_omits_source_updated_at_without_event_timestamp(tmp_path):
     from memforge import hook_adapter
 
     transcript = tmp_path / "codex-no-timestamp.jsonl"
@@ -2046,7 +2046,7 @@ def test_session_window_payload_omits_source_observed_at_without_event_timestamp
         trigger="REQUIRED_CAPTURE",
     )
 
-    assert "source_observed_at" not in payload
+    assert "source_updated_at" not in payload
 
 
 def test_session_window_payload_middle_truncates_oversized_evidence_line(monkeypatch, tmp_path):

@@ -100,7 +100,7 @@ async def test_process_memories_inserts_through_the_adapters(db, monkeypatch):
         raw_memories=[RawMemory(content="deploy via ArgoCD", memory_type="fact")],
         source_type="manual",
         repo_identifier="github.com/shno-labs/mem-forge",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     assert stats["inserted"] == 1
     rows = await db.get_memories_by_source_doc("doc1")
@@ -124,7 +124,7 @@ async def test_process_memories_inserts_through_the_adapters(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_process_memories_persists_explicit_source_observed_at(db, monkeypatch):
+async def test_process_memories_persists_explicit_source_updated_at(db, monkeypatch):
     collection = RecordingCollection()
     adapters = build_sqlite_adapters(db, collection)
     store = MemoryStore(
@@ -152,13 +152,13 @@ async def test_process_memories_persists_explicit_source_observed_at(db, monkeyp
         doc_id="doc-observed",
         raw_memories=[RawMemory(content="historical session produced a durable finding", memory_type="fact")],
         source_type="agent_session",
-        source_observed_at=observed_at,
+        source_updated_at=observed_at,
     )
 
     assert stats["inserted"] == 1
     [memory] = await db.get_memories_by_source_doc("doc-observed")
     [source] = await db.get_memory_sources(memory.id)
-    assert source.source_observed_at == observed_at
+    assert source.source_updated_at == observed_at
 
 
 @pytest.mark.asyncio
@@ -186,7 +186,7 @@ async def test_process_memories_does_not_rematerialize_superseded_evidence_unit(
     )
     raw = RawMemory(content="deploy via ArgoCD", memory_type="fact")
     first = await engine.process_memories(
-        doc_id="doc1", raw_memories=[raw], source_type="manual", source_observed_at=None
+        doc_id="doc1", raw_memories=[raw], source_type="manual", source_updated_at=None
     )
     [old_memory] = await db.get_memories_by_source_doc("doc1")
     now = datetime.now(timezone.utc)
@@ -208,7 +208,7 @@ async def test_process_memories_does_not_rematerialize_superseded_evidence_unit(
     )
 
     second = await engine.process_memories(
-        doc_id="doc1", raw_memories=[raw], source_type="manual", source_observed_at=None
+        doc_id="doc1", raw_memories=[raw], source_type="manual", source_updated_at=None
     )
     async with db.db.execute("SELECT evidence_unit_id FROM relation_runs ORDER BY id LIMIT 1") as cursor:
         row = await cursor.fetchone()

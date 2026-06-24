@@ -371,14 +371,14 @@ class TestReviewCrud:
             "doc-review-incumbent",
             "confluence",
             excerpt="incumbent source",
-            source_observed_at=None,
+            source_updated_at=None,
         )
         await db.add_memory_source(
             challenger.id,
             "doc-review-challenger",
             "confluence",
             excerpt="challenger source",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
         app = create_admin_app(db=db, config=_config(tmp_path))
@@ -449,7 +449,7 @@ class TestReviewCrud:
             "doc-review-object-incumbent",
             "jira",
             excerpt="incumbent source",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
         app = create_admin_app(

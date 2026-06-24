@@ -99,7 +99,7 @@ async def test_private_write_does_not_corroborate_workspace(db, monkeypatch):
         private,
         doc_id="d-1",
         source_type="agent_session",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     assert result == "inserted"  # NOT "corroborated"
 
@@ -126,7 +126,7 @@ async def test_workspace_write_does_not_corroborate_private(db, monkeypatch):
         workspace,
         doc_id="d-2",
         source_type="confluence",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     assert result == "inserted"
 
@@ -151,7 +151,7 @@ async def test_same_user_private_dedup_still_works(db, monkeypatch):
         duplicate,
         doc_id="d-3",
         source_type="agent_session",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     assert result in {"corroborated", "skipped"}
 
@@ -178,7 +178,7 @@ async def test_workspace_write_does_not_corroborate_other_project(db, monkeypatc
         pay,
         doc_id="d-pay",
         source_type="confluence",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     assert result == "inserted"  # NOT "corroborated"
 
@@ -205,6 +205,6 @@ async def test_private_write_does_not_corroborate_other_users_private(db, monkey
         alice,
         doc_id="d-alice",
         source_type="agent_session",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     assert result == "inserted"
