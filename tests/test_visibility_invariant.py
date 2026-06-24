@@ -53,6 +53,7 @@ async def test_insert_persists_workspace_row(db):
 async def test_fresh_check_rejects_private_without_owner(db):
     # Layer 1: the CHECK on the fresh schema rejects a raw-SQL bypass write.
     import sqlite3
+
     with pytest.raises(sqlite3.IntegrityError):
         await db.db.execute(
             "INSERT INTO memories (id, memory_type, content, content_hash, visibility, owner_user_id) "
@@ -64,6 +65,7 @@ async def test_fresh_check_rejects_private_without_owner(db):
 async def test_fresh_check_rejects_workspace_with_owner(db):
     # Layer 1: the CHECK rejects a workspace row that carries an owner.
     import sqlite3
+
     with pytest.raises(sqlite3.IntegrityError):
         await db.db.execute(
             "INSERT INTO memories (id, memory_type, content, content_hash, visibility, owner_user_id) "
@@ -75,6 +77,7 @@ async def test_fresh_check_rejects_workspace_with_owner(db):
 async def test_fresh_check_rejects_unknown_visibility(db):
     # Layer 1: the CHECK rejects a visibility value outside the allowed set.
     import sqlite3
+
     with pytest.raises(sqlite3.IntegrityError):
         await db.db.execute(
             "INSERT INTO memories (id, memory_type, content, content_hash, visibility, owner_user_id) "
@@ -109,6 +112,7 @@ async def test_restore_snapshot_rejects_invalid_memory(db):
 async def test_relational_adapter_delegates_invariant(db):
     # Layer 3: the RelationalStore adapter delegates to the validating Database method.
     from memforge.storage.adapters.sqlite import build_sqlite_adapters
+
     adapters = build_sqlite_adapters(db, memory_collection=None)  # insert path never touches the vector
     with pytest.raises(ValueError, match="owner_user_id"):
         await adapters.relational.insert_memory(_mem(visibility=PRIVATE, owner_user_id=None))

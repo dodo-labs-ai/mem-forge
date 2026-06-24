@@ -65,8 +65,8 @@ class TestSupportAwareRetirement:
         await _insert_doc(db, "doc-b")
         mem = _make_memory("mem-support1", "Service uses PostgreSQL")
         await db.insert_memory(mem)
-        await db.add_memory_source(mem.id, "doc-a", "confluence")
-        await db.add_memory_source(mem.id, "doc-b", "confluence")
+        await db.add_memory_source(mem.id, "doc-a", "confluence", source_observed_at=None)
+        await db.add_memory_source(mem.id, "doc-b", "confluence", source_observed_at=None)
 
         await db.remove_memory_source(mem.id, "doc-a", retire_reason="source_deleted")
 
@@ -80,7 +80,7 @@ class TestSupportAwareRetirement:
         await _insert_doc(db, "doc-a")
         mem = _make_memory("mem-nosupport", "Service uses PostgreSQL")
         await db.insert_memory(mem)
-        await db.add_memory_source(mem.id, "doc-a", "confluence")
+        await db.add_memory_source(mem.id, "doc-a", "confluence", source_observed_at=None)
 
         await db.remove_memory_source(mem.id, "doc-a", retire_reason="source_deleted")
 
@@ -95,8 +95,8 @@ class TestSupportAwareRetirement:
         await _insert_doc(db, "doc-b", source="src-keep")
         mem = _make_memory("mem-docdel01", "Service uses PostgreSQL")
         await db.insert_memory(mem)
-        await db.add_memory_source(mem.id, "doc-a", "confluence")
-        await db.add_memory_source(mem.id, "doc-b", "confluence")
+        await db.add_memory_source(mem.id, "doc-a", "confluence", source_observed_at=None)
+        await db.add_memory_source(mem.id, "doc-b", "confluence", source_observed_at=None)
 
         await db.delete_document("doc-a")
 
@@ -112,8 +112,8 @@ class TestSupportAwareRetirement:
         await _insert_doc(db, "doc-support")
         mem = _make_memory("mem-owner01", "Service uses PostgreSQL")
         await db.insert_memory(mem)
-        await db.add_memory_source(mem.id, "doc-owner", "confluence", support_kind="extracted")
-        await db.add_memory_source(mem.id, "doc-support", "jira", support_kind="corroborated")
+        await db.add_memory_source(mem.id, "doc-owner", "confluence", support_kind="extracted", source_observed_at=None)
+        await db.add_memory_source(mem.id, "doc-support", "jira", support_kind="corroborated", source_observed_at=None)
 
         await db.remove_memory_source(mem.id, "doc-owner", retire_reason="source_deleted")
 
@@ -132,8 +132,8 @@ class TestSupportAwareRetirement:
         await _insert_doc(db, "doc-support")
         mem = _make_memory("mem-corrob01", "Service uses PostgreSQL")
         await db.insert_memory(mem)
-        await db.add_memory_source(mem.id, "doc-owner", "confluence", support_kind="extracted")
-        await db.add_memory_source(mem.id, "doc-support", "jira", support_kind="corroborated")
+        await db.add_memory_source(mem.id, "doc-owner", "confluence", support_kind="extracted", source_observed_at=None)
+        await db.add_memory_source(mem.id, "doc-support", "jira", support_kind="corroborated", source_observed_at=None)
 
         await db.remove_memory_source(mem.id, "doc-support", retire_reason="no_support")
 
@@ -151,8 +151,8 @@ class TestSupportAwareRetirement:
         await _insert_doc(db, "doc-support", source="src-keep")
         mem = _make_memory("mem-docown01", "Service uses PostgreSQL")
         await db.insert_memory(mem)
-        await db.add_memory_source(mem.id, "doc-owner", "confluence", support_kind="extracted")
-        await db.add_memory_source(mem.id, "doc-support", "jira", support_kind="corroborated")
+        await db.add_memory_source(mem.id, "doc-owner", "confluence", support_kind="extracted", source_observed_at=None)
+        await db.add_memory_source(mem.id, "doc-support", "jira", support_kind="corroborated", source_observed_at=None)
 
         await db.delete_document("doc-owner")
 
@@ -170,7 +170,7 @@ class TestSupportAwareRetirement:
         await _insert_doc(db, "doc-a", source="src-delete")
         mem = _make_memory("mem-srcdel01", "Service uses PostgreSQL")
         await db.insert_memory(mem)
-        await db.add_memory_source(mem.id, "doc-a", "confluence")
+        await db.add_memory_source(mem.id, "doc-a", "confluence", source_observed_at=None)
 
         await db.delete_source_cascade("src-delete")
 
@@ -218,6 +218,7 @@ class TestSupersessionMetadata:
             "confluence",
             "PostgreSQL version is 14",
             support_kind="extracted",
+            source_observed_at=None,
         )
 
         await db.supersede_memory(
@@ -277,7 +278,7 @@ class TestSupersessionMetadata:
                 old.id,
                 new,
                 replacement_reason="typo",
-                replacement_kind="revison",  # type: ignore[arg-type]
+                replacement_kind="revison",  # type: ignore[arg-type],
             )
 
 
@@ -306,7 +307,9 @@ class TestHardPurge:
         dependent = _make_memory("mem-dependent", "This memory used to replace the purged one")
         await db.insert_memory(memory)
         await db.insert_memory(dependent)
-        await db.add_memory_source(memory.id, "doc-a", "confluence", excerpt="sensitive excerpt")
+        await db.add_memory_source(
+            memory.id, "doc-a", "confluence", excerpt="sensitive excerpt", source_observed_at=None
+        )
         await db.db.execute(
             "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
             (memory.id, entity_id),

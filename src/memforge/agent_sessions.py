@@ -42,6 +42,8 @@ _KNOWN_CLIENT_SOURCE_NAMES: dict[str, str] = {
     "codex": "Codex Session",
     "claude-code": "Claude Code Session",
 }
+
+
 def agent_session_source_id(client: str) -> str:
     """Return the canonical source id for the given client.
 
@@ -101,8 +103,9 @@ def agent_session_client_for_source_id(source_id: str) -> str | None:
     if source_id in _AGENT_SESSION_ID_TO_CLIENT:
         return _AGENT_SESSION_ID_TO_CLIENT[source_id]
     if source_id.startswith(_AGENT_SESSION_ID_PREFIX):
-        return source_id[len(_AGENT_SESSION_ID_PREFIX):] or None
+        return source_id[len(_AGENT_SESSION_ID_PREFIX) :] or None
     return None
+
 
 _SECRET_PATTERNS = [
     ("assignment", re.compile(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*([^\s`'\"]+)")),
@@ -152,6 +155,7 @@ _TOOL_RESULT_TYPES = {
 }
 _MAX_CANONICAL_EVENT_TEXT_CHARS = 4_000
 
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -162,6 +166,24 @@ def _parse_submitted_at(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _parse_source_observed_at(value: str) -> datetime:
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("source_observed_at must include an explicit timezone offset")
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalize_source_observed_at(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return _parse_source_observed_at(value).isoformat()
+
+
+def _receipt_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    return {key: value for key, value in dict(metadata or {}).items() if key != "source_observed_at"}
 
 
 def default_agent_session_documents_dir(config: AppConfig) -> Path:
@@ -330,24 +352,28 @@ def build_agent_session_doc_id(
     content-distinct so a window that reuses a range with different content gets
     a new id instead of overwriting the earlier one.
     """
-    identity = "|".join([
-        client.strip(),
-        session_id.strip(),
-        trigger.strip(),
-        workspace.strip(),
-        history_window_kind.strip(),
-        history_window_start or "",
-        history_window_end or "",
-        window_hash or "",
-    ])
+    identity = "|".join(
+        [
+            client.strip(),
+            session_id.strip(),
+            trigger.strip(),
+            workspace.strip(),
+            history_window_kind.strip(),
+            history_window_start or "",
+            history_window_end or "",
+            window_hash or "",
+        ]
+    )
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
-    return "-".join([
-        "agent-session",
-        slugify(client)[:30],
-        slugify(session_id)[:50],
-        slugify(trigger)[:30],
-        digest,
-    ])
+    return "-".join(
+        [
+            "agent-session",
+            slugify(client)[:30],
+            slugify(session_id)[:50],
+            slugify(trigger)[:30],
+            digest,
+        ]
+    )
 
 
 def build_agent_hook_receipt_id(
@@ -361,23 +387,27 @@ def build_agent_hook_receipt_id(
     commit_sha: str | None,
 ) -> str:
     """Build a stable receipt id for one client lifecycle hook event."""
-    identity = "|".join([
-        client.strip(),
-        session_id.strip(),
-        hook.strip(),
-        workspace.strip(),
-        repo or "",
-        branch or "",
-        commit_sha or "",
-    ])
+    identity = "|".join(
+        [
+            client.strip(),
+            session_id.strip(),
+            hook.strip(),
+            workspace.strip(),
+            repo or "",
+            branch or "",
+            commit_sha or "",
+        ]
+    )
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
-    return "-".join([
-        "agent-hook",
-        slugify(client)[:30],
-        slugify(session_id)[:50],
-        slugify(hook)[:30],
-        digest,
-    ])
+    return "-".join(
+        [
+            "agent-hook",
+            slugify(client)[:30],
+            slugify(session_id)[:50],
+            slugify(hook)[:30],
+            digest,
+        ]
+    )
 
 
 async def submit_agent_hook_receipt(
@@ -485,6 +515,7 @@ async def submit_agent_session_document(
     source_kind: str = AGENT_SESSION_SOURCE_KIND,
     window_hash: str | None = None,
     submitted_at: str | None = None,
+    source_observed_at: str | None = None,
     user_id: str | None = None,
 ) -> dict:
     """Store a generated session document package and receipt lineage."""
@@ -503,6 +534,7 @@ async def submit_agent_session_document(
     documents_dir = Path(source["config"]["documents_dir"])
 
     submitted_at = submitted_at or _now_iso()
+    normalized_source_observed_at = _normalize_source_observed_at(source_observed_at)
     redacted_markdown = redact_agent_session_markdown(document_markdown)
     document_hash = content_hash(redacted_markdown)
     doc_id = build_agent_session_doc_id(
@@ -527,7 +559,7 @@ async def submit_agent_session_document(
     package_path = documents_dir / slugify(project) / f"{doc_id}.json"
     package_path.parent.mkdir(parents=True, exist_ok=True)
 
-    receipt_metadata = dict(metadata or {})
+    receipt_metadata = _receipt_metadata(metadata)
     if user_id is not None:
         receipt_metadata["user_id"] = user_id
     receipt_metadata.setdefault("repo_identifier", normalize_repo_identifier(repo))
@@ -564,6 +596,8 @@ async def submit_agent_session_document(
         "markdown": redacted_markdown,
         "receipt": receipt.__dict__,
     }
+    if normalized_source_observed_at is not None:
+        package["source_observed_at"] = normalized_source_observed_at
     # Write the package atomically: serialize to a sibling temp file on the same
     # filesystem, then rename it into place. A reader (or a concurrent same-id
     # write) sees either the previous package or the complete new one, never a
@@ -614,6 +648,7 @@ async def _record_window_outcome(
     history_window_start: str | None,
     history_window_end: str | None,
     submitted_at: str,
+    source_observed_at: str | None,
     window_hash: str,
     receipt: dict[str, Any] | None,
     outcome: str,
@@ -644,7 +679,7 @@ async def _record_window_outcome(
         "window_retention": "none",
         "receipt": receipt or {},
     }
-    stored_metadata.update(metadata or {})
+    stored_metadata.update(_receipt_metadata(metadata))
     receipt_record = AgentSessionReceipt(
         doc_id=doc_id,
         source_id=agent_session_source_id(client),
@@ -733,6 +768,7 @@ async def submit_agent_session_window(
     receipt: dict[str, Any] | None = None,
     retention: str = "none",
     submitted_at: str | None = None,
+    source_observed_at: str | None = None,
     process_now: bool = True,
     user_id: str | None = None,
 ) -> dict[str, Any]:
@@ -749,6 +785,7 @@ async def submit_agent_session_window(
         raise ValueError("retention must be none")
 
     submitted_at = submitted_at or _now_iso()
+    normalized_source_observed_at = _normalize_source_observed_at(source_observed_at)
     history_window = history_window or {"kind": "boundary"}
     redacted_history_window = redact_agent_session_payload(history_window)
     redacted_events = redact_agent_session_events(events)
@@ -780,6 +817,7 @@ async def submit_agent_session_window(
         "history_window_start": window_start,
         "history_window_end": window_end,
         "submitted_at": submitted_at,
+        "source_observed_at": normalized_source_observed_at,
         "window_hash": window_hash,
         "receipt": receipt,
     }
@@ -879,6 +917,11 @@ async def submit_agent_session_window(
             repo_identifier=repo_identifier,
             project_key=None,
             submitted_at=_parse_submitted_at(submitted_at),
+            source_observed_at=(
+                _parse_source_observed_at(normalized_source_observed_at)
+                if normalized_source_observed_at is not None
+                else None
+            ),
         )
         reason = patch.reason or proposal.reason or "window had no durable memory value"
         await _record_window_outcome(
@@ -917,6 +960,11 @@ async def submit_agent_session_window(
             repo_identifier=repo_identifier,
             project_key=project,
             submitted_at=_parse_submitted_at(submitted_at),
+            source_observed_at=(
+                _parse_source_observed_at(normalized_source_observed_at)
+                if normalized_source_observed_at is not None
+                else None
+            ),
         )
     except Exception as exc:
         await _record_window_outcome(

@@ -312,9 +312,7 @@ def test_update_source_can_clear_project_binding_to_unmapped(tmp_path):
         with TestClient(app) as client:
             create = client.post(
                 "/api/sources",
-                json=_local_markdown_source_payload(
-                    project_binding={"mode": "fixed", "project_key": "PAY"}
-                ),
+                json=_local_markdown_source_payload(project_binding={"mode": "fixed", "project_key": "PAY"}),
             )
             source_id = create.json()["id"]
 
@@ -511,6 +509,7 @@ def test_resolved_projects_endpoint_groups_memories_by_resolved_key(tmp_path):
                 doc_id=doc,
                 source_type="agent_session",
                 excerpt=None,
+                source_observed_at=None,
             )
 
     asyncio.run(_seed())

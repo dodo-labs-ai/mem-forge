@@ -97,7 +97,7 @@ async def _insert_source_backed_memory(
             status="active",
         )
     )
-    await database.add_memory_source(memory_id, "doc-source-backed", "confluence")
+    await database.add_memory_source(memory_id, "doc-source-backed", "confluence", source_observed_at=None)
 
 
 def test_source_list_exposes_capabilities_and_redacts_config_for_non_owner_member(tmp_path):

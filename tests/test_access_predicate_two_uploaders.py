@@ -35,13 +35,26 @@ class FakeCollection:
 
 async def _document(db: Database, doc_id: str) -> None:
     now = datetime.now(timezone.utc)
-    await db.upsert_document(DocumentRecord(
-        doc_id=doc_id, source="src-agent", source_url=f"agent://{doc_id}",
-        title="t", space_or_project="PROJ", author="a", last_modified=now,
-        labels=[], version="1", content_hash=f"h-{doc_id}", token_count=1,
-        raw_content_uri=None, raw_content_type="text/markdown",
-        normalized_content_uri=None, pdf_content_uri=None, last_synced=now,
-    ))
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            source="src-agent",
+            source_url=f"agent://{doc_id}",
+            title="t",
+            space_or_project="PROJ",
+            author="a",
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash=f"h-{doc_id}",
+            token_count=1,
+            raw_content_uri=None,
+            raw_content_type="text/markdown",
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
 
 
 @pytest.fixture
@@ -88,22 +101,22 @@ async def test_two_uploaders_each_owns_their_private_session_memory(engine_fixtu
     await _document(database, "doc-u1")
     await _document(database, "doc-u2")
 
-    u1_raw = [RawMemory(memory_type="fact", content="u1 deploys via argo",
-                         entity_refs=[], tags=[], confidence=0.9)]
-    u2_raw = [RawMemory(memory_type="fact", content="u2 deploys via flux",
-                         entity_refs=[], tags=[], confidence=0.9)]
+    u1_raw = [RawMemory(memory_type="fact", content="u1 deploys via argo", entity_refs=[], tags=[], confidence=0.9)]
+    u2_raw = [RawMemory(memory_type="fact", content="u2 deploys via flux", entity_refs=[], tags=[], confidence=0.9)]
 
     await engine.process_memories(
         doc_id="doc-u1",
         raw_memories=u1_raw,
         source_type="agent_session",
         user_id="u-1",
+        source_observed_at=None,
     )
     await engine.process_memories(
         doc_id="doc-u2",
         raw_memories=u2_raw,
         source_type="agent_session",
         user_id="u-2",
+        source_observed_at=None,
     )
 
     rows = await database.list_memories()
@@ -118,14 +131,20 @@ async def test_two_uploaders_each_owns_their_private_session_memory(engine_fixtu
     # PERSONALIZED keyword search by U1: U1's own private memory is visible,
     # U2's private memory stays hidden even on a personalized search.
     u1_hits = await adapters.keyword.search(
-        "deploys", _personalized_scope("u-1"), memory_types=None, limit=10,
+        "deploys",
+        _personalized_scope("u-1"),
+        memory_types=None,
+        limit=10,
     )
     u1_ids = {mid for mid, _ in u1_hits}
     assert u1_row.id in u1_ids
     assert u2_row.id not in u1_ids
 
     u2_hits = await adapters.keyword.search(
-        "deploys", _personalized_scope("u-2"), memory_types=None, limit=10,
+        "deploys",
+        _personalized_scope("u-2"),
+        memory_types=None,
+        limit=10,
     )
     u2_ids = {mid for mid, _ in u2_hits}
     assert u2_row.id in u2_ids

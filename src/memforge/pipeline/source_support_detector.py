@@ -98,6 +98,7 @@ class SourceSupportDetector:
         writer_visibility: str | None = None,
         writer_owner_user_id: str | None = None,
         writer_project_key: str | None = None,
+        source_observed_at: datetime | None,
     ) -> dict[str, int]:
         """Attach corroborated provenance for supported existing memories."""
         stats = {
@@ -170,6 +171,7 @@ class SourceSupportDetector:
                 writer_visibility=writer_visibility,
                 writer_owner_user_id=writer_owner_user_id,
                 writer_project_key=writer_project_key,
+                source_observed_at=source_observed_at,
             )
         elif existing_sources:
             stats["removed_stale"] += await self._remove_stale_sources(
@@ -277,6 +279,7 @@ class SourceSupportDetector:
                 writer_visibility=writer_visibility,
                 writer_owner_user_id=writer_owner_user_id,
                 writer_project_key=writer_project_key,
+                source_observed_at=source_observed_at,
                 relation_outcome=await self._support_relation_outcome_bundle(
                     db=db,
                     doc_id=doc_id,
@@ -323,6 +326,7 @@ class SourceSupportDetector:
         writer_visibility: str | None = None,
         writer_owner_user_id: str | None = None,
         writer_project_key: str | None = None,
+        source_observed_at: datetime | None,
     ) -> int:
         refreshed_existing_ids: set[str] = set()
         remove_ids: set[str] = set()
@@ -390,6 +394,7 @@ class SourceSupportDetector:
                 writer_visibility=writer_visibility,
                 writer_owner_user_id=writer_owner_user_id,
                 writer_project_key=writer_project_key,
+                source_observed_at=source_observed_at,
                 relation_outcome=await self._support_relation_outcome_bundle(
                     db=db,
                     doc_id=doc_id,

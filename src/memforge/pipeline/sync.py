@@ -121,16 +121,8 @@ class ExtractionWorkPool:
             return False
 
         source_count = len(
-            {
-                source
-                for source, count in self._active_by_source.items()
-                if count > 0
-            }
-            | {
-                source
-                for source, count in self._waiting_by_source.items()
-                if count > 0
-            }
+            {source for source, count in self._active_by_source.items() if count > 0}
+            | {source for source, count in self._waiting_by_source.items() if count > 0}
         )
         fair_share = max(1, math.ceil(self.max_workers / max(1, source_count)))
 
@@ -143,6 +135,7 @@ class ExtractionWorkPool:
             if self._active_by_source[waiting_source] < fair_share:
                 return False
         return True
+
 
 MAX_RETRIES = 3
 """Number of retry attempts per content item before marking as failed."""
@@ -159,6 +152,20 @@ def _count_tokens(text: str) -> int:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_source_observed_at(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        raise ValueError("source_observed_at must be an ISO datetime string")
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("source_observed_at must include an explicit timezone offset")
+    return parsed.astimezone(timezone.utc)
 
 
 def _plural(count: int, singular: str, plural: str | None = None) -> str:
@@ -194,9 +201,7 @@ def _failure_category(error: str) -> str:
     if "llm provider unreachable" in normalized:
         return "llm_provider_unreachable"
     if _is_provider_unreachable(error) and (
-        "litellm" in normalized
-        or "anthropicexception" in normalized
-        or "openaiexception" in normalized
+        "litellm" in normalized or "anthropicexception" in normalized or "openaiexception" in normalized
     ):
         return "llm_provider_unreachable"
     if "rate limit" in normalized or "429" in normalized:
@@ -227,8 +232,7 @@ def summarize_failed_documents(docs_failed: int, failed_docs: list[FailedDoc]) -
             )
         if counts.get("llm_provider_unreachable"):
             details.append(
-                f"LLM provider was unreachable for "
-                f"{_plural(counts['llm_provider_unreachable'], 'document')}"
+                f"LLM provider was unreachable for {_plural(counts['llm_provider_unreachable'], 'document')}"
             )
         if counts.get("pdf_export"):
             details.append(f"PDF export was unavailable for {_plural(counts['pdf_export'], 'document')}")
@@ -1143,10 +1147,7 @@ class GeneSyncOrchestrator:
                 document_vector_snapshot=document_vector_snapshot,
             )
             error_detail = extraction_result.error or ""
-            raise RuntimeError(
-                f"memory extraction failed for {doc_id}: "
-                f"{extraction_result.error_type}: {error_detail}"
-            )
+            raise RuntimeError(f"memory extraction failed for {doc_id}: {extraction_result.error_type}: {error_detail}")
         logger.debug(
             "Extracted %d raw memories from %s",
             len(raw_memories),
@@ -1190,6 +1191,7 @@ class GeneSyncOrchestrator:
         # predicate, never by this hint.
         uploader_user_id = normalized.source_semantics.get("uploader_user_id")
         repo_identifier = normalized.source_semantics.get("repo_identifier")
+        source_observed_at = _parse_source_observed_at(normalized.source_semantics.get("source_observed_at"))
         if change_type == "updated":
             memory_stats = await self.memory_engine.reconcile_and_persist(
                 doc_id=doc_id,
@@ -1205,6 +1207,7 @@ class GeneSyncOrchestrator:
                 update_plan_stats=self._document_update_plan_stats(update_plan),
                 audit_context=memory_context,
                 user_id=uploader_user_id,
+                source_observed_at=source_observed_at,
             )
             stats["memories_extracted"] = memory_stats.get("added", 0)
             stats["memories_corroborated"] = memory_stats.get("updated", 0)
@@ -1218,13 +1221,15 @@ class GeneSyncOrchestrator:
                 entity_ids=entity_ids,
                 audit_context=memory_context,
                 user_id=uploader_user_id,
+                source_observed_at=source_observed_at,
             )
             stats["memories_extracted"] = memory_stats.get("inserted", 0)
             stats["memories_corroborated"] = memory_stats.get("corroborated", 0)
 
         if not extraction_result.error_type and self.source_support_detector:
             writer_visibility, writer_owner_user_id = default_visibility(
-                source_type, user_id=uploader_user_id,
+                source_type,
+                user_id=uploader_user_id,
             )
             async with self._heavy_work_slot(source_id):
                 support_stats = await self.source_support_detector.detect_and_persist(
@@ -1238,6 +1243,7 @@ class GeneSyncOrchestrator:
                     writer_visibility=writer_visibility,
                     writer_owner_user_id=writer_owner_user_id,
                     writer_project_key=project_key,
+                    source_observed_at=source_observed_at,
                 )
             stats["memory_supports_added"] = support_stats.get("added", 0)
             stats["memory_supports_updated"] = support_stats.get("updated", 0)
@@ -1631,11 +1637,7 @@ class GeneSyncOrchestrator:
             status = "failed"
             reason = result.error_type
         else:
-            event_type = (
-                "memory_change_extraction_completed"
-                if is_change_extraction
-                else "memory_extraction_completed"
-            )
+            event_type = "memory_change_extraction_completed" if is_change_extraction else "memory_extraction_completed"
             status = "committed"
             reason = plan.reason if plan else "full_document"
 
@@ -1991,10 +1993,7 @@ class GeneSyncOrchestrator:
             return False
         if is_litellm_provider_model(model):
             return True
-        return all(
-            str(self.embed_cfg.get(key) or "").strip()
-            for key in ("base_url", "api_key", "model")
-        )
+        return all(str(self.embed_cfg.get(key) or "").strip() for key in ("base_url", "api_key", "model"))
 
     def _document_metadata_from_enrichment(
         self,

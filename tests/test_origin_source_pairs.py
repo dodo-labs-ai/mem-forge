@@ -55,7 +55,9 @@ async def _add_source(
     client: str | None = None,
 ) -> None:
     await _insert_doc(db, doc_id, client=client)
-    await db.add_memory_source(memory_id, doc_id, source_type, "excerpt", support_kind=support_kind)
+    await db.add_memory_source(
+        memory_id, doc_id, source_type, "excerpt", support_kind=support_kind, source_observed_at=None
+    )
     # add_memory_source stamps added_at to now(); override it so ordering is testable.
     await db.db.execute(
         "UPDATE memory_sources SET added_at = ? WHERE memory_id = ? AND doc_id = ?",
@@ -101,8 +103,13 @@ async def test_client_is_returned_for_agent_session_documents(db: Database):
     """Client from documents.client is included in the triple for agent-session docs."""
     await db.insert_memory(_memory("mem-codex"))
     await _add_source(
-        db, "mem-codex", "doc-agent-sess", "agent_session", "extracted",
-        "2026-01-01T00:00:00", client="codex",
+        db,
+        "mem-codex",
+        "doc-agent-sess",
+        "agent_session",
+        "extracted",
+        "2026-01-01T00:00:00",
+        client="codex",
     )
 
     pairs = await db.get_origin_source_pairs(["mem-codex"])

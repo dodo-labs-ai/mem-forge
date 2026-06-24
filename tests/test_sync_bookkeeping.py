@@ -628,11 +628,7 @@ class PdfBackfillGene(BlockingFetchGene):
         new_hash,
     ) -> bool:
         del item
-        return (
-            existing_doc is None
-            or existing_hash != new_hash
-            or not getattr(existing_doc, "pdf_content_uri", None)
-        )
+        return existing_doc is None or existing_hash != new_hash or not getattr(existing_doc, "pdf_content_uri", None)
 
     @classmethod
     def metadata(cls):
@@ -1230,18 +1226,11 @@ async def test_source_sync_schedule_round_trips_and_claims_due_sources(db: Datab
     assert still_due_before_claim is not None
     assert still_due_before_claim["sync_schedule"]["next_run_at"] == due_at.isoformat()
 
-    claimed_sources = await db.claim_due_scheduled_sources(
-        now=claim_time
-    )
+    claimed_sources = await db.claim_due_scheduled_sources(now=claim_time)
     assert [source["id"] for source in claimed_sources] == ["src-due"]
-    assert (
-        claimed_sources[0]["sync_schedule"]["next_run_at"]
-        == "2026-06-16T00:30:00+00:00"
-    )
+    assert claimed_sources[0]["sync_schedule"]["next_run_at"] == "2026-06-16T00:30:00+00:00"
 
-    claimed_again = await db.claim_due_scheduled_sources(
-        now=claim_time
-    )
+    claimed_again = await db.claim_due_scheduled_sources(now=claim_time)
     assert claimed_again == []
 
     await db.set_source_sync_schedule(
@@ -1300,10 +1289,7 @@ async def test_scheduler_starts_due_source_and_advances_next_run(db: Database, m
     source = await db.get_source(source_id)
     assert source is not None
     assert source["sync_schedule"]["next_run_at"] is not None
-    assert (
-        datetime.fromisoformat(source["sync_schedule"]["next_run_at"])
-        > datetime.now(timezone.utc)
-    )
+    assert datetime.fromisoformat(source["sync_schedule"]["next_run_at"]) > datetime.now(timezone.utc)
 
 
 @pytest.mark.asyncio
@@ -1885,8 +1871,7 @@ async def test_document_update_falls_back_to_full_extraction_when_previous_conte
 async def test_large_full_document_uses_deterministic_units(db: Database):
     source_id = "src-large-doc-full"
     markdown = "# Design Doc\n\nIntro.\n\n" + "\n\n".join(
-        f"## Section {index}\n\n" + ("Durable design detail. " * 900)
-        for index in range(8)
+        f"## Section {index}\n\n" + ("Durable design detail. " * 900) for index in range(8)
     )
     extractor = RecordingMemoryExtractor()
     memory_store = _audited_memory_store(db)
@@ -1924,8 +1909,7 @@ async def test_large_full_document_uses_deterministic_units(db: Database):
 @pytest.mark.asyncio
 async def test_full_document_unit_extraction_honors_orchestrator_concurrency(db: Database):
     markdown = "# Design Doc\n\nIntro.\n\n" + "\n\n".join(
-        f"## Section {index}\n\n" + ("Durable design detail. " * 900)
-        for index in range(8)
+        f"## Section {index}\n\n" + ("Durable design detail. " * 900) for index in range(8)
     )
     extractor = BlockingUnitMemoryExtractor()
     orchestrator = GeneSyncOrchestrator(

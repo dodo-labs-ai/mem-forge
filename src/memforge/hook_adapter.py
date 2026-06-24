@@ -145,8 +145,8 @@ CODEX_TOOL_RESULT_TYPES = {
 
 # Capture policies. Each client hook maps onto one of these.
 REQUIRED_CAPTURE_TRIGGER = "REQUIRED_CAPTURE"  # context about to be lost: always capture
-GATED_CAPTURE_TRIGGER = "GATED_CAPTURE"        # turn ended: capture only on durable signal
-RECOVER_TRIGGER = "RECOVER"                    # session resumed: re-arm an uncaptured tail
+GATED_CAPTURE_TRIGGER = "GATED_CAPTURE"  # turn ended: capture only on durable signal
+RECOVER_TRIGGER = "RECOVER"  # session resumed: re-arm an uncaptured tail
 LEGACY_REQUIRED_CAPTURE_TRIGGER = "BOUNDARY"
 LEGACY_GATED_CAPTURE_TRIGGER = "FLUSH"
 _CAPTURE_TRIGGER_ALIASES = {
@@ -160,7 +160,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("mode", choices=("context", "submit-session", "worker-run-once"))
     parser.add_argument("--client", default=os.getenv("MEMFORGE_HOOK_CLIENT", "codex"))
     parser.add_argument("--api-url", default=configured_api_url(DEFAULT_API_URL))
-    parser.add_argument("--timeout", type=float, default=_env_float("MEMFORGE_HOOK_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS))
+    parser.add_argument(
+        "--timeout", type=float, default=_env_float("MEMFORGE_HOOK_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -173,10 +175,12 @@ def main(argv: list[str] | None = None) -> int:
         return _run_submit_session(payload, client=args.client, api_url=args.api_url, timeout=args.timeout)
     except Exception as exc:  # Hooks must not crash the coding session.
         print(
-            json.dumps({
-                "continue": True,
-                "systemMessage": f"MemForge hook skipped: {_safe_exception_message(exc)}",
-            }),
+            json.dumps(
+                {
+                    "continue": True,
+                    "systemMessage": f"MemForge hook skipped: {_safe_exception_message(exc)}",
+                }
+            ),
         )
         return 0
 
@@ -227,13 +231,17 @@ def _run_context(payload: dict[str, Any], *, client: str, api_url: str, timeout:
 
 
 def _emit_additional_context(event_name: str, context: str) -> None:
-    print(json.dumps({
-        "continue": True,
-        "hookSpecificOutput": {
-            "hookEventName": event_name,
-            "additionalContext": context,
-        },
-    }))
+    print(
+        json.dumps(
+            {
+                "continue": True,
+                "hookSpecificOutput": {
+                    "hookEventName": event_name,
+                    "additionalContext": context,
+                },
+            }
+        )
+    )
 
 
 def _run_submit_session(payload: dict[str, Any], *, client: str, api_url: str, timeout: float) -> int:
@@ -527,9 +535,7 @@ def run_agent_window_worker_once(
         # than double-process the same pending sessions.
         return 0
     try:
-        return _process_session_captures(
-            db_path, api_url=api_url, timeout=timeout, max_sessions=max_sessions
-        )
+        return _process_session_captures(db_path, api_url=api_url, timeout=timeout, max_sessions=max_sessions)
     finally:
         _release_worker_lock(lock)
 
@@ -696,9 +702,7 @@ def _has_pending_session_captures(db_path: Path) -> bool:
     try:
         with sqlite3.connect(db_path) as connection:
             _ensure_session_cursor(connection)
-            row = connection.execute(
-                "SELECT 1 FROM session_cursor WHERE capture_pending = 1 LIMIT 1"
-            ).fetchone()
+            row = connection.execute("SELECT 1 FROM session_cursor WHERE capture_pending = 1 LIMIT 1").fetchone()
             return row is not None
     except sqlite3.Error:
         return False
@@ -791,17 +795,12 @@ def _admin_api_request_url(path: str, *, api_url: str) -> str:
     if path == "/api":
         return f"{base_url}/api/workspaces/{quoted_workspace}/api"
     if path.startswith("/api/"):
-        return f"{base_url}/api/workspaces/{quoted_workspace}/api/{path[len('/api/'):]}"
+        return f"{base_url}/api/workspaces/{quoted_workspace}/api/{path[len('/api/') :]}"
     return f"{base_url}{path}"
 
 
 def _event_name(payload: dict[str, Any]) -> str:
-    return str(
-        payload.get("hook_event_name")
-        or payload.get("hookEventName")
-        or payload.get("event")
-        or "UnknownHook"
-    )
+    return str(payload.get("hook_event_name") or payload.get("hookEventName") or payload.get("event") or "UnknownHook")
 
 
 def _workspace(payload: dict[str, Any]) -> str:
@@ -904,9 +903,7 @@ def _has_stop_window_signal_in_transcript(transcript_path: str, start: int, end:
                 if any(term in lowered for term in STOP_SIGNAL_TERMS):
                     return True
                 tool_mentions += (
-                    lowered.count('"type":"tool"')
-                    + lowered.count('"type": "tool"')
-                    + lowered.count('"tool"')
+                    lowered.count('"type":"tool"') + lowered.count('"type": "tool"') + lowered.count('"tool"')
                 )
                 if tool_mentions >= 2:
                     return True
@@ -940,7 +937,7 @@ def _session_window_payload(
         "transcript_path": transcript_path,
         "hook_event_name": trigger,
     }
-    return {
+    payload = {
         "schema_version": WINDOW_SCHEMA_VERSION,
         "plugin_version": os.getenv("MEMFORGE_PLUGIN_VERSION", PLUGIN_VERSION),
         "client": client,
@@ -978,6 +975,35 @@ def _session_window_payload(
         "retention": "none",
         "process_now": False,
     }
+    source_observed_at = _first_reliable_event_timestamp(events)
+    if source_observed_at is not None:
+        payload["source_observed_at"] = source_observed_at
+    return payload
+
+
+def _first_reliable_event_timestamp(events: list[dict[str, Any]]) -> str | None:
+    """Return the earliest explicit offset-aware timestamp in the submitted evidence window.
+
+    This records when the source window started, not when an individual claim was
+    first stated. If the transcript omits reliable absolute time, callers leave
+    source_observed_at unset instead of falling back to upload time.
+    """
+    parsed_times: list[datetime] = []
+    for event in events:
+        value = event.get("timestamp")
+        if not isinstance(value, str) or not value.strip():
+            continue
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError as exc:
+            raise ValueError(f"invalid event timestamp {value!r}") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(f"event timestamp must include timezone offset: {value!r}")
+        parsed_times.append(parsed.astimezone(timezone.utc))
+    if not parsed_times:
+        return None
+    return min(parsed_times).isoformat()
 
 
 def _bounded_transcript_line_slice(transcript_path: str, start: int, end: int) -> tuple[list[str], int, bool]:
@@ -1058,15 +1084,11 @@ def _bounded_transcript_evidence_window(
                 line_chars += event_chars
 
             if selected and (
-                len(selected) + len(line_events) > MAX_EVENTS
-                or used_chars + line_chars > MAX_TRANSCRIPT_CHARS
+                len(selected) + len(line_events) > MAX_EVENTS or used_chars + line_chars > MAX_TRANSCRIPT_CHARS
             ):
                 return selected, index, True, omissions
 
-            if not selected and (
-                len(line_events) > MAX_EVENTS
-                or line_chars > MAX_TRANSCRIPT_CHARS
-            ):
+            if not selected and (len(line_events) > MAX_EVENTS or line_chars > MAX_TRANSCRIPT_CHARS):
                 selected = _fit_events_to_empty_window(line_events)
                 omissions["oversized_event"] += max(0, len(line_events) - len(selected))
                 return selected, index + 1, True, omissions
@@ -1437,10 +1459,9 @@ def _message_content_text(value: Any) -> str | None:
 def _is_memory_excluded_contextual_user_fragment(text: str | None) -> bool:
     if not text:
         return False
-    return (
-        _matches_marked_fragment(text, "# AGENTS.md instructions for ", "</INSTRUCTIONS>")
-        or _matches_marked_fragment(text, "<skill>", "</skill>")
-    )
+    return _matches_marked_fragment(
+        text, "# AGENTS.md instructions for ", "</INSTRUCTIONS>"
+    ) or _matches_marked_fragment(text, "<skill>", "</skill>")
 
 
 def _matches_marked_fragment(text: str, start_marker: str, end_marker: str) -> bool:

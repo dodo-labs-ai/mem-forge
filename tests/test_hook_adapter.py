@@ -51,12 +51,18 @@ def test_hook_adapter_returns_additional_context_for_prompt_hook(monkeypatch, ca
         }
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
-    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
-        "hook_event_name": "UserPromptSubmit",
-        "session_id": "sess-1",
-        "cwd": "/tmp/mem-forge",
-        "prompt": "What memory lifecycle decisions matter?",
-    }))
+    monkeypatch.setattr(
+        hook_adapter.sys,
+        "stdin",
+        _Stdin(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "sess-1",
+                "cwd": "/tmp/mem-forge",
+                "prompt": "What memory lifecycle decisions matter?",
+            }
+        ),
+    )
 
     exit_code = hook_adapter.main(["context"])
 
@@ -80,12 +86,18 @@ def test_hook_adapter_context_sends_canonical_remote_repo_for_claude(monkeypatch
         return {"should_inject": False}
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
-    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
-        "hook_event_name": "UserPromptSubmit",
-        "session_id": "sess-claude-repo",
-        "cwd": str(tmp_path),
-        "prompt": "What do we know about this repo?",
-    }))
+    monkeypatch.setattr(
+        hook_adapter.sys,
+        "stdin",
+        _Stdin(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "sess-claude-repo",
+                "cwd": str(tmp_path),
+                "prompt": "What do we know about this repo?",
+            }
+        ),
+    )
 
     exit_code = hook_adapter.main(["context", "--client", "claude-code"])
 
@@ -106,11 +118,17 @@ def test_hook_adapter_injects_session_start_memforge_usage_guidance_without_api(
         raise AssertionError("SessionStart guidance should not call the API")
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
-    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
-        "hook_event_name": "SessionStart",
-        "session_id": "sess-start",
-        "cwd": "/tmp/mem-forge",
-    }))
+    monkeypatch.setattr(
+        hook_adapter.sys,
+        "stdin",
+        _Stdin(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "sess-start",
+                "cwd": "/tmp/mem-forge",
+            }
+        ),
+    )
 
     exit_code = hook_adapter.main(["context"])
 
@@ -136,11 +154,17 @@ def test_hook_adapter_submits_lifecycle_receipt_when_transcript_is_missing(monke
         return {"receipt_id": "agent-hook-receipt"}
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
-    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
-        "hook_event_name": "Stop",
-        "session_id": "sess-2",
-        "cwd": "/tmp/mem-forge",
-    }))
+    monkeypatch.setattr(
+        hook_adapter.sys,
+        "stdin",
+        _Stdin(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "sess-2",
+                "cwd": "/tmp/mem-forge",
+            }
+        ),
+    )
 
     exit_code = hook_adapter.main(["submit-session"])
 
@@ -161,8 +185,7 @@ def test_hook_adapter_precompact_posts_window_when_transcript_exists(monkeypatch
 
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text(
-        '{"type":"user","message":"please remember this design"}\n'
-        '{"type":"assistant","message":"Done."}\n',
+        '{"type":"user","message":"please remember this design"}\n{"type":"assistant","message":"Done."}\n',
         encoding="utf-8",
     )
     queue_db = tmp_path / "queue.sqlite"
@@ -179,12 +202,18 @@ def test_hook_adapter_precompact_posts_window_when_transcript_exists(monkeypatch
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(queue_db))
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
     monkeypatch.setattr(hook_adapter, "_spawn_agent_window_worker", fake_spawn_worker)
-    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
-        "hook_event_name": "PreCompact",
-        "session_id": "sess-precompact",
-        "cwd": str(tmp_path),
-        "transcript_path": str(transcript),
-    }))
+    monkeypatch.setattr(
+        hook_adapter.sys,
+        "stdin",
+        _Stdin(
+            {
+                "hook_event_name": "PreCompact",
+                "session_id": "sess-precompact",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            }
+        ),
+    )
 
     exit_code = hook_adapter.main(["submit-session"])
 
@@ -280,12 +309,18 @@ def test_hook_adapter_posts_receipt_when_window_queue_fails(monkeypatch, tmp_pat
 
     monkeypatch.setattr(hook_adapter, "request_session_capture", fail_request)
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
-    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
-        "hook_event_name": "PreCompact",
-        "session_id": "sess-queue-fail",
-        "cwd": str(tmp_path),
-        "transcript_path": str(transcript),
-    }))
+    monkeypatch.setattr(
+        hook_adapter.sys,
+        "stdin",
+        _Stdin(
+            {
+                "hook_event_name": "PreCompact",
+                "session_id": "sess-queue-fail",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            }
+        ),
+    )
 
     exit_code = hook_adapter.main(["submit-session"])
 
@@ -308,12 +343,18 @@ def test_hook_adapter_trivial_stop_does_not_post_window(monkeypatch, tmp_path, c
 
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(tmp_path / "queue.sqlite"))
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
-    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
-        "hook_event_name": "Stop",
-        "session_id": "sess-trivial",
-        "cwd": str(tmp_path),
-        "transcript_path": str(transcript),
-    }))
+    monkeypatch.setattr(
+        hook_adapter.sys,
+        "stdin",
+        _Stdin(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "sess-trivial",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            }
+        ),
+    )
 
     exit_code = hook_adapter.main(["submit-session"])
 
@@ -346,12 +387,18 @@ def test_hook_adapter_stop_with_edit_and_test_signal_enqueues_window_worker(monk
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(tmp_path / "queue.sqlite"))
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
     monkeypatch.setattr(hook_adapter, "_spawn_agent_window_worker", fake_spawn_worker, raising=False)
-    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
-        "hook_event_name": "Stop",
-        "session_id": "sess-stop",
-        "cwd": str(tmp_path),
-        "transcript_path": str(transcript),
-    }))
+    monkeypatch.setattr(
+        hook_adapter.sys,
+        "stdin",
+        _Stdin(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "sess-stop",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            }
+        ),
+    )
 
     exit_code = hook_adapter.main(["submit-session"])
 
@@ -373,10 +420,7 @@ def test_gated_capture_scans_tail_without_materializing_full_delta(monkeypatch, 
 
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text(
-        "\n".join(
-            json.dumps({"type": "assistant", "message": f"line {index}"})
-            for index in range(20)
-        )
+        "\n".join(json.dumps({"type": "assistant", "message": f"line {index}"}) for index in range(20))
         + "\n"
         + json.dumps({"type": "tool", "name": "exec_command", "input": "pytest tests"})
         + "\n",
@@ -389,12 +433,15 @@ def test_gated_capture_scans_tail_without_materializing_full_delta(monkeypatch, 
     monkeypatch.setattr(hook_adapter, "_get_captured_through", lambda client, session_id: 0)
     monkeypatch.setattr(hook_adapter, "_transcript_line_slice", fail_full_slice)
 
-    assert hook_adapter._should_request_capture(
-        "GATED_CAPTURE",
-        str(transcript),
-        client="codex",
-        payload={"session_id": "sess-stream-gate"},
-    ) is True
+    assert (
+        hook_adapter._should_request_capture(
+            "GATED_CAPTURE",
+            str(transcript),
+            client="codex",
+            payload={"session_id": "sess-stream-gate"},
+        )
+        is True
+    )
 
 
 def test_hook_adapter_context_wakes_pending_queue_without_changing_output(monkeypatch, tmp_path, capsys):
@@ -430,12 +477,18 @@ def test_hook_adapter_context_wakes_pending_queue_without_changing_output(monkey
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(queue_db))
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
     monkeypatch.setattr(hook_adapter, "_spawn_agent_window_worker", fake_spawn_worker, raising=False)
-    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
-        "hook_event_name": "UserPromptSubmit",
-        "session_id": "sess-context",
-        "cwd": str(tmp_path),
-        "prompt": "continue",
-    }))
+    monkeypatch.setattr(
+        hook_adapter.sys,
+        "stdin",
+        _Stdin(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "sess-context",
+                "cwd": str(tmp_path),
+                "prompt": "continue",
+            }
+        ),
+    )
 
     exit_code = hook_adapter.main(["context"])
 
@@ -473,13 +526,15 @@ def test_hook_adapter_worker_run_once_drains_pending_queue(monkeypatch, tmp_path
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(queue_db))
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
-    exit_code = hook_adapter.main([
-        "worker-run-once",
-        "--api-url",
-        "http://127.0.0.1:8765",
-        "--timeout",
-        "77",
-    ])
+    exit_code = hook_adapter.main(
+        [
+            "worker-run-once",
+            "--api-url",
+            "http://127.0.0.1:8765",
+            "--timeout",
+            "77",
+        ]
+    )
 
     assert exit_code == 0
     assert len(requests) == 1
@@ -512,9 +567,7 @@ def test_worker_normalizes_legacy_capture_trigger_names(monkeypatch, tmp_path):
         queue_db_path=queue_db,
     )
     with sqlite3.connect(queue_db) as connection:
-        connection.execute(
-            "UPDATE session_cursor SET pending_trigger = 'BOUNDARY' WHERE session_id = 'legacy-session'"
-        )
+        connection.execute("UPDATE session_cursor SET pending_trigger = 'BOUNDARY' WHERE session_id = 'legacy-session'")
     requests: list[tuple[str, dict]] = []
 
     def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
@@ -576,10 +629,7 @@ def test_hook_adapter_worker_leaves_source_sync_to_service(monkeypatch, tmp_path
 def test_hook_adapter_worker_splits_large_window_without_advancing_past_upload(monkeypatch, tmp_path):
     from memforge import hook_adapter
 
-    lines = [
-        json.dumps({"type": "tool", "name": f"tool-{index}", "input": "x" * 20})
-        for index in range(3)
-    ]
+    lines = [json.dumps({"type": "tool", "name": f"tool-{index}", "input": "x" * 20}) for index in range(3)]
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
     queue_db = tmp_path / "queue.sqlite"
@@ -615,9 +665,7 @@ def test_hook_adapter_worker_splits_large_window_without_advancing_past_upload(m
     assert "tool-0" in payload["transcript_markdown"]
     assert "tool-2" not in payload["transcript_markdown"]
     with sqlite3.connect(queue_db) as connection:
-        row = connection.execute(
-            "SELECT captured_through, capture_pending FROM session_cursor"
-        ).fetchone()
+        row = connection.execute("SELECT captured_through, capture_pending FROM session_cursor").fetchone()
     assert row == (uploaded_end, 1)
 
 
@@ -848,9 +896,7 @@ def test_plugin_mcp_launchers_match_each_other():
     root = Path(__file__).resolve().parents[1]
     canonical = root / "src" / "memforge" / "plugin_mcp_proxy.py"
     codex_launcher = root / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_mcp.py"
-    claude_launcher = (
-        root / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_mcp.py"
-    )
+    claude_launcher = root / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_mcp.py"
 
     assert codex_launcher.read_text() == canonical.read_text()
     assert codex_launcher.read_text() == claude_launcher.read_text()
@@ -901,12 +947,14 @@ def test_mcp_proxy_supports_json_line_stdio():
 
 
 def _mcp_initialize_request() -> bytes:
-    return json.dumps({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test"}},
-    }).encode()
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test"}},
+        }
+    ).encode()
 
 
 def test_mcp_proxy_forwards_search_to_service_with_token(monkeypatch):
@@ -1041,12 +1089,7 @@ def test_mcp_proxy_rejects_unadvertised_search_source_ids(monkeypatch):
         {"query": "scheduler fix", "sources": ["src-hidden"]},
     )
 
-    assert result == {
-        "error": (
-            "Unsupported search parameter(s): sources. "
-            "Omit unknown filters instead of guessing."
-        )
-    }
+    assert result == {"error": ("Unsupported search parameter(s): sources. Omit unknown filters instead of guessing.")}
 
 
 def test_mcp_proxy_rejects_explicit_repo_hint(monkeypatch):
@@ -1062,10 +1105,7 @@ def test_mcp_proxy_rejects_explicit_repo_hint(monkeypatch):
     )
 
     assert result == {
-        "error": (
-            "Unsupported search parameter(s): active_repo_identifier. "
-            "Omit unknown filters instead of guessing."
-        )
+        "error": ("Unsupported search parameter(s): active_repo_identifier. Omit unknown filters instead of guessing.")
     }
 
 
@@ -1254,7 +1294,7 @@ def test_mcp_proxy_downloads_resource_to_local_cache(monkeypatch, tmp_path):
         def read(self, size=-1):
             if size is None or size < 0:
                 size = len(body) - self._offset
-            chunk = body[self._offset:self._offset + size]
+            chunk = body[self._offset : self._offset + size]
             self._offset += len(chunk)
             return chunk
 
@@ -1268,10 +1308,12 @@ def test_mcp_proxy_downloads_resource_to_local_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("MEMFORGE_ARTIFACT_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
-    result = proxy._handle_get_resource({
-        "url": "/api/documents/doc-123/pdf",
-        "mode": "file",
-    })
+    result = proxy._handle_get_resource(
+        {
+            "url": "/api/documents/doc-123/pdf",
+            "mode": "file",
+        }
+    )
 
     local_path = Path(result["local_path"])
     assert captured["url"] == "http://memforge.test/api/documents/doc-123/pdf"
@@ -1286,14 +1328,18 @@ def test_mcp_proxy_rejects_foreign_and_ambiguous_resource_urls(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
 
-    foreign = proxy._handle_get_resource({
-        "url": "https://evil.example/api/documents/doc-123/pdf",
-        "mode": "file",
-    })
-    encoded_slash = proxy._handle_get_resource({
-        "url": "/api/documents/doc%2F123/pdf",
-        "mode": "file",
-    })
+    foreign = proxy._handle_get_resource(
+        {
+            "url": "https://evil.example/api/documents/doc-123/pdf",
+            "mode": "file",
+        }
+    )
+    encoded_slash = proxy._handle_get_resource(
+        {
+            "url": "/api/documents/doc%2F123/pdf",
+            "mode": "file",
+        }
+    )
 
     assert foreign["error"] == "unsupported resource URL"
     assert encoded_slash["error"] == "unsupported resource URL"
@@ -1458,11 +1504,17 @@ MEMFORGE_WORKSPACE_ID = "mount_tai"
         return {}
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
-    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
-        "hook_event_name": "Stop",
-        "session_id": "sess-config-fallback",
-        "cwd": str(tmp_path),
-    }))
+    monkeypatch.setattr(
+        hook_adapter.sys,
+        "stdin",
+        _Stdin(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "sess-config-fallback",
+                "cwd": str(tmp_path),
+            }
+        ),
+    )
 
     exit_code = hook_adapter.main(["submit-session"])
 
@@ -1521,10 +1573,16 @@ def test_session_start_guidance_explains_agentic_memforge_usage(monkeypatch, cap
     from memforge import hook_adapter
 
     monkeypatch.setattr(hook_adapter, "_drain_pending_agent_windows_if_present", lambda **_: None)
-    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({
-        "hook_event_name": "SessionStart",
-        "session_id": "sess-guidance",
-    }))
+    monkeypatch.setattr(
+        hook_adapter.sys,
+        "stdin",
+        _Stdin(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "sess-guidance",
+            }
+        ),
+    )
 
     exit_code = hook_adapter.main(["context", "--api-url", "http://127.0.0.1:8765"])
 
@@ -1542,15 +1600,21 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
 
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text(
-        json.dumps({
-            "type": "tool",
-            "name": "exec_command",
-            "input": "Authorization: Bearer raw-secret-token",
-        }) + "\n"
-        + json.dumps({
-            "type": "assistant",
-            "message": "api_key: raw-api-secret",
-        }) + "\n",
+        json.dumps(
+            {
+                "type": "tool",
+                "name": "exec_command",
+                "input": "Authorization: Bearer raw-secret-token",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "assistant",
+                "message": "api_key: raw-api-secret",
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -1599,14 +1663,11 @@ def test_bounded_transcript_slice_never_advances_past_lines_read(tmp_path):
 
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text(
-        '{"type":"tool","name":"one","input":"edit"}\n'
-        '{"type":"tool","name":"two","input":"test"}\n',
+        '{"type":"tool","name":"one","input":"edit"}\n{"type":"tool","name":"two","input":"test"}\n',
         encoding="utf-8",
     )
 
-    lines, effective_end, truncated = hook_adapter._bounded_transcript_line_slice(
-        str(transcript), 0, 3
-    )
+    lines, effective_end, truncated = hook_adapter._bounded_transcript_line_slice(str(transcript), 0, 3)
 
     assert len(lines) == 2
     assert effective_end == 2
@@ -1616,25 +1677,31 @@ def test_bounded_transcript_slice_never_advances_past_lines_read(tmp_path):
 def test_extract_transcript_events_understands_codex_payload_shape():
     from memforge import hook_adapter
 
-    text = "\n".join([
-        json.dumps({
-            "timestamp": "2026-05-30T12:00:00Z",
-            "type": "response_item",
-            "payload": {
-                "type": "function_call",
-                "name": "apply_patch",
-                "arguments": "{\"cmd\":\"edit docs\"}",
-            },
-        }),
-        json.dumps({
-            "timestamp": "2026-05-30T12:00:01Z",
-            "type": "event_msg",
-            "payload": {
-                "type": "agent_message",
-                "message": "Implemented the boundary fix.",
-            },
-        }),
-    ])
+    text = "\n".join(
+        [
+            json.dumps(
+                {
+                    "timestamp": "2026-05-30T12:00:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "apply_patch",
+                        "arguments": '{"cmd":"edit docs"}',
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "timestamp": "2026-05-30T12:00:01Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "message": "Implemented the boundary fix.",
+                    },
+                }
+            ),
+        ]
+    )
 
     events = hook_adapter._extract_transcript_events(text)
 
@@ -1646,7 +1713,7 @@ def test_extract_transcript_events_understands_codex_payload_shape():
             "native_type": "function_call",
             "name": "apply_patch",
             "timestamp": "2026-05-30T12:00:00Z",
-            "text": "{\"cmd\":\"edit docs\"}",
+            "text": '{"cmd":"edit docs"}',
         },
         {
             "kind": "assistant_message",
@@ -1662,20 +1729,22 @@ def test_extract_transcript_events_understands_codex_payload_shape():
 def test_extract_transcript_events_understands_claude_nested_content_shape():
     from memforge import hook_adapter
 
-    text = json.dumps({
-        "type": "assistant",
-        "timestamp": "2026-05-30T12:00:02Z",
-        "message": {
-            "content": [
-                {
-                    "type": "tool_use",
-                    "name": "Bash",
-                    "input": {"command": "pytest tests/test_hook_adapter.py -q"},
-                },
-                {"type": "text", "text": "I will run the focused test."},
-            ],
-        },
-    })
+    text = json.dumps(
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-30T12:00:02Z",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "input": {"command": "pytest tests/test_hook_adapter.py -q"},
+                    },
+                    {"type": "text", "text": "I will run the focused test."},
+                ],
+            },
+        }
+    )
 
     events = hook_adapter._extract_transcript_events(text)
 
@@ -1687,7 +1756,7 @@ def test_extract_transcript_events_understands_claude_nested_content_shape():
             "native_type": "tool_use",
             "name": "Bash",
             "timestamp": "2026-05-30T12:00:02Z",
-            "text": "{\"command\":\"pytest tests/test_hook_adapter.py -q\"}",
+            "text": '{"command":"pytest tests/test_hook_adapter.py -q"}',
         }
     ]
 
@@ -1696,8 +1765,7 @@ def test_extract_transcript_events_keeps_recent_within_cap():
     from memforge import hook_adapter
 
     text = "\n".join(
-        json.dumps({"type": "tool", "name": f"tool-{i:03d}", "input": "x"})
-        for i in range(hook_adapter.MAX_EVENTS + 20)
+        json.dumps({"type": "tool", "name": f"tool-{i:03d}", "input": "x"}) for i in range(hook_adapter.MAX_EVENTS + 20)
     )
     events = hook_adapter._extract_transcript_events(text)
 
@@ -1749,44 +1817,52 @@ def test_session_window_payload_filters_codex_bootstrap_before_budgeting(tmp_pat
         json.dumps({"type": "session_meta", "payload": {"cwd": str(tmp_path)}}),
         json.dumps({"type": "turn_context", "payload": {"huge": "startup"}}),
         json.dumps({"type": "event_msg", "payload": {"type": "task_started", "message": "boot"}}),
-        json.dumps({
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "role": "developer",
-                "content": [{"type": "input_text", "text": "private developer instruction"}],
-            },
-        }),
-        json.dumps({
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": "# AGENTS.md instructions for /tmp\n<INSTRUCTIONS>\nnoise\n</INSTRUCTIONS>",
-                    }
-                ],
-            },
-        }),
-        json.dumps({
-            "timestamp": "2026-05-30T12:00:10Z",
-            "type": "response_item",
-            "payload": {
-                "type": "function_call",
-                "name": "apply_patch",
-                "arguments": "{\"file\":\"src/memforge/hook_adapter.py\"}",
-            },
-        }),
-        json.dumps({
-            "timestamp": "2026-05-30T12:00:11Z",
-            "type": "response_item",
-            "payload": {
-                "type": "function_call_output",
-                "output": "Updated canonical evidence extraction.",
-            },
-        }),
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "private developer instruction"}],
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "# AGENTS.md instructions for /tmp\n<INSTRUCTIONS>\nnoise\n</INSTRUCTIONS>",
+                        }
+                    ],
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "timestamp": "2026-05-30T12:00:10Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "apply_patch",
+                    "arguments": '{"file":"src/memforge/hook_adapter.py"}',
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "timestamp": "2026-05-30T12:00:11Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "output": "Updated canonical evidence extraction.",
+                },
+            }
+        ),
     ]
     transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1810,7 +1886,7 @@ def test_session_window_payload_filters_codex_bootstrap_before_budgeting(tmp_pat
             "native_type": "function_call",
             "name": "apply_patch",
             "timestamp": "2026-05-30T12:00:10Z",
-            "text": "{\"file\":\"src/memforge/hook_adapter.py\"}",
+            "text": '{"file":"src/memforge/hook_adapter.py"}',
         },
         {
             "kind": "tool_result",
@@ -1826,7 +1902,151 @@ def test_session_window_payload_filters_codex_bootstrap_before_budgeting(tmp_pat
     assert "private developer instruction" not in payload["transcript_markdown"]
     assert "AGENTS.md" not in payload["transcript_markdown"]
     assert "apply_patch" in payload["transcript_markdown"]
+    assert payload["source_observed_at"] == "2026-05-30T12:00:10+00:00"
     assert payload["receipt"]["metadata"]["omissions"]["metadata_or_context"] == 5
+
+
+def test_session_window_payload_uses_earliest_offset_aware_event_timestamp(tmp_path):
+    from memforge import hook_adapter
+
+    transcript = tmp_path / "codex-out-of-order.jsonl"
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-05-30T12:00:30Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "later event"}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-05-30T12:00:10+00:00",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "earlier event"}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    payload = hook_adapter._session_window_payload(
+        client="codex",
+        session_id="sess-out-of-order",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        from_line=0,
+        to_line=2,
+        trigger="REQUIRED_CAPTURE",
+    )
+
+    assert payload["source_observed_at"] == "2026-05-30T12:00:10+00:00"
+
+
+def test_session_window_payload_rejects_naive_source_observed_at(tmp_path):
+    from memforge import hook_adapter
+
+    transcript = tmp_path / "codex-naive-timestamp.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-30T12:00:10",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "naive timestamp"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="timezone offset"):
+        hook_adapter._session_window_payload(
+            client="codex",
+            session_id="sess-naive-timestamp",
+            transcript_path=str(transcript),
+            workspace=str(tmp_path),
+            from_line=0,
+            to_line=1,
+            trigger="REQUIRED_CAPTURE",
+        )
+
+
+def test_session_window_payload_rejects_invalid_source_observed_at(tmp_path):
+    from memforge import hook_adapter
+
+    transcript = tmp_path / "codex-invalid-timestamp.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "timestamp": "not-a-timestamp",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "invalid timestamp"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid event timestamp"):
+        hook_adapter._session_window_payload(
+            client="codex",
+            session_id="sess-invalid-timestamp",
+            transcript_path=str(transcript),
+            workspace=str(tmp_path),
+            from_line=0,
+            to_line=1,
+            trigger="REQUIRED_CAPTURE",
+        )
+
+
+def test_session_window_payload_omits_source_observed_at_without_event_timestamp(tmp_path):
+    from memforge import hook_adapter
+
+    transcript = tmp_path / "codex-no-timestamp.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "output": "pytest passed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    payload = hook_adapter._session_window_payload(
+        client="codex",
+        session_id="sess-no-timestamp",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        from_line=0,
+        to_line=1,
+        trigger="REQUIRED_CAPTURE",
+    )
+
+    assert "source_observed_at" not in payload
 
 
 def test_session_window_payload_middle_truncates_oversized_evidence_line(monkeypatch, tmp_path):
@@ -1835,13 +2055,16 @@ def test_session_window_payload_middle_truncates_oversized_evidence_line(monkeyp
     monkeypatch.setattr(hook_adapter, "MAX_TRANSCRIPT_CHARS", 220)
     transcript = tmp_path / "codex-huge-line.jsonl"
     transcript.write_text(
-        json.dumps({
-            "type": "response_item",
-            "payload": {
-                "type": "function_call_output",
-                "output": "command started\n" + ("x" * 1000) + "\npytest passed",
-            },
-        }) + "\n",
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "output": "command started\n" + ("x" * 1000) + "\npytest passed",
+                },
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -1868,21 +2091,24 @@ def test_session_window_payload_redacts_claude_nested_json_secret_before_network
 
     transcript = tmp_path / "claude-json-secret.jsonl"
     transcript.write_text(
-        json.dumps({
-            "type": "assistant",
-            "message": {
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "name": "Bash",
-                        "input": {
-                            "command": "pytest tests/test_hook_adapter.py -q",
-                            "api_key": "claude-json-api-key-value",
-                        },
-                    }
-                ]
-            },
-        }) + "\n",
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Bash",
+                            "input": {
+                                "command": "pytest tests/test_hook_adapter.py -q",
+                                "api_key": "claude-json-api-key-value",
+                            },
+                        }
+                    ]
+                },
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -1981,16 +2207,24 @@ def test_worker_keeps_pending_when_capture_requested_during_upload(monkeypatch, 
     transcript.write_text('{"type":"tool","name":"apply_patch","input":"edit"}\n', encoding="utf-8")
     queue_db = tmp_path / "queue.sqlite"
     hook_adapter.request_session_capture(
-        client="codex", session_id="sess", transcript_path=str(transcript),
-        workspace=str(tmp_path), trigger="GATED_CAPTURE", queue_db_path=queue_db,
+        client="codex",
+        session_id="sess",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        trigger="GATED_CAPTURE",
+        queue_db_path=queue_db,
     )
 
     def fake_post_json(path, payload, *, api_url, timeout):
         if path == "/api/agent-sessions/windows":
             # A hook fires during the in-flight upload, requesting another capture.
             hook_adapter.request_session_capture(
-                client="codex", session_id="sess", transcript_path=str(transcript),
-                workspace=str(tmp_path), trigger="GATED_CAPTURE", queue_db_path=queue_db,
+                client="codex",
+                session_id="sess",
+                transcript_path=str(transcript),
+                workspace=str(tmp_path),
+                trigger="GATED_CAPTURE",
+                queue_db_path=queue_db,
             )
         return {"ok": True}
 
@@ -2017,8 +2251,12 @@ def test_worker_keeps_pending_when_request_timestamp_collides(monkeypatch, tmp_p
     constant_now = "2026-05-30T00:00:00+00:00"
     monkeypatch.setattr(hook_adapter, "_now_iso", lambda: constant_now)
     hook_adapter.request_session_capture(
-        client="codex", session_id="sess", transcript_path=str(transcript),
-        workspace=str(tmp_path), trigger="GATED_CAPTURE", queue_db_path=queue_db,
+        client="codex",
+        session_id="sess",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        trigger="GATED_CAPTURE",
+        queue_db_path=queue_db,
     )
 
     def fake_post_json(path, payload, *, api_url, timeout):
@@ -2029,8 +2267,12 @@ def test_worker_keeps_pending_when_request_timestamp_collides(monkeypatch, tmp_p
                 encoding="utf-8",
             )
             hook_adapter.request_session_capture(
-                client="codex", session_id="sess", transcript_path=str(transcript),
-                workspace=str(tmp_path), trigger="GATED_CAPTURE", queue_db_path=queue_db,
+                client="codex",
+                session_id="sess",
+                transcript_path=str(transcript),
+                workspace=str(tmp_path),
+                trigger="GATED_CAPTURE",
+                queue_db_path=queue_db,
             )
         return {"ok": True}
 
@@ -2042,9 +2284,7 @@ def test_worker_keeps_pending_when_request_timestamp_collides(monkeypatch, tmp_p
 
     assert submitted == 1
     with sqlite3.connect(queue_db) as connection:
-        row = connection.execute(
-            "SELECT capture_pending, captured_through, request_seq FROM session_cursor"
-        ).fetchone()
+        row = connection.execute("SELECT capture_pending, captured_through, request_seq FROM session_cursor").fetchone()
     assert row == (1, 1, 2)
     assert capsys.readouterr().out == ""
 
@@ -2056,8 +2296,12 @@ def test_stale_worker_cannot_rewind_bookmark_after_lease_reclaim(monkeypatch, tm
     _write_transcript_lines(transcript, 10)
     queue_db = tmp_path / "queue.sqlite"
     hook_adapter.request_session_capture(
-        client="codex", session_id="sess", transcript_path=str(transcript),
-        workspace=str(tmp_path), trigger="GATED_CAPTURE", queue_db_path=queue_db,
+        client="codex",
+        session_id="sess",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        trigger="GATED_CAPTURE",
+        queue_db_path=queue_db,
     )
     calls = {"window_uploads": 0}
 
@@ -2078,14 +2322,10 @@ def test_stale_worker_cannot_rewind_bookmark_after_lease_reclaim(monkeypatch, tm
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
-    hook_adapter._process_session_captures(
-        queue_db, api_url="http://127.0.0.1:8765", timeout=5, max_sessions=5
-    )
+    hook_adapter._process_session_captures(queue_db, api_url="http://127.0.0.1:8765", timeout=5, max_sessions=5)
 
     with sqlite3.connect(queue_db) as connection:
-        row = connection.execute(
-            "SELECT captured_through, capture_pending FROM session_cursor"
-        ).fetchone()
+        row = connection.execute("SELECT captured_through, capture_pending FROM session_cursor").fetchone()
     assert row == (20, 0)
 
 
@@ -2102,8 +2342,12 @@ def test_recover_does_not_overwrite_concurrent_required_capture_request(monkeypa
         if not requested["done"]:
             requested["done"] = True
             hook_adapter.request_session_capture(
-                client="codex", session_id="sess", transcript_path=str(transcript),
-                workspace=str(tmp_path), trigger="REQUIRED_CAPTURE", queue_db_path=queue_db,
+                client="codex",
+                session_id="sess",
+                transcript_path=str(transcript),
+                workspace=str(tmp_path),
+                trigger="REQUIRED_CAPTURE",
+                queue_db_path=queue_db,
             )
         return 6
 
@@ -2131,8 +2375,14 @@ def _seed_session_cursor(queue_db, **fields):
     from memforge import hook_adapter
 
     columns = (
-        "client", "session_id", "transcript_path", "captured_through",
-        "capture_pending", "pending_trigger", "created_at", "updated_at",
+        "client",
+        "session_id",
+        "transcript_path",
+        "captured_through",
+        "capture_pending",
+        "pending_trigger",
+        "created_at",
+        "updated_at",
     )
     values = {
         "client": "codex",
@@ -2206,8 +2456,11 @@ def test_recover_skips_already_pending_session(tmp_path):
     _write_transcript_lines(transcript, 6)
     queue_db = tmp_path / "queue.sqlite"
     _seed_session_cursor(
-        queue_db, transcript_path=str(transcript), captured_through=2,
-        capture_pending=1, pending_trigger="REQUIRED_CAPTURE",
+        queue_db,
+        transcript_path=str(transcript),
+        captured_through=2,
+        capture_pending=1,
+        pending_trigger="REQUIRED_CAPTURE",
     )
 
     rearmed = hook_adapter._recover_incomplete_sessions(client="codex", queue_db_path=queue_db)
@@ -2222,9 +2475,7 @@ def test_recover_skips_missing_transcript(tmp_path):
     from memforge import hook_adapter
 
     queue_db = tmp_path / "queue.sqlite"
-    _seed_session_cursor(
-        queue_db, transcript_path=str(tmp_path / "gone.jsonl"), captured_through=2, capture_pending=0
-    )
+    _seed_session_cursor(queue_db, transcript_path=str(tmp_path / "gone.jsonl"), captured_through=2, capture_pending=0)
 
     rearmed = hook_adapter._recover_incomplete_sessions(client="codex", queue_db_path=queue_db)
 
@@ -2238,8 +2489,12 @@ def test_queue_uses_wal_mode(tmp_path):
 
     queue_db = tmp_path / "queue.sqlite"
     hook_adapter.request_session_capture(
-        client="codex", session_id="sess", transcript_path=str(tmp_path / "t.jsonl"),
-        workspace=str(tmp_path), trigger="GATED_CAPTURE", queue_db_path=queue_db,
+        client="codex",
+        session_id="sess",
+        transcript_path=str(tmp_path / "t.jsonl"),
+        workspace=str(tmp_path),
+        trigger="GATED_CAPTURE",
+        queue_db_path=queue_db,
     )
 
     with sqlite3.connect(queue_db) as connection:

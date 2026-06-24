@@ -132,29 +132,45 @@ async def test_workspace_write_does_not_corroborate_other_users_private(store_fi
     await store.vector.upsert(
         ids=[u2_priv.id],
         embeddings=[[0.1, 0.1, 0.1]],
-        metadatas=[{
-            "memory_type": "fact",
-            "project_key": SHARED_PROJECT_KEY,
-            "visibility": PRIVATE,
-            "owner_user_id": "u-2",
-            "confidence": u2_priv.confidence,
-            "status": "active",
-            "content_hash": u2_priv.content_hash,
-            "embedding_text_hash": "h",
-        }],
+        metadatas=[
+            {
+                "memory_type": "fact",
+                "project_key": SHARED_PROJECT_KEY,
+                "visibility": PRIVATE,
+                "owner_user_id": "u-2",
+                "confidence": u2_priv.confidence,
+                "status": "active",
+                "content_hash": u2_priv.content_hash,
+                "embedding_text_hash": "h",
+            }
+        ],
     )
 
     # Seed a doc row so the source linkage on insert succeeds.
     from datetime import datetime, timezone
     from memforge.models import DocumentRecord
+
     now = datetime.now(timezone.utc)
-    await db.upsert_document(DocumentRecord(
-        doc_id="doc-team", source="src-team", source_url="team://doc",
-        title="t", space_or_project="PROJ", author="a", last_modified=now,
-        labels=[], version="1", content_hash="h-team", token_count=1,
-        raw_content_uri=None, raw_content_type="text/markdown",
-        normalized_content_uri=None, pdf_content_uri=None, last_synced=now,
-    ))
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="doc-team",
+            source="src-team",
+            source_url="team://doc",
+            title="t",
+            space_or_project="PROJ",
+            author="a",
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash="h-team",
+            token_count=1,
+            raw_content_uri=None,
+            raw_content_type="text/markdown",
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
 
     # U1 writes the same content as a workspace memory.
     new_mem = _mem("ws-new", "deploy via argocd", visibility=WORKSPACE)
@@ -163,6 +179,7 @@ async def test_workspace_write_does_not_corroborate_other_users_private(store_fi
         doc_id="doc-team",
         source_type="manual",
         scope=_writer_scope(),
+        source_observed_at=None,
     )
 
     # The write must land as a fresh insert, not corroborate U2's private row.
@@ -178,9 +195,11 @@ async def test_workspace_write_does_not_corroborate_other_users_private(store_fi
     candidates = coll.query(
         query_embeddings=[[0.1, 0.1, 0.1]],
         n_results=10,
-        where={"$and": [
-            {"status": "active"},
-            {"visibility": WORKSPACE},
-        ]},
+        where={
+            "$and": [
+                {"status": "active"},
+                {"visibility": WORKSPACE},
+            ]
+        },
     )
     assert "priv-u2" not in candidates["ids"][0]

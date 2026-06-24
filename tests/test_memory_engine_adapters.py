@@ -41,13 +41,26 @@ class RecordingCollection:
 
 async def _document(db: Database, doc_id: str) -> None:
     now = datetime.now(timezone.utc)
-    await db.upsert_document(DocumentRecord(
-        doc_id=doc_id, source="src-x", source_url="https://x/1", title="t",
-        space_or_project="PAY", author="a", last_modified=now, labels=[],
-        version="1", content_hash="h", token_count=1, raw_content_uri=None,
-        raw_content_type="text/html", normalized_content_uri=None,
-        pdf_content_uri=None, last_synced=now,
-    ))
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            source="src-x",
+            source_url="https://x/1",
+            title="t",
+            space_or_project="PAY",
+            author="a",
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash="h",
+            token_count=1,
+            raw_content_uri=None,
+            raw_content_type="text/html",
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
 
 
 @pytest.fixture
@@ -87,13 +100,12 @@ async def test_process_memories_inserts_through_the_adapters(db, monkeypatch):
         raw_memories=[RawMemory(content="deploy via ArgoCD", memory_type="fact")],
         source_type="manual",
         repo_identifier="github.com/shno-labs/mem-forge",
+        source_observed_at=None,
     )
     assert stats["inserted"] == 1
     rows = await db.get_memories_by_source_doc("doc1")
     assert rows[0].repo_identifier == "github.com/shno-labs/mem-forge"
-    assert collection.upserted[rows[0].id]["repo_identifier"] == (
-        "github.com/shno-labs/mem-forge"
-    )
+    assert collection.upserted[rows[0].id]["repo_identifier"] == ("github.com/shno-labs/mem-forge")
 
     async with db.db.execute("SELECT * FROM relation_runs") as cursor:
         relation_runs = [dict(row) async for row in cursor]
@@ -109,6 +121,44 @@ async def test_process_memories_inserts_through_the_adapters(db, monkeypatch):
     assert [(relation.memory_id, relation.relation_type) for relation in relations] == [
         (rows[0].id, RelationType.SUPPORTS)
     ]
+
+
+@pytest.mark.asyncio
+async def test_process_memories_persists_explicit_source_observed_at(db, monkeypatch):
+    collection = RecordingCollection()
+    adapters = build_sqlite_adapters(db, collection)
+    store = MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+    )
+
+    async def fake_embed(text: str):
+        return [0.1]
+
+    monkeypatch.setattr(store, "_embed", fake_embed)
+    await _document(db, "doc-observed")
+
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+    )
+    observed_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
+
+    stats = await engine.process_memories(
+        doc_id="doc-observed",
+        raw_memories=[RawMemory(content="historical session produced a durable finding", memory_type="fact")],
+        source_type="agent_session",
+        source_observed_at=observed_at,
+    )
+
+    assert stats["inserted"] == 1
+    [memory] = await db.get_memories_by_source_doc("doc-observed")
+    [source] = await db.get_memory_sources(memory.id)
+    assert source.source_observed_at == observed_at
 
 
 @pytest.mark.asyncio
@@ -135,7 +185,9 @@ async def test_process_memories_does_not_rematerialize_superseded_evidence_unit(
         memory_store=store,
     )
     raw = RawMemory(content="deploy via ArgoCD", memory_type="fact")
-    first = await engine.process_memories(doc_id="doc1", raw_memories=[raw], source_type="manual")
+    first = await engine.process_memories(
+        doc_id="doc1", raw_memories=[raw], source_type="manual", source_observed_at=None
+    )
     [old_memory] = await db.get_memories_by_source_doc("doc1")
     now = datetime.now(timezone.utc)
     replacement = Memory(
@@ -155,7 +207,9 @@ async def test_process_memories_does_not_rematerialize_superseded_evidence_unit(
         replacement_kind="revision",
     )
 
-    second = await engine.process_memories(doc_id="doc1", raw_memories=[raw], source_type="manual")
+    second = await engine.process_memories(
+        doc_id="doc1", raw_memories=[raw], source_type="manual", source_observed_at=None
+    )
     async with db.db.execute("SELECT evidence_unit_id FROM relation_runs ORDER BY id LIMIT 1") as cursor:
         row = await cursor.fetchone()
 

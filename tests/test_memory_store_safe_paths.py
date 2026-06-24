@@ -21,7 +21,7 @@ from memforge.memory.evidence import (
     RelationType,
 )
 from memforge.memory.store import MemoryStore
-from memforge.models import Memory, MemoryReview, content_hash
+from memforge.models import Memory, MemoryReview, MemorySource, content_hash
 from memforge.memory.review_service import ReviewKind, ReviewStatus
 from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.storage.database import Database
@@ -262,9 +262,24 @@ async def _insert_doc_side_tables(db: Database, doc_id: str, source: str = "src-
             document_hash, source_kind, document_uri, metadata, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            doc_id, source, "codex", "session-1", "manual", "/repo", "repo", "main", "abc",
-            "recent", None, None, now, f"hash-{doc_id}", "agent_session",
-            f"file:///{doc_id}.md", "{}", now,
+            doc_id,
+            source,
+            "codex",
+            "session-1",
+            "manual",
+            "/repo",
+            "repo",
+            "main",
+            "abc",
+            "recent",
+            None,
+            None,
+            now,
+            f"hash-{doc_id}",
+            "agent_session",
+            f"file:///{doc_id}.md",
+            "{}",
+            now,
         ),
     )
     await db.db.commit()
@@ -419,7 +434,7 @@ async def test_dedup_ignores_stale_chroma_candidate(db: Database):
     collection = RecordingCollection(query_ids=[retired.id], distances=[0.01])
     store = _store(db, collection)
 
-    result = await store.deduplicate_and_insert(candidate, "doc-1", "confluence")
+    result = await store.deduplicate_and_insert(candidate, "doc-1", "confluence", source_observed_at=None)
 
     stored_candidate = await db.get_memory(candidate.id)
     sources = await db.get_memory_sources(retired.id)
@@ -438,14 +453,22 @@ async def test_dedup_corrobates_active_chroma_candidate(db: Database):
     candidate = _memory("mem-new002", "Equivalent active fact")
     collection = RecordingCollection(query_ids=[active.id], distances=[0.01])
     store = _store(db, collection)
+    source_observed_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
 
-    result = await store.deduplicate_and_insert(candidate, "doc-1", "confluence", excerpt="same fact")
+    result = await store.deduplicate_and_insert(
+        candidate,
+        "doc-1",
+        "confluence",
+        excerpt="same fact",
+        source_observed_at=source_observed_at,
+    )
 
     stored_candidate = await db.get_memory(candidate.id)
     sources = await db.get_memory_sources(active.id)
     assert result == "corroborated"
     assert stored_candidate is None
     assert [(source.doc_id, source.support_kind) for source in sources] == [("doc-1", "extracted")]
+    assert sources[0].source_observed_at == source_observed_at
 
     async with db.db.execute(
         """SELECT rr.*
@@ -475,13 +498,108 @@ async def test_dedup_corrobates_active_chroma_candidate(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_retry_with_unknown_source_timestamp_clears_stale_value(db: Database):
+    await _insert_doc(db)
+    observed_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
+    source_observed_at = datetime(2026, 6, 19, 8, 30, tzinfo=timezone.utc)
+    memory = _memory("mem-agent-claim-source-observed", "Agent claim source timestamp")
+
+    await db.insert_memory_and_upsert_agent_claim(
+        memory,
+        doc_id="doc-1",
+        source_type="agent_session",
+        excerpt="initial excerpt",
+        relation_outcome=None,
+        claim_id="claim-source-observed",
+        concept_id="concept-source-observed",
+        display_anchor="source-observed",
+        claim_text="Agent claim source timestamp",
+        memory_type="fact",
+        tags=["agent-session"],
+        confidence=0.9,
+        observed_at=observed_at,
+        source_observed_at=source_observed_at,
+        concept_projection={
+            "concept_id": "concept-source-observed",
+            "source_id": "agent-source-codex",
+            "owner_user_id": "andrew.sun01@sap.com",
+            "workspace": "/workspace",
+            "repo_identifier": "github.com/shno-labs/mem-forge",
+            "concept_type": "topic",
+            "concept_path": "concepts/source-observed.md",
+            "title": "Source observed",
+            "markdown_body": "# Source observed\n",
+            "frontmatter": {},
+        },
+    )
+    assert (await db.get_memory_sources(memory.id))[0].source_observed_at == source_observed_at
+
+    await db.insert_memory_and_upsert_agent_claim(
+        memory,
+        doc_id="doc-1",
+        source_type="agent_session",
+        excerpt="retry excerpt",
+        relation_outcome=None,
+        claim_id="claim-source-observed",
+        concept_id="concept-source-observed",
+        display_anchor="source-observed",
+        claim_text="Agent claim source timestamp",
+        memory_type="fact",
+        tags=["agent-session"],
+        confidence=0.9,
+        observed_at=observed_at,
+        source_observed_at=None,
+        concept_projection={
+            "concept_id": "concept-source-observed",
+            "source_id": "agent-source-codex",
+            "owner_user_id": "andrew.sun01@sap.com",
+            "workspace": "/workspace",
+            "repo_identifier": "github.com/shno-labs/mem-forge",
+            "concept_type": "topic",
+            "concept_path": "concepts/source-observed.md",
+            "title": "Source observed",
+            "markdown_body": "# Source observed\n",
+            "frontmatter": {},
+        },
+    )
+
+    sources = await db.get_memory_sources(memory.id)
+    assert len(sources) == 1
+    assert sources[0].excerpt == "retry excerpt"
+    assert sources[0].source_observed_at is None
+
+
+@pytest.mark.asyncio
+async def test_restore_memory_source_snapshot_rejects_naive_source_observed_at(db: Database):
+    await _insert_doc(db)
+    memory = _memory("mem-naive-source-observed", "Naive source timestamp")
+    await db.insert_memory(memory)
+
+    with pytest.raises(ValueError, match="timezone"):
+        await db.restore_memory_source_snapshot(
+            MemorySource(
+                memory_id=memory.id,
+                doc_id="doc-1",
+                source_type="agent_session",
+                source_id="src-1",
+                excerpt="source excerpt",
+                support_kind="extracted",
+                added_at=datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc),
+                source_observed_at=datetime(2026, 6, 19, 8, 30),
+            )
+        )
+
+    assert await db.get_memory_sources(memory.id) == []
+
+
+@pytest.mark.asyncio
 async def test_dedup_query_failure_aborts_and_records_failed_index_event(db: Database):
     await _insert_doc(db)
     memory = _memory("mem-query-fail", "Should not insert without dedup")
     store = _store(db, FailingQueryCollection())
 
     with pytest.raises(RuntimeError, match="query failed"):
-        await store.deduplicate_and_insert(memory, "doc-1", "confluence")
+        await store.deduplicate_and_insert(memory, "doc-1", "confluence", source_observed_at=None)
 
     audit_rows = await db.list_memory_audit_events(memory_id=memory.id)
     assert await db.get_memory(memory.id) is None
@@ -495,7 +613,7 @@ async def test_insert_audit_events_share_one_operation_id(db: Database):
     memory = _memory("mem-auditop", "Grouped audit fact")
     store = _store(db, RecordingCollection())
 
-    await store.deduplicate_and_insert(memory, "doc-1", "confluence")
+    await store.deduplicate_and_insert(memory, "doc-1", "confluence", source_observed_at=None)
 
     audit_rows = await db.list_memory_audit_events(memory_id=memory.id)
     event_types = {row.event_type for row in audit_rows}
@@ -522,6 +640,7 @@ async def test_add_source_support_records_audit_event(db: Database):
         "jira",
         excerpt="Supported fact",
         support_kind="corroborated",
+        source_observed_at=None,
     )
 
     audit_rows = await db.list_memory_audit_events(event_type="source_support_added")
@@ -542,6 +661,7 @@ async def test_add_source_support_records_support_and_relation_atomically(db: Da
         "jira",
         excerpt="Supported fact",
         support_kind="corroborated",
+        source_observed_at=None,
         relation_outcome=_relation_outcome_bundle(
             unit_id="eu-support-relation",
             run_id="relrun-support-relation",
@@ -585,6 +705,7 @@ async def test_add_source_support_rolls_back_when_relation_bundle_fails(
             "jira",
             excerpt="Supported fact",
             support_kind="corroborated",
+            source_observed_at=None,
             relation_outcome=_relation_outcome_bundle(
                 unit_id="eu-support-relation-fail",
                 run_id="relrun-support-relation-fail",
@@ -807,6 +928,7 @@ async def test_supersede_memory_records_old_and_new_index_audit(db: Database):
         "confluence",
         replacement_kind="supersession",
         replacement_reason="newer source",
+        source_observed_at=None,
     )
 
     old_rows = await db.list_memory_audit_events(memory_id=old.id)
@@ -850,6 +972,7 @@ async def test_supersede_memory_rolls_back_when_relation_bundle_fails(
             "confluence",
             replacement_kind="supersession",
             replacement_reason="newer source",
+            source_observed_at=None,
             relation_outcome=_relation_outcome_bundle(
                 unit_id="eu-supersede-relation-fail",
                 run_id="relrun-supersede-relation-fail",
@@ -876,11 +999,28 @@ async def test_supersede_memory_does_not_blindly_carry_support_to_revision(db: D
     await _insert_doc(db, "doc-support")
     old = _memory("mem-old-support", "Old supported fact")
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-current", "confluence", "Old excerpt", support_kind="extracted")
-    await db.add_memory_source(old.id, "doc-support", "jira", "Still valid support", support_kind="corroborated")
+    current_observed_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
+    support_observed_at = datetime(2026, 6, 21, 4, 23, 51, tzinfo=timezone.utc)
+    await db.add_memory_source(
+        old.id,
+        "doc-current",
+        "confluence",
+        "Old excerpt",
+        support_kind="extracted",
+        source_observed_at=current_observed_at,
+    )
+    await db.add_memory_source(
+        old.id,
+        "doc-support",
+        "jira",
+        "Still valid support",
+        support_kind="corroborated",
+        source_observed_at=support_observed_at,
+    )
     new = _memory("mem-new-support", "New supported fact")
     collection = RecordingCollection()
     store = _store(db, collection)
+    replacement_observed_at = datetime(2026, 6, 22, 4, 23, 51, tzinfo=timezone.utc)
 
     await store.supersede_memory(
         old.id,
@@ -890,6 +1030,7 @@ async def test_supersede_memory_does_not_blindly_carry_support_to_revision(db: D
         excerpt="New excerpt",
         replacement_reason="source revision",
         replacement_kind="revision",
+        source_observed_at=replacement_observed_at,
     )
 
     old_sources = await db.get_memory_sources(old.id)
@@ -897,18 +1038,18 @@ async def test_supersede_memory_does_not_blindly_carry_support_to_revision(db: D
     stored_old = await db.get_memory(old.id)
     assert stored_old.replacement_kind == "revision"
     assert sorted(
-        (source.doc_id, source.source_type, source.support_kind, source.excerpt)
+        (source.doc_id, source.source_type, source.support_kind, source.excerpt, source.source_observed_at)
         for source in old_sources
     ) == [
-        ("doc-current", "confluence", "extracted", "Old excerpt"),
-        ("doc-support", "jira", "corroborated", "Still valid support"),
+        ("doc-current", "confluence", "extracted", "Old excerpt", current_observed_at),
+        ("doc-support", "jira", "corroborated", "Still valid support", support_observed_at),
     ]
     assert sorted(
-        (source.doc_id, source.source_type, source.support_kind, source.excerpt)
+        (source.doc_id, source.source_type, source.support_kind, source.excerpt, source.source_observed_at)
         for source in new_sources
     ) == [
-        ("doc-current", "confluence", "extracted", "New excerpt"),
-        ("doc-support", "jira", "corroborated", "Still valid support"),
+        ("doc-current", "confluence", "extracted", "New excerpt", replacement_observed_at),
+        ("doc-support", "jira", "corroborated", "Still valid support", support_observed_at),
     ]
 
 
@@ -918,8 +1059,23 @@ async def test_supersession_does_not_carry_old_support_to_replacement(db: Databa
     await _insert_doc(db, "doc-support")
     old = _memory("mem-old-supersession-support", "Old obsolete fact")
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-current", "confluence", "Old excerpt", support_kind="extracted")
-    await db.add_memory_source(old.id, "doc-support", "jira", "Old corroboration", support_kind="corroborated")
+    source_observed_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
+    await db.add_memory_source(
+        old.id,
+        "doc-current",
+        "confluence",
+        "Old excerpt",
+        support_kind="extracted",
+        source_observed_at=source_observed_at,
+    )
+    await db.add_memory_source(
+        old.id,
+        "doc-support",
+        "jira",
+        "Old corroboration",
+        support_kind="corroborated",
+        source_observed_at=None,
+    )
     new = _memory("mem-new-supersession-support", "Replacement fact with different meaning")
     collection = RecordingCollection()
     store = _store(db, collection)
@@ -932,6 +1088,7 @@ async def test_supersession_does_not_carry_old_support_to_replacement(db: Databa
         excerpt="Replacement excerpt",
         replacement_reason="old claim invalidated",
         replacement_kind="supersession",
+        source_observed_at=source_observed_at,
     )
 
     old_sources = await db.get_memory_sources(old.id)
@@ -939,15 +1096,15 @@ async def test_supersession_does_not_carry_old_support_to_replacement(db: Databa
     stored_old = await db.get_memory(old.id)
     assert stored_old.replacement_kind == "supersession"
     assert sorted(
-        (source.doc_id, source.source_type, source.support_kind, source.excerpt)
-        for source in old_sources
+        (source.doc_id, source.source_type, source.support_kind, source.excerpt) for source in old_sources
     ) == [
         ("doc-current", "confluence", "extracted", "Old excerpt"),
         ("doc-support", "jira", "corroborated", "Old corroboration"),
     ]
-    assert [(source.doc_id, source.source_type, source.support_kind, source.excerpt) for source in new_sources] == [
-        ("doc-current", "confluence", "extracted", "Replacement excerpt")
-    ]
+    assert [
+        (source.doc_id, source.source_type, source.support_kind, source.excerpt, source.source_observed_at)
+        for source in new_sources
+    ] == [("doc-current", "confluence", "extracted", "Replacement excerpt", source_observed_at)]
 
 
 @pytest.mark.asyncio
@@ -972,6 +1129,7 @@ async def test_supersede_memory_snapshots_array_like_chroma_embeddings(db: Datab
         "confluence",
         replacement_kind="supersession",
         replacement_reason="newer source",
+        source_observed_at=None,
     )
 
     stored_old = await db.get_memory(old.id)
@@ -996,6 +1154,7 @@ async def test_supersede_audit_uses_old_memory_as_subject_and_new_memory_as_cand
         "confluence",
         replacement_kind="supersession",
         replacement_reason="newer source",
+        source_observed_at=None,
     )
 
     audit_rows = await db.list_memory_audit_events(event_type="memory_supersede_committed")
@@ -1019,6 +1178,7 @@ async def test_supersede_audit_uses_stable_old_new_identity(db: Database):
         "confluence",
         replacement_kind="supersession",
         replacement_reason="newer source",
+        source_observed_at=None,
     )
 
     supersede_rows = await db.list_memory_audit_events(event_type="memory_supersede_committed")
@@ -1050,9 +1210,9 @@ async def test_promote_quarantined_challenger_routes_indexes_and_audit(db: Datab
 
     stored_incumbent = await db.get_memory(incumbent.id)
     stored_challenger = await db.get_memory(challenger.id)
-    audit_rows = await db.list_memory_audit_events(operation_id=(
-        await db.list_memory_audit_events(memory_id=challenger.id)
-    )[0].operation_id)
+    audit_rows = await db.list_memory_audit_events(
+        operation_id=(await db.list_memory_audit_events(memory_id=challenger.id))[0].operation_id
+    )
     assert stored_incumbent.status == "superseded"
     assert stored_challenger.status == "active"
     assert incumbent.id in collection.deleted
@@ -1060,6 +1220,36 @@ async def test_promote_quarantined_challenger_routes_indexes_and_audit(db: Datab
     supersede_rows = [row for row in audit_rows if row.event_type == "memory_supersede_committed"]
     assert [(row.memory_id, row.candidate_id) for row in supersede_rows] == [(incumbent.id, challenger.id)]
     assert len({row.operation_id for row in audit_rows}) == 1
+
+
+@pytest.mark.asyncio
+async def test_promoted_challenger_preserves_staged_source_observed_at(db: Database):
+    await _insert_doc(db, doc_id="doc-review")
+    incumbent = _memory("mem-incobserved", "Old approved fact")
+    challenger = _memory("mem-chalobserved", "New approved fact", status="pending_review")
+    source_observed_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
+    await db.insert_memory(incumbent)
+    store = _store(db, RecordingCollection())
+
+    await store.insert_memory(
+        memory=challenger,
+        doc_id="doc-review",
+        source_type="agent_session",
+        excerpt="Review challenger excerpt",
+        source_observed_at=source_observed_at,
+    )
+    await store.promote_quarantined_challenger(
+        incumbent=incumbent,
+        challenger=challenger,
+        replacement_kind="supersession",
+        replacement_reason="review approved",
+        review_id="rev-observed",
+    )
+
+    sources = await db.get_memory_sources(challenger.id)
+    assert [(source.doc_id, source.source_type, source.source_observed_at) for source in sources] == [
+        ("doc-review", "agent_session", source_observed_at)
+    ]
 
 
 @pytest.mark.asyncio
@@ -1124,9 +1314,7 @@ async def test_purge_memory_records_audit_without_payload_snapshots(db: Database
     assert purged is True
     assert await db.get_memory(memory.id) is None
     assert memory.id in collection.deleted
-    assert {"memory_purge_attempted", "memory_purge_committed"}.issubset(
-        {row.event_type for row in audit_rows}
-    )
+    assert {"memory_purge_attempted", "memory_purge_committed"}.issubset({row.event_type for row in audit_rows})
     assert all(row.before_snapshot is None and row.after_snapshot is None for row in audit_rows)
     assert len({row.operation_id for row in audit_rows}) == 1
 
@@ -1165,7 +1353,7 @@ async def test_delete_document_removes_document_chroma_vector(db: Database):
     await _insert_doc(db, "doc-delete")
     memory = _memory("mem-docdelete", "Document supported fact")
     await db.insert_memory(memory)
-    await db.add_memory_source(memory.id, "doc-delete", "confluence")
+    await db.add_memory_source(memory.id, "doc-delete", "confluence", source_observed_at=None)
     doc_collection = RecordingCollection()
     store = _store(db, RecordingCollection(), document_collection=doc_collection)
 
@@ -1179,7 +1367,7 @@ async def test_delete_document_audit_records_source_absence_context(db: Database
     await _insert_doc(db, "doc-source-absence")
     memory = _memory("mem-source-absence", "Only supported by source absence doc")
     await db.insert_memory(memory)
-    await db.add_memory_source(memory.id, "doc-source-absence", "jira")
+    await db.add_memory_source(memory.id, "doc-source-absence", "jira", source_observed_at=None)
     store = _store(db, RecordingCollection(), document_collection=RecordingCollection())
 
     await store.delete_document(
@@ -1233,9 +1421,7 @@ async def test_delete_document_restores_document_vector_when_chroma_delete_mutat
 
     stored_doc = await db.get_document("doc-delete-mutating-fail")
     assert stored_doc is not None
-    assert doc_collection.upserted["doc-delete-mutating-fail"]["document"] == (
-        "original mutating delete document text"
-    )
+    assert doc_collection.upserted["doc-delete-mutating-fail"]["document"] == ("original mutating delete document text")
     assert doc_collection.upserted["doc-delete-mutating-fail"]["embedding"] == [0.4, 0.5, 0.6]
 
 
@@ -1269,7 +1455,7 @@ async def test_remove_source_support_restores_provenance_when_index_delete_fails
     await _insert_doc(db)
     memory = _memory("mem-source-rollback", "Last sourced fact")
     await db.insert_memory(memory)
-    await db.add_memory_source(memory.id, "doc-1", "confluence", "source excerpt")
+    await db.add_memory_source(memory.id, "doc-1", "confluence", "source excerpt", source_observed_at=None)
     store = _store(db, FailingDeleteCollection())
 
     with pytest.raises(RuntimeError, match="delete failed"):
@@ -1290,7 +1476,13 @@ async def test_delete_document_restores_db_when_retired_memory_index_delete_fail
     await _insert_doc_side_tables(db, "doc-delete-rollback")
     memory = _memory("mem-doc-rollback", "Only supported by deleted doc")
     await db.insert_memory(memory)
-    await db.add_memory_source(memory.id, "doc-delete-rollback", "confluence", "source excerpt")
+    await db.add_memory_source(
+        memory.id,
+        "doc-delete-rollback",
+        "confluence",
+        "source excerpt",
+        source_observed_at=None,
+    )
     doc_collection = RecordingCollection()
     doc_collection.upsert(
         ids=["doc-delete-rollback"],
@@ -1338,7 +1530,13 @@ async def test_delete_document_rolls_back_sqlite_when_db_delete_fails_mid_transa
     await _insert_doc_side_tables(db, "doc-mid-db-fail")
     memory = _memory("mem-mid-db-fail", "Only supported by failing doc")
     await db.insert_memory(memory)
-    await db.add_memory_source(memory.id, "doc-mid-db-fail", "confluence", "source excerpt")
+    await db.add_memory_source(
+        memory.id,
+        "doc-mid-db-fail",
+        "confluence",
+        "source excerpt",
+        source_observed_at=None,
+    )
     store = _store(db, RecordingCollection(), document_collection=RecordingCollection())
 
     async def fail_refresh(memory_ids, *, retire_reason="source_deleted"):
@@ -1390,7 +1588,13 @@ async def test_delete_source_cascade_restores_db_when_retired_memory_index_delet
     await db.db.commit()
     memory = _memory("mem-sourcecascade-rollback", "Only supported by source doc")
     await db.insert_memory(memory)
-    await db.add_memory_source(memory.id, "doc-source-rollback", "confluence", "source excerpt")
+    await db.add_memory_source(
+        memory.id,
+        "doc-source-rollback",
+        "confluence",
+        "source excerpt",
+        source_observed_at=None,
+    )
     doc_collection = RecordingCollection()
     doc_collection.upsert(
         ids=["doc-source-rollback"],
@@ -1508,7 +1712,7 @@ async def test_insert_memory_raises_and_avoids_committed_event_when_chroma_upser
     store = _store(db, FailingUpsertCollection())
 
     with pytest.raises(RuntimeError, match="upsert failed"):
-        await store.deduplicate_and_insert(memory, "doc-1", "confluence")
+        await store.deduplicate_and_insert(memory, "doc-1", "confluence", source_observed_at=None)
 
     audit_rows = await db.list_memory_audit_events(memory_id=memory.id)
     assert "index_operation_failed" in {row.event_type for row in audit_rows}
@@ -1524,7 +1728,7 @@ async def test_insert_memory_cleans_chroma_when_upsert_mutates_then_fails(db: Da
     store = _store(db, collection)
 
     with pytest.raises(RuntimeError, match="upsert failed after mutation"):
-        await store.deduplicate_and_insert(memory, "doc-1", "confluence")
+        await store.deduplicate_and_insert(memory, "doc-1", "confluence", source_observed_at=None)
 
     assert await db.get_memory(memory.id) is None
     assert memory.id not in collection.upserted
@@ -1538,7 +1742,7 @@ async def test_insert_memory_purges_sqlite_when_chroma_cleanup_fails(db: Databas
     store = _store(db, collection)
 
     with pytest.raises(RuntimeError, match="delete failed during rollback"):
-        await store.deduplicate_and_insert(memory, "doc-1", "confluence")
+        await store.deduplicate_and_insert(memory, "doc-1", "confluence", source_observed_at=None)
 
     assert await db.get_memory(memory.id) is None
 
@@ -1557,6 +1761,7 @@ async def test_insert_memory_rebuilds_fts_from_canonical_entity_links(db: Databa
         memory,
         "doc-1",
         "confluence",
+        source_observed_at=None,
         entity_ids=[alpha_id, beta_id],
     )
 
@@ -1588,6 +1793,7 @@ async def test_supersede_memory_rebuilds_fts_from_canonical_entity_links(db: Dat
         "doc-1",
         "confluence",
         replacement_kind="supersession",
+        source_observed_at=None,
         entity_ids=[alpha_id, beta_id],
         replacement_reason="newer source",
     )
@@ -1610,7 +1816,7 @@ async def test_insert_memory_rolls_back_sqlite_when_source_link_fails(db: Databa
     store = _store(FailingSourceInsertDatabase(db), collection)  # type: ignore[arg-type]
 
     with pytest.raises(RuntimeError, match="source insert failed"):
-        await store.deduplicate_and_insert(memory, "doc-1", "confluence")
+        await store.deduplicate_and_insert(memory, "doc-1", "confluence", source_observed_at=None)
 
     assert await db.get_memory(memory.id) is None
     assert memory.id not in collection.upserted
@@ -1633,6 +1839,7 @@ async def test_insert_memory_rolls_back_when_relation_bundle_fails(db: Database,
             memory,
             "doc-1",
             "confluence",
+            source_observed_at=None,
             relation_outcome=_relation_outcome_bundle(
                 unit_id="eu-create-relation-fail",
                 run_id="relrun-create-relation-fail",
@@ -1770,6 +1977,7 @@ async def test_supersede_memory_restores_sqlite_when_new_chroma_upsert_fails(db:
             "doc-1",
             "confluence",
             replacement_kind="supersession",
+            source_observed_at=None,
         )
 
     stored_old = await db.get_memory(old.id)
@@ -1801,6 +2009,7 @@ async def test_supersede_memory_cleans_new_chroma_when_source_link_fails(db: Dat
             "doc-1",
             "confluence",
             replacement_kind="supersession",
+            source_observed_at=None,
         )
 
     stored_old = await db.get_memory(old.id)
@@ -1827,6 +2036,7 @@ async def test_supersede_memory_restores_sqlite_when_new_chroma_cleanup_fails(db
             "doc-1",
             "confluence",
             replacement_kind="supersession",
+            source_observed_at=None,
         )
 
     stored_old = await db.get_memory(old.id)

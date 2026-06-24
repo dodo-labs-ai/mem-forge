@@ -25,16 +25,19 @@ async def test_add_source_support_does_not_cross_visibility(tmp_path):
     await db.connect()
     try:
         priv = Memory(
-            id="m-priv", memory_type="fact", content="x",
+            id="m-priv",
+            memory_type="fact",
+            content="x",
             content_hash=content_hash("x"),
-            visibility=Visibility.PRIVATE.value, owner_user_id="u-alice",
-            project_key=SHARED_PROJECT_KEY, tags=[],
+            visibility=Visibility.PRIVATE.value,
+            owner_user_id="u-alice",
+            project_key=SHARED_PROJECT_KEY,
+            tags=[],
         )
         await db.insert_memory(priv)
 
         adapters = build_sqlite_adapters(db, memory_collection=None)
-        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector,
-                            embed_cfg={}, dedup_threshold=0.08)
+        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
 
         outcome = await store.add_source_support(
             memory_id="m-priv",
@@ -42,6 +45,7 @@ async def test_add_source_support_does_not_cross_visibility(tmp_path):
             source_type="confluence",
             writer_visibility=Visibility.WORKSPACE.value,
             writer_owner_user_id=None,
+            source_observed_at=None,
         )
         assert outcome == "rejected"
 
@@ -57,16 +61,19 @@ async def test_add_source_support_does_not_cross_private_owner(tmp_path):
     await db.connect()
     try:
         alice = Memory(
-            id="m-alice", memory_type="fact", content="x",
+            id="m-alice",
+            memory_type="fact",
+            content="x",
             content_hash=content_hash("x"),
-            visibility=Visibility.PRIVATE.value, owner_user_id="u-alice",
-            project_key=SHARED_PROJECT_KEY, tags=[],
+            visibility=Visibility.PRIVATE.value,
+            owner_user_id="u-alice",
+            project_key=SHARED_PROJECT_KEY,
+            tags=[],
         )
         await db.insert_memory(alice)
 
         adapters = build_sqlite_adapters(db, memory_collection=None)
-        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector,
-                            embed_cfg={}, dedup_threshold=0.08)
+        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
 
         outcome = await store.add_source_support(
             memory_id="m-alice",
@@ -74,6 +81,7 @@ async def test_add_source_support_does_not_cross_private_owner(tmp_path):
             source_type="agent_session",
             writer_visibility=Visibility.PRIVATE.value,
             writer_owner_user_id="u-bob",
+            source_observed_at=None,
         )
         assert outcome == "rejected"
 
@@ -89,16 +97,19 @@ async def test_add_source_support_does_not_cross_workspace_project(tmp_path):
     await db.connect()
     try:
         risk = Memory(
-            id="m-risk", memory_type="fact", content="x",
+            id="m-risk",
+            memory_type="fact",
+            content="x",
             content_hash=content_hash("x"),
-            visibility=Visibility.WORKSPACE.value, owner_user_id=None,
-            project_key="RISK", tags=[],
+            visibility=Visibility.WORKSPACE.value,
+            owner_user_id=None,
+            project_key="RISK",
+            tags=[],
         )
         await db.insert_memory(risk)
 
         adapters = build_sqlite_adapters(db, memory_collection=None)
-        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector,
-                            embed_cfg={}, dedup_threshold=0.08)
+        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
 
         outcome = await store.add_source_support(
             memory_id="m-risk",
@@ -107,6 +118,7 @@ async def test_add_source_support_does_not_cross_workspace_project(tmp_path):
             writer_visibility=Visibility.WORKSPACE.value,
             writer_owner_user_id=None,
             writer_project_key="PAY",
+            source_observed_at=None,
         )
         assert outcome == "rejected"
 
@@ -122,17 +134,21 @@ async def test_add_source_support_rejects_workspace_writer_with_none_project_aga
     persistence, so it must NOT corroborate a target with project_key="PAY".
     Currently the writer-None path skips the check, allowing the cross-project edge."""
     target = Memory(
-        id="m-pay", memory_type="fact", content="x", content_hash=content_hash("x"),
-        visibility=Visibility.WORKSPACE.value, owner_user_id=None,
-        project_key="PAY", tags=[],
+        id="m-pay",
+        memory_type="fact",
+        content="x",
+        content_hash=content_hash("x"),
+        visibility=Visibility.WORKSPACE.value,
+        owner_user_id=None,
+        project_key="PAY",
+        tags=[],
     )
     db = Database(str(tmp_path / "c2.db"))
     await db.connect()
     try:
         await db.insert_memory(target)
         adapters = build_sqlite_adapters(db, memory_collection=None)
-        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector,
-                            embed_cfg={}, dedup_threshold=0.08)
+        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
         outcome = await store.add_source_support(
             memory_id="m-pay",
             doc_id="d-noproj",
@@ -140,6 +156,7 @@ async def test_add_source_support_rejects_workspace_writer_with_none_project_aga
             writer_visibility=Visibility.WORKSPACE.value,
             writer_owner_user_id=None,
             writer_project_key=None,
+            source_observed_at=None,
         )
         assert outcome == "rejected"
         stored = await db.get_memory("m-pay")
