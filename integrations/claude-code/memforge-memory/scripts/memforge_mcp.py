@@ -50,17 +50,21 @@ SOURCE_TYPE_VALUES = [
     "teams",
 ]
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
-SEARCH_ALLOWED_KEYS = frozenset({
-    "query",
-    "source_filter",
-    "time_range",
-    "top_k",
-})
-SOURCE_FILTER_ALLOWED_KEYS = frozenset({
-    "source_types",
-    "clients",
-    "current_repo_only",
-})
+SEARCH_ALLOWED_KEYS = frozenset(
+    {
+        "query",
+        "source_filter",
+        "time_range",
+        "top_k",
+    }
+)
+SOURCE_FILTER_ALLOWED_KEYS = frozenset(
+    {
+        "source_types",
+        "clients",
+        "current_repo_only",
+    }
+)
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -88,10 +92,7 @@ TOOLS: list[dict[str, Any]] = [
                         "source_types": {
                             "type": "array",
                             "items": {"type": "string", "enum": SOURCE_TYPE_VALUES},
-                            "description": (
-                                "Restrict by source category, such as jira, confluence, "
-                                "or agent_session."
-                            ),
+                            "description": ("Restrict by source category, such as jira, confluence, or agent_session."),
                         },
                         "clients": {
                             "type": "array",
@@ -193,6 +194,7 @@ TOOLS: list[dict[str, Any]] = [
                 "title": {"type": "string"},
                 "metadata": {"type": "object"},
                 "submitted_at": {"type": "string"},
+                "source_observed_at": {"type": "string"},
                 "process_now": {"type": "boolean", "default": True},
             },
             "required": ["client", "session_id", "trigger", "workspace", "document_markdown"],
@@ -280,9 +282,7 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
     unknown = sorted(set(args) - SEARCH_ALLOWED_KEYS)
     if unknown:
         raise ValueError(
-            "Unsupported search parameter(s): "
-            + ", ".join(unknown)
-            + ". Omit unknown filters instead of guessing."
+            "Unsupported search parameter(s): " + ", ".join(unknown) + ". Omit unknown filters instead of guessing."
         )
     body = dict(args)
     body["include_private"] = True
@@ -386,7 +386,7 @@ def _api_request_url(path: str) -> str:
     if path == "/api":
         return f"{base_url}/api/workspaces/{quoted_workspace}/api"
     if path.startswith("/api/"):
-        return f"{base_url}/api/workspaces/{quoted_workspace}/api/{path[len('/api/'):]}"
+        return f"{base_url}/api/workspaces/{quoted_workspace}/api/{path[len('/api/') :]}"
     return f"{base_url}{path}"
 
 
@@ -624,8 +624,7 @@ def _is_text_content_type(media_type: str) -> bool:
 
 def _artifact_cache_root() -> Path:
     cache_root = Path(
-        os.getenv("MEMFORGE_ARTIFACT_CACHE_DIR")
-        or (Path.home() / ".memforge-agent" / "artifacts")
+        os.getenv("MEMFORGE_ARTIFACT_CACHE_DIR") or (Path.home() / ".memforge-agent" / "artifacts")
     ).expanduser()
     cache_root.mkdir(parents=True, exist_ok=True)
     return cache_root

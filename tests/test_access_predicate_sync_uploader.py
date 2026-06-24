@@ -161,6 +161,15 @@ class _SpyMemoryEngine:
         return {"added": 1, "updated": 0, "superseded": 0, "deleted": 0, "noop": 0}
 
 
+class _SpySourceSupportDetector:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def detect_and_persist(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"added": 0, "updated": 0, "removed_stale": 0}
+
+
 async def _submit_and_normalize(
     *,
     db: Database,
@@ -171,6 +180,7 @@ async def _submit_and_normalize(
     fact: str,
     repo: str = "mem-forge",
     submitted_at: str | None = None,
+    source_observed_at: str | None = None,
 ):
     """Run the production write path and return (submitted, item, normalized)."""
     submitted = await submit_agent_session_document(
@@ -187,6 +197,7 @@ async def _submit_and_normalize(
         history_window_kind="session",
         user_id=user_id,
         submitted_at=submitted_at,
+        source_observed_at=source_observed_at,
     )
     source = await db.get_source(submitted["source_id"])
     gene = AgentSessionGene(config=source["config"], source_id=source["id"])
@@ -199,9 +210,7 @@ async def _submit_and_normalize(
 
 
 @pytest.mark.asyncio
-async def test_agent_session_gene_exposes_uploader_on_normalize(
-    database_fixture, tmp_path
-):
+async def test_agent_session_gene_exposes_uploader_on_normalize(database_fixture, tmp_path):
     """Gene boundary: ``normalize()`` must surface the uploader hint.
 
     Without this hint on ``source_semantics``, the sync pipeline has nothing to
@@ -232,9 +241,7 @@ async def test_agent_session_gene_exposes_uploader_on_normalize(
 
 
 @pytest.mark.asyncio
-async def test_agent_session_gene_exposes_normalized_repo_identifier(
-    database_fixture, tmp_path
-):
+async def test_agent_session_gene_exposes_normalized_repo_identifier(database_fixture, tmp_path):
     """Gene boundary: repo identity must survive the package read path.
 
     Curator grouping depends on repo_identifier at memory persistence time. A
@@ -258,9 +265,30 @@ async def test_agent_session_gene_exposes_normalized_repo_identifier(
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_forwards_uploader_user_id_on_new_documents(
-    database_fixture, tmp_path
-):
+async def test_agent_session_gene_exposes_explicit_source_observed_at(database_fixture, tmp_path):
+    """Gene boundary: explicit source observation time survives package reads.
+
+    Submission time is lifecycle metadata. It must not be copied into source
+    provenance when the uploader did not provide an absolute source timestamp.
+    """
+    database = database_fixture
+    cfg = _config(tmp_path)
+
+    _, _, normalized = await _submit_and_normalize(
+        db=database,
+        cfg=cfg,
+        client="codex",
+        session_id="sess-source-observed",
+        user_id=U1_USER,
+        fact="agent-session source timestamps are explicit provenance",
+        source_observed_at="2026-06-20T04:23:51Z",
+    )
+
+    assert normalized.source_semantics["source_observed_at"] == "2026-06-20T04:23:51+00:00"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_forwards_uploader_user_id_on_new_documents(database_fixture, tmp_path):
     """First sync (new docs): the orchestrator MUST forward each uploader's id
     on its ``process_memories`` call.
 
@@ -334,9 +362,83 @@ async def test_orchestrator_forwards_uploader_user_id_on_new_documents(
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_forwards_uploader_user_id_on_document_updates(
-    database_fixture, tmp_path
-):
+async def test_orchestrator_forwards_source_observed_at_on_new_documents(database_fixture, tmp_path):
+    """First sync (new docs): source provenance timestamp reaches the memory engine."""
+    database = database_fixture
+    cfg = _config(tmp_path)
+
+    submitted, item, _ = await _submit_and_normalize(
+        db=database,
+        cfg=cfg,
+        client="codex",
+        session_id="sess-source-observed-new",
+        user_id=U1_USER,
+        fact="new document carries source observed timestamp",
+        source_observed_at="2026-06-20T04:23:51Z",
+    )
+
+    spy = _SpyMemoryEngine()
+    orchestrator = GeneSyncOrchestrator(
+        db=database,
+        doc_store=_StubDocumentStore(),
+        enricher=_StubEnricher(),
+        memory_extractor=_SingleMemoryExtractor(),
+        memory_engine=spy,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    src = await database.get_source(submitted["source_id"])
+    gene = AgentSessionGene(config=src["config"], source_id=src["id"])
+    state = await orchestrator.sync_gene(gene=gene, source_name=src["name"], source_id=src["id"])
+
+    assert state.last_sync_status == "success"
+    by_doc = {call["doc_id"]: call for call in spy.process_memories_calls}
+    assert by_doc[item.item_id]["source_observed_at"].isoformat() == "2026-06-20T04:23:51+00:00"
+    assert spy.reconcile_calls == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_forwards_source_observed_at_to_source_support_detector(database_fixture, tmp_path):
+    """Source-support detection must receive the same explicit provenance timestamp."""
+    database = database_fixture
+    cfg = _config(tmp_path)
+
+    submitted, _, _ = await _submit_and_normalize(
+        db=database,
+        cfg=cfg,
+        client="codex",
+        session_id="sess-source-observed-support",
+        user_id=U1_USER,
+        fact="source support detector carries source observed timestamp",
+        source_observed_at="2026-06-20T04:23:51Z",
+    )
+
+    support_detector = _SpySourceSupportDetector()
+    orchestrator = GeneSyncOrchestrator(
+        db=database,
+        doc_store=_StubDocumentStore(),
+        enricher=_StubEnricher(),
+        memory_extractor=_SingleMemoryExtractor(),
+        memory_engine=_SpyMemoryEngine(),
+        memory_store=None,
+        source_support_detector=support_detector,
+        max_concurrent=1,
+    )
+
+    src = await database.get_source(submitted["source_id"])
+    state = await orchestrator.sync_gene(
+        gene=AgentSessionGene(config=src["config"], source_id=src["id"]),
+        source_name=src["name"],
+        source_id=src["id"],
+    )
+
+    assert state.last_sync_status == "success"
+    assert support_detector.calls[0]["source_observed_at"].isoformat() == "2026-06-20T04:23:51+00:00"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_forwards_uploader_user_id_on_document_updates(database_fixture, tmp_path):
     """Second sync (existing doc, new content): the orchestrator MUST forward
     the uploader's id on its ``reconcile_and_persist`` call.
 
@@ -420,3 +522,75 @@ async def test_orchestrator_forwards_uploader_user_id_on_document_updates(
     assert forwarded["doc_id"] == item_second.item_id
     assert forwarded["user_id"] == U1_USER
     assert forwarded["repo_identifier"] == "mem-forge"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_forwards_source_observed_at_on_document_updates(database_fixture, tmp_path):
+    """Second sync (existing doc, new content): provenance timestamp reaches reconciliation."""
+    database = database_fixture
+    cfg = _config(tmp_path)
+
+    submitted_first, item_first, _ = await _submit_and_normalize(
+        db=database,
+        cfg=cfg,
+        client="codex",
+        session_id="sess-source-observed-update",
+        user_id=U1_USER,
+        fact="initial source observed value",
+        source_observed_at="2026-06-20T04:23:51Z",
+        submitted_at="2026-01-01T00:00:00+00:00",
+    )
+
+    src = await database.get_source(submitted_first["source_id"])
+    initial_spy = _SpyMemoryEngine()
+    initial_orchestrator = GeneSyncOrchestrator(
+        db=database,
+        doc_store=_StubDocumentStore(),
+        enricher=_StubEnricher(),
+        memory_extractor=_SingleMemoryExtractor(),
+        memory_engine=initial_spy,
+        memory_store=None,
+        max_concurrent=1,
+    )
+    initial_state = await initial_orchestrator.sync_gene(
+        gene=AgentSessionGene(config=src["config"], source_id=src["id"]),
+        source_name=src["name"],
+        source_id=src["id"],
+    )
+    assert initial_state.last_sync_status == "success"
+    assert initial_spy.process_memories_calls
+
+    submitted_second, item_second, _ = await _submit_and_normalize(
+        db=database,
+        cfg=cfg,
+        client="codex",
+        session_id="sess-source-observed-update",
+        user_id=U1_USER,
+        fact="updated source observed value",
+        source_observed_at="2026-06-21T05:00:00Z",
+        submitted_at="2026-01-02T00:00:00+00:00",
+    )
+    assert submitted_second["doc_id"] == submitted_first["doc_id"]
+    assert item_second.item_id == item_first.item_id
+
+    update_spy = _SpyMemoryEngine()
+    update_orchestrator = GeneSyncOrchestrator(
+        db=database,
+        doc_store=_StubDocumentStore(),
+        enricher=_StubEnricher(),
+        memory_extractor=_SingleMemoryExtractor(),
+        memory_engine=update_spy,
+        memory_store=None,
+        max_concurrent=1,
+    )
+    update_state = await update_orchestrator.sync_gene(
+        gene=AgentSessionGene(config=src["config"], source_id=src["id"]),
+        source_name=src["name"],
+        source_id=src["id"],
+        force_full_sync=True,
+    )
+
+    assert update_state.last_sync_status == "success"
+    by_doc = {call["doc_id"]: call for call in update_spy.reconcile_calls}
+    assert by_doc[item_second.item_id]["source_observed_at"].isoformat() == "2026-06-21T05:00:00+00:00"
+    assert update_spy.process_memories_calls == []

@@ -250,9 +250,7 @@ async def test_health_reports_recent_audit_failures_as_warning(db, tmp_path):
     assert payload["status"] == "healthy"
     assert payload["audit_failures"]["status"] == "warning"
     assert payload["audit_failures"]["payload"]["window_hours"] == 24
-    assert payload["audit_failures"]["payload"]["counts_by_event_type"] == {
-        "source_support_verification_failed": 1
-    }
+    assert payload["audit_failures"]["payload"]["counts_by_event_type"] == {"source_support_verification_failed": 1}
     assert payload["audit_failures"]["payload"]["total"] == 1
     assert payload["audit_failures"]["payload"]["last_seen_at"]
 
@@ -438,10 +436,12 @@ def test_admin_source_update_preserves_encrypted_pat_when_blank(tmp_path, monkey
 
         with sqlite3.connect(cfg.storage.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            before = json.loads(conn.execute(
-                "SELECT config FROM sources WHERE id = ?",
-                (source_id,),
-            ).fetchone()["config"])
+            before = json.loads(
+                conn.execute(
+                    "SELECT config FROM sources WHERE id = ?",
+                    (source_id,),
+                ).fetchone()["config"]
+            )
 
         update_response = client.put(
             f"/api/sources/{source_id}",
@@ -459,10 +459,12 @@ def test_admin_source_update_preserves_encrypted_pat_when_blank(tmp_path, monkey
     assert update_response.status_code == 200
     with sqlite3.connect(cfg.storage.db_path) as conn:
         conn.row_factory = sqlite3.Row
-        after = json.loads(conn.execute(
-            "SELECT config FROM sources WHERE id = ?",
-            (source_id,),
-        ).fetchone()["config"])
+        after = json.loads(
+            conn.execute(
+                "SELECT config FROM sources WHERE id = ?",
+                (source_id,),
+            ).fetchone()["config"]
+        )
 
     assert after["pat_encrypted"] == before["pat_encrypted"]
     assert "pat" not in after
@@ -680,9 +682,7 @@ async def test_sync_service_does_not_queue_paused_source(db, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_queued_sync_stops_quietly_if_source_is_paused_before_execution(
-    db, tmp_path, monkeypatch
-):
+async def test_queued_sync_stops_quietly_if_source_is_paused_before_execution(db, tmp_path, monkeypatch):
     import memforge.runtime as runtime
     from memforge.runtime import SyncService
 
@@ -851,10 +851,7 @@ def test_admin_source_create_accepts_confluence_page_url_without_spaces(tmp_path
                 "type": "confluence",
                 "name": "Payroll Architecture",
                 "config": {
-                    "base_url": (
-                        "https://wiki.company.example/wiki/spaces/PAY/pages/"
-                        "5695886009/Flexible+Payroll"
-                    ),
+                    "base_url": ("https://wiki.company.example/wiki/spaces/PAY/pages/5695886009/Flexible+Payroll"),
                     "pat": "wiki-pat-secret",
                 },
                 "project_binding": _project_binding(),
@@ -1161,9 +1158,7 @@ async def test_admin_sources_exposes_running_stored_counts_separately(db, tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(
-    db, tmp_path
-):
+async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(db, tmp_path):
     """Source counts and memory-list totals must share one visibility contract.
 
     A sync history row reports how many memories the latest run extracted. The
@@ -1220,6 +1215,7 @@ async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(
             doc_id,
             "agent_session",
             f"Excerpt {index}",
+            source_observed_at=None,
         )
     await db.insert_sync_history(
         source=source_id,
@@ -1254,11 +1250,7 @@ async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(
 
     assert sources_response.status_code == 200
     assert memories_response.status_code == 200
-    source = next(
-        item
-        for item in sources_response.json()["data"]
-        if item["id"] == source_id
-    )
+    source = next(item for item in sources_response.json()["data"] if item["id"] == source_id)
     memories = memories_response.json()
     assert source["sync"]["memories_extracted"] == 3
     assert memories["total"] == 2
@@ -1318,10 +1310,12 @@ async def test_unknown_source_type_still_redacts_and_encrypts_secret_fields(db, 
     assert update_response.status_code == 200
     with sqlite3.connect(db.db_path) as conn:
         conn.row_factory = sqlite3.Row
-        stored = json.loads(conn.execute(
-            "SELECT config FROM sources WHERE id = ?",
-            (source_id,),
-        ).fetchone()["config"])
+        stored = json.loads(
+            conn.execute(
+                "SELECT config FROM sources WHERE id = ?",
+                (source_id,),
+            ).fetchone()["config"]
+        )
     assert "pat" not in stored
     assert stored["pat_encrypted"] != "new-plain"
 
@@ -2180,13 +2174,15 @@ async def test_force_resync_resets_cursor_and_starts_source_sync(db, tmp_path):
 def test_schedule_trigger_uses_configured_daily_time():
     from memforge.scheduler import build_schedule_trigger
 
-    trigger = build_schedule_trigger({
-        "enabled": True,
-        "frequency": "daily",
-        "time": "03:45",
-        "day_of_week": 2,
-        "timezone": "UTC",
-    })
+    trigger = build_schedule_trigger(
+        {
+            "enabled": True,
+            "frequency": "daily",
+            "time": "03:45",
+            "day_of_week": 2,
+            "timezone": "UTC",
+        }
+    )
 
     fields = {field.name: str(field) for field in trigger.fields}
     assert fields["hour"] == "3"
@@ -2400,14 +2396,16 @@ async def test_llm_config_probe_auth_error_without_key_is_actionable(db, tmp_pat
 async def test_llm_config_put_can_preserve_and_clear_keys(db, tmp_path):
     from memforge.server.admin_api import create_admin_app
 
-    await db.set_llm_config({
-        "enrichment_model": "chat-model",
-        "enrichment_base_url": "https://chat.example.test/v1",
-        "enrichment_api_key": "chat-secret",
-        "embedding_model": "embed-model",
-        "embedding_base_url": "https://embed.example.test/v1",
-        "embedding_api_key": "embed-secret",
-    })
+    await db.set_llm_config(
+        {
+            "enrichment_model": "chat-model",
+            "enrichment_base_url": "https://chat.example.test/v1",
+            "enrichment_api_key": "chat-secret",
+            "embedding_model": "embed-model",
+            "embedding_base_url": "https://embed.example.test/v1",
+            "embedding_api_key": "embed-secret",
+        }
+    )
     app = create_admin_app(db=db, config=_config(tmp_path))
 
     with TestClient(app) as client:
@@ -2425,14 +2423,16 @@ async def test_llm_config_put_can_preserve_and_clear_keys(db, tmp_path):
 async def test_llm_config_put_can_be_disabled_for_deployment_managed_config(db, tmp_path):
     from memforge.server.admin_api import create_admin_app
 
-    await db.set_llm_config({
-        "enrichment_model": "chat-model",
-        "enrichment_base_url": "https://chat.example.test/v1",
-        "enrichment_api_key": "chat-secret",
-        "embedding_model": "embed-model",
-        "embedding_base_url": "https://embed.example.test/v1",
-        "embedding_api_key": "embed-secret",
-    })
+    await db.set_llm_config(
+        {
+            "enrichment_model": "chat-model",
+            "enrichment_base_url": "https://chat.example.test/v1",
+            "enrichment_api_key": "chat-secret",
+            "embedding_model": "embed-model",
+            "embedding_base_url": "https://embed.example.test/v1",
+            "embedding_api_key": "embed-secret",
+        }
+    )
     cfg = _config(tmp_path)
     cfg.server.llm_config_writable = False
     app = create_admin_app(db=db, config=cfg)

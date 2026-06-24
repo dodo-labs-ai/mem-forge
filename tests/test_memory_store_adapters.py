@@ -57,13 +57,26 @@ def _memory(mem_id: str, content: str) -> Memory:
 
 async def _document(db: Database, doc_id: str) -> None:
     now = datetime.now(timezone.utc)
-    await db.upsert_document(DocumentRecord(
-        doc_id=doc_id, source="src-x", source_url="https://x/1", title="t",
-        space_or_project="PAY", author="a", last_modified=now, labels=[],
-        version="1", content_hash="h", token_count=1, raw_content_uri=None,
-        raw_content_type="text/html", normalized_content_uri=None,
-        pdf_content_uri=None, last_synced=now,
-    ))
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            source="src-x",
+            source_url="https://x/1",
+            title="t",
+            space_or_project="PAY",
+            author="a",
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash="h",
+            token_count=1,
+            raw_content_uri=None,
+            raw_content_type="text/html",
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
 
 
 @pytest.fixture
@@ -105,7 +118,10 @@ async def test_insert_then_purge_routes_through_adapters(db, monkeypatch):
     await _document(db, "doc1")
 
     result = await store.deduplicate_and_insert(
-        _memory("m1", "deploy via ArgoCD"), "doc1", "manual"
+        _memory("m1", "deploy via ArgoCD"),
+        "doc1",
+        "manual",
+        source_observed_at=None,
     )
     assert result == "inserted"
     assert "m1" in collection.upserted

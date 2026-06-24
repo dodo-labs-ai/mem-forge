@@ -94,7 +94,7 @@ async def _seed_source_project(
             status="active",
         )
         await db.insert_memory(memory)
-        await db.add_memory_source(memory.id, doc_id, "agent_session")
+        await db.add_memory_source(memory.id, doc_id, "agent_session", source_observed_at=None)
 
 
 def test_agent_session_document_submit_api_records_generated_source(tmp_path):
@@ -174,9 +174,7 @@ def test_agent_session_document_submit_uses_server_principal(tmp_path):
             )
 
         assert response.status_code == 200, response.text
-        receipt = asyncio.run(
-            database.get_agent_session_receipt(response.json()["doc_id"])
-        )
+        receipt = asyncio.run(database.get_agent_session_receipt(response.json()["doc_id"]))
         assert receipt is not None
         assert receipt["metadata"]["user_id"] == "u-authorized"
     finally:
@@ -373,8 +371,7 @@ def test_agent_session_window_api_generates_package_and_discards_raw_window(tmp_
             return _knowledge_patch(
                 title="Agent Session: useful implementation window",
                 claim_text=(
-                    "The agent updated the window upload endpoint and unit tests "
-                    "covered the knowledge patch path."
+                    "The agent updated the window upload endpoint and unit tests covered the knowledge patch path."
                 ),
             )
 
@@ -729,9 +726,7 @@ def test_agent_session_window_api_records_failed_outcome_for_invalid_patch(tmp_p
         assert "agent knowledge patch validation failed" in response.json()["detail"]
 
         async def _assert_failed_receipt():
-            summary = await database.summarize_agent_session_outcomes(
-                session_id="sess-window-bad-patch"
-            )
+            summary = await database.summarize_agent_session_outcomes(session_id="sess-window-bad-patch")
             assert summary["counts"]["failed"] == 1
             assert summary["latest_failure"]["reason"].startswith("ValidationError:")
 
@@ -775,9 +770,7 @@ def test_agent_session_window_api_records_failed_outcome_for_parse_failed_patch(
         assert body["reason"] == "memory_content is required"
 
         async def _assert_failed_receipt():
-            summary = await database.summarize_agent_session_outcomes(
-                session_id="sess-window-parse-failed"
-            )
+            summary = await database.summarize_agent_session_outcomes(session_id="sess-window-parse-failed")
             assert summary["counts"]["failed"] == 1
             assert summary["latest_failure"]["reason"] == "memory_content is required"
 
@@ -1063,6 +1056,8 @@ def test_agent_session_window_api_records_no_output_receipt(tmp_path):
                     "trigger": "Stop",
                     "workspace": "/workspace/mem-forge",
                     "events": [{"role": "assistant", "text": "Sure, that formats text."}],
+                    "submitted_at": "2026-06-23T22:00:00+00:00",
+                    "source_observed_at": "2026-06-20T04:23:51Z",
                 },
             )
 
@@ -1075,8 +1070,189 @@ def test_agent_session_window_api_records_no_output_receipt(tmp_path):
             metadata = receipts[0]["metadata"]
             assert metadata["outcome"] == "no_output"
             assert metadata["reason"] == "trivial chat"
+            assert "source_observed_at" not in metadata
 
         asyncio.run(_check())
+    finally:
+        asyncio.run(database.close())
+
+
+def test_agent_session_memory_detail_exposes_source_observed_at(tmp_path):
+    """Memory provenance reports the source event time separately from link time."""
+    from memforge.server.admin_api import create_admin_app
+
+    class PackageClient:
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
+                title="Observed timestamp contract",
+                claim_text="Agent-session memory provenance keeps the source event time separate.",
+                memory_content="Agent-session memory provenance keeps the source event time separate.",
+            )
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+
+    import asyncio
+
+    asyncio.run(database.connect())
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            principal_resolver=lambda request: "u-observed",
+        )
+        app.state.agent_session_window_client = PackageClient()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/agent-sessions/windows",
+                json={
+                    "client": "codex",
+                    "session_id": "sess-source-observed",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "events": [
+                        {
+                            "kind": "assistant_message",
+                            "actor": "assistant",
+                            "text": "Implemented a durable timestamp rule.",
+                            "timestamp": "2026-06-20T04:23:51Z",
+                        }
+                    ],
+                    "submitted_at": "2026-06-23T22:00:00+00:00",
+                    "source_observed_at": "2026-06-20T04:23:51Z",
+                },
+            )
+            assert response.status_code == 200, response.text
+            memory_id = response.json()["memory_id"]
+
+            detail = client.get(f"/api/memories/{memory_id}")
+
+        assert detail.status_code == 200, detail.text
+        body = detail.json()
+        source = body["sources"][0]
+        assert source["source_observed_at"] == "2026-06-20T04:23:51+00:00"
+        assert source["added_at"] != source["source_observed_at"]
+        assert not body["created_at"].startswith("2026-06-20T04:23:51")
+
+        async def _claim() -> dict:
+            async with database.db.execute(
+                "SELECT last_observed_at FROM agent_claims WHERE memory_id = ?",
+                (memory_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            return dict(row)
+
+        claim = asyncio.run(_claim())
+        assert claim["last_observed_at"] == "2026-06-23T22:00:00+00:00"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_agent_session_window_rejects_naive_source_observed_at(tmp_path):
+    """Source observation time must be timezone-explicit; it is never localized."""
+    from memforge.server.admin_api import create_admin_app
+
+    class PackageClient:
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
+                title="Naive timestamp rejected",
+                claim_text="Timezone-naive source timestamps must not be accepted.",
+                memory_content="Timezone-naive source timestamps must not be accepted.",
+            )
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+
+    import asyncio
+
+    asyncio.run(database.connect())
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            principal_resolver=lambda request: "u-observed",
+        )
+        app.state.agent_session_window_client = PackageClient()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/agent-sessions/windows",
+                json={
+                    "client": "codex",
+                    "session_id": "sess-naive-source-observed",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "events": [
+                        {
+                            "kind": "assistant_message",
+                            "actor": "assistant",
+                            "text": "Implemented a durable timestamp rule.",
+                            "timestamp": "2026-06-20T04:23:51",
+                        }
+                    ],
+                    "submitted_at": "2026-06-23T22:00:00+00:00",
+                    "source_observed_at": "2026-06-20T04:23:51",
+                },
+            )
+
+        assert response.status_code == 400, response.text
+        assert "source_observed_at must include an explicit timezone offset" in response.text
+    finally:
+        asyncio.run(database.close())
+
+
+def test_agent_session_memory_detail_does_not_fallback_source_observed_at(tmp_path):
+    """Absent source event time stays unknown instead of copying submitted_at."""
+    from memforge.server.admin_api import create_admin_app
+
+    class PackageClient:
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
+                title="No fallback timestamp",
+                claim_text="Agent-session provenance does not invent a source observation time.",
+                memory_content="Agent-session provenance does not invent a source observation time.",
+            )
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+
+    import asyncio
+
+    asyncio.run(database.connect())
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            principal_resolver=lambda request: "u-observed",
+        )
+        app.state.agent_session_window_client = PackageClient()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/agent-sessions/windows",
+                json={
+                    "client": "codex",
+                    "session_id": "sess-no-source-observed",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "events": [
+                        {
+                            "kind": "assistant_message",
+                            "actor": "assistant",
+                            "text": "Implemented a durable timestamp rule.",
+                        }
+                    ],
+                    "submitted_at": "2026-06-23T22:00:00+00:00",
+                },
+            )
+            assert response.status_code == 200, response.text
+            memory_id = response.json()["memory_id"]
+
+            detail = client.get(f"/api/memories/{memory_id}")
+
+        assert detail.status_code == 200, detail.text
+        source = detail.json()["sources"][0]
+        assert source["source_observed_at"] is None
+        assert source["added_at"] != "2026-06-23T22:00:00+00:00"
     finally:
         asyncio.run(database.close())
 
@@ -1306,6 +1482,7 @@ def test_agent_session_completeness_endpoint(tmp_path):
 
     asyncio.run(database.connect())
     try:
+
         async def _seed():
             for index, outcome in enumerate(["knowledge_patched", "no_output"]):
                 await database.upsert_agent_session_receipt(
@@ -1315,9 +1492,7 @@ def test_agent_session_completeness_endpoint(tmp_path):
         asyncio.run(_seed())
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
-            response = client.get(
-                "/api/agent-sessions/completeness", params={"session_id": "sess-ep"}
-            )
+            response = client.get("/api/agent-sessions/completeness", params={"session_id": "sess-ep"})
 
         assert response.status_code == 200
         body = response.json()
@@ -1488,6 +1663,7 @@ def test_db_migration_splits_singleton_documents_to_per_client_sources(tmp_path)
 
         # Apply just enough schema for our test.
         from memforge.storage.database import SCHEMA, MIGRATIONS
+
         await conn.executescript(SCHEMA)
         now_ts = "2026-06-01T10:00:00+00:00"
         # Record migrations 1-10 as applied without executing (schema already created them).
@@ -1511,10 +1687,19 @@ def test_db_migration_splits_singleton_documents_to_per_client_sources(tmp_path)
                    (doc_id, source, source_url, title, space_or_project, author,
                     last_modified, labels, version, content_hash, last_synced)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (doc_id, "src-agent-sessions",
-                 f"agent-session://{client_name}/sess/{doc_id}",
-                 f"{client_name} doc", "workspace", client_name,
-                 now_ts, "[]", "v1", f"hash-{doc_id}", now_ts),
+                (
+                    doc_id,
+                    "src-agent-sessions",
+                    f"agent-session://{client_name}/sess/{doc_id}",
+                    f"{client_name} doc",
+                    "workspace",
+                    client_name,
+                    now_ts,
+                    "[]",
+                    "v1",
+                    f"hash-{doc_id}",
+                    now_ts,
+                ),
             )
             await conn.execute(
                 """INSERT INTO agent_session_receipts
@@ -1522,9 +1707,20 @@ def test_db_migration_splits_singleton_documents_to_per_client_sources(tmp_path)
                     history_window_kind, submitted_at, document_hash, source_kind,
                     document_uri, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (doc_id, "src-agent-sessions", client_name, "sess-x", "Stop",
-                 "/workspace", "session", now_ts, f"hash-{doc_id}",
-                 "generated_agent_summary", "", now_ts),
+                (
+                    doc_id,
+                    "src-agent-sessions",
+                    client_name,
+                    "sess-x",
+                    "Stop",
+                    "/workspace",
+                    "session",
+                    now_ts,
+                    f"hash-{doc_id}",
+                    "generated_agent_summary",
+                    "",
+                    now_ts,
+                ),
             )
         await conn.commit()
         await conn.close()
@@ -1624,7 +1820,7 @@ def test_memories_endpoint_exposes_origin_client_for_agent_session_memories(tmp_
             status="active",
         )
         await database.insert_memory(jira_memory)
-        await database.add_memory_source(jira_memory.id, jira_doc_id, "jira")
+        await database.add_memory_source(jira_memory.id, jira_doc_id, "jira", source_observed_at=None)
 
     import asyncio
 

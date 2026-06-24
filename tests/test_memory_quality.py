@@ -60,6 +60,7 @@ class DirectInsertStore:
         entity_ids: list[int] | None = None,
         excerpt: str | None = None,
         *,
+        source_observed_at: datetime | None,
         relation_outcome=None,
     ) -> str:
         await self.db.insert_memory(memory)
@@ -262,6 +263,7 @@ async def test_engine_skips_metadata_only_candidate(db: Database):
         doc_id="doc-acd",
         raw_memories=[_raw(METADATA_CONTENT, METADATA_CONTEXT)],
         source_type="confluence",
+        source_observed_at=None,
     )
 
     assert stats == {"inserted": 0, "corroborated": 0, "skipped": 1}
@@ -279,6 +281,7 @@ async def test_engine_skips_open_question_candidate(db: Database):
         doc_id="doc-acd",
         raw_memories=[_raw(OPEN_QUESTION_CONTENT, OPEN_QUESTION_CONTEXT)],
         source_type="confluence",
+        source_observed_at=None,
     )
 
     assert stats == {"inserted": 0, "corroborated": 0, "skipped": 1}
@@ -296,6 +299,7 @@ async def test_engine_keeps_conditional_ap_rule(db: Database):
         doc_id="doc-acd",
         raw_memories=[_raw(CONDITIONAL_RULE_CONTENT, CONDITIONAL_RULE_CONTEXT)],
         source_type="confluence",
+        source_observed_at=None,
     )
 
     memories = await db.list_memories()
@@ -312,7 +316,7 @@ async def test_reconciliation_skips_bad_replacement_candidate_instead_of_superse
         mem_id="mem-oldgood",
         content="Payroll Processing V2 uses the Payroll Processing concept as its reference design.",
     )
-    await db.add_memory_source(old_memory.id, doc.doc_id, "confluence")
+    await db.add_memory_source(old_memory.id, doc.doc_id, "confluence", source_observed_at=None)
     adapters = build_sqlite_adapters(db, FakeCollection())
     engine = MemoryEngine(
         relational=adapters.relational,
@@ -341,6 +345,7 @@ async def test_reconciliation_skips_bad_replacement_candidate_instead_of_superse
         raw_memories=[good_extraction],
         source_type="confluence",
         doc_type="design-doc",
+        source_observed_at=None,
     )
 
     stored_old = await db.get_memory(old_memory.id)
@@ -354,7 +359,7 @@ async def test_reconciliation_skips_bad_replacement_candidate_instead_of_superse
 async def test_reconciliation_action_failure_is_audited_without_fallback(db: Database, monkeypatch):
     doc = await _insert_document(db, doc_id="doc-fallback")
     old_memory = await _insert_memory(db, mem_id="mem-fallback-old", content="Old fact")
-    await db.add_memory_source(old_memory.id, doc.doc_id, "confluence")
+    await db.add_memory_source(old_memory.id, doc.doc_id, "confluence", source_observed_at=None)
     store = FailingUpdateAuditStore(db)
     adapters = build_sqlite_adapters(db, FakeCollection())
     engine = MemoryEngine(
@@ -383,6 +388,7 @@ async def test_reconciliation_action_failure_is_audited_without_fallback(db: Dat
         raw_memories=[replacement],
         source_type="confluence",
         doc_type="design-doc",
+        source_observed_at=None,
     )
 
     assert stats["added"] == 0
@@ -404,7 +410,7 @@ async def test_reconciliation_all_filtered_update_retires_sole_source_memory(db:
         mem_id="mem-sole001",
         content="Payroll Processing V2 repeats AP validation after changed regular pay dates.",
     )
-    await db.add_memory_source(old_memory.id, doc.doc_id, "confluence")
+    await db.add_memory_source(old_memory.id, doc.doc_id, "confluence", source_observed_at=None)
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
     store = MemoryStore(
@@ -426,6 +432,7 @@ async def test_reconciliation_all_filtered_update_retires_sole_source_memory(db:
         raw_memories=[_raw(LINK_CONTENT, LINK_CONTEXT)],
         source_type="confluence",
         doc_type="design-doc",
+        source_observed_at=None,
     )
 
     stored_old = await db.get_memory(old_memory.id)
@@ -446,8 +453,8 @@ async def test_reconciliation_all_filtered_update_removes_one_source_but_keeps_s
         mem_id="mem-supported",
         content="Payroll Processing V2 repeats AP validation after changed regular pay dates.",
     )
-    await db.add_memory_source(old_memory.id, doc.doc_id, "confluence")
-    await db.add_memory_source(old_memory.id, other_doc.doc_id, "confluence")
+    await db.add_memory_source(old_memory.id, doc.doc_id, "confluence", source_observed_at=None)
+    await db.add_memory_source(old_memory.id, other_doc.doc_id, "confluence", source_observed_at=None)
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
     store = MemoryStore(
@@ -469,6 +476,7 @@ async def test_reconciliation_all_filtered_update_removes_one_source_but_keeps_s
         raw_memories=[_raw(LINK_CONTENT, LINK_CONTEXT)],
         source_type="confluence",
         doc_type="design-doc",
+        source_observed_at=None,
     )
 
     stored_old = await db.get_memory(old_memory.id)
@@ -495,6 +503,7 @@ async def test_store_document_delete_cleans_indexes_for_last_corroborated_source
         "jira",
         excerpt="A corroborated source can be the last valid source support.",
         support_kind="corroborated",
+        source_observed_at=None,
     )
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -528,6 +537,7 @@ async def test_store_source_cascade_cleans_indexes_for_retired_memories(db: Data
         doc.doc_id,
         "confluence",
         excerpt="A source cascade should remove retired memories from search.",
+        source_observed_at=None,
     )
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -611,7 +621,7 @@ async def test_admin_memory_detail_exposes_service_artifact_urls_only(db: Databa
         mem_id="mem-pdfuri1",
         content="Payroll Processing V2 supports adaptive scheduling adjustments.",
     )
-    await db.add_memory_source(memory.id, doc.doc_id, "confluence", excerpt="source excerpt")
+    await db.add_memory_source(memory.id, doc.doc_id, "confluence", excerpt="source excerpt", source_observed_at=None)
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
@@ -647,7 +657,7 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
         mem_id="mem-artifact-url",
         content="Payroll Processing V2 keeps source artifacts available through the service.",
     )
-    await db.add_memory_source(memory.id, doc.doc_id, "confluence", excerpt="source excerpt")
+    await db.add_memory_source(memory.id, doc.doc_id, "confluence", excerpt="source excerpt", source_observed_at=None)
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
@@ -771,7 +781,9 @@ async def test_admin_document_artifacts_can_use_non_filesystem_store(db: Databas
         mem_id="mem-object-artifact-url",
         content="A durable object artifact should be exposed through provenance URLs.",
     )
-    await db.add_memory_source(memory.id, "doc-object-artifact-url", "jira", excerpt="source excerpt")
+    await db.add_memory_source(
+        memory.id, "doc-object-artifact-url", "jira", excerpt="source excerpt", source_observed_at=None
+    )
 
     app = create_admin_app(
         db=db,
@@ -982,6 +994,7 @@ async def test_admin_memory_list_search_accepts_hyphenated_jira_id(db: Database,
         "jira",
         excerpt="A period switch can only occur once all off-cycle groups have completed payments.",
         support_kind="corroborated",
+        source_observed_at=None,
     )
 
     app = create_admin_app(db=db, config=_config(tmp_path))

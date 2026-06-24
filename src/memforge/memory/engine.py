@@ -174,8 +174,10 @@ class MemoryEngine:
         project_key: str | None = None,
         repo_identifier: str | None = None,
         entity_ids: list[int] | None = None,
+        *,
         audit_context: Any | None = None,
         user_id: str | None = None,
+        source_observed_at: datetime | None,
     ) -> dict:
         """Process extracted memories: build, dedup, and persist.
 
@@ -269,6 +271,7 @@ class MemoryEngine:
                 source_type=source_type,
                 entity_ids=memory_entity_ids,
                 excerpt=raw.extraction_context,
+                source_observed_at=source_observed_at,
                 relation_outcome=self._document_relation_outcome_bundle(
                     unit=unit,
                     relation_run_id=_document_relation_run_id(
@@ -335,8 +338,10 @@ class MemoryEngine:
         update_mode: str = "full_document",
         changed_hunks: str | None = None,
         update_plan_stats: dict[str, Any] | None = None,
+        *,
         audit_context: Any | None = None,
         user_id: str | None = None,
+        source_observed_at: datetime | None,
     ) -> dict:
         """Process memories with LLM reconciliation against existing memories.
 
@@ -377,6 +382,7 @@ class MemoryEngine:
                 entity_ids=entity_ids,
                 audit_context=audit_context,
                 user_id=user_id,
+                source_observed_at=source_observed_at,
             )
             stats["added"] = result.get("inserted", 0)
             stats["skipped"] = result.get("skipped", 0)
@@ -410,6 +416,7 @@ class MemoryEngine:
                 entity_ids=entity_ids,
                 audit_context=audit_context,
                 user_id=user_id,
+                source_observed_at=source_observed_at,
             )
             stats["added"] = result.get("inserted", 0)
             stats["skipped"] += result.get("skipped", 0)
@@ -483,6 +490,7 @@ class MemoryEngine:
                             existing_memory=existing_memory,
                             doc_id=doc_id,
                             source_type=source_type,
+                            source_observed_at=source_observed_at,
                             project_key=project_key,
                             stats=stats,
                             user_id=user_id,
@@ -566,6 +574,7 @@ class MemoryEngine:
                             existing_memory=existing_memory,
                             doc_id=doc_id,
                             source_type=source_type,
+                            source_observed_at=source_observed_at,
                             project_key=project_key,
                             stats=stats,
                             user_id=user_id,
@@ -649,6 +658,7 @@ class MemoryEngine:
                         source_type=source_type,
                         entity_ids=memory_entity_ids,
                         excerpt=op.memory.extraction_context,
+                        source_observed_at=source_observed_at,
                         relation_outcome=self._document_relation_outcome_bundle(
                             unit=unit,
                             relation_run_id=_document_relation_run_id(
@@ -727,6 +737,7 @@ class MemoryEngine:
                         excerpt=op.memory.extraction_context,
                         replacement_reason=op.reason,
                         replacement_kind="revision",
+                        source_observed_at=source_observed_at,
                         relation_outcome=self._document_relation_outcome_bundle(
                             unit=unit,
                             relation_run_id=relation_run_id,
@@ -804,6 +815,7 @@ class MemoryEngine:
                         excerpt=op.memory.extraction_context,
                         replacement_reason=op.reason,
                         replacement_kind="supersession",
+                        source_observed_at=source_observed_at,
                         relation_outcome=self._document_relation_outcome_bundle(
                             unit=unit,
                             relation_run_id=relation_run_id,
@@ -937,6 +949,7 @@ class MemoryEngine:
         existing_memory: Memory,
         doc_id: str,
         source_type: str,
+        source_observed_at: datetime | None,
         project_key: str | None,
         stats: dict,
         user_id: str | None = None,
@@ -999,6 +1012,7 @@ class MemoryEngine:
             source_type=source_type,
             entity_ids=memory_entity_ids,
             excerpt=op.memory.extraction_context,
+            source_observed_at=source_observed_at,
             relation_outcome=self._document_relation_outcome_bundle(
                 unit=unit,
                 relation_run_id=relation_run_id,
@@ -1518,6 +1532,7 @@ class MemoryEngine:
             candidates=tuple(universe.candidates),
             relations=(relation,),
         )
+
 
 def _document_evidence_unit_id(
     *,

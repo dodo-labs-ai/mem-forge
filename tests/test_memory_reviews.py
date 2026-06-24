@@ -371,12 +371,14 @@ class TestReviewCrud:
             "doc-review-incumbent",
             "confluence",
             excerpt="incumbent source",
+            source_observed_at=None,
         )
         await db.add_memory_source(
             challenger.id,
             "doc-review-challenger",
             "confluence",
             excerpt="challenger source",
+            source_observed_at=None,
         )
 
         app = create_admin_app(db=db, config=_config(tmp_path))
@@ -404,9 +406,7 @@ class TestReviewCrud:
 
         class MemoryBackedDocumentStore:
             def __init__(self) -> None:
-                self.objects = {
-                    "mem://review-incumbent.md": b"# Incumbent object evidence"
-                }
+                self.objects = {"mem://review-incumbent.md": b"# Incumbent object evidence"}
 
             def get_artifact(self, uri: str | None, media_type: str):
                 if uri not in self.objects:
@@ -437,9 +437,7 @@ class TestReviewCrud:
             def delete_document_files(self, *, source_name: str, title: str) -> None:
                 raise AssertionError("not used")
 
-        incumbent, challenger, review = await _seed_supersede_review(
-            db, chroma, suffix="objecturls"
-        )
+        incumbent, challenger, review = await _seed_supersede_review(db, chroma, suffix="objecturls")
         await _upsert_doc_with_artifacts(
             db,
             tmp_path,
@@ -451,6 +449,7 @@ class TestReviewCrud:
             "doc-review-object-incumbent",
             "jira",
             excerpt="incumbent source",
+            source_observed_at=None,
         )
 
         app = create_admin_app(
@@ -464,9 +463,7 @@ class TestReviewCrud:
 
         assert detail.status_code == 200
         incumbent_source = detail.json()["incumbent"]["sources"][0]
-        assert incumbent_source["content_url"] == (
-            "/api/documents/doc-review-object-incumbent/content"
-        )
+        assert incumbent_source["content_url"] == ("/api/documents/doc-review-object-incumbent/content")
         assert content.status_code == 200
         assert content.text == "# Incumbent object evidence"
 
@@ -478,9 +475,7 @@ class TestReviewCrud:
 
 class TestApprove:
     @pytest.mark.asyncio
-    async def test_approve_promotes_challenger_and_supersedes_incumbent(
-        self, db, chroma, review_service
-    ):
+    async def test_approve_promotes_challenger_and_supersedes_incumbent(self, db, chroma, review_service):
         incumbent, challenger, review = await _seed_supersede_review(db, chroma)
 
         result = await review_service.approve(review.id, reviewer="alice", note=None)
@@ -498,16 +493,12 @@ class TestApprove:
         assert stored_challenger.status == "active"
 
     @pytest.mark.asyncio
-    async def test_approve_keeps_search_indexes_aligned(
-        self, db, chroma, review_service
-    ):
+    async def test_approve_keeps_search_indexes_aligned(self, db, chroma, review_service):
         incumbent, challenger, review = await _seed_supersede_review(db, chroma)
 
         await review_service.approve(review.id, reviewer="alice", note=None)
 
-        async with db.db.execute(
-            "SELECT memory_id FROM memories_fts ORDER BY memory_id"
-        ) as cursor:
+        async with db.db.execute("SELECT memory_id FROM memories_fts ORDER BY memory_id") as cursor:
             fts_ids = [row[0] async for row in cursor]
         assert challenger.id in fts_ids
         assert incumbent.id not in fts_ids
@@ -516,9 +507,7 @@ class TestApprove:
         assert incumbent.id not in chroma.records
 
     @pytest.mark.asyncio
-    async def test_approve_records_review_and_supersede_audit(
-        self, db, chroma, review_service
-    ):
+    async def test_approve_records_review_and_supersede_audit(self, db, chroma, review_service):
         incumbent, challenger, review = await _seed_supersede_review(db, chroma)
 
         await review_service.approve(review.id, reviewer="alice", note=None)
@@ -530,9 +519,7 @@ class TestApprove:
         assert {row.review_id for row in audit_rows if row.event_type == "review_approved"} == {review.id}
         assert {row.actor_id for row in audit_rows if row.event_type == "review_approved"} == {"alice"}
         assert {
-            (row.memory_id, row.candidate_id)
-            for row in audit_rows
-            if row.event_type == "memory_supersede_committed"
+            (row.memory_id, row.candidate_id) for row in audit_rows if row.event_type == "memory_supersede_committed"
         } == {(incumbent.id, challenger.id)}
         assert len({row.operation_id for row in audit_rows}) == 1
 
@@ -565,9 +552,7 @@ class TestApprove:
         assert "review_approved" not in {row.event_type for row in audit_rows}
 
     @pytest.mark.asyncio
-    async def test_approve_audits_review_resolution_failure(
-        self, db, chroma, review_service, monkeypatch
-    ):
+    async def test_approve_audits_review_resolution_failure(self, db, chroma, review_service, monkeypatch):
         _, challenger, review = await _seed_supersede_review(db, chroma, suffix="fail")
 
         async def fail_resolve(*args, **kwargs):
@@ -586,12 +571,12 @@ class TestApprove:
         assert failure_rows[0].error == "resolution failed"
 
     @pytest.mark.asyncio
-    async def test_approve_preserves_linked_entity_text_in_fts(
-        self, db, chroma, review_service
-    ):
+    async def test_approve_preserves_linked_entity_text_in_fts(self, db, chroma, review_service):
         incumbent, challenger, review = await _seed_supersede_review(db, chroma)
         entity_id = await db.upsert_entity(
-            "postgresql", display_name="PostgreSQL", tags=["technology"],
+            "postgresql",
+            display_name="PostgreSQL",
+            tags=["technology"],
         )
         await db.link_memory_entity(challenger.id, entity_id)
 
@@ -606,9 +591,7 @@ class TestApprove:
         assert "postgresql" in row[0].lower()
 
     @pytest.mark.asyncio
-    async def test_approve_retires_related_challengers_as_redundant(
-        self, db, chroma, review_service
-    ):
+    async def test_approve_retires_related_challengers_as_redundant(self, db, chroma, review_service):
         _, _, review = await _seed_supersede_review(db, chroma)
         related = await _attach_related_challenger(db, review)
         chroma.upsert(ids=[related.id], metadatas=[{"status": "pending_review"}])
@@ -621,9 +604,7 @@ class TestApprove:
         assert related.id not in chroma.records
 
     @pytest.mark.asyncio
-    async def test_repeated_approve_returns_clear_409_without_partial_mutation(
-        self, db, chroma, review_service
-    ):
+    async def test_repeated_approve_returns_clear_409_without_partial_mutation(self, db, chroma, review_service):
         incumbent, challenger, review = await _seed_supersede_review(db, chroma)
         await review_service.approve(review.id, reviewer="alice", note=None)
 
@@ -637,13 +618,14 @@ class TestApprove:
         assert (await db.get_memory(challenger.id)).updated_at == snapshot_challenger.updated_at
 
     @pytest.mark.asyncio
-    async def test_stale_incumbent_blocks_approval_and_marks_review_stale(
-        self, db, chroma, review_service
-    ):
+    async def test_stale_incumbent_blocks_approval_and_marks_review_stale(self, db, chroma, review_service):
         incumbent, _, review = await _seed_supersede_review(db, chroma)
 
         await db.update_memory_content(
-            incumbent.id, new_content="PostgreSQL is now version 15", new_confidence=None, new_tags=None,
+            incumbent.id,
+            new_content="PostgreSQL is now version 15",
+            new_confidence=None,
+            new_tags=None,
         )
 
         with pytest.raises(ReviewStaleConflict):
@@ -660,9 +642,7 @@ class TestApprove:
 
 class TestReject:
     @pytest.mark.asyncio
-    async def test_reject_retires_challenger_with_reason_and_removes_from_indexes(
-        self, db, chroma, review_service
-    ):
+    async def test_reject_retires_challenger_with_reason_and_removes_from_indexes(self, db, chroma, review_service):
         incumbent, challenger, review = await _seed_supersede_review(db, chroma)
         chroma.upsert(ids=[challenger.id], metadatas=[{"status": "pending_review"}])
 
@@ -683,7 +663,8 @@ class TestReject:
         assert stored_challenger.retirement_reason == "rejected"
 
         async with db.db.execute(
-            "SELECT memory_id FROM memories_fts WHERE memory_id = ?", (challenger.id,),
+            "SELECT memory_id FROM memories_fts WHERE memory_id = ?",
+            (challenger.id,),
         ) as cursor:
             assert (await cursor.fetchone()) is None
         assert challenger.id not in chroma.records
@@ -699,9 +680,7 @@ class TestReject:
         assert stored.status == "pending"
 
     @pytest.mark.asyncio
-    async def test_reject_records_review_audit_with_reviewer(
-        self, db, chroma, review_service
-    ):
+    async def test_reject_records_review_audit_with_reviewer(self, db, chroma, review_service):
         _, challenger, review = await _seed_supersede_review(db, chroma)
 
         await review_service.reject(review.id, reviewer="alice", note="bad source")
@@ -713,9 +692,7 @@ class TestReject:
         assert review_rows[0].actor_id == "alice"
 
     @pytest.mark.asyncio
-    async def test_reject_retires_related_challengers(
-        self, db, chroma, review_service
-    ):
+    async def test_reject_retires_related_challengers(self, db, chroma, review_service):
         _, _, review = await _seed_supersede_review(db, chroma)
         related = await _attach_related_challenger(db, review)
         chroma.upsert(ids=[related.id], metadatas=[{"status": "pending_review"}])
@@ -728,9 +705,7 @@ class TestReject:
         assert related.id not in chroma.records
 
     @pytest.mark.asyncio
-    async def test_reject_rolls_back_when_review_resolution_fails(
-        self, db, chroma, review_service, monkeypatch
-    ):
+    async def test_reject_rolls_back_when_review_resolution_fails(self, db, chroma, review_service, monkeypatch):
         _, challenger, review = await _seed_supersede_review(db, chroma)
         original_resolve = db.resolve_memory_review
 
@@ -756,10 +731,13 @@ class TestReject:
     ):
         _, challenger, review = await _seed_supersede_review(db, chroma)
         related = await _attach_related_challenger(db, review)
-        chroma.upsert(ids=[challenger.id, related.id], metadatas=[
-            {"status": "pending_review"},
-            {"status": "pending_review"},
-        ])
+        chroma.upsert(
+            ids=[challenger.id, related.id],
+            metadatas=[
+                {"status": "pending_review"},
+                {"status": "pending_review"},
+            ],
+        )
 
         async def fail_resolve(*args, **kwargs):
             raise RuntimeError("resolution failed")
@@ -793,32 +771,31 @@ class TestReject:
 
 class TestRefresh:
     @pytest.mark.asyncio
-    async def test_refresh_repins_expectations_after_drift(
-        self, db, chroma, review_service
-    ):
+    async def test_refresh_repins_expectations_after_drift(self, db, chroma, review_service):
         incumbent, _, review = await _seed_supersede_review(db, chroma)
 
         await db.update_memory_content(
-            incumbent.id, new_content="PostgreSQL is now version 15", new_confidence=None, new_tags=None,
+            incumbent.id,
+            new_content="PostgreSQL is now version 15",
+            new_confidence=None,
+            new_tags=None,
         )
 
         result = await review_service.refresh(review.id)
 
         refreshed_incumbent = await db.get_memory(incumbent.id)
         assert result.review.status == "pending"
-        assert (
-            result.review.expected_incumbent_updated_at
-            == refreshed_incumbent.updated_at.isoformat()
-        )
+        assert result.review.expected_incumbent_updated_at == refreshed_incumbent.updated_at.isoformat()
 
     @pytest.mark.asyncio
-    async def test_refresh_clears_stale_attempt_metadata(
-        self, db, chroma, review_service
-    ):
+    async def test_refresh_clears_stale_attempt_metadata(self, db, chroma, review_service):
         incumbent, _, review = await _seed_supersede_review(db, chroma)
 
         await db.update_memory_content(
-            incumbent.id, new_content="PostgreSQL is now version 15", new_confidence=None, new_tags=None,
+            incumbent.id,
+            new_content="PostgreSQL is now version 15",
+            new_confidence=None,
+            new_tags=None,
         )
         with pytest.raises(ReviewStaleConflict):
             await review_service.approve(review.id, reviewer="alice", note=None)

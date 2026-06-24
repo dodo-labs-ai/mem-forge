@@ -194,6 +194,7 @@ async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
 
 # -- Health & Stats --
 
+
 class ComponentHealth(BaseModel):
     status: str
     detail: str | None = None
@@ -232,6 +233,7 @@ class StatsResponse(BaseModel):
 
 # -- Memories --
 
+
 class MemorySourceDetail(BaseModel):
     doc_id: str
     source_type: str
@@ -242,6 +244,7 @@ class MemorySourceDetail(BaseModel):
     content_url: str | None = None
     pdf_url: str | None = None
     added_at: str | None = None
+    source_observed_at: str | None = None
 
 
 class MemoryResponse(BaseModel):
@@ -315,10 +318,7 @@ class SourceFacetFilterRequest(BaseModel):
         allowed = set(GENE_REGISTRY)
         invalid = [item for item in value if item not in allowed]
         if invalid:
-            raise ValueError(
-                "source_types must exactly match registered source types: "
-                + ", ".join(sorted(allowed))
-            )
+            raise ValueError("source_types must exactly match registered source types: " + ", ".join(sorted(allowed)))
         return value
 
     @field_validator("clients")
@@ -329,10 +329,7 @@ class SourceFacetFilterRequest(BaseModel):
         allowed = set(SEARCH_CLIENTS)
         invalid = [item for item in value if item not in allowed]
         if invalid:
-            raise ValueError(
-                "clients must exactly match supported clients: "
-                + ", ".join(SEARCH_CLIENTS)
-            )
+            raise ValueError("clients must exactly match supported clients: " + ", ".join(SEARCH_CLIENTS))
         return value
 
     def to_source_filter(self) -> MemorySourceFilter:
@@ -369,10 +366,7 @@ class MemorySearchRequest(BaseModel):
         allowed = {item.value for item in MemoryType}
         invalid = [item for item in value if item not in allowed]
         if invalid:
-            raise ValueError(
-                "memory_types must exactly match supported memory types: "
-                + ", ".join(sorted(allowed))
-            )
+            raise ValueError("memory_types must exactly match supported memory types: " + ", ".join(sorted(allowed)))
         return value
 
     @field_validator("status")
@@ -382,10 +376,7 @@ class MemorySearchRequest(BaseModel):
             return value
         allowed = {item.value for item in MemoryStatus}
         if value not in allowed:
-            raise ValueError(
-                "status must exactly match supported memory statuses: "
-                + ", ".join(sorted(allowed))
-            )
+            raise ValueError("status must exactly match supported memory statuses: " + ", ".join(sorted(allowed)))
         return value
 
     @model_validator(mode="after")
@@ -394,14 +385,13 @@ class MemorySearchRequest(BaseModel):
         asks for a project-aware mode without one, fall through to the flat
         workspace ranking so the contract stays "default just works"."""
         if self.scope_mode in ("project", "project-first") and self.active_project is None:
-            logger.info(
-                "Search request omitted active_project; falling back to flat workspace ranking."
-            )
+            logger.info("Search request omitted active_project; falling back to flat workspace ranking.")
             self.scope_mode = "workspace"
         return self
 
 
 # -- Entities --
+
 
 class EntityAliasResponse(BaseModel):
     alias: str
@@ -438,6 +428,7 @@ class AddAliasRequest(BaseModel):
 
 
 # -- Sources / Genes --
+
 
 class GeneMetadataResponse(BaseModel):
     name: str
@@ -493,6 +484,7 @@ class DiscoveryPreviewResponse(BaseModel):
 
 
 # -- Teams browse --
+
 
 class TeamsAuthCheckResponse(BaseModel):
     authenticated: bool
@@ -687,10 +679,7 @@ def _validate_source_status(status: str | None) -> None:
     if status not in SOURCE_STATUSES:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Invalid source status: "
-                f"{status}. Expected one of {', '.join(sorted(SOURCE_STATUSES))}"
-            ),
+            detail=(f"Invalid source status: {status}. Expected one of {', '.join(sorted(SOURCE_STATUSES))}"),
         )
 
 
@@ -719,6 +708,7 @@ class AgentSessionDocumentRequest(BaseModel):
     title: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     submitted_at: str | None = None
+    source_observed_at: str | None = None
     process_now: bool = True
 
 
@@ -757,6 +747,7 @@ class AgentSessionWindowRequest(BaseModel):
     receipt: dict[str, Any] = Field(default_factory=dict)
     retention: str = "none"
     submitted_at: str | None = None
+    source_observed_at: str | None = None
     process_now: bool = False
 
 
@@ -786,6 +777,7 @@ class AgentHookContextRequest(BaseModel):
 
 # -- Schedule --
 
+
 class ScheduleConfigResponse(BaseModel):
     enabled: bool = False
     frequency: str = "daily"
@@ -803,6 +795,7 @@ class ScheduleConfigRequest(BaseModel):
 
 
 # -- LLM Config --
+
 
 class LlmConfigResponse(BaseModel):
     enrichment_model: str | None = None
@@ -849,6 +842,7 @@ class LlmConfigProbeResponse(BaseModel):
 
 
 # -- Memory reviews --
+
 
 class MemoryReviewMemorySummary(BaseModel):
     id: str
@@ -899,6 +893,7 @@ class MemoryReviewDecisionRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _mask_api_key(key: str | None) -> str | None:
     """Mask an API key, showing only the last 4 characters."""
@@ -1081,7 +1076,8 @@ async def _probe_llm_models(
                 models=models,
                 message=(
                     f"Connected. Found {len(models)} model{'s' if len(models) != 1 else ''}."
-                    if models else "Connected, but this endpoint returned no models."
+                    if models
+                    else "Connected, but this endpoint returned no models."
                 ),
                 latency_ms=latency_ms,
             )
@@ -1137,7 +1133,11 @@ def _sync_scope_config(source_type: str, config: dict[str, Any]) -> dict[str, An
 
 def _canonical_confluence_scope(scope: dict[str, Any]) -> dict[str, Any]:
     mode = str(scope.get("sync_mode") or "").strip().lower()
-    mode = mode if mode in {"page_tree", "space"} else ("page_tree" if str(scope.get("page_tree_root") or "").strip() else "space")
+    mode = (
+        mode
+        if mode in {"page_tree", "space"}
+        else ("page_tree" if str(scope.get("page_tree_root") or "").strip() else "space")
+    )
     exclude_labels = _config_list_value(scope.get("exclude_labels"))
     canonical: dict[str, Any] = {"sync_mode": mode}
     api_prefix = str(scope.get("api_prefix") or "").strip()
@@ -1219,7 +1219,11 @@ def _validate_confluence_config(
     if sync_mode not in {"", "page_tree", "space"}:
         raise ValueError("Confluence Sync Scope must be Page tree or Space")
     if not sync_mode:
-        sync_mode = "page_tree" if str(config.get("page_tree_root") or existing_config.get("page_tree_root") or "").strip() else "space"
+        sync_mode = (
+            "page_tree"
+            if str(config.get("page_tree_root") or existing_config.get("page_tree_root") or "").strip()
+            else "space"
+        )
 
     if sync_mode == "page_tree":
         page_tree_root = str(config.get("page_tree_root") or existing_config.get("page_tree_root") or "").strip()
@@ -1350,9 +1354,8 @@ def _validate_jira_scope_config(config: dict[str, Any]) -> None:
             raise ValueError("Jira JQL is required in advanced query mode")
         return
     projects = config.get("projects")
-    has_projects = (
-        (isinstance(projects, list) and any(str(p).strip() for p in projects))
-        or (isinstance(projects, str) and any(p.strip() for p in projects.split(",")))
+    has_projects = (isinstance(projects, list) and any(str(p).strip() for p in projects)) or (
+        isinstance(projects, str) and any(p.strip() for p in projects.split(","))
     )
     if not has_projects:
         raise ValueError("Jira Projects to Sync is required in simple query mode")
@@ -1404,10 +1407,7 @@ def _source_secret_has_value(
     return bool(
         config.get(f"{field}_encrypted")
         or existing_config.get(f"{field}_encrypted")
-        or (
-            isinstance(existing_config.get(field), str)
-            and existing_config[field].strip()
-        )
+        or (isinstance(existing_config.get(field), str) and existing_config[field].strip())
     )
 
 
@@ -1560,10 +1560,7 @@ def _source_field_has_value(
             return True
         return bool(
             existing_config.get(f"{field.key}_encrypted")
-            or (
-                isinstance(existing_config.get(field.key), str)
-                and existing_config[field.key].strip()
-            )
+            or (isinstance(existing_config.get(field.key), str) and existing_config[field.key].strip())
         )
     if field.field_type in {ConfigFieldType.TAG_LIST, ConfigFieldType.MULTI_SELECT}:
         if isinstance(value, list):
@@ -1630,6 +1627,7 @@ def _memory_source_detail(
         content_url=content_url,
         pdf_url=pdf_url,
         added_at=_dt_iso(ms.added_at),
+        source_observed_at=_dt_iso(ms.source_observed_at),
     )
 
 
@@ -1695,15 +1693,9 @@ def _is_review_stale(review: MemoryReview, incumbent: Memory | None, challenger:
         return True
     actual_incumbent = incumbent.updated_at.isoformat() if incumbent.updated_at else None
     actual_challenger = challenger.updated_at.isoformat() if challenger.updated_at else None
-    if (
-        review.expected_incumbent_updated_at is not None
-        and review.expected_incumbent_updated_at != actual_incumbent
-    ):
+    if review.expected_incumbent_updated_at is not None and review.expected_incumbent_updated_at != actual_incumbent:
         return True
-    if (
-        review.expected_challenger_updated_at is not None
-        and review.expected_challenger_updated_at != actual_challenger
-    ):
+    if review.expected_challenger_updated_at is not None and review.expected_challenger_updated_at != actual_challenger:
         return True
     return False
 
@@ -1791,9 +1783,7 @@ async def _build_memory_store(
     adapters = provider.build_adapters(
         db,
         memory_collection,
-        audit_logger=MemoryAuditLogger(
-            db, default_context=AuditContext(actor_type="admin")
-        ),
+        audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="admin")),
     )
     return MemoryStore(
         relational=adapters.relational,
@@ -1827,9 +1817,7 @@ async def _build_project_adapters(
     return provider.build_adapters(
         db,
         memory_collection,
-        audit_logger=MemoryAuditLogger(
-            db, default_context=AuditContext(actor_type="admin")
-        ),
+        audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="admin")),
     )
 
 
@@ -1889,9 +1877,7 @@ async def _build_agent_session_window_client(db: Database, config: AppConfig):
     from memforge.runtime import get_effective_llm_config
 
     llm = await get_effective_llm_config(db, config)
-    if not llm.enrichment_api_key and not is_litellm_provider_model(
-        llm.enrichment_model
-    ):
+    if not llm.enrichment_api_key and not is_litellm_provider_model(llm.enrichment_model):
         return None
     return LiteLlmStructuredClient(
         StructuredLlmConfig(
@@ -1906,6 +1892,7 @@ async def _build_agent_session_window_client(db: Database, config: AppConfig):
 # ---------------------------------------------------------------------------
 # Dependency injection
 # ---------------------------------------------------------------------------
+
 
 def get_db(request: Request) -> Database:
     """FastAPI dependency: retrieve the Database instance from app.state."""
@@ -1982,15 +1969,11 @@ def create_admin_app(
             app.state.db = db
 
         app.state.config = config
-        app.state.document_store = document_store or LocalDocumentStore(
-            config.storage.docs_path
-        )
+        app.state.document_store = document_store or LocalDocumentStore(config.storage.docs_path)
         app.state.runtime_provider = runtime_provider
         app.state.principal_resolver = principal_resolver
         app.state.workspace_role_resolver = workspace_role_resolver
-        app.state.sync_service = SyncService(
-            app.state.db, config, runtime_provider=runtime_provider
-        )
+        app.state.sync_service = SyncService(app.state.db, config, runtime_provider=runtime_provider)
         app.state.sync_scheduler = SyncScheduler(app.state.db, app.state.sync_service)
         await app.state.sync_scheduler.start()
 
@@ -2013,9 +1996,7 @@ def create_admin_app(
         app.state.sync_service = SyncService(db, config, runtime_provider=runtime_provider)
         app.state.sync_scheduler = SyncScheduler(db, app.state.sync_service)
     app.state.config = config
-    app.state.document_store = document_store or LocalDocumentStore(
-        config.storage.docs_path
-    )
+    app.state.document_store = document_store or LocalDocumentStore(config.storage.docs_path)
     app.state.runtime_provider = runtime_provider
     app.state.principal_resolver = principal_resolver
     app.state.workspace_role_resolver = workspace_role_resolver
@@ -2076,9 +2057,7 @@ def create_admin_app(
         import jwt as pyjwt
 
         user = await db.get_user_by_username(req.username)
-        if not user or not bcrypt.checkpw(
-            req.password.encode(), user["password_hash"].encode()
-        ):
+        if not user or not bcrypt.checkpw(req.password.encode(), user["password_hash"].encode()):
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
         payload = {
@@ -2110,7 +2089,9 @@ def create_admin_app(
         try:
             if req.confirm_principal_change:
                 await _cancel_running_jira_browser_sources_for_origin(
-                    db=db, sync_service=sync_service, base_url=req.base_url,
+                    db=db,
+                    sync_service=sync_service,
+                    base_url=req.base_url,
                 )
             result = await JiraAuthSessionService(db).store_uploaded_session(
                 base_url=req.base_url,
@@ -2190,9 +2171,7 @@ def create_admin_app(
             engine = await runtime_provider.build_search_engine(
                 db,
                 config,
-                audit_logger=MemoryAuditLogger(
-                    db, default_context=AuditContext(actor_type="admin")
-                ),
+                audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="admin")),
             )
             request.app.state.memory_search_engine = engine
         return engine
@@ -2211,19 +2190,10 @@ def create_admin_app(
             database=_runtime_component_to_response(report.database),
             vector_store=_runtime_component_to_response(report.vector_store),
             index_consistency=(
-                _runtime_component_to_response(report.index_consistency)
-                if report.index_consistency
-                else None
+                _runtime_component_to_response(report.index_consistency) if report.index_consistency else None
             ),
-            audit_failures=(
-                _runtime_component_to_response(report.audit_failures)
-                if report.audit_failures
-                else None
-            ),
-            genes={
-                name: _runtime_component_to_response(component)
-                for name, component in report.genes.items()
-            },
+            audit_failures=(_runtime_component_to_response(report.audit_failures) if report.audit_failures else None),
+            genes={name: _runtime_component_to_response(component) for name, component in report.genes.items()},
         )
 
     @health_router.get("/api/stats", response_model=StatsResponse)
@@ -2281,10 +2251,7 @@ def create_admin_app(
             "title": doc.title,
             "source_type": doc.source,
             "source_url": doc.source_url,
-            "artifacts": {
-                kind: artifact.metadata()
-                for kind, artifact in artifacts.items()
-            },
+            "artifacts": {kind: artifact.metadata() for kind, artifact in artifacts.items()},
         }
 
     @document_router.api_route("/{doc_id}/artifacts/{kind}", methods=["GET", "HEAD"])
@@ -2415,11 +2382,7 @@ def create_admin_app(
                 entities=req.entities,
                 include_superseded=req.include_superseded,
                 top_k=req.top_k,
-                source_filter=(
-                    req.source_filter.to_source_filter()
-                    if req.source_filter is not None
-                    else None
-                ),
+                source_filter=(req.source_filter.to_source_filter() if req.source_filter is not None else None),
                 request_scope=scope,
             )
             # Row-status filter is applied post-rank so the GET and POST
@@ -2642,10 +2605,7 @@ def create_admin_app(
             offset=offset,
         )
         return MemoryListResponse(
-            data=[
-                _memory_to_response(m, *page.origins.get(m.id, (None, None)))
-                for m in page.memories
-            ],
+            data=[_memory_to_response(m, *page.origins.get(m.id, (None, None))) for m in page.memories],
             total=page.total,
             limit=limit,
             offset=offset,
@@ -2827,10 +2787,7 @@ def create_admin_app(
         schema = cls.config_schema()
 
         return GeneConfigSchemaResponse(
-            groups=[
-                ConfigGroupResponse(key=g.key, label=g.label, order=g.order)
-                for g in schema.groups
-            ],
+            groups=[ConfigGroupResponse(key=g.key, label=g.label, order=g.order) for g in schema.groups],
             fields=[
                 ConfigFieldResponse(
                     key=f.key,
@@ -2874,12 +2831,14 @@ def create_admin_app(
             async for item in gene.discover(since=None):
                 count += 1
                 if len(items) < req.limit:
-                    items.append(DiscoveryPreviewItemResponse(
-                        item_id=item.item_id,
-                        title=item.title,
-                        source_url=item.source_url,
-                        last_modified=_dt_iso(item.last_modified),
-                    ))
+                    items.append(
+                        DiscoveryPreviewItemResponse(
+                            item_id=item.item_id,
+                            title=item.title,
+                            source_url=item.source_url,
+                            last_modified=_dt_iso(item.last_modified),
+                        )
+                    )
                 if count > req.limit:
                     break
         except ValueError as exc:
@@ -2955,7 +2914,8 @@ def create_admin_app(
         try:
             # Load chat token — only the Chat API is needed for browsing
             chat_token = TeamsAuthenticator.get_token_for_audience(
-                tokens, "https://ic3.teams.office.com",
+                tokens,
+                "https://ic3.teams.office.com",
             )
 
             if not chat_token:
@@ -2976,7 +2936,8 @@ def create_admin_app(
 
             # Fetch channels (grouped by team) + conversations concurrently
             raw_channel_teams, raw_convos = await asyncio.gather(
-                client.list_channels(), client.list_conversations(),
+                client.list_channels(),
+                client.list_conversations(),
                 return_exceptions=True,
             )
 
@@ -2993,25 +2954,20 @@ def create_admin_app(
                 TeamsTeamResponse(
                     id=t["id"],
                     displayName=t["displayName"],
-                    channels=[
-                        TeamsChannelResponse(id=ch["id"], displayName=ch["displayName"])
-                        for ch in t["channels"]
-                    ],
+                    channels=[TeamsChannelResponse(id=ch["id"], displayName=ch["displayName"]) for ch in t["channels"]],
                 )
                 for t in raw_channel_teams
                 if t.get("channels")  # skip teams with no named channels
             ]
 
             # Filter out system conversations (48:notifications, 48:mentions, etc.)
-            user_convos = [
-                c for c in raw_convos
-                if c.get("id", "").startswith("19:")
-            ]
+            user_convos = [c for c in raw_convos if c.get("id", "").startswith("19:")]
 
             # Resolve individual chat display names from lastMessage sender info.
             # Build a GUID→name map from all conversations' last message senders,
             # then use it to name DMs where the last sender was the current user.
             import base64 as _b64
+
             my_oid = ""
             try:
                 parts = chat_token.split(".")
@@ -3059,9 +3015,7 @@ def create_admin_app(
                 reverse=True,
             )
             # Include individual chats with resolved display names
-            individual_chats_raw = [
-                c for c in user_convos if c.get("type") == "individual_chat"
-            ]
+            individual_chats_raw = [c for c in user_convos if c.get("type") == "individual_chat"]
             individual_chats = sorted(
                 [
                     TeamsChatResponse(
@@ -3094,18 +3048,22 @@ def create_admin_app(
                     if fav_channels:
                         # Use the specific favorite channel
                         for ch in fav_channels:
-                            favorites.append(TeamsChatResponse(
-                                id=ch["id"],
-                                topic=f'{t["displayName"]} / {ch["displayName"]}',
-                            ))
+                            favorites.append(
+                                TeamsChatResponse(
+                                    id=ch["id"],
+                                    topic=f"{t['displayName']} / {ch['displayName']}",
+                                )
+                            )
                     else:
                         # Team is favorite but no specific channel — show team name
                         # Pick the first channel as representative
                         if t["channels"]:
-                            favorites.append(TeamsChatResponse(
-                                id=t["channels"][0]["id"],
-                                topic=t["displayName"],
-                            ))
+                            favorites.append(
+                                TeamsChatResponse(
+                                    id=t["channels"][0]["id"],
+                                    topic=t["displayName"],
+                                )
+                            )
 
             return TeamsBrowseResponse(
                 favorites=favorites,
@@ -3196,9 +3154,7 @@ def create_admin_app(
 
         return SourceProjectsResponse(source_id=source_id, projects=projects)
 
-    @source_router.get(
-        "/{source_id}/projects/resolved", response_model=ResolvedProjectsResponse
-    )
+    @source_router.get("/{source_id}/projects/resolved", response_model=ResolvedProjectsResponse)
     async def list_source_resolved_projects(
         source_id: str,
         request: Request,
@@ -3220,10 +3176,7 @@ def create_admin_app(
             include_private=True,
             owner_user_id=resolve_request_principal(request),
         )
-        projects = [
-            ResolvedProjectResponse(project_key=key, memory_count=count)
-            for key, count in rows
-        ]
+        projects = [ResolvedProjectResponse(project_key=key, memory_count=count) for key, count in rows]
         return ResolvedProjectsResponse(source_id=source_id, projects=projects)
 
     @source_router.put("/{source_id}/subscription")
@@ -3280,17 +3233,19 @@ def create_admin_app(
             async with db.db.execute(query, params) as cursor:
                 async for row in cursor:
                     d = dict(row)
-                    changelog.append({
-                        "id": d["id"],
-                        "doc_id": d["doc_id"],
-                        "change_type": d["change_type"],
-                        "title": d.get("title"),
-                        "source": d.get("source"),
-                        "previous_version": d.get("previous_version"),
-                        "current_version": d.get("current_version"),
-                        "ai_change_summary": d.get("ai_change_summary"),
-                        "detected_at": d["detected_at"],
-                    })
+                    changelog.append(
+                        {
+                            "id": d["id"],
+                            "doc_id": d["doc_id"],
+                            "change_type": d["change_type"],
+                            "title": d.get("title"),
+                            "source": d.get("source"),
+                            "previous_version": d.get("previous_version"),
+                            "current_version": d.get("current_version"),
+                            "ai_change_summary": d.get("ai_change_summary"),
+                            "detected_at": d["detected_at"],
+                        }
+                    )
         except Exception as e:
             logger.warning("Failed to query changelog: %s", e)
 
@@ -3314,16 +3269,18 @@ def create_admin_app(
                 async with db.db.execute(mem_query, mem_params) as cursor:
                     async for row in cursor:
                         d = dict(row)
-                        recent_memories.append({
-                            "id": d["id"],
-                            "memory_type": d["memory_type"],
-                            "content": d["content"],
-                            "confidence": d["confidence"],
-                            "status": d["status"],
-                            "corroboration_count": d["corroboration_count"],
-                            "updated_at": d.get("updated_at"),
-                            "created_at": d.get("created_at"),
-                        })
+                        recent_memories.append(
+                            {
+                                "id": d["id"],
+                                "memory_type": d["memory_type"],
+                                "content": d["content"],
+                                "confidence": d["confidence"],
+                                "status": d["status"],
+                                "corroboration_count": d["corroboration_count"],
+                                "updated_at": d.get("updated_at"),
+                                "created_at": d.get("created_at"),
+                            }
+                        )
             except Exception as e:
                 logger.warning("Failed to query recent memories: %s", e)
 
@@ -3416,8 +3373,7 @@ def create_admin_app(
         else:
             src_config = existing["config"]
         scope_changed = req.config is not None and (
-            _sync_scope_config(existing["type"], src_config)
-            != _sync_scope_config(existing["type"], existing["config"])
+            _sync_scope_config(existing["type"], src_config) != _sync_scope_config(existing["type"], existing["config"])
         )
         auth_secret_changed = req.config is not None and _jira_auth_secret_changed(
             existing["type"],
@@ -3601,10 +3557,7 @@ def create_admin_app(
         if source.get("type") != LOCAL_MARKDOWN_SOURCE_TYPE:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"source {source_id} is type {source.get('type')!r}, "
-                    "not 'local_markdown'"
-                ),
+                detail=(f"source {source_id} is type {source.get('type')!r}, not 'local_markdown'"),
             )
         _require_source_management(request, source)
         if source.get("status") == SOURCE_PAUSED_STATUS:
@@ -3674,6 +3627,7 @@ def create_admin_app(
                 title=req.title,
                 metadata=req.metadata,
                 submitted_at=req.submitted_at,
+                source_observed_at=req.source_observed_at,
                 user_id=resolve_request_principal(request),
             )
         except ValueError as e:
@@ -3701,9 +3655,7 @@ def create_admin_app(
         db: Database = Depends(get_db),
     ):
         """Return window outcome counts and the no_output fraction on demand."""
-        return await db.summarize_agent_session_outcomes(
-            session_id=session_id, source_id=source_id
-        )
+        return await db.summarize_agent_session_outcomes(session_id=session_id, source_id=source_id)
 
     @agent_session_router.post("/windows")
     async def submit_agent_session_window_summary(
@@ -3745,6 +3697,7 @@ def create_admin_app(
                 receipt=req.receipt,
                 retention=req.retention,
                 submitted_at=req.submitted_at,
+                source_observed_at=req.source_observed_at,
                 process_now=req.process_now,
                 user_id=resolve_request_principal(request),
             )
@@ -3800,6 +3753,7 @@ def create_admin_app(
             AgentHookContextRequest as HookContextRequest,
             build_agent_hook_context,
         )
+
         principal_user_id = resolve_request_principal(request)
         engine = await get_search_engine(request, db, config)
 
@@ -3838,13 +3792,15 @@ def create_admin_app(
         sync_scheduler: SyncScheduler | None = Depends(get_sync_scheduler),
     ):
         """Update the sync schedule configuration."""
-        await db.set_schedule_config({
-            "enabled": req.enabled,
-            "frequency": req.frequency,
-            "time": req.time,
-            "day_of_week": req.day_of_week,
-            "timezone": req.timezone,
-        })
+        await db.set_schedule_config(
+            {
+                "enabled": req.enabled,
+                "frequency": req.frequency,
+                "time": req.time,
+                "day_of_week": req.day_of_week,
+                "timezone": req.timezone,
+            }
+        )
         if sync_scheduler:
             await sync_scheduler.reload()
         return {"ok": True}
@@ -3922,14 +3878,16 @@ def create_admin_app(
                 return current.get(field)
             return new_val.strip() or None
 
-        await db.set_llm_config({
-            "enrichment_model": _resolve_value("enrichment_model"),
-            "enrichment_base_url": _resolve_value("enrichment_base_url"),
-            "enrichment_api_key": _resolve_key("enrichment_api_key"),
-            "embedding_model": _resolve_value("embedding_model"),
-            "embedding_base_url": _resolve_value("embedding_base_url"),
-            "embedding_api_key": _resolve_key("embedding_api_key"),
-        })
+        await db.set_llm_config(
+            {
+                "enrichment_model": _resolve_value("enrichment_model"),
+                "enrichment_base_url": _resolve_value("enrichment_base_url"),
+                "enrichment_api_key": _resolve_key("enrichment_api_key"),
+                "embedding_model": _resolve_value("embedding_model"),
+                "embedding_base_url": _resolve_value("embedding_base_url"),
+                "embedding_api_key": _resolve_key("embedding_api_key"),
+            }
+        )
         return {"ok": True}
 
     # ===================================================================
@@ -3946,9 +3904,7 @@ def create_admin_app(
         rows = await adapters.relational.list_projects()
         return [_project_to_response(p) for p in rows]
 
-    @projects_router.post(
-        "", response_model=ProjectResponse, status_code=201
-    )
+    @projects_router.post("", response_model=ProjectResponse, status_code=201)
     async def create_project_route(
         req: ProjectCreateRequest,
         db: Database = Depends(get_db),
@@ -3961,7 +3917,9 @@ def create_admin_app(
             raise HTTPException(status_code=400, detail="project key cannot be empty")
         try:
             created = await adapters.relational.create_project(
-                key=key, name=req.name, is_shared=(req.kind == "shared"),
+                key=key,
+                name=req.name,
+                is_shared=(req.kind == "shared"),
             )
         except ValueError:
             raise HTTPException(
@@ -3986,7 +3944,9 @@ def create_admin_app(
         if req.kind is not None:
             is_shared = req.kind == "shared"
         updated = await adapters.relational.update_project(
-            project_id, name=req.name, is_shared=is_shared,
+            project_id,
+            name=req.name,
+            is_shared=is_shared,
         )
         if updated is None:
             raise HTTPException(status_code=404, detail="project not found")
@@ -4012,7 +3972,8 @@ def create_admin_app(
         # project. Only after the vector channel reports success do we
         # commit the relational rebucket and drop the project row.
         await memory_store.rebucket_project_memories(
-            affected, UNSORTED_PROJECT_KEY,
+            affected,
+            UNSORTED_PROJECT_KEY,
         )
         await adapters.relational.commit_project_deletion(project_id, affected)
         return ProjectDeleteResponse(
@@ -4065,22 +4026,14 @@ def create_admin_app(
         incumbent = await db.get_memory(review.incumbent_memory_id)
         challenger = await db.get_memory(review.challenger_memory_id)
         base = _review_to_response(review, incumbent=incumbent, challenger=challenger)
-        incumbent_summary = (
-            await _build_memory_summary(db, incumbent, config, artifact_store)
-            if incumbent else None
-        )
-        challenger_summary = (
-            await _build_memory_summary(db, challenger, config, artifact_store)
-            if challenger else None
-        )
+        incumbent_summary = await _build_memory_summary(db, incumbent, config, artifact_store) if incumbent else None
+        challenger_summary = await _build_memory_summary(db, challenger, config, artifact_store) if challenger else None
         related_challengers: list[MemoryReviewMemorySummary] = []
         for related in await db.list_memory_review_related_challengers(review.id):
             related_memory = await db.get_memory(related.challenger_memory_id)
             if related_memory is None:
                 continue
-            related_challengers.append(
-                await _build_memory_summary(db, related_memory, config, artifact_store)
-            )
+            related_challengers.append(await _build_memory_summary(db, related_memory, config, artifact_store))
         return MemoryReviewDetailResponse(
             **base.model_dump(),
             incumbent=incumbent_summary,
@@ -4126,12 +4079,10 @@ def create_admin_app(
         assert review is not None
         base = _review_to_response(review, incumbent=result.incumbent, challenger=result.challenger)
         incumbent_summary = (
-            await _build_memory_summary(db, result.incumbent, config, artifact_store)
-            if result.incumbent else None
+            await _build_memory_summary(db, result.incumbent, config, artifact_store) if result.incumbent else None
         )
         challenger_summary = (
-            await _build_memory_summary(db, result.challenger, config, artifact_store)
-            if result.challenger else None
+            await _build_memory_summary(db, result.challenger, config, artifact_store) if result.challenger else None
         )
         return MemoryReviewDetailResponse(
             **base.model_dump(),
@@ -4178,12 +4129,10 @@ def create_admin_app(
         assert review is not None
         base = _review_to_response(review, incumbent=result.incumbent, challenger=result.challenger)
         incumbent_summary = (
-            await _build_memory_summary(db, result.incumbent, config, artifact_store)
-            if result.incumbent else None
+            await _build_memory_summary(db, result.incumbent, config, artifact_store) if result.incumbent else None
         )
         challenger_summary = (
-            await _build_memory_summary(db, result.challenger, config, artifact_store)
-            if result.challenger else None
+            await _build_memory_summary(db, result.challenger, config, artifact_store) if result.challenger else None
         )
         return MemoryReviewDetailResponse(
             **base.model_dump(),
@@ -4210,12 +4159,10 @@ def create_admin_app(
         review = result.review
         base = _review_to_response(review, incumbent=result.incumbent, challenger=result.challenger)
         incumbent_summary = (
-            await _build_memory_summary(db, result.incumbent, config, artifact_store)
-            if result.incumbent else None
+            await _build_memory_summary(db, result.incumbent, config, artifact_store) if result.incumbent else None
         )
         challenger_summary = (
-            await _build_memory_summary(db, result.challenger, config, artifact_store)
-            if result.challenger else None
+            await _build_memory_summary(db, result.challenger, config, artifact_store) if result.challenger else None
         )
         return MemoryReviewDetailResponse(
             **base.model_dump(),
@@ -4262,9 +4209,7 @@ def create_admin_app(
 
         # Alias sources breakdown
         alias_sources: dict[str, int] = {}
-        async with db.db.execute(
-            "SELECT source, COUNT(*) FROM entity_aliases GROUP BY source"
-        ) as cur:
+        async with db.db.execute("SELECT source, COUNT(*) FROM entity_aliases GROUP BY source") as cur:
             async for row in cur:
                 alias_sources[row[0]] = row[1]
         stats["alias_sources"] = alias_sources
@@ -4293,9 +4238,11 @@ def create_admin_app(
 # JSON error helper
 # ---------------------------------------------------------------------------
 
+
 def _json_error(status_code: int, message: str):
     """Return a JSONResponse with an error body."""
     from fastapi.responses import JSONResponse
+
     return JSONResponse(
         status_code=status_code,
         content={"error": message, "status_code": status_code},

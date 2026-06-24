@@ -221,6 +221,7 @@ class MemorySource:
     excerpt: str | None = None
     support_kind: str = "extracted"
     added_at: datetime | None = None
+    source_observed_at: datetime | None = None
 
 
 @dataclass

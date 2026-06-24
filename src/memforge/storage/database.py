@@ -105,8 +105,7 @@ def _with_empty_relation_snapshot_audit(run: RelationRunRecord) -> RelationRunRe
         existing = audit.get(key)
         if existing is not None and existing != value:
             raise RuntimeError(
-                "relation_run_id collision for "
-                f"{run.id}: supplied audit does not match empty relation snapshot ({key})"
+                f"relation_run_id collision for {run.id}: supplied audit does not match empty relation snapshot ({key})"
             )
         audit[key] = value
     return replace(run, audit=audit)
@@ -166,11 +165,7 @@ def _assert_relation_run_retry_matches(row: Mapping[str, Any], run: RelationRunR
         "status": run.status,
         "result_memory_id": _relation_result_memory_id(run),
     }
-    mismatches = [
-        key
-        for key, value in expected.items()
-        if _relation_run_value(row, key) != value
-    ]
+    mismatches = [key for key, value in expected.items() if _relation_run_value(row, key) != value]
     if mismatches:
         raise RuntimeError(
             "relation_run_id collision for "
@@ -179,15 +174,11 @@ def _assert_relation_run_retry_matches(row: Mapping[str, Any], run: RelationRunR
     existing_audit = json.loads(row["audit_json"] or "{}")
     if _relation_run_user_audit(existing_audit) != _relation_run_user_audit(dict(run.audit)):
         raise RuntimeError(
-            "relation_run_id collision for "
-            f"{run.id}: existing run does not match retry payload (audit_json)"
+            f"relation_run_id collision for {run.id}: existing run does not match retry payload (audit_json)"
         )
     for key in _RELATION_SNAPSHOT_AUDIT_KEYS:
         if key not in existing_audit:
-            raise RuntimeError(
-                "relation_run_id collision for "
-                f"{run.id}: committed audit is missing {key}"
-            )
+            raise RuntimeError(f"relation_run_id collision for {run.id}: committed audit is missing {key}")
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +192,8 @@ def _now_iso() -> str:
 
 def _utc_iso(dt: datetime | None) -> str:
     value = dt or datetime.now(timezone.utc)
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("datetime values must include timezone information")
     return value.astimezone(timezone.utc).isoformat()
 
 
@@ -432,6 +423,7 @@ CREATE TABLE IF NOT EXISTS memory_sources (
     excerpt     TEXT,
     support_kind TEXT NOT NULL DEFAULT 'extracted',
     added_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    source_observed_at TEXT,
     PRIMARY KEY (memory_id, doc_id)
 );
 
@@ -1439,6 +1431,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         "Backfill relation-run candidate and relation snapshot audit hashes",
         [],
     ),
+    (
+        27,
+        "Track explicit source observation time on memory provenance",
+        [
+            "ALTER TABLE memory_sources ADD COLUMN source_observed_at TEXT",
+        ],
+    ),
 ]
 
 
@@ -2063,7 +2062,7 @@ class Database:
     async def _delete_evidence_graph_for_memory_unlocked(self, memory_id: str) -> None:
         """Remove evidence graph content that materialized one Memory."""
         async with self.db.execute(
-           """SELECT DISTINCT evidence_unit_id
+            """SELECT DISTINCT evidence_unit_id
                FROM relation_runs
                WHERE result_memory_id = ?
                  AND lifecycle_action IN (
@@ -2742,6 +2741,7 @@ class Database:
         excerpt: str | None = None,
         entity_ids: Sequence[int] | None = None,
         relation_outcome: RelationOutcomeBundle | None = None,
+        source_observed_at: datetime | None,
         review: MemoryReview | None = None,
         related_review_id: str | None = None,
         related_review_reason: str | None = None,
@@ -2752,7 +2752,13 @@ class Database:
         async with self._write_lock:
             try:
                 await self._upsert_memory_preserving_created_at_unlocked(mem)
-                await self._add_memory_source_unlocked(mem.id, doc_id, source_type, excerpt)
+                await self._add_memory_source_unlocked(
+                    mem.id,
+                    doc_id,
+                    source_type,
+                    excerpt,
+                    source_observed_at=source_observed_at,
+                )
                 await self._link_memory_entities_unlocked(mem.id, entity_ids)
                 await self._rebuild_memory_fts_unlocked(
                     mem.id,
@@ -2771,9 +2777,7 @@ class Database:
                     if existing:
                         existing_review_id = existing["review_id"]
                         if existing_review_id != related_review_id:
-                            raise ValueError(
-                                f"Challenger {mem.id} is already attached to review {existing_review_id}"
-                            )
+                            raise ValueError(f"Challenger {mem.id} is already attached to review {existing_review_id}")
                         await self.db.execute(
                             """UPDATE memory_review_related_challengers
                                SET reason = COALESCE(?, reason)
@@ -2846,6 +2850,7 @@ class Database:
         tags: list[str],
         confidence: float,
         observed_at: datetime,
+        source_observed_at: datetime | None,
         citations: list[str] | None = None,
         concept_projection: dict[str, Any] | None = None,
         concept_markdown_body: str | None = None,
@@ -2858,10 +2863,23 @@ class Database:
             try:
                 await self._upsert_memory_preserving_created_at_unlocked(mem)
                 await self.db.execute(
-                    """INSERT OR IGNORE INTO memory_sources (
-                        memory_id, doc_id, source_id, source_type, excerpt, support_kind
-                    ) VALUES (?, ?, (SELECT source FROM documents WHERE doc_id = ?), ?, ?, 'extracted')""",
-                    (mem.id, doc_id, doc_id, source_type, excerpt),
+                    """INSERT INTO memory_sources (
+                        memory_id, doc_id, source_id, source_type, excerpt, support_kind, source_observed_at
+                    ) VALUES (?, ?, (SELECT source FROM documents WHERE doc_id = ?), ?, ?, 'extracted', ?)
+                    ON CONFLICT(memory_id, doc_id) DO UPDATE SET
+                        source_id = excluded.source_id,
+                        source_type = excluded.source_type,
+                        excerpt = excluded.excerpt,
+                        support_kind = excluded.support_kind,
+                        source_observed_at = excluded.source_observed_at""",
+                    (
+                        mem.id,
+                        doc_id,
+                        doc_id,
+                        source_type,
+                        excerpt,
+                        _utc_iso(source_observed_at) if source_observed_at is not None else None,
+                    ),
                 )
                 if entity_ids:
                     for entity_id in entity_ids:
@@ -3393,6 +3411,7 @@ class Database:
         excerpt: str | None = None,
         *,
         support_kind: str = "extracted",
+        source_observed_at: datetime | None,
     ) -> str:
         """Add a supporting source and count only distinct source documents."""
         async with self._write_lock:
@@ -3402,6 +3421,7 @@ class Database:
                 source_type,
                 excerpt,
                 support_kind=support_kind,
+                source_observed_at=source_observed_at,
             )
             await self.db.commit()
             return outcome
@@ -3415,6 +3435,7 @@ class Database:
         *,
         support_kind: str = "extracted",
         relation_outcome: RelationOutcomeBundle,
+        source_observed_at: datetime | None,
     ) -> str:
         """Add a supporting source and its Evidence Relation audit atomically."""
         async with self._write_lock:
@@ -3425,6 +3446,7 @@ class Database:
                     source_type,
                     excerpt,
                     support_kind=support_kind,
+                    source_observed_at=source_observed_at,
                 )
                 await self._record_relation_outcome_bundle_unlocked(relation_outcome)
                 await self.db.commit()
@@ -3441,9 +3463,10 @@ class Database:
         excerpt: str | None = None,
         *,
         support_kind: str = "extracted",
+        source_observed_at: datetime | None,
     ) -> str:
         async with self.db.execute(
-            """SELECT excerpt, support_kind
+            """SELECT excerpt, support_kind, source_observed_at
                FROM memory_sources
                WHERE memory_id = ? AND doc_id = ?""",
             (memory_id, doc_id),
@@ -3453,24 +3476,31 @@ class Database:
         if existing:
             existing_excerpt = existing["excerpt"]
             existing_kind = existing["support_kind"]
+            existing_source_observed_at = existing["source_observed_at"]
             next_kind = existing_kind
             if existing_kind == "corroborated" and support_kind == "extracted":
                 next_kind = "extracted"
+            next_source_observed_at = _utc_iso(source_observed_at) if source_observed_at is not None else None
 
             should_update_excerpt = bool(
                 excerpt
                 and excerpt != existing_excerpt
                 and (not existing_excerpt or len(excerpt) > len(existing_excerpt))
             )
-            if should_update_excerpt or next_kind != existing_kind:
+            if (
+                should_update_excerpt
+                or next_kind != existing_kind
+                or next_source_observed_at != existing_source_observed_at
+            ):
                 await self.db.execute(
                     """UPDATE memory_sources
-                       SET source_type = ?, excerpt = ?, support_kind = ?
+                       SET source_type = ?, excerpt = ?, support_kind = ?, source_observed_at = ?
                        WHERE memory_id = ? AND doc_id = ?""",
                     (
                         source_type,
                         excerpt if should_update_excerpt else existing_excerpt,
                         next_kind,
+                        next_source_observed_at,
                         memory_id,
                         doc_id,
                     ),
@@ -3480,9 +3510,17 @@ class Database:
 
         cursor = await self.db.execute(
             """INSERT OR IGNORE INTO memory_sources (
-                memory_id, doc_id, source_id, source_type, excerpt, support_kind
-            ) VALUES (?, ?, (SELECT source FROM documents WHERE doc_id = ?), ?, ?, ?)""",
-            (memory_id, doc_id, doc_id, source_type, excerpt, support_kind),
+                memory_id, doc_id, source_id, source_type, excerpt, support_kind, source_observed_at
+            ) VALUES (?, ?, (SELECT source FROM documents WHERE doc_id = ?), ?, ?, ?, ?)""",
+            (
+                memory_id,
+                doc_id,
+                doc_id,
+                source_type,
+                excerpt,
+                support_kind,
+                _utc_iso(source_observed_at) if source_observed_at is not None else None,
+            ),
         )
         if cursor.rowcount:
             await self.db.execute(
@@ -3555,6 +3593,7 @@ class Database:
         carry_revision_sources: bool = False,
         entity_ids: Sequence[int] | None = None,
         relation_outcome: RelationOutcomeBundle | None = None,
+        source_observed_at: datetime | None,
     ) -> None:
         """Supersede a memory and persist replacement provenance/relation audit atomically."""
         async with self._write_lock:
@@ -3580,12 +3619,14 @@ class Database:
                                 d["source_type"],
                                 d["excerpt"],
                                 support_kind=d.get("support_kind", "extracted"),
+                                source_observed_at=_parse_dt(d.get("source_observed_at")),
                             )
                 await self._add_memory_source_unlocked(
                     new_memory.id,
                     doc_id,
                     source_type,
                     excerpt,
+                    source_observed_at=source_observed_at,
                 )
                 await self._link_memory_entities_unlocked(new_memory.id, entity_ids)
                 await self._rebuild_memory_fts_unlocked(
@@ -3919,6 +3960,7 @@ class Database:
         excerpt: str | None = None,
         *,
         support_kind: str = "extracted",
+        source_observed_at: datetime | None,
     ) -> None:
         async with self._write_lock:
             await self._add_memory_source_unlocked(
@@ -3927,6 +3969,7 @@ class Database:
                 source_type,
                 excerpt,
                 support_kind=support_kind,
+                source_observed_at=source_observed_at,
             )
             await self.db.commit()
 
@@ -3938,12 +3981,27 @@ class Database:
         excerpt: str | None = None,
         *,
         support_kind: str = "extracted",
+        source_observed_at: datetime | None,
     ) -> None:
         await self.db.execute(
-            """INSERT OR IGNORE INTO memory_sources (
-                memory_id, doc_id, source_id, source_type, excerpt, support_kind
-            ) VALUES (?, ?, (SELECT source FROM documents WHERE doc_id = ?), ?, ?, ?)""",
-            (memory_id, doc_id, doc_id, source_type, excerpt, support_kind),
+            """INSERT INTO memory_sources (
+                memory_id, doc_id, source_id, source_type, excerpt, support_kind, source_observed_at
+            ) VALUES (?, ?, (SELECT source FROM documents WHERE doc_id = ?), ?, ?, ?, ?)
+            ON CONFLICT(memory_id, doc_id) DO UPDATE SET
+                source_id = excluded.source_id,
+                source_type = excluded.source_type,
+                excerpt = excluded.excerpt,
+                support_kind = excluded.support_kind,
+                source_observed_at = excluded.source_observed_at""",
+            (
+                memory_id,
+                doc_id,
+                doc_id,
+                source_type,
+                excerpt,
+                support_kind,
+                _utc_iso(source_observed_at) if source_observed_at is not None else None,
+            ),
         )
 
     async def _link_memory_entities_unlocked(
@@ -3962,14 +4020,15 @@ class Database:
         async with self._write_lock:
             await self.db.execute(
                 """INSERT INTO memory_sources (
-                    memory_id, doc_id, source_id, source_type, excerpt, support_kind, added_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    memory_id, doc_id, source_id, source_type, excerpt, support_kind, added_at, source_observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(memory_id, doc_id) DO UPDATE SET
                     source_id=excluded.source_id,
                     source_type=excluded.source_type,
                     excerpt=excluded.excerpt,
                     support_kind=excluded.support_kind,
-                    added_at=excluded.added_at""",
+                    added_at=excluded.added_at,
+                    source_observed_at=excluded.source_observed_at""",
                 (
                     source.memory_id,
                     source.doc_id,
@@ -3978,13 +4037,17 @@ class Database:
                     source.excerpt,
                     source.support_kind,
                     source.added_at.isoformat() if source.added_at else _now_iso(),
+                    _utc_iso(source.source_observed_at) if source.source_observed_at else None,
                 ),
             )
             await self.db.commit()
 
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]:
         results: list[MemorySource] = []
-        async with self.db.execute("SELECT * FROM memory_sources WHERE memory_id = ?", (memory_id,)) as cursor:
+        async with self.db.execute(
+            "SELECT * FROM memory_sources WHERE memory_id = ?",
+            (memory_id,),
+        ) as cursor:
             async for row in cursor:
                 d = dict(row)
                 results.append(
@@ -3996,6 +4059,7 @@ class Database:
                         excerpt=d["excerpt"],
                         support_kind=d.get("support_kind", "extracted"),
                         added_at=_parse_dt(d["added_at"]),
+                        source_observed_at=_parse_dt(d.get("source_observed_at")),
                     )
                 )
         return results
@@ -4254,6 +4318,7 @@ class Database:
         tags: list[str],
         confidence: float,
         observed_at: datetime,
+        source_observed_at: datetime | None,
         citations: list[str] | None = None,
         concept_markdown_body: str | None = None,
         relation_outcome: RelationOutcomeBundle | None = None,
@@ -4285,34 +4350,34 @@ class Database:
                     superseded_at, replacement_reason, replacement_kind, extraction_context,
                     created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    new_memory.id,
-                    new_memory.memory_type,
-                    new_memory.content,
-                    new_memory.content_hash,
-                    json.dumps(new_memory.tags),
-                    new_memory.visibility,
-                    new_memory.owner_user_id,
-                    project_key,
-                    new_memory.repo_identifier,
-                    new_memory.memory_level,
-                    new_memory.curation_cluster_id,
-                    new_memory.confidence,
-                    new_memory.corroboration_count,
-                    new_memory.contradiction_count,
-                    new_memory.valid_from.isoformat() if new_memory.valid_from else None,
-                    new_memory.valid_until.isoformat() if new_memory.valid_until else None,
-                    new_memory.superseded_by,
-                    new_status,
-                    new_memory.retirement_reason,
-                    new_memory.retired_at.isoformat() if new_memory.retired_at else None,
-                    new_memory.superseded_at.isoformat() if new_memory.superseded_at else None,
-                    new_memory.replacement_reason,
-                    new_memory.replacement_kind,
-                    new_memory.extraction_context,
-                    new_memory.created_at.isoformat() if new_memory.created_at else now,
-                    now,
-                ),
+                    (
+                        new_memory.id,
+                        new_memory.memory_type,
+                        new_memory.content,
+                        new_memory.content_hash,
+                        json.dumps(new_memory.tags),
+                        new_memory.visibility,
+                        new_memory.owner_user_id,
+                        project_key,
+                        new_memory.repo_identifier,
+                        new_memory.memory_level,
+                        new_memory.curation_cluster_id,
+                        new_memory.confidence,
+                        new_memory.corroboration_count,
+                        new_memory.contradiction_count,
+                        new_memory.valid_from.isoformat() if new_memory.valid_from else None,
+                        new_memory.valid_until.isoformat() if new_memory.valid_until else None,
+                        new_memory.superseded_by,
+                        new_status,
+                        new_memory.retirement_reason,
+                        new_memory.retired_at.isoformat() if new_memory.retired_at else None,
+                        new_memory.superseded_at.isoformat() if new_memory.superseded_at else None,
+                        new_memory.replacement_reason,
+                        new_memory.replacement_kind,
+                        new_memory.extraction_context,
+                        new_memory.created_at.isoformat() if new_memory.created_at else now,
+                        now,
+                    ),
                 )
                 await self.db.execute(
                     """UPDATE memories SET
@@ -4337,19 +4402,19 @@ class Database:
                     memory_id=excluded.memory_id,
                     updated_at=excluded.updated_at,
                     last_observed_at=excluded.last_observed_at""",
-                (
-                    claim_id,
-                    concept_id,
-                    display_anchor,
-                    claim_text,
-                    memory_type,
-                    json.dumps(tags),
-                    confidence,
-                    new_memory.id,
-                    created_at,
-                    observed,
-                    observed,
-                ),
+                    (
+                        claim_id,
+                        concept_id,
+                        display_anchor,
+                        claim_text,
+                        memory_type,
+                        json.dumps(tags),
+                        confidence,
+                        new_memory.id,
+                        created_at,
+                        observed,
+                        observed,
+                    ),
                 )
                 if carry_revision_sources:
                     async with self.db.execute(
@@ -4363,6 +4428,7 @@ class Database:
                                 row["source_type"],
                                 row["excerpt"],
                                 support_kind=row["support_kind"] or "extracted",
+                                source_observed_at=_parse_dt(row["source_observed_at"]),
                             )
                 await self._add_memory_source_unlocked(
                     new_memory.id,
@@ -4370,6 +4436,7 @@ class Database:
                     source_type,
                     excerpt,
                     support_kind="extracted",
+                    source_observed_at=source_observed_at,
                 )
                 await self._link_memory_entities_unlocked(new_memory.id, entity_ids)
                 await self._rebuild_memory_fts_unlocked(
@@ -4598,6 +4665,7 @@ class Database:
                         excerpt=d["excerpt"],
                         support_kind=d.get("support_kind", "corroborated"),
                         added_at=_parse_dt(d["added_at"]),
+                        source_observed_at=_parse_dt(d.get("source_observed_at")),
                     )
                 )
         return results

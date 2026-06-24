@@ -153,9 +153,7 @@ async def test_reconciliation_prompt_requires_canonical_replacement_content():
 
         async def reconcile_memories(self, prompt: str, **kwargs):
             self.prompt = prompt
-            return ReconciliationResponse(
-                decisions=[ReconciliationDecision(index=0, action="NOOP", reason="ok")]
-            )
+            return ReconciliationResponse(decisions=[ReconciliationDecision(index=0, action="NOOP", reason="ok")])
 
     client = Client()
 
@@ -213,7 +211,7 @@ async def test_reconciliation_llm_failure_is_audited_and_fails_closed(db):
     await _insert_doc(db, "doc-runbook")
     old = _memory("mem-existing", "Service uses PostgreSQL 15.")
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-runbook", "confluence", support_kind="extracted")
+    await db.add_memory_source(old.id, "doc-runbook", "confluence", support_kind="extracted", source_observed_at=None)
 
     adapters = build_sqlite_adapters(db, FakeCollection())
     store = MemoryStore(
@@ -224,7 +222,11 @@ async def test_reconciliation_llm_failure_is_audited_and_fails_closed(db):
         audit_logger=MemoryAuditLogger(db),
     )
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=FailingClient()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=FailingClient(),
     )
 
     stats = await engine.reconcile_and_persist(
@@ -234,6 +236,7 @@ async def test_reconciliation_llm_failure_is_audited_and_fails_closed(db):
         doc_type="design",
         document_content="# Design\n\nService uses PostgreSQL 16.",
         update_mode="full_document",
+        source_observed_at=None,
     )
 
     rows = await db.list_memory_audit_events(event_type="reconciliation_failed")
@@ -255,7 +258,7 @@ async def test_flagged_supersede_inserts_challenger_pending_review_and_keeps_inc
     await _insert_doc(db, "doc-runbook")
     old = _memory("mem-old0001", "PostgreSQL version is 14", corroboration_count=3)
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-runbook", "confluence")
+    await db.add_memory_source(old.id, "doc-runbook", "confluence", source_observed_at=None)
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -268,7 +271,11 @@ async def test_flagged_supersede_inserts_challenger_pending_review_and_keeps_inc
     )
     store._embed = AsyncMock(return_value=[0.1])
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
 
     challenger = RawMemory(content="PostgreSQL version is 16", memory_type="fact", confidence=0.9)
@@ -291,6 +298,7 @@ async def test_flagged_supersede_inserts_challenger_pending_review_and_keeps_inc
         raw_memories=[challenger],
         source_type="confluence",
         doc_type="runbook",
+        source_observed_at=None,
     )
 
     stored_old = await db.get_memory(old.id)
@@ -397,11 +405,14 @@ async def test_pending_review_challenger_insert_rolls_back_relation_when_review_
             excerpt="PostgreSQL version is 16",
             relation_outcome=relation_outcome,
             review=review,
+            source_observed_at=None,
         )
 
     assert await db.get_memory(challenger.id) is None
     assert await db.get_memory_review(review.id) is None
-    async with db.db.execute("SELECT COUNT(*) AS total FROM relation_runs WHERE id = ?", ("rel-run-review-fails",)) as cursor:
+    async with db.db.execute(
+        "SELECT COUNT(*) AS total FROM relation_runs WHERE id = ?", ("rel-run-review-fails",)
+    ) as cursor:
         row = await cursor.fetchone()
     assert row["total"] == 0
 
@@ -412,8 +423,8 @@ async def test_reconcile_delete_removes_only_updated_document_support(db, monkey
     await _insert_doc(db, "doc-other")
     old = _memory("mem-old0001", "PostgreSQL version is 14", corroboration_count=2)
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-runbook", "confluence")
-    await db.add_memory_source(old.id, "doc-other", "confluence")
+    await db.add_memory_source(old.id, "doc-runbook", "confluence", source_observed_at=None)
+    await db.add_memory_source(old.id, "doc-other", "confluence", source_observed_at=None)
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -426,7 +437,11 @@ async def test_reconcile_delete_removes_only_updated_document_support(db, monkey
     )
     store._embed = AsyncMock(return_value=[0.1])
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
 
     async def fake_reconcile_memories(**kwargs):
@@ -446,6 +461,7 @@ async def test_reconcile_delete_removes_only_updated_document_support(db, monkey
         source_type="confluence",
         doc_type="runbook",
         document_content="The updated runbook no longer mentions PostgreSQL 14.",
+        source_observed_at=None,
     )
 
     stored_old = await db.get_memory(old.id)
@@ -460,7 +476,7 @@ async def test_reconcile_delete_retires_memory_when_current_doc_is_only_support(
     await _insert_doc(db, "doc-runbook")
     old = _memory("mem-old0001", "PostgreSQL version is 14")
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-runbook", "confluence", support_kind="extracted")
+    await db.add_memory_source(old.id, "doc-runbook", "confluence", support_kind="extracted", source_observed_at=None)
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -473,7 +489,11 @@ async def test_reconcile_delete_retires_memory_when_current_doc_is_only_support(
     )
     store._embed = AsyncMock(return_value=[0.1])
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
 
     async def fake_reconcile_memories(**kwargs):
@@ -493,6 +513,7 @@ async def test_reconcile_delete_retires_memory_when_current_doc_is_only_support(
         source_type="confluence",
         doc_type="runbook",
         document_content="The updated runbook no longer mentions PostgreSQL 14.",
+        source_observed_at=None,
     )
 
     stored_old = await db.get_memory(old.id)
@@ -515,9 +536,9 @@ async def test_high_corroboration_delete_removes_current_support_when_other_supp
     await _insert_doc(db, "doc-third")
     old = _memory("mem-old0001", "PostgreSQL version is 14", corroboration_count=3)
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-runbook", "confluence")
-    await db.add_memory_source(old.id, "doc-other", "confluence")
-    await db.add_memory_source(old.id, "doc-third", "confluence")
+    await db.add_memory_source(old.id, "doc-runbook", "confluence", source_observed_at=None)
+    await db.add_memory_source(old.id, "doc-other", "confluence", source_observed_at=None)
+    await db.add_memory_source(old.id, "doc-third", "confluence", source_observed_at=None)
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -530,7 +551,11 @@ async def test_high_corroboration_delete_removes_current_support_when_other_supp
     )
     store._embed = AsyncMock(return_value=[0.1])
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
 
     async def fake_reconcile_memories(**kwargs):
@@ -550,6 +575,7 @@ async def test_high_corroboration_delete_removes_current_support_when_other_supp
         source_type="confluence",
         doc_type="runbook",
         document_content="The updated runbook no longer mentions PostgreSQL 14.",
+        source_observed_at=None,
     )
 
     stored_old = await db.get_memory(old.id)
@@ -567,7 +593,7 @@ async def test_high_corroboration_delete_review_records_relation_audit(db, monke
     await _insert_doc(db, "doc-runbook")
     old = _memory("mem-old0001", "PostgreSQL version is 14", corroboration_count=3)
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-runbook", "confluence")
+    await db.add_memory_source(old.id, "doc-runbook", "confluence", source_observed_at=None)
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -580,7 +606,11 @@ async def test_high_corroboration_delete_review_records_relation_audit(db, monke
     )
     store._embed = AsyncMock(return_value=[0.1])
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
 
     async def fake_reconcile_memories(**kwargs):
@@ -600,6 +630,7 @@ async def test_high_corroboration_delete_review_records_relation_audit(db, monke
         source_type="confluence",
         doc_type="runbook",
         document_content="The updated runbook no longer mentions PostgreSQL 14.",
+        source_observed_at=None,
     )
 
     stored_old = await db.get_memory(old.id)
@@ -639,7 +670,7 @@ async def test_diff_guided_reconciliation_context_is_passed_to_reconciler(db, mo
     await _insert_doc(db, "doc-runbook")
     old = _memory("mem-old0001", "PostgreSQL version is 14")
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-runbook", "confluence")
+    await db.add_memory_source(old.id, "doc-runbook", "confluence", source_observed_at=None)
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -651,7 +682,11 @@ async def test_diff_guided_reconciliation_context_is_passed_to_reconciler(db, mo
     )
     store._embed = AsyncMock(return_value=[0.1])
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
     seen_kwargs: dict = {}
 
@@ -676,6 +711,7 @@ async def test_diff_guided_reconciliation_context_is_passed_to_reconciler(db, mo
         update_mode="diff_guided",
         changed_hunks="-The service uses PostgreSQL 14.\n+The service uses PostgreSQL 15.",
         update_plan_stats={"diff_line_count": 2, "added_lines": 1, "removed_lines": 1},
+        source_observed_at=None,
     )
 
     assert stats["noop"] == 1
@@ -690,8 +726,8 @@ async def test_reconciliation_decisions_are_audited_before_mutation(db, monkeypa
     await _insert_doc(db, "doc-other")
     old = _memory("mem-old0001", "PostgreSQL version is 14")
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-runbook", "confluence")
-    await db.add_memory_source(old.id, "doc-other", "confluence")
+    await db.add_memory_source(old.id, "doc-runbook", "confluence", source_observed_at=None)
+    await db.add_memory_source(old.id, "doc-other", "confluence", source_observed_at=None)
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -704,7 +740,11 @@ async def test_reconciliation_decisions_are_audited_before_mutation(db, monkeypa
     )
     store._embed = AsyncMock(return_value=[0.1])
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
 
     async def fake_reconcile_memories(**kwargs):
@@ -727,6 +767,7 @@ async def test_reconciliation_decisions_are_audited_before_mutation(db, monkeypa
         update_mode="diff_guided",
         changed_hunks="-The service uses PostgreSQL 14.",
         update_plan_stats={"diff_line_count": 1},
+        source_observed_at=None,
     )
 
     rows = await db.list_memory_audit_events(event_type="reconciliation_decision_returned")
@@ -744,7 +785,14 @@ async def test_reconciliation_update_replaces_memory_lifecycle_for_document_sour
     await _insert_doc(db, "doc-current")
     old = _memory("mem-update-lifecycle", "Service A uses PostgreSQL 15.")
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-current", source_type, excerpt="Old extracted source.", support_kind="extracted")
+    await db.add_memory_source(
+        old.id,
+        "doc-current",
+        source_type,
+        excerpt="Old extracted source.",
+        support_kind="extracted",
+        source_observed_at=None,
+    )
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -757,7 +805,11 @@ async def test_reconciliation_update_replaces_memory_lifecycle_for_document_sour
     )
     store._embed = AsyncMock(return_value=[0.1])
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
 
     async def fake_reconcile_memories(**kwargs):
@@ -784,6 +836,7 @@ async def test_reconciliation_update_replaces_memory_lifecycle_for_document_sour
         source_type=source_type,
         doc_type="design-doc",
         document_content="Service A uses PostgreSQL 16.",
+        source_observed_at=None,
     )
 
     stored_old = await db.get_memory(old.id)
@@ -843,10 +896,14 @@ async def test_reconciliation_rejects_update_without_current_doc_extracted_suppo
     anchor = _memory("mem-anchor1", "Current doc extracted memory.")
     await db.insert_memory(target)
     await db.insert_memory(anchor)
-    await db.add_memory_source(target.id, "doc-current", "confluence", support_kind="corroborated")
-    await db.add_memory_source(target.id, "doc-owner", "confluence", support_kind="extracted")
+    await db.add_memory_source(
+        target.id, "doc-current", "confluence", support_kind="corroborated", source_observed_at=None
+    )
+    await db.add_memory_source(target.id, "doc-owner", "confluence", support_kind="extracted", source_observed_at=None)
     # The anchor makes reconciliation run while the target remains outside current-doc extracted authority.
-    await db.add_memory_source(anchor.id, "doc-current", "confluence", support_kind="extracted")
+    await db.add_memory_source(
+        anchor.id, "doc-current", "confluence", support_kind="extracted", source_observed_at=None
+    )
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -859,7 +916,11 @@ async def test_reconciliation_rejects_update_without_current_doc_extracted_suppo
     )
     store._embed = AsyncMock(return_value=[0.1])
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
 
     async def fake_reconcile_memories(**kwargs):
@@ -884,6 +945,7 @@ async def test_reconciliation_rejects_update_without_current_doc_extracted_suppo
         source_type="confluence",
         doc_type="design-doc",
         document_content="Current doc supports only as corroboration.",
+        source_observed_at=None,
     )
 
     stored = await db.get_memory(target.id)
@@ -902,10 +964,14 @@ async def test_reconciliation_rejects_delete_for_corroborated_only_current_doc_s
     anchor = _memory("mem-anchor2", "Current doc extracted memory.")
     await db.insert_memory(target)
     await db.insert_memory(anchor)
-    await db.add_memory_source(target.id, "doc-current", "confluence", support_kind="corroborated")
-    await db.add_memory_source(target.id, "doc-owner", "confluence", support_kind="extracted")
+    await db.add_memory_source(
+        target.id, "doc-current", "confluence", support_kind="corroborated", source_observed_at=None
+    )
+    await db.add_memory_source(target.id, "doc-owner", "confluence", support_kind="extracted", source_observed_at=None)
     # The anchor makes reconciliation run while the target remains outside current-doc extracted authority.
-    await db.add_memory_source(anchor.id, "doc-current", "confluence", support_kind="extracted")
+    await db.add_memory_source(
+        anchor.id, "doc-current", "confluence", support_kind="extracted", source_observed_at=None
+    )
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -918,7 +984,11 @@ async def test_reconciliation_rejects_delete_for_corroborated_only_current_doc_s
     )
     store._embed = AsyncMock(return_value=[0.1])
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
 
     async def fake_reconcile_memories(**kwargs):
@@ -938,6 +1008,7 @@ async def test_reconciliation_rejects_delete_for_corroborated_only_current_doc_s
         source_type="confluence",
         doc_type="design-doc",
         document_content="Current doc no longer supports the target memory.",
+        source_observed_at=None,
     )
 
     sources = await db.get_memory_sources(target.id)
@@ -957,8 +1028,8 @@ async def test_reconciliation_routes_supersede_with_other_support_to_review(db, 
     await _insert_doc(db, "doc-support")
     old = _memory("mem-shared1", "Service A uses PostgreSQL 15.")
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-current", "confluence", support_kind="extracted")
-    await db.add_memory_source(old.id, "doc-support", "jira", support_kind="corroborated")
+    await db.add_memory_source(old.id, "doc-current", "confluence", support_kind="extracted", source_observed_at=None)
+    await db.add_memory_source(old.id, "doc-support", "jira", support_kind="corroborated", source_observed_at=None)
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -971,7 +1042,11 @@ async def test_reconciliation_routes_supersede_with_other_support_to_review(db, 
     )
     store._embed = AsyncMock(return_value=[0.1])
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
 
     async def fake_reconcile_memories(**kwargs):
@@ -996,6 +1071,7 @@ async def test_reconciliation_routes_supersede_with_other_support_to_review(db, 
         source_type="confluence",
         doc_type="design-doc",
         document_content="Service A uses PostgreSQL 16.",
+        source_observed_at=None,
     )
 
     stored_old = await db.get_memory(old.id)
@@ -1016,8 +1092,8 @@ async def test_reconciliation_routes_update_with_other_extracted_support_to_revi
     await _insert_doc(db, "doc-support")
     old = _memory("mem-shared2", "Service A uses PostgreSQL 15.")
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-current", "confluence", support_kind="extracted")
-    await db.add_memory_source(old.id, "doc-support", "jira", support_kind="extracted")
+    await db.add_memory_source(old.id, "doc-current", "confluence", support_kind="extracted", source_observed_at=None)
+    await db.add_memory_source(old.id, "doc-support", "jira", support_kind="extracted", source_observed_at=None)
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -1030,7 +1106,11 @@ async def test_reconciliation_routes_update_with_other_extracted_support_to_revi
     )
     store._embed = AsyncMock(return_value=[0.1])
     engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=store, structured_llm_client=object()
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=object(),
     )
 
     async def fake_reconcile_memories(**kwargs):
@@ -1055,6 +1135,7 @@ async def test_reconciliation_routes_update_with_other_extracted_support_to_revi
         source_type="confluence",
         doc_type="design-doc",
         document_content="Service A uses PostgreSQL 16.",
+        source_observed_at=None,
     )
 
     stored_old = await db.get_memory(old.id)

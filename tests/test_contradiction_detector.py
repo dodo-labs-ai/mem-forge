@@ -269,9 +269,9 @@ class TestGetCrossDocCandidates:
         await db.insert_memory(mixed)
         await db.link_memory_entity(current.id, entity_id)
         await db.link_memory_entity(mixed.id, entity_id)
-        await db.add_memory_source(current.id, "doc-current", "confluence")
-        await db.add_memory_source(mixed.id, "doc-enabled", "confluence")
-        await db.add_memory_source(mixed.id, "doc-disabled", "confluence")
+        await db.add_memory_source(current.id, "doc-current", "confluence", source_observed_at=None)
+        await db.add_memory_source(mixed.id, "doc-enabled", "confluence", source_observed_at=None)
+        await db.add_memory_source(mixed.id, "doc-disabled", "confluence", source_observed_at=None)
 
         candidate_page = await db.get_cross_doc_candidates(
             memory_id=current.id,

@@ -42,13 +42,17 @@ class _FakeColl:
         self._seeded = [i for i in self._seeded if i not in ids]
 
 
-def _mem(mid, content, *, visibility=WORKSPACE, owner=None,
-         project_key=SHARED_PROJECT_KEY, status=ACTIVE):
+def _mem(mid, content, *, visibility=WORKSPACE, owner=None, project_key=SHARED_PROJECT_KEY, status=ACTIVE):
     return Memory(
-        id=mid, memory_type="fact", content=content,
+        id=mid,
+        memory_type="fact",
+        content=content,
         content_hash=content_hash(content + mid),
-        visibility=visibility, owner_user_id=owner,
-        project_key=project_key, tags=[], status=status,
+        visibility=visibility,
+        owner_user_id=owner,
+        project_key=project_key,
+        tags=[],
+        status=status,
     )
 
 
@@ -82,17 +86,20 @@ async def test_private_write_does_not_corroborate_workspace(db, monkeypatch):
 
     # A private write with identical content must INSERT, not corroborate.
     adapters = build_sqlite_adapters(db, memory_collection=_FakeColl(seeded=["m-ws"]))
-    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector,
-                        embed_cfg={}, dedup_threshold=0.08)
+    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+
     async def _stub_embed(text):
         return [0.1, 0.1, 0.1]
+
     monkeypatch.setattr(store, "_embed", _stub_embed)
 
-    private = _mem("m-priv", "deploy via argocd",
-                    visibility=PRIVATE, owner="u-alice")
+    private = _mem("m-priv", "deploy via argocd", visibility=PRIVATE, owner="u-alice")
     await _seed_doc(db, "d-1")
     result = await store.deduplicate_and_insert(
-        private, doc_id="d-1", source_type="agent_session",
+        private,
+        doc_id="d-1",
+        source_type="agent_session",
+        source_observed_at=None,
     )
     assert result == "inserted"  # NOT "corroborated"
 
@@ -101,22 +108,25 @@ async def test_private_write_does_not_corroborate_workspace(db, monkeypatch):
 async def test_workspace_write_does_not_corroborate_private(db, monkeypatch):
     # Seed an alice-private memory that the vector channel will return as a
     # dedup candidate (test it for real, not for an empty pool).
-    private = _mem("m-priv", "deploy via argocd",
-                    visibility=PRIVATE, owner="u-alice")
+    private = _mem("m-priv", "deploy via argocd", visibility=PRIVATE, owner="u-alice")
     await db.insert_memory(private)
 
     # A workspace write with identical content must INSERT, not corroborate.
     adapters = build_sqlite_adapters(db, memory_collection=_FakeColl(seeded=["m-priv"]))
-    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector,
-                        embed_cfg={}, dedup_threshold=0.08)
+    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+
     async def _stub_embed(text):
         return [0.1, 0.1, 0.1]
+
     monkeypatch.setattr(store, "_embed", _stub_embed)
 
     workspace = _mem("m-ws", "deploy via argocd", visibility=WORKSPACE)
     await _seed_doc(db, "d-2")
     result = await store.deduplicate_and_insert(
-        workspace, doc_id="d-2", source_type="confluence",
+        workspace,
+        doc_id="d-2",
+        source_type="confluence",
+        source_observed_at=None,
     )
     assert result == "inserted"
 
@@ -124,22 +134,24 @@ async def test_workspace_write_does_not_corroborate_private(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_same_user_private_dedup_still_works(db, monkeypatch):
     # Seed an alice-private memory.
-    existing = _mem("m-1", "deploy via argocd",
-                     visibility=PRIVATE, owner="u-alice")
+    existing = _mem("m-1", "deploy via argocd", visibility=PRIVATE, owner="u-alice")
     await db.insert_memory(existing)
 
     adapters = build_sqlite_adapters(db, memory_collection=_FakeColl(seeded=["m-1"]))
-    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector,
-                        embed_cfg={}, dedup_threshold=0.08)
+    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+
     async def _stub_embed(text):
         return [0.1, 0.1, 0.1]
+
     monkeypatch.setattr(store, "_embed", _stub_embed)
 
-    duplicate = _mem("m-2", "deploy via argocd",
-                      visibility=PRIVATE, owner="u-alice")
+    duplicate = _mem("m-2", "deploy via argocd", visibility=PRIVATE, owner="u-alice")
     await _seed_doc(db, "d-3")
     result = await store.deduplicate_and_insert(
-        duplicate, doc_id="d-3", source_type="agent_session",
+        duplicate,
+        doc_id="d-3",
+        source_type="agent_session",
+        source_observed_at=None,
     )
     assert result in {"corroborated", "skipped"}
 
@@ -149,22 +161,24 @@ async def test_workspace_write_does_not_corroborate_other_project(db, monkeypatc
     # Workspace memories dedup only within the same project_key. The vector
     # channel does not pre-filter by project, so a PAY write receives RISK
     # candidates and the dedup guard must reject them.
-    risk = _mem("m-risk", "deploy via argocd",
-                 visibility=WORKSPACE, project_key="RISK")
+    risk = _mem("m-risk", "deploy via argocd", visibility=WORKSPACE, project_key="RISK")
     await db.insert_memory(risk)
 
     adapters = build_sqlite_adapters(db, memory_collection=_FakeColl(seeded=["m-risk"]))
-    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector,
-                        embed_cfg={}, dedup_threshold=0.08)
+    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+
     async def _stub_embed(text):
         return [0.1, 0.1, 0.1]
+
     monkeypatch.setattr(store, "_embed", _stub_embed)
 
-    pay = _mem("m-pay", "deploy via argocd",
-                visibility=WORKSPACE, project_key="PAY")
+    pay = _mem("m-pay", "deploy via argocd", visibility=WORKSPACE, project_key="PAY")
     await _seed_doc(db, "d-pay")
     result = await store.deduplicate_and_insert(
-        pay, doc_id="d-pay", source_type="confluence",
+        pay,
+        doc_id="d-pay",
+        source_type="confluence",
+        source_observed_at=None,
     )
     assert result == "inserted"  # NOT "corroborated"
 
@@ -174,21 +188,23 @@ async def test_private_write_does_not_corroborate_other_users_private(db, monkey
     # Two distinct private owners must not collide. Even though the writer
     # scope is keyed on memory.owner_user_id, the in-process candidate guard
     # is the second line of defense.
-    bob = _mem("m-bob", "deploy via argocd",
-                visibility=PRIVATE, owner="u-bob")
+    bob = _mem("m-bob", "deploy via argocd", visibility=PRIVATE, owner="u-bob")
     await db.insert_memory(bob)
 
     adapters = build_sqlite_adapters(db, memory_collection=_FakeColl(seeded=["m-bob"]))
-    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector,
-                        embed_cfg={}, dedup_threshold=0.08)
+    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+
     async def _stub_embed(text):
         return [0.1, 0.1, 0.1]
+
     monkeypatch.setattr(store, "_embed", _stub_embed)
 
-    alice = _mem("m-alice", "deploy via argocd",
-                  visibility=PRIVATE, owner="u-alice")
+    alice = _mem("m-alice", "deploy via argocd", visibility=PRIVATE, owner="u-alice")
     await _seed_doc(db, "d-alice")
     result = await store.deduplicate_and_insert(
-        alice, doc_id="d-alice", source_type="agent_session",
+        alice,
+        doc_id="d-alice",
+        source_type="agent_session",
+        source_observed_at=None,
     )
     assert result == "inserted"

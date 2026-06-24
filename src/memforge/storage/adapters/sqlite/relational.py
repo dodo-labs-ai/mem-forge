@@ -87,10 +87,17 @@ class SqliteRelationalStore:
         doc_id: str,
         source_type: str,
         excerpt: str | None,
+        *,
         support_kind: str = "extracted",
+        source_observed_at: datetime | None,
     ) -> None:
         await self._db.add_memory_source(
-            memory_id, doc_id, source_type, excerpt, support_kind=support_kind
+            memory_id,
+            doc_id,
+            source_type,
+            excerpt,
+            support_kind=support_kind,
+            source_observed_at=source_observed_at,
         )
 
     async def add_memory_derivation(
@@ -145,13 +152,9 @@ class SqliteRelationalStore:
         if target is None:
             raise LookupError(f"memory {memory_id!r} not found")
         if target.visibility != Visibility.PRIVATE.value:
-            raise ValueError(
-                f"memory {memory_id!r} is not private; nothing to promote"
-            )
+            raise ValueError(f"memory {memory_id!r} is not private; nothing to promote")
         if target.owner_user_id != actor_user_id:
-            raise PermissionError(
-                f"actor {actor_user_id!r} does not own memory {memory_id!r}"
-            )
+            raise PermissionError(f"actor {actor_user_id!r} does not own memory {memory_id!r}")
         if self._audit_logger is not None:
             await self._audit_logger.emit(
                 "memory_promoted",
@@ -163,13 +166,9 @@ class SqliteRelationalStore:
                     "actor": actor_user_id,
                 },
             )
-        raise NotImplementedError(
-            "promote_to_workspace is not yet implemented"
-        )
+        raise NotImplementedError("promote_to_workspace is not yet implemented")
 
-    async def filter_visible_ids(
-        self, ids: Sequence[str], scope: AccessScope
-    ) -> set[str]:
+    async def filter_visible_ids(self, ids: Sequence[str], scope: AccessScope) -> set[str]:
         visible: set[str] = set()
         memory_ids = list(ids)
         if not memory_ids:
@@ -178,10 +177,7 @@ class SqliteRelationalStore:
         for start in range(0, len(memory_ids), _BATCH_SIZE):
             batch = memory_ids[start : start + _BATCH_SIZE]
             placeholders = ",".join("?" for _ in batch)
-            sql = (
-                "SELECT m.id FROM memories m "
-                f"WHERE m.id IN ({placeholders}) AND {pred_sql}"
-            )
+            sql = f"SELECT m.id FROM memories m WHERE m.id IN ({placeholders}) AND {pred_sql}"
             try:
                 async with self._db.db.execute(sql, [*batch, *pred_params]) as cursor:
                     async for row in cursor:
@@ -191,9 +187,7 @@ class SqliteRelationalStore:
                 return set()
         return visible
 
-    async def filter_ids_supported_by_sources(
-        self, ids: Sequence[str], sources: Sequence[str]
-    ) -> set[str]:
+    async def filter_ids_supported_by_sources(self, ids: Sequence[str], sources: Sequence[str]) -> set[str]:
         memory_ids = list(ids)
         source_list = list(sources)
         if not memory_ids or not source_list:
@@ -217,9 +211,7 @@ class SqliteRelationalStore:
             return set()
         return supported
 
-    async def filter_ids_by_source_filter(
-        self, ids: Sequence[str], source_filter: MemorySourceFilter
-    ) -> set[str]:
+    async def filter_ids_by_source_filter(self, ids: Sequence[str], source_filter: MemorySourceFilter) -> set[str]:
         memory_ids = list(ids)
         if not memory_ids:
             return set()
@@ -325,15 +317,17 @@ class SqliteRelationalStore:
                 "LIMIT ?"
             )
             expanded_params: list[Any] = [
-                *direct_ids, *direct_ids, *predicate_params, *type_params, limit,
+                *direct_ids,
+                *direct_ids,
+                *predicate_params,
+                *type_params,
+                limit,
             ]
             try:
                 async with self._db.db.execute(expanded_sql, expanded_params) as cursor:
                     async for row in cursor:
                         shared = int(row[1])
-                        scored.append(
-                            (row[0], _EXPANSION_WEIGHT * shared / query_entity_count)
-                        )
+                        scored.append((row[0], _EXPANSION_WEIGHT * shared / query_entity_count))
             except Exception:
                 logger.exception("Graph 1-hop expansion failed")
 
@@ -368,12 +362,7 @@ class SqliteRelationalStore:
             conditions.append(f"m.memory_type IN ({type_placeholders})")
             params.extend(memory_types)
 
-        sql = (
-            "SELECT m.id FROM memories m "
-            "WHERE " + " AND ".join(conditions) + " "
-            "ORDER BY m.updated_at DESC "
-            "LIMIT ?"
-        )
+        sql = "SELECT m.id FROM memories m WHERE " + " AND ".join(conditions) + " ORDER BY m.updated_at DESC LIMIT ?"
         params.append(limit)
 
         results: list[tuple[str, float]] = []
@@ -390,9 +379,7 @@ class SqliteRelationalStore:
             return []
         return results
 
-    async def fetch_ranking_metadata(
-        self, ids: Sequence[str]
-    ) -> dict[str, dict[str, Any]]:
+    async def fetch_ranking_metadata(self, ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         """Return ranking and curation metadata for each id in one read.
 
         The fields feed recency, project affinity, repo affinity, and
@@ -435,12 +422,8 @@ class SqliteRelationalStore:
                 logger.exception("Failed to fetch ranking metadata for memory ids")
         return ranked
 
-    async def create_project(
-        self, *, key: str, name: str, is_shared: bool = False
-    ) -> Project:
-        return await self._db.create_project(
-            key=key, name=name, is_shared=is_shared
-        )
+    async def create_project(self, *, key: str, name: str, is_shared: bool = False) -> Project:
+        return await self._db.create_project(key=key, name=name, is_shared=is_shared)
 
     async def get_project(self, project_id: str) -> Project | None:
         return await self._db.get_project(project_id)
@@ -455,14 +438,10 @@ class SqliteRelationalStore:
         name: str | None = None,
         is_shared: bool | None = None,
     ) -> Project | None:
-        return await self._db.update_project(
-            project_id, name=name, is_shared=is_shared
-        )
+        return await self._db.update_project(project_id, name=name, is_shared=is_shared)
 
     async def list_project_memory_ids(self, project_id: str) -> list[str]:
         return await self._db.list_project_memory_ids(project_id)
 
-    async def commit_project_deletion(
-        self, project_id: str, affected_ids: Sequence[str]
-    ) -> None:
+    async def commit_project_deletion(self, project_id: str, affected_ids: Sequence[str]) -> None:
         await self._db.commit_project_deletion(project_id, affected_ids)

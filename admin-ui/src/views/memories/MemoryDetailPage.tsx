@@ -299,7 +299,9 @@ function SourceCard({ source }: { source: MemorySource }) {
         </p>
       )}
       <div className="text-xs text-muted-foreground">
-        Observed: {formatDateTime(source.added_at)}
+        {source.source_observed_at
+          ? `Source observed: ${formatDateTime(source.source_observed_at)}`
+          : `Linked: ${formatDateTime(source.added_at)}`}
       </div>
     </div>
   );

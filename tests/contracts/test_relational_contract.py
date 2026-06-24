@@ -52,8 +52,7 @@ class RelationalStoreContract:
     @pytest.fixture
     def adapters_factory(self) -> AdaptersFactory:  # pragma: no cover - subclass override
         raise NotImplementedError(
-            "Subclass must override adapters_factory with an async callable "
-            "that returns FactoryResult"
+            "Subclass must override adapters_factory with an async callable that returns FactoryResult"
         )
 
     @pytest.fixture
@@ -66,16 +65,12 @@ class RelationalStoreContract:
 
     # -- Protocol conformance -----------------------------------------------
 
-    async def test_satisfies_relational_store_protocol(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_satisfies_relational_store_protocol(self, adapters: ContractAdapters) -> None:
         assert isinstance(adapters.relational, RelationalStore)
 
     # -- Round-trip ---------------------------------------------------------
 
-    async def test_insert_then_get_round_trips(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_insert_then_get_round_trips(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         await store.insert_memory(make_memory("m1"))
         fetched = await store.get_memory("m1")
@@ -83,16 +78,12 @@ class RelationalStoreContract:
         assert fetched.id == "m1"
         assert fetched.content == "content for m1"
 
-    async def test_get_unknown_id_returns_none(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_get_unknown_id_returns_none(self, adapters: ContractAdapters) -> None:
         assert await adapters.relational.get_memory("missing") is None
 
     # -- Visibility filtering ----------------------------------------------
 
-    async def test_filter_visible_ids_keeps_only_workspace_rows_by_default(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_filter_visible_ids_keeps_only_workspace_rows_by_default(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         await store.insert_memory(make_memory("workspace1"))
         await store.insert_memory(
@@ -104,14 +95,10 @@ class RelationalStoreContract:
         )
         # include_private defaults to False, so the private row is hidden
         # even from its own owner.
-        visible = await store.filter_visible_ids(
-            ["workspace1", "private1"], make_scope()
-        )
+        visible = await store.filter_visible_ids(["workspace1", "private1"], make_scope())
         assert visible == {"workspace1"}
 
-    async def test_filter_visible_ids_admits_owners_private_rows(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_filter_visible_ids_admits_owners_private_rows(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         await store.insert_memory(
             make_memory(
@@ -135,20 +122,14 @@ class RelationalStoreContract:
 
     # -- Lifecycle status filtering ----------------------------------------
 
-    async def test_filter_visible_ids_drops_disallowed_statuses(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_filter_visible_ids_drops_disallowed_statuses(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         await store.insert_memory(make_memory("active1", status="active"))
         await store.insert_memory(make_memory("retired1", status="retired"))
-        visible = await store.filter_visible_ids(
-            ["active1", "retired1"], make_scope()
-        )
+        visible = await store.filter_visible_ids(["active1", "retired1"], make_scope())
         assert visible == {"active1"}
 
-    async def test_filter_visible_ids_admits_superseded_when_allowed(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_filter_visible_ids_admits_superseded_when_allowed(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         await store.insert_memory(make_memory("active1", status="active"))
         await store.insert_memory(make_memory("supers1", status="superseded"))
@@ -160,33 +141,23 @@ class RelationalStoreContract:
 
     # -- Scope mode narrowing ----------------------------------------------
 
-    async def test_project_scope_mode_narrows_to_active_and_shared_keys(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_project_scope_mode_narrows_to_active_and_shared_keys(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         await store.insert_memory(make_memory("pay1", project_key="PAY"))
         await store.insert_memory(make_memory("risk1", project_key="RISK"))
-        await store.insert_memory(
-            make_memory("shared1", project_key=SHARED_PROJECT_KEY)
-        )
-        await store.insert_memory(
-            make_memory("backlog1", project_key=UNSORTED_PROJECT_KEY)
-        )
+        await store.insert_memory(make_memory("shared1", project_key=SHARED_PROJECT_KEY))
+        await store.insert_memory(make_memory("backlog1", project_key=UNSORTED_PROJECT_KEY))
         visible = await store.filter_visible_ids(
             ["pay1", "risk1", "shared1", "backlog1"],
             make_scope(active_project="PAY", scope_mode="project"),
         )
         assert visible == {"pay1", "shared1"}
 
-    async def test_project_first_scope_mode_keeps_every_project_visible(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_project_first_scope_mode_keeps_every_project_visible(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         await store.insert_memory(make_memory("pay1", project_key="PAY"))
         await store.insert_memory(make_memory("risk1", project_key="RISK"))
-        await store.insert_memory(
-            make_memory("backlog1", project_key=UNSORTED_PROJECT_KEY)
-        )
+        await store.insert_memory(make_memory("backlog1", project_key=UNSORTED_PROJECT_KEY))
         visible = await store.filter_visible_ids(
             ["pay1", "risk1", "backlog1"],
             make_scope(active_project="PAY", scope_mode="project-first"),
@@ -195,9 +166,7 @@ class RelationalStoreContract:
 
     # -- Ranking metadata --------------------------------------------------
 
-    async def test_fetch_ranking_metadata_returns_updated_at_and_project(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_fetch_ranking_metadata_returns_updated_at_and_project(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         await store.insert_memory(make_memory("m1", project_key="PAY"))
         rows = await store.fetch_ranking_metadata(["m1", "missing"])
@@ -208,9 +177,7 @@ class RelationalStoreContract:
 
     # -- Source facets ------------------------------------------------------
 
-    async def test_filter_ids_by_source_filter_matches_source_type_and_repo(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_filter_ids_by_source_filter_matches_source_type_and_repo(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         await store.insert_memory(
             make_memory(
@@ -233,14 +200,16 @@ class RelationalStoreContract:
             "doc-agent-target",
             "agent_session",
             None,
+            source_observed_at=None,
         )
         await store.add_memory_source(
             "m-agent-other-repo",
             "doc-agent-other-repo",
             "agent_session",
             None,
+            source_observed_at=None,
         )
-        await store.add_memory_source("m-jira", "doc-jira", "jira", None)
+        await store.add_memory_source("m-jira", "doc-jira", "jira", None, source_observed_at=None)
 
         matched = await store.filter_ids_by_source_filter(
             ["m-agent-target", "m-agent-other-repo", "m-jira"],
@@ -254,9 +223,7 @@ class RelationalStoreContract:
 
     # -- Project lifecycle --------------------------------------------------
 
-    async def test_project_create_and_get_round_trips(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_project_create_and_get_round_trips(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         created = await store.create_project(key="PAY", name="Payments")
         fetched = await store.get_project(created.id)
@@ -264,27 +231,21 @@ class RelationalStoreContract:
         assert fetched.key == "PAY"
         assert fetched.name == "Payments"
 
-    async def test_list_projects_returns_every_known_row(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_list_projects_returns_every_known_row(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         await store.create_project(key="PAY", name="Payments")
         await store.create_project(key="RISK", name="Risk")
         keys = {p.key for p in await store.list_projects()}
         assert {"PAY", "RISK"}.issubset(keys)
 
-    async def test_update_project_renames_in_place(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_update_project_renames_in_place(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         created = await store.create_project(key="PAY", name="Pay v1")
         updated = await store.update_project(created.id, name="Pay v2")
         assert updated is not None
         assert updated.name == "Pay v2"
 
-    async def test_list_project_memory_ids_returns_attached_rows(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_list_project_memory_ids_returns_attached_rows(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         project = await store.create_project(key="PAY", name="Payments")
         await store.insert_memory(make_memory("m-pay", project_key="PAY"))
@@ -292,9 +253,7 @@ class RelationalStoreContract:
         ids = await store.list_project_memory_ids(project.id)
         assert ids == ["m-pay"]
 
-    async def test_list_project_memory_ids_rejects_unknown_project(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_list_project_memory_ids_rejects_unknown_project(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         with pytest.raises(LookupError):
             await store.list_project_memory_ids("proj-does-not-exist")

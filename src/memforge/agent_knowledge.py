@@ -118,6 +118,7 @@ class AgentKnowledgeBundleService:
         repo_identifier: str | None,
         project_key: str | None,
         submitted_at: datetime | None = None,
+        source_observed_at: datetime | None,
     ) -> AgentKnowledgePatchResult:
         """Apply one structured patch proposal.
 
@@ -126,6 +127,7 @@ class AgentKnowledgeBundleService:
         """
 
         submitted_at = _utc(submitted_at)
+        source_observed_at = _utc(source_observed_at) if source_observed_at is not None else None
         if proposal.action == "no_output":
             return AgentKnowledgePatchResult(
                 outcome="skipped_not_memory",
@@ -203,6 +205,8 @@ class AgentKnowledgeBundleService:
                 project_key=project_key,
                 source_type="agent_session",
                 submitted_at=submitted_at,
+                observed_at=submitted_at,
+                source_observed_at=source_observed_at,
                 citations=proposal.citations,
                 concept_projection={
                     "concept_id": concept_id,
@@ -283,6 +287,8 @@ class AgentKnowledgeBundleService:
                 project_key=project_key,
                 source_type="agent_session",
                 submitted_at=submitted_at,
+                observed_at=submitted_at,
+                source_observed_at=source_observed_at,
                 citations=proposal.citations,
                 concept_markdown_body=concept_markdown_body,
             )
@@ -332,6 +338,8 @@ class AgentKnowledgeBundleService:
             replacement_reason=proposal.reason or "agent claim updated",
             replacement_kind=_replacement_kind_for_action(proposal.action),
             submitted_at=submitted_at,
+            observed_at=submitted_at,
+            source_observed_at=source_observed_at,
             citations=proposal.citations,
             concept_markdown_body=concept_markdown_body,
         )
@@ -377,6 +385,8 @@ class AgentKnowledgeBundleService:
         project_key: str | None,
         source_type: str,
         submitted_at: datetime,
+        observed_at: datetime,
+        source_observed_at: datetime | None,
         citations: list[str] | None = None,
         concept_projection: dict[str, object] | None = None,
         concept_markdown_body: str | None = None,
@@ -433,7 +443,8 @@ class AgentKnowledgeBundleService:
                 memory_type=memory_type,
                 tags=tags,
                 confidence=confidence,
-                observed_at=submitted_at,
+                observed_at=observed_at,
+                source_observed_at=source_observed_at,
                 citations=citations,
                 concept_projection=concept_projection,
                 concept_markdown_body=concept_markdown_body,
@@ -468,6 +479,8 @@ class AgentKnowledgeBundleService:
         replacement_reason: str,
         replacement_kind: ReplacementKind,
         submitted_at: datetime,
+        observed_at: datetime,
+        source_observed_at: datetime | None,
         citations: list[str] | None = None,
         concept_markdown_body: str | None = None,
     ) -> str:
@@ -523,6 +536,7 @@ class AgentKnowledgeBundleService:
                 doc_id=concept_id,
                 source_type=source_type,
                 excerpt=claim_text.strip(),
+                source_observed_at=source_observed_at,
             )
             return new_memory_id
         universe = await self._mandatory_candidate_universe(
@@ -581,7 +595,8 @@ class AgentKnowledgeBundleService:
             memory_type=memory_type,
             tags=tags,
             confidence=confidence,
-            observed_at=submitted_at,
+            observed_at=observed_at,
+            source_observed_at=source_observed_at,
             relation_outcome=relation_outcome,
             citations=citations,
             concept_markdown_body=concept_markdown_body,
@@ -748,10 +763,7 @@ class AgentKnowledgeBundleService:
         citations: list[str],
     ) -> str:
         claims = await self.db.list_agent_claims(concept["id"])
-        citations_by_claim = {
-            claim["id"]: await self.db.list_agent_claim_citations(claim["id"])
-            for claim in claims
-        }
+        citations_by_claim = {claim["id"]: await self.db.list_agent_claim_citations(claim["id"]) for claim in claims}
         patched_claims = []
         claim_seen = False
         for claim in claims:
@@ -867,8 +879,8 @@ Canonical evidence:
 def _utc(value: datetime | None) -> datetime:
     if value is None:
         return datetime.now(timezone.utc)
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("datetime values must include timezone information")
     return value.astimezone(timezone.utc)
 
 

@@ -60,13 +60,27 @@ async def _document(
     client: str | None = None,
 ) -> None:
     now = datetime.now(timezone.utc)
-    await db.upsert_document(DocumentRecord(
-        doc_id=doc_id, source=source, source_url=f"https://x/{doc_id}", title="t",
-        space_or_project="PAY", author="a", last_modified=now, labels=[],
-        version="1", content_hash=f"h-{doc_id}", token_count=1, raw_content_uri=None,
-        raw_content_type="text/html", normalized_content_uri=None,
-        pdf_content_uri=None, last_synced=now, client=client,
-    ))
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            source=source,
+            source_url=f"https://x/{doc_id}",
+            title="t",
+            space_or_project="PAY",
+            author="a",
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash=f"h-{doc_id}",
+            token_count=1,
+            raw_content_uri=None,
+            raw_content_type="text/html",
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+            client=client,
+        )
+    )
 
 
 @pytest.fixture
@@ -113,8 +127,8 @@ async def test_source_filter_applies_to_vector_hits(db, monkeypatch):
     await db.insert_memory(unbacked)
     await _document(db, "doc-wiki", "wiki")
     await _document(db, "doc-other", "other")
-    await db.add_memory_source("m-backed", "doc-wiki", "wiki", None)
-    await db.add_memory_source("m-unbacked", "doc-other", "other", None)
+    await db.add_memory_source("m-backed", "doc-wiki", "wiki", None, source_observed_at=None)
+    await db.add_memory_source("m-unbacked", "doc-other", "other", None, source_observed_at=None)
 
     async def fake_analyze_query(*args, **kwargs):
         return QueryAnalysis()
@@ -154,10 +168,14 @@ async def test_structured_source_filter_applies_to_vector_hits(db, monkeypatch):
     await _document(db, "doc-codex", "src-agent-codex", client="codex")
     await _document(db, "doc-jira", "src-jira")
     await _document(db, "doc-other-repo", "src-agent-codex", client="codex")
-    await db.add_memory_source("m-codex", "doc-codex", "agent_session", None)
-    await db.add_memory_source("m-jira", "doc-jira", "jira", None)
+    await db.add_memory_source("m-codex", "doc-codex", "agent_session", None, source_observed_at=None)
+    await db.add_memory_source("m-jira", "doc-jira", "jira", None, source_observed_at=None)
     await db.add_memory_source(
-        "m-other-repo", "doc-other-repo", "agent_session", None
+        "m-other-repo",
+        "doc-other-repo",
+        "agent_session",
+        None,
+        source_observed_at=None,
     )
 
     async def fake_analyze_query(*args, **kwargs):

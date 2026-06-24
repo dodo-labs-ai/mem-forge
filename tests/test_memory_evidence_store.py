@@ -736,12 +736,14 @@ async def test_insert_memory_with_relation_retry_is_idempotent_at_store_boundary
         doc_id="doc-1",
         source_type="confluence",
         relation_outcome=bundle,
+        source_observed_at=None,
     )
     await db.insert_memory_with_source_and_relation(
         retry_memory,
         doc_id="doc-1",
         source_type="confluence",
         relation_outcome=bundle,
+        source_observed_at=None,
     )
 
     stored = await db.get_memory(memory.id)
@@ -808,6 +810,7 @@ async def test_supersede_memory_with_relation_retry_is_idempotent_at_store_bound
         doc_id="doc-1",
         source_type="confluence",
         relation_outcome=bundle,
+        source_observed_at=None,
     )
     await db.supersede_memory_with_source_and_relation(
         old.id,
@@ -816,6 +819,7 @@ async def test_supersede_memory_with_relation_retry_is_idempotent_at_store_bound
         doc_id="doc-1",
         source_type="confluence",
         relation_outcome=bundle,
+        source_observed_at=None,
     )
 
     stored_old = await db.get_memory(old.id)
@@ -1007,9 +1011,7 @@ async def test_relation_outcome_bundle_rejects_same_run_id_audit_payload_collisi
         started_at="2026-06-22T12:00:00+00:00",
     )
 
-    await db.record_relation_outcome_bundle(
-        RelationOutcomeBundle(evidence_unit=unit, relation_run=run)
-    )
+    await db.record_relation_outcome_bundle(RelationOutcomeBundle(evidence_unit=unit, relation_run=run))
 
     with pytest.raises(RuntimeError, match="relation_run_id collision"):
         await db.record_relation_outcome_bundle(
@@ -1095,15 +1097,16 @@ async def test_candidate_memories_by_source_doc_are_active_and_complete(db: Data
     await db.insert_memory(active)
     await db.insert_memory(corroborated)
     await db.insert_memory(retired)
-    await db.add_memory_source(active.id, "doc-1", "confluence", "active excerpt")
+    await db.add_memory_source(active.id, "doc-1", "confluence", "active excerpt", source_observed_at=None)
     await db.add_memory_source(
         corroborated.id,
         "doc-1",
         "confluence",
         "corroborated excerpt",
         support_kind="corroborated",
+        source_observed_at=None,
     )
-    await db.add_memory_source(retired.id, "doc-1", "confluence", "retired excerpt")
+    await db.add_memory_source(retired.id, "doc-1", "confluence", "retired excerpt", source_observed_at=None)
 
     candidates = await db.get_candidate_memories_by_source_doc(doc_id="doc-1")
 
@@ -1331,7 +1334,7 @@ async def test_delete_document_deletes_derived_evidence_graph(db: Database) -> N
     await db.upsert_document(_document("doc-1"))
     await db.upsert_evidence_unit(_unit())
     await db.insert_memory(_memory("mem-doc-evidence"))
-    await db.add_memory_source("mem-doc-evidence", "doc-1", "confluence")
+    await db.add_memory_source("mem-doc-evidence", "doc-1", "confluence", source_observed_at=None)
     await _record_run(db, action=LifecycleAction.CREATE_MEMORY)
     await db.replace_evidence_relations("eu-1", [_relation("mem-doc-evidence")])
 
@@ -1394,7 +1397,7 @@ async def test_remove_memory_source_deletes_linked_evidence_graph(db: Database) 
     await db.upsert_document(_document("doc-1"))
     await db.upsert_evidence_unit(_unit())
     await db.insert_memory(_memory("mem-source-evidence"))
-    await db.add_memory_source("mem-source-evidence", "doc-1", "confluence")
+    await db.add_memory_source("mem-source-evidence", "doc-1", "confluence", source_observed_at=None)
     await _record_run(db, action=LifecycleAction.ATTACH_SUPPORT, result_memory_id="mem-source-evidence")
     await db.replace_evidence_relations("eu-1", [_relation("mem-source-evidence")])
 
@@ -1483,7 +1486,7 @@ async def test_supersede_preserves_evidence_relation_history_for_old_memory(
     new = _memory("mem-new")
     await db.upsert_document(_document("doc-1"))
     await db.insert_memory(old)
-    await db.add_memory_source(old.id, "doc-1", "confluence", "source excerpt")
+    await db.add_memory_source(old.id, "doc-1", "confluence", "source excerpt", source_observed_at=None)
     await db.replace_evidence_relations(
         "eu-1",
         [

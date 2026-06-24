@@ -43,24 +43,26 @@ def _memory(mem_id: str, status: str = "active") -> Memory:
 
 async def _document(db: Database, doc_id: str) -> None:
     now = datetime.now(timezone.utc)
-    await db.upsert_document(DocumentRecord(
-        doc_id=doc_id,
-        source="src-confluence",
-        source_url=f"https://example/{doc_id}",
-        title="Doc",
-        space_or_project="PAY",
-        author="A",
-        last_modified=now,
-        labels=[],
-        version="1",
-        content_hash=f"hash-{doc_id}",
-        token_count=10,
-        raw_content_uri=None,
-        raw_content_type="text/html",
-        normalized_content_uri=None,
-        pdf_content_uri=None,
-        last_synced=now,
-    ))
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            source="src-confluence",
+            source_url=f"https://example/{doc_id}",
+            title="Doc",
+            space_or_project="PAY",
+            author="A",
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash=f"hash-{doc_id}",
+            token_count=10,
+            raw_content_uri=None,
+            raw_content_type="text/html",
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
 
 
 @pytest.fixture
@@ -100,9 +102,7 @@ async def test_filter_visible_ids_honors_superseded_when_allowed(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("active1", status="active"))
     await store.insert_memory(_memory("supers1", status="superseded"))
-    visible = await store.filter_visible_ids(
-        ["active1", "supers1"], _scope(statuses=("active", "superseded"))
-    )
+    visible = await store.filter_visible_ids(["active1", "supers1"], _scope(statuses=("active", "superseded")))
     assert visible == {"active1", "supers1"}
 
 
@@ -151,7 +151,7 @@ async def test_filter_ids_supported_by_sources_uses_the_join(db):
     await store.insert_memory(_memory("m1"))
     await store.insert_memory(_memory("m2"))
     await _document(db, "doc1")
-    await store.add_memory_source("m1", "doc1", "confluence", "an excerpt")
+    await store.add_memory_source("m1", "doc1", "confluence", "an excerpt", source_observed_at=None)
     # doc1 belongs to source "src-confluence" (see _document); only m1 is
     # supported by a document from that source.
     kept = await store.filter_ids_supported_by_sources(["m1", "m2"], ["src-confluence"])
@@ -164,6 +164,6 @@ async def test_add_memory_source_links_provenance(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))
     await _document(db, "doc1")
-    await store.add_memory_source("m1", "doc1", "confluence", "an excerpt")
+    await store.add_memory_source("m1", "doc1", "confluence", "an excerpt", source_observed_at=None)
     sources = await db.get_memory_sources("m1")
     assert [s.doc_id for s in sources] == ["doc1"]

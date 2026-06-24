@@ -48,6 +48,7 @@ export interface MemorySource {
   source_type: string;
   excerpt: string | null;
   added_at: string;
+  source_observed_at?: string | null;
   doc_title?: string | null;
   source_url?: string | null;
   file_uri?: string | null;

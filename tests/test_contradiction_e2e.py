@@ -222,20 +222,20 @@ def structured_llm_client():
     api_key = _llm_api_key()
     if not api_key:
         pytest.skip("Local LLM proxy API key not configured")
-    return LiteLlmStructuredClient(StructuredLlmConfig(
-        model="claude-sonnet-4-20250514",
-        base_url=LLM_BASE_URL,
-        api_key=api_key,
-        timeout_s=300.0,
-    ))
+    return LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="claude-sonnet-4-20250514",
+            base_url=LLM_BASE_URL,
+            api_key=api_key,
+            timeout_s=300.0,
+        )
+    )
 
 
 async def _get_llm_model(db: Database) -> str:
     """Read the LLM model from DB config, or fall back to default."""
     try:
-        async with db.db.execute(
-            "SELECT enrichment_model FROM llm_config WHERE id=1"
-        ) as cur:
+        async with db.db.execute("SELECT enrichment_model FROM llm_config WHERE id=1") as cur:
             row = await cur.fetchone()
         if row:
             return row["enrichment_model"]
@@ -328,9 +328,7 @@ class TestContradictionE2E:
         print(f"  Memory B (unrel): {mem_unrelated.content}")
         print(f"  Stats: {stats}")
 
-        assert stats["contradictions"] == 0, (
-            f"Meeting schedule vs DB port should not be a contradiction, got: {stats}"
-        )
+        assert stats["contradictions"] == 0, f"Meeting schedule vs DB port should not be a contradiction, got: {stats}"
 
     @pytest.mark.asyncio
     async def test_temporal_update_detected(self, seeded_db, structured_llm_client):
@@ -387,9 +385,17 @@ class TestContradictionE2E:
             """INSERT INTO documents
                (doc_id, source, source_url, title, space_or_project, last_modified, version, content_hash, last_synced)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("doc-ops", "test", "http://test/doc-ops", "Ops Runbook", "TEST",
-             datetime.now(timezone.utc).isoformat(), "1", "hash-ops",
-             datetime.now(timezone.utc).isoformat()),
+            (
+                "doc-ops",
+                "test",
+                "http://test/doc-ops",
+                "Ops Runbook",
+                "TEST",
+                datetime.now(timezone.utc).isoformat(),
+                "1",
+                "hash-ops",
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
 
         # Contradicts PostgreSQL fact
@@ -510,14 +516,13 @@ class TestProcessMemoriesIntegration:
             doc_id="doc-runbook",
             raw_memories=[raw],
             source_type="test",
+            source_observed_at=None,
         )
 
         print(f"\n  process_memories stats: {stats}")
 
         assert stats["inserted"] == 1
-        assert "contradictions_found" in stats, (
-            "process_memories should include contradictions_found in stats"
-        )
+        assert "contradictions_found" in stats, "process_memories should include contradictions_found in stats"
         # The new memory contradicts the existing PostgreSQL 14 fact
         # (may be classified as contradiction or temporal)
         print(f"  contradictions_found: {stats['contradictions_found']}")
@@ -538,9 +543,7 @@ class TestContradictionErrorResilience:
         db = s["db"]
 
         mock_client = AsyncMock()
-        mock_client.detect_contradictions = AsyncMock(
-            side_effect=StructuredLlmError("api unavailable")
-        )
+        mock_client.detect_contradictions = AsyncMock(side_effect=StructuredLlmError("api unavailable"))
 
         stats = await detect_cross_doc_contradictions(
             new_memory_ids=[s["mem_run_pg"].id],
@@ -618,9 +621,7 @@ class TestContradictionErrorResilience:
         db = s["db"]
 
         mock_client = AsyncMock()
-        mock_client.detect_contradictions = AsyncMock(
-            return_value=ContradictionResponse(decisions=[])
-        )
+        mock_client.detect_contradictions = AsyncMock(return_value=ContradictionResponse(decisions=[]))
 
         stats = await detect_cross_doc_contradictions(
             new_memory_ids=[s["mem_run_pg"].id],
@@ -668,12 +669,8 @@ class TestContradictionErrorResilience:
         db = s["db"]
 
         # Record same pair twice
-        await db.record_contradiction(
-            s["mem_arch_pg"].id, s["mem_run_pg"].id, "contradiction", "first"
-        )
-        await db.record_contradiction(
-            s["mem_arch_pg"].id, s["mem_run_pg"].id, "contradiction", "second"
-        )
+        await db.record_contradiction(s["mem_arch_pg"].id, s["mem_run_pg"].id, "contradiction", "first")
+        await db.record_contradiction(s["mem_arch_pg"].id, s["mem_run_pg"].id, "contradiction", "second")
 
         mem = await db.get_memory(s["mem_arch_pg"].id)
 
@@ -721,8 +718,7 @@ class TestContradictionDBState:
                 """SELECT * FROM memory_contradictions
                    WHERE (memory_id_a = ? AND memory_id_b = ?)
                       OR (memory_id_a = ? AND memory_id_b = ?)""",
-                (s["mem_arch_pg"].id, s["mem_run_pg"].id,
-                 s["mem_run_pg"].id, s["mem_arch_pg"].id),
+                (s["mem_arch_pg"].id, s["mem_run_pg"].id, s["mem_run_pg"].id, s["mem_arch_pg"].id),
             ) as cur:
                 row = await cur.fetchone()
 
@@ -749,8 +745,7 @@ class TestContradictionDBState:
                 """SELECT * FROM memory_contradictions
                    WHERE (memory_id_a = ? AND memory_id_b = ?)
                       OR (memory_id_a = ? AND memory_id_b = ?)""",
-                (s["mem_arch_pg"].id, s["mem_run_pg"].id,
-                 s["mem_run_pg"].id, s["mem_arch_pg"].id),
+                (s["mem_arch_pg"].id, s["mem_run_pg"].id, s["mem_run_pg"].id, s["mem_arch_pg"].id),
             ) as cur:
                 row = await cur.fetchone()
 
