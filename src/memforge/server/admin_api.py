@@ -244,7 +244,7 @@ class MemorySourceDetail(BaseModel):
     content_url: str | None = None
     pdf_url: str | None = None
     added_at: str | None = None
-    source_observed_at: str | None = None
+    source_updated_at: str | None = None
 
 
 class MemoryResponse(BaseModel):
@@ -708,7 +708,7 @@ class AgentSessionDocumentRequest(BaseModel):
     title: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     submitted_at: str | None = None
-    source_observed_at: str | None = None
+    source_updated_at: str | None = None
     process_now: bool = True
 
 
@@ -747,7 +747,7 @@ class AgentSessionWindowRequest(BaseModel):
     receipt: dict[str, Any] = Field(default_factory=dict)
     retention: str = "none"
     submitted_at: str | None = None
-    source_observed_at: str | None = None
+    source_updated_at: str | None = None
     process_now: bool = False
 
 
@@ -1627,7 +1627,7 @@ def _memory_source_detail(
         content_url=content_url,
         pdf_url=pdf_url,
         added_at=_dt_iso(ms.added_at),
-        source_observed_at=_dt_iso(ms.source_observed_at),
+        source_updated_at=_dt_iso(ms.source_updated_at),
     )
 
 
@@ -3627,7 +3627,7 @@ def create_admin_app(
                 title=req.title,
                 metadata=req.metadata,
                 submitted_at=req.submitted_at,
-                source_observed_at=req.source_observed_at,
+                source_updated_at=req.source_updated_at,
                 user_id=resolve_request_principal(request),
             )
         except ValueError as e:
@@ -3697,7 +3697,7 @@ def create_admin_app(
                 receipt=req.receipt,
                 retention=req.retention,
                 submitted_at=req.submitted_at,
-                source_observed_at=req.source_observed_at,
+                source_updated_at=req.source_updated_at,
                 process_now=req.process_now,
                 user_id=resolve_request_principal(request),
             )

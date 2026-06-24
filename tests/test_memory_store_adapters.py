@@ -121,7 +121,7 @@ async def test_insert_then_purge_routes_through_adapters(db, monkeypatch):
         _memory("m1", "deploy via ArgoCD"),
         "doc1",
         "manual",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     assert result == "inserted"
     assert "m1" in collection.upserted

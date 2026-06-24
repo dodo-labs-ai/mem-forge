@@ -239,7 +239,7 @@ class AgentSessionGene(Gene):
                 "commit_sha": receipt.get("commit_sha"),
                 "history_window_kind": receipt.get("history_window_kind"),
                 "uploader_user_id": uploader_user_id,
-                "source_observed_at": package.get("source_observed_at"),
+                "source_updated_at": package.get("source_updated_at"),
             },
         )
 

@@ -516,7 +516,7 @@ class TestProcessMemoriesIntegration:
             doc_id="doc-runbook",
             raw_memories=[raw],
             source_type="test",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
         print(f"\n  process_memories stats: {stats}")

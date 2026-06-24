@@ -151,7 +151,7 @@ async def test_filter_ids_supported_by_sources_uses_the_join(db):
     await store.insert_memory(_memory("m1"))
     await store.insert_memory(_memory("m2"))
     await _document(db, "doc1")
-    await store.add_memory_source("m1", "doc1", "confluence", "an excerpt", source_observed_at=None)
+    await store.add_memory_source("m1", "doc1", "confluence", "an excerpt", source_updated_at=None)
     # doc1 belongs to source "src-confluence" (see _document); only m1 is
     # supported by a document from that source.
     kept = await store.filter_ids_supported_by_sources(["m1", "m2"], ["src-confluence"])
@@ -164,6 +164,6 @@ async def test_add_memory_source_links_provenance(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))
     await _document(db, "doc1")
-    await store.add_memory_source("m1", "doc1", "confluence", "an excerpt", source_observed_at=None)
+    await store.add_memory_source("m1", "doc1", "confluence", "an excerpt", source_updated_at=None)
     sources = await db.get_memory_sources("m1")
     assert [s.doc_id for s in sources] == ["doc1"]

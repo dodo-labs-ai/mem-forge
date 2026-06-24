@@ -89,7 +89,7 @@ class RelationalStore(Protocol):
         excerpt: str | None,
         *,
         support_kind: str = "extracted",
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
     ) -> None: ...
     async def add_memory_derivation(
         self,

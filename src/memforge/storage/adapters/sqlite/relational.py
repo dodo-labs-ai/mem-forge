@@ -89,7 +89,7 @@ class SqliteRelationalStore:
         excerpt: str | None,
         *,
         support_kind: str = "extracted",
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
     ) -> None:
         await self._db.add_memory_source(
             memory_id,
@@ -97,7 +97,7 @@ class SqliteRelationalStore:
             source_type,
             excerpt,
             support_kind=support_kind,
-            source_observed_at=source_observed_at,
+            source_updated_at=source_updated_at,
         )
 
     async def add_memory_derivation(

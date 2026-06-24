@@ -975,9 +975,9 @@ def _session_window_payload(
         "retention": "none",
         "process_now": False,
     }
-    source_observed_at = _first_reliable_event_timestamp(events)
-    if source_observed_at is not None:
-        payload["source_observed_at"] = source_observed_at
+    source_updated_at = _first_reliable_event_timestamp(events)
+    if source_updated_at is not None:
+        payload["source_updated_at"] = source_updated_at
     return payload
 
 
@@ -986,7 +986,7 @@ def _first_reliable_event_timestamp(events: list[dict[str, Any]]) -> str | None:
 
     This records when the source window started, not when an individual claim was
     first stated. If the transcript omits reliable absolute time, callers leave
-    source_observed_at unset instead of falling back to upload time.
+    source_updated_at unset instead of falling back to upload time.
     """
     parsed_times: list[datetime] = []
     for event in events:

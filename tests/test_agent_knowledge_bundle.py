@@ -118,7 +118,7 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
         submitted_at=datetime(2026, 6, 18, 12, 0, tzinfo=timezone.utc),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert result.outcome == "applied"
@@ -187,7 +187,7 @@ async def test_create_concept_does_not_commit_projection_before_memory_lifecycle
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
             submitted_at=datetime(2026, 6, 18, 12, 0, tzinfo=timezone.utc),
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     assert await db.get_document("akb_concept_fail") is not None
@@ -216,7 +216,7 @@ async def test_create_concept_does_not_leave_memory_when_claim_projection_fails(
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
             submitted_at=datetime(2026, 6, 18, 12, 0, tzinfo=timezone.utc),
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     assert await db.get_agent_claim("akb_claim_projection_fail") is None
@@ -243,7 +243,7 @@ async def test_add_claim_does_not_commit_projection_before_memory_lifecycle(bund
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     async def fail_insert_memory(*args, **kwargs):
@@ -267,7 +267,7 @@ async def test_add_claim_does_not_commit_projection_before_memory_lifecycle(bund
             workspace="/workspace/memforge-cloud",
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     assert await db.get_agent_claim("akb_claim_add_fail") is None
@@ -288,7 +288,7 @@ async def test_add_claim_writes_citations_and_markdown_inside_lifecycle_contract
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     async def fail_public_citation_write(*args, **kwargs):
@@ -316,7 +316,7 @@ async def test_add_claim_writes_citations_and_markdown_inside_lifecycle_contract
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert added.outcome == "applied"
@@ -342,7 +342,7 @@ async def test_update_claim_does_not_commit_projection_before_memory_lifecycle(b
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     original_claim = await db.get_agent_claim(created.claim_id)
 
@@ -367,7 +367,7 @@ async def test_update_claim_does_not_commit_projection_before_memory_lifecycle(b
             workspace="/workspace/memforge-cloud",
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     claim = await db.get_agent_claim(created.claim_id)
@@ -391,7 +391,7 @@ async def test_update_claim_rolls_back_when_atomic_citation_projection_fails(bun
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     original_claim = await db.get_agent_claim(created.claim_id)
     original_memory = await db.get_memory(created.memory_id)
@@ -424,7 +424,7 @@ async def test_update_claim_rolls_back_when_atomic_citation_projection_fails(bun
             workspace="/workspace/memforge-cloud",
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     assert await db.get_agent_claim(created.claim_id) == original_claim
@@ -450,7 +450,7 @@ async def test_update_existing_claim_rolls_back_if_claim_projection_commit_fails
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     update_proposal = _proposal(
         action="update_existing_claim",
@@ -479,7 +479,7 @@ async def test_update_existing_claim_rolls_back_if_claim_projection_commit_fails
             workspace="/workspace/memforge-cloud",
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     restored_memory = await db.get_memory(created.memory_id)
@@ -507,7 +507,7 @@ async def test_update_agent_concept_markdown_fails_if_projection_target_is_missi
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     with pytest.raises(RuntimeError, match="agent concept projection target missing"):
@@ -535,7 +535,7 @@ async def test_update_agent_concept_markdown_ignores_stale_projection_body(bundl
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     newer_observed = datetime(2030, 6, 22, 12, 30, tzinfo=timezone.utc)
@@ -571,7 +571,7 @@ async def test_update_existing_claim_records_relation_inside_supersede_contract(
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     update_proposal = _proposal(
         action="update_existing_claim",
@@ -597,7 +597,7 @@ async def test_update_existing_claim_records_relation_inside_supersede_contract(
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     restored_memory = await db.get_memory(created.memory_id)
@@ -624,7 +624,7 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     updated = await service.apply_patch_proposal(
@@ -647,7 +647,7 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert updated.outcome == "applied"
@@ -714,7 +714,7 @@ async def test_update_existing_claim_retry_is_idempotent_after_replacement(bundl
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     update = _proposal(
         action="update_existing_claim",
@@ -738,7 +738,7 @@ async def test_update_existing_claim_retry_is_idempotent_after_replacement(bundl
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     async with db._write_lock:
         await db.db.execute(
@@ -758,7 +758,7 @@ async def test_update_existing_claim_retry_is_idempotent_after_replacement(bundl
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert retry.outcome == "applied"
@@ -807,7 +807,7 @@ async def test_update_existing_claim_retry_rejects_changed_relation_payload(bund
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     update = _proposal(
         action="update_existing_claim",
@@ -829,7 +829,7 @@ async def test_update_existing_claim_retry_rejects_changed_relation_payload(bund
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     changed_retry = _proposal(
@@ -850,7 +850,7 @@ async def test_update_existing_claim_retry_rejects_changed_relation_payload(bund
             workspace="/workspace/memforge-cloud",
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     relation_runs = await _relation_runs_for_memory(db, first_update.memory_id)
@@ -870,7 +870,7 @@ async def test_update_existing_claim_retry_rejects_committed_candidate_snapshot_
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     update = _proposal(
         action="update_existing_claim",
@@ -892,7 +892,7 @@ async def test_update_existing_claim_retry_rejects_committed_candidate_snapshot_
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     relation_runs = await _relation_runs_for_memory(db, first_update.memory_id)
     assert len(relation_runs) == 1
@@ -914,7 +914,7 @@ async def test_update_existing_claim_retry_rejects_committed_candidate_snapshot_
             workspace="/workspace/memforge-cloud",
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
 
@@ -931,7 +931,7 @@ async def test_update_existing_claim_records_complete_mandatory_candidate_univer
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     same_doc_memory = Memory(
         id="mem-other-claim",
@@ -949,7 +949,7 @@ async def test_update_existing_claim_records_complete_mandatory_candidate_univer
         created.concept_id,
         "agent_session",
         excerpt="A separate scheduler claim under the same concept remains active.",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     updated = await service.apply_patch_proposal(
@@ -969,7 +969,7 @@ async def test_update_existing_claim_records_complete_mandatory_candidate_univer
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     relation_runs = await _relation_runs_for_memory(db, updated.memory_id)
@@ -999,7 +999,7 @@ async def test_supersede_existing_claim_records_memory_lifecycle(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     superseded = await service.apply_patch_proposal(
@@ -1021,7 +1021,7 @@ async def test_supersede_existing_claim_records_memory_lifecycle(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert superseded.outcome == "applied"
@@ -1051,7 +1051,7 @@ async def test_agent_claim_requires_structured_memory_projection(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert result.outcome == "parse_failed"
@@ -1072,7 +1072,7 @@ async def test_agent_patch_result_carries_explicit_result_bucket(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     no_output = await service.apply_patch_proposal(
         proposal=_proposal(action="no_output", claim_text="", memory_content=None),
@@ -1083,7 +1083,7 @@ async def test_agent_patch_result_carries_explicit_result_bucket(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert parsed_failure.result_bucket == "failed"
@@ -1105,7 +1105,7 @@ async def test_agent_claim_accepts_detailed_memory_projection(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert result.outcome == "applied"
@@ -1128,7 +1128,7 @@ async def test_agent_evidence_unit_retry_is_idempotent(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     second = await service.apply_patch_proposal(
         proposal=proposal,
@@ -1139,7 +1139,7 @@ async def test_agent_evidence_unit_retry_is_idempotent(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert first.outcome == "applied"
@@ -1167,7 +1167,7 @@ async def test_agent_evidence_unit_retry_is_idempotent_without_model_supplied_id
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     second = await service.apply_patch_proposal(
         proposal=proposal,
@@ -1178,7 +1178,7 @@ async def test_agent_evidence_unit_retry_is_idempotent_without_model_supplied_id
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert first.outcome == "applied"
@@ -1236,7 +1236,7 @@ async def test_agent_patch_missing_claim_text_is_failed_not_no_output(bundle_sta
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert result.outcome == "parse_failed"
@@ -1257,7 +1257,7 @@ async def test_private_concept_rejects_other_user_update(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     rejected = await service.apply_patch_proposal(
@@ -1274,7 +1274,7 @@ async def test_private_concept_rejects_other_user_update(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert rejected.outcome == "rejected_scope"
