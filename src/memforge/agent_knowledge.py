@@ -857,7 +857,11 @@ Decision boundary:
 - If it is a new durable concept, use create_new_concept with a concise title and concept_type.
 - If nothing durable should be kept, use no_output.
 - claim_text is the detailed atomic evidence statement. It may contain the full corrected rule or runbook step.
-- memory_content is required for all non-no_output actions. It is the durable memory record to keep: self-contained, accurate, and useful when read later without the original conversation. Preserve the decision, rule, preference, procedure, or learned fact with enough qualifiers, scope, and operational context for a future agent to use it correctly. Exclude transcript narration, step-by-step investigation chatter, and obsolete alternatives unless they are necessary to explain the current rule.
+- claim_text may keep evidence details such as branch names, exact test names, run-log fragments, implementation checklists, timestamps, and deployment or verification notes when they are useful provenance.
+- memory_content is required for all non-no_output actions. It is the durable memory record to keep: self-contained, accurate, and useful when read later without the original conversation.
+- memory_content must preserve the durable rule or decision, with enough qualifiers, scope, and operational context for a future agent to use it correctly.
+- memory_content must omit evidence-only details such as branch names, exact test names, RED/GREEN markers, "tests passed", "deployed", line numbers, run-log fragments, implementation checklists, and transcript narration unless a specific detail is itself the durable rule.
+- If the evidence has no durable takeaway that can be separated from the evidence details, return no_output instead of copying claim_text into memory_content.
 
 Caller:
 - owner_user_id: {owner_user_id}

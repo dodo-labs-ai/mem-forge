@@ -1223,6 +1223,41 @@ async def test_agent_memory_prompt_describes_durable_memory_not_retrieval_projec
 
 
 @pytest.mark.asyncio
+async def test_agent_memory_prompt_separates_memory_from_evidence_details(bundle_stack):
+    db, _store, _collection = bundle_stack
+
+    prompt = await render_agent_knowledge_patch_prompt(
+        db=db,
+        owner_user_id="u-andrew",
+        client="codex",
+        session_id="sess-1",
+        trigger="stop",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        branch="codex/example-branch",
+        history_window={"kind": "transcript_window"},
+        events=[
+            {
+                "kind": "assistant_message",
+                "text": (
+                    "Fix implemented on branch codex/example-branch. "
+                    "Tests test_exact_impl_detail and test_prompt_contract passed. "
+                    "Durable rule: agent-session memories should preserve the reusable "
+                    "decision while provenance keeps branch and test evidence."
+                ),
+            }
+        ],
+        transcript_markdown="",
+    )
+
+    assert "claim_text may keep evidence details" in prompt
+    assert "branch names, exact test names" in prompt
+    assert "memory_content must preserve the durable rule or decision" in prompt
+    assert "omit evidence-only details" in prompt
+    assert "return no_output instead of copying claim_text" in prompt
+
+
+@pytest.mark.asyncio
 async def test_agent_patch_missing_claim_text_is_failed_not_no_output(bundle_stack):
     db, store, _collection = bundle_stack
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
