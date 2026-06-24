@@ -301,7 +301,7 @@ class MemoryStore:
         doc_id: str,
         source_type: str,
         *,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
         entity_ids: list[int] | None = None,
         excerpt: str | None = None,
         scope: AccessScope | None = None,
@@ -404,7 +404,7 @@ class MemoryStore:
                 writer_visibility=memory.visibility,
                 writer_owner_user_id=memory.owner_user_id,
                 writer_project_key=memory.project_key,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
                 relation_outcome=support_relation_outcome,
             )
             logger.debug(
@@ -423,7 +423,7 @@ class MemoryStore:
             entity_ids,
             excerpt,
             context,
-            source_observed_at=source_observed_at,
+            source_updated_at=source_updated_at,
             relation_outcome=relation_outcome,
         )
         await self._emit(
@@ -568,7 +568,7 @@ class MemoryStore:
         doc_id: str,
         source_type: str,
         *,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
         entity_ids: list[int] | None = None,
         excerpt: str | None = None,
         relation_outcome: RelationOutcomeBundle | None = None,
@@ -589,7 +589,7 @@ class MemoryStore:
             entity_ids,
             excerpt,
             context,
-            source_observed_at=source_observed_at,
+            source_updated_at=source_updated_at,
             relation_outcome=relation_outcome,
             review=review,
             related_review_id=related_review_id,
@@ -619,7 +619,7 @@ class MemoryStore:
         excerpt: str | None,
         context: AuditContext,
         *,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
         relation_outcome: RelationOutcomeBundle | None = None,
         review: MemoryReview | None = None,
         related_review_id: str | None = None,
@@ -638,7 +638,7 @@ class MemoryStore:
                 excerpt=excerpt,
                 entity_ids=entity_ids,
                 relation_outcome=relation_outcome,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
                 review=review,
                 related_review_id=related_review_id,
                 related_review_reason=related_review_reason,
@@ -809,7 +809,7 @@ class MemoryStore:
         source_type: str,
         *,
         replacement_kind: ReplacementKind,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
         entity_ids: list[int] | None = None,
         excerpt: str | None = None,
         replacement_reason: str | None = None,
@@ -849,7 +849,7 @@ class MemoryStore:
                 replacement_reason=replacement_reason,
                 carry_revision_sources=replacement_kind == "revision",
                 entity_ids=entity_ids,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
                 relation_outcome=relation_outcome,
             )
             await self._remove_from_search_indexes(old_memory_id, label="superseded", context=context)
@@ -985,7 +985,7 @@ class MemoryStore:
         tags: list[str],
         confidence: float,
         observed_at: datetime,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
         citations: list[str] | None = None,
         concept_projection: dict[str, Any] | None = None,
         concept_markdown_body: str | None = None,
@@ -1041,7 +1041,7 @@ class MemoryStore:
                 tags=tags,
                 confidence=confidence,
                 observed_at=observed_at,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
                 citations=citations,
                 concept_projection=concept_projection,
                 concept_markdown_body=concept_markdown_body,
@@ -1092,7 +1092,7 @@ class MemoryStore:
         tags: list[str],
         confidence: float,
         observed_at: datetime,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
         citations: list[str] | None = None,
         concept_markdown_body: str | None = None,
         entity_ids: list[int] | None = None,
@@ -1136,7 +1136,7 @@ class MemoryStore:
                 tags=tags,
                 confidence=confidence,
                 observed_at=observed_at,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
                 citations=citations,
                 concept_markdown_body=concept_markdown_body,
                 relation_outcome=relation_outcome,
@@ -1288,7 +1288,7 @@ class MemoryStore:
         source_type: str,
         *,
         excerpt: str | None = None,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
     ) -> None:
         """Converge a committed agent-claim memory with its searchable projections.
 
@@ -1304,7 +1304,7 @@ class MemoryStore:
             doc_id,
             source_type,
             excerpt,
-            source_observed_at=source_observed_at,
+            source_updated_at=source_updated_at,
         )
         await self.db.rebuild_memory_fts(
             memory.id,
@@ -1409,7 +1409,7 @@ class MemoryStore:
         writer_visibility: str | None = None,
         writer_owner_user_id: str | None = None,
         writer_project_key: str | None = None,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
         relation_outcome: RelationOutcomeBundle | None = None,
     ) -> str:
         """Add or update source support for an existing memory.
@@ -1452,7 +1452,7 @@ class MemoryStore:
                 source_type,
                 excerpt,
                 support_kind=support_kind,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
                 relation_outcome=relation_outcome,
             )
         else:
@@ -1462,7 +1462,7 @@ class MemoryStore:
                 source_type,
                 excerpt,
                 support_kind=support_kind,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
             )
         event_type = {
             "inserted": "source_support_added",

@@ -63,8 +63,8 @@ async def test_submit_agent_session_document_records_receipt_and_source_package(
     assert package["package_kind"] == "agent_session_document"
     assert package["content_role"] == "generated_summary"
     assert package["markdown"].startswith("# Session Summary")
-    assert "source_observed_at" not in package
-    assert "source_observed_at" not in receipt["metadata"]
+    assert "source_updated_at" not in package
+    assert "source_updated_at" not in receipt["metadata"]
     documents_root = Path(source["config"]["documents_dir"])
     doc_path = Path(result["document_uri"])
     # Without an admin-bound `project_binding`, agent-session documents
@@ -74,7 +74,7 @@ async def test_submit_agent_session_document_records_receipt_and_source_package(
 
 
 @pytest.mark.asyncio
-async def test_submit_agent_session_document_records_explicit_source_observed_at(
+async def test_submit_agent_session_document_records_explicit_source_updated_at(
     db: Database,
     tmp_path: Path,
 ):
@@ -89,7 +89,7 @@ async def test_submit_agent_session_document_records_explicit_source_observed_at
         document_markdown="## Outcome\nA historical session produced a durable finding.",
         workspace="/workspace/mem-forge",
         submitted_at="2026-06-23T22:00:00+00:00",
-        source_observed_at="2026-06-20T04:23:51Z",
+        source_updated_at="2026-06-20T04:23:51Z",
     )
 
     receipt = await db.get_agent_session_receipt(result["doc_id"])
@@ -97,9 +97,9 @@ async def test_submit_agent_session_document_records_explicit_source_observed_at
 
     assert receipt is not None
     assert receipt["submitted_at"] == "2026-06-23T22:00:00+00:00"
-    assert "source_observed_at" not in receipt["metadata"]
+    assert "source_updated_at" not in receipt["metadata"]
     assert package["last_modified"] == "2026-06-23T22:00:00+00:00"
-    assert package["source_observed_at"] == "2026-06-20T04:23:51+00:00"
+    assert package["source_updated_at"] == "2026-06-20T04:23:51+00:00"
 
 
 @pytest.mark.asyncio
@@ -144,18 +144,18 @@ async def test_agent_session_gene_discovers_and_normalizes_submitted_documents(d
 
 
 @pytest.mark.asyncio
-async def test_agent_session_gene_normalize_exposes_explicit_source_observed_at(db: Database, tmp_path: Path):
+async def test_agent_session_gene_normalize_exposes_explicit_source_updated_at(db: Database, tmp_path: Path):
     cfg = _config(tmp_path)
     submitted = await submit_agent_session_document(
         db=db,
         config=cfg,
         client="codex",
-        session_id="sess-source-observed",
+        session_id="sess-source-updated",
         trigger="Stop",
         document_markdown="## Outcome\nA historical session produced a durable finding.",
         workspace="/workspace/mem-forge",
         submitted_at="2026-06-23T22:00:00+00:00",
-        source_observed_at="2026-06-20T04:23:51Z",
+        source_updated_at="2026-06-20T04:23:51Z",
     )
     source = await db.get_source("src-agent-sessions-codex")
     gene = AgentSessionGene(config=source["config"], source_id=source["id"])
@@ -164,11 +164,11 @@ async def test_agent_session_gene_normalize_exposes_explicit_source_observed_at(
     normalized = await gene.normalize(await gene.fetch(item))
 
     assert item.item_id == submitted["doc_id"]
-    assert normalized.source_semantics["source_observed_at"] == "2026-06-20T04:23:51+00:00"
+    assert normalized.source_semantics["source_updated_at"] == "2026-06-20T04:23:51+00:00"
 
 
 @pytest.mark.asyncio
-async def test_agent_session_gene_ignores_receipt_metadata_source_observed_at(
+async def test_agent_session_gene_ignores_receipt_metadata_source_updated_at(
     db: Database,
     tmp_path: Path,
 ):
@@ -177,12 +177,12 @@ async def test_agent_session_gene_ignores_receipt_metadata_source_observed_at(
         db=db,
         config=cfg,
         client="codex",
-        session_id="sess-stale-metadata-source-observed",
+        session_id="sess-stale-metadata-source-updated",
         trigger="Stop",
-        document_markdown="## Outcome\nNo source event timestamp was available.",
+        document_markdown="## Outcome\nNo source updated timestamp was available.",
         workspace="/workspace/mem-forge",
         submitted_at="2026-06-23T22:00:00+00:00",
-        metadata={"source_observed_at": "2026-06-20T04:23:51Z"},
+        metadata={"source_updated_at": "2026-06-20T04:23:51Z"},
     )
     source = await db.get_source("src-agent-sessions-codex")
     receipt = await db.get_agent_session_receipt(submitted["doc_id"])
@@ -191,9 +191,9 @@ async def test_agent_session_gene_ignores_receipt_metadata_source_observed_at(
 
     normalized = await gene.normalize(await gene.fetch(item))
 
-    assert "source_observed_at" not in receipt["metadata"]
-    assert "source_observed_at" not in json.loads(Path(submitted["document_uri"]).read_text(encoding="utf-8"))
-    assert normalized.source_semantics["source_observed_at"] is None
+    assert "source_updated_at" not in receipt["metadata"]
+    assert "source_updated_at" not in json.loads(Path(submitted["document_uri"]).read_text(encoding="utf-8"))
+    assert normalized.source_semantics["source_updated_at"] is None
 
 
 @pytest.mark.asyncio

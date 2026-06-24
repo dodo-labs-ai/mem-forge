@@ -154,18 +154,27 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _parse_source_observed_at(value: Any) -> datetime | None:
+def _parse_source_updated_at(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
     if not isinstance(value, str):
-        raise ValueError("source_observed_at must be an ISO datetime string")
+        raise ValueError("source_updated_at must be an ISO datetime string")
     normalized = value.strip()
     if normalized.endswith("Z"):
         normalized = normalized[:-1] + "+00:00"
     parsed = datetime.fromisoformat(normalized)
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("source_observed_at must include an explicit timezone offset")
+        raise ValueError("source_updated_at must include an explicit timezone offset")
     return parsed.astimezone(timezone.utc)
+
+
+def _source_updated_at_for_item(item: ContentItem, source_semantics: dict[str, Any]) -> datetime:
+    explicit = _parse_source_updated_at(source_semantics.get("source_updated_at"))
+    if explicit is not None:
+        return explicit
+    if item.last_modified.tzinfo is None or item.last_modified.utcoffset() is None:
+        raise ValueError("ContentItem.last_modified must include an explicit timezone offset")
+    return item.last_modified.astimezone(timezone.utc)
 
 
 def _plural(count: int, singular: str, plural: str | None = None) -> str:
@@ -1191,7 +1200,7 @@ class GeneSyncOrchestrator:
         # predicate, never by this hint.
         uploader_user_id = normalized.source_semantics.get("uploader_user_id")
         repo_identifier = normalized.source_semantics.get("repo_identifier")
-        source_observed_at = _parse_source_observed_at(normalized.source_semantics.get("source_observed_at"))
+        source_updated_at = _source_updated_at_for_item(item, normalized.source_semantics)
         if change_type == "updated":
             memory_stats = await self.memory_engine.reconcile_and_persist(
                 doc_id=doc_id,
@@ -1207,7 +1216,7 @@ class GeneSyncOrchestrator:
                 update_plan_stats=self._document_update_plan_stats(update_plan),
                 audit_context=memory_context,
                 user_id=uploader_user_id,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
             )
             stats["memories_extracted"] = memory_stats.get("added", 0)
             stats["memories_corroborated"] = memory_stats.get("updated", 0)
@@ -1221,7 +1230,7 @@ class GeneSyncOrchestrator:
                 entity_ids=entity_ids,
                 audit_context=memory_context,
                 user_id=uploader_user_id,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
             )
             stats["memories_extracted"] = memory_stats.get("inserted", 0)
             stats["memories_corroborated"] = memory_stats.get("corroborated", 0)
@@ -1243,7 +1252,7 @@ class GeneSyncOrchestrator:
                     writer_visibility=writer_visibility,
                     writer_owner_user_id=writer_owner_user_id,
                     writer_project_key=project_key,
-                    source_observed_at=source_observed_at,
+                    source_updated_at=source_updated_at,
                 )
             stats["memory_supports_added"] = support_stats.get("added", 0)
             stats["memory_supports_updated"] = support_stats.get("updated", 0)

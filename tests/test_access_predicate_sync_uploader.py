@@ -180,7 +180,7 @@ async def _submit_and_normalize(
     fact: str,
     repo: str = "mem-forge",
     submitted_at: str | None = None,
-    source_observed_at: str | None = None,
+    source_updated_at: str | None = None,
 ):
     """Run the production write path and return (submitted, item, normalized)."""
     submitted = await submit_agent_session_document(
@@ -197,7 +197,7 @@ async def _submit_and_normalize(
         history_window_kind="session",
         user_id=user_id,
         submitted_at=submitted_at,
-        source_observed_at=source_observed_at,
+        source_updated_at=source_updated_at,
     )
     source = await db.get_source(submitted["source_id"])
     gene = AgentSessionGene(config=source["config"], source_id=source["id"])
@@ -265,7 +265,7 @@ async def test_agent_session_gene_exposes_normalized_repo_identifier(database_fi
 
 
 @pytest.mark.asyncio
-async def test_agent_session_gene_exposes_explicit_source_observed_at(database_fixture, tmp_path):
+async def test_agent_session_gene_exposes_explicit_source_updated_at(database_fixture, tmp_path):
     """Gene boundary: explicit source observation time survives package reads.
 
     Submission time is lifecycle metadata. It must not be copied into source
@@ -278,13 +278,13 @@ async def test_agent_session_gene_exposes_explicit_source_observed_at(database_f
         db=database,
         cfg=cfg,
         client="codex",
-        session_id="sess-source-observed",
+        session_id="sess-source-updated",
         user_id=U1_USER,
         fact="agent-session source timestamps are explicit provenance",
-        source_observed_at="2026-06-20T04:23:51Z",
+        source_updated_at="2026-06-20T04:23:51Z",
     )
 
-    assert normalized.source_semantics["source_observed_at"] == "2026-06-20T04:23:51+00:00"
+    assert normalized.source_semantics["source_updated_at"] == "2026-06-20T04:23:51+00:00"
 
 
 @pytest.mark.asyncio
@@ -362,7 +362,7 @@ async def test_orchestrator_forwards_uploader_user_id_on_new_documents(database_
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_forwards_source_observed_at_on_new_documents(database_fixture, tmp_path):
+async def test_orchestrator_forwards_source_updated_at_on_new_documents(database_fixture, tmp_path):
     """First sync (new docs): source provenance timestamp reaches the memory engine."""
     database = database_fixture
     cfg = _config(tmp_path)
@@ -371,10 +371,10 @@ async def test_orchestrator_forwards_source_observed_at_on_new_documents(databas
         db=database,
         cfg=cfg,
         client="codex",
-        session_id="sess-source-observed-new",
+        session_id="sess-source-updated-new",
         user_id=U1_USER,
-        fact="new document carries source observed timestamp",
-        source_observed_at="2026-06-20T04:23:51Z",
+        fact="new document carries source updated timestamp",
+        source_updated_at="2026-06-20T04:23:51Z",
     )
 
     spy = _SpyMemoryEngine()
@@ -394,12 +394,12 @@ async def test_orchestrator_forwards_source_observed_at_on_new_documents(databas
 
     assert state.last_sync_status == "success"
     by_doc = {call["doc_id"]: call for call in spy.process_memories_calls}
-    assert by_doc[item.item_id]["source_observed_at"].isoformat() == "2026-06-20T04:23:51+00:00"
+    assert by_doc[item.item_id]["source_updated_at"].isoformat() == "2026-06-20T04:23:51+00:00"
     assert spy.reconcile_calls == []
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_forwards_source_observed_at_to_source_support_detector(database_fixture, tmp_path):
+async def test_orchestrator_forwards_source_updated_at_to_source_support_detector(database_fixture, tmp_path):
     """Source-support detection must receive the same explicit provenance timestamp."""
     database = database_fixture
     cfg = _config(tmp_path)
@@ -408,10 +408,10 @@ async def test_orchestrator_forwards_source_observed_at_to_source_support_detect
         db=database,
         cfg=cfg,
         client="codex",
-        session_id="sess-source-observed-support",
+        session_id="sess-source-updated-support",
         user_id=U1_USER,
-        fact="source support detector carries source observed timestamp",
-        source_observed_at="2026-06-20T04:23:51Z",
+        fact="source support detector carries source updated timestamp",
+        source_updated_at="2026-06-20T04:23:51Z",
     )
 
     support_detector = _SpySourceSupportDetector()
@@ -434,7 +434,7 @@ async def test_orchestrator_forwards_source_observed_at_to_source_support_detect
     )
 
     assert state.last_sync_status == "success"
-    assert support_detector.calls[0]["source_observed_at"].isoformat() == "2026-06-20T04:23:51+00:00"
+    assert support_detector.calls[0]["source_updated_at"].isoformat() == "2026-06-20T04:23:51+00:00"
 
 
 @pytest.mark.asyncio
@@ -525,7 +525,7 @@ async def test_orchestrator_forwards_uploader_user_id_on_document_updates(databa
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_forwards_source_observed_at_on_document_updates(database_fixture, tmp_path):
+async def test_orchestrator_forwards_source_updated_at_on_document_updates(database_fixture, tmp_path):
     """Second sync (existing doc, new content): provenance timestamp reaches reconciliation."""
     database = database_fixture
     cfg = _config(tmp_path)
@@ -534,10 +534,10 @@ async def test_orchestrator_forwards_source_observed_at_on_document_updates(data
         db=database,
         cfg=cfg,
         client="codex",
-        session_id="sess-source-observed-update",
+        session_id="sess-source-updated-update",
         user_id=U1_USER,
-        fact="initial source observed value",
-        source_observed_at="2026-06-20T04:23:51Z",
+        fact="initial source updated value",
+        source_updated_at="2026-06-20T04:23:51Z",
         submitted_at="2026-01-01T00:00:00+00:00",
     )
 
@@ -564,10 +564,10 @@ async def test_orchestrator_forwards_source_observed_at_on_document_updates(data
         db=database,
         cfg=cfg,
         client="codex",
-        session_id="sess-source-observed-update",
+        session_id="sess-source-updated-update",
         user_id=U1_USER,
-        fact="updated source observed value",
-        source_observed_at="2026-06-21T05:00:00Z",
+        fact="updated source updated value",
+        source_updated_at="2026-06-21T05:00:00Z",
         submitted_at="2026-01-02T00:00:00+00:00",
     )
     assert submitted_second["doc_id"] == submitted_first["doc_id"]
@@ -592,5 +592,5 @@ async def test_orchestrator_forwards_source_observed_at_on_document_updates(data
 
     assert update_state.last_sync_status == "success"
     by_doc = {call["doc_id"]: call for call in update_spy.reconcile_calls}
-    assert by_doc[item_second.item_id]["source_observed_at"].isoformat() == "2026-06-21T05:00:00+00:00"
+    assert by_doc[item_second.item_id]["source_updated_at"].isoformat() == "2026-06-21T05:00:00+00:00"
     assert update_spy.process_memories_calls == []

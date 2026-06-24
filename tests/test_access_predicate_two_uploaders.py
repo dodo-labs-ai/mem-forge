@@ -109,14 +109,14 @@ async def test_two_uploaders_each_owns_their_private_session_memory(engine_fixtu
         raw_memories=u1_raw,
         source_type="agent_session",
         user_id="u-1",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     await engine.process_memories(
         doc_id="doc-u2",
         raw_memories=u2_raw,
         source_type="agent_session",
         user_id="u-2",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     rows = await database.list_memories()

@@ -1215,7 +1215,7 @@ async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(db, t
             doc_id,
             "agent_session",
             f"Excerpt {index}",
-            source_observed_at=None,
+            source_updated_at=None,
         )
     await db.insert_sync_history(
         source=source_id,

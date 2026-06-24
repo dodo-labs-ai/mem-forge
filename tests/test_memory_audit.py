@@ -144,7 +144,7 @@ async def test_store_operation_events_share_operation_id(db: Database):
 
     store._embed = fake_embed  # type: ignore[assignment]
 
-    await store.deduplicate_and_insert(memory, "doc-1", "confluence", source_observed_at=None)
+    await store.deduplicate_and_insert(memory, "doc-1", "confluence", source_updated_at=None)
 
     rows = await db.list_memory_audit_events(memory_id=memory.id)
     operation_ids = {row.operation_id for row in rows}

@@ -45,7 +45,7 @@ async def test_add_source_support_does_not_cross_visibility(tmp_path):
             source_type="confluence",
             writer_visibility=Visibility.WORKSPACE.value,
             writer_owner_user_id=None,
-            source_observed_at=None,
+            source_updated_at=None,
         )
         assert outcome == "rejected"
 
@@ -81,7 +81,7 @@ async def test_add_source_support_does_not_cross_private_owner(tmp_path):
             source_type="agent_session",
             writer_visibility=Visibility.PRIVATE.value,
             writer_owner_user_id="u-bob",
-            source_observed_at=None,
+            source_updated_at=None,
         )
         assert outcome == "rejected"
 
@@ -118,7 +118,7 @@ async def test_add_source_support_does_not_cross_workspace_project(tmp_path):
             writer_visibility=Visibility.WORKSPACE.value,
             writer_owner_user_id=None,
             writer_project_key="PAY",
-            source_observed_at=None,
+            source_updated_at=None,
         )
         assert outcome == "rejected"
 
@@ -156,7 +156,7 @@ async def test_add_source_support_rejects_workspace_writer_with_none_project_aga
             writer_visibility=Visibility.WORKSPACE.value,
             writer_owner_user_id=None,
             writer_project_key=None,
-            source_observed_at=None,
+            source_updated_at=None,
         )
         assert outcome == "rejected"
         stored = await db.get_memory("m-pay")

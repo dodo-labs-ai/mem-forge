@@ -168,22 +168,22 @@ def _parse_submitted_at(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _parse_source_observed_at(value: str) -> datetime:
+def _parse_source_updated_at(value: str) -> datetime:
     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     parsed = datetime.fromisoformat(normalized)
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("source_observed_at must include an explicit timezone offset")
+        raise ValueError("source_updated_at must include an explicit timezone offset")
     return parsed.astimezone(timezone.utc)
 
 
-def _normalize_source_observed_at(value: str | None) -> str | None:
+def _normalize_source_updated_at(value: str | None) -> str | None:
     if value is None:
         return None
-    return _parse_source_observed_at(value).isoformat()
+    return _parse_source_updated_at(value).isoformat()
 
 
 def _receipt_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
-    return {key: value for key, value in dict(metadata or {}).items() if key != "source_observed_at"}
+    return {key: value for key, value in dict(metadata or {}).items() if key != "source_updated_at"}
 
 
 def default_agent_session_documents_dir(config: AppConfig) -> Path:
@@ -515,7 +515,7 @@ async def submit_agent_session_document(
     source_kind: str = AGENT_SESSION_SOURCE_KIND,
     window_hash: str | None = None,
     submitted_at: str | None = None,
-    source_observed_at: str | None = None,
+    source_updated_at: str | None = None,
     user_id: str | None = None,
 ) -> dict:
     """Store a generated session document package and receipt lineage."""
@@ -534,7 +534,7 @@ async def submit_agent_session_document(
     documents_dir = Path(source["config"]["documents_dir"])
 
     submitted_at = submitted_at or _now_iso()
-    normalized_source_observed_at = _normalize_source_observed_at(source_observed_at)
+    normalized_source_updated_at = _normalize_source_updated_at(source_updated_at)
     redacted_markdown = redact_agent_session_markdown(document_markdown)
     document_hash = content_hash(redacted_markdown)
     doc_id = build_agent_session_doc_id(
@@ -596,8 +596,8 @@ async def submit_agent_session_document(
         "markdown": redacted_markdown,
         "receipt": receipt.__dict__,
     }
-    if normalized_source_observed_at is not None:
-        package["source_observed_at"] = normalized_source_observed_at
+    if normalized_source_updated_at is not None:
+        package["source_updated_at"] = normalized_source_updated_at
     # Write the package atomically: serialize to a sibling temp file on the same
     # filesystem, then rename it into place. A reader (or a concurrent same-id
     # write) sees either the previous package or the complete new one, never a
@@ -648,7 +648,7 @@ async def _record_window_outcome(
     history_window_start: str | None,
     history_window_end: str | None,
     submitted_at: str,
-    source_observed_at: str | None,
+    source_updated_at: str | None,
     window_hash: str,
     receipt: dict[str, Any] | None,
     outcome: str,
@@ -768,7 +768,7 @@ async def submit_agent_session_window(
     receipt: dict[str, Any] | None = None,
     retention: str = "none",
     submitted_at: str | None = None,
-    source_observed_at: str | None = None,
+    source_updated_at: str | None = None,
     process_now: bool = True,
     user_id: str | None = None,
 ) -> dict[str, Any]:
@@ -785,7 +785,7 @@ async def submit_agent_session_window(
         raise ValueError("retention must be none")
 
     submitted_at = submitted_at or _now_iso()
-    normalized_source_observed_at = _normalize_source_observed_at(source_observed_at)
+    normalized_source_updated_at = _normalize_source_updated_at(source_updated_at)
     history_window = history_window or {"kind": "boundary"}
     redacted_history_window = redact_agent_session_payload(history_window)
     redacted_events = redact_agent_session_events(events)
@@ -817,7 +817,7 @@ async def submit_agent_session_window(
         "history_window_start": window_start,
         "history_window_end": window_end,
         "submitted_at": submitted_at,
-        "source_observed_at": normalized_source_observed_at,
+        "source_updated_at": normalized_source_updated_at,
         "window_hash": window_hash,
         "receipt": receipt,
     }
@@ -917,9 +917,9 @@ async def submit_agent_session_window(
             repo_identifier=repo_identifier,
             project_key=None,
             submitted_at=_parse_submitted_at(submitted_at),
-            source_observed_at=(
-                _parse_source_observed_at(normalized_source_observed_at)
-                if normalized_source_observed_at is not None
+            source_updated_at=(
+                _parse_source_updated_at(normalized_source_updated_at)
+                if normalized_source_updated_at is not None
                 else None
             ),
         )
@@ -960,9 +960,9 @@ async def submit_agent_session_window(
             repo_identifier=repo_identifier,
             project_key=project,
             submitted_at=_parse_submitted_at(submitted_at),
-            source_observed_at=(
-                _parse_source_observed_at(normalized_source_observed_at)
-                if normalized_source_observed_at is not None
+            source_updated_at=(
+                _parse_source_updated_at(normalized_source_updated_at)
+                if normalized_source_updated_at is not None
                 else None
             ),
         )

@@ -118,7 +118,7 @@ class AgentKnowledgeBundleService:
         repo_identifier: str | None,
         project_key: str | None,
         submitted_at: datetime | None = None,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
     ) -> AgentKnowledgePatchResult:
         """Apply one structured patch proposal.
 
@@ -127,7 +127,7 @@ class AgentKnowledgeBundleService:
         """
 
         submitted_at = _utc(submitted_at)
-        source_observed_at = _utc(source_observed_at) if source_observed_at is not None else None
+        source_updated_at = _utc(source_updated_at) if source_updated_at is not None else None
         if proposal.action == "no_output":
             return AgentKnowledgePatchResult(
                 outcome="skipped_not_memory",
@@ -206,7 +206,7 @@ class AgentKnowledgeBundleService:
                 source_type="agent_session",
                 submitted_at=submitted_at,
                 observed_at=submitted_at,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
                 citations=proposal.citations,
                 concept_projection={
                     "concept_id": concept_id,
@@ -288,7 +288,7 @@ class AgentKnowledgeBundleService:
                 source_type="agent_session",
                 submitted_at=submitted_at,
                 observed_at=submitted_at,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
                 citations=proposal.citations,
                 concept_markdown_body=concept_markdown_body,
             )
@@ -339,7 +339,7 @@ class AgentKnowledgeBundleService:
             replacement_kind=_replacement_kind_for_action(proposal.action),
             submitted_at=submitted_at,
             observed_at=submitted_at,
-            source_observed_at=source_observed_at,
+            source_updated_at=source_updated_at,
             citations=proposal.citations,
             concept_markdown_body=concept_markdown_body,
         )
@@ -386,7 +386,7 @@ class AgentKnowledgeBundleService:
         source_type: str,
         submitted_at: datetime,
         observed_at: datetime,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
         citations: list[str] | None = None,
         concept_projection: dict[str, object] | None = None,
         concept_markdown_body: str | None = None,
@@ -444,7 +444,7 @@ class AgentKnowledgeBundleService:
                 tags=tags,
                 confidence=confidence,
                 observed_at=observed_at,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
                 citations=citations,
                 concept_projection=concept_projection,
                 concept_markdown_body=concept_markdown_body,
@@ -480,7 +480,7 @@ class AgentKnowledgeBundleService:
         replacement_kind: ReplacementKind,
         submitted_at: datetime,
         observed_at: datetime,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
         citations: list[str] | None = None,
         concept_markdown_body: str | None = None,
     ) -> str:
@@ -536,7 +536,7 @@ class AgentKnowledgeBundleService:
                 doc_id=concept_id,
                 source_type=source_type,
                 excerpt=claim_text.strip(),
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
             )
             return new_memory_id
         universe = await self._mandatory_candidate_universe(
@@ -596,7 +596,7 @@ class AgentKnowledgeBundleService:
             tags=tags,
             confidence=confidence,
             observed_at=observed_at,
-            source_observed_at=source_observed_at,
+            source_updated_at=source_updated_at,
             relation_outcome=relation_outcome,
             citations=citations,
             concept_markdown_body=concept_markdown_body,
