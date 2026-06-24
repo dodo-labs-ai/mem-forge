@@ -179,7 +179,7 @@ async def test_workspace_write_does_not_corroborate_other_users_private(store_fi
         doc_id="doc-team",
         source_type="manual",
         scope=_writer_scope(),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     # The write must land as a fresh insert, not corroborate U2's private row.

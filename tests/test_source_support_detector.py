@@ -76,7 +76,7 @@ async def _seed_memory(
         "confluence",
         "original excerpt",
         support_kind=support_kind,
-        source_observed_at=None,
+        source_updated_at=None,
     )
     await db.link_memory_entity(memory.id, entity_id)
 
@@ -163,7 +163,7 @@ async def test_support_detection_requires_memory_store(db: Database):
             entity_ids=[],
             project_key="PAY",
             db=db,
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
 
@@ -197,12 +197,12 @@ async def test_detect_and_persist_routes_corroborated_support_through_store(db: 
             writer_visibility: str | None = None,
             writer_owner_user_id: str | None = None,
             writer_project_key: str | None = None,
-            source_observed_at: datetime | None = None,
+            source_updated_at: datetime | None = None,
             relation_outcome=None,
         ) -> str:
             assert relation_outcome is not None
             await db.record_relation_outcome_bundle(relation_outcome)
-            self.calls.append((memory_id, doc_id, source_type, excerpt, support_kind, source_observed_at))
+            self.calls.append((memory_id, doc_id, source_type, excerpt, support_kind, source_updated_at))
             return "inserted"
 
         async def remove_source_support(self, memory_id: str, doc_id: str, reason: str = "no_support") -> bool:
@@ -220,7 +220,7 @@ async def test_detect_and_persist_routes_corroborated_support_through_store(db: 
     )
     detector = SourceSupportDetector(structured_llm_client=structured_client)
     store = RecordingStore()
-    source_observed_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
+    source_updated_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
 
     result = await detector.detect_and_persist(
         doc_id="doc-support",
@@ -230,11 +230,11 @@ async def test_detect_and_persist_routes_corroborated_support_through_store(db: 
         project_key="PAY",
         db=db,
         memory_store=store,  # type: ignore[arg-type]
-        source_observed_at=source_observed_at,
+        source_updated_at=source_updated_at,
     )
 
     assert result["added"] == 1
-    assert store.calls == [(memory.id, "doc-support", "confluence", excerpt, "corroborated", source_observed_at)]
+    assert store.calls == [(memory.id, "doc-support", "confluence", excerpt, "corroborated", source_updated_at)]
 
     async with db.db.execute(
         """SELECT rr.*
@@ -287,7 +287,7 @@ async def test_detect_and_persist_routes_corroborated_support_through_store(db: 
         project_key="PAY",
         db=db,
         memory_store=retry_store,  # type: ignore[arg-type],
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert retry_result["added"] == 1
@@ -295,13 +295,13 @@ async def test_detect_and_persist_routes_corroborated_support_through_store(db: 
 
 
 @pytest.mark.asyncio
-async def test_get_corroborated_sources_by_doc_maps_source_observed_at(db: Database):
+async def test_get_corroborated_sources_by_doc_maps_source_updated_at(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
     memory = _memory("mem-corroborated-observed", "Supported memory.")
     entity_id = await db.upsert_entity("observed support", display_name="Observed Support", tags=["feature"])
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
-    source_observed_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
+    source_updated_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
 
     await db.corroborate_memory(
         memory.id,
@@ -309,51 +309,51 @@ async def test_get_corroborated_sources_by_doc_maps_source_observed_at(db: Datab
         "confluence",
         "support excerpt",
         support_kind="corroborated",
-        source_observed_at=source_observed_at,
+        source_updated_at=source_updated_at,
     )
 
     sources = await db.get_corroborated_sources_by_doc("doc-support")
     assert len(sources) == 1
-    assert sources[0].source_observed_at == source_observed_at
+    assert sources[0].source_updated_at == source_updated_at
 
 
 @pytest.mark.asyncio
-async def test_sqlite_add_memory_source_overwrites_source_observed_at_with_unknown(db: Database):
+async def test_sqlite_add_memory_source_overwrites_source_updated_at_with_unknown(db: Database):
     await _insert_doc(db, "doc-origin")
-    memory = _memory("mem-source-observed-clear", "Source timestamp can become unknown.")
+    memory = _memory("mem-source-updated-clear", "Source timestamp can become unknown.")
     entity_id = await db.upsert_entity("observed clear", display_name="Observed Clear", tags=["feature"])
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
-    source_observed_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
+    source_updated_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
 
     await db.add_memory_source(
         memory.id,
         "doc-origin",
         "confluence",
         "observed excerpt",
-        source_observed_at=source_observed_at,
+        source_updated_at=source_updated_at,
     )
     await db.add_memory_source(
         memory.id,
         "doc-origin",
         "confluence",
         "unknown excerpt",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     sources = await db.get_memory_sources(memory.id)
     assert len(sources) == 1
     assert sources[0].excerpt == "unknown excerpt"
-    assert sources[0].source_observed_at is None
+    assert sources[0].source_updated_at is None
 
 
 @pytest.mark.asyncio
-async def test_sqlite_corroborate_memory_overwrites_source_observed_at_with_unknown(db: Database):
+async def test_sqlite_corroborate_memory_overwrites_source_updated_at_with_unknown(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
     memory = _memory("mem-corroborate-observed-clear", "Corroborated timestamp can become unknown.")
     entity_id = await db.upsert_entity("corroborate clear", display_name="Corroborate Clear", tags=["feature"])
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
-    source_observed_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
+    source_updated_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
 
     await db.corroborate_memory(
         memory.id,
@@ -361,7 +361,7 @@ async def test_sqlite_corroborate_memory_overwrites_source_observed_at_with_unkn
         "confluence",
         "observed excerpt",
         support_kind="corroborated",
-        source_observed_at=source_observed_at,
+        source_updated_at=source_updated_at,
     )
     await db.corroborate_memory(
         memory.id,
@@ -369,12 +369,12 @@ async def test_sqlite_corroborate_memory_overwrites_source_observed_at_with_unkn
         "confluence",
         "unknown excerpt",
         support_kind="corroborated",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     sources = await db.get_memory_sources(memory.id)
     support_source = next(source for source in sources if source.doc_id == "doc-support")
-    assert support_source.source_observed_at is None
+    assert support_source.source_updated_at is None
 
 
 @pytest.mark.asyncio
@@ -419,7 +419,7 @@ async def test_source_support_candidates_exclude_disabled_private_sources(db: Da
         writer_visibility="private",
         writer_owner_user_id="alice@example.com",
         writer_project_key="PAY",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert result["checked"] == 0
@@ -466,7 +466,7 @@ async def test_source_support_workspace_candidates_ignore_personal_disabled_sour
         writer_visibility="workspace",
         writer_owner_user_id="alice@example.com",
         writer_project_key="PAY",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert result["checked"] == 1
@@ -515,7 +515,7 @@ async def test_rejected_source_support_does_not_record_support_relation(db: Data
         project_key="PAY",
         db=db,
         memory_store=RejectingStore(),  # type: ignore[arg-type],
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     async with db.db.execute(
@@ -542,7 +542,7 @@ async def test_existing_support_refresh_routes_through_store(db: Database):
         "confluence",
         "old excerpt",
         support_kind="corroborated",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     class RecordingStore:
@@ -567,12 +567,12 @@ async def test_existing_support_refresh_routes_through_store(db: Database):
             writer_visibility: str | None = None,
             writer_owner_user_id: str | None = None,
             writer_project_key: str | None = None,
-            source_observed_at: datetime | None = None,
+            source_updated_at: datetime | None = None,
             relation_outcome=None,
         ) -> str:
             assert relation_outcome is not None
             await db.record_relation_outcome_bundle(relation_outcome)
-            self.calls.append((memory_id, doc_id, source_type, excerpt, support_kind, source_observed_at))
+            self.calls.append((memory_id, doc_id, source_type, excerpt, support_kind, source_updated_at))
             return "updated"
 
         async def remove_source_support(self, memory_id: str, doc_id: str, reason: str = "no_support") -> bool:
@@ -590,7 +590,7 @@ async def test_existing_support_refresh_routes_through_store(db: Database):
     )
     detector = SourceSupportDetector(structured_llm_client=structured_client)
     store = RecordingStore()
-    source_observed_at = datetime(2026, 6, 21, 5, 0, tzinfo=timezone.utc)
+    source_updated_at = datetime(2026, 6, 21, 5, 0, tzinfo=timezone.utc)
 
     result = await detector.detect_and_persist(
         doc_id="doc-support",
@@ -600,11 +600,11 @@ async def test_existing_support_refresh_routes_through_store(db: Database):
         project_key="PAY",
         db=db,
         memory_store=store,  # type: ignore[arg-type]
-        source_observed_at=source_observed_at,
+        source_updated_at=source_updated_at,
     )
 
     assert result["updated"] == 1
-    assert store.calls == [(memory.id, "doc-support", "confluence", excerpt, "corroborated", source_observed_at)]
+    assert store.calls == [(memory.id, "doc-support", "confluence", excerpt, "corroborated", source_updated_at)]
 
 
 @pytest.mark.asyncio
@@ -635,7 +635,7 @@ async def test_support_detection_adds_corroborated_source_with_validated_excerpt
         project_key="PAY",
         db=db,
         memory_store=_memory_store(db),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     stored = await db.get_memory(memory.id)
@@ -674,7 +674,7 @@ async def test_support_detection_audits_invalid_excerpt_rejection(db: Database):
         project_key="PAY",
         db=db,
         memory_store=_audited_memory_store(db),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     audit_rows = await db.list_memory_audit_events(memory_id=memory.id)
@@ -696,7 +696,7 @@ async def test_existing_support_refresh_audits_unsupported_decision(db: Database
         "confluence",
         "old excerpt",
         support_kind="corroborated",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     structured_client = FakeStructuredSupportClient(
         [
@@ -722,7 +722,7 @@ async def test_existing_support_refresh_audits_unsupported_decision(db: Database
         project_key="PAY",
         db=db,
         memory_store=_audited_memory_store(db),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     audit_rows = await db.list_memory_audit_events(memory_id=memory.id)
@@ -759,7 +759,7 @@ async def test_support_detection_audits_verified_support_with_model_and_reason(d
         project_key="PAY",
         db=db,
         memory_store=_audited_memory_store(db),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     audit_rows = await db.list_memory_audit_events(memory_id=memory.id)
@@ -799,7 +799,7 @@ async def test_support_detection_audits_supported_verifier_decision(db: Database
         project_key="PAY",
         db=db,
         memory_store=_audited_memory_store(db),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     audit_rows = await db.list_memory_audit_events(memory_id=memory.id)
@@ -830,7 +830,7 @@ async def test_support_detection_audits_structured_llm_failure(db: Database):
         project_key="PAY",
         db=db,
         memory_store=_audited_memory_store(db),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     audit_rows = await db.list_memory_audit_events(event_type="source_support_verification_failed")
@@ -860,7 +860,7 @@ async def test_support_detection_audits_missing_structured_client_and_writes_no_
         project_key="PAY",
         db=db,
         memory_store=_audited_memory_store(db),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     audit_rows = await db.list_memory_audit_events(event_type="source_support_verification_failed")
@@ -886,7 +886,7 @@ async def test_support_detection_reprocessing_updates_better_excerpt_without_inc
         "jira",
         "cutoff state checked first",
         support_kind="corroborated",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     better_excerpt = "The backend checks cutoff state before name duplication when creating an off-cycle payroll group."
@@ -909,7 +909,7 @@ async def test_support_detection_reprocessing_updates_better_excerpt_without_inc
         project_key="PAY",
         db=db,
         memory_store=_memory_store(db),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     stored = await db.get_memory(memory.id)
@@ -933,7 +933,7 @@ async def test_support_detection_removes_stale_corroborated_support_on_document_
         "confluence",
         "on-demand correction groups are supported",
         support_kind="corroborated",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     detector = SourceSupportDetector(structured_llm_client=None)
@@ -945,7 +945,7 @@ async def test_support_detection_removes_stale_corroborated_support_on_document_
         project_key="PAY",
         db=db,
         memory_store=_memory_store(db),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     stored = await db.get_memory(memory.id)
@@ -973,7 +973,7 @@ async def test_support_detection_cleans_indexes_when_last_support_is_removed(db:
         project_key="PAY",
         db=db,
         memory_store=_memory_store(db, collection),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     stored = await db.get_memory(memory.id)
@@ -1001,7 +1001,7 @@ async def test_stale_support_removal_reuses_source_support_operation_context(db:
         "confluence",
         "correction groups are supported",
         support_kind="corroborated",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     class RecordingStore:
@@ -1040,7 +1040,7 @@ async def test_stale_support_removal_reuses_source_support_operation_context(db:
         project_key="PAY",
         db=db,
         memory_store=store,  # type: ignore[arg-type],
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert store.removals == [(memory.id, "doc-support", store.context)]
@@ -1060,7 +1060,7 @@ async def test_support_detection_removes_existing_support_when_verifier_says_uns
         "jira",
         old_excerpt,
         support_kind="corroborated",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     structured_client = FakeStructuredSupportClient(
@@ -1087,7 +1087,7 @@ async def test_support_detection_removes_existing_support_when_verifier_says_uns
         project_key="PAY",
         db=db,
         memory_store=_memory_store(db),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     stored = await db.get_memory(memory.id)
@@ -1111,7 +1111,7 @@ async def test_existing_corroborated_support_is_revalidated_before_new_candidate
         "confluence",
         "old ranking excerpt",
         support_kind="corroborated",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     for i in range(3):
         await _insert_doc(db, f"doc-origin-{i}")
@@ -1145,7 +1145,7 @@ async def test_existing_corroborated_support_is_revalidated_before_new_candidate
         project_key="PAY",
         db=db,
         memory_store=_memory_store(db),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     support = [source for source in await db.get_memory_sources(existing.id) if source.doc_id == "doc-support"][0]
@@ -1169,7 +1169,7 @@ async def test_corroborated_support_does_not_participate_in_same_document_reconc
         "confluence",
         "Validation B is mandatory.",
         support_kind="corroborated",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     existing = await db.get_memories_by_source_doc("doc-support")
@@ -1205,7 +1205,7 @@ async def test_support_detection_rejects_link_only_excerpt(db: Database):
         project_key="PAY",
         db=db,
         memory_store=_memory_store(db),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     stored = await db.get_memory(memory.id)

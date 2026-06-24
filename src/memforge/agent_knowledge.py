@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from memforge.memory.evidence import (
     AccessContext,
@@ -60,10 +60,36 @@ PatchOutcome = Literal[
 PatchResultBucket = Literal["applied", "failed", "no_output"]
 
 
+class DurableClaim(BaseModel):
+    """Durable memory shape produced by the LLM and rendered by the service."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rule: str = Field(min_length=1)
+    scope: str = Field(min_length=1)
+    rationale: str | None = None
+
+    @field_validator("rule", "scope")
+    @classmethod
+    def _strip_required_text(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be blank")
+        return text
+
+    @field_validator("rationale")
+    @classmethod
+    def _strip_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        return text or None
+
+
 class AgentKnowledgePatchProposal(BaseModel):
     """Validated LLM proposal. The service validates scope before applying it."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     action: PatchAction
     concept_id: str | None = None
@@ -81,7 +107,7 @@ class AgentKnowledgePatchProposal(BaseModel):
     ) = None
     title: str | None = None
     claim_text: str = ""
-    memory_content: str | None = None
+    durable_claim: DurableClaim | None = None
     memory_type: Literal["fact", "decision", "convention", "procedure"] = "fact"
     tags: list[str] = Field(default_factory=list)
     reason: str = ""
@@ -118,7 +144,7 @@ class AgentKnowledgeBundleService:
         repo_identifier: str | None,
         project_key: str | None,
         submitted_at: datetime | None = None,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
     ) -> AgentKnowledgePatchResult:
         """Apply one structured patch proposal.
 
@@ -127,7 +153,7 @@ class AgentKnowledgeBundleService:
         """
 
         submitted_at = _utc(submitted_at)
-        source_observed_at = _utc(source_observed_at) if source_observed_at is not None else None
+        source_updated_at = _utc(source_updated_at) if source_updated_at is not None else None
         if proposal.action == "no_output":
             return AgentKnowledgePatchResult(
                 outcome="skipped_not_memory",
@@ -206,7 +232,7 @@ class AgentKnowledgeBundleService:
                 source_type="agent_session",
                 submitted_at=submitted_at,
                 observed_at=submitted_at,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
                 citations=proposal.citations,
                 concept_projection={
                     "concept_id": concept_id,
@@ -288,7 +314,7 @@ class AgentKnowledgeBundleService:
                 source_type="agent_session",
                 submitted_at=submitted_at,
                 observed_at=submitted_at,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
                 citations=proposal.citations,
                 concept_markdown_body=concept_markdown_body,
             )
@@ -339,7 +365,7 @@ class AgentKnowledgeBundleService:
             replacement_kind=_replacement_kind_for_action(proposal.action),
             submitted_at=submitted_at,
             observed_at=submitted_at,
-            source_observed_at=source_observed_at,
+            source_updated_at=source_updated_at,
             citations=proposal.citations,
             concept_markdown_body=concept_markdown_body,
         )
@@ -386,7 +412,7 @@ class AgentKnowledgeBundleService:
         source_type: str,
         submitted_at: datetime,
         observed_at: datetime,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
         citations: list[str] | None = None,
         concept_projection: dict[str, object] | None = None,
         concept_markdown_body: str | None = None,
@@ -444,7 +470,7 @@ class AgentKnowledgeBundleService:
                 tags=tags,
                 confidence=confidence,
                 observed_at=observed_at,
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
                 citations=citations,
                 concept_projection=concept_projection,
                 concept_markdown_body=concept_markdown_body,
@@ -480,7 +506,7 @@ class AgentKnowledgeBundleService:
         replacement_kind: ReplacementKind,
         submitted_at: datetime,
         observed_at: datetime,
-        source_observed_at: datetime | None,
+        source_updated_at: datetime | None,
         citations: list[str] | None = None,
         concept_markdown_body: str | None = None,
     ) -> str:
@@ -536,7 +562,7 @@ class AgentKnowledgeBundleService:
                 doc_id=concept_id,
                 source_type=source_type,
                 excerpt=claim_text.strip(),
-                source_observed_at=source_observed_at,
+                source_updated_at=source_updated_at,
             )
             return new_memory_id
         universe = await self._mandatory_candidate_universe(
@@ -596,7 +622,7 @@ class AgentKnowledgeBundleService:
             tags=tags,
             confidence=confidence,
             observed_at=observed_at,
-            source_observed_at=source_observed_at,
+            source_updated_at=source_updated_at,
             relation_outcome=relation_outcome,
             citations=citations,
             concept_markdown_body=concept_markdown_body,
@@ -852,14 +878,22 @@ Decision boundary:
 - Do not summarize ordinary progress, transient status, or facts a future agent can rediscover from the current repo.
 - Agent-session memories are private-only in this version.
 - If the evidence updates an existing claim, use update_existing_claim and copy the exact concept_id and claim_id.
-- If the evidence replaces or invalidates an existing claim, use supersede_existing_claim and copy the exact concept_id and claim_id. Lifecycle is represented only by action, not by claim_text or memory_content.
+- If the evidence replaces or invalidates an existing claim, use supersede_existing_claim and copy the exact concept_id and claim_id. Lifecycle is represented only by action, not by claim_text or durable_claim.
 - If it belongs in an existing concept but is a distinct durable claim, use add_new_claim and copy the exact concept_id.
 - If it is a new durable concept, use create_new_concept with a concise title and concept_type.
 - If nothing durable should be kept, use no_output.
 - claim_text is the detailed atomic evidence statement. It may contain the full corrected rule or runbook step.
-- memory_content is required for all non-no_output actions. It is the durable memory record to keep: self-contained, accurate, and useful when read later without the original conversation. Preserve the decision, rule, preference, procedure, or learned fact with enough qualifiers, scope, and operational context for a future agent to use it correctly. Exclude transcript narration, step-by-step investigation chatter, and obsolete alternatives unless they are necessary to explain the current rule.
+- claim_text may keep evidence details such as branch names, exact test names, run-log fragments, implementation checklists, timestamps, and deployment or verification notes when they are useful provenance.
+- durable_claim is required for all non-no_output actions. It is the durable memory record to keep, and the service will render Memory.content from it.
+- durable_claim.rule states the durable rule, decision, invariant, pitfall, or reusable takeaway in present tense.
+- durable_claim.scope states where or when the rule applies.
+- durable_claim.rationale may explain why the rule matters, but only when the reason is durable.
+- Do not prefix durable_claim.scope with "Applies:"; the service adds that label when rendering.
+- durable_claim must omit evidence-only details unless a specific detail is itself the durable rule.
+- If the evidence only supports implementation narration, verification status, branch/test/deploy notes, or other provenance details, keep those details in claim_text and return no_output unless a clean durable_claim can be filled.
+- If the durable takeaway cannot be separated from evidence details, return no_output instead of copying claim_text.
 
-Caller:
+<operational_context>
 - owner_user_id: {owner_user_id}
 - client: {client}
 - session_id: {session_id}
@@ -867,12 +901,17 @@ Caller:
 - workspace: {workspace}
 - repo_identifier: {repo_identifier or "none"}
 - branch: {branch or "none"}
+</operational_context>
 
-Existing private concepts for this user and repo:
+<comparison_context>
+Existing private concepts for this user and repo. Use these only to choose create/update/supersede/add action and IDs; do not extract new memory from this section alone.
 {existing}
+</comparison_context>
 
-Canonical evidence:
+<candidate_evidence>
+Canonical event evidence for this window. Create or update memory only when this evidence supports a clean durable_claim.
 {evidence or "- no evidence"}
+</candidate_evidence>
 """
 
 
@@ -965,13 +1004,31 @@ def _stable_id(prefix: str, *parts: str) -> str:
 
 
 def _memory_content_for(proposal: AgentKnowledgePatchProposal) -> str:
-    return (proposal.memory_content or "").strip()
+    if proposal.durable_claim is None:
+        return ""
+    claim = proposal.durable_claim
+    parts = [
+        _ensure_sentence(claim.rule),
+        f"Applies: {_ensure_sentence(claim.scope)}",
+    ]
+    if claim.rationale and claim.rationale.strip():
+        parts.append(f"Why: {_ensure_sentence(claim.rationale)}")
+    return "\n".join(parts).strip()
+
+
+def _ensure_sentence(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    if text[-1] in ".!?":
+        return text
+    return f"{text}."
 
 
 def _validate_memory_content(proposal: AgentKnowledgePatchProposal) -> str | None:
     memory_content = _memory_content_for(proposal)
     if not memory_content:
-        return "memory_content is required"
+        return "durable_claim is required"
     return None
 
 

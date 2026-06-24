@@ -68,6 +68,15 @@ async def bundle_stack(tmp_path, monkeypatch):
         await db.close()
 
 
+def _durable(
+    rule: str,
+    *,
+    scope: str = "Agent-session memory extraction.",
+    rationale: str | None = None,
+) -> dict:
+    return {"rule": rule, "scope": scope, "rationale": rationale}
+
+
 def _proposal(**overrides) -> AgentKnowledgePatchProposal:
     base = {
         "action": "create_new_concept",
@@ -77,7 +86,11 @@ def _proposal(**overrides) -> AgentKnowledgePatchProposal:
             "Workspace source schedulers must start during app startup so overdue "
             "source schedules run without UI traffic."
         ),
-        "memory_content": "Workspace source schedulers must start during app startup so overdue schedules run without UI traffic.",
+        "durable_claim": {
+            "rule": "Workspace source schedulers must start during app startup.",
+            "scope": "Workspace source scheduling in MemForge.",
+            "rationale": "This lets overdue schedules run without waiting for UI traffic.",
+        },
         "memory_type": "procedure",
         "tags": ["scheduler", "source-sync"],
         "reason": "The window confirms a durable scheduler invariant.",
@@ -118,7 +131,7 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
         submitted_at=datetime(2026, 6, 18, 12, 0, tzinfo=timezone.utc),
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert result.outcome == "applied"
@@ -144,7 +157,9 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
     assert memory.repo_identifier == "github.tools.sap/hcm/memforge-cloud"
     assert (
         memory.content
-        == "Workspace source schedulers must start during app startup so overdue schedules run without UI traffic."
+        == "Workspace source schedulers must start during app startup.\n"
+        "Applies: Workspace source scheduling in MemForge.\n"
+        "Why: This lets overdue schedules run without waiting for UI traffic."
     )
     assert "overdue source schedules" in (memory.extraction_context or "")
     assert collection.upserted[result.memory_id]["owner_user_id"] == "u-andrew"
@@ -187,7 +202,7 @@ async def test_create_concept_does_not_commit_projection_before_memory_lifecycle
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
             submitted_at=datetime(2026, 6, 18, 12, 0, tzinfo=timezone.utc),
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     assert await db.get_document("akb_concept_fail") is not None
@@ -216,7 +231,7 @@ async def test_create_concept_does_not_leave_memory_when_claim_projection_fails(
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
             submitted_at=datetime(2026, 6, 18, 12, 0, tzinfo=timezone.utc),
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     assert await db.get_agent_claim("akb_claim_projection_fail") is None
@@ -243,7 +258,7 @@ async def test_add_claim_does_not_commit_projection_before_memory_lifecycle(bund
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     async def fail_insert_memory(*args, **kwargs):
@@ -258,7 +273,7 @@ async def test_add_claim_does_not_commit_projection_before_memory_lifecycle(bund
                 concept_id=created.concept_id,
                 claim_id="akb_claim_add_fail",
                 claim_text="A second claim should not be projected if memory creation fails.",
-                memory_content="A second claim should not be projected if memory creation fails.",
+                durable_claim=_durable("A second claim should not be projected if memory creation fails."),
             ),
             owner_user_id="u-andrew",
             source_id="src-agent-sessions-codex",
@@ -267,7 +282,7 @@ async def test_add_claim_does_not_commit_projection_before_memory_lifecycle(bund
             workspace="/workspace/memforge-cloud",
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     assert await db.get_agent_claim("akb_claim_add_fail") is None
@@ -288,7 +303,7 @@ async def test_add_claim_writes_citations_and_markdown_inside_lifecycle_contract
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     async def fail_public_citation_write(*args, **kwargs):
@@ -306,7 +321,7 @@ async def test_add_claim_writes_citations_and_markdown_inside_lifecycle_contract
             concept_id=created.concept_id,
             claim_id="akb_claim_add_atomic",
             claim_text="Scheduler claims are persisted with their concept markdown in one lifecycle commit.",
-            memory_content="Scheduler claims persist with their concept markdown in one lifecycle commit.",
+            durable_claim=_durable("Scheduler claims persist with their concept markdown in one lifecycle commit."),
             citations=["agent-window://codex/sess-2/sha256-window"],
         ),
         owner_user_id="u-andrew",
@@ -316,7 +331,7 @@ async def test_add_claim_writes_citations_and_markdown_inside_lifecycle_contract
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert added.outcome == "applied"
@@ -342,7 +357,7 @@ async def test_update_claim_does_not_commit_projection_before_memory_lifecycle(b
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     original_claim = await db.get_agent_claim(created.claim_id)
 
@@ -358,7 +373,7 @@ async def test_update_claim_does_not_commit_projection_before_memory_lifecycle(b
                 concept_id=created.concept_id,
                 claim_id=created.claim_id,
                 claim_text="This update must not replace the projection if memory supersession fails.",
-                memory_content="This update must not replace the projection if memory supersession fails.",
+                durable_claim=_durable("This update must not replace the projection if memory supersession fails."),
             ),
             owner_user_id="u-andrew",
             source_id="src-agent-sessions-codex",
@@ -367,7 +382,7 @@ async def test_update_claim_does_not_commit_projection_before_memory_lifecycle(b
             workspace="/workspace/memforge-cloud",
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     claim = await db.get_agent_claim(created.claim_id)
@@ -391,7 +406,7 @@ async def test_update_claim_rolls_back_when_atomic_citation_projection_fails(bun
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     original_claim = await db.get_agent_claim(created.claim_id)
     original_memory = await db.get_memory(created.memory_id)
@@ -413,7 +428,7 @@ async def test_update_claim_rolls_back_when_atomic_citation_projection_fails(bun
                 concept_id=created.concept_id,
                 claim_id=created.claim_id,
                 claim_text="Workspace source schedulers advance next_run_at after a successful claim.",
-                memory_content="Workspace source schedulers advance next_run_at after a successful claim.",
+                durable_claim=_durable("Workspace source schedulers advance next_run_at after a successful claim."),
                 reason="New evidence refines the scheduler lifecycle claim.",
                 citations=["agent-window://codex/sess-2/sha256-window"],
             ),
@@ -424,7 +439,7 @@ async def test_update_claim_rolls_back_when_atomic_citation_projection_fails(bun
             workspace="/workspace/memforge-cloud",
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     assert await db.get_agent_claim(created.claim_id) == original_claim
@@ -450,14 +465,14 @@ async def test_update_existing_claim_rolls_back_if_claim_projection_commit_fails
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     update_proposal = _proposal(
         action="update_existing_claim",
         concept_id=created.concept_id,
         claim_id=created.claim_id,
         claim_text="Workspace source schedulers advance next_run_at after a successful claim.",
-        memory_content="Workspace source schedulers advance next_run_at after a successful claim.",
+        durable_claim=_durable("Workspace source schedulers advance next_run_at after a successful claim."),
         reason="New evidence refines the scheduler lifecycle claim.",
     )
     original_claim = await db.get_agent_claim(created.claim_id)
@@ -479,7 +494,7 @@ async def test_update_existing_claim_rolls_back_if_claim_projection_commit_fails
             workspace="/workspace/memforge-cloud",
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     restored_memory = await db.get_memory(created.memory_id)
@@ -507,7 +522,7 @@ async def test_update_agent_concept_markdown_fails_if_projection_target_is_missi
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     with pytest.raises(RuntimeError, match="agent concept projection target missing"):
@@ -535,7 +550,7 @@ async def test_update_agent_concept_markdown_ignores_stale_projection_body(bundl
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     newer_observed = datetime(2030, 6, 22, 12, 30, tzinfo=timezone.utc)
@@ -571,14 +586,14 @@ async def test_update_existing_claim_records_relation_inside_supersede_contract(
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     update_proposal = _proposal(
         action="update_existing_claim",
         concept_id=created.concept_id,
         claim_id=created.claim_id,
         claim_text="Workspace source schedulers advance next_run_at after a successful claim.",
-        memory_content="Workspace source schedulers advance next_run_at after a successful claim.",
+        durable_claim=_durable("Workspace source schedulers advance next_run_at after a successful claim."),
         reason="New evidence refines the scheduler lifecycle claim.",
     )
     original_claim = await db.get_agent_claim(created.claim_id)
@@ -597,7 +612,7 @@ async def test_update_existing_claim_records_relation_inside_supersede_contract(
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     restored_memory = await db.get_memory(created.memory_id)
@@ -624,7 +639,7 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     updated = await service.apply_patch_proposal(
@@ -636,7 +651,7 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
                 "Workspace source schedulers must start during app startup, claim due "
                 "source schedules, and advance next_run_at after a successful claim."
             ),
-            memory_content="Source schedulers start on app startup, claim due schedules, and advance next_run_at after success.",
+            durable_claim=_durable("Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."),
             reason="New evidence refines the scheduler lifecycle claim.",
             citations=["agent-window://codex/sess-2/sha256-window"],
         ),
@@ -647,7 +662,7 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert updated.outcome == "applied"
@@ -659,7 +674,10 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
     assert memory is not None
     assert (
         memory.content
-        == "Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."
+        == (
+            "Source schedulers start on app startup, claim due schedules, and advance next_run_at after success.\n"
+            "Applies: Agent-session memory extraction."
+        )
     )
     assert "advance next_run_at" in (memory.extraction_context or "")
     assert collection.upserted[updated.memory_id]["content_hash"] == memory.content_hash
@@ -714,7 +732,7 @@ async def test_update_existing_claim_retry_is_idempotent_after_replacement(bundl
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     update = _proposal(
         action="update_existing_claim",
@@ -724,7 +742,7 @@ async def test_update_existing_claim_retry_is_idempotent_after_replacement(bundl
             "Workspace source schedulers must start during app startup, claim due "
             "source schedules, and advance next_run_at after a successful claim."
         ),
-        memory_content="Source schedulers start on app startup, claim due schedules, and advance next_run_at after success.",
+        durable_claim=_durable("Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."),
         reason="New evidence refines the scheduler lifecycle claim.",
         citations=["agent-window://codex/sess-2/sha256-window"],
     )
@@ -738,7 +756,7 @@ async def test_update_existing_claim_retry_is_idempotent_after_replacement(bundl
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     async with db._write_lock:
         await db.db.execute(
@@ -758,7 +776,7 @@ async def test_update_existing_claim_retry_is_idempotent_after_replacement(bundl
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert retry.outcome == "applied"
@@ -807,7 +825,7 @@ async def test_update_existing_claim_retry_rejects_changed_relation_payload(bund
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     update = _proposal(
         action="update_existing_claim",
@@ -817,7 +835,7 @@ async def test_update_existing_claim_retry_rejects_changed_relation_payload(bund
             "Workspace source schedulers must start during app startup, claim due "
             "source schedules, and advance next_run_at after a successful claim."
         ),
-        memory_content="Source schedulers start on app startup, claim due schedules, and advance next_run_at after success.",
+        durable_claim=_durable("Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."),
         reason="New evidence refines the scheduler lifecycle claim.",
     )
     first_update = await service.apply_patch_proposal(
@@ -829,7 +847,7 @@ async def test_update_existing_claim_retry_rejects_changed_relation_payload(bund
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     changed_retry = _proposal(
@@ -837,7 +855,7 @@ async def test_update_existing_claim_retry_rejects_changed_relation_payload(bund
         concept_id=created.concept_id,
         claim_id=created.claim_id,
         claim_text=update.claim_text,
-        memory_content=update.memory_content,
+        durable_claim=update.durable_claim,
         reason="A different retry reason would change the relation payload.",
     )
     with pytest.raises(RuntimeError, match="relation_run_id collision"):
@@ -850,7 +868,7 @@ async def test_update_existing_claim_retry_rejects_changed_relation_payload(bund
             workspace="/workspace/memforge-cloud",
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
     relation_runs = await _relation_runs_for_memory(db, first_update.memory_id)
@@ -870,7 +888,7 @@ async def test_update_existing_claim_retry_rejects_committed_candidate_snapshot_
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     update = _proposal(
         action="update_existing_claim",
@@ -880,7 +898,7 @@ async def test_update_existing_claim_retry_rejects_committed_candidate_snapshot_
             "Workspace source schedulers must start during app startup, claim due "
             "source schedules, and advance next_run_at after a successful claim."
         ),
-        memory_content="Source schedulers start on app startup, claim due schedules, and advance next_run_at after success.",
+        durable_claim=_durable("Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."),
         reason="New evidence refines the scheduler lifecycle claim.",
     )
     first_update = await service.apply_patch_proposal(
@@ -892,7 +910,7 @@ async def test_update_existing_claim_retry_rejects_committed_candidate_snapshot_
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     relation_runs = await _relation_runs_for_memory(db, first_update.memory_id)
     assert len(relation_runs) == 1
@@ -914,7 +932,7 @@ async def test_update_existing_claim_retry_rejects_committed_candidate_snapshot_
             workspace="/workspace/memforge-cloud",
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
             project_key="UNSORTED",
-            source_observed_at=None,
+            source_updated_at=None,
         )
 
 
@@ -931,7 +949,7 @@ async def test_update_existing_claim_records_complete_mandatory_candidate_univer
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     same_doc_memory = Memory(
         id="mem-other-claim",
@@ -949,7 +967,7 @@ async def test_update_existing_claim_records_complete_mandatory_candidate_univer
         created.concept_id,
         "agent_session",
         excerpt="A separate scheduler claim under the same concept remains active.",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     updated = await service.apply_patch_proposal(
@@ -958,7 +976,7 @@ async def test_update_existing_claim_records_complete_mandatory_candidate_univer
             concept_id=created.concept_id,
             claim_id=created.claim_id,
             claim_text="Workspace source schedulers advance next_run_at after a successful claim.",
-            memory_content="Workspace source schedulers advance next_run_at after a successful claim.",
+            durable_claim=_durable("Workspace source schedulers advance next_run_at after a successful claim."),
             reason="New evidence refines the scheduler lifecycle claim.",
             citations=["agent-window://codex/sess-2/sha256-window"],
         ),
@@ -969,7 +987,7 @@ async def test_update_existing_claim_records_complete_mandatory_candidate_univer
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     relation_runs = await _relation_runs_for_memory(db, updated.memory_id)
@@ -999,7 +1017,7 @@ async def test_supersede_existing_claim_records_memory_lifecycle(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     superseded = await service.apply_patch_proposal(
@@ -1011,7 +1029,7 @@ async def test_supersede_existing_claim_records_memory_lifecycle(bundle_stack):
                 "The source scheduler startup claim is obsolete: the scheduler is "
                 "now started by the cloud app bootstrap during lifespan startup."
             ),
-            memory_content="Source scheduler startup is owned by the cloud app bootstrap lifespan.",
+            durable_claim=_durable("Source scheduler startup is owned by the cloud app bootstrap lifespan."),
             reason="New implementation replaced the older scheduler startup claim.",
         ),
         owner_user_id="u-andrew",
@@ -1021,7 +1039,7 @@ async def test_supersede_existing_claim_records_memory_lifecycle(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert superseded.outcome == "applied"
@@ -1043,7 +1061,7 @@ async def test_agent_claim_requires_structured_memory_projection(bundle_stack):
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
 
     result = await service.apply_patch_proposal(
-        proposal=_proposal(memory_content=None),
+        proposal=_proposal(durable_claim=None),
         owner_user_id="u-andrew",
         source_id="src-agent-sessions-codex",
         client="codex",
@@ -1051,11 +1069,49 @@ async def test_agent_claim_requires_structured_memory_projection(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert result.outcome == "parse_failed"
-    assert result.reason == "memory_content is required"
+    assert result.reason == "durable_claim is required"
+
+
+@pytest.mark.parametrize(
+    "durable_claim",
+    [
+        {"rule": "   ", "scope": "Agent-session memory extraction.", "rationale": None},
+        {"rule": "Durable rule.", "scope": "   ", "rationale": None},
+    ],
+)
+def test_agent_claim_rejects_blank_durable_claim_fields(durable_claim):
+    with pytest.raises(ValueError, match="must not be blank"):
+        _proposal(durable_claim=durable_claim)
+
+
+def test_agent_claim_ignores_blank_optional_rationale():
+    proposal = _proposal(
+        durable_claim={
+            "rule": "Durable rule.",
+            "scope": "Agent-session memory extraction.",
+            "rationale": "   ",
+        }
+    )
+
+    assert proposal.durable_claim is not None
+    assert proposal.durable_claim.rationale is None
+
+
+def test_agent_patch_rejects_stale_memory_content_field():
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        AgentKnowledgePatchProposal(
+            action="create_new_concept",
+            concept_type="debugging_takeaway",
+            title="Stale schema",
+            claim_text="The model emitted the previous patch schema.",
+            memory_content="This stale field must fail loudly.",
+            memory_type="fact",
+            reason="stale schema",
+        )
 
 
 @pytest.mark.asyncio
@@ -1064,7 +1120,7 @@ async def test_agent_patch_result_carries_explicit_result_bucket(bundle_stack):
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
 
     parsed_failure = await service.apply_patch_proposal(
-        proposal=_proposal(memory_content=None),
+        proposal=_proposal(durable_claim=None),
         owner_user_id="u-andrew",
         source_id="src-agent-sessions-codex",
         client="codex",
@@ -1072,10 +1128,10 @@ async def test_agent_patch_result_carries_explicit_result_bucket(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     no_output = await service.apply_patch_proposal(
-        proposal=_proposal(action="no_output", claim_text="", memory_content=None),
+        proposal=_proposal(action="no_output", claim_text="", durable_claim=None),
         owner_user_id="u-andrew",
         source_id="src-agent-sessions-codex",
         client="codex",
@@ -1083,7 +1139,7 @@ async def test_agent_patch_result_carries_explicit_result_bucket(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert parsed_failure.result_bucket == "failed"
@@ -1097,7 +1153,7 @@ async def test_agent_claim_accepts_detailed_memory_projection(bundle_stack):
     detailed_projection = " ".join(["Detailed projection remains valid when the flow needs context."] * 40)
 
     result = await service.apply_patch_proposal(
-        proposal=_proposal(memory_content=detailed_projection),
+        proposal=_proposal(durable_claim=_durable(detailed_projection)),
         owner_user_id="u-andrew",
         source_id="src-agent-sessions-codex",
         client="codex",
@@ -1105,7 +1161,7 @@ async def test_agent_claim_accepts_detailed_memory_projection(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert result.outcome == "applied"
@@ -1128,7 +1184,7 @@ async def test_agent_evidence_unit_retry_is_idempotent(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     second = await service.apply_patch_proposal(
         proposal=proposal,
@@ -1139,7 +1195,7 @@ async def test_agent_evidence_unit_retry_is_idempotent(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert first.outcome == "applied"
@@ -1167,7 +1223,7 @@ async def test_agent_evidence_unit_retry_is_idempotent_without_model_supplied_id
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
     second = await service.apply_patch_proposal(
         proposal=proposal,
@@ -1178,7 +1234,7 @@ async def test_agent_evidence_unit_retry_is_idempotent_without_model_supplied_id
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert first.outcome == "applied"
@@ -1218,8 +1274,47 @@ async def test_agent_memory_prompt_describes_durable_memory_not_retrieval_projec
     )
 
     assert "durable memory record" in prompt
+    assert "durable_claim" in prompt
+    assert "rule" in prompt
+    assert "scope" in prompt
     assert "retrieval-ready" not in prompt
     assert "memory projection" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_memory_prompt_separates_memory_from_evidence_details(bundle_stack):
+    db, _store, _collection = bundle_stack
+
+    prompt = await render_agent_knowledge_patch_prompt(
+        db=db,
+        owner_user_id="u-andrew",
+        client="codex",
+        session_id="sess-1",
+        trigger="stop",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        branch="codex/example-branch",
+        history_window={"kind": "transcript_window"},
+        events=[
+            {
+                "kind": "assistant_message",
+                "text": (
+                    "Fix implemented on branch codex/example-branch. "
+                    "Tests test_exact_impl_detail and test_prompt_contract passed. "
+                    "Durable rule: agent-session memories should preserve the reusable "
+                    "decision while provenance keeps branch and test evidence."
+                ),
+            }
+        ],
+        transcript_markdown="",
+    )
+
+    assert "claim_text may keep evidence details" in prompt
+    assert "branch names, exact test names" in prompt
+    assert "durable_claim.rule states the durable rule" in prompt
+    assert "durable_claim.scope states where or when the rule applies" in prompt
+    assert "omit evidence-only details" in prompt
+    assert "return no_output instead of copying claim_text" in prompt
 
 
 @pytest.mark.asyncio
@@ -1236,7 +1331,7 @@ async def test_agent_patch_missing_claim_text_is_failed_not_no_output(bundle_sta
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert result.outcome == "parse_failed"
@@ -1257,7 +1352,7 @@ async def test_private_concept_rejects_other_user_update(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     rejected = await service.apply_patch_proposal(
@@ -1274,7 +1369,7 @@ async def test_private_concept_rejects_other_user_update(bundle_stack):
         workspace="/workspace/memforge-cloud",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         project_key="UNSORTED",
-        source_observed_at=None,
+        source_updated_at=None,
     )
 
     assert rejected.outcome == "rejected_scope"

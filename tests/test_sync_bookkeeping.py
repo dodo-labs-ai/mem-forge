@@ -412,7 +412,12 @@ class CountingMemoryEngine(NoopMemoryEngine):
 
 class RecordingMemoryEngine(NoopMemoryEngine):
     def __init__(self) -> None:
+        self.process_memories_calls: list[dict] = []
         self.reconcile_calls: list[dict] = []
+
+    async def process_memories(self, **kwargs):
+        self.process_memories_calls.append(kwargs)
+        return await super().process_memories(**kwargs)
 
     async def reconcile_and_persist(self, **kwargs):
         self.reconcile_calls.append(kwargs)
@@ -651,9 +656,18 @@ class MissingPdfGene(PdfBackfillGene):
 
 
 class UpdatingDocumentGene:
-    def __init__(self, markdown: str, version: str = "2") -> None:
+    def __init__(
+        self,
+        markdown: str,
+        version: str = "2",
+        *,
+        last_modified: datetime | None = None,
+        source_updated_at: str | None = None,
+    ) -> None:
         self.markdown = markdown
         self.version = version
+        self.last_modified = last_modified or datetime.now(timezone.utc)
+        self.source_updated_at = source_updated_at
 
     def requires_pdf_artifact(
         self,
@@ -684,7 +698,7 @@ class UpdatingDocumentGene:
             item_id="doc-1",
             title="Design Doc",
             source_url="https://docs.example/doc-1",
-            last_modified=datetime.now(timezone.utc),
+            last_modified=self.last_modified,
             content_type="text/markdown",
             space_or_project="ARCH",
             version=self.version,
@@ -694,7 +708,10 @@ class UpdatingDocumentGene:
         return RawContent(item=item, body=self.markdown.encode("utf-8"), content_type="text/markdown")
 
     async def normalize(self, raw):
-        return NormalizedContent(item=raw.item, markdown_body=self.markdown)
+        source_semantics = {}
+        if self.source_updated_at is not None:
+            source_semantics["source_updated_at"] = self.source_updated_at
+        return NormalizedContent(item=raw.item, markdown_body=self.markdown, source_semantics=source_semantics)
 
 
 class UpdatingTicketGene(UpdatingDocumentGene):
@@ -1084,6 +1101,80 @@ async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_
     assert extractor.change_calls == []
     assert len(memory_engine.reconcile_calls) == 1
     assert memory_engine.reconcile_calls[0]["update_mode"] == "full_document"
+
+
+@pytest.mark.asyncio
+async def test_document_last_modified_becomes_memory_source_updated_at(db: Database):
+    source_id = "src-document-source-updated"
+    markdown = "# Design Doc\n\nThe service keeps source timestamps."
+    last_modified = datetime(2026, 6, 10, 8, 30, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Documents",
+        config_json="{}",
+    )
+    memory_engine = RecordingMemoryEngine()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=DocumentVisibleEnricher(db, source_id),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=memory_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=UpdatingDocumentGene(markdown, last_modified=last_modified),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "success"
+    assert len(memory_engine.reconcile_calls) == 0
+    # No source-specific metadata was supplied; document last_modified is the
+    # canonical source-side update time forwarded into memory provenance.
+    assert len(memory_engine.process_memories_calls) == 1
+    assert memory_engine.process_memories_calls[0]["source_updated_at"] == last_modified
+
+
+@pytest.mark.asyncio
+async def test_explicit_source_updated_at_overrides_document_last_modified(db: Database):
+    source_id = "src-explicit-source-updated"
+    markdown = "# Design Doc\n\nThe source gives a separate updated time."
+    last_modified = datetime(2026, 6, 10, 8, 30, tzinfo=timezone.utc)
+    explicit_source_updated_at = "2026-06-11T09:45:00+00:00"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Documents",
+        config_json="{}",
+    )
+    memory_engine = RecordingMemoryEngine()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=DocumentVisibleEnricher(db, source_id),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=memory_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=UpdatingDocumentGene(
+            markdown,
+            last_modified=last_modified,
+            source_updated_at=explicit_source_updated_at,
+        ),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "success"
+    assert len(memory_engine.process_memories_calls) == 1
+    assert memory_engine.process_memories_calls[0]["source_updated_at"].isoformat() == explicit_source_updated_at
 
 
 @pytest.mark.asyncio

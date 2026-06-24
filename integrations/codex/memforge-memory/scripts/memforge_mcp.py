@@ -194,7 +194,7 @@ TOOLS: list[dict[str, Any]] = [
                 "title": {"type": "string"},
                 "metadata": {"type": "object"},
                 "submitted_at": {"type": "string"},
-                "source_observed_at": {"type": "string"},
+                "source_updated_at": {"type": "string"},
                 "process_now": {"type": "boolean", "default": True},
             },
             "required": ["client", "session_id", "trigger", "workspace", "document_markdown"],

@@ -149,7 +149,7 @@ async def test_search_results_expose_service_artifact_urls_without_storage_uris(
     active = _memory("mem-active-artifact", "Active PostgreSQL memory", "active")
     await db.insert_memory(active)
     doc = await _document(db, tmp_path, "doc-search-artifact")
-    await db.add_memory_source(active.id, doc.doc_id, "confluence", excerpt="source excerpt", source_observed_at=None)
+    await db.add_memory_source(active.id, doc.doc_id, "confluence", excerpt="source excerpt", source_updated_at=None)
 
     async def fake_analyze_query(*args, **kwargs):
         return QueryAnalysis()
@@ -276,7 +276,7 @@ async def test_search_results_resolve_artifacts_through_configured_store(
         last_synced=now,
     )
     await db.upsert_document(doc)
-    await db.add_memory_source(active.id, doc.doc_id, "jira", excerpt="source excerpt", source_observed_at=None)
+    await db.add_memory_source(active.id, doc.doc_id, "jira", excerpt="source excerpt", source_updated_at=None)
 
     async def fake_analyze_query(*args, **kwargs):
         return QueryAnalysis()

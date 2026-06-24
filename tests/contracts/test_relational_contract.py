@@ -200,16 +200,16 @@ class RelationalStoreContract:
             "doc-agent-target",
             "agent_session",
             None,
-            source_observed_at=None,
+            source_updated_at=None,
         )
         await store.add_memory_source(
             "m-agent-other-repo",
             "doc-agent-other-repo",
             "agent_session",
             None,
-            source_observed_at=None,
+            source_updated_at=None,
         )
-        await store.add_memory_source("m-jira", "doc-jira", "jira", None, source_observed_at=None)
+        await store.add_memory_source("m-jira", "doc-jira", "jira", None, source_updated_at=None)
 
         matched = await store.filter_ids_by_source_filter(
             ["m-agent-target", "m-agent-other-repo", "m-jira"],
