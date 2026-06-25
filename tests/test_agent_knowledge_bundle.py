@@ -1147,6 +1147,84 @@ async def test_agent_patch_result_carries_explicit_result_bucket(bundle_stack):
 
 
 @pytest.mark.asyncio
+async def test_no_output_validates_covered_concept_and_claim_ids(bundle_stack):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+
+    created = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+
+    covered = await service.apply_patch_proposal(
+        proposal=_proposal(
+            action="no_output",
+            claim_text="",
+            durable_claim=None,
+            covered_concept_id=created.concept_id,
+            covered_claim_id=created.claim_id,
+        ),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+    wrong_repo = await service.apply_patch_proposal(
+        proposal=_proposal(
+            action="no_output",
+            claim_text="",
+            durable_claim=None,
+            covered_concept_id=created.concept_id,
+            covered_claim_id=created.claim_id,
+        ),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/other",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+    wrong_claim = await service.apply_patch_proposal(
+        proposal=_proposal(
+            action="no_output",
+            claim_text="",
+            durable_claim=None,
+            covered_concept_id=created.concept_id,
+            covered_claim_id="claim-does-not-exist",
+        ),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+
+    assert covered.result_bucket == "no_output"
+    assert covered.covered_concept_id == created.concept_id
+    assert covered.covered_claim_id == created.claim_id
+    assert wrong_repo.covered_concept_id is None
+    assert wrong_repo.covered_claim_id is None
+    assert wrong_claim.covered_concept_id == created.concept_id
+    assert wrong_claim.covered_claim_id is None
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_accepts_detailed_memory_projection(bundle_stack):
     db, store, _collection = bundle_stack
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
@@ -1269,7 +1347,14 @@ async def test_agent_memory_prompt_describes_durable_memory_not_retrieval_projec
         repo_identifier="github.tools.sap/hcm/memforge-cloud",
         branch="main",
         history_window={"kind": "transcript_window"},
-        events=[{"kind": "decision", "text": "Use immutable memory revisions."}],
+        events=[
+            {
+                "evidence_id": "E1",
+                "evidence_role": "primary",
+                "kind": "user_message",
+                "text": "Use immutable memory revisions.",
+            }
+        ],
         transcript_markdown="",
     )
 
@@ -1297,6 +1382,8 @@ async def test_agent_memory_prompt_separates_memory_from_evidence_details(bundle
         history_window={"kind": "transcript_window"},
         events=[
             {
+                "evidence_id": "E1",
+                "evidence_role": "supporting",
                 "kind": "assistant_message",
                 "text": (
                     "Fix implemented on branch codex/example-branch. "
@@ -1315,6 +1402,46 @@ async def test_agent_memory_prompt_separates_memory_from_evidence_details(bundle
     assert "durable_claim.scope states where or when the rule applies" in prompt
     assert "omit evidence-only details" in prompt
     assert "return no_output instead of copying claim_text" in prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_memory_prompt_uses_primary_evidence_as_authorization_boundary(bundle_stack):
+    db, _store, _collection = bundle_stack
+
+    prompt = await render_agent_knowledge_patch_prompt(
+        db=db,
+        owner_user_id="u-andrew",
+        client="claude-code",
+        session_id="sess-1",
+        trigger="stop",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        branch="codex/example-branch",
+        history_window={"kind": "transcript_window"},
+        events=[
+            {
+                "evidence_id": "E1",
+                "evidence_role": "supporting",
+                "kind": "assistant_message",
+                "text": "I verified the prompt tests and deployed the change.",
+            },
+            {
+                "evidence_id": "E2",
+                "evidence_role": "primary",
+                "kind": "user_message",
+                "text": "Yes, agent-session memories should be user-approved, not agent self-reasoning.",
+            },
+        ],
+        transcript_markdown="",
+    )
+
+    assert "<primary_evidence>" in prompt
+    assert "[E2:user_message] Yes, agent-session memories should be user-approved" in prompt
+    assert "<supporting_evidence>" in prompt
+    assert "[E1:assistant_message] I verified the prompt tests" in prompt
+    assert "<candidate_evidence>" not in prompt
+    assert "Supporting evidence cannot by itself authorize create_new_concept or add_new_claim" in prompt
+    assert "primary_evidence_ids" in prompt
 
 
 @pytest.mark.asyncio

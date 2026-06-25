@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from memforge.agent_knowledge import AgentKnowledgePatchProposal
+from memforge.agent_sessions import canonicalize_agent_session_events
 from memforge.config import AppConfig
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.storage.database import Database
@@ -54,9 +55,37 @@ def _knowledge_patch(**overrides) -> AgentKnowledgePatchProposal:
         "tags": ["agent-session"],
         "confidence": 0.9,
         "reason": "durable implementation behavior",
+        "primary_evidence_ids": [] if action == "no_output" else ["E1"],
     }
     data.update(overrides)
     return AgentKnowledgePatchProposal(**data)
+
+
+def _authorized_events(*supporting_events: dict) -> list[dict]:
+    return [
+        {"role": "user", "text": "Keep the durable outcome from this window for future work."},
+        *supporting_events,
+    ]
+
+
+def test_canonical_agent_events_mark_user_turns_as_primary_authority():
+    events = canonicalize_agent_session_events(
+        [
+            {"role": "assistant", "text": "I will implement and test the plan."},
+            {"role": "tool", "name": "pytest", "output": "58 passed"},
+            {"kind": "tool_result", "actor": "user", "text": "Tool result with a user actor hint."},
+            {"kind": "user_message", "actor": "assistant", "text": "Assistant text with a user-message kind."},
+            {"role": "user", "text": "Yes, make agent-session memories user-approved only."},
+        ]
+    )
+
+    assert [(event["evidence_id"], event["kind"], event["evidence_role"]) for event in events] == [
+        ("E1", "assistant_message", "supporting"),
+        ("E2", "tool_result", "supporting"),
+        ("E3", "tool_result", "supporting"),
+        ("E4", "user_message", "supporting"),
+        ("E5", "user_message", "primary"),
+    ]
 
 
 async def _seed_source_project(
@@ -107,7 +136,7 @@ async def _seed_source_project(
         await db.add_memory_source(memory.id, doc_id, "agent_session", source_updated_at=None)
 
 
-def test_agent_session_document_submit_api_records_generated_source(tmp_path):
+def test_agent_session_document_submit_api_is_retired(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
@@ -140,17 +169,13 @@ def test_agent_session_document_submit_api_records_generated_source(tmp_path):
                 },
             )
 
-        assert response.status_code == 200
-        body = response.json()
-        assert body["source_id"] == "src-agent-sessions-codex"
-        assert body["sync_started"] is False
-        assert body["receipt"]["client"] == "codex"
-        assert Path(body["document_uri"]).exists()
+        assert response.status_code == 410
+        assert "agent-session document intake has been retired" in response.json()["detail"]
     finally:
         asyncio.run(database.close())
 
 
-def test_agent_session_document_submit_uses_server_principal(tmp_path):
+def test_agent_session_document_submit_retired_before_principal_handling(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
@@ -183,10 +208,8 @@ def test_agent_session_document_submit_uses_server_principal(tmp_path):
                 },
             )
 
-        assert response.status_code == 200, response.text
-        receipt = asyncio.run(database.get_agent_session_receipt(response.json()["doc_id"]))
-        assert receipt is not None
-        assert receipt["metadata"]["user_id"] == "u-authorized"
+        assert response.status_code == 410
+        assert "agent-session document intake has been retired" in response.json()["detail"]
     finally:
         asyncio.run(database.close())
 
@@ -229,9 +252,9 @@ def test_agent_session_window_submit_uses_server_principal(tmp_path):
                     "repo": "mem-forge",
                     "events": [
                         {
-                            "kind": "assistant_message",
-                            "actor": "assistant",
-                            "text": "Implemented the durable rule.",
+                            "kind": "user_message",
+                            "actor": "user",
+                            "text": "Remember that the window route pins owner identity to the server principal.",
                         }
                     ],
                     "retention": "none",
@@ -373,7 +396,9 @@ def test_agent_session_window_api_generates_package_and_discards_raw_window(tmp_
 
     class FakeWindowClient:
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
-            assert "<candidate_evidence>" in prompt
+            assert "<primary_evidence>" in prompt
+            assert "[E1:user_message] Implement the window upload endpoint." in prompt
+            assert "<supporting_evidence>" in prompt
             assert "api_key: [REDACTED]" in prompt
             assert "token: secret-value" not in prompt
             assert "raw-api-secret" not in prompt
@@ -450,7 +475,8 @@ def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_pa
 
     class FakeWindowClient:
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
-            assert "<candidate_evidence>" in prompt
+            assert "<primary_evidence>" in prompt
+            assert "<supporting_evidence>" in prompt
             assert "apply_patch" in prompt
             assert "Edited src/memforge/hook_adapter.py" in prompt
             assert "service-json-secret" not in prompt
@@ -487,6 +513,7 @@ def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_pa
                             "type": "session_meta",
                             "preview": "private developer bootstrap",
                         },
+                        {"role": "user", "text": "Remember that canonical evidence is filtered before patching."},
                         {
                             "kind": "tool_call",
                             "actor": "assistant",
@@ -560,7 +587,7 @@ def test_agent_session_window_api_queues_service_owned_sync(tmp_path):
                     "session_id": "sess-window-sync",
                     "trigger": "PreCompact",
                     "workspace": "/workspace/mem-forge",
-                    "events": [{"role": "tool", "name": "apply_patch", "summary": "Edited code."}],
+                    "events": _authorized_events({"role": "tool", "name": "apply_patch", "summary": "Edited code."}),
                     "retention": "none",
                     "process_now": False,
                 },
@@ -769,7 +796,7 @@ def test_agent_session_window_api_records_failed_outcome_for_parse_failed_patch(
                     "session_id": "sess-window-parse-failed",
                     "trigger": "Stop",
                     "workspace": "/workspace/mem-forge",
-                    "events": [{"role": "tool", "name": "apply_patch", "summary": "Edited code."}],
+                    "events": _authorized_events({"role": "tool", "name": "apply_patch", "summary": "Edited code."}),
                 },
             )
 
@@ -817,7 +844,7 @@ def test_agent_session_window_api_keeps_windows_distinct_and_idempotent(tmp_path
             "trigger": "Stop",
             "workspace": "/workspace/mem-forge",
             "repo": "mem-forge",
-            "events": events,
+            "events": _authorized_events(*events),
             "history_window": {"kind": "transcript_window"},
             "retention": "none",
         }
@@ -875,7 +902,7 @@ def test_agent_session_window_api_same_range_different_content_is_distinct(tmp_p
             "session_id": "sess-range",
             "trigger": "PreCompact",
             "workspace": "/workspace/mem-forge",
-            "events": events,
+            "events": _authorized_events(*events),
             # Same explicit event-id boundary on every call.
             "history_window": {"kind": "boundary", "start_event_id": "evt-1", "end_event_id": "evt-9"},
             "retention": "none",
@@ -931,7 +958,7 @@ def test_agent_session_window_retry_identity_ignores_receipt_and_submission_date
             "session_id": "sess-retry",
             "trigger": "Stop",
             "workspace": "/workspace/mem-forge",
-            "events": [{"role": "tool", "name": "apply_patch", "summary": "same edit"}],
+            "events": _authorized_events({"role": "tool", "name": "apply_patch", "summary": "same edit"}),
             "history_window": {"kind": "transcript_window", "start": "10", "end": "20"},
             "receipt": receipt,
             "submitted_at": submitted_at,
@@ -999,7 +1026,7 @@ def test_agent_session_window_can_patch_existing_private_claim(tmp_path):
             "trigger": "Stop",
             "workspace": "/workspace/memforge-cloud",
             "repo": "github.tools.sap/hcm/memforge-cloud",
-            "events": [{"role": "tool", "name": "apply_patch", "summary": summary}],
+            "events": _authorized_events({"role": "tool", "name": "apply_patch", "summary": summary}),
             "history_window": {"kind": "transcript_window", "start": summary, "end": summary},
             "retention": "none",
         }
@@ -1087,6 +1114,137 @@ def test_agent_session_window_api_records_no_output_receipt(tmp_path):
         asyncio.run(database.close())
 
 
+@pytest.mark.parametrize("client_name", ["codex", "claude-code"])
+def test_agent_session_window_requires_primary_user_anchor_for_both_clients(tmp_path, client_name):
+    """Assistant-only windows cannot create durable memories for any agent client."""
+    from memforge.server.admin_api import create_admin_app
+
+    class OverEagerClient:
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
+                title="Self verification should not become memory",
+                claim_text=(
+                    "The assistant verified its own prompt test strategy and should not "
+                    "turn that narration into durable memory."
+                ),
+                durable_claim=_durable("Agent self-verification should not become durable memory."),
+                primary_evidence_ids=[],
+                reason="assistant-only narration should be blocked by the service",
+            )
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+
+    import asyncio
+
+    asyncio.run(database.connect())
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        app.state.agent_session_window_client = OverEagerClient()
+        with TestClient(app) as http:
+            response = http.post(
+                "/api/agent-sessions/windows",
+                json={
+                    "client": client_name,
+                    "session_id": f"sess-{client_name}-assistant-only",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "events": [
+                        {
+                            "role": "assistant",
+                            "text": "I verified the tests passed and this procedure should be remembered.",
+                        },
+                        {"role": "tool", "name": "pytest", "output": "58 passed"},
+                    ],
+                    "submitted_at": "2026-06-24T22:00:00+00:00",
+                },
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["result"] == "no_output"
+        assert body["patch_outcome"] == "skipped_not_memory"
+        assert "primary evidence" in body["reason"]
+
+        async def _check():
+            assert await database.get_source(f"src-agent-sessions-{client_name}") is None
+            async with database.db.execute("SELECT COUNT(*) FROM memories") as cursor:
+                row = await cursor.fetchone()
+            assert row[0] == 0
+
+        asyncio.run(_check())
+    finally:
+        asyncio.run(database.close())
+
+
+@pytest.mark.parametrize(
+    "spoofed_event",
+    [
+        {
+            "kind": "tool_result",
+            "actor": "user",
+            "text": "Tool output that should never authorize durable memory.",
+        },
+        {
+            "kind": "user_message",
+            "actor": "assistant",
+            "text": "Assistant output that should never authorize durable memory.",
+        },
+    ],
+)
+def test_agent_session_window_rejects_spoofed_primary_evidence(tmp_path, spoofed_event):
+    """Only canonical user messages can authorize agent-session memory creation."""
+    from memforge.server.admin_api import create_admin_app
+
+    class SpoofedPrimaryClient:
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
+                title="Spoofed actor should not authorize memory",
+                claim_text="A tool result with actor=user should not become a durable user-approved rule.",
+                durable_claim=_durable("Tool result actor hints are not user authorization."),
+                primary_evidence_ids=["E1"],
+                reason="tool result attempted to cite itself as primary",
+            )
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+
+    import asyncio
+
+    asyncio.run(database.connect())
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        app.state.agent_session_window_client = SpoofedPrimaryClient()
+        with TestClient(app) as http:
+            response = http.post(
+                "/api/agent-sessions/windows",
+                json={
+                    "client": "codex",
+                    "session_id": "sess-tool-actor-user",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "events": [spoofed_event],
+                    "submitted_at": "2026-06-24T23:00:00+00:00",
+                },
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["result"] == "no_output"
+        assert body["patch_outcome"] == "skipped_not_memory"
+        assert "non-primary evidence" in body["reason"]
+
+        async def _check():
+            assert await database.get_source("src-agent-sessions-codex") is None
+            async with database.db.execute("SELECT COUNT(*) FROM memories") as cursor:
+                row = await cursor.fetchone()
+            assert row[0] == 0
+
+        asyncio.run(_check())
+    finally:
+        asyncio.run(database.close())
+
+
 def test_agent_session_memory_detail_exposes_source_updated_at(tmp_path):
     """Memory provenance reports the source updated time separately from link time."""
     from memforge.server.admin_api import create_admin_app
@@ -1122,9 +1280,9 @@ def test_agent_session_memory_detail_exposes_source_updated_at(tmp_path):
                     "workspace": "/workspace/mem-forge",
                     "events": [
                         {
-                            "kind": "assistant_message",
-                            "actor": "assistant",
-                            "text": "Implemented a durable timestamp rule.",
+                            "kind": "user_message",
+                            "actor": "user",
+                            "text": "Remember the durable timestamp provenance rule.",
                             "timestamp": "2026-06-20T04:23:51Z",
                         }
                     ],
@@ -1194,9 +1352,9 @@ def test_agent_session_window_rejects_naive_source_updated_at(tmp_path):
                     "workspace": "/workspace/mem-forge",
                     "events": [
                         {
-                            "kind": "assistant_message",
-                            "actor": "assistant",
-                            "text": "Implemented a durable timestamp rule.",
+                            "kind": "user_message",
+                            "actor": "user",
+                            "text": "Remember that timezone-naive source timestamps must not be accepted.",
                             "timestamp": "2026-06-20T04:23:51",
                         }
                     ],
@@ -1246,9 +1404,9 @@ def test_agent_session_memory_detail_does_not_fallback_source_updated_at(tmp_pat
                     "workspace": "/workspace/mem-forge",
                     "events": [
                         {
-                            "kind": "assistant_message",
-                            "actor": "assistant",
-                            "text": "Implemented a durable timestamp rule.",
+                            "kind": "user_message",
+                            "actor": "user",
+                            "text": "Remember that provenance does not invent source observation time.",
                         }
                     ],
                     "submitted_at": "2026-06-23T22:00:00+00:00",
@@ -1574,7 +1732,7 @@ def test_agent_window_patch_writes_memory_without_package_file(tmp_path):
                     "session_id": "sess-atomic",
                     "trigger": "Stop",
                     "workspace": "/workspace/mem-forge",
-                    "events": [{"role": "tool", "name": "apply_patch", "summary": "edit"}],
+                    "events": _authorized_events({"role": "tool", "name": "apply_patch", "summary": "edit"}),
                     "transcript_markdown": "did some real work worth keeping",
                 },
             )
@@ -1593,6 +1751,14 @@ def test_per_client_source_split_creates_two_distinct_source_rows(tmp_path):
     """Submitting from codex and claude-code creates two separate source rows."""
     from memforge.server.admin_api import create_admin_app
 
+    class PackageClient:
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
+                title="Client source split",
+                claim_text="Known agent clients write to their own managed source rows.",
+                durable_claim=_durable("Known agent clients write to their own managed source rows."),
+            )
+
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "api.db"))
     import asyncio
@@ -1600,29 +1766,28 @@ def test_per_client_source_split_creates_two_distinct_source_rows(tmp_path):
     asyncio.run(database.connect())
     try:
         app = create_admin_app(db=database, config=cfg)
+        app.state.agent_session_window_client = PackageClient()
         with TestClient(app) as client:
             codex_response = client.post(
-                "/api/agent-sessions/documents",
+                "/api/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-codex",
                     "trigger": "Stop",
                     "workspace": "/workspace/mem-forge",
-                    "document_markdown": "## Outcome\nCodex session summary.",
-                    "process_now": False,
+                    "events": _authorized_events({"role": "assistant", "text": "Codex session summary."}),
                 },
             )
             assert codex_response.status_code == 200
 
             claude_response = client.post(
-                "/api/agent-sessions/documents",
+                "/api/agent-sessions/windows",
                 json={
                     "client": "claude-code",
                     "session_id": "sess-claude-code",
                     "trigger": "Stop",
                     "workspace": "/workspace/mem-forge",
-                    "document_markdown": "## Outcome\nClaude Code session summary.",
-                    "process_now": False,
+                    "events": _authorized_events({"role": "assistant", "text": "Claude Code session summary."}),
                 },
             )
             assert claude_response.status_code == 200
@@ -1632,8 +1797,6 @@ def test_per_client_source_split_creates_two_distinct_source_rows(tmp_path):
 
         assert codex_body["source_id"] == "src-agent-sessions-codex"
         assert claude_body["source_id"] == "src-agent-sessions-claude-code"
-        assert codex_body["receipt"]["client"] == "codex"
-        assert claude_body["receipt"]["client"] == "claude-code"
 
         async def _check_sources():
             sources = await database.list_sources()

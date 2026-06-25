@@ -56,15 +56,15 @@ Default capture flow:
 
 ```text
 hook -> local queue -> window upload with process_now=false
-     -> MemForge package generation -> service-owned source sync
+     -> MemForge service-owned extraction
 ```
 
 The hook worker does not call `/api/sources/{source_id}/sync`.
 It stores retry state in `~/.memforge-agent/queue.sqlite` unless
 `MEMFORGE_AGENT_QUEUE_DB` points somewhere else.
 
-The bundled MCP proxy exposes tools such as `search`, `get_memory`,
-`get_resource`, and `submit_agent_session_document`.
+The bundled MCP proxy exposes tools such as `search`, `get_memory`, and
+`get_resource`.
 `get_resource` fetches `content_url` / `pdf_url` artifacts through
 `MEMFORGE_API_URL`; in `file` mode it writes the artifact to
 `~/.memforge-agent/artifacts`.

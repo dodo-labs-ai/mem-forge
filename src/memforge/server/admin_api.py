@@ -3605,48 +3605,13 @@ def create_admin_app(
         sync_service: SyncService = Depends(get_sync_service),
     ):
         """Submit a client-generated agent session summary document."""
-        from memforge.agent_sessions import agent_session_source_id, submit_agent_session_document
-
-        await _raise_if_source_paused(db, agent_session_source_id(req.client))
-
-        try:
-            result = await submit_agent_session_document(
-                db=db,
-                config=config,
-                client=req.client,
-                session_id=req.session_id,
-                trigger=req.trigger,
-                document_markdown=req.document_markdown,
-                workspace=req.workspace,
-                repo=req.repo,
-                branch=req.branch,
-                commit_sha=req.commit_sha,
-                history_window_kind=req.history_window_kind,
-                history_window_start=req.history_window_start,
-                history_window_end=req.history_window_end,
-                title=req.title,
-                metadata=req.metadata,
-                submitted_at=req.submitted_at,
-                source_updated_at=req.source_updated_at,
-                user_id=resolve_request_principal(request),
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-        sync_started = False
-        if req.process_now:
-            try:
-                await sync_service.start_source(result["source_id"])
-                sync_started = True
-            except SyncAlreadyRunningError:
-                sync_started = True
-            except SourcePausedError:
-                raise _source_paused_http_error()
-
-        return {
-            **result,
-            "sync_started": sync_started,
-        }
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "agent-session document intake has been retired; submit canonical "
+                "agent-session windows so user-active evidence can be verified"
+            ),
+        )
 
     @agent_session_router.get("/completeness")
     async def agent_session_completeness(

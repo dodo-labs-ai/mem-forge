@@ -171,35 +171,6 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["url"],
         },
     },
-    {
-        "name": "submit_agent_session_document",
-        "description": (
-            "Submit a client-generated agent session, task, or compaction-window summary as a "
-            "low-authority generated source document."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "client": {"type": "string", "enum": AGENT_CLIENT_VALUES},
-                "session_id": {"type": "string"},
-                "trigger": {"type": "string"},
-                "workspace": {"type": "string"},
-                "document_markdown": {"type": "string"},
-                "repo": {"type": "string"},
-                "branch": {"type": "string"},
-                "commit_sha": {"type": "string"},
-                "history_window_kind": {"type": "string", "default": "session"},
-                "history_window_start": {"type": "string"},
-                "history_window_end": {"type": "string"},
-                "title": {"type": "string"},
-                "metadata": {"type": "object"},
-                "submitted_at": {"type": "string"},
-                "source_updated_at": {"type": "string"},
-                "process_now": {"type": "boolean", "default": True},
-            },
-            "required": ["client", "session_id", "trigger", "workspace", "document_markdown"],
-        },
-    },
 ]
 
 
@@ -271,8 +242,6 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         if not memory_id:
             return {"error": "memory_id is required"}
         return _http_json("GET", f"/api/memories/{quote(memory_id, safe='')}?include_private=true", None)
-    if name == "submit_agent_session_document":
-        return _http_json("POST", "/api/agent-sessions/documents", args)
     if name == "get_resource":
         return _handle_get_resource(args)
     return {"error": f"Unknown tool: {name}"}

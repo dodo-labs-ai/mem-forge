@@ -113,6 +113,9 @@ class AgentKnowledgePatchProposal(BaseModel):
     reason: str = ""
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     citations: list[str] = Field(default_factory=list)
+    primary_evidence_ids: list[str] = Field(default_factory=list)
+    covered_concept_id: str | None = None
+    covered_claim_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +125,8 @@ class AgentKnowledgePatchResult:
     concept_id: str | None = None
     claim_id: str | None = None
     memory_id: str | None = None
+    covered_concept_id: str | None = None
+    covered_claim_id: str | None = None
     reason: str | None = None
 
 
@@ -155,9 +160,16 @@ class AgentKnowledgeBundleService:
         submitted_at = _utc(submitted_at)
         source_updated_at = _utc(source_updated_at) if source_updated_at is not None else None
         if proposal.action == "no_output":
+            covered_concept_id, covered_claim_id = await self._validated_covered_ids(
+                proposal=proposal,
+                owner_user_id=owner_user_id,
+                repo_identifier=repo_identifier,
+            )
             return AgentKnowledgePatchResult(
                 outcome="skipped_not_memory",
                 result_bucket="no_output",
+                covered_concept_id=covered_concept_id,
+                covered_claim_id=covered_claim_id,
                 reason=proposal.reason or "proposal returned no_output",
             )
         if not proposal.claim_text.strip():
@@ -821,6 +833,31 @@ class AgentKnowledgeBundleService:
             citations=[citation for claim in patched_claims for citation in merged_citations[claim["id"]]],
         )
 
+    async def _validated_covered_ids(
+        self,
+        *,
+        proposal: AgentKnowledgePatchProposal,
+        owner_user_id: str,
+        repo_identifier: str | None,
+    ) -> tuple[str | None, str | None]:
+        concept_id = proposal.covered_concept_id
+        claim_id = proposal.covered_claim_id
+        if not concept_id:
+            return None, None
+        concept = await self.db.get_agent_concept(concept_id)
+        if (
+            concept is None
+            or concept.get("owner_user_id") != owner_user_id
+            or concept.get("repo_identifier") != repo_identifier
+        ):
+            return None, None
+        if not claim_id:
+            return concept_id, None
+        claim = await self.db.get_agent_claim(claim_id)
+        if claim is None or claim.get("concept_id") != concept_id:
+            return concept_id, None
+        return concept_id, claim_id
+
 
 async def render_agent_knowledge_patch_prompt(
     *,
@@ -859,17 +896,27 @@ async def render_agent_knowledge_patch_prompt(
         )
 
     existing = "\n".join(concept_lines) if concept_lines else "- none"
-    evidence_lines = []
+    primary_lines = []
+    supporting_lines = []
     for event in events:
         name = event.get("name")
         label = event.get("kind", "event")
         if name:
             label = f"{label}:{name}"
+        evidence_id = event["evidence_id"]
         text = event.get("text") or event.get("summary") or json.dumps(event, ensure_ascii=False)
-        evidence_lines.append(f"[{label}] {text}")
-    evidence = "\n\n".join(evidence_lines)
+        line = f"[{evidence_id}:{label}] {text}"
+        if event.get("evidence_role") == "primary":
+            primary_lines.append(line)
+        else:
+            supporting_lines.append(line)
+    primary_evidence = "\n\n".join(primary_lines) or "- none"
+    supporting_evidence = "\n\n".join(supporting_lines) or "- none"
     if transcript_markdown.strip():
-        evidence = f"{evidence}\n\nFull transcript evidence:\n{transcript_markdown.strip()}".strip()
+        supporting_evidence = (
+            f"{supporting_evidence}\n\nFull transcript evidence (supporting only):\n"
+            f"{transcript_markdown.strip()}"
+        ).strip()
 
     return f"""You are updating a private MemForge agent-memory bundle for one user.
 
@@ -882,6 +929,11 @@ Decision boundary:
 - If it belongs in an existing concept but is a distinct durable claim, use add_new_claim and copy the exact concept_id.
 - If it is a new durable concept, use create_new_concept with a concise title and concept_type.
 - If nothing durable should be kept, use no_output.
+- Agent-session memory is user-anchored: non-no_output actions require at least one primary_evidence_ids entry from <primary_evidence>.
+- Primary evidence authorizes the durable claim. Supporting evidence can explain, qualify, or provide provenance, but Supporting evidence cannot by itself authorize create_new_concept or add_new_claim.
+- Intermediate assistant reasoning, self-verification, tool logs, command output, handoff summaries, and deployment narration are supporting evidence only unless a primary user turn authorizes the durable outcome.
+- If an existing listed claim, applied to the same situation, already predicts or covers the proposed statement, choose no_output and set covered_concept_id and covered_claim_id when known.
+- Use add_new_claim only when the statement is independently checkable and not implied by any listed claim in the same concept.
 - claim_text is the detailed atomic evidence statement. It may contain the full corrected rule or runbook step.
 - claim_text may keep evidence details such as branch names, exact test names, run-log fragments, implementation checklists, timestamps, and deployment or verification notes when they are useful provenance.
 - durable_claim is required for all non-no_output actions. It is the durable memory record to keep, and the service will render Memory.content from it.
@@ -908,10 +960,15 @@ Existing private concepts for this user and repo. Use these only to choose creat
 {existing}
 </comparison_context>
 
-<candidate_evidence>
-Canonical event evidence for this window. Create or update memory only when this evidence supports a clean durable_claim.
-{evidence or "- no evidence"}
-</candidate_evidence>
+<primary_evidence>
+User-active or explicit summary evidence that may authorize durable memory. Non-no_output actions must cite one or more IDs from this section in primary_evidence_ids.
+{primary_evidence}
+</primary_evidence>
+
+<supporting_evidence>
+Context, provenance, intermediate reasoning, logs, tests, tool output, or transcript detail. Use this to understand scope and evidence, but do not create memory from this section alone.
+{supporting_evidence}
+</supporting_evidence>
 """
 
 
