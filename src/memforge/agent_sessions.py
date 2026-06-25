@@ -19,9 +19,11 @@ from memforge.config import AppConfig
 from memforge.agent_knowledge import (
     AgentKnowledgeBundleService,
     AgentKnowledgePatchProposal,
+    render_agent_session_authority_prompt,
     render_agent_knowledge_patch_prompt,
 )
 from memforge.memory.project_resolver import resolve_project_key
+from memforge.llm.structured import AgentSessionAuthorityResponse
 from memforge.models import AgentHookReceipt, AgentSessionReceipt, content_hash, slugify
 from memforge.storage.database import Database
 
@@ -154,6 +156,7 @@ _TOOL_RESULT_TYPES = {
     "custom_tool_call_output",
 }
 _MAX_CANONICAL_EVENT_TEXT_CHARS = 4_000
+AGENT_SESSION_AUTHORITY_CLASSIFIER_MAX_TOKENS = 1024
 
 
 def _now_iso() -> str:
@@ -240,15 +243,23 @@ def canonicalize_agent_session_events(events: list[dict[str, Any]]) -> list[dict
         if canonical is not None:
             canonical["evidence_id"] = f"E{len(canonical_events) + 1}"
             canonical["evidence_role"] = _agent_session_evidence_role(canonical)
+            canonical["authority_candidate"] = _is_agent_session_authority_candidate(canonical)
             canonical_events.append(canonical)
     return canonical_events
 
 
 def _agent_session_evidence_role(event: dict[str, Any]) -> str:
-    """Return whether an event can authorize durable agent-session memory."""
-    if event.get("kind") == "user_message" and event.get("actor") == "user" and event.get("actor_is_explicit"):
-        return "primary"
+    """Return the initial evidence role before semantic authority classification."""
     return "supporting"
+
+
+def _is_agent_session_authority_candidate(event: dict[str, Any]) -> bool:
+    return (
+        event.get("kind") == "user_message"
+        and event.get("actor") == "user"
+        and event.get("actor_is_explicit")
+        and bool(event.get("text"))
+    )
 
 
 def _canonicalize_agent_session_event(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -322,6 +333,98 @@ def _primary_agent_session_evidence_ids(events: list[dict[str, Any]]) -> set[str
     }
 
 
+def _candidate_agent_session_authority_ids(events: list[dict[str, Any]]) -> set[str]:
+    return {
+        str(event["evidence_id"])
+        for event in events
+        if event.get("authority_candidate") and event.get("evidence_id")
+    }
+
+
+def _apply_agent_session_authority_response(
+    events: list[dict[str, Any]],
+    response: AgentSessionAuthorityResponse,
+) -> list[dict[str, Any]]:
+    """Return events with semantic authority decisions applied."""
+    candidate_ids = _candidate_agent_session_authority_ids(events)
+    seen_ids: set[str] = set()
+    authoritative_ids: set[str] = set()
+    unknown_ids: set[str] = set()
+    duplicate_ids: set[str] = set()
+    for decision in response.decisions:
+        evidence_id = decision.evidence_id.strip()
+        if evidence_id in seen_ids:
+            duplicate_ids.add(evidence_id)
+            continue
+        seen_ids.add(evidence_id)
+        if evidence_id not in candidate_ids:
+            unknown_ids.add(evidence_id)
+            continue
+        if decision.is_authoritative:
+            authoritative_ids.add(evidence_id)
+    missing_ids = candidate_ids - seen_ids
+    if missing_ids:
+        raise ValueError(
+            "authority classifier omitted candidate evidence ids: "
+            + ", ".join(sorted(missing_ids))
+        )
+    if unknown_ids:
+        raise ValueError(
+            "authority classifier returned non-candidate evidence ids: "
+            + ", ".join(sorted(unknown_ids))
+        )
+    if duplicate_ids:
+        raise ValueError(
+            "authority classifier returned duplicate evidence ids: "
+            + ", ".join(sorted(duplicate_ids))
+        )
+    classified_events = []
+    for event in events:
+        classified = dict(event)
+        classified["evidence_role"] = (
+            "primary" if classified.get("evidence_id") in authoritative_ids else "supporting"
+        )
+        classified_events.append(classified)
+    return classified_events
+
+
+async def _classify_agent_session_authority(
+    *,
+    structured_llm_client: Any,
+    owner_user_id: str,
+    client: str,
+    session_id: str,
+    trigger: str,
+    workspace: str,
+    repo_identifier: str | None,
+    branch: str | None,
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    candidate_ids = _candidate_agent_session_authority_ids(events)
+    if not candidate_ids:
+        return events
+    prompt = render_agent_session_authority_prompt(
+        owner_user_id=owner_user_id,
+        client=client,
+        session_id=session_id,
+        trigger=trigger,
+        workspace=workspace,
+        repo_identifier=repo_identifier,
+        branch=branch,
+        events=events,
+    )
+    generated = await structured_llm_client.classify_agent_session_evidence_authority(
+        prompt,
+        max_tokens=AGENT_SESSION_AUTHORITY_CLASSIFIER_MAX_TOKENS,
+    )
+    response = (
+        generated
+        if isinstance(generated, AgentSessionAuthorityResponse)
+        else AgentSessionAuthorityResponse.model_validate(generated)
+    )
+    return _apply_agent_session_authority_response(events, response)
+
+
 def _agent_patch_primary_evidence_error(
     proposal: AgentKnowledgePatchProposal,
     events: list[dict[str, Any]],
@@ -378,8 +481,8 @@ def build_agent_session_doc_id(
     trigger: str,
     workspace: str,
     history_window_kind: str,
-    history_window_start: str | None,
-    history_window_end: str | None,
+    history_window_start: object | None,
+    history_window_end: object | None,
     window_hash: str | None = None,
 ) -> str:
     """Build a stable document id for one client history window.
@@ -396,8 +499,8 @@ def build_agent_session_doc_id(
             trigger.strip(),
             workspace.strip(),
             history_window_kind.strip(),
-            history_window_start or "",
-            history_window_end or "",
+            "" if history_window_start is None else str(history_window_start),
+            "" if history_window_end is None else str(history_window_end),
             window_hash or "",
         ]
     )
@@ -902,9 +1005,31 @@ async def submit_agent_session_window(
         raise ValueError("agent session window summarization LLM unavailable")
 
     repo_identifier = normalize_repo_identifier(repo)
+    owner_user_id = user_id or "local"
+    try:
+        canonical_events = await _classify_agent_session_authority(
+            structured_llm_client=structured_llm_client,
+            owner_user_id=owner_user_id,
+            client=client,
+            session_id=session_id,
+            trigger=trigger,
+            workspace=workspace,
+            repo_identifier=repo_identifier,
+            branch=branch,
+            events=canonical_events,
+        )
+    except Exception as exc:
+        await _record_window_outcome(
+            db=db,
+            **outcome_identity,
+            outcome="failed",
+            reason=f"{type(exc).__name__}: {exc}"[:500],
+        )
+        raise
+
     prompt = await render_agent_knowledge_patch_prompt(
         db=db,
-        owner_user_id=user_id or "local",
+        owner_user_id=owner_user_id,
         client=client,
         session_id=session_id,
         trigger=trigger,
@@ -963,7 +1088,7 @@ async def submit_agent_session_window(
         patch_service = AgentKnowledgeBundleService(db=db, memory_store=memory_store)
         patch = await patch_service.apply_patch_proposal(
             proposal=proposal,
-            owner_user_id=user_id or "local",
+            owner_user_id=owner_user_id,
             source_id=agent_session_source_id(client),
             client=client,
             session_id=session_id,
@@ -1012,7 +1137,7 @@ async def submit_agent_session_window(
     try:
         patch = await patch_service.apply_patch_proposal(
             proposal=proposal,
-            owner_user_id=user_id or "local",
+            owner_user_id=owner_user_id,
             source_id=agent_session_source_id(client),
             client=client,
             session_id=session_id,
