@@ -191,6 +191,8 @@ def _issue_content_item(issue: dict, base_url: str) -> ContentItem:
     updated_str = fields.get("updated", "")
     try:
         last_modified = datetime.fromisoformat(updated_str.replace("Z", "+00:00"))
+        if last_modified.tzinfo is None or last_modified.utcoffset() is None:
+            last_modified = last_modified.replace(tzinfo=timezone.utc)
     except (ValueError, AttributeError):
         last_modified = datetime.now(timezone.utc)
     assignee = fields.get("assignee") or {}

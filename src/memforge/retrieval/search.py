@@ -1094,11 +1094,7 @@ def _compute_freshness(memory: Memory, has_source: bool) -> str:
         return "stale"
 
     if memory.valid_until:
-        now = datetime.now(timezone.utc)
-        vu = memory.valid_until
-        if vu.tzinfo is None:
-            vu = vu.replace(tzinfo=timezone.utc)
-        if now > vu:
+        if datetime.now(timezone.utc).date() > memory.valid_until:
             return "stale"
 
     return "current"

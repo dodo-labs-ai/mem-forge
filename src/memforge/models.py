@@ -10,7 +10,7 @@ import re
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from typing import Literal
 
@@ -178,8 +178,8 @@ class Memory:
     confidence: float = 0.7
     corroboration_count: int = 1
     contradiction_count: int = 0
-    valid_from: datetime | None = None
-    valid_until: datetime | None = None
+    valid_from: date | None = None
+    valid_until: date | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

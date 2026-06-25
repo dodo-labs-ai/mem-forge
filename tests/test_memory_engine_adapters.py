@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -159,6 +159,50 @@ async def test_process_memories_persists_explicit_source_updated_at(db, monkeypa
     [memory] = await db.get_memories_by_source_doc("doc-observed")
     [source] = await db.get_memory_sources(memory.id)
     assert source.source_updated_at == observed_at
+
+
+@pytest.mark.asyncio
+async def test_process_memories_stores_validity_as_dates(db, monkeypatch):
+    collection = RecordingCollection()
+    adapters = build_sqlite_adapters(db, collection)
+    store = MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+    )
+
+    async def fake_embed(text: str):
+        return [0.1]
+
+    monkeypatch.setattr(store, "_embed", fake_embed)
+    await _document(db, "doc-validity")
+
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+    )
+
+    stats = await engine.process_memories(
+        doc_id="doc-validity",
+        raw_memories=[
+            RawMemory(
+                content="Memory validity is a calendar-date contract.",
+                memory_type="fact",
+                valid_from="2026-06-01",
+                valid_until="2026-06-30T12:00:00+08:00",
+            )
+        ],
+        source_type="jira",
+        source_updated_at=None,
+    )
+
+    assert stats["inserted"] == 1
+    [memory] = await db.get_memories_by_source_doc("doc-validity")
+    assert memory.valid_from == date(2026, 6, 1)
+    assert memory.valid_until == date(2026, 6, 30)
 
 
 @pytest.mark.asyncio
