@@ -1116,6 +1116,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
 
     assert "search" in tools
     assert "list_recent_changes" not in tools
+    assert "submit_agent_session_document" not in tools
 
     search_schema = tools["search"]["inputSchema"]
     properties = search_schema["properties"]

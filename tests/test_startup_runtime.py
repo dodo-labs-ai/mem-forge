@@ -570,7 +570,7 @@ def test_admin_source_sync_rejects_paused_source(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_agent_session_document_intake_rejects_paused_source(db, tmp_path):
+async def test_agent_session_document_intake_is_retired_before_source_status(db, tmp_path):
     from memforge.agent_sessions import agent_session_source_id
     from memforge.server.admin_api import create_admin_app
 
@@ -597,8 +597,8 @@ async def test_agent_session_document_intake_rejects_paused_source(db, tmp_path)
             },
         )
 
-    assert response.status_code == 400
-    assert response.json()["detail"] == "Source is paused"
+    assert response.status_code == 410
+    assert "agent-session document intake has been retired" in response.json()["detail"]
 
 
 @pytest.mark.asyncio

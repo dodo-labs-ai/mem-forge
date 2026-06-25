@@ -229,13 +229,26 @@ def redact_agent_session_payload(value: Any) -> Any:
 
 
 def canonicalize_agent_session_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return the service-owned evidence stream used for package generation."""
+    """Return the service-owned evidence stream used for package generation.
+
+    Evidence IDs are local to one canonicalized submission. They are prompt
+    handles, not persistent identifiers for historical rows.
+    """
     canonical_events: list[dict[str, Any]] = []
     for event in events:
         canonical = _canonicalize_agent_session_event(event)
         if canonical is not None:
+            canonical["evidence_id"] = f"E{len(canonical_events) + 1}"
+            canonical["evidence_role"] = _agent_session_evidence_role(canonical)
             canonical_events.append(canonical)
     return canonical_events
+
+
+def _agent_session_evidence_role(event: dict[str, Any]) -> str:
+    """Return whether an event can authorize durable agent-session memory."""
+    if event.get("kind") == "user_message" and event.get("actor") == "user" and event.get("actor_is_explicit"):
+        return "primary"
+    return "supporting"
 
 
 def _canonicalize_agent_session_event(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -262,6 +275,7 @@ def _canonicalize_agent_session_event(event: dict[str, Any]) -> dict[str, Any] |
     canonical: dict[str, Any] = {
         "kind": kind,
         "actor": role or _default_actor_for_kind(kind),
+        "actor_is_explicit": bool(role),
     }
     if name:
         canonical["name"] = name
@@ -298,6 +312,29 @@ def _infer_agent_session_event_kind(
     if role == "assistant" or candidate == "assistant":
         return "assistant_message", "assistant"
     return None, role
+
+
+def _primary_agent_session_evidence_ids(events: list[dict[str, Any]]) -> set[str]:
+    return {
+        str(event["evidence_id"])
+        for event in events
+        if event.get("evidence_role") == "primary" and event.get("evidence_id")
+    }
+
+
+def _agent_patch_primary_evidence_error(
+    proposal: AgentKnowledgePatchProposal,
+    events: list[dict[str, Any]],
+) -> str | None:
+    if proposal.action == "no_output":
+        return None
+    primary_ids = _primary_agent_session_evidence_ids(events)
+    cited_primary_ids = {evidence_id.strip() for evidence_id in proposal.primary_evidence_ids if evidence_id.strip()}
+    if not cited_primary_ids:
+        return "Agent-session patch has no primary evidence authorization."
+    if not cited_primary_ids <= primary_ids:
+        return "Agent-session patch cites non-primary evidence as authorization."
+    return None
 
 
 def _default_actor_for_kind(kind: str) -> str:
@@ -743,7 +780,15 @@ async def _existing_window_result(
         "process_now": False,
         "idempotent": True,
     }
-    for key in ("patch_outcome", "concept_id", "claim_id", "memory_id", "reason"):
+    for key in (
+        "patch_outcome",
+        "concept_id",
+        "claim_id",
+        "memory_id",
+        "covered_concept_id",
+        "covered_claim_id",
+        "reason",
+    ):
         if key in metadata:
             result[key] = metadata[key]
     return result
@@ -905,6 +950,15 @@ async def submit_agent_session_window(
     if citation not in proposal.citations:
         proposal.citations.append(citation)
 
+    primary_evidence_error = _agent_patch_primary_evidence_error(proposal, canonical_events)
+    if primary_evidence_error:
+        proposal = AgentKnowledgePatchProposal(
+            action="no_output",
+            reason=primary_evidence_error,
+            covered_concept_id=proposal.covered_concept_id,
+            covered_claim_id=proposal.covered_claim_id,
+        )
+
     if proposal.action == "no_output":
         patch_service = AgentKnowledgeBundleService(db=db, memory_store=memory_store)
         patch = await patch_service.apply_patch_proposal(
@@ -929,7 +983,11 @@ async def submit_agent_session_window(
             **outcome_identity,
             outcome="no_output",
             reason=reason,
-            metadata={"patch_outcome": patch.outcome},
+            metadata={
+                "patch_outcome": patch.outcome,
+                "covered_concept_id": patch.covered_concept_id,
+                "covered_claim_id": patch.covered_claim_id,
+            },
         )
         return {
             "accepted": True,
@@ -938,6 +996,8 @@ async def submit_agent_session_window(
             "result": "no_output",
             "patch_outcome": patch.outcome,
             "reason": reason,
+            "covered_concept_id": patch.covered_concept_id,
+            "covered_claim_id": patch.covered_claim_id,
         }
 
     source = await ensure_agent_session_source(db, config, client=client)
