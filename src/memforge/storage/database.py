@@ -4091,6 +4091,16 @@ class Database:
                 )
         return results
 
+    async def get_memory_ids_for_doc(self, doc_id: str) -> list[str]:
+        ids: list[str] = []
+        async with self.db.execute(
+            "SELECT memory_id FROM memory_sources WHERE doc_id = ?",
+            (doc_id,),
+        ) as cursor:
+            async for row in cursor:
+                ids.append(str(row[0]))
+        return list(dict.fromkeys(ids))
+
     # ==================================================================
     # Agent Knowledge Bundle
     # ==================================================================

@@ -2114,17 +2114,8 @@ class MemoryStore:
             raise
 
     async def _memory_ids_for_doc(self, doc_id: str) -> list[str]:
-        """Document-cascade row lookup. Reads provenance rows through the bound
-        connection: a row helper, not a retrieval channel, so it stays outside
-        the adapters in this phase."""
-        ids: list[str] = []
-        async with self.db.db.execute(
-            "SELECT memory_id FROM memory_sources WHERE doc_id = ?",
-            (doc_id,),
-        ) as cursor:
-            async for row in cursor:
-                ids.append(row[0])
-        return list(dict.fromkeys(ids))
+        """Return memories linked to a document through the storage contract."""
+        return await self.db.get_memory_ids_for_doc(doc_id)
 
     async def _memory_ids_for_docs(self, doc_ids: list[str]) -> list[str]:
         ids: list[str] = []
