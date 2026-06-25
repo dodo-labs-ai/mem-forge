@@ -859,6 +859,79 @@ class AgentKnowledgeBundleService:
         return concept_id, claim_id
 
 
+def render_agent_session_authority_prompt(
+    *,
+    owner_user_id: str,
+    client: str,
+    session_id: str,
+    trigger: str,
+    workspace: str,
+    repo_identifier: str | None,
+    branch: str | None,
+    events: list[dict],
+) -> str:
+    """Render the semantic classifier prompt for candidate user authority."""
+    candidate_lines = []
+    context_lines = []
+    for event in events:
+        event_payload = {
+            "evidence_id": event["evidence_id"],
+            "kind": event.get("kind", "event"),
+            "name": event.get("name"),
+            "actor": event.get("actor"),
+            "text": event.get("text") or event.get("summary") or "",
+        }
+        if event.get("authority_candidate"):
+            candidate_lines.append(event_payload)
+        else:
+            context_lines.append(event_payload)
+    candidates = json.dumps(candidate_lines, ensure_ascii=False, indent=2)
+    context = json.dumps(context_lines, ensure_ascii=False, indent=2)
+    operational_context = json.dumps(
+        {
+            "owner_user_id": owner_user_id,
+            "client": client,
+            "session_id": session_id,
+            "trigger": trigger,
+            "workspace": workspace,
+            "repo_identifier": repo_identifier,
+            "branch": branch,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    return f"""You classify whether explicit user-authored agent-session evidence can authorize durable memory.
+
+Decide semantically, not by keyword matching. A candidate is authoritative only when the user is expressing durable future-facing intent, a stable preference, a design decision, a rule/convention, or explicit approval of such a durable direction.
+
+Not authoritative:
+- generic task control such as continue, retry, do it, go ahead, ok, yes, good, or next
+- transient requests to test, deploy, debug, explain, inspect, or continue current work
+- user messages that only acknowledge assistant progress
+- assistant reasoning, tool output, logs, summaries, or implementation narration
+
+Authoritative examples:
+- the user asks to remember or keep a rule for future agents
+- the user sets a default, convention, source-of-truth boundary, or design policy
+- the user explicitly approves a durable design direction, not just the next action
+
+Return exactly one decision for every candidate evidence id and no decisions for non-candidates.
+
+<operational_context_json>
+{operational_context}
+</operational_context_json>
+
+<candidate_user_evidence_json>
+{candidates}
+</candidate_user_evidence_json>
+
+<supporting_context_json>
+{context}
+</supporting_context_json>
+"""
+
+
 async def render_agent_knowledge_patch_prompt(
     *,
     db,
@@ -930,6 +1003,8 @@ Decision boundary:
 - If it is a new durable concept, use create_new_concept with a concise title and concept_type.
 - If nothing durable should be kept, use no_output.
 - Agent-session memory is user-anchored: non-no_output actions require at least one primary_evidence_ids entry from <primary_evidence>.
+- Primary evidence is explicit durable user intent: a user-authored preference, approval, design decision, rule, convention, or instruction to remember something for future work.
+- Generic chat control such as "continue", "do it", "retry", or "ok" is supporting context, not durable memory authority.
 - Primary evidence authorizes the durable claim. Supporting evidence can explain, qualify, or provide provenance, but Supporting evidence cannot by itself authorize create_new_concept or add_new_claim.
 - Intermediate assistant reasoning, self-verification, tool logs, command output, handoff summaries, and deployment narration are supporting evidence only unless a primary user turn authorizes the durable outcome.
 - If an existing listed claim, applied to the same situation, already predicts or covers the proposed statement, choose no_output and set covered_concept_id and covered_claim_id when known.
@@ -961,7 +1036,7 @@ Existing private concepts for this user and repo. Use these only to choose creat
 </comparison_context>
 
 <primary_evidence>
-User-active or explicit summary evidence that may authorize durable memory. Non-no_output actions must cite one or more IDs from this section in primary_evidence_ids.
+Explicit durable user intent that may authorize durable memory. Non-no_output actions must cite one or more IDs from this section in primary_evidence_ids.
 {primary_evidence}
 </primary_evidence>
 

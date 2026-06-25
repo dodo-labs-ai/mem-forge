@@ -1441,6 +1441,8 @@ async def test_agent_memory_prompt_uses_primary_evidence_as_authorization_bounda
     assert "[E1:assistant_message] I verified the prompt tests" in prompt
     assert "<candidate_evidence>" not in prompt
     assert "Supporting evidence cannot by itself authorize create_new_concept or add_new_claim" in prompt
+    assert "Primary evidence is explicit durable user intent" in prompt
+    assert 'Generic chat control such as "continue", "do it", "retry", or "ok"' in prompt
     assert "primary_evidence_ids" in prompt
 
 

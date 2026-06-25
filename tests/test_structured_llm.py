@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from memforge.llm.structured import (
+    AgentSessionAuthorityResponse,
     ContradictionResponse,
     EntityValidationResponse,
     EnrichmentResponse,
@@ -74,6 +75,61 @@ def test_source_support_response_rejects_top_level_array():
         SourceSupportResponse.model_validate([
             {"memory_id": "mem-1", "supported": True}
         ])
+
+
+def test_agent_session_authority_response_accepts_typed_decisions():
+    response = AgentSessionAuthorityResponse.model_validate(
+        {
+            "decisions": [
+                {
+                    "evidence_id": "E1",
+                    "is_authoritative": True,
+                    "authority_kind": "durable_user_intent",
+                    "reason": "user explicitly set a durable convention",
+                },
+                {
+                    "evidence_id": "E2",
+                    "is_authoritative": False,
+                    "authority_kind": "not_authoritative",
+                    "reason": "generic continuation",
+                },
+            ]
+        }
+    )
+
+    assert response.decisions[0].evidence_id == "E1"
+    assert response.decisions[0].is_authoritative is True
+    assert response.decisions[1].authority_kind == "not_authoritative"
+
+
+def test_agent_session_authority_response_rejects_contradictory_decisions():
+    with pytest.raises(ValidationError):
+        AgentSessionAuthorityResponse.model_validate(
+            {
+                "decisions": [
+                    {
+                        "evidence_id": "E1",
+                        "is_authoritative": True,
+                        "authority_kind": "not_authoritative",
+                        "reason": "contradictory",
+                    }
+                ]
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        AgentSessionAuthorityResponse.model_validate(
+            {
+                "decisions": [
+                    {
+                        "evidence_id": "E2",
+                        "is_authoritative": False,
+                        "authority_kind": "design_decision",
+                        "reason": "contradictory",
+                    }
+                ]
+            }
+        )
 
 
 def test_memory_extraction_response_accepts_memory_list():
@@ -188,6 +244,62 @@ async def test_litellm_structured_client_uses_response_schema_for_memory_extract
     assert "tools" not in calls[0]
     assert "tool_choice" not in calls[0]
     assert calls[0]["max_tokens"] == 8192
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_uses_response_schema_for_agent_session_authority(monkeypatch):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse(
+            '{"decisions":[{"evidence_id":"E1","is_authoritative":true,'
+            '"authority_kind":"durable_user_intent","reason":"explicit user rule"}]}'
+        )
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url="http://localhost:6655/anthropic",
+            api_key="local-key",
+            timeout_s=120.0,
+        )
+    )
+
+    response = await client.classify_agent_session_evidence_authority("prompt", max_tokens=1024)
+
+    assert response.decisions[0].evidence_id == "E1"
+    assert calls[0]["messages"] == [{"role": "user", "content": "prompt"}]
+    assert calls[0]["response_format"] is AgentSessionAuthorityResponse
+    assert calls[0]["max_tokens"] == 1024
+
+
+@pytest.mark.asyncio
+async def test_agent_session_authority_classifier_does_not_retry_native_schema_failure(monkeypatch):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("native schema rejected")
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url="http://localhost:6655/anthropic",
+            api_key="local-key",
+            timeout_s=120.0,
+        )
+    )
+
+    with pytest.raises(StructuredLlmError):
+        await client.classify_agent_session_evidence_authority("prompt", max_tokens=1024)
+
+    assert len(calls) == 1
+    assert calls[0]["response_format"] is AgentSessionAuthorityResponse
 
 
 @pytest.mark.asyncio

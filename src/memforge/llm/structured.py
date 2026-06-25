@@ -76,6 +76,41 @@ class SourceSupportResponse(StructuredResponseModel):
     decisions: list[SourceSupportDecision]
 
 
+class AgentSessionAuthorityDecision(StructuredResponseModel):
+    """One semantic authority decision for a candidate agent-session user event."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str = Field(min_length=1)
+    is_authoritative: bool
+    authority_kind: Literal[
+        "durable_user_intent",
+        "future_memory_intent",
+        "durable_preference",
+        "design_decision",
+        "rule_or_convention",
+        "approval_of_durable_direction",
+        "not_authoritative",
+    ]
+    reason: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _authority_kind_matches_decision(self):
+        if self.is_authoritative and self.authority_kind == "not_authoritative":
+            raise ValueError("authoritative decisions require an authoritative authority_kind")
+        if not self.is_authoritative and self.authority_kind != "not_authoritative":
+            raise ValueError("non-authoritative decisions require authority_kind='not_authoritative'")
+        return self
+
+
+class AgentSessionAuthorityResponse(StructuredResponseModel):
+    """Schema returned by agent-session authority classification."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: list[AgentSessionAuthorityDecision]
+
+
 class EnrichmentEntity(StructuredResponseModel):
     """One entity identified during document enrichment."""
 
@@ -319,6 +354,15 @@ class SourceSupportStructuredClient(Protocol):
     ):
         """Return a private agent-knowledge patch proposal."""
 
+    async def classify_agent_session_evidence_authority(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 1024,
+        model: str | None = None,
+    ) -> AgentSessionAuthorityResponse:
+        """Return semantic authority decisions for candidate user evidence."""
+
 
 class StructuredLlmError(RuntimeError):
     """Raised when a required structured LLM call cannot produce valid schema output."""
@@ -539,6 +583,21 @@ class LiteLlmStructuredClient:
             model=model,
         )
 
+    async def classify_agent_session_evidence_authority(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 1024,
+        model: str | None = None,
+    ) -> AgentSessionAuthorityResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=AgentSessionAuthorityResponse,
+            max_tokens=max_tokens,
+            model=model,
+            retry_with_json_text=False,
+        )
+
     async def _call_schema(
         self,
         *,
@@ -546,6 +605,7 @@ class LiteLlmStructuredClient:
         response_format: type[BaseModel],
         max_tokens: int,
         model: str | None = None,
+        retry_with_json_text: bool = True,
     ):
         model_name = litellm_model_name(model or self.config.model)
         if not _supports_native_response_schema(model_name):
@@ -575,6 +635,8 @@ class LiteLlmStructuredClient:
                 native_schema=True,
             )
         except Exception as schema_exc:
+            if not retry_with_json_text:
+                raise StructuredLlmError(str(schema_exc)) from schema_exc
             logger.warning(
                 "Structured LLM response_schema attempt failed for model %s and schema %s; "
                 "retrying with JSON-text schema: %s: %s",
