@@ -13,7 +13,7 @@ import logging
 import sqlite3
 import uuid
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -190,6 +190,10 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _today_iso() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
 def _utc_iso(dt: datetime | None) -> str:
     value = dt or datetime.now(timezone.utc)
     if value.tzinfo is None or value.utcoffset() is None:
@@ -207,6 +211,12 @@ def _parse_dt(s: str | None) -> datetime | None:
     if not s:
         return None
     return datetime.fromisoformat(s)
+
+
+def _parse_date(s: str | None) -> date | None:
+    if not s:
+        return None
+    return date.fromisoformat(str(s)[:10])
 
 
 def _source_schedule_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -3573,7 +3583,15 @@ class Database:
                 status = 'superseded', superseded_by = ?, valid_until = ?,
                 superseded_at = ?, replacement_reason = ?, replacement_kind = ?, updated_at = ?
                WHERE id = ?""",
-            (new_memory.id, now, now, replacement_reason, replacement_kind, now, old_id),
+            (
+                new_memory.id,
+                _today_iso(),
+                now,
+                replacement_reason,
+                replacement_kind,
+                now,
+                old_id,
+            ),
         )
         await self._rebuild_memory_fts_unlocked(
             new_memory.id,
@@ -3695,7 +3713,15 @@ class Database:
                     status = 'superseded', superseded_by = ?, superseded_at = ?,
                     valid_until = ?, replacement_reason = ?, replacement_kind = ?, updated_at = ?
                    WHERE id = ?""",
-                (challenger.id, now, now, replacement_reason, replacement_kind, now, incumbent_id),
+                (
+                    challenger.id,
+                    now,
+                    _today_iso(),
+                    replacement_reason,
+                    replacement_kind,
+                    now,
+                    incumbent_id,
+                ),
             )
             await self.db.execute(
                 "DELETE FROM memories_fts WHERE memory_id = ?",
@@ -3918,9 +3944,10 @@ class Database:
         return results
 
     async def retire_expired_memories(self) -> int:
-        """Retire active memories whose ``valid_until`` timestamp has passed."""
+        """Retire active memories whose ``valid_until`` date has passed."""
         async with self._write_lock:
             now = _now_iso()
+            today = _today_iso()
             cursor = await self.db.execute(
                 """UPDATE memories SET
                     status = 'retired', retirement_reason = 'expired',
@@ -3928,21 +3955,21 @@ class Database:
                    WHERE status = 'active'
                    AND valid_until IS NOT NULL
                    AND valid_until < ?""",
-                (now, now, now),
+                (now, now, today),
             )
             await self.db.commit()
             return cursor.rowcount
 
     async def get_expired_memories(self) -> list[Memory]:
-        """Return active memories whose valid_until has passed."""
+        """Return active memories whose valid_until date has passed."""
         results: list[Memory] = []
-        now = _now_iso()
+        today = _today_iso()
         async with self.db.execute(
             """SELECT * FROM memories
                WHERE status = 'active'
                AND valid_until IS NOT NULL
                AND valid_until < ?""",
-            (now,),
+            (today,),
         ) as cursor:
             async for row in cursor:
                 results.append(self._row_to_memory(row))
@@ -6922,8 +6949,8 @@ class Database:
             confidence=d["confidence"],
             corroboration_count=d["corroboration_count"],
             contradiction_count=d["contradiction_count"],
-            valid_from=_parse_dt(d.get("valid_from")),
-            valid_until=_parse_dt(d.get("valid_until")),
+            valid_from=_parse_date(d.get("valid_from")),
+            valid_until=_parse_date(d.get("valid_until")),
             superseded_by=d.get("superseded_by"),
             status=d["status"],
             retirement_reason=d.get("retirement_reason"),

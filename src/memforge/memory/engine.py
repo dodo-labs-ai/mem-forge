@@ -8,7 +8,7 @@ persisted, deduplicated, entity-linked memories.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 
@@ -238,8 +238,8 @@ class MemoryEngine:
                 confidence=raw.confidence,
                 corroboration_count=1,
                 contradiction_count=0,
-                valid_from=_parse_datetime(raw.valid_from),
-                valid_until=_parse_datetime(raw.valid_until),
+                valid_from=_parse_date(raw.valid_from),
+                valid_until=_parse_date(raw.valid_until),
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
                 status="active",
@@ -1196,8 +1196,8 @@ class MemoryEngine:
             confidence=raw.confidence,
             corroboration_count=1,
             contradiction_count=0,
-            valid_from=_parse_datetime(raw.valid_from),
-            valid_until=_parse_datetime(raw.valid_until),
+            valid_from=_parse_date(raw.valid_from),
+            valid_until=_parse_date(raw.valid_until),
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
             status="active",
@@ -1568,11 +1568,11 @@ def _document_relation_run_id(
     )
 
 
-def _parse_datetime(value: str | None) -> datetime | None:
-    """Parse an ISO datetime string, returning None on failure."""
+def _parse_date(value: str | None) -> date | None:
+    """Parse an ISO date or datetime string into a calendar date."""
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        return date.fromisoformat(value[:10])
     except (ValueError, TypeError):
         return None

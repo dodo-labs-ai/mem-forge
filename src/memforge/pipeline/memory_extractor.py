@@ -61,8 +61,8 @@ Extract durable atomic knowledge units justified by the document. Returning an e
 - "confidence": 0.0-1.0 (use high confidence only when the source directly states durable domain knowledge)
 - "entity_refs": list of key entity names (use the canonical names from <entities_found>)
 - "tags": {tag_min}-{tag_max} lowercase topic tags
-- "valid_from": ISO date if time-bound, null otherwise
-- "valid_until": ISO date if time-bound, null otherwise
+- "valid_from": YYYY-MM-DD calendar date if time-bound, null otherwise
+- "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "extraction_context": exact quote from the document this was extracted from (max {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix (e.g. "**Alice** (10:05): the actual message content")
 
 Top rules (apply these first; reject candidates that fail any of them):
@@ -124,8 +124,8 @@ For changed durable knowledge, return JSON objects with:
 - "confidence": 0.0-1.0
 - "entity_refs": list of key entity names (use the canonical names from <entities_found>)
 - "tags": {tag_min}-{tag_max} lowercase topic tags
-- "valid_from": ISO date if time-bound, null otherwise
-- "valid_until": ISO date if time-bound, null otherwise
+- "valid_from": YYYY-MM-DD calendar date if time-bound, null otherwise
+- "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "extraction_context": exact quote from the updated document this was extracted from (max {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix from the updated document.
 
 Top rules (apply these first; reject candidates that fail any of them):
@@ -189,8 +189,8 @@ Each memory must be a JSON object with:
 - "confidence": 0.0-1.0
 - "entity_refs": list of key entity names from <entities_found>
 - "tags": {tag_min}-{tag_max} lowercase topic tags
-- "valid_from": ISO date if time-bound, null otherwise
-- "valid_until": ISO date if time-bound, null otherwise
+- "valid_from": YYYY-MM-DD calendar date if time-bound, null otherwise
+- "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "extraction_context": exact quote from <unit_markdown> (max {quote_max} chars)
 - "evidence_quote": exact quote copied from <unit_markdown>
 - "evidence_anchor": "unit"

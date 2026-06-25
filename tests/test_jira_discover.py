@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import timezone
+
 from memforge.genes.jira_gene import _issue_content_item
 
 
@@ -53,3 +55,18 @@ def test_maps_populated_fields():
     assert item.extra["status"] == "Open"
     assert item.extra["priority"] == "High"
     assert item.extra["issue_type"] == "Story"
+
+
+def test_treats_offsetless_updated_timestamp_as_utc():
+    issue = {
+        "key": "PROJ-3",
+        "fields": {
+            "summary": "Offsetless timestamp",
+            "updated": "2026-06-01T12:00:00.000",
+        },
+    }
+
+    item = _issue_content_item(issue, "https://jira.example")
+
+    assert item.last_modified.tzinfo is timezone.utc
+    assert item.last_modified.isoformat() == "2026-06-01T12:00:00+00:00"

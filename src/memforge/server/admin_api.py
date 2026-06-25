@@ -14,7 +14,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -1580,10 +1580,12 @@ def _config_contains_secret(config: dict[str, Any], secret_fields: tuple[str, ..
     return False
 
 
-def _dt_iso(dt: datetime | None) -> str | None:
-    """Convert a datetime to ISO string, or None."""
+def _dt_iso(dt: date | datetime | None) -> str | None:
+    """Convert a date or datetime to an ISO string, or None."""
     if dt is None:
         return None
+    if isinstance(dt, date) and not isinstance(dt, datetime):
+        return dt.isoformat()
     value = dt
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
