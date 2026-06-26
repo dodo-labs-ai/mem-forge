@@ -691,8 +691,15 @@ def sync(ctx, source: str | None):
 )
 @click.option("--source", "sources", multiple=True, help="Filter by source name or ID. Repeat for multiple sources.")
 @click.option("--entity", "entities", multiple=True, help="Entity hint. Repeat for multiple entities.")
-@click.option("--after", default=None, help="Only include results after this ISO date.")
-@click.option("--before", default=None, help="Only include results before this ISO date.")
+@click.option("--start-date", default=None, help="Optional YYYY-MM-DD lower bound for date filtering.")
+@click.option("--end-date", default=None, help="Optional YYYY-MM-DD upper bound for date filtering.")
+@click.option(
+    "--date-type",
+    default="source_updated_at",
+    show_default=True,
+    type=click.Choice(["source_updated_at", "memory_updated_at"]),
+    help="Date field to filter when --start-date or --end-date is provided.",
+)
 @click.option("--include-superseded", is_flag=True, help="Include superseded memories.")
 @click.pass_context
 def search(
@@ -702,12 +709,21 @@ def search(
     memory_types: tuple[str, ...],
     sources: tuple[str, ...],
     entities: tuple[str, ...],
-    after: str | None,
-    before: str | None,
+    start_date: str | None,
+    end_date: str | None,
+    date_type: str,
     include_superseded: bool,
 ):
     """Search MemForge using the same service path as the MCP search tool."""
-    time_range = {k: v for k, v in {"after": after, "before": before}.items() if v}
+    time_range = (
+        {
+            k: v
+            for k, v in {"date_type": date_type, "start_date": start_date, "end_date": end_date}.items()
+            if v
+        }
+        if start_date or end_date
+        else {}
+    )
     kwargs: dict = {
         "query": query,
         "top_k": top_k,
@@ -769,8 +785,15 @@ def memory():
 )
 @click.option("--source", "sources", multiple=True, help="Filter by source name or ID. Repeat for multiple sources.")
 @click.option("--entity", "entities", multiple=True, help="Entity hint. Repeat for multiple entities.")
-@click.option("--after", default=None, help="Only include results after this ISO date.")
-@click.option("--before", default=None, help="Only include results before this ISO date.")
+@click.option("--start-date", default=None, help="Optional YYYY-MM-DD lower bound for date filtering.")
+@click.option("--end-date", default=None, help="Optional YYYY-MM-DD upper bound for date filtering.")
+@click.option(
+    "--date-type",
+    default="source_updated_at",
+    show_default=True,
+    type=click.Choice(["source_updated_at", "memory_updated_at"]),
+    help="Date field to filter when --start-date or --end-date is provided.",
+)
 @click.option("--include-superseded", is_flag=True, help="Include superseded memories.")
 @click.pass_context
 def memory_search(
@@ -780,12 +803,21 @@ def memory_search(
     memory_types: tuple[str, ...],
     sources: tuple[str, ...],
     entities: tuple[str, ...],
-    after: str | None,
-    before: str | None,
+    start_date: str | None,
+    end_date: str | None,
+    date_type: str,
     include_superseded: bool,
 ):
     """Search MemForge memories."""
-    time_range = {k: v for k, v in {"after": after, "before": before}.items() if v}
+    time_range = (
+        {
+            k: v
+            for k, v in {"date_type": date_type, "start_date": start_date, "end_date": end_date}.items()
+            if v
+        }
+        if start_date or end_date
+        else {}
+    )
     kwargs: dict = {
         "query": query,
         "top_k": top_k,

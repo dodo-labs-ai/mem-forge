@@ -89,6 +89,8 @@ def make_memory(
     owner_user_id: str | None = None,
     project_key: str | None = None,
     repo_identifier: str | None = None,
+    created_at: datetime | None = None,
+    updated_at: datetime | None = None,
 ) -> Memory:
     """Build a Memory with stamped timestamps and a derived content hash.
 
@@ -110,8 +112,8 @@ def make_memory(
         project_key=project_key,
         repo_identifier=repo_identifier,
         confidence=0.9,
-        created_at=now,
-        updated_at=now,
+        created_at=created_at or now,
+        updated_at=updated_at or now,
         status=status,
     )
 

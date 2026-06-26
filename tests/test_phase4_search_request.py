@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from memforge.server.admin_api import MemorySearchRequest
@@ -87,3 +89,47 @@ def test_search_request_rejects_unknown_memory_type():
 def test_search_request_rejects_unknown_status():
     with pytest.raises(Exception):
         MemorySearchRequest(query="test", status="resolved")
+
+
+def test_time_range_accepts_date_only_open_ended_bounds():
+    req = MemorySearchRequest(
+        query="jira memories",
+        time_range={"start_date": "2026-06-19", "date_type": "source_updated_at"},
+    )
+
+    assert req.time_range is not None
+    assert req.time_range.start_date.isoformat() == "2026-06-19"
+    assert req.time_range.end_date is None
+    converted = req.time_range.to_time_range()
+    assert converted.date_type == "source_updated_at"
+    assert converted.after == datetime(2026, 6, 19, tzinfo=timezone.utc)
+    assert converted.before is None
+
+
+def test_time_range_defaults_to_source_updated_at_and_converts_end_date_half_open():
+    req = MemorySearchRequest(
+        query="recent memory updates",
+        time_range={"end_date": "2026-06-26"},
+    )
+
+    assert req.time_range is not None
+    converted = req.time_range.to_time_range()
+    assert converted.date_type == "source_updated_at"
+    assert converted.after is None
+    assert converted.before == datetime(2026, 6, 27, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    "time_range",
+    [
+        {},
+        {"start_date": "2026-06-20T00:00:00Z"},
+        {"after": "2026-06-20"},
+        {"date_type": "created_at", "start_date": "2026-06-20"},
+        {"start_date": "2026-06-21", "end_date": "2026-06-20"},
+        {"start_date": "2026-02-30"},
+    ],
+)
+def test_time_range_rejects_invalid_shapes(time_range):
+    with pytest.raises(Exception):
+        MemorySearchRequest(query="test", time_range=time_range)

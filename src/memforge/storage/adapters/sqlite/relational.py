@@ -2,8 +2,8 @@
 
 Row writes and their co-transactional FTS writes stay inside the Database
 methods, so this store delegates rather than relocating SQL. The graph,
-temporal, source, visibility, and ranking reads own the SQL that callers run
-inline today, so no caller reaches a connection directly.
+source/date, visibility, and ranking reads own the SQL that callers run inline
+today, so no caller reaches a connection directly.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from memforge.models import (
     Visibility,
 )
 from memforge.retrieval.access_predicate import visible_sql
-from memforge.retrieval.filters import MemorySourceFilter
+from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope
 
@@ -187,70 +187,90 @@ class SqliteRelationalStore:
                 return set()
         return visible
 
-    async def filter_ids_supported_by_sources(self, ids: Sequence[str], sources: Sequence[str]) -> set[str]:
-        memory_ids = list(ids)
-        source_list = list(sources)
-        if not memory_ids or not source_list:
-            return set()
-        id_placeholders = ",".join("?" for _ in memory_ids)
-        source_placeholders = ",".join("?" for _ in source_list)
-        sql = (
-            "SELECT DISTINCT ms.memory_id "
-            "FROM memory_sources ms "
-            "JOIN documents d ON ms.doc_id = d.doc_id "
-            f"WHERE ms.memory_id IN ({id_placeholders}) "
-            f"AND d.source IN ({source_placeholders})"
-        )
-        supported: set[str] = set()
-        try:
-            async with self._db.db.execute(sql, [*memory_ids, *source_list]) as cursor:
-                async for row in cursor:
-                    supported.add(row[0])
-        except Exception:
-            logger.exception("Failed to filter ids by supporting sources")
-            return set()
-        return supported
-
-    async def filter_ids_by_source_filter(self, ids: Sequence[str], source_filter: MemorySourceFilter) -> set[str]:
+    async def filter_ids_by_source_and_time(
+        self,
+        ids: Sequence[str],
+        source_filter: MemorySourceFilter | None = None,
+        time_range: MemoryTimeRange | None = None,
+    ) -> set[str]:
         memory_ids = list(ids)
         if not memory_ids:
             return set()
-        if source_filter.is_empty():
+        source_filter = source_filter or MemorySourceFilter()
+        has_source_filter = not source_filter.is_empty()
+        has_time_filter = time_range is not None and not time_range.is_empty()
+        if not has_source_filter and not has_time_filter:
             return set(memory_ids)
 
-        clauses = []
-        params: list[Any] = []
-        if source_filter.source_types:
-            placeholders = ",".join("?" for _ in source_filter.source_types)
-            clauses.append(f"ms.source_type IN ({placeholders})")
-            params.extend(source_filter.source_types)
-        if source_filter.clients:
-            placeholders = ",".join("?" for _ in source_filter.clients)
-            clauses.append(f"d.client IN ({placeholders})")
-            params.extend(source_filter.clients)
-        if source_filter.repo_identifiers:
-            placeholders = ",".join("?" for _ in source_filter.repo_identifiers)
-            clauses.append(f"m.repo_identifier IN ({placeholders})")
-            params.extend(source_filter.repo_identifiers)
+        needs_source_join = (
+            bool(source_filter.source_types)
+            or bool(source_filter.sources)
+            or bool(source_filter.clients)
+            or (has_time_filter and time_range is not None and time_range.date_type == "source_updated_at")
+        )
+        needs_document_join = bool(source_filter.sources) or bool(source_filter.clients)
 
         matched: set[str] = set()
         for start in range(0, len(memory_ids), _BATCH_SIZE):
             batch = memory_ids[start : start + _BATCH_SIZE]
             id_placeholders = ",".join("?" for _ in batch)
+            joins: list[str] = []
+            clauses = [f"m.id IN ({id_placeholders})"]
+            params: list[Any] = [*batch]
+
+            if needs_source_join:
+                joins.append("JOIN memory_sources ms ON m.id = ms.memory_id")
+            if needs_document_join:
+                joins.append("LEFT JOIN documents d ON ms.doc_id = d.doc_id")
+
+            if source_filter.source_types:
+                placeholders = ",".join("?" for _ in source_filter.source_types)
+                clauses.append(f"ms.source_type IN ({placeholders})")
+                params.extend(source_filter.source_types)
+            if source_filter.sources:
+                placeholders = ",".join("?" for _ in source_filter.sources)
+                clauses.append(f"d.source IN ({placeholders})")
+                params.extend(source_filter.sources)
+            if source_filter.clients:
+                placeholders = ",".join("?" for _ in source_filter.clients)
+                clauses.append(f"d.client IN ({placeholders})")
+                params.extend(source_filter.clients)
+            if source_filter.repo_identifiers:
+                placeholders = ",".join("?" for _ in source_filter.repo_identifiers)
+                clauses.append(f"m.repo_identifier IN ({placeholders})")
+                params.extend(source_filter.repo_identifiers)
+
+            if has_time_filter and time_range is not None:
+                if time_range.date_type == "source_updated_at":
+                    if time_range.after is not None:
+                        clauses.append("ms.source_updated_at >= ?")
+                        params.append(time_range.after.isoformat())
+                    if time_range.before is not None:
+                        clauses.append("ms.source_updated_at < ?")
+                        params.append(time_range.before.isoformat())
+                elif time_range.date_type == "memory_updated_at":
+                    if time_range.after is not None:
+                        clauses.append("m.updated_at >= ?")
+                        params.append(time_range.after.isoformat())
+                    if time_range.before is not None:
+                        clauses.append("m.updated_at < ?")
+                        params.append(time_range.before.isoformat())
+                else:
+                    raise ValueError(f"Unsupported memory time range date_type: {time_range.date_type}")
+
             sql = (
                 "SELECT DISTINCT m.id "
                 "FROM memories m "
-                "JOIN memory_sources ms ON m.id = ms.memory_id "
-                "LEFT JOIN documents d ON ms.doc_id = d.doc_id "
-                f"WHERE m.id IN ({id_placeholders}) "
-                f"AND {' AND '.join(clauses)}"
+                + (" ".join(joins) + " " if joins else "")
+                + "WHERE "
+                + " AND ".join(clauses)
             )
             try:
-                async with self._db.db.execute(sql, [*batch, *params]) as cursor:
+                async with self._db.db.execute(sql, params) as cursor:
                     async for row in cursor:
                         matched.add(row[0])
             except Exception:
-                logger.exception("Failed to filter ids by structured source facets")
+                logger.exception("Failed to filter ids by structured source/date facets")
                 return set()
         return matched
 
@@ -332,52 +352,6 @@ class SqliteRelationalStore:
                 logger.exception("Graph 1-hop expansion failed")
 
         return scored
-
-    async def temporal_search(
-        self,
-        after: datetime | None,
-        before: datetime | None,
-        scope: AccessScope,
-        memory_types: list[str] | None,
-        limit: int,
-    ) -> list[tuple[str, float]]:
-        conditions: list[str] = []
-        params: list[Any] = []
-        if after:
-            iso_after = after.isoformat()
-            conditions.append("(m.updated_at >= ? OR m.created_at >= ?)")
-            params.extend([iso_after, iso_after])
-        if before:
-            iso_before = before.isoformat()
-            conditions.append("(m.updated_at <= ? OR m.created_at <= ?)")
-            params.extend([iso_before, iso_before])
-        if not conditions:
-            return []
-
-        predicate_sql, predicate_params = visible_sql(scope, "m")
-        conditions.append(predicate_sql)
-        params.extend(predicate_params)
-        if memory_types:
-            type_placeholders = ",".join("?" for _ in memory_types)
-            conditions.append(f"m.memory_type IN ({type_placeholders})")
-            params.extend(memory_types)
-
-        sql = "SELECT m.id FROM memories m WHERE " + " AND ".join(conditions) + " ORDER BY m.updated_at DESC LIMIT ?"
-        params.append(limit)
-
-        results: list[tuple[str, float]] = []
-        try:
-            async with self._db.db.execute(sql, params) as cursor:
-                position = 0
-                async for row in cursor:
-                    # A decreasing score by result order so more-recently-updated
-                    # rows rank higher within this channel.
-                    position += 1
-                    results.append((row[0], 1.0 / position))
-        except Exception:
-            logger.exception("Temporal search failed")
-            return []
-        return results
 
     async def fetch_ranking_metadata(self, ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         """Return ranking and curation metadata for each id in one read.

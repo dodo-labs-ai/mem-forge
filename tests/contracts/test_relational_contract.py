@@ -24,7 +24,7 @@ are part of the concrete implementation.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -33,7 +33,7 @@ from memforge.models import (
     UNSORTED_PROJECT_KEY,
     Visibility,
 )
-from memforge.retrieval.filters import MemorySourceFilter
+from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.storage.adapters.protocols import RelationalStore
 
 from tests.contracts._support import (
@@ -177,7 +177,7 @@ class RelationalStoreContract:
 
     # -- Source facets ------------------------------------------------------
 
-    async def test_filter_ids_by_source_filter_matches_source_type_and_repo(self, adapters: ContractAdapters) -> None:
+    async def test_filter_ids_by_source_and_time_matches_source_type_and_repo(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         await store.insert_memory(
             make_memory(
@@ -211,15 +211,173 @@ class RelationalStoreContract:
         )
         await store.add_memory_source("m-jira", "doc-jira", "jira", None, source_updated_at=None)
 
-        matched = await store.filter_ids_by_source_filter(
+        matched = await store.filter_ids_by_source_and_time(
             ["m-agent-target", "m-agent-other-repo", "m-jira"],
             MemorySourceFilter(
                 source_types=("agent_session",),
                 repo_identifiers=("github.tools.sap/hcm/memforge-cloud",),
             ),
+            None,
         )
 
         assert matched == {"m-agent-target"}
+
+    async def test_filter_ids_by_source_and_time_supports_source_and_memory_dates(self, adapters: ContractAdapters) -> None:
+        store = adapters.relational
+        await store.insert_memory(make_memory("m-source-fresh", updated_at=datetime(2026, 6, 1, tzinfo=timezone.utc)))
+        await store.insert_memory(make_memory("m-source-stale", updated_at=datetime(2026, 6, 1, tzinfo=timezone.utc)))
+        await store.insert_memory(make_memory("m-memory-fresh", updated_at=datetime(2026, 6, 24, tzinfo=timezone.utc)))
+        await store.upsert_document(make_document("doc-source-fresh"))
+        await store.upsert_document(make_document("doc-source-stale"))
+        await store.upsert_document(make_document("doc-memory-fresh"))
+        await store.add_memory_source(
+            "m-source-fresh",
+            "doc-source-fresh",
+            "jira",
+            None,
+            source_updated_at=datetime(2026, 6, 24, 9, 0, tzinfo=timezone.utc),
+        )
+        await store.add_memory_source(
+            "m-source-stale",
+            "doc-source-stale",
+            "jira",
+            None,
+            source_updated_at=datetime(2026, 6, 1, 9, 0, tzinfo=timezone.utc),
+        )
+        await store.add_memory_source(
+            "m-memory-fresh",
+            "doc-memory-fresh",
+            "jira",
+            None,
+            source_updated_at=datetime(2026, 6, 1, 9, 0, tzinfo=timezone.utc),
+        )
+
+        source_matches = await store.filter_ids_by_source_and_time(
+            ["m-source-fresh", "m-source-stale", "m-memory-fresh"],
+            None,
+            MemoryTimeRange(
+                after=datetime(2026, 6, 20, tzinfo=timezone.utc),
+                before=datetime(2026, 6, 27, tzinfo=timezone.utc),
+                date_type="source_updated_at",
+            ),
+        )
+        memory_matches = await store.filter_ids_by_source_and_time(
+            ["m-source-fresh", "m-source-stale", "m-memory-fresh"],
+            None,
+            MemoryTimeRange(
+                after=datetime(2026, 6, 20, tzinfo=timezone.utc),
+                before=datetime(2026, 6, 27, tzinfo=timezone.utc),
+                date_type="memory_updated_at",
+            ),
+        )
+
+        assert source_matches == {"m-source-fresh"}
+        assert memory_matches == {"m-memory-fresh"}
+
+    async def test_filter_ids_by_source_and_time_scopes_source_date_to_same_provenance_row(
+        self,
+        adapters: ContractAdapters,
+    ) -> None:
+        store = adapters.relational
+        await store.insert_memory(make_memory("m-mixed"))
+        await store.upsert_document(make_document("doc-jira-stale", source="JIRA"))
+        await store.upsert_document(make_document("doc-confluence-fresh", source="CONF"))
+        await store.add_memory_source(
+            "m-mixed",
+            "doc-jira-stale",
+            "jira",
+            None,
+            source_updated_at=datetime(2026, 6, 1, 9, 0, tzinfo=timezone.utc),
+        )
+        await store.add_memory_source(
+            "m-mixed",
+            "doc-confluence-fresh",
+            "confluence",
+            None,
+            source_updated_at=datetime(2026, 6, 24, 9, 0, tzinfo=timezone.utc),
+        )
+
+        matched = await store.filter_ids_by_source_and_time(
+            ["m-mixed"],
+            MemorySourceFilter(source_types=("jira",), sources=("JIRA",)),
+            MemoryTimeRange(
+                after=datetime(2026, 6, 20, tzinfo=timezone.utc),
+                before=datetime(2026, 6, 27, tzinfo=timezone.utc),
+                date_type="source_updated_at",
+            ),
+        )
+
+        assert matched == set()
+
+    async def test_filter_ids_by_source_and_time_does_not_match_created_at(self, adapters: ContractAdapters) -> None:
+        store = adapters.relational
+        await store.insert_memory(
+            make_memory(
+                "m-created-only",
+                created_at=datetime(2026, 6, 24, tzinfo=timezone.utc),
+                updated_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            )
+        )
+
+        matched = await store.filter_ids_by_source_and_time(
+            ["m-created-only"],
+            None,
+            MemoryTimeRange(
+                after=datetime(2026, 6, 20, tzinfo=timezone.utc),
+                before=datetime(2026, 6, 27, tzinfo=timezone.utc),
+                date_type="memory_updated_at",
+            ),
+        )
+
+        assert matched == set()
+
+    async def test_filter_ids_by_source_and_time_memory_date_does_not_require_provenance(
+        self,
+        adapters: ContractAdapters,
+    ) -> None:
+        store = adapters.relational
+        await store.insert_memory(
+            make_memory(
+                "m-unbacked-fresh",
+                updated_at=datetime(2026, 6, 24, tzinfo=timezone.utc),
+            )
+        )
+
+        matched = await store.filter_ids_by_source_and_time(
+            ["m-unbacked-fresh"],
+            None,
+            MemoryTimeRange(
+                after=datetime(2026, 6, 20, tzinfo=timezone.utc),
+                before=datetime(2026, 6, 27, tzinfo=timezone.utc),
+                date_type="memory_updated_at",
+            ),
+        )
+
+        assert matched == {"m-unbacked-fresh"}
+
+    async def test_filter_ids_by_source_and_time_source_date_requires_provenance(
+        self,
+        adapters: ContractAdapters,
+    ) -> None:
+        store = adapters.relational
+        await store.insert_memory(
+            make_memory(
+                "m-unbacked-fresh",
+                updated_at=datetime(2026, 6, 24, tzinfo=timezone.utc),
+            )
+        )
+
+        matched = await store.filter_ids_by_source_and_time(
+            ["m-unbacked-fresh"],
+            None,
+            MemoryTimeRange(
+                after=datetime(2026, 6, 20, tzinfo=timezone.utc),
+                before=datetime(2026, 6, 27, tzinfo=timezone.utc),
+                date_type="source_updated_at",
+            ),
+        )
+
+        assert matched == set()
 
     # -- Project lifecycle --------------------------------------------------
 

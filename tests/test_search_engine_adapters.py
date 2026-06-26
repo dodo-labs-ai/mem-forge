@@ -8,7 +8,7 @@ import pytest
 
 from memforge.config import RetrievalConfig
 from memforge.models import DocumentRecord, Memory, content_hash
-from memforge.retrieval.filters import MemorySourceFilter
+from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.search import SearchEngine
 from memforge.retrieval.query_analyzer import QueryAnalysis
 from memforge.storage.database import Database
@@ -150,6 +150,49 @@ async def test_source_filter_applies_to_vector_hits(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_top_level_sources_merge_with_structured_source_filter(db, monkeypatch):
+    from_structured_filter = _memory("m-structured", "PostgreSQL pooling from wiki")
+    from_top_level_sources = _memory("m-top-level", "PostgreSQL pooling from Jira")
+    filtered_out = _memory("m-other", "PostgreSQL pooling from Slack")
+    await db.insert_memory(from_structured_filter)
+    await db.insert_memory(from_top_level_sources)
+    await db.insert_memory(filtered_out)
+    await _document(db, "doc-wiki", "wiki")
+    await _document(db, "doc-jira", "jira")
+    await _document(db, "doc-slack", "slack")
+    await db.add_memory_source("m-structured", "doc-wiki", "confluence", None, source_updated_at=None)
+    await db.add_memory_source("m-top-level", "doc-jira", "jira", None, source_updated_at=None)
+    await db.add_memory_source("m-other", "doc-slack", "slack", None, source_updated_at=None)
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    adapters = build_sqlite_adapters(
+        db,
+        FakeCollection(["m-structured", "m-top-level", "m-other"]),
+    )
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search(
+        "PostgreSQL",
+        sources=["jira"],
+        source_filter=MemorySourceFilter(sources=("wiki",)),
+        top_k=10,
+    )
+
+    assert [r.memory_id for r in result["results"]] == ["m-structured", "m-top-level"]
+
+
+@pytest.mark.asyncio
 async def test_structured_source_filter_applies_to_vector_hits(db, monkeypatch):
     codex = _memory(
         "m-codex",
@@ -207,3 +250,58 @@ async def test_structured_source_filter_applies_to_vector_hits(db, monkeypatch):
     )
 
     assert [r.memory_id for r in result["results"]] == ["m-codex"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_time_range_filters_vector_hits_before_ranking(db, monkeypatch):
+    in_window = _memory("m-in-window", "Payroll incident triage pattern")
+    out_of_window = _memory("m-out-of-window", "Payroll incident triage pattern")
+    await db.insert_memory(in_window)
+    await db.insert_memory(out_of_window)
+    await _document(db, "doc-fresh", "wiki")
+    await _document(db, "doc-stale", "wiki")
+    await db.add_memory_source(
+        "m-in-window",
+        "doc-fresh",
+        "confluence",
+        None,
+        source_updated_at=datetime(2026, 6, 20, tzinfo=timezone.utc),
+    )
+    await db.add_memory_source(
+        "m-out-of-window",
+        "doc-stale",
+        "confluence",
+        None,
+        source_updated_at=datetime(2026, 6, 10, tzinfo=timezone.utc),
+    )
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    adapters = build_sqlite_adapters(
+        db,
+        FakeCollection(["m-out-of-window", "m-in-window"]),
+    )
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search(
+        "Payroll incident",
+        source_filter=MemorySourceFilter(source_types=("confluence",), sources=("wiki",)),
+        time_range=MemoryTimeRange(
+            after=datetime(2026, 6, 19, tzinfo=timezone.utc),
+            before=datetime(2026, 6, 21, tzinfo=timezone.utc),
+            date_type="source_updated_at",
+        ),
+        top_k=10,
+    )
+
+    assert [r.memory_id for r in result["results"]] == ["m-in-window"]

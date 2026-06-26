@@ -152,25 +152,6 @@ async def test_keyword_channel_hides_null_visibility_row(db):
 
 
 @pytest.mark.asyncio
-async def test_temporal_channel_hides_null_visibility_row(db):
-    from datetime import timedelta
-    await _insert_null_visibility_row(db, "n-temp", "x")
-    await _insert_workspace_row(db, "ws-temp", "x")
-    adapters = build_sqlite_adapters(db, memory_collection=None)
-    now = datetime.now(timezone.utc)
-
-    for include_private in (False, True):
-        hits = await adapters.relational.temporal_search(
-            after=now - timedelta(days=1), before=None,
-            scope=_scope(include_private=include_private),
-            memory_types=None, limit=10,
-        )
-        ids = {mid for mid, _ in hits}
-        assert "n-temp" not in ids
-        assert "ws-temp" in ids
-
-
-@pytest.mark.asyncio
 async def test_graph_channel_hides_null_visibility_row(db):
     eid = await db.upsert_entity("argocd", "tool")
     await _insert_null_visibility_row(db, "n-graph", "deploys via argocd")

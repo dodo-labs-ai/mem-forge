@@ -65,7 +65,6 @@ async def test_repo_affinity_boosts_same_repo_candidate():
             _RankedCandidate("other-repo", rrf_score=1.0),
             _RankedCandidate("same-repo", rrf_score=1.0),
         ],
-        is_temporal=False,
         scope=_scope("github.tools.sap/hcm/memforge-cloud"),
     )
 

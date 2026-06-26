@@ -1137,6 +1137,11 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "source_instance_ids" not in properties["source_filter"]["properties"]
     assert "sources" not in properties
     assert set(properties) == {"query", "source_filter", "time_range", "top_k"}
+    time_range_schema = properties["time_range"]
+    assert "Omit time_range" in time_range_schema["description"]
+    assert "start_date and end_date are individually optional" in time_range_schema["description"]
+    assert time_range_schema["anyOf"] == [{"required": ["start_date"]}, {"required": ["end_date"]}]
+    assert set(time_range_schema["properties"]) == {"date_type", "start_date", "end_date"}
     assert "include_private" not in properties
     assert "include_superseded" not in properties
     assert "status" not in properties
@@ -1186,6 +1191,71 @@ def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
         "include_private": True,
         "include_superseded": False,
     }
+
+
+def test_mcp_proxy_forwards_explicit_optional_date_bounds(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "query": "jira memories",
+            "time_range": {
+                "date_type": "source_updated_at",
+                "start_date": "2026-06-19",
+            },
+        },
+    )
+
+    assert result == {"results": []}
+    assert json.loads(captured["body"].decode())["time_range"] == {
+        "date_type": "source_updated_at",
+        "start_date": "2026-06-19",
+    }
+
+
+@pytest.mark.parametrize(
+    "time_range",
+    [
+        {},
+        {"start_date": "2026-06-20T00:00:00Z"},
+        {"after": "2026-06-20"},
+        {"date_type": "created_at", "start_date": "2026-06-20"},
+        {"start_date": "2026-06-21", "end_date": "2026-06-20"},
+    ],
+)
+def test_mcp_proxy_rejects_invalid_time_range_shapes(monkeypatch, time_range):
+    proxy = _load_plugin_mcp_proxy()
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool("search", {"query": "jira memories", "time_range": time_range})
+
+    assert "error" in result
+    assert "time_range" in result["error"]
 
 
 def test_mcp_proxy_rejects_removed_backend_search_knobs(monkeypatch):

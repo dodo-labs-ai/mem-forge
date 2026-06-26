@@ -1,8 +1,8 @@
-"""Query analysis: temporal detection + entity detection.
+"""Query analysis: entity detection for retrieval routing.
 
-Two detections — no 7-type classifier. The agent explicitly passes memory_types
-and entities via the MCP tool schema; the analyzer detects temporal intent and
-entity mentions from the query text.
+The agent explicitly passes memory_types, entities, and date filters via the
+MCP/API tool schemas. This analyzer only detects entity mentions from the query
+text.
 
 Entity detection is two-tier:
   1. Regex scan against known entity names + aliases (< 5ms, deterministic).
@@ -17,7 +17,6 @@ import asyncio
 import re
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from memforge.llm.structured import StructuredLlmError
@@ -32,11 +31,6 @@ __all__ = ["QueryAnalysis", "analyze_query"]
 class QueryAnalysis:
     """Result of rule-based query analysis."""
 
-    # Temporal detection
-    is_temporal: bool = False
-    temporal_start: datetime | None = None
-    temporal_end: datetime | None = None
-
     # Entity detection
     detected_entities: list[str] = field(default_factory=list)
     detected_entity_ids: list[int] = field(default_factory=list)
@@ -45,94 +39,6 @@ class QueryAnalysis:
     use_vector: bool = True      # always on
     use_bm25: bool = True        # always on
     use_graph: bool = False      # only when entities detected
-    use_temporal: bool = False   # only when temporal intent detected
-
-
-# ---------------------------------------------------------------------------
-# Temporal patterns
-# ---------------------------------------------------------------------------
-
-_TEMPORAL_KEYWORDS = [
-    "recently", "recent", "latest", "newest", "new",
-    "changed", "updated", "modified",
-    "today", "yesterday",
-    "this week", "last week", "past week",
-    "this month", "last month", "past month",
-    "this quarter", "last quarter",
-]
-
-_TEMPORAL_REGEX = re.compile(
-    r"(?:last|past)\s+(\d+)\s+(day|week|month|hour)s?",
-    re.IGNORECASE,
-)
-
-_SINCE_REGEX = re.compile(
-    r"since\s+(\d{4}-\d{2}-\d{2})",
-    re.IGNORECASE,
-)
-
-
-def _detect_temporal(query: str) -> tuple[bool, datetime | None, datetime | None]:
-    """Detect temporal intent and resolve to a date range.
-
-    Returns (is_temporal, start_date, end_date).
-    """
-    q = query.lower().strip()
-    now = datetime.now(timezone.utc)
-
-    # Check "since YYYY-MM-DD"
-    since_match = _SINCE_REGEX.search(q)
-    if since_match:
-        try:
-            start = datetime.fromisoformat(since_match.group(1)).replace(tzinfo=timezone.utc)
-            return True, start, None
-        except ValueError:
-            pass
-
-    # Check "last/past N days/weeks/months"
-    range_match = _TEMPORAL_REGEX.search(q)
-    if range_match:
-        amount = int(range_match.group(1))
-        unit = range_match.group(2).lower()
-        if unit == "hour":
-            delta = timedelta(hours=amount)
-        elif unit == "day":
-            delta = timedelta(days=amount)
-        elif unit == "week":
-            delta = timedelta(weeks=amount)
-        elif unit == "month":
-            delta = timedelta(days=amount * 30)
-        else:
-            delta = timedelta(days=amount)
-        return True, now - delta, None
-
-    # Check keyword triggers
-    for keyword in _TEMPORAL_KEYWORDS:
-        if keyword in q:
-            # Default temporal range: 7 days for "recently", "changed", etc.
-            if keyword in ("today",):
-                return True, now.replace(hour=0, minute=0, second=0, microsecond=0), None
-            elif keyword in ("yesterday",):
-                yesterday = now - timedelta(days=1)
-                return True, yesterday.replace(hour=0, minute=0, second=0, microsecond=0), now.replace(hour=0, minute=0, second=0, microsecond=0)
-            elif keyword in ("this week",):
-                start = now - timedelta(days=now.weekday())
-                return True, start.replace(hour=0, minute=0, second=0, microsecond=0), None
-            elif keyword in ("last week", "past week"):
-                start = now - timedelta(days=now.weekday() + 7)
-                end = now - timedelta(days=now.weekday())
-                return True, start.replace(hour=0, minute=0, second=0, microsecond=0), end.replace(hour=0, minute=0, second=0, microsecond=0)
-            elif keyword in ("this month",):
-                return True, now.replace(day=1, hour=0, minute=0, second=0, microsecond=0), None
-            elif keyword in ("last month", "past month"):
-                first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-                prev_month = first_of_month - timedelta(days=1)
-                return True, prev_month.replace(day=1), first_of_month
-            else:
-                # Generic "recently" / "changed" / "updated" → last 7 days
-                return True, now - timedelta(days=7), None
-
-    return False, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -315,12 +221,10 @@ async def analyze_query(
 ) -> QueryAnalysis:
     """Analyze a search query to determine retrieval strategies.
 
-    Two detections:
-    1. Temporal intent → adds SQL date filter
-    2. Entity mentions → activates graph traversal (regex first, LLM fallback)
+    Entity mentions activate graph traversal (regex first, LLM fallback).
 
-    All queries run vector + BM25 in parallel. Graph traversal and temporal
-    filtering are additive when detected.
+    All queries run vector + BM25 in parallel. Date filtering is explicit and
+    handled outside this analyzer.
 
     Args:
         query: The search query text.
@@ -336,15 +240,7 @@ async def analyze_query(
     """
     analysis = QueryAnalysis()
 
-    # Detection 1: Temporal intent
-    is_temporal, start, end = _detect_temporal(query)
-    if is_temporal:
-        analysis.is_temporal = True
-        analysis.temporal_start = start
-        analysis.temporal_end = end
-        analysis.use_temporal = True
-
-    # Detection 2: Entity mentions — regex first, LLM fallback
+    # Entity mentions — regex first, LLM fallback
     if known_entities:
         names, ids = _detect_entities_regex(query, known_entities)
         if not names:
