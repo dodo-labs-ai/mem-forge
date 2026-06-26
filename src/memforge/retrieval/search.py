@@ -1,10 +1,11 @@
 """Hybrid search engine for MemForge.
 
-Four retrieval channels run in parallel (vector, BM25/FTS5, entity-graph,
-temporal SQL), fused via Reciprocal Rank Fusion (RRF), then ranked with a
-recency-weighted final score.  Optional cross-encoder reranking via LLM
-can be enabled for higher precision at scale.  Document fallback fills
-remaining slots when memory results are sparse.
+Three retrieval channels run in parallel (vector, BM25/FTS5, entity-graph),
+fused via Reciprocal Rank Fusion (RRF), then strictly filtered by source/time
+facets and ranked with a recency-weighted final score. Optional cross-encoder
+reranking via LLM can be enabled for higher precision at scale. Document
+fallback fills remaining slots when memory results are sparse and no explicit
+date filter is present.
 
 Architecture reference: docs/architecture.md Section 10.
 """
@@ -29,7 +30,7 @@ from memforge.provenance import (
     document_pdf_url_for_store,
 )
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
-from memforge.retrieval.filters import MemorySourceFilter
+from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.query_analyzer import QueryAnalysis, analyze_query
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
@@ -40,18 +41,14 @@ __all__ = [
     "CROSS_PROJECT_PENALTY",
     "SearchEngine",
     "W_RECENCY_DEFAULT",
-    "W_RECENCY_TEMPORAL",
     "W_RRF_DEFAULT",
-    "W_RRF_TEMPORAL",
 ]
 
 
-# Ranking weights for the final score. Standard queries lean on RRF; queries
-# the analyzer flags as temporal lift the recency contribution.
+# Ranking weights for the final score. Queries lean on fused recall with a
+# small recency contribution.
 W_RRF_DEFAULT = 0.85
 W_RECENCY_DEFAULT = 0.15
-W_RRF_TEMPORAL = 0.70
-W_RECENCY_TEMPORAL = 0.30
 
 # Cross-project affinity penalty subtracted in `project-first` mode for any
 # candidate that is neither the active project nor SHARED. Applied after RRF
@@ -197,12 +194,28 @@ def _default_access_scope(include_superseded: bool) -> AccessScope:
     )
 
 
+def _merge_source_filters(
+    source_filter: MemorySourceFilter | None,
+    sources: list[str] | None,
+) -> MemorySourceFilter | None:
+    if source_filter is None and not sources:
+        return None
+    base = source_filter or MemorySourceFilter()
+    merged_sources = tuple(dict.fromkeys((*base.sources, *(sources or ()))))
+    return MemorySourceFilter(
+        source_types=base.source_types,
+        sources=merged_sources,
+        clients=base.clients,
+        repo_identifiers=base.repo_identifiers,
+    )
+
+
 # ---------------------------------------------------------------------------
 # SearchEngine
 # ---------------------------------------------------------------------------
 
 class SearchEngine:
-    """Hybrid retrieval engine: vector + BM25 + graph + temporal, fused via RRF.
+    """Hybrid retrieval engine: vector + BM25 + graph, fused via RRF.
 
     Bound to the storage adapters, never to a database connection or a Chroma
     collection directly. Per-request visibility rides on the ``AccessScope``
@@ -211,8 +224,8 @@ class SearchEngine:
     Parameters
     ----------
     relational : RelationalStore
-        Source-of-truth rows plus the scoped graph, temporal, source, and
-        ranking reads.
+        Source-of-truth rows plus the scoped graph, source/date, and ranking
+        reads.
     keyword : KeywordSearch
         The BM25/FTS5 channel.
     vector : VectorStore
@@ -263,7 +276,7 @@ class SearchEngine:
         query: str,
         memory_types: list[str] | None = None,
         sources: list[str] | None = None,
-        time_range: dict | None = None,
+        time_range: MemoryTimeRange | None = None,
         entities: list[str] | None = None,
         include_superseded: bool = False,
         top_k: int = 10,
@@ -312,24 +325,6 @@ class SearchEngine:
             if analysis.detected_entities:
                 analysis.use_graph = True
 
-        if time_range:
-            analysis.is_temporal = True
-            analysis.use_temporal = True
-            if time_range.get("after") and analysis.temporal_start is None:
-                try:
-                    analysis.temporal_start = datetime.fromisoformat(
-                        time_range["after"]
-                    ).replace(tzinfo=timezone.utc)
-                except (ValueError, TypeError):
-                    pass
-            if time_range.get("before") and analysis.temporal_end is None:
-                try:
-                    analysis.temporal_end = datetime.fromisoformat(
-                        time_range["before"]
-                    ).replace(tzinfo=timezone.utc)
-                except (ValueError, TypeError):
-                    pass
-
         # ----- 4. Run active channels in parallel -----
         fetch_k = top_k * 2
         tasks: list[asyncio.Task] = []
@@ -354,19 +349,6 @@ class SearchEngine:
             ))
             channel_names.append("graph")
 
-        # Temporal filter — only when temporal intent detected
-        if analysis.use_temporal:
-            tasks.append(asyncio.ensure_future(
-                self._temporal_filter(
-                    analysis.temporal_start,
-                    analysis.temporal_end,
-                    memory_types,
-                    scope,
-                    fetch_k,
-                )
-            ))
-            channel_names.append("temporal")
-
         raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Collect channel results, logging any errors
@@ -381,20 +363,21 @@ class SearchEngine:
         # ----- 5. Fuse via RRF, then apply the source-of-truth re-checks -----
         fused = self._rrf_fusion(channel_results, k=self._config.rrf_k)
         fused = await self._filter_candidates_by_status(fused, scope)
-        if sources:
-            supported = await self._relational.filter_ids_supported_by_sources(
-                [c.memory_id for c in fused], sources
-            )
-            fused = [c for c in fused if c.memory_id in supported]
-        if source_filter is not None and not source_filter.is_empty():
-            supported = await self._relational.filter_ids_by_source_filter(
-                [c.memory_id for c in fused], source_filter
+        combined_source_filter = _merge_source_filters(source_filter, sources)
+        if (
+            (combined_source_filter is not None and not combined_source_filter.is_empty())
+            or (time_range is not None and not time_range.is_empty())
+        ):
+            supported = await self._relational.filter_ids_by_source_and_time(
+                [c.memory_id for c in fused],
+                combined_source_filter,
+                time_range,
             )
             fused = [c for c in fused if c.memory_id in supported]
         total_candidates = len(fused)
 
         # ----- 6. Apply ranking -----
-        ranked = await self._apply_ranking(fused, analysis.is_temporal, scope=scope)
+        ranked = await self._apply_ranking(fused, scope=scope)
 
         # ----- 6b. Optional cross-encoder rerank -----
         ranked = await self._rerank_with_llm(query, ranked, top_k)
@@ -408,7 +391,7 @@ class SearchEngine:
         results = await self._enrich_results(memory_ids, ranked)
 
         # ----- 9. Document fallback -----
-        if len(results) < top_k:
+        if time_range is None and len(results) < top_k:
             remaining = top_k - len(results)
             existing_doc_ids = {
                 r.source_doc_id for r in results if r.source_doc_id
@@ -420,7 +403,6 @@ class SearchEngine:
 
         return {
             "query_analysis": {
-                "is_temporal": analysis.is_temporal,
                 "detected_entities": analysis.detected_entities,
                 "strategies_used": channel_names,
             },
@@ -496,19 +478,6 @@ class SearchEngine:
             entity_ids, scope, memory_types, limit
         )
 
-    async def _temporal_filter(
-        self,
-        start: datetime | None,
-        end: datetime | None,
-        memory_types: list[str] | None,
-        scope: AccessScope,
-        limit: int,
-    ) -> list[tuple[str, float]]:
-        """SQL date-range filter via the relational channel."""
-        return await self._relational.temporal_search(
-            start, end, scope, memory_types, limit
-        )
-
     # ==================================================================
     # Fusion
     # ==================================================================
@@ -560,7 +529,6 @@ class SearchEngine:
     async def _apply_ranking(
         self,
         candidates: list[_RankedCandidate],
-        is_temporal: bool,
         *,
         scope: AccessScope,
     ) -> list[_RankedCandidate]:
@@ -568,8 +536,9 @@ class SearchEngine:
 
         ``final_score = max(0, w_rrf * rrf_normalized + w_recency * recency - penalty)``
 
-        Standard:  w_rrf=W_RRF_DEFAULT,  w_recency=W_RECENCY_DEFAULT
-        Temporal:  w_rrf=W_RRF_TEMPORAL, w_recency=W_RECENCY_TEMPORAL
+        ``W_RRF_DEFAULT`` and ``W_RECENCY_DEFAULT`` are constant regardless of
+        whether an explicit date filter was used; date filters only narrow the
+        candidate set.
         """
         if not candidates:
             return candidates
@@ -586,8 +555,8 @@ class SearchEngine:
             max_rrf = 1.0
 
         half_life = float(self._config.recency_half_life_days)
-        w_rrf = W_RRF_TEMPORAL if is_temporal else W_RRF_DEFAULT
-        w_rec = W_RECENCY_TEMPORAL if is_temporal else W_RECENCY_DEFAULT
+        w_rrf = W_RRF_DEFAULT
+        w_rec = W_RECENCY_DEFAULT
 
         for c in candidates:
             meta = id_to_meta.get(c.memory_id, {})

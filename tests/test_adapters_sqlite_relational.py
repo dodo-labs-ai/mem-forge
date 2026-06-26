@@ -11,6 +11,7 @@ from memforge.models import (
     Memory,
     content_hash,
 )
+from memforge.retrieval.filters import MemorySourceFilter
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import RelationalStore
@@ -136,17 +137,7 @@ async def test_graph_search_filters_retired_by_scope(db):
 
 
 @pytest.mark.asyncio
-async def test_temporal_search_returns_rows_in_window(db):
-    store = SqliteRelationalStore(db)
-    await store.insert_memory(_memory("m1"))
-    after = datetime(2000, 1, 1, tzinfo=timezone.utc)
-    before = datetime(2100, 1, 1, tzinfo=timezone.utc)
-    hits = await store.temporal_search(after, before, _scope(), None, limit=10)
-    assert [mid for mid, _ in hits] == ["m1"]
-
-
-@pytest.mark.asyncio
-async def test_filter_ids_supported_by_sources_uses_the_join(db):
+async def test_filter_ids_by_source_and_time_uses_the_source_join(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))
     await store.insert_memory(_memory("m2"))
@@ -154,9 +145,20 @@ async def test_filter_ids_supported_by_sources_uses_the_join(db):
     await store.add_memory_source("m1", "doc1", "confluence", "an excerpt", source_updated_at=None)
     # doc1 belongs to source "src-confluence" (see _document); only m1 is
     # supported by a document from that source.
-    kept = await store.filter_ids_supported_by_sources(["m1", "m2"], ["src-confluence"])
+    kept = await store.filter_ids_by_source_and_time(
+        ["m1", "m2"],
+        MemorySourceFilter(sources=("src-confluence",)),
+        None,
+    )
     assert kept == {"m1"}
-    assert await store.filter_ids_supported_by_sources(["m1"], ["other-source"]) == set()
+    assert (
+        await store.filter_ids_by_source_and_time(
+            ["m1"],
+            MemorySourceFilter(sources=("other-source",)),
+            None,
+        )
+        == set()
+    )
 
 
 @pytest.mark.asyncio

@@ -72,7 +72,7 @@ class ToolClient:
             body["memory_types"] = list(memory_types)
         if sources:
             body["sources"] = list(sources)
-        if time_range:
+        if time_range is not None:
             body["time_range"] = time_range
         if entities:
             body["entities"] = list(entities)

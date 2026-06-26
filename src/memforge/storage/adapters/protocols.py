@@ -20,7 +20,7 @@ from memforge.models import (
     MemorySource,
     Project,
 )
-from memforge.retrieval.filters import MemorySourceFilter
+from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.storage.adapters.context import AccessScope
 
 
@@ -49,8 +49,8 @@ class RelationalStore(Protocol):
     co-transactional FTS write stay inside the existing Database methods:
     this protocol delegates to those methods rather than relocating their
     SQL, preserving the single-commit atomicity that keeps SQLite and FTS5
-    in sync. The read channels (graph, temporal, the post-fusion re-check,
-    the ranking fetch, and the source re-check) own the SQL that callers run
+    in sync. The read channels (graph, the post-fusion re-check, the ranking
+    fetch, and the source/date re-check) own the SQL that callers run
     inline today, so a caller never reaches a database connection directly.
     """
 
@@ -63,20 +63,16 @@ class RelationalStore(Protocol):
     async def get_all_entities(self) -> list[Entity]: ...
     async def get_all_aliases(self) -> list[tuple[str, int]]: ...
     async def filter_visible_ids(self, ids: Sequence[str], scope: AccessScope) -> set[str]: ...
-    async def filter_ids_supported_by_sources(self, ids: Sequence[str], sources: Sequence[str]) -> set[str]: ...
-    async def filter_ids_by_source_filter(self, ids: Sequence[str], source_filter: MemorySourceFilter) -> set[str]: ...
+    async def filter_ids_by_source_and_time(
+        self,
+        ids: Sequence[str],
+        source_filter: MemorySourceFilter | None = None,
+        time_range: MemoryTimeRange | None = None,
+    ) -> set[str]: ...
     async def fetch_ranking_metadata(self, ids: Sequence[str]) -> Mapping[str, RankingMetadata]: ...
     async def graph_search(
         self,
         entity_ids: Sequence[int],
-        scope: AccessScope,
-        memory_types: list[str] | None,
-        limit: int,
-    ) -> list[tuple[str, float]]: ...
-    async def temporal_search(
-        self,
-        after: datetime | None,
-        before: datetime | None,
         scope: AccessScope,
         memory_types: list[str] | None,
         limit: int,

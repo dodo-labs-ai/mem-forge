@@ -83,21 +83,6 @@ async def test_graph_hides_other_users_private_memory(db):
     assert {mid for mid, _ in hits} == {"g-shared"}
 
 
-@pytest.mark.asyncio
-async def test_temporal_hides_other_users_private_memory(db):
-    from datetime import datetime, timezone, timedelta
-    now = datetime.now(timezone.utc)
-    await db.insert_memory(_mem("t-shared", "x"))
-    await db.insert_memory(_mem("t-priv", "x", visibility=PRIVATE, owner="u-2"))
-    adapters = build_sqlite_adapters(db, memory_collection=None)
-    hits = await adapters.relational.temporal_search(
-        after=now - timedelta(days=1), before=None,
-        scope=_scope(user_id="u-1", include_private=False),
-        memory_types=None, limit=10,
-    )
-    assert {mid for mid, _ in hits} == {"t-shared"}
-
-
 class _Coll:
     """Minimal Chroma fake: stores items with metadata, supports a where-filter."""
 

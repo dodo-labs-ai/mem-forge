@@ -65,6 +65,8 @@ SOURCE_FILTER_ALLOWED_KEYS = frozenset(
         "current_repo_only",
     }
 )
+TIME_RANGE_ALLOWED_KEYS = frozenset({"date_type", "start_date", "end_date"})
+DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -115,10 +117,35 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "time_range": {
                     "type": "object",
+                    "description": (
+                        "Optional explicit date-only filter. Omit time_range when the "
+                        "user did not ask for a date window. start_date and end_date "
+                        "are individually optional; provide at least one if this object "
+                        "is sent. Convert phrases like 'last week' into YYYY-MM-DD "
+                        "dates before calling. date_type defaults to source_updated_at."
+                    ),
                     "properties": {
-                        "after": {"type": "string"},
-                        "before": {"type": "string"},
+                        "date_type": {
+                            "type": "string",
+                            "enum": ["source_updated_at", "memory_updated_at"],
+                            "description": (
+                                "source_updated_at filters by source/provenance update date; "
+                                "memory_updated_at filters by MemForge memory lifecycle update date."
+                            ),
+                        },
+                        "start_date": {
+                            "type": "string",
+                            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                            "description": "Optional inclusive start date in YYYY-MM-DD format.",
+                        },
+                        "end_date": {
+                            "type": "string",
+                            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                            "description": "Optional inclusive end date in YYYY-MM-DD format.",
+                        },
                     },
+                    "anyOf": [{"required": ["start_date"]}, {"required": ["end_date"]}],
+                    "additionalProperties": False,
                 },
                 "top_k": {"type": "integer", "default": 10},
             },
@@ -277,7 +304,35 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
                 )
             source_filter["repo_identifiers"] = [repo_identifier]
         body["source_filter"] = source_filter
+    time_range = body.get("time_range")
+    if time_range is not None:
+        body["time_range"] = _validate_time_range(time_range)
     return body
+
+
+def _validate_time_range(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("time_range must be an object with YYYY-MM-DD date bounds")
+    unknown = sorted(set(value) - TIME_RANGE_ALLOWED_KEYS)
+    if unknown:
+        raise ValueError("Unsupported time_range parameter(s): " + ", ".join(unknown))
+    date_type = value.get("date_type", "source_updated_at")
+    if date_type not in {"source_updated_at", "memory_updated_at"}:
+        raise ValueError("time_range.date_type must be source_updated_at or memory_updated_at")
+    start_date = value.get("start_date")
+    end_date = value.get("end_date")
+    if not start_date and not end_date:
+        raise ValueError("time_range requires start_date or end_date; omit time_range for no date filter")
+    normalized: dict[str, str] = {"date_type": date_type}
+    for key, item in (("start_date", start_date), ("end_date", end_date)):
+        if item is None:
+            continue
+        if not isinstance(item, str) or not DATE_ONLY_RE.fullmatch(item):
+            raise ValueError(f"time_range.{key} must be a YYYY-MM-DD date")
+        normalized[key] = item
+    if start_date and end_date and str(start_date) > str(end_date):
+        raise ValueError("time_range.start_date must be on or before end_date")
+    return normalized
 
 
 def _active_repo_identifier() -> str | None:

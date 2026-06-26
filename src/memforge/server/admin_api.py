@@ -11,6 +11,7 @@ from dataclasses import asdict, is_dataclass
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -71,7 +72,7 @@ from memforge.provenance import (
     list_document_artifacts,
     select_document_artifact,
 )
-from memforge.retrieval.filters import MemorySourceFilter
+from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.runtime import (
     DefaultRuntimeProvider,
     RuntimeHealthComponent,
@@ -340,11 +341,55 @@ class SourceFacetFilterRequest(BaseModel):
         )
 
 
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class MemoryTimeRangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    date_type: Literal["source_updated_at", "memory_updated_at"] = "source_updated_at"
+    start_date: date | None = None
+    end_date: date | None = None
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def _validate_date_only(cls, value: Any) -> Any:
+        if value is None or (isinstance(value, date) and not isinstance(value, datetime)):
+            return value
+        if isinstance(value, str):
+            if not _DATE_ONLY_RE.fullmatch(value):
+                raise ValueError("date bounds must be YYYY-MM-DD dates, not datetimes")
+            return value
+        raise ValueError("date bounds must be YYYY-MM-DD strings")
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> "MemoryTimeRangeRequest":
+        if self.start_date is None and self.end_date is None:
+            raise ValueError("time_range requires start_date or end_date")
+        if self.start_date is not None and self.end_date is not None and self.start_date > self.end_date:
+            raise ValueError("start_date must be on or before end_date")
+        return self
+
+    def to_time_range(self) -> MemoryTimeRange:
+        after = (
+            datetime(self.start_date.year, self.start_date.month, self.start_date.day, tzinfo=timezone.utc)
+            if self.start_date is not None
+            else None
+        )
+        before = (
+            datetime(self.end_date.year, self.end_date.month, self.end_date.day, tzinfo=timezone.utc)
+            + timedelta(days=1)
+            if self.end_date is not None
+            else None
+        )
+        return MemoryTimeRange(after=after, before=before, date_type=self.date_type)
+
+
 class MemorySearchRequest(BaseModel):
     query: str
     memory_types: list[str] | None = None
     sources: list[str] | None = None
-    time_range: dict[str, Any] | None = None
+    time_range: MemoryTimeRangeRequest | None = None
     entities: list[str] | None = None
     include_superseded: bool = False
     top_k: int = Field(default=10, ge=1, le=50)
@@ -2380,7 +2425,7 @@ def create_admin_app(
                 query=req.query,
                 memory_types=req.memory_types,
                 sources=req.sources,
-                time_range=req.time_range,
+                time_range=req.time_range.to_time_range() if req.time_range is not None else None,
                 entities=req.entities,
                 include_superseded=req.include_superseded,
                 top_k=req.top_k,

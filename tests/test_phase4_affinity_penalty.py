@@ -8,9 +8,7 @@ from memforge.models import SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY
 from memforge.retrieval.search import (
     CROSS_PROJECT_PENALTY,
     W_RECENCY_DEFAULT,
-    W_RECENCY_TEMPORAL,
     W_RRF_DEFAULT,
-    W_RRF_TEMPORAL,
     _affinity_penalty,
 )
 from memforge.storage.adapters.context import AccessScope
@@ -68,12 +66,11 @@ def test_null_project_key_takes_penalty():
 
 
 def test_ranking_weights_form_a_valid_distribution():
-    """The default and temporal weight pairs each sum to 1.0 and the
-    cross-project penalty stays in (0, 1) so a penalized candidate is
-    never lifted above the unpenalized active-project candidate."""
+    """The ranking weights sum to 1.0 and the cross-project penalty stays in
+    (0, 1) so a penalized candidate is never lifted above the unpenalized
+    active-project candidate."""
     from math import isclose
     assert isclose(W_RRF_DEFAULT + W_RECENCY_DEFAULT, 1.0)
-    assert isclose(W_RRF_TEMPORAL + W_RECENCY_TEMPORAL, 1.0)
     assert 0.0 < CROSS_PROJECT_PENALTY < 1.0
 
 
@@ -228,4 +225,3 @@ async def test_project_first_visibility_survives_real_cross_project_rows(tmp_pat
         assert visible == {"m-pay", "m-risk"}
     finally:
         await db.close()
-
