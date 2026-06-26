@@ -25,10 +25,10 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
     except ImportError:
         import importlib.util
 
-        _config_spec = importlib.util.spec_from_file_location(
-            "memforge_plugin_config",
-            Path(__file__).with_name("plugin_config.py"),
-        )
+        _config_path = Path(__file__).with_name("memforge_plugin_config.py")
+        if not _config_path.exists():
+            _config_path = Path(__file__).with_name("plugin_config.py")
+        _config_spec = importlib.util.spec_from_file_location("memforge_plugin_config", _config_path)
         if _config_spec is None or _config_spec.loader is None:
             raise
         _config_module = importlib.util.module_from_spec(_config_spec)
