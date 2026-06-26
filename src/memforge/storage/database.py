@@ -4509,6 +4509,16 @@ class Database:
             return None
         return self._row_to_agent_claim(row)
 
+    async def get_agent_claim_by_memory_id(self, memory_id: str) -> dict[str, Any] | None:
+        async with self.db.execute(
+            "SELECT * FROM agent_claims WHERE memory_id = ? ORDER BY updated_at DESC, id LIMIT 1",
+            (memory_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        return self._row_to_agent_claim(row)
+
     async def list_agent_claims(self, concept_id: str) -> list[dict[str, Any]]:
         claims: list[dict[str, Any]] = []
         async with self.db.execute(

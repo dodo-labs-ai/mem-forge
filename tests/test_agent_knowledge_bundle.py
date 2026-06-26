@@ -20,9 +20,11 @@ class RecordingCollection:
     def __init__(self) -> None:
         self.upserted: dict[str, dict] = {}
         self.deleted: list[str] = []
+        self.query_ids: list[str] = []
+        self.query_distances: list[float] = []
 
     def query(self, **kwargs):
-        return {"ids": [[]], "distances": [[]]}
+        return {"ids": [self.query_ids], "distances": [self.query_distances]}
 
     def upsert(self, *, ids, embeddings=None, metadatas=None, documents=None):
         for index, record_id in enumerate(ids):
@@ -717,6 +719,206 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
     assert [(relation.memory_id, relation.relation_type) for relation in relations] == [
         (updated.memory_id, RelationType.SUPPORTS)
     ]
+
+
+@pytest.mark.asyncio
+async def test_update_without_model_claim_id_resolves_target_from_memory_candidate(bundle_stack):
+    db, store, collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    created = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+    collection.query_ids = [created.memory_id]
+    collection.query_distances = [0.01]
+
+    updated = await service.apply_patch_proposal(
+        proposal=_proposal(
+            action="update_existing_claim",
+            concept_id=None,
+            claim_id=None,
+            claim_text=(
+                "Workspace source schedulers are now owned by the cloud app bootstrap "
+                "and advance next_run_at after a successful claim."
+            ),
+            durable_claim=_durable(
+                "Source schedulers are owned by the cloud app bootstrap and advance next_run_at after success."
+            ),
+            reason="The new session outcome refines the older scheduler lifecycle memory.",
+            citations=["agent-window://codex/sess-2/sha256-window"],
+        ),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-2",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+
+    assert updated.outcome == "applied"
+    assert updated.concept_id == created.concept_id
+    assert updated.claim_id == created.claim_id
+    assert updated.memory_id != created.memory_id
+
+    old_memory = await db.get_memory(created.memory_id)
+    new_memory = await db.get_memory(updated.memory_id)
+    claim = await db.get_agent_claim(created.claim_id)
+    assert old_memory is not None
+    assert new_memory is not None
+    assert claim is not None
+    assert old_memory.status == "superseded"
+    assert old_memory.superseded_by == updated.memory_id
+    assert claim["memory_id"] == updated.memory_id
+    assert "cloud app bootstrap" in claim["claim_text"]
+
+
+@pytest.mark.asyncio
+async def test_create_action_reconciles_existing_memory_candidate_instead_of_duplicate(bundle_stack):
+    db, store, collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    created = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+    collection.query_ids = [created.memory_id]
+    collection.query_distances = [0.01]
+
+    reconciled = await service.apply_patch_proposal(
+        proposal=_proposal(
+            action="create_new_concept",
+            concept_id=None,
+            claim_id=None,
+            title="Cloud bootstrap scheduler ownership",
+            concept_type="debugging_takeaway",
+            claim_text="Source schedulers are owned by the cloud app bootstrap.",
+            durable_claim=_durable("Source schedulers are owned by the cloud app bootstrap."),
+            reason="The model proposed a new concept, but the memory candidate is the current scheduler claim.",
+        ),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-2",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+
+    assert reconciled.outcome == "applied"
+    assert reconciled.concept_id == created.concept_id
+    assert reconciled.claim_id == created.claim_id
+    assert reconciled.memory_id != created.memory_id
+    claims = await db.list_agent_claims(created.concept_id)
+    assert [claim["id"] for claim in claims] == [created.claim_id]
+    old_memory = await db.get_memory(created.memory_id)
+    assert old_memory is not None
+    assert old_memory.status == "superseded"
+
+
+@pytest.mark.asyncio
+async def test_create_action_with_same_memory_content_moves_existing_claim_forward(bundle_stack):
+    db, store, collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    created = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+    collection.query_ids = [created.memory_id]
+    collection.query_distances = [0.01]
+
+    moved = await service.apply_patch_proposal(
+        proposal=_proposal(
+            action="create_new_concept",
+            concept_id=None,
+            claim_id=None,
+        ),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-2",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+
+    assert moved.outcome == "applied"
+    assert moved.concept_id == created.concept_id
+    assert moved.claim_id == created.claim_id
+    assert moved.memory_id != created.memory_id
+    claims = await db.list_agent_claims(created.concept_id)
+    assert [claim["id"] for claim in claims] == [created.claim_id]
+    old_memory = await db.get_memory(created.memory_id)
+    new_memory = await db.get_memory(moved.memory_id)
+    assert old_memory is not None
+    assert new_memory is not None
+    assert old_memory.status == "superseded"
+    assert new_memory.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_update_without_model_claim_id_does_not_create_duplicate_when_no_memory_target(bundle_stack):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    created = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+
+    rejected = await service.apply_patch_proposal(
+        proposal=_proposal(
+            action="update_existing_claim",
+            concept_id=None,
+            claim_id=None,
+            claim_text="This update has no safe memory target.",
+            durable_claim=_durable("This update has no safe memory target."),
+        ),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-2",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+
+    assert rejected.outcome == "rejected_scope"
+    claims = await db.list_agent_claims(created.concept_id)
+    assert [claim["id"] for claim in claims] == [created.claim_id]
+    memory = await db.get_memory(created.memory_id)
+    assert memory is not None
+    assert memory.status == "active"
 
 
 @pytest.mark.asyncio

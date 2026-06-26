@@ -51,6 +51,8 @@ logger = logging.getLogger(__name__)
 __all__ = ["MemoryStore"]
 
 DEDUP_CANDIDATE_LIMIT = 10
+AGENT_CLAIM_RECONCILE_LIMIT = 10
+AGENT_CLAIM_RECONCILE_SIMILARITY_FLOOR = 0.85
 
 
 def _writer_access_scope(memory: Memory) -> AccessScope:
@@ -294,6 +296,49 @@ class MemoryStore:
     # -------------------------------------------------------------------
     # Core: Deduplicate and Insert
     # -------------------------------------------------------------------
+
+    async def find_agent_claim_memory_candidates(
+        self,
+        memory: Memory,
+        *,
+        source_id: str,
+        owner_user_id: str,
+        repo_identifier: str | None,
+        limit: int = AGENT_CLAIM_RECONCILE_LIMIT,
+    ) -> list[tuple[Memory, float]]:
+        """Return active private same-user same-repo agent-session memory candidates."""
+        embedding_text = await self._canonical_memory_embedding_text(memory)
+        embedding = await self._embed(embedding_text)
+        scope = AccessScope(
+            user_id=owner_user_id,
+            include_private=True,
+            allowed_statuses=(MemoryStatus.ACTIVE.value,),
+            active_project=memory.project_key,
+            scope_mode="project-first",
+            active_repo_identifier=repo_identifier,
+        )
+        hits = await self.vector.query(embedding, scope, None, limit)
+        candidates: list[tuple[Memory, float]] = []
+        for memory_id, score in hits:
+            if score < AGENT_CLAIM_RECONCILE_SIMILARITY_FLOOR:
+                continue
+            existing = await self.db.get_memory(memory_id)
+            if (
+                existing is None
+                or existing.status != MemoryStatus.ACTIVE.value
+                or existing.visibility != Visibility.PRIVATE.value
+                or existing.owner_user_id != owner_user_id
+                or (existing.repo_identifier or None) != (repo_identifier or None)
+            ):
+                continue
+            sources = await self.db.get_memory_sources(existing.id)
+            if not any(
+                source.source_type == "agent_session" and source.source_id == source_id
+                for source in sources
+            ):
+                continue
+            candidates.append((existing, score))
+        return candidates
 
     async def deduplicate_and_insert(
         self,

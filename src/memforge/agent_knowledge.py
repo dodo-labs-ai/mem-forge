@@ -183,6 +183,31 @@ class AgentKnowledgeBundleService:
             return AgentKnowledgePatchResult(outcome="parse_failed", result_bucket="failed", reason=text_error)
         memory_content = _memory_content_for(proposal)
 
+        resolved_claim: dict | None = None
+        if proposal.action in {"create_new_concept", "add_new_claim"}:
+            targets = await self._claim_targets_from_memory_candidates(
+                proposal=proposal,
+                source_id=source_id,
+                client=client,
+                session_id=session_id,
+                workspace=workspace,
+                memory_content=memory_content,
+                owner_user_id=owner_user_id,
+                repo_identifier=repo_identifier,
+                project_key=project_key,
+            )
+            if len(targets) == 1:
+                resolved_claim, _matched_memory = targets[0]
+                proposal.action = "update_existing_claim"
+                proposal.concept_id = resolved_claim["concept_id"]
+                proposal.claim_id = resolved_claim["id"]
+            elif len(targets) > 1:
+                return AgentKnowledgePatchResult(
+                    outcome="skipped_ambiguous",
+                    result_bucket="failed",
+                    reason="create/add proposal matched multiple current claim memory targets",
+                )
+
         if proposal.action == "create_new_concept":
             if not proposal.title or not proposal.concept_type:
                 return AgentKnowledgePatchResult(
@@ -282,6 +307,24 @@ class AgentKnowledgeBundleService:
                 reason="unsupported action",
             )
 
+        if proposal.action in {"update_existing_claim", "supersede_existing_claim"} and not proposal.claim_id:
+            resolution = await self._resolve_claim_target_from_memory_candidate(
+                proposal=proposal,
+                source_id=source_id,
+                client=client,
+                session_id=session_id,
+                workspace=workspace,
+                memory_content=memory_content,
+                owner_user_id=owner_user_id,
+                repo_identifier=repo_identifier,
+                project_key=project_key,
+            )
+            if isinstance(resolution, AgentKnowledgePatchResult):
+                return resolution
+            resolved_claim = resolution
+            proposal.concept_id = resolved_claim["concept_id"]
+            proposal.claim_id = resolved_claim["id"]
+
         concept = await self.db.get_agent_concept(proposal.concept_id or "")
         if not self._can_patch_concept(concept, owner_user_id, repo_identifier):
             return AgentKnowledgePatchResult(
@@ -338,7 +381,7 @@ class AgentKnowledgeBundleService:
                 memory_id=memory_id,
             )
 
-        claim = await self.db.get_agent_claim(proposal.claim_id or "")
+        claim = resolved_claim or await self.db.get_agent_claim(proposal.claim_id or "")
         if not claim or claim["concept_id"] != concept["id"]:
             return AgentKnowledgePatchResult(
                 outcome="rejected_scope",
@@ -401,6 +444,88 @@ class AgentKnowledgeBundleService:
             and concept.get("owner_user_id") == owner_user_id
             and (concept.get("repo_identifier") or None) == (repo_identifier or None)
         )
+
+    async def _resolve_claim_target_from_memory_candidate(
+        self,
+        *,
+        proposal: AgentKnowledgePatchProposal,
+        source_id: str,
+        client: str,
+        session_id: str,
+        workspace: str,
+        memory_content: str,
+        owner_user_id: str,
+        repo_identifier: str | None,
+        project_key: str | None,
+    ) -> dict | AgentKnowledgePatchResult:
+        scoped_claims = await self._claim_targets_from_memory_candidates(
+            proposal=proposal,
+            source_id=source_id,
+            client=client,
+            session_id=session_id,
+            workspace=workspace,
+            memory_content=memory_content,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            project_key=project_key,
+        )
+        if not scoped_claims:
+            return AgentKnowledgePatchResult(
+                outcome="rejected_scope",
+                result_bucket="failed",
+                reason="update/supersede proposal did not resolve a current claim memory target",
+            )
+        if len(scoped_claims) > 1:
+            return AgentKnowledgePatchResult(
+                outcome="skipped_ambiguous",
+                result_bucket="failed",
+                reason="update/supersede proposal matched multiple current claim memory targets",
+            )
+        return scoped_claims[0][0]
+
+    async def _claim_targets_from_memory_candidates(
+        self,
+        *,
+        proposal: AgentKnowledgePatchProposal,
+        source_id: str,
+        client: str,
+        session_id: str,
+        workspace: str,
+        memory_content: str,
+        owner_user_id: str,
+        repo_identifier: str | None,
+        project_key: str | None,
+    ) -> list[tuple[dict, Memory]]:
+        del client, workspace
+        candidate_memory = self._build_claim_memory(
+            memory_id=_stable_id("agent_candidate", source_id, session_id, content_hash(memory_content)),
+            claim_text=proposal.claim_text,
+            memory_content=memory_content,
+            memory_type=proposal.memory_type,
+            tags=proposal.tags,
+            confidence=proposal.confidence,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            project_key=project_key,
+        )
+        matches = await self.memory_store.find_agent_claim_memory_candidates(
+            candidate_memory,
+            source_id=source_id,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+        )
+        scoped_claims: list[tuple[dict, Memory]] = []
+        seen_claim_ids: set[str] = set()
+        for matched_memory, _score in matches:
+            claim = await self.db.get_agent_claim_by_memory_id(matched_memory.id)
+            if claim is None or claim["id"] in seen_claim_ids:
+                continue
+            concept = await self.db.get_agent_concept(claim["concept_id"])
+            if not self._can_patch_concept(concept, owner_user_id, repo_identifier):
+                continue
+            scoped_claims.append((claim, matched_memory))
+            seen_claim_ids.add(claim["id"])
+        return scoped_claims
 
     async def _insert_claim_memory(
         self,
@@ -997,9 +1122,9 @@ Decision boundary:
 - Write only durable preferences, conventions, procedures, decisions, pitfalls, or debugging takeaways.
 - Do not summarize ordinary progress, transient status, or facts a future agent can rediscover from the current repo.
 - Agent-session memories are private-only in this version.
-- If the evidence updates an existing claim, use update_existing_claim and copy the exact concept_id and claim_id.
-- If the evidence replaces or invalidates an existing claim, use supersede_existing_claim and copy the exact concept_id and claim_id. Lifecycle is represented only by action, not by claim_text or durable_claim.
-- If it belongs in an existing concept but is a distinct durable claim, use add_new_claim and copy the exact concept_id.
+- If the evidence updates existing durable knowledge, use update_existing_claim. Copy concept_id and claim_id only when the listed match is unambiguous; otherwise leave them null and MemForge will reconcile against memory rows.
+- If the evidence replaces or invalidates existing durable knowledge, use supersede_existing_claim. Copy concept_id and claim_id only when the listed match is unambiguous; otherwise leave them null and MemForge will reconcile against memory rows.
+- If it belongs in an existing concept but is a distinct durable claim, use add_new_claim and copy the exact concept_id when the listed concept is unambiguous.
 - If it is a new durable concept, use create_new_concept with a concise title and concept_type.
 - If nothing durable should be kept, use no_output.
 - Agent-session memory is user-anchored: non-no_output actions require at least one primary_evidence_ids entry from <primary_evidence>.
@@ -1032,6 +1157,7 @@ Decision boundary:
 
 <comparison_context>
 Existing private concepts for this user and repo. Use these only to choose create/update/supersede/add action and IDs; do not extract new memory from this section alone.
+IDs are optional for update_existing_claim and supersede_existing_claim when the durable evidence is clear but the listed context is incomplete.
 {existing}
 </comparison_context>
 
