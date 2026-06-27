@@ -1114,8 +1114,12 @@ async def test_admin_sources_exposes_running_stored_counts_separately(db, tmp_pa
             ),
         )
         await db.db.execute(
-            "INSERT INTO memory_sources (memory_id, doc_id, source_type, excerpt) VALUES (?, ?, ?, ?)",
-            (f"mem-{index}", doc_id, "github_pages", f"Excerpt {index}"),
+            """
+            INSERT INTO memory_sources (
+                memory_id, doc_id, source_type, source_id, excerpt
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (f"mem-{index}", doc_id, "github_pages", source_id, f"Excerpt {index}"),
         )
     await db.db.commit()
 

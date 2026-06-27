@@ -680,7 +680,7 @@ def sync(ctx, source: str | None):
 
 
 @cli.command("search")
-@click.argument("query")
+@click.argument("query", required=False, default="")
 @click.option("--top-k", default=10, show_default=True, type=int, help="Maximum number of results.")
 @click.option(
     "--type",
@@ -689,7 +689,12 @@ def sync(ctx, source: str | None):
     type=click.Choice(["fact", "decision", "convention", "procedure"]),
     help="Filter by memory type. Repeat for multiple types.",
 )
-@click.option("--source", "sources", multiple=True, help="Filter by source name or ID. Repeat for multiple sources.")
+@click.option(
+    "--source-id",
+    "source_ids",
+    multiple=True,
+    help="Exact source ID from `memforge sources searchable`. Repeat for multiple sources.",
+)
 @click.option("--entity", "entities", multiple=True, help="Entity hint. Repeat for multiple entities.")
 @click.option("--start-date", default=None, help="Optional YYYY-MM-DD lower bound for date filtering.")
 @click.option("--end-date", default=None, help="Optional YYYY-MM-DD upper bound for date filtering.")
@@ -707,7 +712,7 @@ def search(
     query: str,
     top_k: int,
     memory_types: tuple[str, ...],
-    sources: tuple[str, ...],
+    source_ids: tuple[str, ...],
     entities: tuple[str, ...],
     start_date: str | None,
     end_date: str | None,
@@ -731,8 +736,8 @@ def search(
     }
     if memory_types:
         kwargs["memory_types"] = list(memory_types)
-    if sources:
-        kwargs["sources"] = list(sources)
+    if source_ids:
+        kwargs["source_filter"] = {"source_ids": list(source_ids)}
     if entities:
         kwargs["entities"] = list(entities)
     if time_range:
@@ -774,7 +779,7 @@ def memory():
 
 
 @memory.command("search")
-@click.argument("query")
+@click.argument("query", required=False, default="")
 @click.option("--top-k", default=10, show_default=True, type=int, help="Maximum number of results.")
 @click.option(
     "--type",
@@ -783,7 +788,12 @@ def memory():
     type=click.Choice(["fact", "decision", "convention", "procedure"]),
     help="Filter by memory type. Repeat for multiple types.",
 )
-@click.option("--source", "sources", multiple=True, help="Filter by source name or ID. Repeat for multiple sources.")
+@click.option(
+    "--source-id",
+    "source_ids",
+    multiple=True,
+    help="Exact source ID from `memforge sources searchable`. Repeat for multiple sources.",
+)
 @click.option("--entity", "entities", multiple=True, help="Entity hint. Repeat for multiple entities.")
 @click.option("--start-date", default=None, help="Optional YYYY-MM-DD lower bound for date filtering.")
 @click.option("--end-date", default=None, help="Optional YYYY-MM-DD upper bound for date filtering.")
@@ -801,7 +811,7 @@ def memory_search(
     query: str,
     top_k: int,
     memory_types: tuple[str, ...],
-    sources: tuple[str, ...],
+    source_ids: tuple[str, ...],
     entities: tuple[str, ...],
     start_date: str | None,
     end_date: str | None,
@@ -825,8 +835,8 @@ def memory_search(
     }
     if memory_types:
         kwargs["memory_types"] = list(memory_types)
-    if sources:
-        kwargs["sources"] = list(sources)
+    if source_ids:
+        kwargs["source_filter"] = {"source_ids": list(source_ids)}
     if entities:
         kwargs["entities"] = list(entities)
     if time_range:
@@ -893,38 +903,73 @@ def sources():
 @sources.command("list")
 @click.pass_context
 def sources_list(ctx):
-    """List all configured sources."""
+    """List all configured sources for the active API target."""
+    payload = _tool_client(ctx).list_sources()
+    if ctx.obj.get("json") or payload.get("error"):
+        _emit_tool_payload(ctx, payload)
+        return
 
-    async def _run():
-        config: AppConfig = ctx.obj["config"]
-        db = await _get_db(config)
-        src_list = await db.list_sources()
-        await db.close()
+    src_list = payload.get("data") or []
+    if not src_list:
+        console.print("[dim]No sources configured.[/]")
+        return
 
-        if not src_list:
-            console.print("[dim]No sources configured.[/]")
-            return
+    table = Table(title="Configured Sources")
+    table.add_column("ID", style="dim", max_width=18)
+    table.add_column("Name")
+    table.add_column("Type")
+    table.add_column("Status")
+    table.add_column("Docs", justify="right")
+    table.add_column("Memories", justify="right")
+    table.add_column("Last Sync")
 
-        table = Table(title="Configured Sources")
-        table.add_column("ID", style="dim", max_width=12)
-        table.add_column("Name")
-        table.add_column("Type")
-        table.add_column("Status")
-        table.add_column("Doc Count", justify="right")
-        table.add_column("Last Sync")
+    for src in src_list:
+        table.add_row(
+            src.get("source_id") or src.get("id", ""),
+            src.get("name", ""),
+            src.get("type", ""),
+            src.get("status", ""),
+            str(src.get("doc_count", 0)),
+            str(src.get("memory_count", 0)),
+            src.get("last_synced_at") or "never",
+        )
+    console.print(table)
 
-        for src in src_list:
-            table.add_row(
-                src.get("id", ""),
-                src.get("name", ""),
-                src.get("type", ""),
-                src.get("status", ""),
-                str(src.get("doc_count", 0)),
-                src.get("last_sync") or "never",
-            )
-        console.print(table)
 
-    asyncio.run(_run())
+@sources.command("searchable")
+@click.pass_context
+def sources_searchable(ctx):
+    """List source IDs available for memory search filtering."""
+    payload = _tool_client(ctx).list_searchable_sources()
+    if ctx.obj.get("json") or payload.get("error"):
+        _emit_tool_payload(ctx, payload)
+        return
+
+    src_list = payload.get("data") or []
+    if not src_list:
+        console.print("[dim]No searchable sources configured.[/]")
+        return
+
+    table = Table(title="Searchable Sources")
+    table.add_column("Source ID", style="dim", max_width=18)
+    table.add_column("Name")
+    table.add_column("Type")
+    table.add_column("Status")
+    table.add_column("Docs", justify="right")
+    table.add_column("Memories", justify="right")
+    table.add_column("Last Sync")
+
+    for src in src_list:
+        table.add_row(
+            src.get("source_id", ""),
+            src.get("name", ""),
+            src.get("type", ""),
+            src.get("status", ""),
+            str(src.get("doc_count", 0)),
+            str(src.get("memory_count", 0)),
+            src.get("last_synced_at") or "never",
+        )
+    console.print(table)
 
 
 @sources.command("schedule")

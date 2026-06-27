@@ -194,22 +194,6 @@ def _default_access_scope(include_superseded: bool) -> AccessScope:
     )
 
 
-def _merge_source_filters(
-    source_filter: MemorySourceFilter | None,
-    sources: list[str] | None,
-) -> MemorySourceFilter | None:
-    if source_filter is None and not sources:
-        return None
-    base = source_filter or MemorySourceFilter()
-    merged_sources = tuple(dict.fromkeys((*base.sources, *(sources or ()))))
-    return MemorySourceFilter(
-        source_types=base.source_types,
-        sources=merged_sources,
-        clients=base.clients,
-        repo_identifiers=base.repo_identifiers,
-    )
-
-
 # ---------------------------------------------------------------------------
 # SearchEngine
 # ---------------------------------------------------------------------------
@@ -275,7 +259,6 @@ class SearchEngine:
         self,
         query: str,
         memory_types: list[str] | None = None,
-        sources: list[str] | None = None,
         time_range: MemoryTimeRange | None = None,
         entities: list[str] | None = None,
         include_superseded: bool = False,
@@ -283,6 +266,7 @@ class SearchEngine:
         *,
         source_filter: MemorySourceFilter | None = None,
         request_scope: AccessScope | None = None,
+        offset: int = 0,
     ) -> dict:
         """Unified search: memories (primary) + documents (fallback).
 
@@ -302,6 +286,39 @@ class SearchEngine:
         """
         t0 = time.monotonic()
         scope = request_scope or _default_access_scope(include_superseded)
+        combined_source_filter = source_filter
+
+        if not query.strip():
+            if (
+                (combined_source_filter is None or combined_source_filter.is_empty())
+                and (time_range is None or time_range.is_empty())
+            ):
+                raise ValueError("queryless search requires source_filter or time_range")
+            ids, total_candidates = await self._relational.list_ids_by_source_and_time(
+                combined_source_filter,
+                time_range,
+                scope,
+                limit=top_k,
+                offset=offset,
+            )
+            ranked = [
+                _RankedCandidate(memory_id=memory_id, rrf_score=float(top_k - index), final_score=float(top_k - index))
+                for index, memory_id in enumerate(ids)
+            ]
+            results = await self._enrich_results(ids, ranked)
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            return {
+                "query_analysis": {
+                    "detected_entities": [],
+                    "strategies_used": ["source_time_listing"],
+                },
+                "results": results,
+                "total_candidates": total_candidates,
+                "total_count": total_candidates,
+                "limit": top_k,
+                "offset": offset,
+                "retrieval_time_ms": elapsed_ms,
+            }
 
         # ----- 1. Build known entities dict for query analysis -----
         known_entities = await self._build_known_entities()
@@ -326,19 +343,19 @@ class SearchEngine:
                 analysis.use_graph = True
 
         # ----- 4. Run active channels in parallel -----
-        fetch_k = top_k * 2
+        fetch_k = max(top_k * 2, top_k + offset)
         tasks: list[asyncio.Task] = []
         channel_names: list[str] = []
 
         # Vector search is always on
         tasks.append(asyncio.ensure_future(
-            self._vector_search(query, memory_types, sources, scope, fetch_k)
+            self._vector_search(query, memory_types, scope, fetch_k)
         ))
         channel_names.append("vector")
 
         # BM25 is always on
         tasks.append(asyncio.ensure_future(
-            self._bm25_search(query, analysis, memory_types, sources, scope, fetch_k)
+            self._bm25_search(query, analysis, memory_types, scope, fetch_k)
         ))
         channel_names.append("bm25")
 
@@ -363,7 +380,6 @@ class SearchEngine:
         # ----- 5. Fuse via RRF, then apply the source-of-truth re-checks -----
         fused = self._rrf_fusion(channel_results, k=self._config.rrf_k)
         fused = await self._filter_candidates_by_status(fused, scope)
-        combined_source_filter = _merge_source_filters(source_filter, sources)
         if (
             (combined_source_filter is not None and not combined_source_filter.is_empty())
             or (time_range is not None and not time_range.is_empty())
@@ -382,16 +398,18 @@ class SearchEngine:
         # ----- 6b. Optional cross-encoder rerank -----
         ranked = await self._rerank_with_llm(query, ranked, top_k)
 
-        # ----- 7. Trim to top_k -----
+        # ----- 7. Collapse duplicate families and apply the requested page -----
         ranked = self._collapse_curation_families(ranked)
-        ranked = ranked[:top_k]
+        ranked = ranked[offset: offset + top_k]
 
         # ----- 8. Enrich results -----
         memory_ids = [c.memory_id for c in ranked]
         results = await self._enrich_results(memory_ids, ranked)
 
         # ----- 9. Document fallback -----
-        if time_range is None and len(results) < top_k:
+        has_explicit_source_filter = combined_source_filter is not None and not combined_source_filter.is_empty()
+        has_explicit_time_filter = time_range is not None and not time_range.is_empty()
+        if not has_explicit_source_filter and not has_explicit_time_filter and len(results) < top_k:
             remaining = top_k - len(results)
             existing_doc_ids = {
                 r.source_doc_id for r in results if r.source_doc_id
@@ -408,6 +426,8 @@ class SearchEngine:
             },
             "results": results,
             "total_candidates": total_candidates,
+            "limit": top_k,
+            "offset": offset,
             "retrieval_time_ms": elapsed_ms,
         }
 
@@ -419,16 +439,14 @@ class SearchEngine:
         self,
         query: str,
         memory_types: list[str] | None,
-        sources: list[str] | None,
         scope: AccessScope,
         limit: int,
     ) -> list[tuple[str, float]]:
         """Embed the query via cache, then query the vector channel.
 
-        Source filtering is not applied here: it is authoritative on the
-        fused candidate set (a memory has many sources; this channel cannot
-        express that). The ``sources`` parameter is accepted for a uniform
-        channel signature.
+        Source filtering is authoritative on the fused candidate set because a
+        memory can have many source rows and vector stores cannot express that
+        provenance predicate.
         """
         embedding = self._get_or_compute_embedding(query)
         if embedding is None:
@@ -440,14 +458,13 @@ class SearchEngine:
         query: str,
         analysis: QueryAnalysis,
         memory_types: list[str] | None,
-        sources: list[str] | None,
         scope: AccessScope,
         limit: int,
     ) -> list[tuple[str, float]]:
         """Query the keyword channel with optional alias expansion.
 
         Source filtering is applied once on the fused set (Step 8), not per
-        channel, so this method does not re-check ``sources``.
+        channel.
         """
         sanitized_query = _sanitize_fts_query(query)
         if not sanitized_query:

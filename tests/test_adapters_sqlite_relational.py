@@ -9,9 +9,10 @@ import pytest
 from memforge.models import (
     DocumentRecord,
     Memory,
+    MemorySource,
     content_hash,
 )
-from memforge.retrieval.filters import MemorySourceFilter
+from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import RelationalStore
@@ -42,12 +43,12 @@ def _memory(mem_id: str, status: str = "active") -> Memory:
     )
 
 
-async def _document(db: Database, doc_id: str) -> None:
+async def _document(db: Database, doc_id: str, *, source: str = "src-confluence") -> None:
     now = datetime.now(timezone.utc)
     await db.upsert_document(
         DocumentRecord(
             doc_id=doc_id,
-            source="src-confluence",
+            source=source,
             source_url=f"https://example/{doc_id}",
             title="Doc",
             space_or_project="PAY",
@@ -147,18 +148,122 @@ async def test_filter_ids_by_source_and_time_uses_the_source_join(db):
     # supported by a document from that source.
     kept = await store.filter_ids_by_source_and_time(
         ["m1", "m2"],
-        MemorySourceFilter(sources=("src-confluence",)),
+        MemorySourceFilter(source_ids=("src-confluence",)),
         None,
     )
     assert kept == {"m1"}
     assert (
         await store.filter_ids_by_source_and_time(
             ["m1"],
-            MemorySourceFilter(sources=("other-source",)),
+            MemorySourceFilter(source_ids=("other-source",)),
             None,
         )
         == set()
     )
+
+
+@pytest.mark.asyncio
+async def test_list_ids_by_source_and_time_excludes_user_disabled_sources(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-disabled"))
+    await store.insert_memory(_memory("m-enabled"))
+    await db.upsert_source("src-disabled", "jira", "Disabled Jira", "{}")
+    await db.upsert_source("src-enabled", "jira", "Enabled Jira", "{}")
+    await _document(db, "doc-disabled", source="src-disabled")
+    await _document(db, "doc-enabled", source="src-enabled")
+    source_updated_at = datetime(2026, 6, 24, tzinfo=timezone.utc)
+    await store.add_memory_source(
+        "m-disabled",
+        "doc-disabled",
+        "jira",
+        None,
+        source_updated_at=source_updated_at,
+    )
+    await store.add_memory_source(
+        "m-enabled",
+        "doc-enabled",
+        "jira",
+        None,
+        source_updated_at=source_updated_at,
+    )
+    await db.set_source_subscription("src-disabled", LOCAL_DEV_USER_ID, False)
+
+    page, total = await store.list_ids_by_source_and_time(
+        None,
+        MemoryTimeRange(
+            after=datetime(2026, 6, 20, tzinfo=timezone.utc),
+            before=datetime(2026, 6, 27, tzinfo=timezone.utc),
+            date_type="source_updated_at",
+        ),
+        _scope(),
+        limit=10,
+        offset=0,
+    )
+
+    assert page == ["m-enabled"]
+    assert total == 1
+
+
+@pytest.mark.asyncio
+async def test_count_source_memories_uses_canonical_memory_source_id(db):
+    await db.insert_memory(_memory("m1"))
+    await db.insert_memory(_memory("m-retired", status="retired"))
+    await _document(db, "doc-legacy", source="legacy-document-label")
+    await _document(db, "doc-retired", source="src-exact")
+    await db.restore_memory_source_snapshot(
+        MemorySource(
+            memory_id="m1",
+            doc_id="doc-legacy",
+            source_id="src-exact",
+            source_type="jira",
+            source_updated_at=None,
+        )
+    )
+    await db.restore_memory_source_snapshot(
+        MemorySource(
+            memory_id="m-retired",
+            doc_id="doc-retired",
+            source_id="src-exact",
+            source_type="jira",
+            source_updated_at=None,
+        )
+    )
+
+    assert await db.count_source_memories("src-exact") == 1
+    assert await db.count_source_memories("legacy-document-label") == 0
+
+
+@pytest.mark.asyncio
+async def test_source_id_backfill_migration_repairs_legacy_memory_sources(db):
+    await db.insert_memory(_memory("m1"))
+    await _document(db, "doc1", source="src-backfill")
+    await db.add_memory_source("m1", "doc1", "confluence", None, source_updated_at=None)
+    await db.db.execute("UPDATE memory_sources SET source_id = NULL WHERE memory_id = ?", ("m1",))
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 28")
+    await db.db.commit()
+
+    await db._run_migrations()
+
+    assert await db.count_source_memories("src-backfill") == 1
+
+
+@pytest.mark.asyncio
+async def test_source_id_invariant_rejects_unresolved_blank_provenance(db):
+    await db.insert_memory(_memory("m1"))
+    await _document(db, "doc1", source="src-backfill")
+    await db.add_memory_source("m1", "doc1", "confluence", None, source_updated_at=None)
+    await db.db.execute("UPDATE memory_sources SET source_id = '' WHERE memory_id = ?", ("m1",))
+    await db.db.commit()
+
+    with pytest.raises(RuntimeError, match="without source_id"):
+        await db._assert_memory_source_ids_resolved()
+
+
+@pytest.mark.asyncio
+async def test_count_source_memories_returns_zero_when_no_search_visible_statuses(db, monkeypatch):
+    monkeypatch.setattr("memforge.storage.database.allowed_search_statuses", lambda _include=False: ())
+
+    assert await db.count_source_memories("src-exact") == 0
 
 
 @pytest.mark.asyncio

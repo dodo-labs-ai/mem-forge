@@ -57,7 +57,7 @@ MAX_EVENTS = 40
 WORKER_LEASE_BUFFER_SECONDS = 60.0
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.9"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -65,11 +65,12 @@ SESSION_START_USAGE_GUIDANCE = (
     "- Before non-trivial repo or workspace work, use the MemForge MCP search "
     "tool with a natural language query. Omit filters when unsure so you do not "
     "accidentally hide relevant memories.\n"
-    "- Use source filters only when the user or task gives a clear facet: "
-    "`current_repo_only` for current-repo agent-session history, `clients` only "
-    "when the user names Codex or Claude Code, and `source_types` only when a "
-    "specific source category such as Jira, Confluence, or agent sessions is "
-    "actually relevant.\n"
+    "- Use source filters only when the user or task gives a clear facet. Use "
+    "`current_repo_only` for current-repo agent-session history and `clients` "
+    "only when the user names Codex or Claude Code. When the user names a "
+    "configured knowledge source, call `list_sources` first and pass exact "
+    "`source_ids` from that result; do not guess source ids from source names "
+    "or source types.\n"
     "- If a memory affects an answer, review, or code change, call `get_memory` "
     "for full content and provenance before relying on it.\n"
     "- If `content_url` or `pdf_url` is returned and the user needs source "

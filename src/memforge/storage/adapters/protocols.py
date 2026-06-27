@@ -69,6 +69,15 @@ class RelationalStore(Protocol):
         source_filter: MemorySourceFilter | None = None,
         time_range: MemoryTimeRange | None = None,
     ) -> set[str]: ...
+    async def list_ids_by_source_and_time(
+        self,
+        source_filter: MemorySourceFilter | None,
+        time_range: MemoryTimeRange | None,
+        scope: AccessScope,
+        *,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[str], int]: ...
     async def fetch_ranking_metadata(self, ids: Sequence[str]) -> Mapping[str, RankingMetadata]: ...
     async def graph_search(
         self,

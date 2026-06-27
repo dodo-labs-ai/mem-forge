@@ -118,7 +118,6 @@ async def test_bm25_with_alias_expansion_still_matches(db):
         query="payroll cutoff",
         analysis=QueryAnalysis(detected_entity_ids=[cutoff_id]),
         memory_types=None,
-        sources=None,
         scope=_scope(),
         limit=10,
     )
