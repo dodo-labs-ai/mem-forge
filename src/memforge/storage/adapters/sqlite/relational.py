@@ -46,6 +46,94 @@ _MIN_SHARED_ENTITIES_FOR_EXPANSION = 2
 _EXPANSION_WEIGHT = 0.5
 
 
+def _enabled_source_visibility_condition(
+    disabled_source_ids: list[str],
+) -> tuple[str | None, list[str]]:
+    if not disabled_source_ids:
+        return None, []
+    placeholders = ", ".join("?" for _ in disabled_source_ids)
+    return (
+        f"""(
+            NOT EXISTS (
+                SELECT 1
+                FROM memory_sources ms_any
+                WHERE ms_any.memory_id = m.id
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM memory_sources ms_enabled
+                WHERE ms_enabled.memory_id = m.id
+                  AND (ms_enabled.source_id IS NULL OR ms_enabled.source_id NOT IN ({placeholders}))
+            )
+        )""",
+        list(disabled_source_ids),
+    )
+
+
+def _append_source_time_predicates(
+    *,
+    source_filter: MemorySourceFilter,
+    time_range: MemoryTimeRange | None,
+    joins: list[str],
+    clauses: list[str],
+    params: list[Any],
+) -> str:
+    """Append canonical source/time predicates and return the deterministic order.
+
+    `source_updated_at` intentionally lives on the same `memory_sources` row as
+    exact source facets such as `source_ids`, so a stale Jira provenance row
+    cannot match because a different Confluence row was updated recently.
+    """
+
+    has_time_filter = time_range is not None and not time_range.is_empty()
+    needs_source_join = (
+        bool(source_filter.source_ids)
+        or bool(source_filter.clients)
+        or (has_time_filter and time_range is not None and time_range.date_type == "source_updated_at")
+    )
+    needs_document_join = bool(source_filter.clients)
+
+    if needs_source_join:
+        joins.append("JOIN memory_sources ms ON m.id = ms.memory_id")
+    if needs_document_join:
+        joins.append("LEFT JOIN documents d ON ms.doc_id = d.doc_id")
+
+    if source_filter.source_ids:
+        placeholders = ",".join("?" for _ in source_filter.source_ids)
+        clauses.append(f"ms.source_id IN ({placeholders})")
+        params.extend(source_filter.source_ids)
+    if source_filter.clients:
+        placeholders = ",".join("?" for _ in source_filter.clients)
+        clauses.append(f"d.client IN ({placeholders})")
+        params.extend(source_filter.clients)
+    if source_filter.repo_identifiers:
+        placeholders = ",".join("?" for _ in source_filter.repo_identifiers)
+        clauses.append(f"m.repo_identifier IN ({placeholders})")
+        params.extend(source_filter.repo_identifiers)
+
+    if has_time_filter and time_range is not None:
+        if time_range.date_type == "source_updated_at":
+            if time_range.after is not None:
+                clauses.append("ms.source_updated_at >= ?")
+                params.append(time_range.after.isoformat())
+            if time_range.before is not None:
+                clauses.append("ms.source_updated_at < ?")
+                params.append(time_range.before.isoformat())
+        elif time_range.date_type == "memory_updated_at":
+            if time_range.after is not None:
+                clauses.append("m.updated_at >= ?")
+                params.append(time_range.after.isoformat())
+            if time_range.before is not None:
+                clauses.append("m.updated_at < ?")
+                params.append(time_range.before.isoformat())
+        else:
+            raise ValueError(f"Unsupported memory time range date_type: {time_range.date_type}")
+
+    if has_time_filter and time_range is not None and time_range.date_type == "source_updated_at":
+        return "MAX(ms.source_updated_at) DESC, m.id DESC"
+    return "m.updated_at DESC, m.id DESC"
+
+
 class SqliteRelationalStore:
     """The row channel backed by the memories table."""
 
@@ -202,14 +290,6 @@ class SqliteRelationalStore:
         if not has_source_filter and not has_time_filter:
             return set(memory_ids)
 
-        needs_source_join = (
-            bool(source_filter.source_types)
-            or bool(source_filter.sources)
-            or bool(source_filter.clients)
-            or (has_time_filter and time_range is not None and time_range.date_type == "source_updated_at")
-        )
-        needs_document_join = bool(source_filter.sources) or bool(source_filter.clients)
-
         matched: set[str] = set()
         for start in range(0, len(memory_ids), _BATCH_SIZE):
             batch = memory_ids[start : start + _BATCH_SIZE]
@@ -218,45 +298,13 @@ class SqliteRelationalStore:
             clauses = [f"m.id IN ({id_placeholders})"]
             params: list[Any] = [*batch]
 
-            if needs_source_join:
-                joins.append("JOIN memory_sources ms ON m.id = ms.memory_id")
-            if needs_document_join:
-                joins.append("LEFT JOIN documents d ON ms.doc_id = d.doc_id")
-
-            if source_filter.source_types:
-                placeholders = ",".join("?" for _ in source_filter.source_types)
-                clauses.append(f"ms.source_type IN ({placeholders})")
-                params.extend(source_filter.source_types)
-            if source_filter.sources:
-                placeholders = ",".join("?" for _ in source_filter.sources)
-                clauses.append(f"d.source IN ({placeholders})")
-                params.extend(source_filter.sources)
-            if source_filter.clients:
-                placeholders = ",".join("?" for _ in source_filter.clients)
-                clauses.append(f"d.client IN ({placeholders})")
-                params.extend(source_filter.clients)
-            if source_filter.repo_identifiers:
-                placeholders = ",".join("?" for _ in source_filter.repo_identifiers)
-                clauses.append(f"m.repo_identifier IN ({placeholders})")
-                params.extend(source_filter.repo_identifiers)
-
-            if has_time_filter and time_range is not None:
-                if time_range.date_type == "source_updated_at":
-                    if time_range.after is not None:
-                        clauses.append("ms.source_updated_at >= ?")
-                        params.append(time_range.after.isoformat())
-                    if time_range.before is not None:
-                        clauses.append("ms.source_updated_at < ?")
-                        params.append(time_range.before.isoformat())
-                elif time_range.date_type == "memory_updated_at":
-                    if time_range.after is not None:
-                        clauses.append("m.updated_at >= ?")
-                        params.append(time_range.after.isoformat())
-                    if time_range.before is not None:
-                        clauses.append("m.updated_at < ?")
-                        params.append(time_range.before.isoformat())
-                else:
-                    raise ValueError(f"Unsupported memory time range date_type: {time_range.date_type}")
+            _append_source_time_predicates(
+                source_filter=source_filter,
+                time_range=time_range,
+                joins=joins,
+                clauses=clauses,
+                params=params,
+            )
 
             sql = (
                 "SELECT DISTINCT m.id "
@@ -273,6 +321,62 @@ class SqliteRelationalStore:
                 logger.exception("Failed to filter ids by structured source/date facets")
                 return set()
         return matched
+
+    async def list_ids_by_source_and_time(
+        self,
+        source_filter: MemorySourceFilter | None,
+        time_range: MemoryTimeRange | None,
+        scope: AccessScope,
+        *,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[str], int]:
+        source_filter = source_filter or MemorySourceFilter()
+        has_source_filter = not source_filter.is_empty()
+        has_time_filter = time_range is not None and not time_range.is_empty()
+        if not has_source_filter and not has_time_filter:
+            raise ValueError("list_ids_by_source_and_time requires source_filter or time_range")
+
+        predicate_sql, predicate_params = visible_sql(scope, "m")
+        joins: list[str] = []
+        clauses = [predicate_sql]
+        params: list[Any] = list(predicate_params)
+        disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
+        order_sql = _append_source_time_predicates(
+            source_filter=source_filter,
+            time_range=time_range,
+            joins=joins,
+            clauses=clauses,
+            params=params,
+        )
+        has_source_row_join = any("memory_sources ms" in join for join in joins)
+        if has_source_row_join and disabled_source_ids:
+            placeholders = ", ".join("?" for _ in disabled_source_ids)
+            clauses.append(f"(ms.source_id IS NULL OR ms.source_id NOT IN ({placeholders}))")
+            params.extend(disabled_source_ids)
+        else:
+            source_visibility_sql, source_visibility_params = _enabled_source_visibility_condition(disabled_source_ids)
+            if source_visibility_sql:
+                clauses.append(source_visibility_sql)
+                params.extend(source_visibility_params)
+        join_sql = " ".join(joins)
+        where_sql = " AND ".join(clauses)
+        group_sql = "GROUP BY m.id" if joins else ""
+
+        count_sql = f"SELECT COUNT(*) FROM (SELECT m.id FROM memories m {join_sql} WHERE {where_sql} {group_sql}) q"
+        async with self._db.db.execute(count_sql, params) as cursor:
+            row = await cursor.fetchone()
+            total = int(row[0]) if row else 0
+
+        page_sql = (
+            f"SELECT m.id FROM memories m {join_sql} WHERE {where_sql} "
+            f"{group_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?"
+        )
+        ids: list[str] = []
+        async with self._db.db.execute(page_sql, [*params, limit, offset]) as cursor:
+            async for row in cursor:
+                ids.append(row[0])
+        return ids, total
 
     async def graph_search(
         self,

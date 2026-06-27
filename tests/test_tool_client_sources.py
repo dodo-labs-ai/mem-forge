@@ -127,7 +127,7 @@ def test_tool_client_forwards_structured_memory_search_facets():
     client.search(
         query="scheduler fixes last week",
         source_filter={
-            "source_types": ["agent_session"],
+            "source_ids": ["src-codex-session"],
             "clients": ["codex"],
             "repo_identifiers": ["github.tools.sap/hcm/memforge-cloud"],
         },
@@ -145,7 +145,7 @@ def test_tool_client_forwards_structured_memory_search_facets():
                 "top_k": 10,
                 "include_superseded": False,
                 "source_filter": {
-                    "source_types": ["agent_session"],
+                    "source_ids": ["src-codex-session"],
                     "clients": ["codex"],
                     "repo_identifiers": ["github.tools.sap/hcm/memforge-cloud"],
                 },

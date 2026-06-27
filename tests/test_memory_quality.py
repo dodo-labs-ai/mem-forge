@@ -1069,17 +1069,78 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
         {
             "query": "proxy search",
             "memory_types": None,
-            "sources": None,
             "source_filter": None,
             "time_range": None,
             "entities": None,
             "include_superseded": False,
             "top_k": 3,
             "request_scope": expected_scope,
+            "offset": 0,
         }
     ]
     assert payload["results"][0]["memory_id"] == "mem-proxy-search"
     assert payload["results"][0]["pdf_url"] == "/api/documents/doc-proxy/pdf"
+
+
+@pytest.mark.asyncio
+async def test_admin_memory_search_validates_source_ids_without_hydrating_admin_rows(
+    db: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from memforge.server.admin_api import create_admin_app
+    from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
+
+    await db.upsert_source("src-mounttai", "jira", "MountTai Defects", "{}")
+
+    calls = []
+
+    class FakeSearchEngine:
+        async def search(self, **kwargs):
+            calls.append(kwargs)
+            return {"query": kwargs["query"], "results": []}
+
+    class FakeRuntimeProvider:
+        async def build_search_engine(self, _db, _config, *, audit_logger=None):
+            return FakeSearchEngine()
+
+    async def fail_admin_row_hydration(*args, **kwargs):
+        raise AssertionError("search source-id validation must not hydrate all source admin rows")
+
+    monkeypatch.setattr(
+        "memforge.server.admin_api.list_source_admin_rows",
+        fail_admin_row_hydration,
+    )
+
+    app = create_admin_app(
+        db=db,
+        config=_config(tmp_path),
+        runtime_provider=FakeRuntimeProvider(),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/memories/search",
+            json={
+                "query": "payroll defect",
+                "source_filter": {"source_ids": ["src-mounttai"]},
+            },
+        )
+
+    assert response.status_code == 200
+    assert calls[0]["source_filter"].source_ids == ("src-mounttai",)
+
+    await db.set_source_subscription("src-mounttai", LOCAL_DEV_USER_ID, enabled=False)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/memories/search",
+            json={
+                "query": "payroll defect",
+                "source_filter": {"source_ids": ["src-mounttai", "src-missing"]},
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "unknown_or_unavailable_source_id"
 
 
 @pytest.mark.asyncio

@@ -307,19 +307,17 @@ class MemoryUpdateRequest(BaseModel):
 class SourceFacetFilterRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    source_types: list[str] | None = None
+    source_ids: list[str] | None = None
     clients: list[str] | None = None
     repo_identifiers: list[str] | None = None
 
-    @field_validator("source_types")
+    @field_validator("source_ids")
     @classmethod
-    def _validate_source_types(cls, value: list[str] | None) -> list[str] | None:
+    def _validate_source_ids(cls, value: list[str] | None) -> list[str] | None:
         if value is None:
             return value
-        allowed = set(GENE_REGISTRY)
-        invalid = [item for item in value if item not in allowed]
-        if invalid:
-            raise ValueError("source_types must exactly match registered source types: " + ", ".join(sorted(allowed)))
+        if not value or any(not isinstance(item, str) or not item.strip() for item in value):
+            raise ValueError("source_ids must be a non-empty list of source IDs")
         return value
 
     @field_validator("clients")
@@ -335,7 +333,7 @@ class SourceFacetFilterRequest(BaseModel):
 
     def to_source_filter(self) -> MemorySourceFilter:
         return MemorySourceFilter(
-            source_types=tuple(self.source_types or ()),
+            source_ids=tuple(self.source_ids or ()),
             clients=tuple(self.clients or ()),
             repo_identifiers=tuple(self.repo_identifiers or ()),
         )
@@ -386,18 +384,20 @@ class MemoryTimeRangeRequest(BaseModel):
 
 
 class MemorySearchRequest(BaseModel):
-    query: str
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = ""
     memory_types: list[str] | None = None
-    sources: list[str] | None = None
     time_range: MemoryTimeRangeRequest | None = None
     entities: list[str] | None = None
     include_superseded: bool = False
     top_k: int = Field(default=10, ge=1, le=50)
+    offset: int = Field(default=0, ge=0)
     active_project: str | None = None
     active_repo_identifier: str | None = None
     scope_mode: Literal["project", "project-first", "workspace"] = "project-first"
     include_private: bool = False
-    status: str | None = None  # post-rank row-status filter; mirrors GET /api/memories
+    status: str | None = None
     source_filter: SourceFacetFilterRequest | None = None
     # NO user_id field. The caller's identity is server-derived from
     # resolve_principal(request); a body-supplied user_id is never used as
@@ -423,6 +423,20 @@ class MemorySearchRequest(BaseModel):
         if value not in allowed:
             raise ValueError("status must exactly match supported memory statuses: " + ", ".join(sorted(allowed)))
         return value
+
+    @model_validator(mode="after")
+    def _validate_query_or_deterministic_filter(self) -> "MemorySearchRequest":
+        if self.query.strip():
+            return self
+        has_source_filter = self.source_filter is not None and bool(
+            (self.source_filter.source_ids or [])
+            or (self.source_filter.clients or [])
+            or (self.source_filter.repo_identifiers or [])
+        )
+        has_time_range = self.time_range is not None
+        if not has_source_filter and not has_time_range:
+            raise ValueError("query may be omitted only when source_filter or time_range is provided")
+        return self
 
     @model_validator(mode="after")
     def _coerce_scope_without_active_project(self) -> "MemorySearchRequest":
@@ -2401,6 +2415,7 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
+        sync_service: SyncService = Depends(get_sync_service),
     ):
         """Service-owned memory search used by local agent MCP proxies."""
         from memforge.memory.lifecycle import allowed_search_statuses
@@ -2409,6 +2424,18 @@ def create_admin_app(
         try:
             engine = await get_search_engine(request, db, config)
             user_id = resolve_request_principal(request)
+            if req.source_filter is not None and req.source_filter.source_ids:
+                available = await db.list_searchable_source_ids_for_user(
+                    req.source_filter.source_ids,
+                    user_id,
+                )
+                if any(source_id not in available for source_id in req.source_filter.source_ids):
+                    raise HTTPException(status_code=400, detail="unknown_or_unavailable_source_id")
+            allowed_statuses = (
+                (normalize_memory_status(req.status),)
+                if req.status
+                else allowed_search_statuses(req.include_superseded)
+            )
             # `project-first` and `workspace` modes weight cross-project hits
             # but keep them visible at the predicate. `project` mode is the
             # only mode that narrows the workspace branch, and it narrows to
@@ -2416,7 +2443,7 @@ def create_admin_app(
             scope = AccessScope(
                 user_id=user_id,
                 include_private=req.include_private,
-                allowed_statuses=allowed_search_statuses(req.include_superseded),
+                allowed_statuses=allowed_statuses,
                 active_project=req.active_project,
                 scope_mode=req.scope_mode,
                 active_repo_identifier=req.active_repo_identifier,
@@ -2424,22 +2451,17 @@ def create_admin_app(
             result = await engine.search(
                 query=req.query,
                 memory_types=req.memory_types,
-                sources=req.sources,
                 time_range=req.time_range.to_time_range() if req.time_range is not None else None,
                 entities=req.entities,
                 include_superseded=req.include_superseded,
                 top_k=req.top_k,
                 source_filter=(req.source_filter.to_source_filter() if req.source_filter is not None else None),
                 request_scope=scope,
+                offset=req.offset,
             )
-            # Row-status filter is applied post-rank so the GET and POST
-            # routes share the same status semantics without coupling the
-            # ranker to lifecycle filtering.
-            if req.status:
-                kept = [r for r in result["results"] if getattr(r, "status", "active") == req.status]
-                result["results"] = kept
-                result["total_candidates"] = len(kept)
             return _json_ready(result)
+        except HTTPException:
+            raise
         except Exception as e:
             logger.warning("Search failed: %s", e, exc_info=True)
             raise HTTPException(
@@ -3173,6 +3195,45 @@ def create_admin_app(
                     }
 
         return {"data": sources}
+
+    async def _searchable_source_rows(
+        request: Request,
+        db: Database,
+        *,
+        sync_service: SyncService,
+    ) -> list[dict[str, Any]]:
+        rows = await list_source_admin_rows(
+            db,
+            sync_service=sync_service,
+            viewer_id=resolve_request_principal(request),
+            viewer_role=resolve_request_workspace_role(request),
+        )
+        searchable: list[dict[str, Any]] = []
+        for row in rows:
+            source_id = str(row.get("id") or "")
+            if not source_id or row.get("status") != "active" or not row.get("enabled_for_me", False):
+                continue
+            searchable.append(
+                {
+                    "source_id": source_id,
+                    "name": row.get("name") or "",
+                    "type": row.get("type") or "",
+                    "status": row.get("status") or "",
+                    "doc_count": int(row.get("doc_count") or 0),
+                    "memory_count": int(row.get("memory_count") or 0),
+                    "last_synced_at": row.get("last_sync"),
+                }
+            )
+        return searchable
+
+    @source_router.get("/searchable")
+    async def list_searchable_sources(
+        request: Request,
+        db: Database = Depends(get_db),
+        sync_service: SyncService = Depends(get_sync_service),
+    ):
+        """List search-eligible sources for MCP/source-id discovery."""
+        return {"data": await _searchable_source_rows(request, db, sync_service=sync_service)}
 
     @source_router.get("/{source_id}/projects", response_model=SourceProjectsResponse)
     async def list_source_projects(

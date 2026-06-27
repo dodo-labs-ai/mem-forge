@@ -51,10 +51,9 @@ class ToolClient:
     def search(
         self,
         *,
-        query: str,
+        query: str = "",
         top_k: int = 10,
         memory_types: list[str] | tuple[str, ...] | None = None,
-        sources: list[str] | tuple[str, ...] | None = None,
         time_range: dict[str, Any] | None = None,
         entities: list[str] | tuple[str, ...] | None = None,
         source_filter: dict[str, Any] | None = None,
@@ -64,14 +63,13 @@ class ToolClient:
         status: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
-            "query": query,
             "top_k": top_k,
             "include_superseded": include_superseded,
         }
+        if query:
+            body["query"] = query
         if memory_types:
             body["memory_types"] = list(memory_types)
-        if sources:
-            body["sources"] = list(sources)
         if time_range is not None:
             body["time_range"] = time_range
         if entities:
@@ -139,6 +137,10 @@ class ToolClient:
     def list_sources(self) -> dict[str, Any]:
         """List configured sources. Returns the API ``{"data": [...]}`` envelope."""
         return self._http_json("GET", "/api/sources", None)
+
+    def list_searchable_sources(self) -> dict[str, Any]:
+        """List search-eligible sources for MCP/source-id discovery."""
+        return self._http_json("GET", "/api/sources/searchable", None)
 
     def create_source(self, *, source_type: str, name: str, config: dict[str, Any]) -> dict[str, Any]:
         """Create a source (gene instance) of ``source_type`` with the given config."""

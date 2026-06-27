@@ -145,12 +145,12 @@ async def test_source_filter_applies_to_vector_hits(db, monkeypatch):
     )
     engine._get_or_compute_embedding = lambda query: [0.1]
 
-    result = await engine.search("PostgreSQL", sources=["wiki"], top_k=10)
+    result = await engine.search("PostgreSQL", source_filter=MemorySourceFilter(source_ids=("wiki",)), top_k=10)
     assert [r.memory_id for r in result["results"]] == ["m-backed"]
 
 
 @pytest.mark.asyncio
-async def test_top_level_sources_merge_with_structured_source_filter(db, monkeypatch):
+async def test_structured_source_filter_accepts_multiple_source_ids(db, monkeypatch):
     from_structured_filter = _memory("m-structured", "PostgreSQL pooling from wiki")
     from_top_level_sources = _memory("m-top-level", "PostgreSQL pooling from Jira")
     filtered_out = _memory("m-other", "PostgreSQL pooling from Slack")
@@ -184,8 +184,7 @@ async def test_top_level_sources_merge_with_structured_source_filter(db, monkeyp
 
     result = await engine.search(
         "PostgreSQL",
-        sources=["jira"],
-        source_filter=MemorySourceFilter(sources=("wiki",)),
+        source_filter=MemorySourceFilter(source_ids=("wiki", "jira")),
         top_k=10,
     )
 
@@ -242,7 +241,6 @@ async def test_structured_source_filter_applies_to_vector_hits(db, monkeypatch):
     result = await engine.search(
         "Scheduler claim",
         source_filter=MemorySourceFilter(
-            source_types=("agent_session",),
             clients=("codex",),
             repo_identifiers=("github.tools.sap/hcm/memforge-cloud",),
         ),
@@ -295,7 +293,7 @@ async def test_explicit_time_range_filters_vector_hits_before_ranking(db, monkey
 
     result = await engine.search(
         "Payroll incident",
-        source_filter=MemorySourceFilter(source_types=("confluence",), sources=("wiki",)),
+        source_filter=MemorySourceFilter(source_ids=("wiki",)),
         time_range=MemoryTimeRange(
             after=datetime(2026, 6, 19, tzinfo=timezone.utc),
             before=datetime(2026, 6, 21, tzinfo=timezone.utc),
@@ -305,3 +303,154 @@ async def test_explicit_time_range_filters_vector_hits_before_ranking(db, monkey
     )
 
     assert [r.memory_id for r in result["results"]] == ["m-in-window"]
+
+
+@pytest.mark.asyncio
+async def test_queried_search_honors_offset_after_ranking(db, monkeypatch):
+    first = _memory("m-first", "PostgreSQL pagination memory first")
+    second = _memory("m-second", "PostgreSQL pagination memory second")
+    third = _memory("m-third", "PostgreSQL pagination memory third")
+    for memory in (first, second, third):
+        await db.insert_memory(memory)
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    async def no_bm25(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    adapters = build_sqlite_adapters(
+        db,
+        FakeCollection(["m-first", "m-second", "m-third"]),
+    )
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+    monkeypatch.setattr(engine, "_bm25_search", no_bm25)
+
+    result = await engine.search("PostgreSQL pagination", top_k=1, offset=1)
+
+    assert [r.memory_id for r in result["results"]] == ["m-second"]
+    assert result["total_candidates"] == 3
+    assert "total_count" not in result
+
+
+@pytest.mark.asyncio
+async def test_source_filter_disables_unfiltered_document_fallback(db, monkeypatch):
+    memory = _memory("m-target", "Mount Tai payroll defect memory")
+    await db.insert_memory(memory)
+    await _document(db, "doc-target", "src-target")
+    await _document(db, "doc-fallback-other-source", "src-other")
+    await db.add_memory_source(
+        "m-target",
+        "doc-target",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 6, 25, tzinfo=timezone.utc),
+    )
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    async def no_bm25(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    memory_adapters = build_sqlite_adapters(db, FakeCollection(["m-target"]))
+    document_adapters = build_sqlite_adapters(db, FakeCollection(["doc-fallback-other-source"]))
+    engine = SearchEngine(
+        relational=memory_adapters.relational,
+        keyword=memory_adapters.keyword,
+        vector=memory_adapters.vector,
+        document_vector=document_adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+    monkeypatch.setattr(engine, "_bm25_search", no_bm25)
+
+    result = await engine.search(
+        "Mount Tai payroll defect",
+        source_filter=MemorySourceFilter(source_ids=("src-target",)),
+        top_k=2,
+    )
+
+    assert [r.memory_id for r in result["results"]] == ["m-target"]
+    assert all(not r.is_document_result for r in result["results"])
+
+
+@pytest.mark.asyncio
+async def test_queryless_source_id_time_range_uses_relational_listing_only(db, monkeypatch):
+    newer = _memory("m-newer", "Mount Tai defect triage rule")
+    older = _memory("m-older", "Mount Tai payroll defect rule")
+    other = _memory("m-other", "Another source rule")
+    await db.insert_memory(newer)
+    await db.insert_memory(older)
+    await db.insert_memory(other)
+    await _document(db, "doc-newer", "src-mounttai")
+    await _document(db, "doc-older", "src-mounttai")
+    await _document(db, "doc-other", "src-other")
+    await db.add_memory_source(
+        "m-newer",
+        "doc-newer",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 6, 25, tzinfo=timezone.utc),
+    )
+    await db.add_memory_source(
+        "m-older",
+        "doc-older",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 6, 24, tzinfo=timezone.utc),
+    )
+    await db.add_memory_source(
+        "m-other",
+        "doc-other",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 6, 26, tzinfo=timezone.utc),
+    )
+
+    async def fail_analyze_query(*args, **kwargs):
+        raise AssertionError("queryless search must not run semantic query analysis")
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fail_analyze_query)
+
+    adapters = build_sqlite_adapters(
+        db,
+        FakeCollection(["m-other", "m-older", "m-newer"]),
+    )
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: (_ for _ in ()).throw(
+        AssertionError("queryless search must not embed")
+    )
+
+    result = await engine.search(
+        "",
+        source_filter=MemorySourceFilter(source_ids=("src-mounttai",)),
+        time_range=MemoryTimeRange(
+            after=datetime(2026, 6, 20, tzinfo=timezone.utc),
+            before=datetime(2026, 6, 27, tzinfo=timezone.utc),
+            date_type="source_updated_at",
+        ),
+        top_k=10,
+    )
+
+    assert [r.memory_id for r in result["results"]] == ["m-newer", "m-older"]
+    assert result["total_candidates"] == 2
+    assert result["query_analysis"]["strategies_used"] == ["source_time_listing"]

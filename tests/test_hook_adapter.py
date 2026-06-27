@@ -139,6 +139,9 @@ def test_hook_adapter_injects_session_start_memforge_usage_guidance_without_api(
     context = output["hookSpecificOutput"]["additionalContext"]
     assert "MemForge Usage Guidance" in context
     assert "MCP search" in context
+    assert "list_sources" in context
+    assert "source_ids" in context
+    assert "source_types" not in context
     assert "get_memory" in context
     assert "get_resource" in context
     assert "Relevant Memories" not in context
@@ -922,6 +925,7 @@ def test_mcp_proxy_starts_without_memforge_executable():
     _, payload = result.stdout.split(b"\r\n\r\n", 1)
     response = json.loads(payload)
     assert response["result"]["serverInfo"]["name"] == "memforge"
+    assert response["result"]["serverInfo"]["version"] == "0.1.9"
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
 
 
@@ -1000,6 +1004,44 @@ def test_mcp_proxy_forwards_search_to_service_with_token(monkeypatch):
     }
 
 
+def test_mcp_proxy_forwards_list_sources_to_searchable_sources(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return (
+                b'{"data":[{"source_id":"src-mounttai","name":"MountTai Defects",'
+                b'"type":"jira","status":"active","doc_count":68,"memory_count":199,'
+                b'"last_synced_at":"2026-06-27T00:00:00Z"}]}'
+            )
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["url"] = request.full_url
+            captured["authorization"] = request.get_header("Authorization")
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    result = proxy._call_tool("list_sources", {})
+
+    assert result["data"][0]["source_id"] == "src-mounttai"
+    assert captured["url"] == "https://memforge.example/api/workspaces/mount_tai/api/sources/searchable"
+    assert captured["authorization"] == "Bearer token-123"
+
+
 def test_mcp_proxy_adds_detected_repo_as_ranking_hint_only(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
     captured = {}
@@ -1066,7 +1108,6 @@ def test_mcp_proxy_converts_current_repo_only_to_detected_repo_filter(monkeypatc
         {
             "query": "scheduler fix",
             "source_filter": {
-                "source_types": ["agent_session"],
                 "current_repo_only": True,
             },
         },
@@ -1075,7 +1116,6 @@ def test_mcp_proxy_converts_current_repo_only_to_detected_repo_filter(monkeypatc
     body = json.loads(captured["body"].decode())
     assert body["active_repo_identifier"] == "github.tools.sap/hcm/memforge-cloud"
     assert body["source_filter"] == {
-        "source_types": ["agent_session"],
         "repo_identifiers": ["github.tools.sap/hcm/memforge-cloud"],
     }
 
@@ -1115,19 +1155,15 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     tools = {tool["name"]: tool for tool in proxy.TOOLS}
 
     assert "search" in tools
+    assert "list_sources" in tools
     assert "list_recent_changes" not in tools
     assert "submit_agent_session_document" not in tools
 
     search_schema = tools["search"]["inputSchema"]
     properties = search_schema["properties"]
-    assert properties["source_filter"]["properties"]["source_types"]["items"]["enum"] == [
-        "agent_session",
-        "confluence",
-        "github_pages",
-        "jira",
-        "local_markdown",
-        "teams",
-    ]
+    assert "source_types" not in properties["source_filter"]["properties"]
+    assert properties["source_filter"]["properties"]["source_ids"]["items"]["type"] == "string"
+    assert "list_sources" in properties["source_filter"]["properties"]["source_ids"]["description"]
     assert properties["source_filter"]["properties"]["clients"]["items"]["enum"] == [
         "claude-code",
         "codex",
@@ -1137,6 +1173,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "source_instance_ids" not in properties["source_filter"]["properties"]
     assert "sources" not in properties
     assert set(properties) == {"query", "source_filter", "time_range", "top_k"}
+    assert "required" not in search_schema or "query" not in search_schema.get("required", [])
     time_range_schema = properties["time_range"]
     assert "Omit time_range" in time_range_schema["description"]
     assert "start_date and end_date are individually optional" in time_range_schema["description"]
@@ -1190,6 +1227,69 @@ def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
         "query": "artifact cache",
         "include_private": True,
         "include_superseded": False,
+    }
+
+
+def test_mcp_proxy_forwards_queryless_source_id_time_range(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "source_filter": {"source_ids": ["src-mounttai"]},
+            "time_range": {
+                "date_type": "source_updated_at",
+                "start_date": "2026-06-20",
+                "end_date": "2026-06-26",
+            },
+        },
+    )
+
+    assert result == {"results": []}
+    assert json.loads(captured["body"].decode()) == {
+        "include_private": True,
+        "include_superseded": False,
+        "source_filter": {"source_ids": ["src-mounttai"]},
+        "time_range": {
+            "date_type": "source_updated_at",
+            "start_date": "2026-06-20",
+            "end_date": "2026-06-26",
+        },
+    }
+
+
+def test_mcp_proxy_rejects_queryless_without_deterministic_filter(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool("search", {})
+
+    assert result == {
+        "error": "search.query may be omitted only when source_filter or time_range is provided"
     }
 
 
@@ -1258,6 +1358,23 @@ def test_mcp_proxy_rejects_invalid_time_range_shapes(monkeypatch, time_range):
     assert "time_range" in result["error"]
 
 
+def test_mcp_proxy_rejects_empty_source_ids(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "source_filter": {"source_ids": []},
+            "time_range": {"start_date": "2026-06-20"},
+        },
+    )
+
+    assert result == {
+        "error": "source_filter.source_ids must be a non-empty array of source IDs from list_sources"
+    }
+
+
 def test_mcp_proxy_rejects_removed_backend_search_knobs(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
@@ -1297,7 +1414,7 @@ def test_mcp_proxy_rejects_unadvertised_source_filter_facets(monkeypatch):
 
     assert result == {
         "error": (
-            "Unsupported source_filter parameter(s): repo_identifiers. "
+            "Unsupported source_filter parameter(s): repo_identifiers, source_types. "
             "Use current_repo_only for repo-scoped search or omit the facet."
         )
     }
@@ -1704,7 +1821,7 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
     assert "raw-api-secret" not in serialized
     assert "[REDACTED]" in serialized
     assert payload["schema_version"] == "agent-session-window/v1"
-    assert payload["plugin_version"]
+    assert payload["plugin_version"] == "0.1.9"
     assert payload["receipt"]["metadata"]["uploaded_to_line"] == 2
     assert payload["receipt"]["metadata"]["observed_to_line"] == 2
 

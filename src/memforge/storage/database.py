@@ -1448,6 +1448,25 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE memory_sources ADD COLUMN source_updated_at TEXT",
         ],
     ),
+    (
+        28,
+        "Backfill canonical source id on memory provenance rows",
+        [
+            """UPDATE memory_sources
+           SET source_id = (
+               SELECT documents.source
+               FROM documents
+               WHERE documents.doc_id = memory_sources.doc_id
+               LIMIT 1
+           )
+           WHERE (source_id IS NULL OR source_id = '')
+             AND EXISTS (
+               SELECT 1
+               FROM documents
+               WHERE documents.doc_id = memory_sources.doc_id
+             )""",
+        ],
+    ),
 ]
 
 
@@ -1478,6 +1497,7 @@ class Database:
         await self._db.execute("PRAGMA foreign_keys = ON")
         await self._db.executescript(SCHEMA)
         await self._run_migrations()
+        await self._assert_memory_source_ids_resolved()
         await self._db.commit()
 
     async def _run_migrations(self) -> None:
@@ -1512,6 +1532,21 @@ class Database:
             )
             await self.db.commit()
             logger.info("Applied migration %d: %s", version, description)
+        await self._assert_memory_source_ids_resolved()
+
+    async def _assert_memory_source_ids_resolved(self) -> None:
+        """Fail startup when exact source-id provenance cannot be trusted."""
+
+        async with self.db.execute(
+            "SELECT COUNT(*) AS total FROM memory_sources WHERE source_id IS NULL OR source_id = ''"
+        ) as cursor:
+            row = await cursor.fetchone()
+        unresolved = int(row["total"] if row else 0)
+        if unresolved:
+            raise RuntimeError(
+                "memory_sources contains rows without source_id after migration: "
+                f"{unresolved}. Repair source provenance before starting MemForge."
+            )
 
     async def _backfill_relation_run_snapshot_audit(self) -> None:
         """Backfill immutable retry snapshot hashes for pre-hardening relation runs."""
@@ -5250,6 +5285,27 @@ class Database:
                 results.append(d)
         return results
 
+    async def list_searchable_source_ids_for_user(
+        self,
+        source_ids: list[str],
+        user_id: str,
+    ) -> set[str]:
+        if not source_ids:
+            return set()
+        ordered_unique = tuple(dict.fromkeys(source_ids))
+        placeholders = ", ".join("?" for _ in ordered_unique)
+        async with self.db.execute(
+            f"""SELECT s.id
+               FROM sources s
+               LEFT JOIN source_subscriptions ss
+                 ON ss.source_id = s.id AND ss.user_id = ?
+               WHERE s.id IN ({placeholders})
+                 AND s.status = 'active'
+                 AND COALESCE(ss.enabled, 1) = 1""",
+            (user_id, *ordered_unique),
+        ) as cursor:
+            return {str(row["id"]) async for row in cursor}
+
     async def set_source_sync_schedule(
         self,
         source_id: str,
@@ -5405,18 +5461,22 @@ class Database:
         include_private: bool = False,
         owner_user_id: str | None = None,
     ) -> int:
+        visible_statuses = allowed_search_statuses(False)
+        if not visible_statuses:
+            return 0
+        status_placeholders = ", ".join("?" for _ in visible_statuses)
         visibility_sql = "m.visibility <> ?"
-        params: list[Any] = [source_id, Visibility.PRIVATE.value]
+        params: list[Any] = [source_id, *visible_statuses, Visibility.PRIVATE.value]
         if include_private and owner_user_id:
             visibility_sql = "(m.visibility <> ? OR m.owner_user_id = ?)"
-            params = [source_id, Visibility.PRIVATE.value, owner_user_id]
+            params = [source_id, *visible_statuses, Visibility.PRIVATE.value, owner_user_id]
         async with self.db.execute(
             f"""
             SELECT COUNT(DISTINCT ms.memory_id)
             FROM memory_sources ms
-            JOIN documents d ON ms.doc_id = d.doc_id
             JOIN memories m ON m.id = ms.memory_id
-            WHERE d.source = ?
+            WHERE ms.source_id = ?
+              AND m.status IN ({status_placeholders})
               AND {visibility_sql}
             """,
             params,

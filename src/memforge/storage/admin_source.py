@@ -14,13 +14,25 @@ SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES = 10080
 class SourceAdminReader(Protocol):
     async def list_sources(self) -> list[dict[str, Any]]: ...
 
+    async def list_searchable_source_ids_for_user(
+        self,
+        source_ids: list[str],
+        user_id: str,
+    ) -> set[str]: ...
+
     async def count_source_memories(
         self,
         source_id: str,
         *,
         include_private: bool = False,
         owner_user_id: str | None = None,
-    ) -> int: ...
+    ) -> int:
+        """Count search-visible active memories linked to ``source_id``.
+
+        This is a source total. Per-user source subscription state is returned
+        separately by source-list APIs.
+        """
+        ...
 
     async def count_documents(self, source: str | None = None) -> int: ...
 

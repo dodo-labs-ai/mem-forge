@@ -1,8 +1,8 @@
 """The HTTP request body is never the source of authorization identity.
 
 A caller cannot impersonate another user by stuffing ``user_id`` into the
-search request body: the server resolves the principal server-side, and a
-body field is ignored for the purpose of access checks.
+search request body: the server resolves the principal server-side, and the
+public request schema rejects identity fields supplied by callers.
 """
 
 from __future__ import annotations
@@ -121,18 +121,28 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
 
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
-            response = client.post(
+            rejected = client.post(
                 "/api/memories/search",
                 json={
                     "query": "meeting notes",
                     "top_k": 10,
                     # Caller tries to claim a different identity in the body.
-                    # The server must ignore this for access purposes.
+                    # The public schema must reject this instead of accepting
+                    # user-controlled authorization identity.
                     "user_id": "u-2",
                     "include_private": True,
                 },
             )
+            response = client.post(
+                "/api/memories/search",
+                json={
+                    "query": "meeting notes",
+                    "top_k": 10,
+                    "include_private": True,
+                },
+            )
 
+        assert rejected.status_code == 422, rejected.text
         assert response.status_code == 200, response.text
         body = response.json()
         ids = {row["memory_id"] for row in body["results"]}

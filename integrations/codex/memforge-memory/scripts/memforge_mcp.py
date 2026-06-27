@@ -40,15 +40,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.8"
-SOURCE_TYPE_VALUES = [
-    "agent_session",
-    "confluence",
-    "github_pages",
-    "jira",
-    "local_markdown",
-    "teams",
-]
+SERVER_VERSION = "0.1.9"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 SEARCH_ALLOWED_KEYS = frozenset(
     {
@@ -60,7 +52,7 @@ SEARCH_ALLOWED_KEYS = frozenset(
 )
 SOURCE_FILTER_ALLOWED_KEYS = frozenset(
     {
-        "source_types",
+        "source_ids",
         "clients",
         "current_repo_only",
     }
@@ -73,16 +65,24 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "search",
         "description": (
-            "Search all memories visible to the current principal, including the user's own "
-            "private agent-session memories. Returns ranked results with provenance and "
-            "source artifact URLs when available. A result may include follow_up with "
-            "suggested_tool and reason; use that hint to decide whether to call get_memory "
-            "before relying on the summary."
+            "Search memories visible to the current principal. If the user names a configured "
+            "source such as a Jira/Confluence source, call list_sources first and pass exact "
+            "source_ids here; never guess source ids from the name. Query may be omitted only "
+            "for deterministic listing with source_filter or time_range. Convert phrases like "
+            "'last week' into explicit YYYY-MM-DD start_date/end_date before calling. A result "
+            "may include follow_up with suggested_tool and reason; use that hint to decide "
+            "whether to call get_memory before relying on the summary."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Natural language search query"},
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Natural language search query. Optional when source_filter or time_range "
+                        "is provided and the user wants a deterministic list rather than semantic ranking."
+                    ),
+                },
                 "source_filter": {
                     "type": "object",
                     "description": (
@@ -91,10 +91,13 @@ TOOLS: list[dict[str, Any]] = [
                         "invent source ids, repo ids, or fuzzy source names."
                     ),
                     "properties": {
-                        "source_types": {
+                        "source_ids": {
                             "type": "array",
-                            "items": {"type": "string", "enum": SOURCE_TYPE_VALUES},
-                            "description": ("Restrict by source category, such as jira, confluence, or agent_session."),
+                            "items": {"type": "string"},
+                            "description": (
+                                "Exact source IDs returned by list_sources. Use source_ids when "
+                                "the user names a configured source; do not guess IDs."
+                            ),
                         },
                         "clients": {
                             "type": "array",
@@ -149,7 +152,20 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "top_k": {"type": "integer", "default": 10},
             },
-            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "list_sources",
+        "description": (
+            "List search-eligible memory sources in the current workspace for the current "
+            "principal. Use this before search when the user names a source, system, project, "
+            "or configured connector such as a Jira or Confluence source. Returns safe metadata "
+            "only: source_id, name, type, status, counts, and last_synced_at."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
             "additionalProperties": False,
         },
     },
@@ -264,6 +280,10 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         except ValueError as exc:
             return {"error": str(exc)}
         return _http_json("POST", "/api/memories/search", body)
+    if name == "list_sources":
+        if args:
+            return {"error": "list_sources does not accept parameters"}
+        return _http_json("GET", "/api/sources/searchable", None)
     if name == "get_memory":
         memory_id = str(args.get("memory_id") or "").strip()
         if not memory_id:
@@ -281,6 +301,8 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
             "Unsupported search parameter(s): " + ", ".join(unknown) + ". Omit unknown filters instead of guessing."
         )
     body = dict(args)
+    query = str(body.get("query") or "").strip()
+    has_deterministic_filter = False
     body["include_private"] = True
     body["include_superseded"] = False
     repo_identifier = _active_repo_identifier()
@@ -295,6 +317,12 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
                 + ", ".join(unknown_filter_keys)
                 + ". Use current_repo_only for repo-scoped search or omit the facet."
             )
+        source_ids = source_filter.get("source_ids")
+        if source_ids is not None:
+            if not isinstance(source_ids, list) or not source_ids or not all(
+                isinstance(item, str) and item.strip() for item in source_ids
+            ):
+                raise ValueError("source_filter.source_ids must be a non-empty array of source IDs from list_sources")
         current_repo_only = bool(source_filter.pop("current_repo_only", False))
         if current_repo_only:
             if not repo_identifier:
@@ -303,10 +331,14 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
                     "Omit the filter to search all visible memories."
                 )
             source_filter["repo_identifiers"] = [repo_identifier]
+        has_deterministic_filter = bool(source_filter)
         body["source_filter"] = source_filter
     time_range = body.get("time_range")
     if time_range is not None:
         body["time_range"] = _validate_time_range(time_range)
+        has_deterministic_filter = True
+    if not query and not has_deterministic_filter:
+        raise ValueError("search.query may be omitted only when source_filter or time_range is provided")
     return body
 
 

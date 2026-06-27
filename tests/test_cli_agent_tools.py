@@ -29,6 +29,10 @@ class FakeToolClient:
         self.calls.append(("list_sources", {"api_url": self.api_url, "api_token": self.api_token}))
         return self.list_response
 
+    def list_searchable_sources(self):
+        self.calls.append(("list_searchable_sources", {"api_url": self.api_url, "api_token": self.api_token}))
+        return self.list_response
+
     def create_source(self, **kwargs):
         self.calls.append(("create_source", {"api_url": self.api_url, "api_token": self.api_token, **kwargs}))
         return self.create_response
@@ -90,8 +94,6 @@ def test_search_cli_forwards_mcp_shape(monkeypatch):
             "3",
             "--type",
             "fact",
-            "--source",
-            "src-docs",
             "--include-superseded",
         ],
         env={"MEMFORGE_API_URL": "https://memforge.example.test", "MEMFORGE_API_TOKEN": "token-1"},
@@ -108,11 +110,64 @@ def test_search_cli_forwards_mcp_shape(monkeypatch):
                 "query": "docker artifact provenance",
                 "top_k": 3,
                 "memory_types": ["fact"],
-                "sources": ["src-docs"],
                 "include_superseded": True,
             },
         )
     ]
+
+
+def test_search_cli_forwards_exact_source_ids(monkeypatch):
+    FakeToolClient.reset({"results": []})
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient, raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "search",
+            "--source-id",
+            "src-mounttai",
+            "--start-date",
+            "2026-06-20",
+            "--end-date",
+            "2026-06-26",
+        ],
+        env={"MEMFORGE_API_URL": "https://memforge.example.test", "MEMFORGE_API_TOKEN": "token-1"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert FakeToolClient.calls == [
+        (
+            "search",
+            {
+                "api_url": "https://memforge.example.test",
+                "api_token": "token-1",
+                "query": "",
+                "top_k": 10,
+                "include_superseded": False,
+                "source_filter": {"source_ids": ["src-mounttai"]},
+                "time_range": {
+                    "date_type": "source_updated_at",
+                    "start_date": "2026-06-20",
+                    "end_date": "2026-06-26",
+                },
+            },
+        )
+    ]
+
+
+def test_search_cli_rejects_legacy_source_name_filter(monkeypatch):
+    FakeToolClient.reset({"results": []})
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient, raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        ["search", "jira defects", "--source", "Matterhorn Defects"],
+        env={"MEMFORGE_API_URL": "https://memforge.example.test"},
+    )
+
+    assert result.exit_code != 0
+    assert "No such option '--source'" in result.output
+    assert FakeToolClient.calls == []
 
 
 def test_get_memory_cli_fetches_memory_detail(monkeypatch):
@@ -182,6 +237,80 @@ def test_memory_group_keeps_read_tools_api_backed(monkeypatch):
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["memory_id"] == "mem-456"
     assert FakeToolClient.calls[0][0] == "get_memory"
+
+
+def test_sources_list_cli_reads_configured_sources_from_active_api_target(monkeypatch):
+    FakeToolClient.reset(
+        {},
+        list_response={
+            "data": [
+                {
+                    "id": "src-paused",
+                    "source_id": "src-paused",
+                    "name": "MountTai Defects",
+                    "type": "jira",
+                    "status": "paused",
+                    "doc_count": 68,
+                    "memory_count": 199,
+                    "last_synced_at": "2026-06-27T00:00:00Z",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient, raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        ["sources", "list"],
+        env={"MEMFORGE_API_URL": "https://memforge.example.test", "MEMFORGE_API_TOKEN": "token-1"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Configured Sources" in result.output
+    assert "src-paused" in result.output
+    assert "paused" in result.output
+    assert FakeToolClient.calls == [
+        (
+            "list_sources",
+            {"api_url": "https://memforge.example.test", "api_token": "token-1"},
+        )
+    ]
+
+
+def test_sources_searchable_cli_reads_searchable_sources_from_active_api_target(monkeypatch):
+    FakeToolClient.reset(
+        {},
+        list_response={
+            "data": [
+                {
+                    "source_id": "src-mounttai",
+                    "name": "MountTai Defects",
+                    "type": "jira",
+                    "status": "active",
+                    "doc_count": 68,
+                    "memory_count": 199,
+                    "last_synced_at": "2026-06-27T00:00:00Z",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient, raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        ["sources", "searchable"],
+        env={"MEMFORGE_API_URL": "https://memforge.example.test", "MEMFORGE_API_TOKEN": "token-1"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Searchable Sources" in result.output
+    assert "src-mounttai" in result.output
+    assert FakeToolClient.calls == [
+        (
+            "list_searchable_sources",
+            {"api_url": "https://memforge.example.test", "api_token": "token-1"},
+        )
+    ]
 
 
 def test_sources_schedule_cli_updates_active_api_target(monkeypatch):

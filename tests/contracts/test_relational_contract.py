@@ -177,7 +177,7 @@ class RelationalStoreContract:
 
     # -- Source facets ------------------------------------------------------
 
-    async def test_filter_ids_by_source_and_time_matches_source_type_and_repo(self, adapters: ContractAdapters) -> None:
+    async def test_filter_ids_by_source_and_time_matches_client_and_repo(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         await store.insert_memory(
             make_memory(
@@ -192,8 +192,8 @@ class RelationalStoreContract:
             )
         )
         await store.insert_memory(make_memory("m-jira"))
-        await store.upsert_document(make_document("doc-agent-target"))
-        await store.upsert_document(make_document("doc-agent-other-repo"))
+        await store.upsert_document(make_document("doc-agent-target", client="codex"))
+        await store.upsert_document(make_document("doc-agent-other-repo", client="codex"))
         await store.upsert_document(make_document("doc-jira"))
         await store.add_memory_source(
             "m-agent-target",
@@ -214,7 +214,7 @@ class RelationalStoreContract:
         matched = await store.filter_ids_by_source_and_time(
             ["m-agent-target", "m-agent-other-repo", "m-jira"],
             MemorySourceFilter(
-                source_types=("agent_session",),
+                clients=("codex",),
                 repo_identifiers=("github.tools.sap/hcm/memforge-cloud",),
             ),
             None,
@@ -299,7 +299,7 @@ class RelationalStoreContract:
 
         matched = await store.filter_ids_by_source_and_time(
             ["m-mixed"],
-            MemorySourceFilter(source_types=("jira",), sources=("JIRA",)),
+            MemorySourceFilter(source_ids=("JIRA",)),
             MemoryTimeRange(
                 after=datetime(2026, 6, 20, tzinfo=timezone.utc),
                 before=datetime(2026, 6, 27, tzinfo=timezone.utc),
@@ -308,6 +308,90 @@ class RelationalStoreContract:
         )
 
         assert matched == set()
+
+    async def test_filter_ids_by_source_and_time_matches_exact_source_id_on_same_row(
+        self,
+        adapters: ContractAdapters,
+    ) -> None:
+        store = adapters.relational
+        await store.insert_memory(make_memory("m-target"))
+        await store.insert_memory(make_memory("m-other"))
+        await store.upsert_document(make_document("doc-target", source="src-mounttai"))
+        await store.upsert_document(make_document("doc-other", source="src-other"))
+        await store.add_memory_source(
+            "m-target",
+            "doc-target",
+            "jira",
+            None,
+            source_updated_at=datetime(2026, 6, 24, 9, 0, tzinfo=timezone.utc),
+        )
+        await store.add_memory_source(
+            "m-other",
+            "doc-other",
+            "jira",
+            None,
+            source_updated_at=datetime(2026, 6, 24, 9, 0, tzinfo=timezone.utc),
+        )
+
+        matched = await store.filter_ids_by_source_and_time(
+            ["m-target", "m-other"],
+            MemorySourceFilter(source_ids=("src-mounttai",)),
+            MemoryTimeRange(
+                after=datetime(2026, 6, 20, tzinfo=timezone.utc),
+                before=datetime(2026, 6, 27, tzinfo=timezone.utc),
+                date_type="source_updated_at",
+            ),
+        )
+
+        assert matched == {"m-target"}
+
+    async def test_list_ids_by_source_and_time_returns_deterministic_source_date_page(
+        self,
+        adapters: ContractAdapters,
+    ) -> None:
+        store = adapters.relational
+        await store.insert_memory(make_memory("m-newer", updated_at=datetime(2026, 6, 1, tzinfo=timezone.utc)))
+        await store.insert_memory(make_memory("m-older", updated_at=datetime(2026, 6, 1, tzinfo=timezone.utc)))
+        await store.insert_memory(make_memory("m-other", updated_at=datetime(2026, 6, 1, tzinfo=timezone.utc)))
+        await store.upsert_document(make_document("doc-newer", source="src-mounttai"))
+        await store.upsert_document(make_document("doc-older", source="src-mounttai"))
+        await store.upsert_document(make_document("doc-other", source="src-other"))
+        await store.add_memory_source(
+            "m-newer",
+            "doc-newer",
+            "jira",
+            None,
+            source_updated_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        )
+        await store.add_memory_source(
+            "m-older",
+            "doc-older",
+            "jira",
+            None,
+            source_updated_at=datetime(2026, 6, 24, 9, 0, tzinfo=timezone.utc),
+        )
+        await store.add_memory_source(
+            "m-other",
+            "doc-other",
+            "jira",
+            None,
+            source_updated_at=datetime(2026, 6, 26, 9, 0, tzinfo=timezone.utc),
+        )
+
+        page, total = await store.list_ids_by_source_and_time(
+            MemorySourceFilter(source_ids=("src-mounttai",)),
+            MemoryTimeRange(
+                after=datetime(2026, 6, 20, tzinfo=timezone.utc),
+                before=datetime(2026, 6, 27, tzinfo=timezone.utc),
+                date_type="source_updated_at",
+            ),
+            make_scope(),
+            limit=1,
+            offset=0,
+        )
+
+        assert page == ["m-newer"]
+        assert total == 2
 
     async def test_filter_ids_by_source_and_time_does_not_match_created_at(self, adapters: ContractAdapters) -> None:
         store = adapters.relational

@@ -43,13 +43,12 @@ def test_invalid_scope_mode_rejected_by_literal():
         MemorySearchRequest(query="test", scope_mode="bogus")  # type: ignore[arg-type]
 
 
-def test_source_filter_accepts_exact_registered_facets():
+def test_source_filter_accepts_exact_agent_session_facets():
     req = MemorySearchRequest(
         query="agent memory last week",
         include_private=True,
         active_repo_identifier="github.tools.sap/hcm/memforge-cloud",
         source_filter={
-            "source_types": ["agent_session"],
             "clients": ["codex"],
             "repo_identifiers": ["github.tools.sap/hcm/memforge-cloud"],
         },
@@ -58,18 +57,46 @@ def test_source_filter_accepts_exact_registered_facets():
     assert req.include_private is True
     assert req.active_repo_identifier == "github.tools.sap/hcm/memforge-cloud"
     assert req.source_filter is not None
-    assert req.source_filter.source_types == ["agent_session"]
     assert req.source_filter.clients == ["codex"]
     assert req.source_filter.repo_identifiers == [
         "github.tools.sap/hcm/memforge-cloud"
     ]
 
 
-def test_source_filter_rejects_unknown_source_type():
+def test_source_filter_accepts_exact_source_ids():
+    req = MemorySearchRequest(
+        source_filter={"source_ids": ["src-mounttai", "src-sfpay"]},
+        time_range={"start_date": "2026-06-19"},
+    )
+
+    assert req.query == ""
+    assert req.source_filter is not None
+    assert req.source_filter.source_ids == ["src-mounttai", "src-sfpay"]
+
+
+def test_source_filter_rejects_empty_source_ids():
+    with pytest.raises(Exception):
+        MemorySearchRequest(
+            source_filter={"source_ids": []},
+            time_range={"start_date": "2026-06-19"},
+        )
+
+
+def test_queryless_search_requires_deterministic_filter():
+    with pytest.raises(Exception):
+        MemorySearchRequest()
+
+
+def test_search_request_rejects_legacy_top_level_sources_filter():
+    with pytest.raises(Exception):
+        MemorySearchRequest(query="jira defects", sources=["Matterhorn Defects"])  # type: ignore[call-arg]
+
+
+def test_source_filter_rejects_source_type_selector():
     with pytest.raises(Exception):
         MemorySearchRequest(
             query="agent memory last week",
-            source_filter={"source_types": ["agent-session"]},
+            source_filter={"source_types": ["agent_session"]},
         )
 
 

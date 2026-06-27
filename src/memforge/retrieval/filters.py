@@ -18,17 +18,13 @@ class MemorySourceFilter:
     the request boundary; storage implementations only apply exact matches.
     """
 
-    source_types: tuple[str, ...] = ()
-    sources: tuple[str, ...] = ()
+    source_ids: tuple[str, ...] = ()
     clients: tuple[str, ...] = ()
     repo_identifiers: tuple[str, ...] = ()
 
     def is_empty(self) -> bool:
         return not (
-            self.source_types
-            or self.sources
-            or self.clients
-            or self.repo_identifiers
+            self.source_ids or self.clients or self.repo_identifiers
         )
 
 
