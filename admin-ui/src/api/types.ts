@@ -449,6 +449,8 @@ export interface MemoryReviewSummary {
   created_at: string | null;
   resolved_at: string | null;
   is_stale: boolean;
+  incumbent?: MemoryReviewMemorySummary | null;
+  challenger?: MemoryReviewMemorySummary | null;
 }
 
 export interface MemoryReviewMemorySummary {
@@ -463,6 +465,8 @@ export interface MemoryReviewMemorySummary {
   sources: MemorySource[];
   created_at: string | null;
   updated_at: string | null;
+  origin_source_type?: string | null;
+  origin_client?: string | null;
 }
 
 export interface MemoryReviewDetail extends MemoryReviewSummary {

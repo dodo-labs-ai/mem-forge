@@ -310,6 +310,26 @@ class TestReviewCrud:
         assert open_count == 2
 
     @pytest.mark.asyncio
+    async def test_review_list_includes_pending_challenger_snapshot(self, db, chroma, tmp_path):
+        from memforge.server.admin_api import create_admin_app
+
+        incumbent, challenger, review = await _seed_supersede_review(db, chroma, suffix="queue")
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            response = client.get("/api/memory-reviews", params={"status": "open", "limit": 10})
+
+        assert response.status_code == 200
+        rows = response.json()["data"]
+        row = next(item for item in rows if item["id"] == review.id)
+        assert row["incumbent"]["id"] == incumbent.id
+        assert row["incumbent"]["status"] == "active"
+        assert row["incumbent"]["content"] == incumbent.content
+        assert row["challenger"]["id"] == challenger.id
+        assert row["challenger"]["status"] == "pending_review"
+        assert row["challenger"]["content"] == challenger.content
+
+    @pytest.mark.asyncio
     async def test_related_challenger_conflict_is_explicit(self, db, chroma):
         _, _, first_review = await _seed_supersede_review(db, chroma, suffix="one")
         _, _, second_review = await _seed_supersede_review(db, chroma, suffix="two")
