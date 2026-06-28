@@ -4,8 +4,7 @@ import { CheckCircle2, RefreshCw, ShieldCheck, Sparkles } from "lucide-react";
 import client from "@/api/client";
 import type {
   MemoryReviewListResponse,
-  MemoryReviewSummary,
-  MemorySource,
+  MemoryReviewMemorySummary,
 } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
@@ -25,21 +24,7 @@ import { timeAgo } from "@/utils/date";
 
 const REVIEW_QUEUE_LIMIT = 100;
 
-interface MemorySnapshot {
-  id: string;
-  content: string;
-  confidence: number;
-  corroboration_count: number;
-  is_agent_session: boolean;
-}
-
 const AGENT_SESSION_SOURCE_TYPE = "agent_session";
-
-function hasAgentSessionSource(sources: MemorySource[] | null | undefined): boolean {
-  return Array.isArray(sources)
-    ? sources.some((source) => source.source_type === AGENT_SESSION_SOURCE_TYPE)
-    : false;
-}
 
 function useReviewQueue() {
   return useQuery<MemoryReviewListResponse>({
@@ -53,39 +38,8 @@ function useReviewQueue() {
   });
 }
 
-function useMemorySnapshots(reviews: MemoryReviewSummary[]) {
-  const ids = Array.from(
-    new Set(
-      reviews.flatMap((review) => [review.incumbent_memory_id, review.challenger_memory_id])
-    )
-  );
-  return useQuery<Record<string, MemorySnapshot>>({
-    queryKey: ["memory-review-snapshots", ids.sort().join(",")],
-    enabled: ids.length > 0,
-    queryFn: async () => {
-      const entries = await Promise.all(
-        ids.map((id) =>
-          client
-            .get(`/api/memories/${id}`, { params: { include_private: "true" } })
-            .then((response) => [id, response.data] as const)
-            .catch(() => [id, null] as const)
-        )
-      );
-      const snapshots: Record<string, MemorySnapshot> = {};
-      for (const [id, memory] of entries) {
-        if (memory) {
-          snapshots[id] = {
-            id,
-            content: memory.content,
-            confidence: memory.confidence,
-            corroboration_count: memory.corroboration_count,
-            is_agent_session: hasAgentSessionSource(memory.sources),
-          };
-        }
-      }
-      return snapshots;
-    },
-  });
+function isAgentSessionMemory(memory: MemoryReviewMemorySummary | null | undefined): boolean {
+  return memory?.origin_source_type === AGENT_SESSION_SOURCE_TYPE;
 }
 
 export function ReviewQueuePage() {
@@ -93,8 +47,6 @@ export function ReviewQueuePage() {
   const queueQuery = useReviewQueue();
   const reviews = queueQuery.data?.data ?? [];
   const total = queueQuery.data?.total ?? 0;
-  const snapshotsQuery = useMemorySnapshots(reviews);
-  const snapshots = snapshotsQuery.data ?? {};
 
   return (
     <div className="space-y-4">
@@ -107,7 +59,6 @@ export function ReviewQueuePage() {
             variant="outline"
             onClick={() => {
               queueQuery.refetch();
-              snapshotsQuery.refetch();
             }}
           >
             <RefreshCw className="size-4" />
@@ -152,8 +103,8 @@ export function ReviewQueuePage() {
               </TableHeader>
               <TableBody>
                 {reviews.map((review) => {
-                  const challenger = snapshots[review.challenger_memory_id];
-                  const incumbent = snapshots[review.incumbent_memory_id];
+                  const challenger = review.challenger;
+                  const incumbent = review.incumbent;
                   return (
                     <TableRow
                       key={review.id}
@@ -168,7 +119,7 @@ export function ReviewQueuePage() {
                           <div className="min-w-0 flex-1 truncate text-sm font-medium">
                             {challenger?.content ?? "Loading..."}
                           </div>
-                          {challenger?.is_agent_session && (
+                          {isAgentSessionMemory(challenger) && (
                             <Badge
                               variant="outline"
                               className="shrink-0 gap-1 text-[10px]"

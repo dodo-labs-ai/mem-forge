@@ -915,6 +915,8 @@ class MemoryReviewMemorySummary(BaseModel):
     sources: list[MemorySourceDetail] = []
     created_at: str | None = None
     updated_at: str | None = None
+    origin_source_type: str | None = None
+    origin_client: str | None = None
 
 
 class MemoryReviewResponse(BaseModel):
@@ -933,8 +935,13 @@ class MemoryReviewResponse(BaseModel):
     is_stale: bool = False
 
 
+class MemoryReviewListItemResponse(MemoryReviewResponse):
+    incumbent: MemoryReviewMemorySummary | None = None
+    challenger: MemoryReviewMemorySummary | None = None
+
+
 class MemoryReviewListResponse(BaseModel):
-    data: list[MemoryReviewResponse]
+    data: list[MemoryReviewListItemResponse]
     total: int
 
 
@@ -1811,6 +1818,28 @@ async def _build_memory_summary(
         sources=sources,
         created_at=_dt_iso(memory.created_at),
         updated_at=_dt_iso(memory.updated_at),
+    )
+
+
+def _build_memory_review_list_summary(
+    memory: Memory,
+    *,
+    origin_source_type: str | None = None,
+    origin_client: str | None = None,
+) -> MemoryReviewMemorySummary:
+    """Build the review-queue list snapshot without full provenance hydration."""
+    return MemoryReviewMemorySummary(
+        id=memory.id,
+        memory_type=memory.memory_type,
+        content=memory.content,
+        confidence=memory.confidence,
+        corroboration_count=memory.corroboration_count,
+        status=memory.status,
+        tags=memory.tags,
+        created_at=_dt_iso(memory.created_at),
+        updated_at=_dt_iso(memory.updated_at),
+        origin_source_type=origin_source_type,
+        origin_client=origin_client,
     )
 
 
@@ -4076,11 +4105,47 @@ def create_admin_app(
             offset=offset,
         )
 
-        responses: list[MemoryReviewResponse] = []
+        review_memories: dict[str, Memory] = {}
         for review in reviews:
-            incumbent = await db.get_memory(review.incumbent_memory_id)
-            challenger = await db.get_memory(review.challenger_memory_id)
-            responses.append(_review_to_response(review, incumbent=incumbent, challenger=challenger))
+            for memory_id in (review.incumbent_memory_id, review.challenger_memory_id):
+                if memory_id not in review_memories:
+                    memory = await db.get_memory(memory_id)
+                    if memory is not None:
+                        review_memories[memory_id] = memory
+
+        origins = await _origin_source_types(db, list(review_memories)) if review_memories else {}
+        responses: list[MemoryReviewListItemResponse] = []
+        for review in reviews:
+            incumbent = review_memories.get(review.incumbent_memory_id)
+            challenger = review_memories.get(review.challenger_memory_id)
+            base = _review_to_response(review, incumbent=incumbent, challenger=challenger)
+            incumbent_origin = origins.get(incumbent.id, (None, None)) if incumbent else (None, None)
+            challenger_origin = origins.get(challenger.id, (None, None)) if challenger else (None, None)
+            incumbent_summary = (
+                _build_memory_review_list_summary(
+                    incumbent,
+                    origin_source_type=incumbent_origin[0],
+                    origin_client=incumbent_origin[1],
+                )
+                if incumbent
+                else None
+            )
+            challenger_summary = (
+                _build_memory_review_list_summary(
+                    challenger,
+                    origin_source_type=challenger_origin[0],
+                    origin_client=challenger_origin[1],
+                )
+                if challenger
+                else None
+            )
+            responses.append(
+                MemoryReviewListItemResponse(
+                    **base.model_dump(),
+                    incumbent=incumbent_summary,
+                    challenger=challenger_summary,
+                )
+            )
 
         total = await db.count_memory_reviews(status=normalized_status, kind=kind)
         return MemoryReviewListResponse(data=responses, total=total)
