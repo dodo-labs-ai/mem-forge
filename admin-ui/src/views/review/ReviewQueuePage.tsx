@@ -26,6 +26,10 @@ const REVIEW_QUEUE_LIMIT = 100;
 
 const AGENT_SESSION_SOURCE_TYPE = "agent_session";
 
+function MissingSnapshotLabel() {
+  return <span className="italic text-muted-foreground">Unavailable</span>;
+}
+
 function useReviewQueue() {
   return useQuery<MemoryReviewListResponse>({
     queryKey: ["memory-reviews", "open", "queue"],
@@ -117,7 +121,7 @@ export function ReviewQueuePage() {
                       <TableCell>
                         <div className="flex max-w-xl items-start gap-2">
                           <div className="min-w-0 flex-1 truncate text-sm font-medium">
-                            {challenger?.content ?? "Loading..."}
+                            {challenger?.content ?? <MissingSnapshotLabel />}
                           </div>
                           {isAgentSessionMemory(challenger) && (
                             <Badge
@@ -140,7 +144,7 @@ export function ReviewQueuePage() {
                       </TableCell>
                       <TableCell>
                         <div className="max-w-xl truncate text-sm text-muted-foreground">
-                          {incumbent?.content ?? "Loading..."}
+                          {incumbent?.content ?? <MissingSnapshotLabel />}
                         </div>
                         {incumbent && (
                           <div className="mt-1 text-xs text-muted-foreground">
