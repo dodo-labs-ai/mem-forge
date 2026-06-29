@@ -925,7 +925,7 @@ def test_mcp_proxy_starts_without_memforge_executable():
     _, payload = result.stdout.split(b"\r\n\r\n", 1)
     response = json.loads(payload)
     assert response["result"]["serverInfo"]["name"] == "memforge"
-    assert response["result"]["serverInfo"]["version"] == "0.1.11"
+    assert response["result"]["serverInfo"]["version"] == "0.1.12"
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
 
 
@@ -1857,7 +1857,7 @@ def test_post_json_includes_configured_bearer_token(monkeypatch):
     assert auth_headers == ["Bearer secret-token"]
 
 
-def test_hook_adapter_uses_codex_mcp_config_when_hook_env_is_absent(monkeypatch, tmp_path, capsys):
+def test_hook_adapter_uses_codex_plugin_config_when_hook_env_is_absent(monkeypatch, tmp_path, capsys):
     from memforge import hook_adapter
     from memforge import plugin_config
 
@@ -1865,7 +1865,7 @@ def test_hook_adapter_uses_codex_mcp_config_when_hook_env_is_absent(monkeypatch,
     codex_home.mkdir()
     (codex_home / "config.toml").write_text(
         """
-[mcp_servers.memforge.env]
+[memforge]
 MEMFORGE_API_URL = "https://memforge.example"
 MEMFORGE_API_TOKEN = "config-token"
 MEMFORGE_WORKSPACE_ID = "mount_tai"
@@ -1904,7 +1904,7 @@ MEMFORGE_WORKSPACE_ID = "mount_tai"
     assert capsys.readouterr().out == ""
 
 
-def test_post_json_uses_codex_mcp_config_for_workspace_and_token(monkeypatch, tmp_path):
+def test_post_json_uses_codex_plugin_config_for_workspace_and_token(monkeypatch, tmp_path):
     from memforge import hook_adapter
     from memforge import plugin_config
 
@@ -1912,7 +1912,7 @@ def test_post_json_uses_codex_mcp_config_for_workspace_and_token(monkeypatch, tm
     codex_home.mkdir()
     (codex_home / "config.toml").write_text(
         """
-[mcp_servers.memforge.env]
+[memforge]
 MEMFORGE_API_URL = "https://memforge.example"
 MEMFORGE_API_TOKEN = "config-token"
 MEMFORGE_WORKSPACE_ID = "mount_tai"
@@ -2014,7 +2014,7 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
     assert "raw-api-secret" not in serialized
     assert "[REDACTED]" in serialized
     assert payload["schema_version"] == "agent-session-window/v1"
-    assert payload["plugin_version"] == "0.1.11"
+    assert payload["plugin_version"] == "0.1.12"
     assert payload["receipt"]["metadata"]["uploaded_to_line"] == 2
     assert payload["receipt"]["metadata"]["observed_to_line"] == 2
 
