@@ -762,7 +762,7 @@ def get_memory(ctx, memory_id: str):
 @click.option("--max-bytes", default=2_000_000, show_default=True, type=int, help="Maximum bytes for inline modes.")
 @click.pass_context
 def get_resource(ctx, url: str, mode: str, max_chars: int, max_bytes: int):
-    """Fetch a source artifact URL returned by search or get-memory."""
+    """Fetch a source artifact URL returned by get-memory."""
     payload = _tool_client(ctx).get_resource(
         url=url,
         mode=mode,
@@ -861,7 +861,7 @@ def memory_get(ctx, memory_id: str):
 @click.option("--max-bytes", default=2_000_000, show_default=True, type=int, help="Maximum bytes for inline modes.")
 @click.pass_context
 def memory_resource(ctx, url: str, mode: str, max_chars: int, max_bytes: int):
-    """Fetch a source artifact URL returned by search or get."""
+    """Fetch a source artifact URL returned by get-memory."""
     payload = _tool_client(ctx).get_resource(
         url=url,
         mode=mode,

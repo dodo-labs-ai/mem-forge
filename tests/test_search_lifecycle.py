@@ -13,7 +13,6 @@ from memforge.retrieval.query_analyzer import QueryAnalysis
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
-from memforge.storage.document_store import StoredDocumentArtifact
 
 
 class FakeCollection:
@@ -22,36 +21,6 @@ class FakeCollection:
 
     def query(self, **kwargs):
         return {"ids": [self.ids], "distances": [[0.01 for _ in self.ids]]}
-
-
-class FakeVectorStore:
-    def __init__(self, ids: list[str]) -> None:
-        self.collection = FakeCollection(ids)
-
-    def similarity(self, distance: float) -> float:
-        return max(1.0 - distance, 0.0)
-
-
-class MemoryBackedDocumentStore:
-    def __init__(self, artifacts: dict[str, bytes]) -> None:
-        self._artifacts = artifacts
-
-    def get_artifact(
-        self,
-        uri: str | None,
-        media_type: str,
-    ) -> StoredDocumentArtifact | None:
-        if uri is None or uri not in self._artifacts:
-            return None
-        return StoredDocumentArtifact(
-            uri=uri,
-            filename=uri.rsplit("/", 1)[-1],
-            media_type=media_type,
-            size_bytes=len(self._artifacts[uri]),
-        )
-
-    def read_artifact(self, uri: str) -> bytes:
-        return self._artifacts[uri]
 
 
 @pytest.fixture
@@ -80,7 +49,13 @@ def _config(tmp_path: Path) -> AppConfig:
     return AppConfig(base_dir=tmp_path / "memforge")
 
 
-async def _document(db: Database, tmp_path: Path, doc_id: str) -> DocumentRecord:
+async def _document(
+    db: Database,
+    tmp_path: Path,
+    doc_id: str,
+    *,
+    source_url: str | None = None,
+) -> DocumentRecord:
     config = _config(tmp_path)
     docs_dir = Path(config.storage.docs_path)
     docs_dir.mkdir(parents=True)
@@ -92,7 +67,7 @@ async def _document(db: Database, tmp_path: Path, doc_id: str) -> DocumentRecord
     doc = DocumentRecord(
         doc_id=doc_id,
         source="src-confluence",
-        source_url=f"https://confluence.example/{doc_id}",
+        source_url=source_url if source_url is not None else f"https://confluence.example/{doc_id}",
         title="Search Source",
         space_or_project="PAY",
         author="Sun, Youpeng",
@@ -141,7 +116,7 @@ async def test_default_search_returns_only_active_memories(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_search_results_expose_service_artifact_urls_without_storage_uris(
+async def test_search_results_do_not_expose_top_level_provenance_fields(
     db,
     tmp_path,
     monkeypatch,
@@ -164,17 +139,71 @@ async def test_search_results_expose_service_artifact_urls_without_storage_uris(
         vector=adapters.vector,
         embed_cfg={},
         config=config.retrieval,
-        artifact_config=config,
     )
     engine._get_or_compute_embedding = lambda query: [0.1]
 
     result = await engine.search("PostgreSQL", top_k=1)
     search_result = result["results"][0]
 
-    assert search_result.content_url == "/api/documents/doc-search-artifact/content"
-    assert search_result.pdf_url == "/api/documents/doc-search-artifact/pdf"
-    assert not hasattr(search_result, "file_uri")
-    assert not hasattr(search_result, "pdf_uri")
+    assert search_result.memory_id == active.id
+    assert not hasattr(search_result, "source_doc_id")
+    assert not hasattr(search_result, "source_doc_title")
+    assert not hasattr(search_result, "source_type")
+    assert not hasattr(search_result, "source_url")
+    assert not hasattr(search_result, "content_url")
+    assert not hasattr(search_result, "pdf_url")
+
+
+@pytest.mark.asyncio
+async def test_search_result_without_sources_remains_unverified(db, tmp_path, monkeypatch):
+    active = _memory("mem-no-source", "Active HANA memory without sources", "active")
+    await db.insert_memory(active)
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    adapters = build_sqlite_adapters(db, FakeCollection([active.id]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=_config(tmp_path).retrieval,
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("HANA", top_k=1)
+
+    assert result["results"][0].freshness == "unverified"
+
+
+@pytest.mark.asyncio
+async def test_search_result_with_source_row_but_no_source_url_is_current(db, tmp_path, monkeypatch):
+    active = _memory("mem-source-no-url", "Active memory with provenance but no document URL", "active")
+    await db.insert_memory(active)
+    doc = await _document(db, tmp_path, "doc-no-source-url", source_url="")
+    await db.add_memory_source(active.id, doc.doc_id, "confluence", source_updated_at=None)
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    adapters = build_sqlite_adapters(db, FakeCollection([active.id]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=_config(tmp_path).retrieval,
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("provenance", top_k=1)
+
+    assert result["results"][0].freshness == "current"
 
 
 @pytest.mark.asyncio
@@ -203,7 +232,6 @@ async def test_search_result_suggests_detail_for_procedure_memory(
         vector=adapters.vector,
         embed_cfg={},
         config=_config(tmp_path).retrieval,
-        artifact_config=_config(tmp_path),
     )
     engine._get_or_compute_embedding = lambda query: [0.1]
 
@@ -237,7 +265,6 @@ async def test_search_result_omits_follow_up_for_simple_fact_memory(
         vector=adapters.vector,
         embed_cfg={},
         config=_config(tmp_path).retrieval,
-        artifact_config=_config(tmp_path),
     )
     engine._get_or_compute_embedding = lambda query: [0.1]
 
@@ -248,7 +275,7 @@ async def test_search_result_omits_follow_up_for_simple_fact_memory(
 
 
 @pytest.mark.asyncio
-async def test_search_results_resolve_artifacts_through_configured_store(
+async def test_search_results_do_not_resolve_artifacts_through_configured_store(
     db,
     tmp_path,
     monkeypatch,
@@ -283,63 +310,23 @@ async def test_search_results_resolve_artifacts_through_configured_store(
 
     monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
-    config = _config(tmp_path)
     adapters = build_sqlite_adapters(db, FakeCollection([active.id]))
     engine = SearchEngine(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
         embed_cfg={},
-        config=config.retrieval,
-        artifact_config=config,
-        artifact_store=MemoryBackedDocumentStore(
-            {"object://workspace/doc-object-search-artifact.md": b"# Jira Source"}
-        ),
+        config=_config(tmp_path).retrieval,
     )
     engine._get_or_compute_embedding = lambda query: [0.1]
 
     result = await engine.search("HANA", top_k=1)
     search_result = result["results"][0]
 
-    assert search_result.source_doc_id == doc.doc_id
-    assert search_result.content_url == "/api/documents/doc-object-search-artifact/content"
-    assert search_result.pdf_url is None
-
-
-@pytest.mark.asyncio
-async def test_document_fallback_suggests_resource_when_artifact_is_available(
-    db,
-    tmp_path,
-    monkeypatch,
-):
-    doc = await _document(db, tmp_path, "doc-fallback-artifact")
-
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
-
-    adapters = build_sqlite_adapters(db, FakeCollection([]))
-    engine = SearchEngine(
-        relational=adapters.relational,
-        keyword=adapters.keyword,
-        vector=adapters.vector,
-        embed_cfg={},
-        config=_config(tmp_path).retrieval,
-        artifact_config=_config(tmp_path),
-        document_vector=FakeVectorStore([doc.doc_id]),
-    )
-    engine._get_or_compute_embedding = lambda query: [0.1]
-
-    result = await engine.search("deployment", top_k=1)
-    search_result = result["results"][0]
-
-    assert search_result.memory_id is None
-    assert search_result.is_document_result is True
-    assert search_result.follow_up == {
-        "suggested_tool": "get_resource",
-        "reason": "document_result_needs_source_artifact",
-    }
+    assert search_result.memory_id == active.id
+    assert not hasattr(search_result, "source_doc_id")
+    assert not hasattr(search_result, "content_url")
+    assert not hasattr(search_result, "pdf_url")
 
 
 @pytest.mark.asyncio

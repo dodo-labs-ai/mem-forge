@@ -57,7 +57,7 @@ MAX_EVENTS = 40
 WORKER_LEASE_BUFFER_SECONDS = 60.0
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.9"
+PLUGIN_VERSION = "0.1.10"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -73,8 +73,9 @@ SESSION_START_USAGE_GUIDANCE = (
     "or source types.\n"
     "- If a memory affects an answer, review, or code change, call `get_memory` "
     "for full content and provenance before relying on it.\n"
-    "- If `content_url` or `pdf_url` is returned and the user needs source "
-    "evidence, quotes, or exact document context, call `get_resource`.\n"
+    "- Search results do not include source links or artifact URLs. Use "
+    "`search -> get_memory -> get_resource` when the user needs source "
+    "evidence, quotes, or exact document context.\n"
     "- Treat memory as context, not current truth. Verify current files, tests, "
     "runtime state, or external systems when facts may have changed.\n"
     "- If no relevant memory is found, continue normally and say so only when it "

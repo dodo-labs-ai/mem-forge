@@ -546,27 +546,19 @@ class ChangelogEntry:
 
 @dataclass
 class SearchResult:
-    """A single search result (memory or document fallback)."""
-    memory_id: str | None
-    memory_type: str | None
+    """A single memory search result."""
+    memory_id: str
+    memory_type: str
     summary: str
     confidence: float
     relevance_score: float
     tags: list[str] = field(default_factory=list)
-    # Primary source
-    source_doc_id: str | None = None
-    source_doc_title: str | None = None
-    source_type: str | None = None
-    content_url: str | None = None
-    pdf_url: str | None = None
-    source_url: str | None = None
     # Metadata
     corroborated_by: int = 1
     last_observed_at: str | None = None
     freshness: str = "current"  # current | stale | unverified
     contradiction_warning: str | None = None
-    is_document_result: bool = False
-    status: str = "active"  # mirrors Memory.status; "active" for document fallbacks
+    status: str = "active"
     memory_level: str = MemoryLevel.ATOMIC.value
     curation_cluster_id: str | None = None
     covered_memory_count: int = 0

@@ -4118,7 +4118,12 @@ class Database:
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]:
         results: list[MemorySource] = []
         async with self.db.execute(
-            "SELECT * FROM memory_sources WHERE memory_id = ?",
+            """SELECT * FROM memory_sources
+               WHERE memory_id = ?
+               ORDER BY
+                   CASE WHEN support_kind = 'extracted' THEN 0 ELSE 1 END,
+                   added_at DESC,
+                   doc_id ASC""",
             (memory_id,),
         ) as cursor:
             async for row in cursor:

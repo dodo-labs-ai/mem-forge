@@ -343,11 +343,10 @@ async def test_queried_search_honors_offset_after_ranking(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_source_filter_disables_unfiltered_document_fallback(db, monkeypatch):
+async def test_search_engine_returns_only_memory_results_even_when_top_k_has_room(db, monkeypatch):
     memory = _memory("m-target", "Mount Tai payroll defect memory")
     await db.insert_memory(memory)
     await _document(db, "doc-target", "src-target")
-    await _document(db, "doc-fallback-other-source", "src-other")
     await db.add_memory_source(
         "m-target",
         "doc-target",
@@ -365,12 +364,10 @@ async def test_source_filter_disables_unfiltered_document_fallback(db, monkeypat
     monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     memory_adapters = build_sqlite_adapters(db, FakeCollection(["m-target"]))
-    document_adapters = build_sqlite_adapters(db, FakeCollection(["doc-fallback-other-source"]))
     engine = SearchEngine(
         relational=memory_adapters.relational,
         keyword=memory_adapters.keyword,
         vector=memory_adapters.vector,
-        document_vector=document_adapters.vector,
         embed_cfg={},
         config=RetrievalConfig(),
     )
@@ -384,7 +381,7 @@ async def test_source_filter_disables_unfiltered_document_fallback(db, monkeypat
     )
 
     assert [r.memory_id for r in result["results"]] == ["m-target"]
-    assert all(not r.is_document_result for r in result["results"])
+    assert all(r.memory_id is not None for r in result["results"])
 
 
 @pytest.mark.asyncio

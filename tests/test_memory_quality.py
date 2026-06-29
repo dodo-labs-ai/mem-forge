@@ -1032,9 +1032,6 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
                         summary="Proxy search stays service-owned.",
                         confidence=0.9,
                         relevance_score=1.0,
-                        source_doc_id="doc-proxy",
-                        content_url="/api/documents/doc-proxy/content",
-                        pdf_url="/api/documents/doc-proxy/pdf",
                     )
                 ],
             }
@@ -1079,7 +1076,90 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
         }
     ]
     assert payload["results"][0]["memory_id"] == "mem-proxy-search"
-    assert payload["results"][0]["pdf_url"] == "/api/documents/doc-proxy/pdf"
+    result = payload["results"][0]
+    for field in ("source_doc_id", "source_doc_title", "source_url", "content_url", "pdf_url", "is_document_result"):
+        assert field not in result
+
+
+@pytest.mark.asyncio
+async def test_get_memory_sources_orders_extracted_before_corroborated(db: Database):
+    memory = await _insert_memory(
+        db,
+        mem_id="mem-source-order",
+        content="The extracted source should be listed before corroborating sources.",
+    )
+    await _insert_document(db, doc_id="doc-corrob-new")
+    await _insert_document(db, doc_id="doc-extracted")
+    await _insert_document(db, doc_id="doc-corrob-tie-a")
+    await _insert_document(db, doc_id="doc-corrob-tie-b")
+    await _insert_document(db, doc_id="doc-corrob-old")
+    await db.add_memory_source(
+        memory.id,
+        "doc-corrob-new",
+        "confluence",
+        support_kind="corroborated",
+        source_updated_at=None,
+    )
+    await db.add_memory_source(
+        memory.id,
+        "doc-extracted",
+        "confluence",
+        support_kind="extracted",
+        source_updated_at=None,
+    )
+    await db.add_memory_source(
+        memory.id,
+        "doc-corrob-old",
+        "confluence",
+        support_kind="corroborated",
+        source_updated_at=None,
+    )
+    await db.add_memory_source(
+        memory.id,
+        "doc-corrob-tie-b",
+        "confluence",
+        support_kind="corroborated",
+        source_updated_at=None,
+    )
+    await db.add_memory_source(
+        memory.id,
+        "doc-corrob-tie-a",
+        "confluence",
+        support_kind="corroborated",
+        source_updated_at=None,
+    )
+
+    await db.db.execute(
+        "UPDATE memory_sources SET added_at = ? WHERE memory_id = ? AND doc_id = ?",
+        ("2026-06-23T12:00:00+00:00", memory.id, "doc-corrob-new"),
+    )
+    await db.db.execute(
+        "UPDATE memory_sources SET added_at = ? WHERE memory_id = ? AND doc_id = ?",
+        ("2026-06-22T12:00:00+00:00", memory.id, "doc-extracted"),
+    )
+    await db.db.execute(
+        "UPDATE memory_sources SET added_at = ? WHERE memory_id = ? AND doc_id = ?",
+        ("2026-06-21T12:00:00+00:00", memory.id, "doc-corrob-old"),
+    )
+    await db.db.execute(
+        "UPDATE memory_sources SET added_at = ? WHERE memory_id = ? AND doc_id = ?",
+        ("2026-06-22T00:00:00+00:00", memory.id, "doc-corrob-tie-b"),
+    )
+    await db.db.execute(
+        "UPDATE memory_sources SET added_at = ? WHERE memory_id = ? AND doc_id = ?",
+        ("2026-06-22T00:00:00+00:00", memory.id, "doc-corrob-tie-a"),
+    )
+    await db.db.commit()
+
+    sources = await db.get_memory_sources(memory.id)
+
+    assert [(source.doc_id, source.support_kind) for source in sources] == [
+        ("doc-extracted", "extracted"),
+        ("doc-corrob-new", "corroborated"),
+        ("doc-corrob-tie-a", "corroborated"),
+        ("doc-corrob-tie-b", "corroborated"),
+        ("doc-corrob-old", "corroborated"),
+    ]
 
 
 @pytest.mark.asyncio
