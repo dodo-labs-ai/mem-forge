@@ -1212,6 +1212,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
 
     resolve_schema = tools["resolve_memory_review"]["inputSchema"]
     assert resolve_schema["properties"]["decision"]["enum"] == ["approve", "reject", "refresh"]
+    assert "required when decision is reject" in resolve_schema["properties"]["note"]["description"]
 
 
 def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
@@ -1397,6 +1398,22 @@ def test_mcp_proxy_forwards_memory_review_tools(monkeypatch):
     assert calls[2]["method"] == "POST"
     assert calls[2]["url"] == "https://memforge.example/api/memory-reviews/rev-1/reject"
     assert json.loads(calls[2]["body"].decode()) == {"note": "Not durable enough."}
+
+
+def test_mcp_proxy_requires_note_before_rejecting_memory_review(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            raise AssertionError("reject without note should fail before HTTP")
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    assert proxy._call_tool(
+        "resolve_memory_review",
+        {"review_id": "rev-1", "decision": "reject"},
+    ) == {"error": "note is required when decision is reject"}
 
 
 def test_mcp_proxy_rejects_invalid_memory_review_pagination():

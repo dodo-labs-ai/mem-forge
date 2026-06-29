@@ -275,3 +275,72 @@ async def test_retire_memory_route_returns_conflict_for_stale_content_hash(db: D
 
     assert response.status_code == 409
     assert response.json()["detail"] == "content_hash_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_retire_memory_route_audits_request_principal(db: Database, tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    memory = _memory("mem-retire-route-audit", "Route audited fact")
+    await db.insert_memory(memory)
+    app = create_admin_app(
+        db=db,
+        config=AppConfig(base_dir=tmp_path / "memforge"),
+        principal_resolver=lambda _request: "andrew.sun01@sap.com",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/memories/{memory.id}/retire",
+            json={
+                "reason": "User says this is stale",
+                "expected_content_hash": memory.content_hash,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    audit_rows = await db.list_memory_audit_events(
+        memory_id=memory.id,
+        event_type="memory_retire_committed",
+    )
+    assert len(audit_rows) == 1
+    assert audit_rows[0].actor_type == "user"
+    assert audit_rows[0].actor_id == "andrew.sun01@sap.com"
+
+
+@pytest.mark.asyncio
+async def test_replace_memory_route_audits_request_principal(db: Database, tmp_path, monkeypatch):
+    from memforge.server.admin_api import create_admin_app
+
+    async def fake_embed(self, _text: str) -> list[float]:
+        return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr("memforge.memory.store.MemoryStore._embed", fake_embed)
+
+    memory = _memory("mem-replace-route-audit", "Route replacement audited fact")
+    await db.insert_memory(memory)
+    app = create_admin_app(
+        db=db,
+        config=AppConfig(base_dir=tmp_path / "memforge"),
+        principal_resolver=lambda _request: "andrew.sun01@sap.com",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/memories/{memory.id}/replace",
+            json={
+                "replacement_content": "Route replacement corrected fact",
+                "reason": "User corrected this memory.",
+                "expected_content_hash": memory.content_hash,
+                "replacement_kind": "supersession",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    audit_rows = await db.list_memory_audit_events(
+        memory_id=memory.id,
+        event_type="memory_supersede_committed",
+    )
+    assert len(audit_rows) == 1
+    assert audit_rows[0].actor_type == "user"
+    assert audit_rows[0].actor_id == "andrew.sun01@sap.com"

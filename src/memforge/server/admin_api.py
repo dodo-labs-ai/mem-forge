@@ -42,6 +42,7 @@ from memforge.genes.atlassian_auth import (
     require_https_base_url,
     validate_tls_ca_bundle,
 )
+from memforge.memory.audit import AuditContext
 from memforge.memory.lifecycle import normalize_memory_status
 from memforge.memory.lifecycle_service import (
     MemoryLifecycleConflict,
@@ -191,6 +192,10 @@ async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
     from memforge.storage.adapters.sqlite.relational import SqliteRelationalStore
 
     return await SqliteRelationalStore(db).filter_visible_ids(list(ids), scope)
+
+
+def _request_audit_context(request: Request) -> AuditContext:
+    return AuditContext(actor_type="user", actor_id=resolve_request_principal(request))
 
 
 # ---------------------------------------------------------------------------
@@ -1882,10 +1887,11 @@ async def _build_memory_store(
     db: Database,
     config: AppConfig,
     runtime_provider: RuntimeProvider | None = None,
+    audit_context: AuditContext | None = None,
 ) -> MemoryStore:
     """Build a request-scoped memory store with effective embedding settings."""
 
-    from memforge.memory.audit import AuditContext, MemoryAuditLogger
+    from memforge.memory.audit import MemoryAuditLogger
     from memforge.retrieval.document_index import DocumentVectorIndex
     from memforge.retrieval.embeddings import get_chroma_collection
     from memforge.runtime import get_effective_llm_config
@@ -1905,17 +1911,19 @@ async def _build_memory_store(
         "model": llm.embedding_model,
     }
     provider = runtime_provider or DefaultRuntimeProvider()
+    default_audit_context = audit_context or AuditContext(actor_type="admin")
+    audit_logger = MemoryAuditLogger(db, default_context=default_audit_context)
     adapters = provider.build_adapters(
         db,
         memory_collection,
-        audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="admin")),
+        audit_logger=audit_logger,
     )
     return MemoryStore(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
         embed_cfg=embed_cfg,
-        audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="admin")),
+        audit_logger=audit_logger,
         document_index=DocumentVectorIndex(document_collection),
     )
 
@@ -1998,8 +2006,9 @@ async def _build_lifecycle_service(
     db: Database,
     config: AppConfig,
     runtime_provider: RuntimeProvider | None = None,
+    audit_context: AuditContext | None = None,
 ) -> MemoryLifecycleService:
-    memory_store = await _build_memory_store(db, config, runtime_provider)
+    memory_store = await _build_memory_store(db, config, runtime_provider, audit_context=audit_context)
     return MemoryLifecycleService(db=db, memory_store=memory_store)
 
 
@@ -2690,7 +2699,12 @@ def create_admin_app(
         visible = await _filter_visible_ids(db, [memory_id], _workspace_default_scope(request, include_private=True))
         if memory_id not in visible:
             raise HTTPException(status_code=404, detail="Memory not found")
-        service = await _build_lifecycle_service(db, config, runtime_provider)
+        service = await _build_lifecycle_service(
+            db,
+            config,
+            runtime_provider,
+            audit_context=_request_audit_context(request),
+        )
         try:
             result = await service.retire_memory(
                 memory_id,
@@ -2715,7 +2729,12 @@ def create_admin_app(
         visible = await _filter_visible_ids(db, [memory_id], _workspace_default_scope(request, include_private=True))
         if memory_id not in visible:
             raise HTTPException(status_code=404, detail="Memory not found")
-        service = await _build_lifecycle_service(db, config, runtime_provider)
+        service = await _build_lifecycle_service(
+            db,
+            config,
+            runtime_provider,
+            audit_context=_request_audit_context(request),
+        )
         try:
             result = await service.replace_memory(
                 memory_id,
