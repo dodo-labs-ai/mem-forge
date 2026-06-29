@@ -319,7 +319,10 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "review_id": {"type": "string", "description": "The memory review ID."},
                 "decision": {"type": "string", "enum": ["approve", "reject", "refresh"]},
-                "note": {"type": "string", "description": "Optional reviewer note; recommended for reject."},
+                "note": {
+                    "type": "string",
+                    "description": "Reviewer note; required when decision is reject.",
+                },
                 "reviewer": {"type": "string", "description": "Optional reviewer display name or user id."},
             },
             "required": ["review_id", "decision"],
@@ -454,7 +457,15 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             decision = _required_string_arg(args, "decision")
             if decision not in {"approve", "reject", "refresh"}:
                 raise ValueError("decision must be approve, reject, or refresh")
-            body = {key: value for key in ("note", "reviewer") if (value := args.get(key))}
+            note = str(args.get("note") or "").strip()
+            if decision == "reject" and not note:
+                raise ValueError("note is required when decision is reject")
+            reviewer = str(args.get("reviewer") or "").strip()
+            body = {}
+            if note:
+                body["note"] = note
+            if reviewer:
+                body["reviewer"] = reviewer
         except ValueError as exc:
             return {"error": str(exc)}
         return _http_json("POST", f"/api/memory-reviews/{quote(review_id, safe='')}/{decision}", body)
