@@ -859,6 +859,7 @@ class MemoryStore:
         excerpt: str | None = None,
         replacement_reason: str | None = None,
         relation_outcome: RelationOutcomeBundle | None = None,
+        carry_revision_sources: bool | None = None,
     ) -> None:
         """Supersede an old memory with a new one, updating all stores.
 
@@ -892,7 +893,9 @@ class MemoryStore:
                 source_type=source_type,
                 excerpt=excerpt,
                 replacement_reason=replacement_reason,
-                carry_revision_sources=replacement_kind == "revision",
+                carry_revision_sources=(
+                    replacement_kind == "revision" if carry_revision_sources is None else carry_revision_sources
+                ),
                 entity_ids=entity_ids,
                 source_updated_at=source_updated_at,
                 relation_outcome=relation_outcome,

@@ -1158,6 +1158,12 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "list_sources" in tools
     assert "list_recent_changes" not in tools
     assert "submit_agent_session_document" not in tools
+    assert "suggest_memory_replacement" not in tools
+    assert "retire_memory" in tools
+    assert "replace_memory" in tools
+    assert "list_memory_reviews" in tools
+    assert "get_memory_review" in tools
+    assert "resolve_memory_review" in tools
 
     search_schema = tools["search"]["inputSchema"]
     properties = search_schema["properties"]
@@ -1187,6 +1193,23 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "active_repo_identifier" not in properties
     assert "follow_up" in tools["search"]["description"]
     assert "search -> get_memory -> get_resource" in tools["get_resource"]["description"]
+
+    retire_schema = tools["retire_memory"]["inputSchema"]
+    assert retire_schema["required"] == ["memory_id", "reason", "expected_content_hash"]
+    assert "status" not in retire_schema["properties"]
+
+    replace_schema = tools["replace_memory"]["inputSchema"]
+    assert replace_schema["required"] == [
+        "memory_id",
+        "replacement_content",
+        "reason",
+        "expected_content_hash",
+    ]
+    assert replace_schema["properties"]["replacement_kind"]["enum"] == ["revision", "supersession"]
+    assert "status" not in replace_schema["properties"]
+
+    resolve_schema = tools["resolve_memory_review"]["inputSchema"]
+    assert resolve_schema["properties"]["decision"]["enum"] == ["approve", "reject", "refresh"]
 
 
 def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
@@ -1228,6 +1251,157 @@ def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
         "include_private": True,
         "include_superseded": False,
     }
+
+
+def test_mcp_proxy_forwards_retire_memory_to_lifecycle_endpoint(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"status":"retired","memory_id":"mem-123"}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["url"] = request.full_url
+            captured["method"] = request.get_method()
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    result = proxy._call_tool(
+        "retire_memory",
+        {
+            "memory_id": "mem-123",
+            "reason": "User confirmed this memory is obsolete.",
+            "expected_content_hash": "hash-old",
+        },
+    )
+
+    assert result == {"status": "retired", "memory_id": "mem-123"}
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://memforge.example/api/workspaces/mount_tai/api/memories/mem-123/retire"
+    assert json.loads(captured["body"].decode()) == {
+        "reason": "User confirmed this memory is obsolete.",
+        "expected_content_hash": "hash-old",
+    }
+
+
+def test_mcp_proxy_forwards_replace_memory_to_lifecycle_endpoint(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"status":"superseded","memory_id":"mem-old","replacement_memory_id":"mem-new"}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["url"] = request.full_url
+            captured["method"] = request.get_method()
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    result = proxy._call_tool(
+        "replace_memory",
+        {
+            "memory_id": "mem-old",
+            "replacement_content": "Use the new deployment route.",
+            "reason": "User corrected the stale route.",
+            "expected_content_hash": "hash-old",
+            "replacement_kind": "revision",
+        },
+    )
+
+    assert result["replacement_memory_id"] == "mem-new"
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://memforge.example/api/memories/mem-old/replace"
+    assert json.loads(captured["body"].decode()) == {
+        "replacement_content": "Use the new deployment route.",
+        "reason": "User corrected the stale route.",
+        "expected_content_hash": "hash-old",
+        "replacement_kind": "revision",
+    }
+
+
+def test_mcp_proxy_forwards_memory_review_tools(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    calls = []
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __init__(self, body: bytes = b'{"ok":true}'):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return self.body
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            calls.append(
+                {
+                    "url": request.full_url,
+                    "method": request.get_method(),
+                    "body": request.data,
+                }
+            )
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    assert proxy._call_tool("list_memory_reviews", {"status": "open", "limit": 5}) == {"ok": True}
+    assert proxy._call_tool("get_memory_review", {"review_id": "rev-1"}) == {"ok": True}
+    assert proxy._call_tool(
+        "resolve_memory_review",
+        {"review_id": "rev-1", "decision": "reject", "note": "Not durable enough."},
+    ) == {"ok": True}
+
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == "https://memforge.example/api/memory-reviews?status=open&limit=5&offset=0"
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "https://memforge.example/api/memory-reviews/rev-1"
+    assert calls[2]["method"] == "POST"
+    assert calls[2]["url"] == "https://memforge.example/api/memory-reviews/rev-1/reject"
+    assert json.loads(calls[2]["body"].decode()) == {"note": "Not durable enough."}
+
+
+def test_mcp_proxy_rejects_invalid_memory_review_pagination():
+    proxy = _load_plugin_mcp_proxy()
+
+    assert proxy._call_tool("list_memory_reviews", {"limit": "ten"}) == {"error": "limit must be an integer"}
+    assert proxy._call_tool("list_memory_reviews", {"offset": "soon"}) == {"error": "offset must be an integer"}
 
 
 def test_mcp_proxy_forwards_queryless_source_id_time_range(monkeypatch):

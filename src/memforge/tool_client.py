@@ -11,7 +11,7 @@ import re
 import tempfile
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 DEFAULT_API_URL = "http://127.0.0.1:8765"
@@ -90,6 +90,48 @@ class ToolClient:
             return {"error": "memory_id is required"}
         return self._http_json("GET", f"/api/memories/{quote(memory_id, safe='')}?include_private=true", None)
 
+    def retire_memory(
+        self,
+        memory_id: str,
+        *,
+        reason: str,
+        expected_content_hash: str,
+    ) -> dict[str, Any]:
+        memory_id = memory_id.strip()
+        if not memory_id:
+            return {"error": "memory_id is required"}
+        return self._http_json(
+            "POST",
+            f"/api/memories/{quote(memory_id, safe='')}/retire",
+            {
+                "reason": reason,
+                "expected_content_hash": expected_content_hash,
+            },
+        )
+
+    def replace_memory(
+        self,
+        memory_id: str,
+        *,
+        replacement_content: str,
+        reason: str,
+        expected_content_hash: str,
+        replacement_kind: str = "supersession",
+    ) -> dict[str, Any]:
+        memory_id = memory_id.strip()
+        if not memory_id:
+            return {"error": "memory_id is required"}
+        return self._http_json(
+            "POST",
+            f"/api/memories/{quote(memory_id, safe='')}/replace",
+            {
+                "replacement_content": replacement_content,
+                "reason": reason,
+                "expected_content_hash": expected_content_hash,
+                "replacement_kind": replacement_kind,
+            },
+        )
+
     def push_local_markdown_document(
         self,
         *,
@@ -141,6 +183,40 @@ class ToolClient:
     def list_searchable_sources(self) -> dict[str, Any]:
         """List search-eligible sources for MCP/source-id discovery."""
         return self._http_json("GET", "/api/sources/searchable", None)
+
+    def list_memory_reviews(
+        self,
+        *,
+        status: str = "open",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        query = urlencode({"status": status, "limit": limit, "offset": offset})
+        return self._http_json("GET", f"/api/memory-reviews?{query}", None)
+
+    def get_memory_review(self, review_id: str) -> dict[str, Any]:
+        review_id = review_id.strip()
+        if not review_id:
+            return {"error": "review_id is required"}
+        return self._http_json("GET", f"/api/memory-reviews/{quote(review_id, safe='')}", None)
+
+    def resolve_memory_review(
+        self,
+        review_id: str,
+        *,
+        decision: str,
+        note: str | None = None,
+        reviewer: str | None = None,
+    ) -> dict[str, Any]:
+        review_id = review_id.strip()
+        if not review_id:
+            return {"error": "review_id is required"}
+        body: dict[str, Any] = {}
+        if note is not None:
+            body["note"] = note
+        if reviewer is not None:
+            body["reviewer"] = reviewer
+        return self._http_json("POST", f"/api/memory-reviews/{quote(review_id, safe='')}/{decision}", body)
 
     def create_source(self, *, source_type: str, name: str, config: dict[str, Any]) -> dict[str, Any]:
         """Create a source (gene instance) of ``source_type`` with the given config."""

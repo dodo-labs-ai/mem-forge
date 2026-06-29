@@ -168,6 +168,65 @@ def test_tool_client_get_memory_uses_personalized_detail_route():
     ]
 
 
+def test_tool_client_retire_memory_posts_lifecycle_guard():
+    client = _RecordingClient({"memory_id": "mem-1", "status": "retired"})
+
+    result = client.retire_memory(
+        "mem-1",
+        reason="User says this is stale",
+        expected_content_hash="hash-1",
+    )
+
+    assert result["status"] == "retired"
+    assert client.calls == [
+        (
+            "POST",
+            "/api/memories/mem-1/retire",
+            {"reason": "User says this is stale", "expected_content_hash": "hash-1"},
+        )
+    ]
+
+
+def test_tool_client_replace_memory_posts_lifecycle_guard():
+    client = _RecordingClient({"memory_id": "mem-1", "replacement_memory_id": "mem-2"})
+
+    result = client.replace_memory(
+        "mem-1",
+        replacement_content="Corrected memory",
+        reason="User corrected it",
+        expected_content_hash="hash-1",
+        replacement_kind="revision",
+    )
+
+    assert result["replacement_memory_id"] == "mem-2"
+    assert client.calls == [
+        (
+            "POST",
+            "/api/memories/mem-1/replace",
+            {
+                "replacement_content": "Corrected memory",
+                "reason": "User corrected it",
+                "expected_content_hash": "hash-1",
+                "replacement_kind": "revision",
+            },
+        )
+    ]
+
+
+def test_tool_client_memory_review_methods_use_review_endpoints():
+    client = _RecordingClient({"ok": True})
+
+    client.list_memory_reviews(status="open", limit=5, offset=2)
+    client.get_memory_review("rev-1")
+    client.resolve_memory_review("rev-1", decision="reject", note="Not durable", reviewer="alice")
+
+    assert client.calls == [
+        ("GET", "/api/memory-reviews?status=open&limit=5&offset=2", None),
+        ("GET", "/api/memory-reviews/rev-1", None),
+        ("POST", "/api/memory-reviews/rev-1/reject", {"note": "Not durable", "reviewer": "alice"}),
+    ]
+
+
 def test_tool_client_fetches_resource_through_hosted_workspace(monkeypatch):
     captured = {}
 
