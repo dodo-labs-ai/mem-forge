@@ -2587,7 +2587,9 @@ def create_admin_app(
         if memory_id not in visible:
             raise HTTPException(status_code=404, detail="Memory not found")
 
-        # Fetch provenance: memory_sources with document titles and artifact URLs.
+        # Keep provenance order deterministic for agents: extracted first, then
+        # newer corroboration. Callers should inspect support_kind/title instead
+        # of relying on a hidden single "source".
         raw_sources = await db.get_memory_sources(memory_id)
         source_details: list[MemorySourceDetail] = []
         for ms in raw_sources:

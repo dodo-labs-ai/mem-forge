@@ -72,18 +72,16 @@ interface SourcesResponse {
 
 // Shape returned by POST /api/memories/search. Mirrors `SearchResult`
 // (memforge.models). Only the fields the list view actually renders are
-// declared here; the backend returns more (source URLs, freshness, etc.).
+// declared here; provenance is fetched from memory detail when needed.
 interface SearchHit {
-  memory_id: string | null;
-  memory_type: Memory["memory_type"] | null;
+  memory_id: string;
+  memory_type: Memory["memory_type"];
   summary: string;
   confidence: number;
   relevance_score: number;
   tags: string[];
-  source_type: string | null;
   corroborated_by: number;
   last_observed_at: string | null;
-  is_document_result: boolean;
   status: Memory["status"] | null;
 }
 
@@ -103,18 +101,13 @@ interface SearchResponse {
  * That keeps the search route ranking-pure (no row hydration roundtrip) and
  * leaves the keyword GET route unchanged for the cross-project admin path.
  *
- * Visibility (predicate) and shape (adapter) are kept separate: `isMemoryHit`
- * decides whether a hit is a memory row at all; `searchHitToMemoryRow` is a
- * total adapter that callers must guard with `isMemoryHit` first.
+ * Search is memory-only, so `searchHitToMemoryRow` can adapt each ranked hit
+ * directly.
  */
-function isMemoryHit(hit: SearchHit): boolean {
-  return hit.memory_id !== null && hit.memory_type !== null && !hit.is_document_result;
-}
-
 function searchHitToMemoryRow(hit: SearchHit): Memory {
   return {
-    id: hit.memory_id as string,
-    memory_type: hit.memory_type as Memory["memory_type"],
+    id: hit.memory_id,
+    memory_type: hit.memory_type,
     content: hit.summary,
     content_hash: "",
     visibility: "workspace",
@@ -137,7 +130,7 @@ function searchHitToMemoryRow(hit: SearchHit): Memory {
     extraction_context: null,
     entity_refs: [],
     sources: [],
-    origin_source_type: hit.source_type,
+    origin_source_type: null,
     origin_client: null,
   };
 }
@@ -284,7 +277,7 @@ export function MemoriesPage() {
           top_k: LIST_PAGE_SIZE,
         };
         const response = await client.post<SearchResponse>("/api/memories/search", body);
-        const rows = response.data.results.filter(isMemoryHit).map(searchHitToMemoryRow);
+        const rows = response.data.results.map(searchHitToMemoryRow);
         return {
           data: rows,
           total: response.data.total_candidates,

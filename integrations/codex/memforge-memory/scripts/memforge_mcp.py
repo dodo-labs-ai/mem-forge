@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.9"
+SERVER_VERSION = "0.1.10"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 SEARCH_ALLOWED_KEYS = frozenset(
     {
@@ -70,8 +70,9 @@ TOOLS: list[dict[str, Any]] = [
             "source_ids here; never guess source ids from the name. Query may be omitted only "
             "for deterministic listing with source_filter or time_range. Convert phrases like "
             "'last week' into explicit YYYY-MM-DD start_date/end_date before calling. A result "
-            "may include follow_up with suggested_tool and reason; use that hint to decide "
-            "whether to call get_memory before relying on the summary."
+            "may include follow_up with suggested_tool and reason. Search results do not include "
+            "source links or artifact URLs; call get_memory for provenance, source titles, exact "
+            "links, quotes, and lifecycle details before relying on source evidence."
         ),
         "inputSchema": {
             "type": "object",
@@ -187,11 +188,10 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_resource",
         "description": (
-            "Fetch a MemForge source artifact from a content_url or pdf_url returned by search "
-            "or get_memory. In file mode this local proxy writes the artifact to the agent host "
-            "cache and returns a real local_path. Prefer search -> get_memory -> get_resource "
-            "for memory hits; call this directly only for explicit document artifact results "
-            "or when exact source text is needed."
+            "Fetch a MemForge source artifact from a content_url or pdf_url returned by "
+            "get_memory. In file mode this local proxy writes the artifact to the agent host "
+            "cache and returns a real local_path. Use search -> get_memory -> get_resource "
+            "when exact source text, quotes, or document evidence is needed."
         ),
         "inputSchema": {
             "type": "object",

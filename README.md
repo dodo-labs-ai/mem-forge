@@ -133,9 +133,10 @@ docker compose --env-file .env.mirrors.example up --build
 
 The API image uses WeasyPrint for Confluence PDF export and does not require a
 browser runtime.
-When an agent needs backing source content from a Docker-hosted service, it can
-read the returned `content_url` / `pdf_url` provenance links through MemForge's
-artifact endpoints instead of depending on service-local filesystem paths.
+When an agent needs backing source content from a Docker-hosted service, it
+should call `get-memory` for provenance and then read the returned `content_url`
+or `pdf_url` through MemForge's artifact endpoints instead of depending on
+service-local filesystem paths.
 
 For detailed setup, configuration, and first-source examples, see
 [docs/quickstart.md](docs/quickstart.md).
@@ -200,9 +201,9 @@ If a memory points to a backing page or PDF, inspect it when the original contex
 could change your recommendation.
 ```
 
-The plugin returns source-traced memories with `source_url`, `content_url`, and
-`pdf_url` provenance when available. Agents can use those links to open backing
-content or PDFs through `get_resource` when they need more than the memory card.
+The plugin returns compact memory cards from search. Agents call `get_memory`
+for source provenance, then use those `source_url`, `content_url`, and `pdf_url`
+links with `get_resource` when they need more than the memory card.
 
 Both plugins follow the same MemForge boundary: the local agent gets useful
 memory in the moment, while the service owns extraction, provenance, and review.

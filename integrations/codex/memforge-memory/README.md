@@ -40,15 +40,16 @@ codex mcp get memforge --json
 Try a search:
 
 ```text
-Use MemForge to search for "<topic>". Show the top memories with source_url,
-content_url, and pdf_url when present.
+Use MemForge to search for "<topic>". If source evidence matters, call
+get_memory on the relevant result before citing source details.
 ```
 
 Fetch backing evidence:
 
 ```text
-Search MemForge for "<topic>". If a result has content_url or pdf_url, call
-get_resource with mode="file" and show the local_path.
+Search MemForge for "<topic>". Call get_memory for the relevant memory, then
+call get_resource with mode="file" on the best content_url or pdf_url and show
+the local_path.
 ```
 
 The plugin adds context during `SessionStart`, records hook lifecycle receipts

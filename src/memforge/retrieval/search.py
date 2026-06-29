@@ -3,9 +3,7 @@
 Three retrieval channels run in parallel (vector, BM25/FTS5, entity-graph),
 fused via Reciprocal Rank Fusion (RRF), then strictly filtered by source/time
 facets and ranked with a recency-weighted final score. Optional cross-encoder
-reranking via LLM can be enabled for higher precision at scale. Document
-fallback fills remaining slots when memory results are sparse and no explicit
-date filter is present.
+reranking via LLM can be enabled for higher precision at scale.
 
 Architecture reference: docs/architecture.md Section 10.
 """
@@ -20,15 +18,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from memforge.config import AppConfig, RetrievalConfig
+from memforge.config import RetrievalConfig
 from memforge.llm.structured import StructuredLlmError
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
-from memforge.provenance import (
-    DocumentArtifactStore,
-    document_content_url_for_store,
-    document_pdf_url_for_store,
-)
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.query_analyzer import QueryAnalysis, analyze_query
@@ -145,20 +138,6 @@ def _search_follow_up_for_memory(
     return None
 
 
-def _search_follow_up_for_document_result(
-    *,
-    content_url: str | None,
-    pdf_url: str | None,
-) -> dict[str, str] | None:
-    """Document fallbacks have no memory_id, so point only to source artifacts."""
-    if content_url or pdf_url:
-        return {
-            "suggested_tool": "get_resource",
-            "reason": "document_result_needs_source_artifact",
-        }
-    return None
-
-
 def _sanitize_fts_query(text: str) -> str:
     """Escape characters that are special in FTS5 MATCH syntax.
 
@@ -221,11 +200,6 @@ class SearchEngine:
         Tuning knobs (``rrf_k``, ``recency_half_life_days``, etc.).
     structured_llm_client : Any | None
         Optional cross-encoder reranking client.
-    artifact_config : AppConfig | None
-        Resolves content/pdf provenance URLs for enriched results.
-    document_vector : VectorStore | None
-        Optional documents-collection channel for the document fallback.
-        Unbound on the service path, so the fallback stays disabled.
     """
 
     def __init__(
@@ -236,20 +210,14 @@ class SearchEngine:
         embed_cfg: dict,
         config: RetrievalConfig,
         structured_llm_client: Any | None = None,
-        artifact_config: AppConfig | None = None,
-        artifact_store: DocumentArtifactStore | None = None,
-        document_vector: VectorStore | None = None,
     ) -> None:
         self._relational = relational
         self._keyword = keyword
         self._vector = vector
-        self._document_vector = document_vector
         self._embed_cfg = embed_cfg
         self._config = config
         self._embed_cache = EmbeddingCache(max_size=config.embedding_cache_size)
         self._structured_llm_client = structured_llm_client
-        self._artifact_config = artifact_config
-        self._artifact_store = artifact_store
 
     # ==================================================================
     # Public API
@@ -405,17 +373,6 @@ class SearchEngine:
         # ----- 8. Enrich results -----
         memory_ids = [c.memory_id for c in ranked]
         results = await self._enrich_results(memory_ids, ranked)
-
-        # ----- 9. Document fallback -----
-        has_explicit_source_filter = combined_source_filter is not None and not combined_source_filter.is_empty()
-        has_explicit_time_filter = time_range is not None and not time_range.is_empty()
-        if not has_explicit_source_filter and not has_explicit_time_filter and len(results) < top_k:
-            remaining = top_k - len(results)
-            existing_doc_ids = {
-                r.source_doc_id for r in results if r.source_doc_id
-            }
-            fallback = await self._document_fallback(query, remaining, existing_doc_ids)
-            results.extend(fallback)
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 
@@ -747,7 +704,7 @@ class SearchEngine:
         memory_ids: list[str],
         ranked: list[_RankedCandidate],
     ) -> list[SearchResult]:
-        """Fetch full Memory objects and primary source for each result."""
+        """Fetch full Memory objects for each result."""
         if not memory_ids:
             return []
 
@@ -769,47 +726,15 @@ class SearchEngine:
             if memory is None:
                 continue
 
-            # Fetch primary source (most recent)
-            source_doc_id = None
-            source_doc_title = None
-            source_type = None
-            content_url = None
-            pdf_url = None
-            source_url = None
-
             try:
                 mem_sources = await self._relational.get_memory_sources(mid)
-                if mem_sources:
-                    # Sort by added_at descending to get most recent
-                    mem_sources.sort(
-                        key=lambda s: s.added_at.isoformat() if s.added_at else "",
-                        reverse=True,
-                    )
-                    primary = mem_sources[0]
-                    source_doc_id = primary.doc_id
-                    source_type = primary.source_type
-
-                    # Fetch document details
-                    doc = await self._relational.get_document(primary.doc_id)
-                    if doc:
-                        source_doc_title = doc.title
-                        if self._artifact_config is not None:
-                            content_url = document_content_url_for_store(
-                                doc,
-                                self._artifact_config,
-                                self._artifact_store,
-                            )
-                            pdf_url = document_pdf_url_for_store(
-                                doc,
-                                self._artifact_config,
-                                self._artifact_store,
-                            )
-                        source_url = doc.source_url
+                has_source = bool(mem_sources)
             except Exception:
                 logger.exception("Failed to fetch sources for memory %s", mid)
+                has_source = False
 
             # Determine freshness
-            freshness = _compute_freshness(memory, source_url is not None)
+            freshness = _compute_freshness(memory, has_source)
 
             # Contradiction warning
             contradiction_warning = None
@@ -826,12 +751,6 @@ class SearchEngine:
                 confidence=memory.confidence,
                 relevance_score=round(candidate.final_score, 4),
                 tags=memory.tags,
-                source_doc_id=source_doc_id,
-                source_doc_title=source_doc_title,
-                source_type=source_type,
-                content_url=content_url,
-                pdf_url=pdf_url,
-                source_url=source_url,
                 corroborated_by=memory.corroboration_count,
                 last_observed_at=(
                     memory.updated_at.isoformat()
@@ -839,7 +758,6 @@ class SearchEngine:
                 ),
                 freshness=freshness,
                 contradiction_warning=contradiction_warning,
-                is_document_result=False,
                 status=memory.status,
                 memory_level=candidate.memory_level or memory.memory_level,
                 curation_cluster_id=(
@@ -850,114 +768,6 @@ class SearchEngine:
                 follow_up=_search_follow_up_for_memory(
                     memory,
                     contradiction_warning=contradiction_warning,
-                ),
-            ))
-
-        return results
-
-    # ==================================================================
-    # Document fallback
-    # ==================================================================
-
-    async def _document_fallback(
-        self,
-        query: str,
-        remaining_slots: int,
-        exclude_doc_ids: set[str] | None = None,
-    ) -> list[SearchResult]:
-        """Basic ChromaDB search on the documents collection.
-
-        Returns ``SearchResult`` objects with ``is_document_result=True``.
-        """
-        if remaining_slots <= 0 or self._document_vector is None:
-            return []
-
-        embedding = self._get_or_compute_embedding(query)
-        if embedding is None:
-            return []
-
-        try:
-            # Over-fetch so we can exclude docs already represented by memories
-            fetch_n = remaining_slots + (len(exclude_doc_ids) if exclude_doc_ids else 0)
-            chroma_result = self._document_vector.collection.query(
-                query_embeddings=[embedding],
-                n_results=min(fetch_n, 50),
-            )
-        except Exception:
-            logger.exception("Document fallback ChromaDB query failed")
-            return []
-
-        if (
-            not chroma_result
-            or not chroma_result.get("ids")
-            or not chroma_result["ids"][0]
-        ):
-            return []
-
-        doc_ids = chroma_result["ids"][0]
-        distances = (
-            chroma_result["distances"][0]
-            if chroma_result.get("distances")
-            else [0.0] * len(doc_ids)
-        )
-
-        results: list[SearchResult] = []
-        for doc_id, dist in zip(doc_ids, distances):
-            if exclude_doc_ids and doc_id in exclude_doc_ids:
-                continue
-            if len(results) >= remaining_slots:
-                break
-
-            similarity = self._document_vector.similarity(dist)
-
-            # Fetch document metadata
-            title = doc_id
-            content_url = None
-            pdf_url = None
-            source_url = None
-            source_type = None
-
-            try:
-                doc = await self._relational.get_document(doc_id)
-                if doc:
-                    title = doc.title
-                    if self._artifact_config is not None:
-                        content_url = document_content_url_for_store(
-                            doc,
-                            self._artifact_config,
-                            self._artifact_store,
-                        )
-                        pdf_url = document_pdf_url_for_store(
-                            doc,
-                            self._artifact_config,
-                            self._artifact_store,
-                        )
-                    source_url = doc.source_url
-                    source_type = doc.source
-            except Exception:
-                logger.exception("Failed to fetch document %s for fallback", doc_id)
-
-            results.append(SearchResult(
-                memory_id=None,
-                memory_type=None,
-                summary=f"[Document] {title}",
-                confidence=0.0,
-                relevance_score=round(similarity, 4),
-                tags=[],
-                source_doc_id=doc_id,
-                source_doc_title=title,
-                source_type=source_type,
-                content_url=content_url,
-                pdf_url=pdf_url,
-                source_url=source_url,
-                corroborated_by=0,
-                last_observed_at=None,
-                freshness="unverified",
-                contradiction_warning=None,
-                is_document_result=True,
-                follow_up=_search_follow_up_for_document_result(
-                    content_url=content_url,
-                    pdf_url=pdf_url,
                 ),
             ))
 

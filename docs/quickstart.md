@@ -51,9 +51,10 @@ Runtime data is stored in the `memforge-data` Docker volume. Remove that volume
 only when you intentionally want a clean local instance.
 
 When Codex or another host-side agent queries a Docker-hosted MemForge, memory
-search works over HTTP as usual. For backing source artifacts, prefer
-`content_url` and `pdf_url` from provenance; those URLs are served by the API
-and work even when the service storage lives inside a Docker volume.
+search works over HTTP as usual. For backing source artifacts, call
+`get_memory` for provenance and use its `content_url` or `pdf_url`; those URLs
+are served by the API and work even when the service storage lives inside a
+Docker volume.
 
 ## 2. Configure Models
 
@@ -137,15 +138,16 @@ The MCP server should be named `memforge`.
 After a source has synced, ask:
 
 ```text
-Use MemForge to search for "<topic>". Include source_url, content_url, and
-pdf_url when present.
+Use MemForge to search for "<topic>". If source evidence matters, call
+get_memory on the relevant result before citing source details.
 ```
 
 To fetch backing evidence:
 
 ```text
-Search MemForge for "<topic>". If a result has content_url or pdf_url, call
-get_resource with mode="file" and show the local_path.
+Search MemForge for "<topic>". Call get_memory for the relevant memory, then
+call get_resource with mode="file" on the best content_url or pdf_url and show
+the local_path.
 ```
 
 `local_path` is written by the local plugin under

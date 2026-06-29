@@ -925,7 +925,7 @@ def test_mcp_proxy_starts_without_memforge_executable():
     _, payload = result.stdout.split(b"\r\n\r\n", 1)
     response = json.loads(payload)
     assert response["result"]["serverInfo"]["name"] == "memforge"
-    assert response["result"]["serverInfo"]["version"] == "0.1.9"
+    assert response["result"]["serverInfo"]["version"] == "0.1.10"
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
 
 
@@ -1192,6 +1192,8 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "entities" not in properties
     assert "active_repo_identifier" not in properties
     assert "follow_up" in tools["search"]["description"]
+    assert "call get_memory" in tools["search"]["description"]
+    assert "do not include source links" in tools["search"]["description"]
     assert "search -> get_memory -> get_resource" in tools["get_resource"]["description"]
 
     retire_schema = tools["retire_memory"]["inputSchema"]
@@ -1995,7 +1997,7 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
     assert "raw-api-secret" not in serialized
     assert "[REDACTED]" in serialized
     assert payload["schema_version"] == "agent-session-window/v1"
-    assert payload["plugin_version"] == "0.1.9"
+    assert payload["plugin_version"] == "0.1.10"
     assert payload["receipt"]["metadata"]["uploaded_to_line"] == 2
     assert payload["receipt"]["metadata"]["observed_to_line"] == 2
 
