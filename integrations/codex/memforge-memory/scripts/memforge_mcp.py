@@ -188,9 +188,10 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_resource",
         "description": (
-            "Fetch a MemForge source artifact from a content_url or pdf_url returned by "
-            "get_memory. In file mode this local proxy writes the artifact to the agent host "
-            "cache and returns a real local_path. Use search -> get_memory -> get_resource "
+            "Fetch a MemForge source artifact from get_memory.sources[].content_url or "
+            "get_memory.sources[].pdf_url. In file mode this local proxy writes the "
+            "artifact to the agent host cache and returns a real local_path. Use "
+            "search -> get_memory -> get_resource "
             "when exact source text, quotes, or document evidence is needed."
         ),
         "inputSchema": {
