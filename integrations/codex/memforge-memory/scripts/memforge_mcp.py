@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 try:
@@ -214,6 +214,117 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["url"],
         },
     },
+    {
+        "name": "retire_memory",
+        "description": (
+            "Retire a memory when the user explicitly confirms it is wrong, obsolete, "
+            "or should no longer be used. This is an intent-level lifecycle action; do "
+            "not use it to set arbitrary status values."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "The memory ID to retire."},
+                "reason": {
+                    "type": "string",
+                    "description": "User-facing reason for retiring this memory.",
+                },
+                "expected_content_hash": {
+                    "type": "string",
+                    "description": "Content hash from get_memory/search used as a stale guard.",
+                },
+            },
+            "required": ["memory_id", "reason", "expected_content_hash"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "replace_memory",
+        "description": (
+            "Replace a memory only when the user explicitly provides or approves the exact "
+            "replacement content. The backend creates a new active memory and supersedes "
+            "the old one through the lifecycle service."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "The memory ID to replace."},
+                "replacement_content": {
+                    "type": "string",
+                    "description": "The exact replacement memory content approved by the user.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "User-facing reason for replacing this memory.",
+                },
+                "expected_content_hash": {
+                    "type": "string",
+                    "description": "Content hash from get_memory/search used as a stale guard.",
+                },
+                "replacement_kind": {
+                    "type": "string",
+                    "enum": ["revision", "supersession"],
+                    "default": "supersession",
+                    "description": (
+                        "Use revision only when the user explicitly says this is the corrected "
+                        "current version of the same knowledge. Otherwise use supersession."
+                    ),
+                },
+            },
+            "required": ["memory_id", "replacement_content", "reason", "expected_content_hash"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "list_memory_reviews",
+        "description": (
+            "List memory-review decisions that need attention. Use this when the user asks "
+            "to process pending memory reviews interactively."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["open", "pending", "stale", "approved", "rejected"],
+                    "default": "open",
+                },
+                "limit": {"type": "integer", "default": 20},
+                "offset": {"type": "integer", "default": 0},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_memory_review",
+        "description": "Fetch full current/proposed memory details for a memory-review decision.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "review_id": {"type": "string", "description": "The memory review ID."},
+            },
+            "required": ["review_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "resolve_memory_review",
+        "description": (
+            "Resolve one memory review after explicit user confirmation. approve promotes "
+            "the challenger, reject retires it, and refresh repins stale expectations."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "review_id": {"type": "string", "description": "The memory review ID."},
+                "decision": {"type": "string", "enum": ["approve", "reject", "refresh"]},
+                "note": {"type": "string", "description": "Optional reviewer note; recommended for reject."},
+                "reviewer": {"type": "string", "description": "Optional reviewer display name or user id."},
+            },
+            "required": ["review_id", "decision"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -291,7 +402,79 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return _http_json("GET", f"/api/memories/{quote(memory_id, safe='')}?include_private=true", None)
     if name == "get_resource":
         return _handle_get_resource(args)
+    if name == "retire_memory":
+        try:
+            memory_id = _required_string_arg(args, "memory_id")
+            body = {
+                "reason": _required_string_arg(args, "reason"),
+                "expected_content_hash": _required_string_arg(args, "expected_content_hash"),
+            }
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return _http_json("POST", f"/api/memories/{quote(memory_id, safe='')}/retire", body)
+    if name == "replace_memory":
+        try:
+            memory_id = _required_string_arg(args, "memory_id")
+            replacement_kind = str(args.get("replacement_kind") or "supersession").strip()
+            if replacement_kind not in {"revision", "supersession"}:
+                raise ValueError("replacement_kind must be revision or supersession")
+            body = {
+                "replacement_content": _required_string_arg(args, "replacement_content"),
+                "reason": _required_string_arg(args, "reason"),
+                "expected_content_hash": _required_string_arg(args, "expected_content_hash"),
+                "replacement_kind": replacement_kind,
+            }
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return _http_json("POST", f"/api/memories/{quote(memory_id, safe='')}/replace", body)
+    if name == "list_memory_reviews":
+        allowed = {"status", "limit", "offset"}
+        unknown = sorted(set(args) - allowed)
+        if unknown:
+            return {"error": "Unsupported list_memory_reviews parameter(s): " + ", ".join(unknown)}
+        try:
+            query = {
+                "status": str(args.get("status") or "open"),
+                "limit": _optional_int_arg(args, "limit", 20),
+                "offset": _optional_int_arg(args, "offset", 0),
+            }
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return _http_json("GET", "/api/memory-reviews?" + urlencode(query), None)
+    if name == "get_memory_review":
+        try:
+            review_id = _required_string_arg(args, "review_id")
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return _http_json("GET", f"/api/memory-reviews/{quote(review_id, safe='')}", None)
+    if name == "resolve_memory_review":
+        try:
+            review_id = _required_string_arg(args, "review_id")
+            decision = _required_string_arg(args, "decision")
+            if decision not in {"approve", "reject", "refresh"}:
+                raise ValueError("decision must be approve, reject, or refresh")
+            body = {key: value for key in ("note", "reviewer") if (value := args.get(key))}
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return _http_json("POST", f"/api/memory-reviews/{quote(review_id, safe='')}/{decision}", body)
     return {"error": f"Unknown tool: {name}"}
+
+
+def _required_string_arg(args: dict[str, Any], name: str) -> str:
+    value = str(args.get(name) or "").strip()
+    if not value:
+        raise ValueError(f"{name} is required")
+    return value
+
+
+def _optional_int_arg(args: dict[str, Any], name: str, default: int) -> int:
+    value = args.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
 
 
 def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:

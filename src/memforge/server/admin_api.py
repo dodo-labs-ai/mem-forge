@@ -43,6 +43,11 @@ from memforge.genes.atlassian_auth import (
     validate_tls_ca_bundle,
 )
 from memforge.memory.lifecycle import normalize_memory_status
+from memforge.memory.lifecycle_service import (
+    MemoryLifecycleConflict,
+    MemoryLifecycleNotFound,
+    MemoryLifecycleService,
+)
 from memforge.memory.review_service import (
     ReviewAlreadyResolved,
     ReviewError,
@@ -302,6 +307,34 @@ class MemoryUpdateRequest(BaseModel):
     content: str | None = None
     confidence: float | None = None
     status: str | None = None  # active, superseded, retired, decayed, pending_review
+
+
+class MemoryRetireRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1)
+    expected_content_hash: str = Field(min_length=1)
+
+
+class MemoryLifecycleResponse(BaseModel):
+    memory_id: str
+    status: str
+
+
+class MemoryReplaceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    replacement_content: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    expected_content_hash: str = Field(min_length=1)
+    replacement_kind: Literal["revision", "supersession"] = "supersession"
+
+
+class MemoryReplaceResponse(BaseModel):
+    memory_id: str
+    replacement_memory_id: str
+    status: str
+    replacement_kind: str
 
 
 class SourceFacetFilterRequest(BaseModel):
@@ -1961,6 +1994,15 @@ async def _build_review_service(
     return ReviewService(db=db, memory_store=memory_store)
 
 
+async def _build_lifecycle_service(
+    db: Database,
+    config: AppConfig,
+    runtime_provider: RuntimeProvider | None = None,
+) -> MemoryLifecycleService:
+    memory_store = await _build_memory_store(db, config, runtime_provider)
+    return MemoryLifecycleService(db=db, memory_store=memory_store)
+
+
 async def _build_agent_session_window_client(db: Database, config: AppConfig):
     """Build the request-scoped LLM client for agent-session window packaging."""
 
@@ -2633,6 +2675,63 @@ def create_admin_app(
                 )
 
         return {"status": "updated", "memory_id": memory_id}
+
+    @memory_router.post("/{memory_id}/retire", response_model=MemoryLifecycleResponse)
+    async def retire_memory_route(
+        memory_id: str,
+        req: MemoryRetireRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+    ):
+        visible = await _filter_visible_ids(db, [memory_id], _workspace_default_scope(request, include_private=True))
+        if memory_id not in visible:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        service = await _build_lifecycle_service(db, config, runtime_provider)
+        try:
+            result = await service.retire_memory(
+                memory_id,
+                reason=req.reason,
+                expected_content_hash=req.expected_content_hash,
+            )
+        except MemoryLifecycleNotFound:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        except MemoryLifecycleConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return MemoryLifecycleResponse(memory_id=result.memory_id, status=result.status)
+
+    @memory_router.post("/{memory_id}/replace", response_model=MemoryReplaceResponse)
+    async def replace_memory_route(
+        memory_id: str,
+        req: MemoryReplaceRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+    ):
+        visible = await _filter_visible_ids(db, [memory_id], _workspace_default_scope(request, include_private=True))
+        if memory_id not in visible:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        service = await _build_lifecycle_service(db, config, runtime_provider)
+        try:
+            result = await service.replace_memory(
+                memory_id,
+                replacement_content=req.replacement_content,
+                reason=req.reason,
+                expected_content_hash=req.expected_content_hash,
+                replacement_kind=req.replacement_kind,
+            )
+        except MemoryLifecycleNotFound:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        except MemoryLifecycleConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return MemoryReplaceResponse(
+            memory_id=result.memory_id,
+            replacement_memory_id=result.replacement_memory_id,
+            status=result.status,
+            replacement_kind=result.replacement_kind,
+        )
 
     @memory_router.delete("/{memory_id}")
     async def delete_memory(
