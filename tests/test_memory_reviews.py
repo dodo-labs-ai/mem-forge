@@ -22,6 +22,7 @@ from memforge.models import (
     DocumentRecord,
     Memory,
     MemoryReview,
+    ReplacementKind,
     ReviewKind,
     ReviewStatus,
     content_hash,
@@ -184,6 +185,7 @@ async def _seed_supersede_review(
     chroma: StubChromaCollection,
     *,
     review_reason: str = "Newer doc updates this fact",
+    replacement_kind: ReplacementKind = "supersession",
     suffix: str = "1234",
 ) -> tuple[Memory, Memory, MemoryReview]:
     """Build the canonical SUPERSEDE review: active incumbent, pending challenger."""
@@ -207,6 +209,7 @@ async def _seed_supersede_review(
         reason=review_reason,
         expected_incumbent_updated_at=incumbent.updated_at.isoformat(),
         expected_challenger_updated_at=challenger.updated_at.isoformat(),
+        replacement_kind=replacement_kind,
         created_at=datetime.now(timezone.utc),
     )
     await db.insert_memory_review(review)
@@ -268,6 +271,36 @@ class TestReviewCrud:
         assert loaded.reason == "Newer doc updates this fact"
         assert loaded.expected_incumbent_updated_at == incumbent.updated_at.isoformat()
         assert loaded.expected_challenger_updated_at == challenger.updated_at.isoformat()
+        assert loaded.replacement_kind == "supersession"
+
+    @pytest.mark.asyncio
+    async def test_review_replacement_kind_round_trips_through_db_and_api(self, db, chroma, tmp_path):
+        _, _, review = await _seed_supersede_review(
+            db,
+            chroma,
+            replacement_kind="revision",
+            suffix="revk",
+        )
+
+        loaded = await db.get_memory_review(review.id)
+        listed = await db.list_memory_reviews(status="pending")
+
+        assert loaded is not None
+        assert loaded.replacement_kind == "revision"
+        assert {item.id: item.replacement_kind for item in listed}[review.id] == "revision"
+
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            list_response = client.get("/api/memory-reviews", params={"status": "open"})
+            detail_response = client.get(f"/api/memory-reviews/{review.id}")
+
+        assert list_response.status_code == 200
+        row = next(item for item in list_response.json()["data"] if item["id"] == review.id)
+        assert row["replacement_kind"] == "revision"
+        assert detail_response.status_code == 200
+        assert detail_response.json()["replacement_kind"] == "revision"
 
     @pytest.mark.asyncio
     async def test_list_pending_reviews_filters_by_status(self, db, chroma):
@@ -510,6 +543,25 @@ class TestApprove:
         assert stored_incumbent.status == "superseded"
         assert stored_incumbent.superseded_by == challenger.id
         assert stored_incumbent.replacement_reason == review.reason
+        assert stored_challenger.status == "active"
+
+    @pytest.mark.asyncio
+    async def test_approve_uses_review_replacement_kind(self, db, chroma, review_service):
+        incumbent, challenger, review = await _seed_supersede_review(
+            db,
+            chroma,
+            replacement_kind="revision",
+            suffix="apprrev",
+        )
+
+        await review_service.approve(review.id, reviewer="alice", note=None)
+
+        stored_incumbent = await db.get_memory(incumbent.id)
+        stored_challenger = await db.get_memory(challenger.id)
+
+        assert stored_incumbent.status == "superseded"
+        assert stored_incumbent.superseded_by == challenger.id
+        assert stored_incumbent.replacement_kind == "revision"
         assert stored_challenger.status == "active"
 
     @pytest.mark.asyncio

@@ -97,7 +97,7 @@ class ReviewService:
         await self.memory_store.promote_quarantined_challenger(
             incumbent=incumbent,
             challenger=challenger,
-            replacement_kind="supersession",
+            replacement_kind=review.replacement_kind,
             replacement_reason=review.reason,
             review_id=review.id,
             context=context,

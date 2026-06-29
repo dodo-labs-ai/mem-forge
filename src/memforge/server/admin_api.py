@@ -930,6 +930,7 @@ class MemoryReviewResponse(BaseModel):
     reviewer: str | None = None
     expected_incumbent_updated_at: str | None = None
     expected_challenger_updated_at: str | None = None
+    replacement_kind: str = "supersession"
     created_at: str | None = None
     resolved_at: str | None = None
     is_stale: bool = False
@@ -1785,6 +1786,7 @@ def _review_to_response(
         reviewer=review.reviewer,
         expected_incumbent_updated_at=review.expected_incumbent_updated_at,
         expected_challenger_updated_at=review.expected_challenger_updated_at,
+        replacement_kind=review.replacement_kind,
         created_at=_dt_iso(review.created_at),
         resolved_at=_dt_iso(review.resolved_at),
         is_stale=_is_review_stale(review, incumbent, challenger),

@@ -540,6 +540,53 @@ async def test_update_agent_concept_markdown_fails_if_projection_target_is_missi
 
 
 @pytest.mark.asyncio
+async def test_retired_claim_backed_memory_is_removed_from_active_claim_projection(bundle_stack):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    created = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+
+    await store.retire_memory(created.memory_id, reason="user_retired")
+
+    active_claims = await db.list_agent_claims(created.concept_id)
+    lineage_claim = await db.get_agent_claim(created.claim_id)
+    prompt = await render_agent_knowledge_patch_prompt(
+        db=db,
+        owner_user_id="u-andrew",
+        client="codex",
+        session_id="sess-2",
+        trigger="stop",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        branch=None,
+        history_window={"kind": "tail"},
+        events=[
+            {
+                "evidence_id": "event-1",
+                "kind": "user",
+                "text": "Keep future scheduler work aligned with current active memories.",
+            }
+        ],
+        transcript_markdown="user: Keep future scheduler work aligned with current active memories.",
+    )
+
+    assert lineage_claim is not None
+    assert lineage_claim["memory_id"] == created.memory_id
+    assert active_claims == []
+    assert created.claim_id not in prompt
+    assert "Workspace source schedulers must start during app startup" not in prompt
+
+
+@pytest.mark.asyncio
 async def test_update_agent_concept_markdown_ignores_stale_projection_body(bundle_stack):
     db, store, _collection = bundle_stack
     service = AgentKnowledgeBundleService(db=db, memory_store=store)

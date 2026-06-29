@@ -837,6 +837,7 @@ CREATE TABLE IF NOT EXISTS memory_reviews (
     reviewer                        TEXT,
     expected_incumbent_updated_at   TEXT,
     expected_challenger_updated_at  TEXT,
+    replacement_kind                TEXT NOT NULL DEFAULT 'supersession',
     created_at                      TEXT NOT NULL,
     resolved_at                     TEXT
 );
@@ -982,6 +983,7 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             reviewer                        TEXT,
             expected_incumbent_updated_at   TEXT,
             expected_challenger_updated_at  TEXT,
+            replacement_kind                TEXT NOT NULL DEFAULT 'supersession',
             created_at                      TEXT NOT NULL,
             resolved_at                     TEXT
         )""",
@@ -1465,6 +1467,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                FROM documents
                WHERE documents.doc_id = memory_sources.doc_id
              )""",
+        ],
+    ),
+    (
+        29,
+        "Persist replacement kind on memory reviews",
+        [
+            "ALTER TABLE memory_reviews ADD COLUMN replacement_kind TEXT NOT NULL DEFAULT 'supersession'",
         ],
     ),
 ]
@@ -2844,8 +2853,8 @@ class Database:
                             id, kind, status, incumbent_memory_id, challenger_memory_id,
                             reason, review_note, reviewer,
                             expected_incumbent_updated_at, expected_challenger_updated_at,
-                            created_at, resolved_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            replacement_kind, created_at, resolved_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(id) DO UPDATE SET
                             kind=excluded.kind,
                             status=excluded.status,
@@ -2856,6 +2865,7 @@ class Database:
                             reviewer=excluded.reviewer,
                             expected_incumbent_updated_at=excluded.expected_incumbent_updated_at,
                             expected_challenger_updated_at=excluded.expected_challenger_updated_at,
+                            replacement_kind=excluded.replacement_kind,
                             resolved_at=excluded.resolved_at
                         WHERE memory_reviews.status = 'pending'""",
                         (
@@ -2869,6 +2879,7 @@ class Database:
                             review.reviewer,
                             review.expected_incumbent_updated_at,
                             review.expected_challenger_updated_at,
+                            _validate_replacement_kind(review.replacement_kind),
                             created_at,
                             review.resolved_at.isoformat() if review.resolved_at else None,
                         ),
@@ -4554,12 +4565,18 @@ class Database:
             return None
         return self._row_to_agent_claim(row)
 
-    async def list_agent_claims(self, concept_id: str) -> list[dict[str, Any]]:
+    async def list_agent_claims(self, concept_id: str, *, include_inactive: bool = False) -> list[dict[str, Any]]:
         claims: list[dict[str, Any]] = []
-        async with self.db.execute(
-            "SELECT * FROM agent_claims WHERE concept_id = ? ORDER BY created_at, id",
-            (concept_id,),
-        ) as cursor:
+        if include_inactive:
+            query = "SELECT ac.* FROM agent_claims ac WHERE ac.concept_id = ? ORDER BY ac.created_at, ac.id"
+            params = (concept_id,)
+        else:
+            query = """SELECT ac.* FROM agent_claims ac
+                       JOIN memories m ON m.id = ac.memory_id
+                       WHERE ac.concept_id = ? AND m.status = 'active'
+                       ORDER BY ac.created_at, ac.id"""
+            params = (concept_id,)
+        async with self.db.execute(query, params) as cursor:
             async for row in cursor:
                 claims.append(self._row_to_agent_claim(row))
         return claims
@@ -6504,8 +6521,8 @@ class Database:
                     id, kind, status, incumbent_memory_id, challenger_memory_id,
                     reason, review_note, reviewer,
                     expected_incumbent_updated_at, expected_challenger_updated_at,
-                    created_at, resolved_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    replacement_kind, created_at, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     review.id,
                     review.kind,
@@ -6517,6 +6534,7 @@ class Database:
                     review.reviewer,
                     review.expected_incumbent_updated_at,
                     review.expected_challenger_updated_at,
+                    _validate_replacement_kind(review.replacement_kind),
                     created_at,
                     review.resolved_at.isoformat() if review.resolved_at else None,
                 ),
@@ -6679,8 +6697,8 @@ class Database:
                             id, kind, status, incumbent_memory_id, challenger_memory_id,
                             reason, review_note, reviewer,
                             expected_incumbent_updated_at, expected_challenger_updated_at,
-                            created_at, resolved_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            replacement_kind, created_at, resolved_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(id) DO UPDATE SET
                             kind=excluded.kind,
                             status=excluded.status,
@@ -6691,6 +6709,7 @@ class Database:
                             reviewer=excluded.reviewer,
                             expected_incumbent_updated_at=excluded.expected_incumbent_updated_at,
                             expected_challenger_updated_at=excluded.expected_challenger_updated_at,
+                            replacement_kind=excluded.replacement_kind,
                             resolved_at=excluded.resolved_at
                         WHERE memory_reviews.status = 'pending'""",
                         (
@@ -6704,6 +6723,7 @@ class Database:
                             review.reviewer,
                             review.expected_incumbent_updated_at,
                             review.expected_challenger_updated_at,
+                            _validate_replacement_kind(review.replacement_kind),
                             created_at,
                             review.resolved_at.isoformat() if review.resolved_at else None,
                         ),
@@ -6843,6 +6863,7 @@ class Database:
             reviewer=d.get("reviewer"),
             expected_incumbent_updated_at=d.get("expected_incumbent_updated_at"),
             expected_challenger_updated_at=d.get("expected_challenger_updated_at"),
+            replacement_kind=_validate_replacement_kind(d.get("replacement_kind") or "supersession"),
             created_at=_parse_dt(d.get("created_at")),
             resolved_at=_parse_dt(d.get("resolved_at")),
         )
