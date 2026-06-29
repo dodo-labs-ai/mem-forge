@@ -1084,6 +1084,7 @@ async def test_reconciliation_routes_supersede_with_other_support_to_review(db, 
     assert len(reviews) == 1
     assert reviews[0].incumbent_memory_id == old.id
     assert reviews[0].challenger_memory_id == challengers[0].id
+    assert reviews[0].replacement_kind == "supersession"
 
 
 @pytest.mark.asyncio
@@ -1149,3 +1150,4 @@ async def test_reconciliation_routes_update_with_other_extracted_support_to_revi
     assert len(reviews) == 1
     assert reviews[0].incumbent_memory_id == old.id
     assert reviews[0].challenger_memory_id == challengers[0].id
+    assert reviews[0].replacement_kind == "revision"

@@ -41,6 +41,7 @@ from memforge.models import (
     RawMemory,
     ReconcileAction,
     ReconcileOperation,
+    ReplacementKind,
     ReviewKind,
     ReviewStatus,
     content_hash,
@@ -962,7 +963,9 @@ class MemoryEngine:
         challenger = self._build_memory(op.memory, project_key, source_type, user_id=user_id)
         challenger.status = "pending_review"
         memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
-        replacement_relation = RelationType.REFINES if op.action == ReconcileAction.UPDATE else RelationType.CONTRADICTS
+        is_revision = op.action == ReconcileAction.UPDATE
+        replacement_relation = RelationType.REFINES if is_revision else RelationType.CONTRADICTS
+        replacement_kind: ReplacementKind = "revision" if is_revision else "supersession"
         (
             unit,
             _lifecycle,
@@ -1004,6 +1007,7 @@ class MemoryEngine:
                     existing_memory.updated_at.isoformat() if existing_memory.updated_at else None
                 ),
                 expected_challenger_updated_at=(challenger.updated_at.isoformat() if challenger.updated_at else None),
+                replacement_kind=replacement_kind,
                 created_at=datetime.now(timezone.utc),
             )
         await self.memory_store.insert_memory(

@@ -641,6 +641,7 @@ class MemoryReview:
     reviewer: str | None = None
     expected_incumbent_updated_at: str | None = None
     expected_challenger_updated_at: str | None = None
+    replacement_kind: ReplacementKind = "supersession"
     created_at: datetime | None = None
     resolved_at: datetime | None = None
 
