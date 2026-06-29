@@ -1,9 +1,9 @@
 """Shared configuration helpers for installable MemForge agent plugins.
 
-Hooks are not launched as MCP servers, so they do not automatically inherit the
-environment block configured for the MemForge MCP server. Keep a tiny stdlib
-resolver here so hooks and MCP tools agree on the same endpoint, token, and
-workspace without copying secrets into hook command strings.
+Hooks are not launched as MCP servers, so they do not automatically inherit MCP
+stdio process environment. Keep a tiny stdlib resolver here so hooks and MCP
+tools agree on the same endpoint, token, and workspace without copying secrets
+into hook command strings or registering a second manual MCP server.
 """
 
 from __future__ import annotations
@@ -33,10 +33,10 @@ def _configured_value(name: str, default: str) -> str:
     value = os.getenv(name)
     if value:
         return value
-    return _codex_memforge_env().get(name, default)
+    return _codex_memforge_config().get(name, default)
 
 
-def _codex_memforge_env() -> Mapping[str, str]:
+def _codex_memforge_config() -> Mapping[str, str]:
     global _CONFIG_CACHE
     if _CONFIG_CACHE is not None:
         return _CONFIG_CACHE
@@ -52,7 +52,7 @@ def _codex_memforge_env() -> Mapping[str, str]:
         _CONFIG_CACHE = {}
         return _CONFIG_CACHE
 
-    _CONFIG_CACHE = _parse_toml_string_table(text, "mcp_servers.memforge.env")
+    _CONFIG_CACHE = _parse_toml_string_table(text, "memforge")
     return _CONFIG_CACHE
 
 
