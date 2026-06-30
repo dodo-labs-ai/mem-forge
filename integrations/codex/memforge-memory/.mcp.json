@@ -1,9 +1,10 @@
 {
   "mcpServers": {
     "memforge": {
-      "command": "python3",
+      "command": "sh",
       "args": [
-        "${CODEX_PLUGIN_ROOT}/scripts/memforge_mcp.py"
+        "-lc",
+        "exec python3 \"${CODEX_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}/scripts/memforge_mcp.py\""
       ]
     }
   }
