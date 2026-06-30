@@ -829,9 +829,17 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert codex_memforge["cwd"] == "."
 
     claude_memforge = claude_mcp["mcpServers"]["memforge"]
-    assert claude_memforge["command"] == "python3"
-    assert claude_memforge["args"] == ["scripts/memforge_mcp.py"]
-    assert claude_memforge["cwd"] == "."
+    assert claude_memforge["command"] == "sh"
+    assert claude_memforge["args"] == [
+        "-lc",
+        (
+            "root=$CLAUDE_PLUGIN_ROOT; "
+            'if [ -z "$root" ]; then root=$PLUGIN_ROOT; fi; '
+            'if [ -z "$root" ]; then root=.; fi; '
+            'cd "$root" && exec python3 scripts/memforge_mcp.py'
+        ),
+    ]
+    assert "cwd" not in claude_memforge
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
@@ -935,7 +943,7 @@ def test_mcp_proxy_starts_without_memforge_executable():
     _, payload = result.stdout.split(b"\r\n\r\n", 1)
     response = json.loads(payload)
     assert response["result"]["serverInfo"]["name"] == "memforge"
-    assert response["result"]["serverInfo"]["version"] == "0.1.14"
+    assert response["result"]["serverInfo"]["version"] == "0.1.16"
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
 
 
@@ -2024,7 +2032,7 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
     assert "raw-api-secret" not in serialized
     assert "[REDACTED]" in serialized
     assert payload["schema_version"] == "agent-session-window/v1"
-    assert payload["plugin_version"] == "0.1.14"
+    assert payload["plugin_version"] == "0.1.16"
     assert payload["receipt"]["metadata"]["uploaded_to_line"] == 2
     assert payload["receipt"]["metadata"]["observed_to_line"] == 2
 
