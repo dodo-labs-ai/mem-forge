@@ -57,7 +57,7 @@ MAX_EVENTS = 40
 WORKER_LEASE_BUFFER_SECONDS = 60.0
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.13"
+PLUGIN_VERSION = "0.1.14"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -78,6 +78,13 @@ SESSION_START_USAGE_GUIDANCE = (
     "evidence, quotes, or exact document context.\n"
     "- Treat memory as context, not current truth. Verify current files, tests, "
     "runtime state, or external systems when facts may have changed.\n"
+    "- Proactively detect memory corrections or retirements (`not X, actually Y`, "
+    "`update memory`, `don't use this anymore`). Locate the memory with "
+    "`search`/`get_memory`, then show a readable preview: old claim, new claim "
+    "or retirement reason, and scope.\n"
+    "- Never mutate memory silently. Before `replace_memory`, `retire_memory`, "
+    "or `resolve_memory_review`, confirm via `request_user_input` if available; "
+    "otherwise ask a concise text question. Do not show raw tool arguments unless needed.\n"
     "- If no relevant memory is found, continue normally and say so only when it "
     "matters to the user.\n"
 )
