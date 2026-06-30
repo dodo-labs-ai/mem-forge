@@ -1,5 +1,5 @@
 import { cn } from "@/lib/utils";
-import { AGENT_SESSION_CLIENT_MARK, BRAND_MARKS, SOURCE_DOT_FALLBACK, SOURCE_TYPE_MARKS } from "@/views/sources/sourceBrand";
+import { BRAND_MARKS, SOURCE_DOT_FALLBACK, sourceBrandKeysFor } from "@/views/sources/sourceBrand";
 
 const AGENT_SESSION_TYPE = "agent_session";
 
@@ -7,8 +7,9 @@ type SourceIconProps = {
   /** Source type, e.g. "confluence" or "agent_session". */
   type: string;
   /**
-   * For agent_session sources, the plugin client identifier ("codex" or
-   * "claude-code"). Picks exactly one brand mark. Omit for non-agent types.
+   * For client-authored sources such as agent_session or user_memory, the
+   * plugin client identifier ("codex" or "claude-code"). Picks exactly one
+   * producer mark.
    */
   client?: string | null;
   /** Sizing/positioning classes applied to each mark (e.g. "size-5"). */
@@ -16,17 +17,16 @@ type SourceIconProps = {
 };
 
 /**
- * Renders a source's brand logo. Agent-session sources show a single mark
+ * Renders a source's brand logo. Client-authored sources show a single mark
  * chosen by `client` ("codex" or "claude-code"). All other source types use
  * the SOURCE_TYPE_MARKS table. Unknown types fall back to a colored dot so
  * future genes still render.
  */
 export function SourceIcon({ type, client, className }: SourceIconProps) {
-  // Agent session: resolve to a single brand mark based on the client, or fall
-  // back to a neutral dot when the client is unrecognised or absent.
-  if (type === AGENT_SESSION_TYPE) {
-    const brandKey = client ? AGENT_SESSION_CLIENT_MARK[client] : undefined;
-    if (!brandKey) {
+  const keys = sourceBrandKeysFor(type, client);
+
+  if (!keys) {
+    if (type === AGENT_SESSION_TYPE) {
       return (
         <span
           role="img"
@@ -35,23 +35,7 @@ export function SourceIcon({ type, client, className }: SourceIconProps) {
         />
       );
     }
-    const mark = BRAND_MARKS[brandKey];
-    return (
-      <span role="img" aria-label={mark.label} title={mark.label} className="inline-flex items-center">
-        <svg
-          aria-hidden="true"
-          viewBox="0 0 24 24"
-          className={cn("shrink-0", mark.color ? undefined : "text-foreground", className)}
-          style={mark.color ? { color: mark.color } : undefined}
-          dangerouslySetInnerHTML={{ __html: mark.markup }}
-        />
-      </span>
-    );
-  }
 
-  const keys = SOURCE_TYPE_MARKS[type];
-
-  if (!keys) {
     return (
       <span
         role="img"
