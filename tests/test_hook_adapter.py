@@ -820,8 +820,22 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
         commands = json.dumps(hooks)
         assert "memforge_hook.py" in commands
         assert "submit-session" in commands
-    assert "memforge_mcp.py" in (codex_root / ".mcp.json").read_text()
-    assert "memforge_mcp.py" in (claude_root / ".mcp.json").read_text()
+    codex_mcp = json.loads((codex_root / ".mcp.json").read_text())
+    claude_mcp = json.loads((claude_root / ".mcp.json").read_text())
+
+    codex_memforge = codex_mcp["mcpServers"]["memforge"]
+    assert codex_memforge["command"] == "sh"
+    assert codex_memforge["args"] == [
+        "-lc",
+        'exec python3 "${CODEX_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}/scripts/memforge_mcp.py"',
+    ]
+
+    claude_memforge = claude_mcp["mcpServers"]["memforge"]
+    assert claude_memforge["command"] == "sh"
+    assert claude_memforge["args"] == [
+        "-lc",
+        'exec python3 "${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}/scripts/memforge_mcp.py"',
+    ]
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
