@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.16"
+SERVER_VERSION = "0.1.17"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 SEARCH_ALLOWED_KEYS = frozenset(
     {
@@ -213,6 +213,50 @@ TOOLS: list[dict[str, Any]] = [
                 "max_bytes": {"type": "integer", "default": 2000000},
             },
             "required": ["url"],
+        },
+    },
+    {
+        "name": "create_memory",
+        "description": (
+            "Create a new memory when the user asks to remember or record durable knowledge. "
+            "Users need not name this tool. First search for similar memories to avoid duplicates, "
+            "show a readable preview with the new claim, scope, type/tags, and reason, then get "
+            "explicit confirmation via request_user_input if available, else a concise text question. "
+            "Generate content from the confirmed preview without unapproved semantic changes. "
+            "Never create memory silently."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": (
+                        "Canonical memory text generated from the user-confirmed readable preview; "
+                        "preserve its meaning without unapproved semantic changes."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "User-facing reason for creating this memory.",
+                },
+                "memory_type": {
+                    "type": "string",
+                    "enum": ["fact", "decision", "convention", "procedure"],
+                    "default": "fact",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Short topical tags from the confirmed preview.",
+                },
+                "confidence": {"type": "number"},
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Optional stable key for retrying the same user-confirmed create action.",
+                },
+            },
+            "required": ["content", "reason"],
+            "additionalProperties": False,
         },
     },
     {
@@ -416,6 +460,35 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return _http_json("GET", f"/api/memories/{quote(memory_id, safe='')}?include_private=true", None)
     if name == "get_resource":
         return _handle_get_resource(args)
+    if name == "create_memory":
+        try:
+            memory_type = str(args.get("memory_type") or "fact").strip()
+            if memory_type not in {"fact", "decision", "convention", "procedure"}:
+                raise ValueError("memory_type must be fact, decision, convention, or procedure")
+            tags = args.get("tags") or []
+            if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
+                raise ValueError("tags must be an array of strings")
+            body = {
+                "content": _required_string_arg(args, "content"),
+                "reason": _required_string_arg(args, "reason"),
+                "memory_type": memory_type,
+                "tags": tags,
+                "client": _mcp_client(),
+            }
+            if "confidence" in args:
+                confidence = args.get("confidence")
+                if not isinstance(confidence, int | float):
+                    raise ValueError("confidence must be a number")
+                body["confidence"] = float(confidence)
+            repo_identifier = _active_repo_identifier()
+            if repo_identifier:
+                body["repo_identifier"] = repo_identifier
+            idempotency_key = str(args.get("idempotency_key") or "").strip()
+            if idempotency_key:
+                body["idempotency_key"] = idempotency_key
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return _http_json("POST", "/api/memories/create", body)
     if name == "retire_memory":
         try:
             memory_id = _required_string_arg(args, "memory_id")
@@ -582,6 +655,13 @@ def _active_repo_identifier() -> str | None:
         return normalized_remote
     root = _git_value(["git", "rev-parse", "--show-toplevel"])
     return Path(root).name if root else None
+
+
+def _mcp_client() -> str:
+    value = os.getenv("MEMFORGE_MCP_CLIENT", "").strip()
+    if value in AGENT_CLIENT_VALUES:
+        return value
+    return "codex"
 
 
 def _normalize_repo_identifier(repo: str | None) -> str | None:

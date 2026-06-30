@@ -285,8 +285,8 @@ class MemoryResponse(BaseModel):
     # Source type for the leading glyph: the memory's extraction origin, else its
     # first attached source. None only when a memory has no remaining provenance.
     origin_source_type: str | None = None
-    # The originating client for agent-session memories (e.g. 'codex' or
-    # 'claude-code'); None for memories extracted from non-agent-session sources.
+    # The originating agent client when provenance is submitted by a client
+    # plugin (e.g. 'codex' or 'claude-code').
     origin_client: str | None = None
 
 
@@ -322,6 +322,24 @@ class MemoryRetireRequest(BaseModel):
 
 
 class MemoryLifecycleResponse(BaseModel):
+    memory_id: str
+    status: str
+
+
+class MemoryCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    memory_type: Literal["fact", "decision", "convention", "procedure"] = "fact"
+    tags: list[str] = Field(default_factory=list)
+    confidence: float = 0.95
+    client: Literal["codex", "claude-code"] = "codex"
+    repo_identifier: str | None = None
+    idempotency_key: str | None = None
+
+
+class MemoryCreateResponse(BaseModel):
     memory_id: str
     status: str
 
@@ -2686,6 +2704,36 @@ def create_admin_app(
                 )
 
         return {"status": "updated", "memory_id": memory_id}
+
+    @memory_router.post("/create", response_model=MemoryCreateResponse)
+    async def create_memory_route(
+        req: MemoryCreateRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+    ):
+        service = await _build_lifecycle_service(
+            db,
+            config,
+            runtime_provider,
+            audit_context=_request_audit_context(request),
+        )
+        try:
+            result = await service.create_memory(
+                content=req.content,
+                reason=req.reason,
+                memory_type=req.memory_type,
+                tags=req.tags,
+                confidence=req.confidence,
+                owner_user_id=resolve_request_principal(request),
+                client=req.client,
+                repo_identifier=req.repo_identifier,
+                idempotency_key=req.idempotency_key,
+            )
+        except MemoryLifecycleConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return MemoryCreateResponse(memory_id=result.memory_id, status=result.status)
 
     @memory_router.post("/{memory_id}/retire", response_model=MemoryLifecycleResponse)
     async def retire_memory_route(

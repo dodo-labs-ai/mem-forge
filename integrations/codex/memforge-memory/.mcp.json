@@ -5,7 +5,10 @@
       "args": [
         "scripts/memforge_mcp.py"
       ],
-      "cwd": "."
+      "cwd": ".",
+      "env": {
+        "MEMFORGE_MCP_CLIENT": "codex"
+      }
     }
   }
 }

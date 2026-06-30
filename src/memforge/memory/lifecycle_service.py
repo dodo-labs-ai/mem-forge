@@ -11,7 +11,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from memforge.memory.store import MemoryStore
-from memforge.models import DocumentRecord, Memory, ReplacementKind, content_hash, generate_memory_id
+from memforge.models import (
+    DocumentRecord,
+    Memory,
+    MemoryType,
+    ReplacementKind,
+    UNSORTED_PROJECT_KEY,
+    Visibility,
+    content_hash,
+    generate_memory_id,
+)
 from memforge.storage.database import Database
 
 
@@ -41,12 +50,81 @@ class ReplaceMemoryResult:
     replacement_kind: ReplacementKind
 
 
+@dataclass(frozen=True)
+class CreateMemoryResult:
+    memory_id: str
+    status: str
+
+
 class MemoryLifecycleService:
     """Apply user-confirmed memory lifecycle actions through store primitives."""
 
     def __init__(self, *, db: Database, memory_store: MemoryStore) -> None:
         self.db = db
         self.memory_store = memory_store
+
+    async def create_memory(
+        self,
+        *,
+        content: str,
+        reason: str,
+        owner_user_id: str,
+        client: str,
+        memory_type: str = MemoryType.FACT.value,
+        tags: list[str] | None = None,
+        confidence: float = 0.95,
+        repo_identifier: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> CreateMemoryResult:
+        content = content.strip()
+        reason = reason.strip()
+        if not content:
+            raise MemoryLifecycleConflict("content_required")
+        if not reason:
+            raise MemoryLifecycleConflict("reason_required")
+        if not owner_user_id.strip():
+            raise MemoryLifecycleConflict("owner_user_id_required")
+        memory_type = self._validate_memory_type(memory_type)
+        normalized_tags = [tag.strip() for tag in (tags or []) if tag.strip()]
+
+        now = datetime.now(timezone.utc)
+        memory = Memory(
+            id=generate_memory_id(),
+            memory_type=memory_type,
+            content=content,
+            content_hash=content_hash(content),
+            visibility=Visibility.PRIVATE.value,
+            owner_user_id=owner_user_id.strip(),
+            project_key=UNSORTED_PROJECT_KEY,
+            repo_identifier=repo_identifier.strip() if repo_identifier else None,
+            tags=normalized_tags,
+            confidence=confidence,
+            created_at=now,
+            updated_at=now,
+            status="active",
+            extraction_context=reason,
+        )
+        doc_id = self._user_memory_doc_id(memory.id, idempotency_key=idempotency_key)
+        await self._write_user_memory_document(
+            doc_id=doc_id,
+            memory=memory,
+            reason=reason,
+            client=client,
+            observed_at=now,
+        )
+        status = await self.memory_store.deduplicate_and_insert(
+            memory,
+            doc_id,
+            "user_memory",
+            source_updated_at=now,
+            excerpt=content,
+        )
+        memory_id = memory.id
+        if status != "inserted":
+            memory_ids = await self.db.get_memory_ids_for_doc(doc_id)
+            if memory_ids:
+                memory_id = memory_ids[0]
+        return CreateMemoryResult(memory_id=memory_id, status=status)
 
     async def retire_memory(
         self,
@@ -190,8 +268,60 @@ class MemoryLifecycleService:
             )
         )
 
+    async def _write_user_memory_document(
+        self,
+        *,
+        doc_id: str,
+        memory: Memory,
+        reason: str,
+        client: str,
+        observed_at: datetime,
+    ) -> None:
+        document_body = "\n".join(
+            [
+                f"Client: {client}",
+                f"Reason: {reason}",
+                "",
+                memory.content,
+            ]
+        )
+        await self.db.upsert_document(
+            DocumentRecord(
+                doc_id=doc_id,
+                source="user_memory",
+                source_url=f"memforge://user-memory/{doc_id}",
+                title=f"User memory {memory.id}",
+                space_or_project=memory.project_key or UNSORTED_PROJECT_KEY,
+                author=memory.owner_user_id,
+                last_modified=observed_at,
+                labels=["user_memory"],
+                version=content_hash(document_body),
+                content_hash=content_hash(document_body),
+                token_count=len(document_body.split()),
+                raw_content_uri=None,
+                raw_content_type=None,
+                normalized_content_uri=None,
+                pdf_content_uri=None,
+                last_synced=observed_at,
+                client=client,
+            )
+        )
+
+    @staticmethod
+    def _user_memory_doc_id(memory_id: str, *, idempotency_key: str | None) -> str:
+        if idempotency_key:
+            return f"user-memory-{content_hash(idempotency_key)[:16]}"
+        return f"user-memory-{memory_id}"
+
     @staticmethod
     def _validate_replacement_kind(value: str) -> ReplacementKind:
         if value not in {"revision", "supersession"}:
             raise MemoryLifecycleConflict("invalid_replacement_kind")
         return value  # type: ignore[return-value]
+
+    @staticmethod
+    def _validate_memory_type(value: str) -> str:
+        allowed = {item.value for item in MemoryType}
+        if value not in allowed:
+            raise MemoryLifecycleConflict("invalid_memory_type")
+        return value

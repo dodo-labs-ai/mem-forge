@@ -5,7 +5,10 @@
       "args": [
         "-lc",
         "root=$CLAUDE_PLUGIN_ROOT; if [ -z \"$root\" ]; then root=$PLUGIN_ROOT; fi; if [ -z \"$root\" ]; then root=.; fi; cd \"$root\" && exec python3 scripts/memforge_mcp.py"
-      ]
+      ],
+      "env": {
+        "MEMFORGE_MCP_CLIENT": "claude-code"
+      }
     }
   }
 }

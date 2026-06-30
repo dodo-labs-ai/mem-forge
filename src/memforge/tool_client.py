@@ -90,6 +90,33 @@ class ToolClient:
             return {"error": "memory_id is required"}
         return self._http_json("GET", f"/api/memories/{quote(memory_id, safe='')}?include_private=true", None)
 
+    def create_memory(
+        self,
+        *,
+        content: str,
+        reason: str,
+        memory_type: str = "fact",
+        tags: list[str] | tuple[str, ...] | None = None,
+        confidence: float | None = None,
+        client: str = "codex",
+        repo_identifier: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "content": content,
+            "reason": reason,
+            "memory_type": memory_type,
+            "tags": list(tags or []),
+            "client": client,
+        }
+        if confidence is not None:
+            body["confidence"] = confidence
+        if repo_identifier:
+            body["repo_identifier"] = repo_identifier
+        if idempotency_key:
+            body["idempotency_key"] = idempotency_key
+        return self._http_json("POST", "/api/memories/create", body)
+
     def retire_memory(
         self,
         memory_id: str,

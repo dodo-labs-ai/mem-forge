@@ -168,6 +168,35 @@ def test_tool_client_get_memory_uses_personalized_detail_route():
     ]
 
 
+def test_tool_client_create_memory_posts_user_memory_payload():
+    client = _RecordingClient({"memory_id": "mem-new", "status": "inserted"})
+
+    result = client.create_memory(
+        content="Use readable confirmation previews before memory mutations.",
+        reason="User confirmed the new memory preview.",
+        memory_type="convention",
+        tags=["ux", "mcp"],
+        client="codex",
+        repo_identifier="github.com/shno-labs/mem-forge",
+    )
+
+    assert result["memory_id"] == "mem-new"
+    assert client.calls == [
+        (
+            "POST",
+            "/api/memories/create",
+            {
+                "content": "Use readable confirmation previews before memory mutations.",
+                "reason": "User confirmed the new memory preview.",
+                "memory_type": "convention",
+                "tags": ["ux", "mcp"],
+                "client": "codex",
+                "repo_identifier": "github.com/shno-labs/mem-forge",
+            },
+        )
+    ]
+
+
 def test_tool_client_retire_memory_posts_lifecycle_guard():
     client = _RecordingClient({"memory_id": "mem-1", "status": "retired"})
 
