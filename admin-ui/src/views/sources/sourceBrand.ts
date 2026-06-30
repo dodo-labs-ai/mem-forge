@@ -70,9 +70,9 @@ export const BRAND_MARKS = {
 export type BrandKey = keyof typeof BRAND_MARKS;
 
 /**
- * Source type to its ordered brand marks. Agent session types are not listed
- * here; SourceIcon resolves those per-client via the `client` prop so each
- * source row and memory icon shows exactly one brand mark.
+ * Source type to its ordered brand marks. Client-branded source types are not
+ * listed here; SourceIcon resolves those per-client so each source row and
+ * memory icon shows exactly one producer mark.
  */
 export const SOURCE_TYPE_MARKS: Record<string, BrandKey[]> = {
   confluence: ["confluence"],
@@ -83,13 +83,23 @@ export const SOURCE_TYPE_MARKS: Record<string, BrandKey[]> = {
 };
 
 /**
- * Maps the agent-session `client` value to a single brand key. "codex" maps to
- * the OpenAI/Codex mark; "claude-code" maps to the Claude Code mark.
+ * Maps the producer `client` value to a single brand key. "codex" maps to the
+ * OpenAI/Codex mark; "claude-code" maps to the Claude Code mark.
  */
 export const AGENT_SESSION_CLIENT_MARK: Record<string, BrandKey> = {
   codex: "codex",
   "claude-code": "claude",
 };
+
+const CLIENT_BRANDED_SOURCE_TYPES = new Set(["agent_session", "user_memory"]);
+
+export function sourceBrandKeysFor(type: string, client?: string | null): BrandKey[] | undefined {
+  if (CLIENT_BRANDED_SOURCE_TYPES.has(type) && client) {
+    const brandKey = AGENT_SESSION_CLIENT_MARK[client];
+    return brandKey ? [brandKey] : undefined;
+  }
+  return SOURCE_TYPE_MARKS[type];
+}
 
 /**
  * Colored-dot fallback for source types without a bundled brand mark, keyed by
