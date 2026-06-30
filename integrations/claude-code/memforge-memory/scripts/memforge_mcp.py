@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.13"
+SERVER_VERSION = "0.1.14"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 SEARCH_ALLOWED_KEYS = frozenset(
     {
@@ -218,9 +218,12 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "retire_memory",
         "description": (
-            "Retire a memory when the user explicitly confirms it is wrong, obsolete, "
-            "or should no longer be used. This is an intent-level lifecycle action; do "
-            "not use it to set arbitrary status values."
+            "Retire a memory when conversation context shows it is wrong, obsolete, "
+            "or should no longer be used. Users need not name this tool. First fetch "
+            "the memory for hash/provenance, show a readable retire preview and reason, "
+            "then get explicit confirmation via request_user_input if available, else "
+            "a concise text question. Never retire silently or use this for arbitrary "
+            "status changes."
         ),
         "inputSchema": {
             "type": "object",
@@ -242,9 +245,12 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "replace_memory",
         "description": (
-            "Replace a memory only when the user explicitly provides or approves the exact "
-            "replacement content. The backend creates a new active memory and supersedes "
-            "the old one through the lifecycle service."
+            "Replace a memory when conversation context shows a claim should be corrected, "
+            "narrowed, broadened, or superseded. Users need not name this tool. First fetch "
+            "the memory for hash/provenance, show a readable preview with old claim, new "
+            "claim, scope, and reason, then get explicit confirmation via request_user_input "
+            "if available, else a concise text question. Generate replacement_content from "
+            "the confirmed preview without unapproved semantic changes. Never replace silently."
         ),
         "inputSchema": {
             "type": "object",
@@ -252,7 +258,10 @@ TOOLS: list[dict[str, Any]] = [
                 "memory_id": {"type": "string", "description": "The memory ID to replace."},
                 "replacement_content": {
                     "type": "string",
-                    "description": "The exact replacement memory content approved by the user.",
+                    "description": (
+                        "Canonical memory text generated from the user-confirmed readable preview; "
+                        "preserve its meaning without unapproved semantic changes."
+                    ),
                 },
                 "reason": {
                     "type": "string",
@@ -279,8 +288,7 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "list_memory_reviews",
         "description": (
-            "List memory-review decisions that need attention. Use this when the user asks "
-            "to process pending memory reviews interactively."
+            "List pending memory-review decisions for interactive conflict or correction review."
         ),
         "inputSchema": {
             "type": "object",
@@ -312,7 +320,9 @@ TOOLS: list[dict[str, Any]] = [
         "name": "resolve_memory_review",
         "description": (
             "Resolve one memory review after explicit user confirmation. approve promotes "
-            "the challenger, reject retires it, and refresh repins stale expectations."
+            "the challenger, reject retires it, and refresh repins stale expectations. "
+            "Show a readable current/proposed diff and confirm via request_user_input if "
+            "available, else a concise text question. Never resolve silently."
         ),
         "inputSchema": {
             "type": "object",
