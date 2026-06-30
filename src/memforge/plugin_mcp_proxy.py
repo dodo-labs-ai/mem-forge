@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.17"
+SERVER_VERSION = "0.1.18"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 SEARCH_ALLOWED_KEYS = frozenset(
     {
@@ -477,7 +477,7 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             }
             if "confidence" in args:
                 confidence = args.get("confidence")
-                if not isinstance(confidence, int | float):
+                if not isinstance(confidence, (int, float)):
                     raise ValueError("confidence must be a number")
                 body["confidence"] = float(confidence)
             repo_identifier = _active_repo_identifier()
