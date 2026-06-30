@@ -4730,8 +4730,8 @@ class Database:
     ) -> dict[str, list[tuple[str, str | None, str | None]]]:
         """Return each memory's (source_type, support_kind, client) triples, ordered
         oldest-first by (added_at, doc_id), for a batch of memories in one query.
-        The client value comes from documents.client and is None for non-agent-session
-        sources. Memories with no sources are absent from the result."""
+        The client value comes from documents.client for agent-submitted sources.
+        Memories with no sources are absent from the result."""
         if not memory_ids:
             return {}
         placeholders = ",".join("?" for _ in memory_ids)

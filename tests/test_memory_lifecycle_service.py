@@ -12,7 +12,7 @@ from memforge.config import AppConfig
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.lifecycle_service import MemoryLifecycleConflict, MemoryLifecycleService
 from memforge.memory.store import MemoryStore
-from memforge.models import DocumentRecord, Memory, content_hash
+from memforge.models import DocumentRecord, Memory, Visibility, content_hash
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
@@ -34,6 +34,9 @@ class RecordingCollection:
         for record_id in ids:
             self.deleted.append(record_id)
             self.records.pop(record_id, None)
+
+    def query(self, **_params):
+        return {"ids": [[]], "distances": [[]]}
 
     def get(self, *, ids=None, include=None):
         selected = [record_id for record_id in (ids or self.records) if record_id in self.records]
@@ -86,6 +89,41 @@ def _store(db: Database, collection: RecordingCollection) -> MemoryStore:
 
     store._embed = fake_embed  # type: ignore[method-assign]
     return store
+
+
+@pytest.mark.asyncio
+async def test_create_memory_writes_private_user_memory_with_provenance(db: Database):
+    collection = RecordingCollection()
+    store = _store(db, collection)
+    service = MemoryLifecycleService(db=db, memory_store=store)
+
+    result = await service.create_memory(
+        content="Use Status and FollowUpStepStatus when polling PayrollProcessingTriggerViews.",
+        reason="User explicitly asked MemForge to remember this.",
+        memory_type="fact",
+        tags=["dwc", "polling"],
+        owner_user_id="andrew.sun01@sap.com",
+        client="codex",
+        repo_identifier="github.com/shno-labs/mem-forge",
+    )
+
+    stored = await db.get_memory(result.memory_id)
+    sources = await db.get_memory_sources(result.memory_id)
+    assert result.status == "inserted"
+    assert stored is not None
+    assert stored.content == "Use Status and FollowUpStepStatus when polling PayrollProcessingTriggerViews."
+    assert stored.visibility == Visibility.PRIVATE.value
+    assert stored.owner_user_id == "andrew.sun01@sap.com"
+    assert stored.project_key == "UNSORTED"
+    assert stored.repo_identifier == "github.com/shno-labs/mem-forge"
+    assert stored.tags == ["dwc", "polling"]
+    assert [(source.doc_id, source.source_type) for source in sources] == [
+        (f"user-memory-{result.memory_id}", "user_memory")
+    ]
+    document = await db.get_document(f"user-memory-{result.memory_id}")
+    assert document is not None
+    assert document.source == "user_memory"
+    assert document.client == "codex"
 
 
 @pytest.mark.asyncio
@@ -254,6 +292,53 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     assert [(source.doc_id, source.source_type) for source in new_sources] == [
         ("concept-claude-cli", "agent_session")
     ]
+
+
+@pytest.mark.asyncio
+async def test_create_memory_route_audits_request_principal_and_client(db: Database, tmp_path, monkeypatch):
+    from memforge.server.admin_api import create_admin_app
+
+    async def fake_embed(self, _text: str) -> list[float]:
+        return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr("memforge.memory.store.MemoryStore._embed", fake_embed)
+
+    app = create_admin_app(
+        db=db,
+        config=AppConfig(base_dir=tmp_path / "memforge"),
+        principal_resolver=lambda _request: "andrew.sun01@sap.com",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/memories/create",
+            json={
+                "content": "Use canonical payroll trigger status fields.",
+                "reason": "User confirmed the readable memory preview.",
+                "memory_type": "fact",
+                "tags": ["payroll", "polling"],
+                "client": "codex",
+                "repo_identifier": "github.com/shno-labs/mem-forge",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    stored = await db.get_memory(payload["memory_id"])
+    assert payload["status"] == "inserted"
+    assert stored is not None
+    assert stored.owner_user_id == "andrew.sun01@sap.com"
+    assert stored.visibility == "private"
+    audit_rows = await db.list_memory_audit_events(
+        memory_id=payload["memory_id"],
+        event_type="memory_insert_committed",
+    )
+    assert len(audit_rows) == 1
+    assert audit_rows[0].actor_type == "user"
+    assert audit_rows[0].actor_id == "andrew.sun01@sap.com"
+    document = await db.get_document(f"user-memory-{payload['memory_id']}")
+    assert document is not None
+    assert document.client == "codex"
 
 
 @pytest.mark.asyncio
