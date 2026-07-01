@@ -220,11 +220,11 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Create a new memory when the user asks to remember or record durable knowledge. "
             "Users need not name this tool. First search for similar memories to avoid duplicates, "
-            "show a readable preview with the new claim, scope, type/tags, and reason, then get "
+            "show a readable preview with the new durable claim, provenance/evidence, scope, and type/tags, then get "
             "explicit confirmation via request_user_input if available, else a concise text question. "
             "Generate durable memory content from the confirmed preview without unapproved semantic changes. "
             "Keep provenance, confirmation details, test/deploy notes, and why-the-tool-was-called "
-            "out of content; put the user-facing why in reason. Never create memory silently."
+            "out of content; put source details in provenance. Never create memory silently."
         ),
         "inputSchema": {
             "type": "object",
@@ -235,12 +235,16 @@ TOOLS: list[dict[str, Any]] = [
                         "Canonical durable memory content generated from the user-confirmed readable "
                         "preview. Preserve its meaning without unapproved semantic changes. Do not "
                         "put confirmation details, provenance, test/deploy notes, or why-the-tool-was-called "
-                        "into content; those belong in reason or source provenance."
+                        "into content; those belong in provenance or stay out of the memory."
                     ),
                 },
-                "reason": {
+                "provenance": {
                     "type": "string",
-                    "description": "User-facing reason for creating this memory.",
+                    "description": (
+                        "Optional evidence or source context for the provenance card. Use this for "
+                        "details that explain where the memory came from but should not be used as "
+                        "RAG memory content."
+                    ),
                 },
                 "memory_type": {
                     "type": "string",
@@ -258,7 +262,7 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "Optional stable key for retrying the same user-confirmed create action.",
                 },
             },
-            "required": ["content", "reason"],
+            "required": ["content"],
             "additionalProperties": False,
         },
     },
@@ -473,11 +477,13 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("tags must be an array of strings")
             body = {
                 "content": _required_string_arg(args, "content"),
-                "reason": _required_string_arg(args, "reason"),
                 "memory_type": memory_type,
                 "tags": tags,
                 "client": _mcp_client(),
             }
+            provenance = _optional_string_arg(args, "provenance")
+            if provenance:
+                body["provenance"] = provenance
             if "confidence" in args:
                 confidence = args.get("confidence")
                 if not isinstance(confidence, (int, float)):
@@ -563,6 +569,14 @@ def _required_string_arg(args: dict[str, Any], name: str) -> str:
     if not value:
         raise ValueError(f"{name} is required")
     return value
+
+
+def _optional_string_arg(args: dict[str, Any], name: str) -> str | None:
+    value = args.get(name)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _optional_int_arg(args: dict[str, Any], name: str, default: int) -> int:

@@ -67,7 +67,7 @@ class MemoryLifecycleService:
         self,
         *,
         content: str,
-        reason: str,
+        provenance: str | None = None,
         owner_user_id: str,
         client: str,
         memory_type: str = MemoryType.FACT.value,
@@ -77,11 +77,9 @@ class MemoryLifecycleService:
         idempotency_key: str | None = None,
     ) -> CreateMemoryResult:
         content = content.strip()
-        reason = reason.strip()
+        provenance = provenance.strip() if provenance else None
         if not content:
             raise MemoryLifecycleConflict("content_required")
-        if not reason:
-            raise MemoryLifecycleConflict("reason_required")
         if not owner_user_id.strip():
             raise MemoryLifecycleConflict("owner_user_id_required")
         memory_type = self._validate_memory_type(memory_type)
@@ -102,22 +100,23 @@ class MemoryLifecycleService:
             created_at=now,
             updated_at=now,
             status="active",
-            extraction_context=reason,
+            extraction_context=provenance,
         )
         doc_id = self._user_memory_doc_id(memory.id, idempotency_key=idempotency_key)
         await self._write_user_memory_document(
             doc_id=doc_id,
             memory=memory,
-            reason=reason,
+            provenance=provenance,
             client=client,
             observed_at=now,
         )
+        source_excerpt = provenance or content
         status = await self.memory_store.deduplicate_and_insert(
             memory,
             doc_id,
             "user_memory",
             source_updated_at=now,
-            excerpt=content,
+            excerpt=source_excerpt,
         )
         memory_id = memory.id
         if status != "inserted":
@@ -273,15 +272,19 @@ class MemoryLifecycleService:
         *,
         doc_id: str,
         memory: Memory,
-        reason: str,
+        provenance: str | None,
         client: str,
         observed_at: datetime,
     ) -> None:
+        provenance_block = provenance or memory.content
         document_body = "\n".join(
             [
                 f"Client: {client}",
-                f"Reason: {reason}",
                 "",
+                "Provenance:",
+                provenance_block,
+                "",
+                "Memory:",
                 memory.content,
             ]
         )

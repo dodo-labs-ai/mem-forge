@@ -173,7 +173,7 @@ def test_tool_client_create_memory_posts_user_memory_payload():
 
     result = client.create_memory(
         content="Use readable confirmation previews before memory mutations.",
-        reason="User confirmed the new memory preview.",
+        provenance="User asked to remember this after reviewing the MemForge MCP UX.",
         memory_type="convention",
         tags=["ux", "mcp"],
         client="codex",
@@ -187,7 +187,7 @@ def test_tool_client_create_memory_posts_user_memory_payload():
             "/api/memories/create",
             {
                 "content": "Use readable confirmation previews before memory mutations.",
-                "reason": "User confirmed the new memory preview.",
+                "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
                 "memory_type": "convention",
                 "tags": ["ux", "mcp"],
                 "client": "codex",
