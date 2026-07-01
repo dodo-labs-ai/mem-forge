@@ -144,6 +144,8 @@ def test_hook_adapter_injects_session_start_memforge_usage_guidance_without_api(
     assert "source_types" not in context
     assert "get_memory" in context
     assert "get_resource" in context
+    assert "confirmed content must be the durable memory only" in context
+    assert "why-the-tool-was-called out of content" in context
     assert "Relevant Memories" not in context
 
 
@@ -943,7 +945,7 @@ def test_mcp_proxy_starts_without_memforge_executable():
     _, payload = result.stdout.split(b"\r\n\r\n", 1)
     response = json.loads(payload)
     assert response["result"]["serverInfo"]["name"] == "memforge"
-    assert response["result"]["serverInfo"]["version"] == "0.1.18"
+    assert response["result"]["serverInfo"]["version"] == "0.1.19"
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
 
 
@@ -1222,6 +1224,9 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "repo_identifier" not in create_schema["properties"]
     assert "readable preview" in tools["create_memory"]["description"]
     assert "request_user_input" in tools["create_memory"]["description"]
+    assert "durable memory content" in tools["create_memory"]["description"]
+    assert "provenance" in tools["create_memory"]["description"]
+    assert "Do not put confirmation details" in create_schema["properties"]["content"]["description"]
 
     retire_schema = tools["retire_memory"]["inputSchema"]
     assert retire_schema["required"] == ["memory_id", "reason", "expected_content_hash"]
@@ -2095,7 +2100,7 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
     assert "raw-api-secret" not in serialized
     assert "[REDACTED]" in serialized
     assert payload["schema_version"] == "agent-session-window/v1"
-    assert payload["plugin_version"] == "0.1.18"
+    assert payload["plugin_version"] == "0.1.19"
     assert payload["receipt"]["metadata"]["uploaded_to_line"] == 2
     assert payload["receipt"]["metadata"]["observed_to_line"] == 2
 

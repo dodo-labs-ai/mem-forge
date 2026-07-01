@@ -57,7 +57,7 @@ MAX_EVENTS = 40
 WORKER_LEASE_BUFFER_SECONDS = 60.0
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.18"
+PLUGIN_VERSION = "0.1.19"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -83,6 +83,9 @@ SESSION_START_USAGE_GUIDANCE = (
     "to avoid duplicates. For replace/retire, locate the memory with "
     "`search`/`get_memory`. Show a readable preview: new claim or old/new claim, "
     "scope, type/tags, and reason.\n"
+    "- For `create_memory`, confirmed content must be the durable memory only. Keep "
+    "confirmation details, provenance, test/deploy notes, and why-the-tool-was-called out "
+    "of content; put the user-facing why in `reason`.\n"
     "- Never mutate memory silently. Before `create_memory`, `replace_memory`, "
     "`retire_memory`, or `resolve_memory_review`, confirm via `request_user_input` if available; "
     "otherwise ask a concise text question. Do not show raw tool arguments unless needed.\n"

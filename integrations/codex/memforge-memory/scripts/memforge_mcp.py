@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.18"
+SERVER_VERSION = "0.1.19"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 SEARCH_ALLOWED_KEYS = frozenset(
     {
@@ -222,8 +222,9 @@ TOOLS: list[dict[str, Any]] = [
             "Users need not name this tool. First search for similar memories to avoid duplicates, "
             "show a readable preview with the new claim, scope, type/tags, and reason, then get "
             "explicit confirmation via request_user_input if available, else a concise text question. "
-            "Generate content from the confirmed preview without unapproved semantic changes. "
-            "Never create memory silently."
+            "Generate durable memory content from the confirmed preview without unapproved semantic changes. "
+            "Keep provenance, confirmation details, test/deploy notes, and why-the-tool-was-called "
+            "out of content; put the user-facing why in reason. Never create memory silently."
         ),
         "inputSchema": {
             "type": "object",
@@ -231,8 +232,10 @@ TOOLS: list[dict[str, Any]] = [
                 "content": {
                     "type": "string",
                     "description": (
-                        "Canonical memory text generated from the user-confirmed readable preview; "
-                        "preserve its meaning without unapproved semantic changes."
+                        "Canonical durable memory content generated from the user-confirmed readable "
+                        "preview. Preserve its meaning without unapproved semantic changes. Do not "
+                        "put confirmation details, provenance, test/deploy notes, or why-the-tool-was-called "
+                        "into content; those belong in reason or source provenance."
                     ),
                 },
                 "reason": {
