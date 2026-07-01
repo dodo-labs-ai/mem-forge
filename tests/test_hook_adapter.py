@@ -945,7 +945,7 @@ def test_mcp_proxy_starts_without_memforge_executable():
     _, payload = result.stdout.split(b"\r\n\r\n", 1)
     response = json.loads(payload)
     assert response["result"]["serverInfo"]["name"] == "memforge"
-    assert response["result"]["serverInfo"]["version"] == "0.1.20"
+    assert response["result"]["serverInfo"]["version"] == "0.1.21-rc.1"
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
 
 
@@ -970,6 +970,50 @@ def test_mcp_proxy_supports_json_line_stdio():
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
 
 
+@pytest.mark.parametrize("client", ["codex", "claude-code"])
+def test_mcp_proxy_launchers_request_roots_when_client_supports_roots(client):
+    root = Path(__file__).resolve().parents[1]
+    proxy = root / "integrations" / client / "memforge-memory" / "scripts" / "memforge_mcp.py"
+    initialize = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"roots": {"listChanged": True}},
+                "clientInfo": {"name": "test"},
+            },
+        }
+    ).encode()
+    initialized = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode()
+    frame = (
+        b"Content-Length: "
+        + str(len(initialize)).encode()
+        + b"\r\n\r\n"
+        + initialize
+        + b"Content-Length: "
+        + str(len(initialized)).encode()
+        + b"\r\n\r\n"
+        + initialized
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(proxy)],
+        input=frame,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == b""
+    messages = _mcp_content_length_messages(result.stdout)
+    assert messages[0]["result"]["serverInfo"]["name"] == "memforge"
+    assert messages[1]["method"] == "roots/list"
+
+
 def _mcp_initialize_request() -> bytes:
     return json.dumps(
         {
@@ -979,6 +1023,18 @@ def _mcp_initialize_request() -> bytes:
             "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test"}},
         }
     ).encode()
+
+
+def _mcp_content_length_messages(stream: bytes) -> list[dict]:
+    messages = []
+    remaining = stream
+    while remaining:
+        header, payload_start = remaining.split(b"\r\n\r\n", 1)
+        length = int(header.removeprefix(b"Content-Length: ").strip())
+        payload = payload_start[:length]
+        messages.append(json.loads(payload))
+        remaining = payload_start[length:]
+    return messages
 
 
 def test_mcp_proxy_forwards_search_to_service_with_token(monkeypatch):
@@ -1062,9 +1118,12 @@ def test_mcp_proxy_forwards_list_sources_to_searchable_sources(monkeypatch):
     assert captured["authorization"] == "Bearer token-123"
 
 
-def test_mcp_proxy_adds_detected_repo_as_ranking_hint_only(monkeypatch):
+def test_mcp_proxy_adds_client_root_git_remote_as_ranking_hint_only(monkeypatch, tmp_path):
     proxy = _load_plugin_mcp_proxy()
     captured = {}
+    repo_root = tmp_path / "memforge-cloud"
+    repo_root.mkdir()
+    _init_git_repo_with_origin(repo_root, "https://github.com/dodoman-sun/memforge-cloud.git")
 
     class FakeResponse:
         headers = {"content-type": "application/json"}
@@ -1083,22 +1142,47 @@ def test_mcp_proxy_adds_detected_repo_as_ranking_hint_only(monkeypatch):
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv(
-        "MEMFORGE_ACTIVE_REPO_IDENTIFIER",
-        "github.tools.sap/hcm/memforge-cloud",
-    )
+    _provide_mcp_roots(proxy, repo_root)
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
     proxy._call_tool("search", {"query": "scheduler fix"})
 
     body = json.loads(captured["body"].decode())
-    assert body["active_repo_identifier"] == "github.tools.sap/hcm/memforge-cloud"
+    assert body["active_repo_identifier"] == "github.com/dodoman-sun/memforge-cloud"
     assert "source_filter" not in body
 
 
-def test_mcp_proxy_converts_current_repo_only_to_detected_repo_filter(monkeypatch):
+def test_mcp_proxy_ignores_env_repo_override_for_current_repo_filter(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    monkeypatch.setenv("MEMFORGE_ACTIVE_REPO_IDENTIFIER", "github.tools.sap/hcm/memforge-cloud")
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "query": "scheduler fix",
+            "source_filter": {
+                "current_repo_only": True,
+            },
+        },
+    )
+
+    assert result == {
+        "error": (
+            "current_repo_only requires exactly one git remote from MCP workspace roots; "
+            "the MCP client did not advertise roots support. Omit the filter to search all visible memories."
+        )
+    }
+
+
+def test_mcp_proxy_converts_current_repo_only_from_client_roots_when_started_outside_repo(monkeypatch, tmp_path):
     proxy = _load_plugin_mcp_proxy()
     captured = {}
+    repo_root = tmp_path / "memforge-cloud"
+    repo_root.mkdir()
+    _init_git_repo_with_origin(repo_root, "https://github.com/dodoman-sun/memforge-cloud.git")
+    plugin_root = tmp_path / "plugin"
+    plugin_root.mkdir()
+    monkeypatch.chdir(plugin_root)
 
     class FakeResponse:
         headers = {"content-type": "application/json"}
@@ -1117,9 +1201,36 @@ def test_mcp_proxy_converts_current_repo_only_to_detected_repo_filter(monkeypatc
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv(
-        "MEMFORGE_ACTIVE_REPO_IDENTIFIER",
-        "github.tools.sap/hcm/memforge-cloud",
+    initialize = proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"roots": {"listChanged": True}},
+                "clientInfo": {"name": "test"},
+            },
+        }
+    )
+    assert initialize["result"]["serverInfo"]["name"] == "memforge"
+    roots_request = proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }
+    )
+    assert roots_request["method"] == "roots/list"
+
+    assert (
+        proxy._handle_rpc_message(
+            {
+                "jsonrpc": "2.0",
+                "id": roots_request["id"],
+                "result": {"roots": [{"uri": repo_root.as_uri(), "name": "memforge-cloud"}]},
+            }
+        )
+        is None
     )
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
@@ -1134,9 +1245,87 @@ def test_mcp_proxy_converts_current_repo_only_to_detected_repo_filter(monkeypatc
     )
 
     body = json.loads(captured["body"].decode())
-    assert body["active_repo_identifier"] == "github.tools.sap/hcm/memforge-cloud"
+    assert body["active_repo_identifier"] == "github.com/dodoman-sun/memforge-cloud"
     assert body["source_filter"] == {
-        "repo_identifiers": ["github.tools.sap/hcm/memforge-cloud"],
+        "repo_identifiers": ["github.com/dodoman-sun/memforge-cloud"],
+    }
+
+
+def test_mcp_proxy_rejects_current_repo_only_when_cwd_is_git_repo_but_roots_are_missing(monkeypatch, tmp_path):
+    proxy = _load_plugin_mcp_proxy()
+    repo_root = tmp_path / "memforge-cloud"
+    repo_root.mkdir()
+    _init_git_repo_with_origin(repo_root, "https://github.com/dodoman-sun/memforge-cloud.git")
+    monkeypatch.chdir(repo_root)
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "query": "scheduler fix",
+            "source_filter": {
+                "current_repo_only": True,
+            },
+        },
+    )
+
+    assert result == {
+        "error": (
+            "current_repo_only requires exactly one git remote from MCP workspace roots; "
+            "the MCP client did not advertise roots support. Omit the filter to search all visible memories."
+        )
+    }
+
+
+def test_mcp_proxy_rejects_current_repo_only_when_root_has_no_git_remote(tmp_path):
+    proxy = _load_plugin_mcp_proxy()
+    repo_root = tmp_path / "local-only"
+    repo_root.mkdir()
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _provide_mcp_roots(proxy, repo_root)
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "query": "scheduler fix",
+            "source_filter": {
+                "current_repo_only": True,
+            },
+        },
+    )
+
+    assert result == {
+        "error": (
+            "current_repo_only requires exactly one git remote from MCP workspace roots; "
+            "workspace roots do not resolve to a git remote. Omit the filter to search all visible memories."
+        )
+    }
+
+
+def test_mcp_proxy_rejects_current_repo_only_when_roots_have_multiple_git_remotes(tmp_path):
+    proxy = _load_plugin_mcp_proxy()
+    first_root = tmp_path / "memforge-cloud"
+    second_root = tmp_path / "mem-forge"
+    first_root.mkdir()
+    second_root.mkdir()
+    _init_git_repo_with_origin(first_root, "https://github.com/dodoman-sun/memforge-cloud.git")
+    _init_git_repo_with_origin(second_root, "https://github.com/shno-labs/mem-forge.git")
+    _provide_mcp_roots(proxy, first_root, second_root)
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "query": "scheduler fix",
+            "source_filter": {
+                "current_repo_only": True,
+            },
+        },
+    )
+
+    assert result == {
+        "error": (
+            "current_repo_only requires exactly one git remote from MCP workspace roots; "
+            "workspace roots resolve to multiple git remotes. Omit the filter to search all visible memories."
+        )
     }
 
 
@@ -1825,6 +2014,39 @@ def _load_plugin_mcp_proxy():
     return proxy
 
 
+def _provide_mcp_roots(proxy, *roots: Path) -> None:
+    initialize = proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"roots": {"listChanged": True}},
+                "clientInfo": {"name": "test"},
+            },
+        }
+    )
+    assert initialize["result"]["serverInfo"]["name"] == "memforge"
+    roots_request = proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }
+    )
+    assert roots_request["method"] == "roots/list"
+    assert (
+        proxy._handle_rpc_message(
+            {
+                "jsonrpc": "2.0",
+                "id": roots_request["id"],
+                "result": {"roots": [{"uri": root.as_uri(), "name": root.name} for root in roots]},
+            }
+        )
+        is None
+    )
+
+
 def test_malformed_timeout_env_fails_open(monkeypatch, capsys):
     from memforge import hook_adapter
 
@@ -2102,7 +2324,7 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
     assert "raw-api-secret" not in serialized
     assert "[REDACTED]" in serialized
     assert payload["schema_version"] == "agent-session-window/v1"
-    assert payload["plugin_version"] == "0.1.20"
+    assert payload["plugin_version"] == "0.1.21-rc.1"
     assert payload["receipt"]["metadata"]["uploaded_to_line"] == 2
     assert payload["receipt"]["metadata"]["observed_to_line"] == 2
 
