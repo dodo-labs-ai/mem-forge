@@ -327,10 +327,10 @@ class MemoryLifecycleResponse(BaseModel):
 
 
 class MemoryCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     content: str = Field(min_length=1)
-    reason: str = Field(min_length=1)
+    provenance: str | None = None
     memory_type: Literal["fact", "decision", "convention", "procedure"] = "fact"
     tags: list[str] = Field(default_factory=list)
     confidence: float = 0.95
@@ -2722,7 +2722,7 @@ def create_admin_app(
         try:
             result = await service.create_memory(
                 content=req.content,
-                reason=req.reason,
+                provenance=req.provenance,
                 memory_type=req.memory_type,
                 tags=req.tags,
                 confidence=req.confidence,

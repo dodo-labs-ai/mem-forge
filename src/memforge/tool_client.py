@@ -94,7 +94,7 @@ class ToolClient:
         self,
         *,
         content: str,
-        reason: str,
+        provenance: str | None = None,
         memory_type: str = "fact",
         tags: list[str] | tuple[str, ...] | None = None,
         confidence: float | None = None,
@@ -104,11 +104,12 @@ class ToolClient:
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "content": content,
-            "reason": reason,
             "memory_type": memory_type,
             "tags": list(tags or []),
             "client": client,
         }
+        if provenance:
+            body["provenance"] = provenance
         if confidence is not None:
             body["confidence"] = confidence
         if repo_identifier:

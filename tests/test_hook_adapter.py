@@ -1218,8 +1218,10 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "search -> get_memory -> get_resource" in tools["get_resource"]["description"]
 
     create_schema = tools["create_memory"]["inputSchema"]
-    assert create_schema["required"] == ["content", "reason"]
+    assert create_schema["required"] == ["content"]
     assert create_schema["properties"]["memory_type"]["enum"] == ["fact", "decision", "convention", "procedure"]
+    assert "provenance" in create_schema["properties"]
+    assert "reason" not in create_schema["properties"]
     assert "client" not in create_schema["properties"]
     assert "repo_identifier" not in create_schema["properties"]
     assert "readable preview" in tools["create_memory"]["description"]
@@ -1367,7 +1369,7 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
         "create_memory",
         {
             "content": "Use readable confirmation previews before memory mutations.",
-            "reason": "User confirmed the new memory preview.",
+            "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
             "memory_type": "convention",
             "tags": ["ux", "mcp"],
             "confidence": 0.9,
@@ -1379,7 +1381,7 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
     assert captured["url"] == "https://memforge.example/api/workspaces/mount_tai/api/memories/create"
     assert json.loads(captured["body"].decode()) == {
         "content": "Use readable confirmation previews before memory mutations.",
-        "reason": "User confirmed the new memory preview.",
+        "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
         "memory_type": "convention",
         "tags": ["ux", "mcp"],
         "confidence": 0.9,
