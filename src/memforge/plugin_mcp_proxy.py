@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.20-rc.1"
+SERVER_VERSION = "0.1.20"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 SEARCH_ALLOWED_KEYS = frozenset(
     {
