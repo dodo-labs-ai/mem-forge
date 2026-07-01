@@ -40,8 +40,9 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.20"
+SERVER_VERSION = "0.1.21-rc.1"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
+ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 SEARCH_ALLOWED_KEYS = frozenset(
     {
         "query",
@@ -59,6 +60,9 @@ SOURCE_FILTER_ALLOWED_KEYS = frozenset(
 )
 TIME_RANGE_ALLOWED_KEYS = frozenset({"date_type", "start_date", "end_date"})
 DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_CLIENT_SUPPORTS_ROOTS = False
+_PENDING_ROOTS_REQUEST_ID: str | None = None
+_CLIENT_ROOT_PATHS: list[str] = []
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -421,7 +425,11 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | None:
     method = message.get("method")
     request_id = message.get("id")
     try:
+        if method is None:
+            _handle_rpc_response(message)
+            return None
         if method == "initialize":
+            _record_client_capabilities(message)
             result = {
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"tools": {"listChanged": False}},
@@ -429,6 +437,13 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | None:
             }
             return _rpc_result(request_id, result)
         if method == "notifications/initialized":
+            if _CLIENT_SUPPORTS_ROOTS and _PENDING_ROOTS_REQUEST_ID is None and not _CLIENT_ROOT_PATHS:
+                return _request_client_roots()
+            return None
+        if method == "notifications/roots/list_changed":
+            _CLIENT_ROOT_PATHS.clear()
+            if _CLIENT_SUPPORTS_ROOTS and _PENDING_ROOTS_REQUEST_ID is None:
+                return _request_client_roots()
             return None
         if method == "ping":
             return _rpc_result(request_id, {})
@@ -621,10 +636,7 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
         current_repo_only = bool(source_filter.pop("current_repo_only", False))
         if current_repo_only:
             if not repo_identifier:
-                raise ValueError(
-                    "current_repo_only requires a detectable git repository. "
-                    "Omit the filter to search all visible memories."
-                )
+                raise ValueError(_current_repo_only_error())
             source_filter["repo_identifiers"] = [repo_identifier]
         has_deterministic_filter = bool(source_filter)
         body["source_filter"] = source_filter
@@ -663,15 +675,39 @@ def _validate_time_range(value: Any) -> dict[str, str]:
 
 
 def _active_repo_identifier() -> str | None:
-    configured = os.getenv("MEMFORGE_ACTIVE_REPO_IDENTIFIER", "").strip()
-    if configured:
-        return _normalize_repo_identifier(configured)
-    remote = _git_value(["git", "remote", "get-url", "origin"])
-    normalized_remote = _normalize_repo_identifier(remote)
-    if normalized_remote:
-        return normalized_remote
-    root = _git_value(["git", "rev-parse", "--show-toplevel"])
-    return Path(root).name if root else None
+    identifiers = _client_root_repo_identifiers()
+    if len(identifiers) == 1:
+        return next(iter(identifiers))
+    return None
+
+
+def _current_repo_only_error() -> str:
+    if not _CLIENT_SUPPORTS_ROOTS:
+        reason = "the MCP client did not advertise roots support"
+    elif _PENDING_ROOTS_REQUEST_ID is not None:
+        reason = "the MCP client has not returned workspace roots yet"
+    elif not _CLIENT_ROOT_PATHS:
+        reason = "the MCP client did not provide workspace roots"
+    else:
+        identifiers = _client_root_repo_identifiers()
+        if len(identifiers) > 1:
+            reason = "workspace roots resolve to multiple git remotes"
+        else:
+            reason = "workspace roots do not resolve to a git remote"
+    return f"current_repo_only requires exactly one git remote from MCP workspace roots; {reason}. Omit the filter to search all visible memories."
+
+
+def _client_root_repo_identifiers() -> set[str]:
+    return {
+        repo_identifier
+        for root_path in _CLIENT_ROOT_PATHS
+        if (repo_identifier := _repo_identifier_from_cwd(root_path))
+    }
+
+
+def _repo_identifier_from_cwd(cwd: str | Path) -> str | None:
+    remote = _git_value(["git", "remote", "get-url", "origin"], cwd=cwd)
+    return _normalize_repo_identifier(remote)
 
 
 def _mcp_client() -> str:
@@ -703,11 +739,11 @@ def _normalize_repo_identifier(repo: str | None) -> str | None:
     return value.lower() or None
 
 
-def _git_value(command: list[str]) -> str | None:
+def _git_value(command: list[str], *, cwd: str | Path | None = None) -> str | None:
     try:
         result = subprocess.run(
             command,
-            cwd=os.getcwd(),
+            cwd=str(cwd or os.getcwd()),
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -718,6 +754,49 @@ def _git_value(command: list[str]) -> str | None:
         return None
     value = result.stdout.strip()
     return value or None
+
+
+def _record_client_capabilities(message: dict[str, Any]) -> None:
+    global _CLIENT_SUPPORTS_ROOTS, _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOT_PATHS
+    params = message.get("params") if isinstance(message.get("params"), dict) else {}
+    capabilities = params.get("capabilities") if isinstance(params.get("capabilities"), dict) else {}
+    _CLIENT_SUPPORTS_ROOTS = isinstance(capabilities.get("roots"), dict)
+    _PENDING_ROOTS_REQUEST_ID = None
+    _CLIENT_ROOT_PATHS = []
+
+
+def _request_client_roots() -> dict[str, Any]:
+    global _PENDING_ROOTS_REQUEST_ID
+    _PENDING_ROOTS_REQUEST_ID = ROOTS_LIST_REQUEST_ID
+    return {"jsonrpc": "2.0", "id": ROOTS_LIST_REQUEST_ID, "method": "roots/list"}
+
+
+def _handle_rpc_response(message: dict[str, Any]) -> None:
+    global _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOT_PATHS
+    if message.get("id") != _PENDING_ROOTS_REQUEST_ID:
+        return
+    _PENDING_ROOTS_REQUEST_ID = None
+    result = message.get("result") if isinstance(message.get("result"), dict) else {}
+    roots = result.get("roots") if isinstance(result.get("roots"), list) else []
+    _CLIENT_ROOT_PATHS = [path for item in roots if (path := _root_path(item))]
+
+
+def _root_path(item: Any) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    uri = str(item.get("uri") or "").strip()
+    if not uri:
+        return None
+    parsed = urlparse(uri)
+    if parsed.scheme and parsed.scheme != "file":
+        return None
+    if parsed.scheme == "file":
+        if parsed.netloc and parsed.netloc not in {"localhost", "127.0.0.1"}:
+            path = f"//{parsed.netloc}{parsed.path}"
+        else:
+            path = parsed.path
+        return unquote(path) or None
+    return uri
 
 
 def _tool_result(payload: dict[str, Any]) -> dict[str, Any]:
