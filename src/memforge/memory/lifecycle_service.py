@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from memforge.agent_knowledge_markdown import render_agent_concept_markdown_with_patch
 from memforge.memory.store import MemoryStore
 from memforge.models import (
     DocumentRecord,
@@ -171,10 +172,21 @@ class MemoryLifecycleService:
             created_at=now,
             updated_at=now,
             status="active",
+            extraction_context=provenance,
         )
 
         claim = await self.db.get_agent_claim_by_memory_id(old.id)
         if claim is not None:
+            concept = await self.db.get_agent_concept(claim["concept_id"])
+            if concept is None:
+                raise MemoryLifecycleConflict("agent_claim_concept_missing")
+            concept_markdown_body = await render_agent_concept_markdown_with_patch(
+                self.db,
+                concept,
+                claim_id=claim["id"],
+                claim_text=replacement_content,
+                citations=[],
+            )
             await self.memory_store.supersede_agent_claim_memory(
                 old.id,
                 new_memory,
@@ -192,6 +204,7 @@ class MemoryLifecycleService:
                 source_updated_at=now,
                 excerpt=replacement_content,
                 replacement_reason=reason,
+                concept_markdown_body=concept_markdown_body,
             )
         else:
             correction_doc_id = f"correction-{new_memory.id}"
