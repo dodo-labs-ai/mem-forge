@@ -997,7 +997,7 @@ def test_mcp_proxy_starts_without_memforge_executable():
     _, payload = result.stdout.split(b"\r\n\r\n", 1)
     response = json.loads(payload)
     assert response["result"]["serverInfo"]["name"] == "memforge"
-    assert response["result"]["serverInfo"]["version"] == "0.1.21-rc.3"
+    assert response["result"]["serverInfo"]["version"] == "0.1.21-rc.4"
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
 
 
@@ -1328,6 +1328,53 @@ def test_mcp_proxy_rejects_current_repo_only_when_cwd_is_git_repo_but_roots_are_
     }
 
 
+def test_mcp_proxy_uses_codex_workspace_root_when_roots_are_not_advertised(monkeypatch, tmp_path):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+    repo_root = tmp_path / "memforge-cloud"
+    repo_root.mkdir()
+    _init_git_repo_with_origin(repo_root, "https://github.com/dodoman-sun/memforge-cloud.git")
+    plugin_root = tmp_path / "plugin-cache"
+    plugin_root.mkdir()
+    monkeypatch.chdir(plugin_root)
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv("CODEX_WORKSPACE_ROOT", str(repo_root))
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    proxy._call_tool(
+        "search",
+        {
+            "query": "scheduler fix",
+            "source_filter": {
+                "current_repo_only": True,
+            },
+        },
+    )
+
+    body = json.loads(captured["body"].decode())
+    assert body["active_repo_identifier"] == "github.com/dodoman-sun/memforge-cloud"
+    assert body["source_filter"] == {
+        "repo_identifiers": ["github.com/dodoman-sun/memforge-cloud"],
+    }
+
+
 def test_mcp_proxy_rejects_current_repo_only_when_root_has_no_git_remote(tmp_path):
     proxy = _load_plugin_mcp_proxy()
     repo_root = tmp_path / "local-only"
@@ -1627,6 +1674,55 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
         "tags": ["ux", "mcp"],
         "confidence": 0.9,
         "client": "claude-code",
+        "repo_identifier": "github.com/shno-labs/mem-forge",
+    }
+
+
+def test_mcp_proxy_create_memory_uses_codex_workspace_root_when_roots_are_not_advertised(monkeypatch, tmp_path):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+    repo_root = tmp_path / "mem-forge"
+    repo_root.mkdir()
+    _init_git_repo_with_origin(repo_root, "https://github.com/shno-labs/mem-forge.git")
+    plugin_root = tmp_path / "plugin-cache"
+    plugin_root.mkdir()
+    monkeypatch.chdir(plugin_root)
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"status":"inserted","memory_id":"mem-new"}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv("CODEX_WORKSPACE_ROOT", str(repo_root))
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    result = proxy._call_tool(
+        "create_memory",
+        {
+            "content": "Use readable confirmation previews before memory mutations.",
+            "memory_type": "convention",
+            "tags": ["ux", "mcp"],
+        },
+    )
+
+    assert result == {"status": "inserted", "memory_id": "mem-new"}
+    assert json.loads(captured["body"].decode()) == {
+        "content": "Use readable confirmation previews before memory mutations.",
+        "memory_type": "convention",
+        "tags": ["ux", "mcp"],
+        "client": "codex",
         "repo_identifier": "github.com/shno-labs/mem-forge",
     }
 
@@ -2402,7 +2498,7 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
     assert "raw-api-secret" not in serialized
     assert "[REDACTED]" in serialized
     assert payload["schema_version"] == "agent-session-window/v1"
-    assert payload["plugin_version"] == "0.1.21-rc.3"
+    assert payload["plugin_version"] == "0.1.21-rc.4"
     assert payload["receipt"]["metadata"]["uploaded_to_line"] == 2
     assert payload["receipt"]["metadata"]["observed_to_line"] == 2
 

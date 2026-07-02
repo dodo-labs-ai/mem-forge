@@ -40,9 +40,10 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.21-rc.3"
+SERVER_VERSION = "0.1.21-rc.4"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
+WORKSPACE_ROOT_ENV_VARS = ("CODEX_WORKSPACE_ROOT",)
 SEARCH_ALLOWED_KEYS = frozenset(
     {
         "query",
@@ -679,6 +680,10 @@ def _active_repo_identifier() -> str | None:
     identifiers = _client_root_repo_identifiers()
     if len(identifiers) == 1:
         return next(iter(identifiers))
+    if not _CLIENT_SUPPORTS_ROOTS:
+        env_identifier = _env_workspace_repo_identifier()
+        if env_identifier:
+            return env_identifier
     return None
 
 
@@ -694,6 +699,10 @@ def _create_memory_repo_error() -> str:
 
 def _repo_roots_error_reason() -> str:
     if not _CLIENT_SUPPORTS_ROOTS:
+        if env_root := _env_workspace_root():
+            if _repo_identifier_from_cwd(env_root):
+                return "the MCP client did not advertise roots support and host workspace root resolution was inconsistent"
+            return "the MCP client did not advertise roots support and CODEX_WORKSPACE_ROOT does not resolve to a git remote"
         return "the MCP client did not advertise roots support"
     elif _PENDING_ROOTS_REQUEST_ID is not None:
         return "the MCP client has not returned workspace roots yet"
@@ -711,6 +720,20 @@ def _client_root_repo_identifiers() -> set[str]:
         for root_path in _CLIENT_ROOT_PATHS
         if (repo_identifier := _repo_identifier_from_cwd(root_path))
     }
+
+
+def _env_workspace_repo_identifier() -> str | None:
+    if env_root := _env_workspace_root():
+        return _repo_identifier_from_cwd(env_root)
+    return None
+
+
+def _env_workspace_root() -> str | None:
+    for name in WORKSPACE_ROOT_ENV_VARS:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return None
 
 
 def _repo_identifier_from_cwd(cwd: str | Path) -> str | None:
