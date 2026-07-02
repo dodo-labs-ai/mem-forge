@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CODEX_PLUGIN_ROOT:-$PLUGIN_ROOT}/scripts/memforge_hook.py\" context --client codex",
+            "command": "sh -lc 'root=\"${CODEX_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; script=\"$root/scripts/memforge_hook.py\"; if [ ! -f \"$script\" ]; then script=\"\"; for candidate in \"$HOME\"/.codex/plugins/cache/memforge/memory/*/scripts/memforge_hook.py; do [ -f \"$candidate\" ] || continue; if [ -z \"$script\" ] || [ \"$candidate\" -nt \"$script\" ]; then script=\"$candidate\"; fi; done; fi; if [ -z \"$script\" ]; then echo \"MemForge hook script not found\" >&2; exit 0; fi; exec python3 \"$script\" context --client codex'",
             "timeout": 10,
             "statusMessage": "Loading MemForge context"
           }
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CODEX_PLUGIN_ROOT:-$PLUGIN_ROOT}/scripts/memforge_hook.py\" submit-session --client codex",
+            "command": "sh -lc 'root=\"${CODEX_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; script=\"$root/scripts/memforge_hook.py\"; if [ ! -f \"$script\" ]; then script=\"\"; for candidate in \"$HOME\"/.codex/plugins/cache/memforge/memory/*/scripts/memforge_hook.py; do [ -f \"$candidate\" ] || continue; if [ -z \"$script\" ] || [ \"$candidate\" -nt \"$script\" ]; then script=\"$candidate\"; fi; done; fi; if [ -z \"$script\" ]; then echo \"MemForge hook script not found\" >&2; exit 0; fi; exec python3 \"$script\" submit-session --client codex'",
             "timeout": 15,
             "statusMessage": "Submitting MemForge compaction receipt"
           }
@@ -30,7 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CODEX_PLUGIN_ROOT:-$PLUGIN_ROOT}/scripts/memforge_hook.py\" submit-session --client codex",
+            "command": "sh -lc 'root=\"${CODEX_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; script=\"$root/scripts/memforge_hook.py\"; if [ ! -f \"$script\" ]; then script=\"\"; for candidate in \"$HOME\"/.codex/plugins/cache/memforge/memory/*/scripts/memforge_hook.py; do [ -f \"$candidate\" ] || continue; if [ -z \"$script\" ] || [ \"$candidate\" -nt \"$script\" ]; then script=\"$candidate\"; fi; done; fi; if [ -z \"$script\" ]; then echo \"MemForge hook script not found\" >&2; exit 0; fi; exec python3 \"$script\" submit-session --client codex'",
             "timeout": 15,
             "statusMessage": "Submitting MemForge session receipt"
           }

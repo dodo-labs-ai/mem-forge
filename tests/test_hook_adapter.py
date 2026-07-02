@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -845,6 +846,57 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
+@pytest.mark.parametrize(
+    ("plugin_path", "home_cache", "env_root", "expected_client"),
+    [
+        (
+            "integrations/codex/memforge-memory/hooks/hooks.json",
+            ".codex/plugins/cache/memforge/memory",
+            "CODEX_PLUGIN_ROOT",
+            "codex",
+        ),
+        (
+            "integrations/claude-code/memforge-memory/hooks/hooks.json",
+            ".claude/plugins/cache/memforge/memory",
+            "CLAUDE_PLUGIN_ROOT",
+            "claude-code",
+        ),
+    ],
+)
+def test_plugin_hook_commands_fallback_to_installed_cache_when_registered_root_is_stale(
+    tmp_path, plugin_path, home_cache, env_root, expected_client
+):
+    root = Path(__file__).resolve().parents[1]
+    hooks = json.loads((root / plugin_path).read_text())
+    command = hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
+    script = tmp_path / home_cache / "0.1.99" / "scripts" / "memforge_hook.py"
+    script.parent.mkdir(parents=True)
+    marker = tmp_path / "argv.txt"
+    script.write_text(
+        "import os, pathlib, sys\n"
+        "pathlib.Path(os.environ['MEMFORGE_TEST_MARKER']).write_text(' '.join(sys.argv[1:]))\n"
+    )
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path)
+    env[env_root] = str(tmp_path / "deleted-plugin-root")
+    env["PLUGIN_ROOT"] = str(tmp_path / "also-missing")
+    env["MEMFORGE_TEST_MARKER"] = str(marker)
+
+    result = subprocess.run(
+        command,
+        shell=True,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == f"submit-session --client {expected_client}"
+
+
 def test_plugin_wrapper_runs_from_repo_checkout_without_pythonpath():
     root = Path(__file__).resolve().parents[1]
     wrapper = root / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_hook.py"
@@ -945,7 +997,7 @@ def test_mcp_proxy_starts_without_memforge_executable():
     _, payload = result.stdout.split(b"\r\n\r\n", 1)
     response = json.loads(payload)
     assert response["result"]["serverInfo"]["name"] == "memforge"
-    assert response["result"]["serverInfo"]["version"] == "0.1.21-rc.2"
+    assert response["result"]["serverInfo"]["version"] == "0.1.21-rc.3"
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
 
 
@@ -2350,7 +2402,7 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
     assert "raw-api-secret" not in serialized
     assert "[REDACTED]" in serialized
     assert payload["schema_version"] == "agent-session-window/v1"
-    assert payload["plugin_version"] == "0.1.21-rc.2"
+    assert payload["plugin_version"] == "0.1.21-rc.3"
     assert payload["receipt"]["metadata"]["uploaded_to_line"] == 2
     assert payload["receipt"]["metadata"]["observed_to_line"] == 2
 
