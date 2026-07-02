@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.21-rc.5"
+SERVER_VERSION = "0.1.21-rc.6"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 WORKSPACE_ROOT_ENV_VARS = ("CODEX_WORKSPACE_ROOT",)
@@ -111,14 +111,6 @@ TOOLS: list[dict[str, Any]] = [
                             "description": (
                                 "Restrict agent-session memories by producer. Use only when "
                                 "the user explicitly names Codex or Claude Code."
-                            ),
-                        },
-                        "current_repo_only": {
-                            "type": "boolean",
-                            "description": (
-                                "Restrict to agent-session memories for the current git "
-                                "repository. The local proxy resolves the exact repo "
-                                "identifier; do not provide repo ids."
                             ),
                         },
                     },
@@ -306,7 +298,9 @@ TOOLS: list[dict[str, Any]] = [
             "the memory for hash/provenance, show a readable preview with old claim, new "
             "claim, scope, and reason, then get explicit confirmation via request_user_input "
             "if available, else a concise text question. Generate replacement_content from "
-            "the confirmed preview without unapproved semantic changes. Never replace silently."
+            "the confirmed preview without unapproved semantic changes. Keep provenance, "
+            "confirmation details, test/deploy notes, and why-the-tool-was-called out of "
+            "replacement_content; put source details in provenance. Never replace silently."
         ),
         "inputSchema": {
             "type": "object",
@@ -316,7 +310,17 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": (
                         "Canonical memory text generated from the user-confirmed readable preview; "
-                        "preserve its meaning without unapproved semantic changes."
+                        "preserve its meaning without unapproved semantic changes. Do not put "
+                        "confirmation details, provenance, test/deploy notes, or why-the-tool-was-called "
+                        "into replacement_content; those belong in provenance or stay out of the memory."
+                    ),
+                },
+                "provenance": {
+                    "type": "string",
+                    "description": (
+                        "Optional evidence or source context for the correction provenance card. "
+                        "Use this for details that explain where the replacement came from but "
+                        "should not be used as RAG memory content."
                     ),
                 },
                 "reason": {
@@ -537,6 +541,9 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 "expected_content_hash": _required_string_arg(args, "expected_content_hash"),
                 "replacement_kind": replacement_kind,
             }
+            provenance = _optional_string_arg(args, "provenance")
+            if provenance:
+                body["provenance"] = provenance
         except ValueError as exc:
             return {"error": str(exc)}
         return _http_json("POST", f"/api/memories/{quote(memory_id, safe='')}/replace", body)
@@ -627,7 +634,7 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "Unsupported source_filter parameter(s): "
                 + ", ".join(unknown_filter_keys)
-                + ". Use current_repo_only for repo-scoped search or omit the facet."
+                + ". Omit repo-scoped facets until MCP roots are available."
             )
         source_ids = source_filter.get("source_ids")
         if source_ids is not None:
@@ -635,11 +642,9 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
                 isinstance(item, str) and item.strip() for item in source_ids
             ):
                 raise ValueError("source_filter.source_ids must be a non-empty array of source IDs from list_sources")
-        current_repo_only = bool(source_filter.pop("current_repo_only", False))
-        if current_repo_only:
-            if not repo_identifier:
-                raise ValueError(_current_repo_only_error())
-            source_filter["repo_identifiers"] = [repo_identifier]
+        # Temporarily disabled until Codex hosts reliably provide MCP roots or
+        # CODEX_WORKSPACE_ROOT. Keep accepting stale callers but search globally.
+        source_filter.pop("current_repo_only", None)
         has_deterministic_filter = bool(source_filter)
         body["source_filter"] = source_filter
     time_range = body.get("time_range")
