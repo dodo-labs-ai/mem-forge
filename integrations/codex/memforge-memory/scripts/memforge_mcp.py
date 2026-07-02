@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.21-rc.1"
+SERVER_VERSION = "0.1.21-rc.2"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 SEARCH_ALLOWED_KEYS = frozenset(
@@ -505,8 +505,9 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                     raise ValueError("confidence must be a number")
                 body["confidence"] = float(confidence)
             repo_identifier = _active_repo_identifier()
-            if repo_identifier:
-                body["repo_identifier"] = repo_identifier
+            if not repo_identifier:
+                raise ValueError(_create_memory_repo_error())
+            body["repo_identifier"] = repo_identifier
             idempotency_key = str(args.get("idempotency_key") or "").strip()
             if idempotency_key:
                 body["idempotency_key"] = idempotency_key
@@ -682,19 +683,26 @@ def _active_repo_identifier() -> str | None:
 
 
 def _current_repo_only_error() -> str:
-    if not _CLIENT_SUPPORTS_ROOTS:
-        reason = "the MCP client did not advertise roots support"
-    elif _PENDING_ROOTS_REQUEST_ID is not None:
-        reason = "the MCP client has not returned workspace roots yet"
-    elif not _CLIENT_ROOT_PATHS:
-        reason = "the MCP client did not provide workspace roots"
-    else:
-        identifiers = _client_root_repo_identifiers()
-        if len(identifiers) > 1:
-            reason = "workspace roots resolve to multiple git remotes"
-        else:
-            reason = "workspace roots do not resolve to a git remote"
+    reason = _repo_roots_error_reason()
     return f"current_repo_only requires exactly one git remote from MCP workspace roots; {reason}. Omit the filter to search all visible memories."
+
+
+def _create_memory_repo_error() -> str:
+    reason = _repo_roots_error_reason()
+    return f"create_memory requires exactly one git remote from MCP workspace roots; {reason}. Refusing to create an unscoped memory."
+
+
+def _repo_roots_error_reason() -> str:
+    if not _CLIENT_SUPPORTS_ROOTS:
+        return "the MCP client did not advertise roots support"
+    elif _PENDING_ROOTS_REQUEST_ID is not None:
+        return "the MCP client has not returned workspace roots yet"
+    elif not _CLIENT_ROOT_PATHS:
+        return "the MCP client did not provide workspace roots"
+    identifiers = _client_root_repo_identifiers()
+    if len(identifiers) > 1:
+        return "workspace roots resolve to multiple git remotes"
+    return "workspace roots do not resolve to a git remote"
 
 
 def _client_root_repo_identifiers() -> set[str]:

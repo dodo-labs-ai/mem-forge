@@ -945,7 +945,7 @@ def test_mcp_proxy_starts_without_memforge_executable():
     _, payload = result.stdout.split(b"\r\n\r\n", 1)
     response = json.loads(payload)
     assert response["result"]["serverInfo"]["name"] == "memforge"
-    assert response["result"]["serverInfo"]["version"] == "0.1.21-rc.1"
+    assert response["result"]["serverInfo"]["version"] == "0.1.21-rc.2"
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
 
 
@@ -1576,6 +1576,32 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
         "confidence": 0.9,
         "client": "claude-code",
         "repo_identifier": "github.com/shno-labs/mem-forge",
+    }
+
+
+def test_mcp_proxy_rejects_create_memory_when_repo_roots_are_missing(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+
+    class FailOpener:
+        def open(self, *_args, **_kwargs):
+            raise AssertionError("create_memory should fail before posting without repo roots")
+
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FailOpener())
+
+    result = proxy._call_tool(
+        "create_memory",
+        {
+            "content": "Use readable confirmation previews before memory mutations.",
+            "memory_type": "convention",
+            "tags": ["ux", "mcp"],
+        },
+    )
+
+    assert result == {
+        "error": (
+            "create_memory requires exactly one git remote from MCP workspace roots; "
+            "the MCP client did not advertise roots support. Refusing to create an unscoped memory."
+        )
     }
 
 
@@ -2324,7 +2350,7 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
     assert "raw-api-secret" not in serialized
     assert "[REDACTED]" in serialized
     assert payload["schema_version"] == "agent-session-window/v1"
-    assert payload["plugin_version"] == "0.1.21-rc.1"
+    assert payload["plugin_version"] == "0.1.21-rc.2"
     assert payload["receipt"]["metadata"]["uploaded_to_line"] == 2
     assert payload["receipt"]["metadata"]["observed_to_line"] == 2
 
