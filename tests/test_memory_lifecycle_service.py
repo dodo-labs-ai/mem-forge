@@ -99,7 +99,10 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
 
     result = await service.create_memory(
         content="Use Status and FollowUpStepStatus when polling PayrollProcessingTriggerViews.",
-        reason="User explicitly asked MemForge to remember this.",
+        provenance=(
+            "During the xall-004 smoke test, PayrollProcessingTriggerViews polling only "
+            "matched after using Status and FollowUpStepStatus."
+        ),
         memory_type="fact",
         tags=["dwc", "polling"],
         owner_user_id="andrew.sun01@sap.com",
@@ -112,6 +115,10 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
     assert result.status == "inserted"
     assert stored is not None
     assert stored.content == "Use Status and FollowUpStepStatus when polling PayrollProcessingTriggerViews."
+    assert stored.extraction_context == (
+        "During the xall-004 smoke test, PayrollProcessingTriggerViews polling only "
+        "matched after using Status and FollowUpStepStatus."
+    )
     assert stored.visibility == Visibility.PRIVATE.value
     assert stored.owner_user_id == "andrew.sun01@sap.com"
     assert stored.project_key == "UNSORTED"
@@ -120,10 +127,13 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
     assert [(source.doc_id, source.source_type) for source in sources] == [
         (f"user-memory-{result.memory_id}", "user_memory")
     ]
+    assert sources[0].excerpt == "Use Status and FollowUpStepStatus when polling PayrollProcessingTriggerViews."
+    assert sources[0].excerpt != stored.extraction_context
     document = await db.get_document(f"user-memory-{result.memory_id}")
     assert document is not None
     assert document.source == "user_memory"
     assert document.client == "codex"
+    assert document.normalized_content_uri is None
 
 
 @pytest.mark.asyncio
@@ -191,6 +201,7 @@ async def test_replace_document_memory_creates_correction_provenance_without_car
     result = await service.replace_memory(
         old.id,
         replacement_content="Mount Tai defects use queue B",
+        provenance="User corrected this after reviewing the Mount Tai defect triage board.",
         reason="User corrected the queue.",
         expected_content_hash=old.content_hash,
         replacement_kind="revision",
@@ -210,6 +221,27 @@ async def test_replace_document_memory_creates_correction_provenance_without_car
     assert [(source.doc_id, source.source_type) for source in new_sources] == [
         (f"correction-{result.replacement_memory_id}", "user_correction")
     ]
+    assert new_sources[0].excerpt == "Mount Tai defects use queue B"
+    assert new_sources[0].excerpt != "User corrected this after reviewing the Mount Tai defect triage board."
+
+
+@pytest.mark.asyncio
+async def test_replace_document_memory_without_provenance_fails_closed(db: Database):
+    old = _memory("mem-replace-tool-no-provenance", "Mount Tai defects use queue A")
+    await db.insert_memory(old)
+    collection = RecordingCollection()
+    store = _store(db, collection)
+    service = MemoryLifecycleService(db=db, memory_store=store)
+
+    with pytest.raises(MemoryLifecycleConflict, match="provenance_required"):
+        await service.replace_memory(
+            old.id,
+            replacement_content="Mount Tai defects use queue B",
+            provenance="",
+            reason="User corrected the queue.",
+            expected_content_hash=old.content_hash,
+            replacement_kind="revision",
+        )
 
 
 @pytest.mark.asyncio
@@ -271,6 +303,7 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     result = await service.replace_memory(
         old.id,
         replacement_content="Invoke Claude Code with `claude`, not `claude-code`.",
+        provenance="User corrected the command while reviewing Claude Code CLI usage.",
         reason="User corrected the command name.",
         expected_content_hash=old.content_hash,
         replacement_kind="revision",
@@ -314,7 +347,7 @@ async def test_create_memory_route_audits_request_principal_and_client(db: Datab
             "/api/memories/create",
             json={
                 "content": "Use canonical payroll trigger status fields.",
-                "reason": "User confirmed the readable memory preview.",
+                "provenance": "User confirmed this after validating the payroll smoke flow.",
                 "memory_type": "fact",
                 "tags": ["payroll", "polling"],
                 "client": "codex",
@@ -329,6 +362,7 @@ async def test_create_memory_route_audits_request_principal_and_client(db: Datab
     assert stored is not None
     assert stored.owner_user_id == "andrew.sun01@sap.com"
     assert stored.visibility == "private"
+    assert stored.extraction_context == "User confirmed this after validating the payroll smoke flow."
     audit_rows = await db.list_memory_audit_events(
         memory_id=payload["memory_id"],
         event_type="memory_insert_committed",
@@ -339,6 +373,67 @@ async def test_create_memory_route_audits_request_principal_and_client(db: Datab
     document = await db.get_document(f"user-memory-{payload['memory_id']}")
     assert document is not None
     assert document.client == "codex"
+
+
+@pytest.mark.asyncio
+async def test_create_memory_route_requires_provenance(db: Database, tmp_path, monkeypatch):
+    from memforge.server.admin_api import create_admin_app
+
+    async def fake_embed(self, _text: str) -> list[float]:
+        return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr("memforge.memory.store.MemoryStore._embed", fake_embed)
+
+    app = create_admin_app(
+        db=db,
+        config=AppConfig(base_dir=tmp_path / "memforge"),
+        principal_resolver=lambda _request: "andrew.sun01@sap.com",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/memories/create",
+            json={
+                "content": "Keep create_memory content durable and reusable.",
+                "reason": "Legacy clients used to send this field.",
+                "memory_type": "convention",
+                "client": "codex",
+            },
+        )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_memory_route_rejects_legacy_reason_field(db: Database, tmp_path, monkeypatch):
+    from memforge.server.admin_api import create_admin_app
+
+    async def fake_embed(self, _text: str) -> list[float]:
+        return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr("memforge.memory.store.MemoryStore._embed", fake_embed)
+
+    app = create_admin_app(
+        db=db,
+        config=AppConfig(base_dir=tmp_path / "memforge"),
+        principal_resolver=lambda _request: "andrew.sun01@sap.com",
+    )
+
+    provenance = "User explicitly asked to keep this convention after reviewing MCP memory behavior."
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/memories/create",
+            json={
+                "content": "Keep create_memory content durable and reusable.",
+                "provenance": provenance,
+                "reason": "Legacy clients used to send this field.",
+                "memory_type": "convention",
+                "client": "codex",
+            },
+        )
+
+    assert response.status_code == 422
+    assert "Extra inputs are not permitted" in response.text
 
 
 @pytest.mark.asyncio
@@ -415,6 +510,7 @@ async def test_replace_memory_route_audits_request_principal(db: Database, tmp_p
             f"/api/memories/{memory.id}/replace",
             json={
                 "replacement_content": "Route replacement corrected fact",
+                "provenance": "User supplied the corrected route in chat.",
                 "reason": "User corrected this memory.",
                 "expected_content_hash": memory.content_hash,
                 "replacement_kind": "supersession",
