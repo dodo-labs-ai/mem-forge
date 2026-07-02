@@ -1535,7 +1535,24 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "repo_identifiers" not in properties["source_filter"]["properties"]
     assert "source_instance_ids" not in properties["source_filter"]["properties"]
     assert "sources" not in properties
-    assert set(properties) == {"query", "source_filter", "time_range", "top_k"}
+    assert set(properties) == {"query", "source_filter", "time_range", "top_k", "offset"}
+    assert "total_candidates" in tools["search"]["description"]
+    assert "complete list" in tools["search"]["description"]
+    assert "enumeration" in tools["search"]["description"]
+    assert "previous offset plus the number of results returned" in tools["search"]["description"]
+    assert "Stop when results is empty" in tools["search"]["description"]
+    assert "larger top_k" in tools["search"]["description"]
+    assert "backlog" not in tools["search"]["description"].lower()
+    assert "not a hard cap" in properties["top_k"]["description"]
+    assert "up to 50" in properties["top_k"]["description"]
+    assert "complete list" in properties["top_k"]["description"]
+    assert "enumeration" in properties["top_k"]["description"]
+    assert "backlog" not in properties["top_k"]["description"].lower()
+    assert properties["top_k"]["minimum"] == 1
+    assert properties["top_k"]["maximum"] == 50
+    assert properties["offset"]["default"] == 0
+    assert properties["offset"]["minimum"] == 0
+    assert "next page" in properties["offset"]["description"]
     assert "required" not in search_schema or "query" not in search_schema.get("required", [])
     time_range_schema = properties["time_range"]
     assert "Omit time_range" in time_range_schema["description"]
@@ -2082,6 +2099,86 @@ def test_mcp_proxy_forwards_queryless_source_id_time_range(monkeypatch):
             "end_date": "2026-06-26",
         },
     }
+
+
+def test_mcp_proxy_forwards_search_offset_for_deterministic_listing(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[],"total_candidates":52,"limit":10,"offset":10}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "source_filter": {"source_ids": ["src-backlog"]},
+            "time_range": {"date_type": "source_updated_at", "start_date": "2026-06-29"},
+            "top_k": 10,
+            "offset": 10,
+        },
+    )
+
+    assert result["total_candidates"] == 52
+    assert json.loads(captured["body"].decode()) == {
+        "include_private": True,
+        "include_superseded": False,
+        "source_filter": {"source_ids": ["src-backlog"]},
+        "time_range": {"date_type": "source_updated_at", "start_date": "2026-06-29"},
+        "top_k": 10,
+        "offset": 10,
+    }
+
+
+@pytest.mark.parametrize("offset", [-1, "10", True])
+def test_mcp_proxy_rejects_invalid_search_offset(monkeypatch, offset):
+    proxy = _load_plugin_mcp_proxy()
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "source_filter": {"source_ids": ["src-backlog"]},
+            "offset": offset,
+        },
+    )
+
+    assert result == {"error": "offset must be a non-negative integer"}
+
+
+@pytest.mark.parametrize("top_k", [0, 51, "10", True])
+def test_mcp_proxy_rejects_invalid_search_top_k(monkeypatch, top_k):
+    proxy = _load_plugin_mcp_proxy()
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "query": "payroll",
+            "top_k": top_k,
+        },
+    )
+
+    assert result == {"error": "top_k must be an integer from 1 to 50"}
 
 
 def test_mcp_proxy_rejects_queryless_without_deterministic_filter(monkeypatch):
