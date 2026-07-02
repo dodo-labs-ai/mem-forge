@@ -1,6 +1,6 @@
 {
   "name": "memory",
-  "version": "0.1.21-rc.4",
+  "version": "0.1.21-rc.5",
   "description": "MemForge hook integration for Claude Code.",
   "author": {
     "name": "MemForge Team"
