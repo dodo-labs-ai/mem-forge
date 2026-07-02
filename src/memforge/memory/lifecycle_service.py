@@ -67,7 +67,7 @@ class MemoryLifecycleService:
         self,
         *,
         content: str,
-        provenance: str | None = None,
+        provenance: str,
         owner_user_id: str,
         client: str,
         memory_type: str = MemoryType.FACT.value,
@@ -80,6 +80,8 @@ class MemoryLifecycleService:
         provenance = provenance.strip() if provenance else None
         if not content:
             raise MemoryLifecycleConflict("content_required")
+        if not provenance:
+            raise MemoryLifecycleConflict("provenance_required")
         if not owner_user_id.strip():
             raise MemoryLifecycleConflict("owner_user_id_required")
         memory_type = self._validate_memory_type(memory_type)
@@ -110,13 +112,12 @@ class MemoryLifecycleService:
             client=client,
             observed_at=now,
         )
-        source_excerpt = provenance or content
         status = await self.memory_store.deduplicate_and_insert(
             memory,
             doc_id,
             "user_memory",
             source_updated_at=now,
-            excerpt=source_excerpt,
+            excerpt=provenance,
         )
         memory_id = memory.id
         if status != "inserted":
@@ -141,7 +142,7 @@ class MemoryLifecycleService:
         memory_id: str,
         *,
         replacement_content: str,
-        provenance: str | None = None,
+        provenance: str,
         reason: str,
         expected_content_hash: str,
         replacement_kind: ReplacementKind = "supersession",
@@ -151,7 +152,8 @@ class MemoryLifecycleService:
         if not replacement_content:
             raise MemoryLifecycleConflict("replacement_content_required")
         provenance = provenance.strip() if provenance else None
-        correction_excerpt = provenance
+        if not provenance:
+            raise MemoryLifecycleConflict("provenance_required")
 
         old = await self._active_target(memory_id, expected_content_hash=expected_content_hash)
         now = datetime.now(timezone.utc)
@@ -188,7 +190,7 @@ class MemoryLifecycleService:
                 confidence=new_memory.confidence,
                 observed_at=now,
                 source_updated_at=now,
-                excerpt=correction_excerpt,
+                excerpt=provenance,
                 replacement_reason=reason,
             )
         else:
@@ -210,7 +212,7 @@ class MemoryLifecycleService:
                 replacement_kind=replacement_kind,
                 replacement_reason=reason,
                 source_updated_at=now,
-                excerpt=correction_excerpt,
+                excerpt=provenance,
                 carry_revision_sources=False,
             )
 
@@ -277,17 +279,16 @@ class MemoryLifecycleService:
         *,
         doc_id: str,
         memory: Memory,
-        provenance: str | None,
+        provenance: str,
         client: str,
         observed_at: datetime,
     ) -> None:
-        provenance_block = provenance or memory.content
         document_body = "\n".join(
             [
                 f"Client: {client}",
                 "",
                 "Provenance:",
-                provenance_block,
+                provenance,
                 "",
                 "Memory:",
                 memory.content,

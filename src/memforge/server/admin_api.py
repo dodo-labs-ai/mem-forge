@@ -330,7 +330,7 @@ class MemoryCreateRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     content: str = Field(min_length=1)
-    provenance: str | None = None
+    provenance: str = Field(min_length=1)
     memory_type: Literal["fact", "decision", "convention", "procedure"] = "fact"
     tags: list[str] = Field(default_factory=list)
     confidence: float = 0.95
@@ -348,7 +348,7 @@ class MemoryReplaceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     replacement_content: str = Field(min_length=1)
-    provenance: str | None = None
+    provenance: str = Field(min_length=1)
     reason: str = Field(min_length=1)
     expected_content_hash: str = Field(min_length=1)
     replacement_kind: Literal["revision", "supersession"] = "supersession"

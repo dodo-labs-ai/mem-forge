@@ -228,28 +228,22 @@ async def test_replace_document_memory_creates_correction_provenance_without_car
 
 
 @pytest.mark.asyncio
-async def test_replace_document_memory_without_provenance_does_not_use_reason_as_excerpt(db: Database):
+async def test_replace_document_memory_without_provenance_fails_closed(db: Database):
     old = _memory("mem-replace-tool-no-provenance", "Mount Tai defects use queue A")
     await db.insert_memory(old)
     collection = RecordingCollection()
     store = _store(db, collection)
     service = MemoryLifecycleService(db=db, memory_store=store)
 
-    result = await service.replace_memory(
-        old.id,
-        replacement_content="Mount Tai defects use queue B",
-        reason="User corrected the queue.",
-        expected_content_hash=old.content_hash,
-        replacement_kind="revision",
-    )
-
-    stored_new = await db.get_memory(result.replacement_memory_id)
-    new_sources = await db.get_memory_sources(result.replacement_memory_id)
-    assert stored_new is not None
-    assert stored_new.content == "Mount Tai defects use queue B"
-    assert len(new_sources) == 1
-    assert new_sources[0].source_type == "user_correction"
-    assert new_sources[0].excerpt is None
+    with pytest.raises(MemoryLifecycleConflict, match="provenance_required"):
+        await service.replace_memory(
+            old.id,
+            replacement_content="Mount Tai defects use queue B",
+            provenance="",
+            reason="User corrected the queue.",
+            expected_content_hash=old.content_hash,
+            replacement_kind="revision",
+        )
 
 
 @pytest.mark.asyncio
@@ -311,6 +305,7 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     result = await service.replace_memory(
         old.id,
         replacement_content="Invoke Claude Code with `claude`, not `claude-code`.",
+        provenance="User corrected the command while reviewing Claude Code CLI usage.",
         reason="User corrected the command name.",
         expected_content_hash=old.content_hash,
         replacement_kind="revision",
@@ -383,7 +378,7 @@ async def test_create_memory_route_audits_request_principal_and_client(db: Datab
 
 
 @pytest.mark.asyncio
-async def test_create_memory_route_ignores_legacy_reason_field(db: Database, tmp_path, monkeypatch):
+async def test_create_memory_route_requires_provenance(db: Database, tmp_path, monkeypatch):
     from memforge.server.admin_api import create_admin_app
 
     async def fake_embed(self, _text: str) -> list[float]:
@@ -408,13 +403,44 @@ async def test_create_memory_route_ignores_legacy_reason_field(db: Database, tmp
             },
         )
 
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_memory_route_ignores_legacy_reason_field(db: Database, tmp_path, monkeypatch):
+    from memforge.server.admin_api import create_admin_app
+
+    async def fake_embed(self, _text: str) -> list[float]:
+        return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr("memforge.memory.store.MemoryStore._embed", fake_embed)
+
+    app = create_admin_app(
+        db=db,
+        config=AppConfig(base_dir=tmp_path / "memforge"),
+        principal_resolver=lambda _request: "andrew.sun01@sap.com",
+    )
+
+    provenance = "User explicitly asked to keep this convention after reviewing MCP memory behavior."
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/memories/create",
+            json={
+                "content": "Keep create_memory content durable and reusable.",
+                "provenance": provenance,
+                "reason": "Legacy clients used to send this field.",
+                "memory_type": "convention",
+                "client": "codex",
+            },
+        )
+
     assert response.status_code == 200, response.text
     payload = response.json()
     stored = await db.get_memory(payload["memory_id"])
     sources = await db.get_memory_sources(payload["memory_id"])
     assert stored is not None
-    assert stored.extraction_context is None
-    assert sources[0].excerpt == "Keep create_memory content durable and reusable."
+    assert stored.extraction_context == provenance
+    assert sources[0].excerpt == provenance
 
 
 @pytest.mark.asyncio
@@ -491,6 +517,7 @@ async def test_replace_memory_route_audits_request_principal(db: Database, tmp_p
             f"/api/memories/{memory.id}/replace",
             json={
                 "replacement_content": "Route replacement corrected fact",
+                "provenance": "User supplied the corrected route in chat.",
                 "reason": "User corrected this memory.",
                 "expected_content_hash": memory.content_hash,
                 "replacement_kind": "supersession",

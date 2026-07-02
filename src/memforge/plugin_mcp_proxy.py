@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.21-rc.6"
+SERVER_VERSION = "0.1.21-rc.7"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 WORKSPACE_ROOT_ENV_VARS = ("CODEX_WORKSPACE_ROOT",)
@@ -238,9 +238,9 @@ TOOLS: list[dict[str, Any]] = [
                 "provenance": {
                     "type": "string",
                     "description": (
-                        "Optional evidence or source context for the provenance card. Use this for "
-                        "details that explain where the memory came from but should not be used as "
-                        "RAG memory content."
+                        "Required evidence or source context for the provenance card. Use this "
+                        "for details that explain where the memory came from but should not be "
+                        "used as RAG memory content."
                     ),
                 },
                 "memory_type": {
@@ -259,7 +259,7 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "Optional stable key for retrying the same user-confirmed create action.",
                 },
             },
-            "required": ["content"],
+            "required": ["content", "provenance"],
             "additionalProperties": False,
         },
     },
@@ -318,7 +318,7 @@ TOOLS: list[dict[str, Any]] = [
                 "provenance": {
                     "type": "string",
                     "description": (
-                        "Optional evidence or source context for the correction provenance card. "
+                        "Required evidence or source context for the correction provenance card. "
                         "Use this for details that explain where the replacement came from but "
                         "should not be used as RAG memory content."
                     ),
@@ -341,7 +341,7 @@ TOOLS: list[dict[str, Any]] = [
                     ),
                 },
             },
-            "required": ["memory_id", "replacement_content", "reason", "expected_content_hash"],
+            "required": ["memory_id", "replacement_content", "provenance", "reason", "expected_content_hash"],
             "additionalProperties": False,
         },
     },
@@ -497,13 +497,11 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("tags must be an array of strings")
             body = {
                 "content": _required_string_arg(args, "content"),
+                "provenance": _required_string_arg(args, "provenance"),
                 "memory_type": memory_type,
                 "tags": tags,
                 "client": _mcp_client(),
             }
-            provenance = _optional_string_arg(args, "provenance")
-            if provenance:
-                body["provenance"] = provenance
             if "confidence" in args:
                 confidence = args.get("confidence")
                 if not isinstance(confidence, (int, float)):
@@ -537,13 +535,11 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("replacement_kind must be revision or supersession")
             body = {
                 "replacement_content": _required_string_arg(args, "replacement_content"),
+                "provenance": _required_string_arg(args, "provenance"),
                 "reason": _required_string_arg(args, "reason"),
                 "expected_content_hash": _required_string_arg(args, "expected_content_hash"),
                 "replacement_kind": replacement_kind,
             }
-            provenance = _optional_string_arg(args, "provenance")
-            if provenance:
-                body["provenance"] = provenance
         except ValueError as exc:
             return {"error": str(exc)}
         return _http_json("POST", f"/api/memories/{quote(memory_id, safe='')}/replace", body)

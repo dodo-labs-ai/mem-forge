@@ -998,7 +998,7 @@ def test_mcp_proxy_starts_without_memforge_executable():
     _, payload = result.stdout.split(b"\r\n\r\n", 1)
     response = json.loads(payload)
     assert response["result"]["serverInfo"]["name"] == "memforge"
-    assert response["result"]["serverInfo"]["version"] == "0.1.21-rc.6"
+    assert response["result"]["serverInfo"]["version"] == "0.1.21-rc.7"
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
 
 
@@ -1571,7 +1571,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "search -> get_memory -> get_resource" in tools["get_resource"]["description"]
 
     create_schema = tools["create_memory"]["inputSchema"]
-    assert create_schema["required"] == ["content"]
+    assert create_schema["required"] == ["content", "provenance"]
     assert create_schema["properties"]["memory_type"]["enum"] == ["fact", "decision", "convention", "procedure"]
     assert "provenance" in create_schema["properties"]
     assert "reason" not in create_schema["properties"]
@@ -1591,6 +1591,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert replace_schema["required"] == [
         "memory_id",
         "replacement_content",
+        "provenance",
         "reason",
         "expected_content_hash",
     ]
@@ -1780,6 +1781,7 @@ def test_mcp_proxy_create_memory_uses_codex_workspace_root_when_roots_are_not_ad
         "create_memory",
         {
             "content": "Use readable confirmation previews before memory mutations.",
+            "provenance": "User confirmed this convention after reviewing the MemForge MCP UX.",
             "memory_type": "convention",
             "tags": ["ux", "mcp"],
         },
@@ -1788,6 +1790,7 @@ def test_mcp_proxy_create_memory_uses_codex_workspace_root_when_roots_are_not_ad
     assert result == {"status": "inserted", "memory_id": "mem-new"}
     assert json.loads(captured["body"].decode()) == {
         "content": "Use readable confirmation previews before memory mutations.",
+        "provenance": "User confirmed this convention after reviewing the MemForge MCP UX.",
         "memory_type": "convention",
         "tags": ["ux", "mcp"],
         "client": "codex",
@@ -1808,6 +1811,7 @@ def test_mcp_proxy_rejects_create_memory_when_repo_roots_are_missing(monkeypatch
         "create_memory",
         {
             "content": "Use readable confirmation previews before memory mutations.",
+            "provenance": "User confirmed this convention after reviewing the MemForge MCP UX.",
             "memory_type": "convention",
             "tags": ["ux", "mcp"],
         },
@@ -1819,6 +1823,28 @@ def test_mcp_proxy_rejects_create_memory_when_repo_roots_are_missing(monkeypatch
             "the MCP client did not advertise roots support. Refusing to create an unscoped memory."
         )
     }
+
+
+def test_mcp_proxy_rejects_create_memory_without_provenance(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+
+    class FailOpener:
+        def open(self, *_args, **_kwargs):
+            raise AssertionError("create_memory should fail before posting without provenance")
+
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FailOpener())
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: "github.com/shno-labs/mem-forge")
+
+    result = proxy._call_tool(
+        "create_memory",
+        {
+            "content": "Use readable confirmation previews before memory mutations.",
+            "memory_type": "convention",
+            "tags": ["ux", "mcp"],
+        },
+    )
+
+    assert result == {"error": "provenance is required"}
 
 
 def test_mcp_proxy_forwards_replace_memory_to_lifecycle_endpoint(monkeypatch):
@@ -1870,6 +1896,29 @@ def test_mcp_proxy_forwards_replace_memory_to_lifecycle_endpoint(monkeypatch):
         "expected_content_hash": "hash-old",
         "replacement_kind": "revision",
     }
+
+
+def test_mcp_proxy_rejects_replace_memory_without_provenance(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+
+    class FailOpener:
+        def open(self, *_args, **_kwargs):
+            raise AssertionError("replace_memory should fail before posting without provenance")
+
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FailOpener())
+
+    result = proxy._call_tool(
+        "replace_memory",
+        {
+            "memory_id": "mem-old",
+            "replacement_content": "Use the new deployment route.",
+            "reason": "User corrected the stale route.",
+            "expected_content_hash": "hash-old",
+            "replacement_kind": "revision",
+        },
+    )
+
+    assert result == {"error": "provenance is required"}
 
 
 def test_mcp_proxy_forwards_memory_review_tools(monkeypatch):
@@ -2568,7 +2617,7 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
     assert "raw-api-secret" not in serialized
     assert "[REDACTED]" in serialized
     assert payload["schema_version"] == "agent-session-window/v1"
-    assert payload["plugin_version"] == "0.1.21-rc.6"
+    assert payload["plugin_version"] == "0.1.21-rc.7"
     assert payload["receipt"]["metadata"]["uploaded_to_line"] == 2
     assert payload["receipt"]["metadata"]["observed_to_line"] == 2
 
