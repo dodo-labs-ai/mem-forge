@@ -151,7 +151,7 @@ class MemoryLifecycleService:
         if not replacement_content:
             raise MemoryLifecycleConflict("replacement_content_required")
         provenance = provenance.strip() if provenance else None
-        correction_excerpt = provenance or f"User correction reason: {reason.strip()}"
+        correction_excerpt = provenance
 
         old = await self._active_target(memory_id, expected_content_hash=expected_content_hash)
         now = datetime.now(timezone.utc)

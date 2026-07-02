@@ -228,6 +228,31 @@ async def test_replace_document_memory_creates_correction_provenance_without_car
 
 
 @pytest.mark.asyncio
+async def test_replace_document_memory_without_provenance_does_not_use_reason_as_excerpt(db: Database):
+    old = _memory("mem-replace-tool-no-provenance", "Mount Tai defects use queue A")
+    await db.insert_memory(old)
+    collection = RecordingCollection()
+    store = _store(db, collection)
+    service = MemoryLifecycleService(db=db, memory_store=store)
+
+    result = await service.replace_memory(
+        old.id,
+        replacement_content="Mount Tai defects use queue B",
+        reason="User corrected the queue.",
+        expected_content_hash=old.content_hash,
+        replacement_kind="revision",
+    )
+
+    stored_new = await db.get_memory(result.replacement_memory_id)
+    new_sources = await db.get_memory_sources(result.replacement_memory_id)
+    assert stored_new is not None
+    assert stored_new.content == "Mount Tai defects use queue B"
+    assert len(new_sources) == 1
+    assert new_sources[0].source_type == "user_correction"
+    assert new_sources[0].excerpt is None
+
+
+@pytest.mark.asyncio
 async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     observed_at = datetime(2026, 6, 28, tzinfo=timezone.utc)
     old = _memory("mem-agent-tool-old", "Use claude-code to invoke Claude Code CLI")
