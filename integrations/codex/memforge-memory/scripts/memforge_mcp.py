@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.21"
+SERVER_VERSION = "0.1.22"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 WORKSPACE_ROOT_ENV_VARS = ("CODEX_WORKSPACE_ROOT",)
@@ -54,6 +54,7 @@ SEARCH_ALLOWED_KEYS = frozenset(
         "source_filter",
         "time_range",
         "top_k",
+        "offset",
     }
 )
 SOURCE_FILTER_ALLOWED_KEYS = frozenset(
@@ -65,6 +66,8 @@ SOURCE_FILTER_ALLOWED_KEYS = frozenset(
 )
 TIME_RANGE_ALLOWED_KEYS = frozenset({"date_type", "start_date", "end_date"})
 DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+SEARCH_TOP_K_MIN = 1
+SEARCH_TOP_K_MAX = 50
 _CLIENT_SUPPORTS_ROOTS = False
 _PENDING_ROOTS_REQUEST_ID: str | None = None
 _CLIENT_ROOT_PATHS: list[str] = []
@@ -79,10 +82,16 @@ TOOLS: list[dict[str, Any]] = [
             "source such as a Jira/Confluence source, call list_sources first and pass exact "
             "source_ids here; never guess source ids from the name. Query may be omitted only "
             "for deterministic listing with source_filter or time_range. Convert phrases like "
-            "'last week' into explicit YYYY-MM-DD start_date/end_date before calling. A result "
-            "may include follow_up with suggested_tool and reason. Search results do not include "
-            "source links or artifact URLs; call get_memory for provenance, source titles, exact "
-            "links, quotes, and lifecycle details before relying on source evidence."
+            "'last week' into explicit YYYY-MM-DD start_date/end_date before calling. For "
+            "complete-list, enumeration, or inventory requests, use list_sources, then queryless deterministic "
+            "listing; if total_candidates is greater than returned results, the answer is not a "
+            "complete list until you request the next page with offset. Set each next offset to "
+            "the previous offset plus the number of results returned. Stop when results is empty "
+            "or the next offset is greater than or equal to total_candidates. For complete-list "
+            "inventory tasks, choose a larger top_k page size up to 50 instead of assuming the default 10 is "
+            "enough. A result may include follow_up with suggested_tool and reason. Search results "
+            "do not include source links or artifact URLs; call get_memory for provenance, source "
+            "titles, exact links, quotes, and lifecycle details before relying on source evidence."
         ),
         "inputSchema": {
             "type": "object",
@@ -153,7 +162,27 @@ TOOLS: list[dict[str, Any]] = [
                     "anyOf": [{"required": ["start_date"]}, {"required": ["end_date"]}],
                     "additionalProperties": False,
                 },
-                "top_k": {"type": "integer", "default": 10},
+                "top_k": {
+                    "type": "integer",
+                    "default": 10,
+                    "minimum": SEARCH_TOP_K_MIN,
+                    "maximum": SEARCH_TOP_K_MAX,
+                    "description": (
+                        "Page size for search results. Default is 10 for ordinary semantic search, "
+                        "not a hard cap; use a larger value up to 50 for complete list, enumeration, or inventory "
+                        "tasks, then continue with offset when total_candidates is still larger."
+                    ),
+                },
+                "offset": {
+                    "type": "integer",
+                    "default": 0,
+                    "minimum": 0,
+                    "description": (
+                        "Zero-based result offset for the next page. Use when total_candidates "
+                        "is greater than the number of returned results and the user asked for a "
+                        "complete list or inventory."
+                    ),
+                },
             },
             "additionalProperties": False,
         },
@@ -615,6 +644,20 @@ def _optional_int_arg(args: dict[str, Any], name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer") from exc
 
 
+def _required_non_negative_int_arg(args: dict[str, Any], name: str) -> int:
+    value = args.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _required_bounded_int_arg(args: dict[str, Any], name: str, *, minimum: int, maximum: int) -> int:
+    value = args.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > maximum:
+        raise ValueError(f"{name} must be an integer from {minimum} to {maximum}")
+    return value
+
+
 def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
     unknown = sorted(set(args) - SEARCH_ALLOWED_KEYS)
     if unknown:
@@ -624,6 +667,15 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
     body = dict(args)
     query = str(body.get("query") or "").strip()
     has_deterministic_filter = False
+    if "top_k" in body:
+        body["top_k"] = _required_bounded_int_arg(
+            body,
+            "top_k",
+            minimum=SEARCH_TOP_K_MIN,
+            maximum=SEARCH_TOP_K_MAX,
+        )
+    if "offset" in body:
+        body["offset"] = _required_non_negative_int_arg(body, "offset")
     body["include_private"] = True
     body["include_superseded"] = False
     repo_identifier = _active_repo_identifier()
