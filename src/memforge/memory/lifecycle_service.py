@@ -67,7 +67,7 @@ class MemoryLifecycleService:
         self,
         *,
         content: str,
-        reason: str,
+        provenance: str,
         owner_user_id: str,
         client: str,
         memory_type: str = MemoryType.FACT.value,
@@ -77,11 +77,11 @@ class MemoryLifecycleService:
         idempotency_key: str | None = None,
     ) -> CreateMemoryResult:
         content = content.strip()
-        reason = reason.strip()
+        provenance = provenance.strip() if provenance else None
         if not content:
             raise MemoryLifecycleConflict("content_required")
-        if not reason:
-            raise MemoryLifecycleConflict("reason_required")
+        if not provenance:
+            raise MemoryLifecycleConflict("provenance_required")
         if not owner_user_id.strip():
             raise MemoryLifecycleConflict("owner_user_id_required")
         memory_type = self._validate_memory_type(memory_type)
@@ -102,13 +102,13 @@ class MemoryLifecycleService:
             created_at=now,
             updated_at=now,
             status="active",
-            extraction_context=reason,
+            extraction_context=provenance,
         )
         doc_id = self._user_memory_doc_id(memory.id, idempotency_key=idempotency_key)
         await self._write_user_memory_document(
             doc_id=doc_id,
             memory=memory,
-            reason=reason,
+            provenance=provenance,
             client=client,
             observed_at=now,
         )
@@ -142,6 +142,7 @@ class MemoryLifecycleService:
         memory_id: str,
         *,
         replacement_content: str,
+        provenance: str,
         reason: str,
         expected_content_hash: str,
         replacement_kind: ReplacementKind = "supersession",
@@ -150,6 +151,9 @@ class MemoryLifecycleService:
         replacement_content = replacement_content.strip()
         if not replacement_content:
             raise MemoryLifecycleConflict("replacement_content_required")
+        provenance = provenance.strip() if provenance else None
+        if not provenance:
+            raise MemoryLifecycleConflict("provenance_required")
 
         old = await self._active_target(memory_id, expected_content_hash=expected_content_hash)
         now = datetime.now(timezone.utc)
@@ -195,6 +199,7 @@ class MemoryLifecycleService:
                 doc_id=correction_doc_id,
                 old_memory=old,
                 replacement_content=replacement_content,
+                provenance=provenance,
                 reason=reason,
                 replacement_kind=replacement_kind,
                 observed_at=now,
@@ -234,19 +239,19 @@ class MemoryLifecycleService:
         doc_id: str,
         old_memory: Memory,
         replacement_content: str,
+        provenance: str,
         reason: str,
         replacement_kind: ReplacementKind,
         observed_at: datetime,
     ) -> None:
-        document_body = "\n".join(
-            [
-                f"Target memory: {old_memory.id}",
-                f"Replacement kind: {replacement_kind}",
-                f"Reason: {reason}",
-                "",
-                replacement_content,
-            ]
-        )
+        lines = [
+            f"Target memory: {old_memory.id}",
+            f"Replacement kind: {replacement_kind}",
+            f"Reason: {reason}",
+        ]
+        lines.extend(["", "Provenance:", provenance])
+        lines.extend(["", "Replacement content:", replacement_content])
+        document_body = "\n".join(lines)
         await self.db.upsert_document(
             DocumentRecord(
                 doc_id=doc_id,
@@ -273,15 +278,18 @@ class MemoryLifecycleService:
         *,
         doc_id: str,
         memory: Memory,
-        reason: str,
+        provenance: str,
         client: str,
         observed_at: datetime,
     ) -> None:
         document_body = "\n".join(
             [
                 f"Client: {client}",
-                f"Reason: {reason}",
                 "",
+                "Provenance:",
+                provenance,
+                "",
+                "Memory:",
                 memory.content,
             ]
         )

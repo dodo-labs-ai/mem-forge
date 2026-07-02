@@ -94,7 +94,7 @@ class ToolClient:
         self,
         *,
         content: str,
-        reason: str,
+        provenance: str,
         memory_type: str = "fact",
         tags: list[str] | tuple[str, ...] | None = None,
         confidence: float | None = None,
@@ -104,10 +104,10 @@ class ToolClient:
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "content": content,
-            "reason": reason,
             "memory_type": memory_type,
             "tags": list(tags or []),
             "client": client,
+            "provenance": provenance,
         }
         if confidence is not None:
             body["confidence"] = confidence
@@ -141,6 +141,7 @@ class ToolClient:
         memory_id: str,
         *,
         replacement_content: str,
+        provenance: str,
         reason: str,
         expected_content_hash: str,
         replacement_kind: str = "supersession",
@@ -148,15 +149,17 @@ class ToolClient:
         memory_id = memory_id.strip()
         if not memory_id:
             return {"error": "memory_id is required"}
+        body = {
+            "replacement_content": replacement_content,
+            "provenance": provenance,
+            "reason": reason,
+            "expected_content_hash": expected_content_hash,
+            "replacement_kind": replacement_kind,
+        }
         return self._http_json(
             "POST",
             f"/api/memories/{quote(memory_id, safe='')}/replace",
-            {
-                "replacement_content": replacement_content,
-                "reason": reason,
-                "expected_content_hash": expected_content_hash,
-                "replacement_kind": replacement_kind,
-            },
+            body,
         )
 
     def push_local_markdown_document(

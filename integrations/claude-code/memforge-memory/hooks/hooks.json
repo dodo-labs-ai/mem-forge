@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}/scripts/memforge_hook.py\" context --client claude-code",
+            "command": "sh -lc 'root=\"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; script=\"$root/scripts/memforge_hook.py\"; if [ ! -f \"$script\" ]; then echo \"MemForge hook script not found\" >&2; exit 0; fi; exec python3 \"$script\" context --client claude-code'",
             "timeout": 10,
             "statusMessage": "Loading MemForge context"
           }
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}/scripts/memforge_hook.py\" submit-session --client claude-code",
+            "command": "sh -lc 'root=\"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; script=\"$root/scripts/memforge_hook.py\"; if [ ! -f \"$script\" ]; then echo \"MemForge hook script not found\" >&2; exit 0; fi; exec python3 \"$script\" submit-session --client claude-code'",
             "timeout": 15,
             "statusMessage": "Submitting MemForge compaction receipt"
           }
@@ -30,7 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}/scripts/memforge_hook.py\" submit-session --client claude-code",
+            "command": "sh -lc 'root=\"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; script=\"$root/scripts/memforge_hook.py\"; if [ ! -f \"$script\" ]; then echo \"MemForge hook script not found\" >&2; exit 0; fi; exec python3 \"$script\" submit-session --client claude-code'",
             "timeout": 15,
             "statusMessage": "Submitting MemForge session receipt"
           }
@@ -42,7 +42,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}/scripts/memforge_hook.py\" submit-session --client claude-code",
+            "command": "sh -lc 'root=\"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; script=\"$root/scripts/memforge_hook.py\"; if [ ! -f \"$script\" ]; then echo \"MemForge hook script not found\" >&2; exit 0; fi; exec python3 \"$script\" submit-session --client claude-code'",
             "timeout": 15,
             "statusMessage": "Submitting MemForge subagent receipt"
           }

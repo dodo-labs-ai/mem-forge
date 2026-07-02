@@ -40,8 +40,14 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.19"
+SERVER_VERSION = "0.1.21-rc.9"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
+ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
+WORKSPACE_ROOT_ENV_VARS = ("CODEX_WORKSPACE_ROOT",)
+CURRENT_REPO_ONLY_DISABLED_ERROR = (
+    "current_repo_only is disabled for MCP search because repo-scoped search depends on reliable "
+    "workspace roots. Omit the filter to search all visible memories."
+)
 SEARCH_ALLOWED_KEYS = frozenset(
     {
         "query",
@@ -59,6 +65,10 @@ SOURCE_FILTER_ALLOWED_KEYS = frozenset(
 )
 TIME_RANGE_ALLOWED_KEYS = frozenset({"date_type", "start_date", "end_date"})
 DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_CLIENT_SUPPORTS_ROOTS = False
+_PENDING_ROOTS_REQUEST_ID: str | None = None
+_CLIENT_ROOT_PATHS: list[str] = []
+_CLIENT_ROOTS_ERROR: str | None = None
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -106,14 +116,6 @@ TOOLS: list[dict[str, Any]] = [
                             "description": (
                                 "Restrict agent-session memories by producer. Use only when "
                                 "the user explicitly names Codex or Claude Code."
-                            ),
-                        },
-                        "current_repo_only": {
-                            "type": "boolean",
-                            "description": (
-                                "Restrict to agent-session memories for the current git "
-                                "repository. The local proxy resolves the exact repo "
-                                "identifier; do not provide repo ids."
                             ),
                         },
                     },
@@ -220,11 +222,11 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Create a new memory when the user asks to remember or record durable knowledge. "
             "Users need not name this tool. First search for similar memories to avoid duplicates, "
-            "show a readable preview with the new claim, scope, type/tags, and reason, then get "
+            "show a readable preview with the new durable claim, provenance/evidence, scope, and type/tags, then get "
             "explicit confirmation via request_user_input if available, else a concise text question. "
             "Generate durable memory content from the confirmed preview without unapproved semantic changes. "
             "Keep provenance, confirmation details, test/deploy notes, and why-the-tool-was-called "
-            "out of content; put the user-facing why in reason. Never create memory silently."
+            "out of content; put source details in provenance. Never create memory silently."
         ),
         "inputSchema": {
             "type": "object",
@@ -235,12 +237,16 @@ TOOLS: list[dict[str, Any]] = [
                         "Canonical durable memory content generated from the user-confirmed readable "
                         "preview. Preserve its meaning without unapproved semantic changes. Do not "
                         "put confirmation details, provenance, test/deploy notes, or why-the-tool-was-called "
-                        "into content; those belong in reason or source provenance."
+                        "into content; those belong in provenance or stay out of the memory."
                     ),
                 },
-                "reason": {
+                "provenance": {
                     "type": "string",
-                    "description": "User-facing reason for creating this memory.",
+                    "description": (
+                        "Required evidence or source context for the provenance card. Use this "
+                        "for details that explain where the memory came from but should not be "
+                        "used as RAG memory content."
+                    ),
                 },
                 "memory_type": {
                     "type": "string",
@@ -258,7 +264,7 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "Optional stable key for retrying the same user-confirmed create action.",
                 },
             },
-            "required": ["content", "reason"],
+            "required": ["content", "provenance"],
             "additionalProperties": False,
         },
     },
@@ -295,9 +301,12 @@ TOOLS: list[dict[str, Any]] = [
             "Replace a memory when conversation context shows a claim should be corrected, "
             "narrowed, broadened, or superseded. Users need not name this tool. First fetch "
             "the memory for hash/provenance, show a readable preview with old claim, new "
-            "claim, scope, and reason, then get explicit confirmation via request_user_input "
-            "if available, else a concise text question. Generate replacement_content from "
-            "the confirmed preview without unapproved semantic changes. Never replace silently."
+            "claim, provenance/evidence, scope, and replacement reason, then get explicit "
+            "confirmation via request_user_input if available, else a concise text question. "
+            "Generate replacement_content from the confirmed preview without unapproved semantic "
+            "changes. Keep provenance, confirmation details, test/deploy notes, and "
+            "why-the-tool-was-called out of replacement_content; put source details in "
+            "provenance. Never replace silently."
         ),
         "inputSchema": {
             "type": "object",
@@ -307,7 +316,17 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": (
                         "Canonical memory text generated from the user-confirmed readable preview; "
-                        "preserve its meaning without unapproved semantic changes."
+                        "preserve its meaning without unapproved semantic changes. Do not put "
+                        "confirmation details, provenance, test/deploy notes, or why-the-tool-was-called "
+                        "into replacement_content; those belong in provenance or stay out of the memory."
+                    ),
+                },
+                "provenance": {
+                    "type": "string",
+                    "description": (
+                        "Required evidence or source context for the correction provenance card. "
+                        "Use this for details that explain where the replacement came from but "
+                        "should not be used as RAG memory content."
                     ),
                 },
                 "reason": {
@@ -328,7 +347,7 @@ TOOLS: list[dict[str, Any]] = [
                     ),
                 },
             },
-            "required": ["memory_id", "replacement_content", "reason", "expected_content_hash"],
+            "required": ["memory_id", "replacement_content", "provenance", "reason", "expected_content_hash"],
             "additionalProperties": False,
         },
     },
@@ -417,7 +436,11 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | None:
     method = message.get("method")
     request_id = message.get("id")
     try:
+        if method is None:
+            _handle_rpc_response(message)
+            return None
         if method == "initialize":
+            _record_client_capabilities(message)
             result = {
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"tools": {"listChanged": False}},
@@ -425,6 +448,13 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | None:
             }
             return _rpc_result(request_id, result)
         if method == "notifications/initialized":
+            if _CLIENT_SUPPORTS_ROOTS and _PENDING_ROOTS_REQUEST_ID is None and not _CLIENT_ROOT_PATHS:
+                return _request_client_roots()
+            return None
+        if method == "notifications/roots/list_changed":
+            _CLIENT_ROOT_PATHS.clear()
+            if _CLIENT_SUPPORTS_ROOTS:
+                return _request_client_roots()
             return None
         if method == "ping":
             return _rpc_result(request_id, {})
@@ -473,7 +503,7 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("tags must be an array of strings")
             body = {
                 "content": _required_string_arg(args, "content"),
-                "reason": _required_string_arg(args, "reason"),
+                "provenance": _required_string_arg(args, "provenance"),
                 "memory_type": memory_type,
                 "tags": tags,
                 "client": _mcp_client(),
@@ -484,8 +514,9 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                     raise ValueError("confidence must be a number")
                 body["confidence"] = float(confidence)
             repo_identifier = _active_repo_identifier()
-            if repo_identifier:
-                body["repo_identifier"] = repo_identifier
+            if not repo_identifier:
+                raise ValueError(_create_memory_repo_error())
+            body["repo_identifier"] = repo_identifier
             idempotency_key = str(args.get("idempotency_key") or "").strip()
             if idempotency_key:
                 body["idempotency_key"] = idempotency_key
@@ -510,6 +541,7 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("replacement_kind must be revision or supersession")
             body = {
                 "replacement_content": _required_string_arg(args, "replacement_content"),
+                "provenance": _required_string_arg(args, "provenance"),
                 "reason": _required_string_arg(args, "reason"),
                 "expected_content_hash": _required_string_arg(args, "expected_content_hash"),
                 "replacement_kind": replacement_kind,
@@ -565,6 +597,14 @@ def _required_string_arg(args: dict[str, Any], name: str) -> str:
     return value
 
 
+def _optional_string_arg(args: dict[str, Any], name: str) -> str | None:
+    value = args.get(name)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _optional_int_arg(args: dict[str, Any], name: str, default: int) -> int:
     value = args.get(name)
     if value is None or value == "":
@@ -596,7 +636,7 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "Unsupported source_filter parameter(s): "
                 + ", ".join(unknown_filter_keys)
-                + ". Use current_repo_only for repo-scoped search or omit the facet."
+                + ". Omit repo-scoped facets until MCP roots are available."
             )
         source_ids = source_filter.get("source_ids")
         if source_ids is not None:
@@ -604,14 +644,8 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
                 isinstance(item, str) and item.strip() for item in source_ids
             ):
                 raise ValueError("source_filter.source_ids must be a non-empty array of source IDs from list_sources")
-        current_repo_only = bool(source_filter.pop("current_repo_only", False))
-        if current_repo_only:
-            if not repo_identifier:
-                raise ValueError(
-                    "current_repo_only requires a detectable git repository. "
-                    "Omit the filter to search all visible memories."
-                )
-            source_filter["repo_identifiers"] = [repo_identifier]
+        if "current_repo_only" in source_filter:
+            raise ValueError(CURRENT_REPO_ONLY_DISABLED_ERROR)
         has_deterministic_filter = bool(source_filter)
         body["source_filter"] = source_filter
     time_range = body.get("time_range")
@@ -649,15 +683,63 @@ def _validate_time_range(value: Any) -> dict[str, str]:
 
 
 def _active_repo_identifier() -> str | None:
-    configured = os.getenv("MEMFORGE_ACTIVE_REPO_IDENTIFIER", "").strip()
-    if configured:
-        return _normalize_repo_identifier(configured)
-    remote = _git_value(["git", "remote", "get-url", "origin"])
-    normalized_remote = _normalize_repo_identifier(remote)
-    if normalized_remote:
-        return normalized_remote
-    root = _git_value(["git", "rev-parse", "--show-toplevel"])
-    return Path(root).name if root else None
+    identifiers = _client_root_repo_identifiers()
+    if len(identifiers) == 1:
+        return next(iter(identifiers))
+    if not _CLIENT_SUPPORTS_ROOTS:
+        env_identifier = _env_workspace_repo_identifier()
+        if env_identifier:
+            return env_identifier
+    return None
+
+
+def _create_memory_repo_error() -> str:
+    reason = _repo_roots_error_reason()
+    return f"create_memory requires exactly one git remote from MCP workspace roots; {reason}. Refusing to create an unscoped memory."
+
+
+def _repo_roots_error_reason() -> str:
+    if not _CLIENT_SUPPORTS_ROOTS:
+        if _env_workspace_root():
+            return "the MCP client did not advertise roots support and CODEX_WORKSPACE_ROOT does not resolve to a git remote"
+        return "the MCP client did not advertise roots support"
+    elif _PENDING_ROOTS_REQUEST_ID is not None:
+        return "the MCP client has not returned workspace roots yet"
+    elif _CLIENT_ROOTS_ERROR:
+        return f"the MCP client returned an error for roots/list: {_CLIENT_ROOTS_ERROR}"
+    elif not _CLIENT_ROOT_PATHS:
+        return "the MCP client did not provide workspace roots"
+    identifiers = _client_root_repo_identifiers()
+    if len(identifiers) > 1:
+        return "workspace roots resolve to multiple git remotes"
+    return "workspace roots do not resolve to a git remote"
+
+
+def _client_root_repo_identifiers() -> set[str]:
+    return {
+        repo_identifier
+        for root_path in _CLIENT_ROOT_PATHS
+        if (repo_identifier := _repo_identifier_from_cwd(root_path))
+    }
+
+
+def _env_workspace_repo_identifier() -> str | None:
+    if env_root := _env_workspace_root():
+        return _repo_identifier_from_cwd(env_root)
+    return None
+
+
+def _env_workspace_root() -> str | None:
+    for name in WORKSPACE_ROOT_ENV_VARS:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def _repo_identifier_from_cwd(cwd: str | Path) -> str | None:
+    remote = _git_value(["git", "remote", "get-url", "origin"], cwd=cwd)
+    return _normalize_repo_identifier(remote)
 
 
 def _mcp_client() -> str:
@@ -689,11 +771,11 @@ def _normalize_repo_identifier(repo: str | None) -> str | None:
     return value.lower() or None
 
 
-def _git_value(command: list[str]) -> str | None:
+def _git_value(command: list[str], *, cwd: str | Path | None = None) -> str | None:
     try:
         result = subprocess.run(
             command,
-            cwd=os.getcwd(),
+            cwd=str(cwd or os.getcwd()),
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -704,6 +786,57 @@ def _git_value(command: list[str]) -> str | None:
         return None
     value = result.stdout.strip()
     return value or None
+
+
+def _record_client_capabilities(message: dict[str, Any]) -> None:
+    global _CLIENT_SUPPORTS_ROOTS, _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOT_PATHS, _CLIENT_ROOTS_ERROR
+    params = message.get("params") if isinstance(message.get("params"), dict) else {}
+    capabilities = params.get("capabilities") if isinstance(params.get("capabilities"), dict) else {}
+    _CLIENT_SUPPORTS_ROOTS = isinstance(capabilities.get("roots"), dict)
+    _PENDING_ROOTS_REQUEST_ID = None
+    _CLIENT_ROOT_PATHS = []
+    _CLIENT_ROOTS_ERROR = None
+
+
+def _request_client_roots() -> dict[str, Any]:
+    global _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOTS_ERROR
+    _PENDING_ROOTS_REQUEST_ID = ROOTS_LIST_REQUEST_ID
+    _CLIENT_ROOTS_ERROR = None
+    return {"jsonrpc": "2.0", "id": ROOTS_LIST_REQUEST_ID, "method": "roots/list"}
+
+
+def _handle_rpc_response(message: dict[str, Any]) -> None:
+    global _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOT_PATHS, _CLIENT_ROOTS_ERROR
+    if message.get("id") != _PENDING_ROOTS_REQUEST_ID:
+        return
+    _PENDING_ROOTS_REQUEST_ID = None
+    error = message.get("error")
+    if isinstance(error, dict):
+        _CLIENT_ROOTS_ERROR = str(error.get("message") or error).strip()
+        _CLIENT_ROOT_PATHS = []
+        return
+    _CLIENT_ROOTS_ERROR = None
+    result = message.get("result") if isinstance(message.get("result"), dict) else {}
+    roots = result.get("roots") if isinstance(result.get("roots"), list) else []
+    _CLIENT_ROOT_PATHS = [path for item in roots if (path := _root_path(item))]
+
+
+def _root_path(item: Any) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    uri = str(item.get("uri") or "").strip()
+    if not uri:
+        return None
+    parsed = urlparse(uri)
+    if parsed.scheme and parsed.scheme != "file":
+        return None
+    if parsed.scheme == "file":
+        if parsed.netloc and parsed.netloc not in {"localhost", "127.0.0.1"}:
+            path = f"//{parsed.netloc}{parsed.path}"
+        else:
+            path = parsed.path
+        return unquote(path) or None
+    return uri
 
 
 def _tool_result(payload: dict[str, Any]) -> dict[str, Any]:

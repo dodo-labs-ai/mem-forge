@@ -173,7 +173,7 @@ def test_tool_client_create_memory_posts_user_memory_payload():
 
     result = client.create_memory(
         content="Use readable confirmation previews before memory mutations.",
-        reason="User confirmed the new memory preview.",
+        provenance="User asked to remember this after reviewing the MemForge MCP UX.",
         memory_type="convention",
         tags=["ux", "mcp"],
         client="codex",
@@ -187,7 +187,7 @@ def test_tool_client_create_memory_posts_user_memory_payload():
             "/api/memories/create",
             {
                 "content": "Use readable confirmation previews before memory mutations.",
-                "reason": "User confirmed the new memory preview.",
+                "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
                 "memory_type": "convention",
                 "tags": ["ux", "mcp"],
                 "client": "codex",
@@ -222,6 +222,7 @@ def test_tool_client_replace_memory_posts_lifecycle_guard():
     result = client.replace_memory(
         "mem-1",
         replacement_content="Corrected memory",
+        provenance="User supplied the corrected value in chat.",
         reason="User corrected it",
         expected_content_hash="hash-1",
         replacement_kind="revision",
@@ -234,6 +235,7 @@ def test_tool_client_replace_memory_posts_lifecycle_guard():
             "/api/memories/mem-1/replace",
             {
                 "replacement_content": "Corrected memory",
+                "provenance": "User supplied the corrected value in chat.",
                 "reason": "User corrected it",
                 "expected_content_hash": "hash-1",
                 "replacement_kind": "revision",
