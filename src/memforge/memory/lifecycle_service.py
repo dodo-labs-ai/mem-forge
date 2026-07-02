@@ -117,7 +117,7 @@ class MemoryLifecycleService:
             doc_id,
             "user_memory",
             source_updated_at=now,
-            excerpt=provenance,
+            excerpt=content,
         )
         memory_id = memory.id
         if status != "inserted":
@@ -190,7 +190,7 @@ class MemoryLifecycleService:
                 confidence=new_memory.confidence,
                 observed_at=now,
                 source_updated_at=now,
-                excerpt=provenance,
+                excerpt=replacement_content,
                 replacement_reason=reason,
             )
         else:
@@ -212,7 +212,7 @@ class MemoryLifecycleService:
                 replacement_kind=replacement_kind,
                 replacement_reason=reason,
                 source_updated_at=now,
-                excerpt=provenance,
+                excerpt=replacement_content,
                 carry_revision_sources=False,
             )
 
@@ -239,7 +239,7 @@ class MemoryLifecycleService:
         doc_id: str,
         old_memory: Memory,
         replacement_content: str,
-        provenance: str | None,
+        provenance: str,
         reason: str,
         replacement_kind: ReplacementKind,
         observed_at: datetime,
@@ -249,8 +249,7 @@ class MemoryLifecycleService:
             f"Replacement kind: {replacement_kind}",
             f"Reason: {reason}",
         ]
-        if provenance:
-            lines.extend(["", "Provenance:", provenance])
+        lines.extend(["", "Provenance:", provenance])
         lines.extend(["", "Replacement content:", replacement_content])
         document_body = "\n".join(lines)
         await self.db.upsert_document(

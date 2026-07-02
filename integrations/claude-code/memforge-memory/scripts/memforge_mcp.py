@@ -40,10 +40,14 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.21-rc.7"
+SERVER_VERSION = "0.1.21-rc.9"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 WORKSPACE_ROOT_ENV_VARS = ("CODEX_WORKSPACE_ROOT",)
+CURRENT_REPO_ONLY_DISABLED_ERROR = (
+    "current_repo_only is disabled for MCP search because repo-scoped search depends on reliable "
+    "workspace roots. Omit the filter to search all visible memories."
+)
 SEARCH_ALLOWED_KEYS = frozenset(
     {
         "query",
@@ -64,6 +68,7 @@ DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _CLIENT_SUPPORTS_ROOTS = False
 _PENDING_ROOTS_REQUEST_ID: str | None = None
 _CLIENT_ROOT_PATHS: list[str] = []
+_CLIENT_ROOTS_ERROR: str | None = None
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -296,11 +301,12 @@ TOOLS: list[dict[str, Any]] = [
             "Replace a memory when conversation context shows a claim should be corrected, "
             "narrowed, broadened, or superseded. Users need not name this tool. First fetch "
             "the memory for hash/provenance, show a readable preview with old claim, new "
-            "claim, scope, and reason, then get explicit confirmation via request_user_input "
-            "if available, else a concise text question. Generate replacement_content from "
-            "the confirmed preview without unapproved semantic changes. Keep provenance, "
-            "confirmation details, test/deploy notes, and why-the-tool-was-called out of "
-            "replacement_content; put source details in provenance. Never replace silently."
+            "claim, provenance/evidence, scope, and replacement reason, then get explicit "
+            "confirmation via request_user_input if available, else a concise text question. "
+            "Generate replacement_content from the confirmed preview without unapproved semantic "
+            "changes. Keep provenance, confirmation details, test/deploy notes, and "
+            "why-the-tool-was-called out of replacement_content; put source details in "
+            "provenance. Never replace silently."
         ),
         "inputSchema": {
             "type": "object",
@@ -447,7 +453,7 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | None:
             return None
         if method == "notifications/roots/list_changed":
             _CLIENT_ROOT_PATHS.clear()
-            if _CLIENT_SUPPORTS_ROOTS and _PENDING_ROOTS_REQUEST_ID is None:
+            if _CLIENT_SUPPORTS_ROOTS:
                 return _request_client_roots()
             return None
         if method == "ping":
@@ -638,9 +644,8 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
                 isinstance(item, str) and item.strip() for item in source_ids
             ):
                 raise ValueError("source_filter.source_ids must be a non-empty array of source IDs from list_sources")
-        # Temporarily disabled until Codex hosts reliably provide MCP roots or
-        # CODEX_WORKSPACE_ROOT. Keep accepting stale callers but search globally.
-        source_filter.pop("current_repo_only", None)
+        if "current_repo_only" in source_filter:
+            raise ValueError(CURRENT_REPO_ONLY_DISABLED_ERROR)
         has_deterministic_filter = bool(source_filter)
         body["source_filter"] = source_filter
     time_range = body.get("time_range")
@@ -688,11 +693,6 @@ def _active_repo_identifier() -> str | None:
     return None
 
 
-def _current_repo_only_error() -> str:
-    reason = _repo_roots_error_reason()
-    return f"current_repo_only requires exactly one git remote from MCP workspace roots; {reason}. Omit the filter to search all visible memories."
-
-
 def _create_memory_repo_error() -> str:
     reason = _repo_roots_error_reason()
     return f"create_memory requires exactly one git remote from MCP workspace roots; {reason}. Refusing to create an unscoped memory."
@@ -700,13 +700,13 @@ def _create_memory_repo_error() -> str:
 
 def _repo_roots_error_reason() -> str:
     if not _CLIENT_SUPPORTS_ROOTS:
-        if env_root := _env_workspace_root():
-            if _repo_identifier_from_cwd(env_root):
-                return "the MCP client did not advertise roots support and host workspace root resolution was inconsistent"
+        if _env_workspace_root():
             return "the MCP client did not advertise roots support and CODEX_WORKSPACE_ROOT does not resolve to a git remote"
         return "the MCP client did not advertise roots support"
     elif _PENDING_ROOTS_REQUEST_ID is not None:
         return "the MCP client has not returned workspace roots yet"
+    elif _CLIENT_ROOTS_ERROR:
+        return f"the MCP client returned an error for roots/list: {_CLIENT_ROOTS_ERROR}"
     elif not _CLIENT_ROOT_PATHS:
         return "the MCP client did not provide workspace roots"
     identifiers = _client_root_repo_identifiers()
@@ -789,25 +789,33 @@ def _git_value(command: list[str], *, cwd: str | Path | None = None) -> str | No
 
 
 def _record_client_capabilities(message: dict[str, Any]) -> None:
-    global _CLIENT_SUPPORTS_ROOTS, _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOT_PATHS
+    global _CLIENT_SUPPORTS_ROOTS, _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOT_PATHS, _CLIENT_ROOTS_ERROR
     params = message.get("params") if isinstance(message.get("params"), dict) else {}
     capabilities = params.get("capabilities") if isinstance(params.get("capabilities"), dict) else {}
     _CLIENT_SUPPORTS_ROOTS = isinstance(capabilities.get("roots"), dict)
     _PENDING_ROOTS_REQUEST_ID = None
     _CLIENT_ROOT_PATHS = []
+    _CLIENT_ROOTS_ERROR = None
 
 
 def _request_client_roots() -> dict[str, Any]:
-    global _PENDING_ROOTS_REQUEST_ID
+    global _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOTS_ERROR
     _PENDING_ROOTS_REQUEST_ID = ROOTS_LIST_REQUEST_ID
+    _CLIENT_ROOTS_ERROR = None
     return {"jsonrpc": "2.0", "id": ROOTS_LIST_REQUEST_ID, "method": "roots/list"}
 
 
 def _handle_rpc_response(message: dict[str, Any]) -> None:
-    global _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOT_PATHS
+    global _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOT_PATHS, _CLIENT_ROOTS_ERROR
     if message.get("id") != _PENDING_ROOTS_REQUEST_ID:
         return
     _PENDING_ROOTS_REQUEST_ID = None
+    error = message.get("error")
+    if isinstance(error, dict):
+        _CLIENT_ROOTS_ERROR = str(error.get("message") or error).strip()
+        _CLIENT_ROOT_PATHS = []
+        return
+    _CLIENT_ROOTS_ERROR = None
     result = message.get("result") if isinstance(message.get("result"), dict) else {}
     roots = result.get("roots") if isinstance(result.get("roots"), list) else []
     _CLIENT_ROOT_PATHS = [path for item in roots if (path := _root_path(item))]

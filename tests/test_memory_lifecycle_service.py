@@ -127,10 +127,8 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
     assert [(source.doc_id, source.source_type) for source in sources] == [
         (f"user-memory-{result.memory_id}", "user_memory")
     ]
-    assert sources[0].excerpt == (
-        "During the xall-004 smoke test, PayrollProcessingTriggerViews polling only "
-        "matched after using Status and FollowUpStepStatus."
-    )
+    assert sources[0].excerpt == "Use Status and FollowUpStepStatus when polling PayrollProcessingTriggerViews."
+    assert sources[0].excerpt != stored.extraction_context
     document = await db.get_document(f"user-memory-{result.memory_id}")
     assert document is not None
     assert document.source == "user_memory"
@@ -223,8 +221,8 @@ async def test_replace_document_memory_creates_correction_provenance_without_car
     assert [(source.doc_id, source.source_type) for source in new_sources] == [
         (f"correction-{result.replacement_memory_id}", "user_correction")
     ]
-    assert new_sources[0].excerpt == "User corrected this after reviewing the Mount Tai defect triage board."
-    assert new_sources[0].excerpt != stored_new.content
+    assert new_sources[0].excerpt == "Mount Tai defects use queue B"
+    assert new_sources[0].excerpt != "User corrected this after reviewing the Mount Tai defect triage board."
 
 
 @pytest.mark.asyncio
@@ -407,7 +405,7 @@ async def test_create_memory_route_requires_provenance(db: Database, tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_create_memory_route_ignores_legacy_reason_field(db: Database, tmp_path, monkeypatch):
+async def test_create_memory_route_rejects_legacy_reason_field(db: Database, tmp_path, monkeypatch):
     from memforge.server.admin_api import create_admin_app
 
     async def fake_embed(self, _text: str) -> list[float]:
@@ -434,13 +432,8 @@ async def test_create_memory_route_ignores_legacy_reason_field(db: Database, tmp
             },
         )
 
-    assert response.status_code == 200, response.text
-    payload = response.json()
-    stored = await db.get_memory(payload["memory_id"])
-    sources = await db.get_memory_sources(payload["memory_id"])
-    assert stored is not None
-    assert stored.extraction_context == provenance
-    assert sources[0].excerpt == provenance
+    assert response.status_code == 422
+    assert "Extra inputs are not permitted" in response.text
 
 
 @pytest.mark.asyncio

@@ -327,7 +327,7 @@ class MemoryLifecycleResponse(BaseModel):
 
 
 class MemoryCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     content: str = Field(min_length=1)
     provenance: str = Field(min_length=1)
