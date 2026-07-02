@@ -1,6 +1,6 @@
 {
   "name": "memory",
-  "version": "0.1.21-rc.7",
+  "version": "0.1.21-rc.9",
   "description": "MemForge hook integration for Codex.",
   "author": {
     "name": "MemForge Team"
