@@ -203,6 +203,7 @@ async def test_replace_document_memory_creates_correction_provenance_without_car
     result = await service.replace_memory(
         old.id,
         replacement_content="Mount Tai defects use queue B",
+        provenance="User corrected this after reviewing the Mount Tai defect triage board.",
         reason="User corrected the queue.",
         expected_content_hash=old.content_hash,
         replacement_kind="revision",
@@ -222,6 +223,8 @@ async def test_replace_document_memory_creates_correction_provenance_without_car
     assert [(source.doc_id, source.source_type) for source in new_sources] == [
         (f"correction-{result.replacement_memory_id}", "user_correction")
     ]
+    assert new_sources[0].excerpt == "User corrected this after reviewing the Mount Tai defect triage board."
+    assert new_sources[0].excerpt != stored_new.content
 
 
 @pytest.mark.asyncio

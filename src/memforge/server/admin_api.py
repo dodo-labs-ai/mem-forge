@@ -348,6 +348,7 @@ class MemoryReplaceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     replacement_content: str = Field(min_length=1)
+    provenance: str | None = None
     reason: str = Field(min_length=1)
     expected_content_hash: str = Field(min_length=1)
     replacement_kind: Literal["revision", "supersession"] = "supersession"
@@ -2787,6 +2788,7 @@ def create_admin_app(
             result = await service.replace_memory(
                 memory_id,
                 replacement_content=req.replacement_content,
+                provenance=req.provenance,
                 reason=req.reason,
                 expected_content_hash=req.expected_content_hash,
                 replacement_kind=req.replacement_kind,

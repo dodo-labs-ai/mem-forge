@@ -141,6 +141,7 @@ class MemoryLifecycleService:
         memory_id: str,
         *,
         replacement_content: str,
+        provenance: str | None = None,
         reason: str,
         expected_content_hash: str,
         replacement_kind: ReplacementKind = "supersession",
@@ -149,6 +150,8 @@ class MemoryLifecycleService:
         replacement_content = replacement_content.strip()
         if not replacement_content:
             raise MemoryLifecycleConflict("replacement_content_required")
+        provenance = provenance.strip() if provenance else None
+        correction_excerpt = provenance or f"User correction reason: {reason.strip()}"
 
         old = await self._active_target(memory_id, expected_content_hash=expected_content_hash)
         now = datetime.now(timezone.utc)
@@ -185,7 +188,7 @@ class MemoryLifecycleService:
                 confidence=new_memory.confidence,
                 observed_at=now,
                 source_updated_at=now,
-                excerpt=replacement_content,
+                excerpt=correction_excerpt,
                 replacement_reason=reason,
             )
         else:
@@ -194,6 +197,7 @@ class MemoryLifecycleService:
                 doc_id=correction_doc_id,
                 old_memory=old,
                 replacement_content=replacement_content,
+                provenance=provenance,
                 reason=reason,
                 replacement_kind=replacement_kind,
                 observed_at=now,
@@ -206,7 +210,7 @@ class MemoryLifecycleService:
                 replacement_kind=replacement_kind,
                 replacement_reason=reason,
                 source_updated_at=now,
-                excerpt=replacement_content,
+                excerpt=correction_excerpt,
                 carry_revision_sources=False,
             )
 
@@ -233,19 +237,20 @@ class MemoryLifecycleService:
         doc_id: str,
         old_memory: Memory,
         replacement_content: str,
+        provenance: str | None,
         reason: str,
         replacement_kind: ReplacementKind,
         observed_at: datetime,
     ) -> None:
-        document_body = "\n".join(
-            [
-                f"Target memory: {old_memory.id}",
-                f"Replacement kind: {replacement_kind}",
-                f"Reason: {reason}",
-                "",
-                replacement_content,
-            ]
-        )
+        lines = [
+            f"Target memory: {old_memory.id}",
+            f"Replacement kind: {replacement_kind}",
+            f"Reason: {reason}",
+        ]
+        if provenance:
+            lines.extend(["", "Provenance:", provenance])
+        lines.extend(["", "Replacement content:", replacement_content])
+        document_body = "\n".join(lines)
         await self.db.upsert_document(
             DocumentRecord(
                 doc_id=doc_id,

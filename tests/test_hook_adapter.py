@@ -998,7 +998,7 @@ def test_mcp_proxy_starts_without_memforge_executable():
     _, payload = result.stdout.split(b"\r\n\r\n", 1)
     response = json.loads(payload)
     assert response["result"]["serverInfo"]["name"] == "memforge"
-    assert response["result"]["serverInfo"]["version"] == "0.1.21-rc.5"
+    assert response["result"]["serverInfo"]["version"] == "0.1.21-rc.6"
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
 
 
@@ -1205,11 +1205,31 @@ def test_mcp_proxy_adds_client_root_git_remote_as_ranking_hint_only(monkeypatch,
     assert "source_filter" not in body
 
 
-def test_mcp_proxy_ignores_env_repo_override_for_current_repo_filter(monkeypatch):
+def test_mcp_proxy_ignores_current_repo_filter_when_repo_context_is_unavailable(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
+    captured = {}
     monkeypatch.setenv("MEMFORGE_ACTIVE_REPO_IDENTIFIER", "github.tools.sap/hcm/memforge-cloud")
 
-    result = proxy._call_tool(
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    proxy._call_tool(
         "search",
         {
             "query": "scheduler fix",
@@ -1219,15 +1239,12 @@ def test_mcp_proxy_ignores_env_repo_override_for_current_repo_filter(monkeypatch
         },
     )
 
-    assert result == {
-        "error": (
-            "current_repo_only requires exactly one git remote from MCP workspace roots; "
-            "the MCP client did not advertise roots support. Omit the filter to search all visible memories."
-        )
-    }
+    body = json.loads(captured["body"].decode())
+    assert body["source_filter"] == {}
+    assert "active_repo_identifier" not in body
 
 
-def test_mcp_proxy_converts_current_repo_only_from_client_roots_when_started_outside_repo(monkeypatch, tmp_path):
+def test_mcp_proxy_ignores_current_repo_filter_even_when_client_roots_are_available(monkeypatch, tmp_path):
     proxy = _load_plugin_mcp_proxy()
     captured = {}
     repo_root = tmp_path / "memforge-cloud"
@@ -1299,19 +1316,37 @@ def test_mcp_proxy_converts_current_repo_only_from_client_roots_when_started_out
 
     body = json.loads(captured["body"].decode())
     assert body["active_repo_identifier"] == "github.com/dodoman-sun/memforge-cloud"
-    assert body["source_filter"] == {
-        "repo_identifiers": ["github.com/dodoman-sun/memforge-cloud"],
-    }
+    assert body["source_filter"] == {}
 
 
-def test_mcp_proxy_rejects_current_repo_only_when_cwd_is_git_repo_but_roots_are_missing(monkeypatch, tmp_path):
+def test_mcp_proxy_ignores_current_repo_filter_when_cwd_is_git_repo_but_roots_are_missing(monkeypatch, tmp_path):
     proxy = _load_plugin_mcp_proxy()
+    captured = {}
     repo_root = tmp_path / "memforge-cloud"
     repo_root.mkdir()
     _init_git_repo_with_origin(repo_root, "https://github.com/dodoman-sun/memforge-cloud.git")
     monkeypatch.chdir(repo_root)
 
-    result = proxy._call_tool(
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    proxy._call_tool(
         "search",
         {
             "query": "scheduler fix",
@@ -1321,12 +1356,9 @@ def test_mcp_proxy_rejects_current_repo_only_when_cwd_is_git_repo_but_roots_are_
         },
     )
 
-    assert result == {
-        "error": (
-            "current_repo_only requires exactly one git remote from MCP workspace roots; "
-            "the MCP client did not advertise roots support. Omit the filter to search all visible memories."
-        )
-    }
+    body = json.loads(captured["body"].decode())
+    assert body["source_filter"] == {}
+    assert "active_repo_identifier" not in body
 
 
 def test_mcp_proxy_uses_codex_workspace_root_when_roots_are_not_advertised(monkeypatch, tmp_path):
@@ -1371,19 +1403,37 @@ def test_mcp_proxy_uses_codex_workspace_root_when_roots_are_not_advertised(monke
 
     body = json.loads(captured["body"].decode())
     assert body["active_repo_identifier"] == "github.com/dodoman-sun/memforge-cloud"
-    assert body["source_filter"] == {
-        "repo_identifiers": ["github.com/dodoman-sun/memforge-cloud"],
-    }
+    assert body["source_filter"] == {}
 
 
-def test_mcp_proxy_rejects_current_repo_only_when_root_has_no_git_remote(tmp_path):
+def test_mcp_proxy_ignores_current_repo_filter_when_root_has_no_git_remote(monkeypatch, tmp_path):
     proxy = _load_plugin_mcp_proxy()
+    captured = {}
     repo_root = tmp_path / "local-only"
     repo_root.mkdir()
     subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     _provide_mcp_roots(proxy, repo_root)
 
-    result = proxy._call_tool(
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    proxy._call_tool(
         "search",
         {
             "query": "scheduler fix",
@@ -1393,16 +1443,14 @@ def test_mcp_proxy_rejects_current_repo_only_when_root_has_no_git_remote(tmp_pat
         },
     )
 
-    assert result == {
-        "error": (
-            "current_repo_only requires exactly one git remote from MCP workspace roots; "
-            "workspace roots do not resolve to a git remote. Omit the filter to search all visible memories."
-        )
-    }
+    body = json.loads(captured["body"].decode())
+    assert body["source_filter"] == {}
+    assert "active_repo_identifier" not in body
 
 
-def test_mcp_proxy_rejects_current_repo_only_when_roots_have_multiple_git_remotes(tmp_path):
+def test_mcp_proxy_ignores_current_repo_filter_when_roots_have_multiple_git_remotes(monkeypatch, tmp_path):
     proxy = _load_plugin_mcp_proxy()
+    captured = {}
     first_root = tmp_path / "memforge-cloud"
     second_root = tmp_path / "mem-forge"
     first_root.mkdir()
@@ -1411,7 +1459,26 @@ def test_mcp_proxy_rejects_current_repo_only_when_roots_have_multiple_git_remote
     _init_git_repo_with_origin(second_root, "https://github.com/shno-labs/mem-forge.git")
     _provide_mcp_roots(proxy, first_root, second_root)
 
-    result = proxy._call_tool(
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    proxy._call_tool(
         "search",
         {
             "query": "scheduler fix",
@@ -1421,12 +1488,9 @@ def test_mcp_proxy_rejects_current_repo_only_when_roots_have_multiple_git_remote
         },
     )
 
-    assert result == {
-        "error": (
-            "current_repo_only requires exactly one git remote from MCP workspace roots; "
-            "workspace roots resolve to multiple git remotes. Omit the filter to search all visible memories."
-        )
-    }
+    body = json.loads(captured["body"].decode())
+    assert body["source_filter"] == {}
+    assert "active_repo_identifier" not in body
 
 
 def test_mcp_proxy_rejects_unadvertised_search_source_ids(monkeypatch):
@@ -1484,7 +1548,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
         "claude-code",
         "codex",
     ]
-    assert "current_repo_only" in properties["source_filter"]["properties"]
+    assert "current_repo_only" not in properties["source_filter"]["properties"]
     assert "repo_identifiers" not in properties["source_filter"]["properties"]
     assert "source_instance_ids" not in properties["source_filter"]["properties"]
     assert "sources" not in properties
@@ -1530,6 +1594,9 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
         "reason",
         "expected_content_hash",
     ]
+    assert "provenance" in replace_schema["properties"]
+    assert "Do not put confirmation details" in replace_schema["properties"]["replacement_content"]["description"]
+    assert "provenance" in tools["replace_memory"]["description"]
     assert replace_schema["properties"]["replacement_kind"]["enum"] == ["revision", "supersession"]
     assert "status" not in replace_schema["properties"]
 
@@ -1786,6 +1853,7 @@ def test_mcp_proxy_forwards_replace_memory_to_lifecycle_endpoint(monkeypatch):
         {
             "memory_id": "mem-old",
             "replacement_content": "Use the new deployment route.",
+            "provenance": "User corrected this while reviewing the deployment guide.",
             "reason": "User corrected the stale route.",
             "expected_content_hash": "hash-old",
             "replacement_kind": "revision",
@@ -1797,6 +1865,7 @@ def test_mcp_proxy_forwards_replace_memory_to_lifecycle_endpoint(monkeypatch):
     assert captured["url"] == "https://memforge.example/api/memories/mem-old/replace"
     assert json.loads(captured["body"].decode()) == {
         "replacement_content": "Use the new deployment route.",
+        "provenance": "User corrected this while reviewing the deployment guide.",
         "reason": "User corrected the stale route.",
         "expected_content_hash": "hash-old",
         "replacement_kind": "revision",
@@ -2060,7 +2129,7 @@ def test_mcp_proxy_rejects_unadvertised_source_filter_facets(monkeypatch):
     assert result == {
         "error": (
             "Unsupported source_filter parameter(s): repo_identifiers, source_types. "
-            "Use current_repo_only for repo-scoped search or omit the facet."
+            "Omit repo-scoped facets until MCP roots are available."
         )
     }
 
@@ -2499,7 +2568,7 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
     assert "raw-api-secret" not in serialized
     assert "[REDACTED]" in serialized
     assert payload["schema_version"] == "agent-session-window/v1"
-    assert payload["plugin_version"] == "0.1.21-rc.5"
+    assert payload["plugin_version"] == "0.1.21-rc.6"
     assert payload["receipt"]["metadata"]["uploaded_to_line"] == 2
     assert payload["receipt"]["metadata"]["observed_to_line"] == 2
 
