@@ -15,6 +15,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from memforge.agent_knowledge_markdown import (
+    render_agent_concept_markdown,
+    render_agent_concept_markdown_with_patch,
+)
 from memforge.memory.evidence import (
     AccessContext,
     AuthorityCase,
@@ -228,7 +232,7 @@ class AgentKnowledgeBundleService:
                 claim_text=proposal.claim_text,
                 citations=proposal.citations,
             )
-            markdown_body = _render_markdown(
+            markdown_body = render_agent_concept_markdown(
                 title=proposal.title,
                 concept_type=proposal.concept_type,
                 repo_identifier=repo_identifier,
@@ -925,37 +929,12 @@ class AgentKnowledgeBundleService:
         claim_text: str,
         citations: list[str],
     ) -> str:
-        claims = await self.db.list_agent_claims(concept["id"])
-        citations_by_claim = {claim["id"]: await self.db.list_agent_claim_citations(claim["id"]) for claim in claims}
-        patched_claims = []
-        claim_seen = False
-        for claim in claims:
-            if claim["id"] == claim_id:
-                patched_claims.append({**claim, "claim_text": claim_text})
-                claim_seen = True
-            else:
-                patched_claims.append(claim)
-        if not claim_seen:
-            patched_claims.append({"id": claim_id, "claim_text": claim_text})
-
-        merged_citations: dict[str, list[str]] = {}
-        for claim in patched_claims:
-            existing = [
-                citation["citation_url"]
-                for citation in citations_by_claim.get(claim["id"], [])
-                if citation["citation_url"].strip()
-            ]
-            if claim["id"] == claim_id:
-                existing.extend(citation.strip() for citation in citations if citation.strip())
-            merged_citations[claim["id"]] = list(dict.fromkeys(existing))
-
-        return _render_markdown(
-            title=concept["title"],
-            concept_type=concept["concept_type"],
-            repo_identifier=concept.get("repo_identifier"),
-            claim_id=patched_claims[0]["id"] if patched_claims else claim_id,
-            claim_text="\n\n".join(claim["claim_text"] for claim in patched_claims),
-            citations=[citation for claim in patched_claims for citation in merged_citations[claim["id"]]],
+        return await render_agent_concept_markdown_with_patch(
+            self.db,
+            concept,
+            claim_id=claim_id,
+            claim_text=claim_text,
+            citations=citations,
         )
 
     async def _validated_covered_ids(
@@ -1335,34 +1314,3 @@ def _concept_path(
 ) -> str:
     repo = slugify(repo_identifier or "no-repo")
     return f"users/{slugify(owner_user_id)}/repos/{repo}/{concept_type}/{slugify(title)}.md"
-
-
-def _render_markdown(
-    *,
-    title: str,
-    concept_type: str,
-    repo_identifier: str | None,
-    claim_id: str,
-    claim_text: str,
-    citations: list[str],
-) -> str:
-    frontmatter = {
-        "type": concept_type,
-        "title": title,
-        "visibility": Visibility.PRIVATE.value,
-        "repo_identifier": repo_identifier,
-    }
-    citation_lines = "\n".join(f"- {citation}" for citation in citations if citation.strip())
-    return (
-        "---\n"
-        f"{json.dumps(frontmatter, indent=2, sort_keys=True)}\n"
-        "---\n\n"
-        f"# {title}\n\n"
-        "<!--\n"
-        "mf:claim\n"
-        f'id="{claim_id}"\n'
-        "-->\n"
-        f"{claim_text.strip()}\n\n"
-        "# Citations\n\n"
-        f"{citation_lines or '- none'}\n"
-    )
