@@ -14,7 +14,6 @@ import pytest
 from memforge import runtime
 from memforge.config import AppConfig, RetrievalConfig
 from memforge.models import Memory, content_hash
-from memforge.retrieval.query_analyzer import QueryAnalysis
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
@@ -95,11 +94,6 @@ async def test_search_does_not_append_document_results_when_memory_results_are_s
 ):
     memory = _memory("mem-only-result", "PostgreSQL memory")
     await db.insert_memory(memory)
-
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     adapters = build_sqlite_adapters(db, FakeCollection([memory.id]))
     engine = SearchEngine(

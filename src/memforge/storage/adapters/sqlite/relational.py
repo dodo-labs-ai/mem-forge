@@ -9,8 +9,11 @@ today, so no caller reaches a connection directly.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import datetime
 from typing import Any, Sequence
+
+import aiosqlite
 
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.models import (
@@ -728,7 +731,7 @@ class SqliteRelationalStore:
         try:
             async with self._db.db.execute(sql, [*params, limit]) as cursor:
                 return [row async for row in cursor]
-        except Exception:
+        except (aiosqlite.Error, sqlite3.Error):
             logger.exception("SQLite entity linker query failed")
             return []
 

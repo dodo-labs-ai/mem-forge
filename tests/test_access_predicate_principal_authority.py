@@ -59,7 +59,6 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
     # server must derive identity from the request, not from the body, and
     # must not return U2's private memory to the resolved principal (U1).
     from memforge.server.admin_api import create_admin_app
-    from memforge.retrieval import search as search_module
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "principal.db"))
@@ -111,13 +110,6 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
         monkeypatch.setattr(
             runtime_module, "build_search_engine", fake_build_search_engine
         )
-
-        from memforge.retrieval.query_analyzer import QueryAnalysis
-
-        async def fake_analyze_query(*args, **kwargs):
-            return QueryAnalysis()
-
-        monkeypatch.setattr(search_module, "analyze_query", fake_analyze_query)
 
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:

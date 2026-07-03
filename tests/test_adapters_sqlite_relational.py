@@ -242,6 +242,54 @@ async def test_link_query_entities_honors_disabled_sources(db):
 
 
 @pytest.mark.asyncio
+async def test_link_query_entities_honors_source_filter(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-wiki"))
+    await store.insert_memory(_memory("m-jira"))
+    await _document(db, "doc-wiki", source="wiki")
+    await _document(db, "doc-jira", source="jira")
+    wiki_entity = await db.upsert_entity("wiki blocker", "Wiki Blocker", ["feature"])
+    jira_entity = await db.upsert_entity("jira blocker", "Jira Blocker", ["feature"])
+    await db.link_memory_entity("m-wiki", wiki_entity)
+    await db.link_memory_entity("m-jira", jira_entity)
+    await store.add_memory_source("m-wiki", "doc-wiki", "confluence", None, source_updated_at=None)
+    await store.add_memory_source("m-jira", "doc-jira", "jira", None, source_updated_at=None)
+
+    result = await store.link_query_entities(
+        "wiki blocker and jira blocker",
+        scope=_scope(),
+        source_filter=MemorySourceFilter(source_ids=("wiki",)),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
+        (wiki_entity, "alias_exact", "wiki blocker")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_honors_memory_types(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-fact", memory_type="fact"))
+    await store.insert_memory(_memory("m-procedure", memory_type="procedure"))
+    fact_entity = await db.upsert_entity("fact blocker", "Fact Blocker", ["feature"])
+    procedure_entity = await db.upsert_entity("procedure blocker", "Procedure Blocker", ["feature"])
+    await db.link_memory_entity("m-fact", fact_entity)
+    await db.link_memory_entity("m-procedure", procedure_entity)
+
+    result = await store.link_query_entities(
+        "fact blocker and procedure blocker",
+        scope=_scope(),
+        memory_types=("procedure",),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
+        (procedure_entity, "alias_exact", "procedure blocker")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_filter_ids_by_source_and_time_uses_the_source_join(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))
