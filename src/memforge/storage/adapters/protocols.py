@@ -46,9 +46,19 @@ class KeywordCandidate:
     matched_text: tuple[str, ...] = ()
 
 
+DEFAULT_ENTITY_LINK_LIMIT = 5
+"""Default maximum linked entities per query; keeps graph fan-out bounded."""
+
+
 @dataclass(frozen=True)
 class EntityLinkCandidate:
-    """Visible entity candidate that can optionally activate graph retrieval."""
+    """Visible entity candidate with channel evidence.
+
+    `activates_graph` is true only for linker channels trusted to seed graph
+    retrieval, such as explicit, exact-alias, and lexical-alias matches.
+    Diagnostic channels such as compact formatting recall can return visible
+    candidates while leaving graph retrieval disabled.
+    """
 
     entity_id: int
     canonical_name: str
@@ -138,7 +148,7 @@ class RelationalStore(Protocol):
         explicit_entities: Sequence[str] = (),
         source_filter: MemorySourceFilter | None = None,
         memory_types: Sequence[str] | None = None,
-        limit: int = 5,
+        limit: int = DEFAULT_ENTITY_LINK_LIMIT,
     ) -> EntityLinkResult: ...
     async def add_memory_source(
         self,

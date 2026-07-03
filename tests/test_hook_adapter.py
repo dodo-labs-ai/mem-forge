@@ -1217,6 +1217,42 @@ def test_mcp_proxy_forwards_explicit_search_entities(monkeypatch):
     }
 
 
+def test_mcp_proxy_omits_empty_explicit_search_entities(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool("search", {"query": "deployment owner", "entities": []})
+
+    assert result == {"results": []}
+    assert json.loads(captured["body"].decode()) == {
+        "query": "deployment owner",
+        "include_private": True,
+        "include_superseded": False,
+    }
+
+
 @pytest.mark.parametrize(
     "entities",
     [

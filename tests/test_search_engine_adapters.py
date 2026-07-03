@@ -127,6 +127,35 @@ async def test_search_routes_vector_and_bm25_through_the_adapters(db, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_current_search_path_does_not_call_entity_linking_stub(db, monkeypatch):
+    active = _memory("m-active", "PostgreSQL pooling memory")
+    await db.insert_memory(active)
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    async def fail_link_query_entities(*args, **kwargs):
+        raise AssertionError("link_query_entities is not wired until the deterministic linker slice")
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    adapters = build_sqlite_adapters(db, FakeCollection([active.id]))
+    monkeypatch.setattr(adapters.relational, "link_query_entities", fail_link_query_entities)
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("PostgreSQL", entities=["postgresql"], top_k=10)
+
+    assert [r.memory_id for r in result["results"]] == [active.id]
+
+
+@pytest.mark.asyncio
 async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch):
     target = _memory("m-blocker", "Lifecycle assignment skips person assignment creation")
     await db.insert_memory(target)
