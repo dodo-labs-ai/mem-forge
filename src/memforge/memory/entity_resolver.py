@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +31,19 @@ __all__ = [
     "validate_alias",
     "insert_llm_alias",
 ]
+
+_ENTITY_EMBEDDING_LOAD_LOCKS: dict[int, asyncio.Lock] = {}
+_ENTITY_EMBEDDING_LOAD_LOCKS_GUARD = threading.Lock()
+
+
+def _embedding_load_lock_for(db: object) -> asyncio.Lock:
+    key = id(db)
+    with _ENTITY_EMBEDDING_LOAD_LOCKS_GUARD:
+        lock = _ENTITY_EMBEDDING_LOAD_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _ENTITY_EMBEDDING_LOAD_LOCKS[key] = lock
+        return lock
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +182,7 @@ class EntityResolver:
         self.embedding_threshold = embedding_threshold
         # Cache: entity_id -> embedding vector (populated lazily)
         self._entity_embeddings: dict[int, list[float]] = {}
+        self._entity_by_id: dict[int, Entity] = {}
         self._embeddings_loaded = False
         # Resolution stats (observability)
         self._stats = {
@@ -317,29 +332,34 @@ class EntityResolver:
         if self._embeddings_loaded:
             return
 
-        entities = await db.get_all_entities()
-        if not entities:
+        async with _embedding_load_lock_for(db):
+            if self._embeddings_loaded:
+                return
+
+            entities = await db.get_all_entities()
+            self._entity_by_id = {entity.id: entity for entity in entities}
+            if not entities:
+                self._embeddings_loaded = True
+                return
+
+            # Batch embed all entity canonical names
+            names = [e.canonical_name for e in entities]
+            try:
+                from memforge.retrieval.embeddings import embed_texts
+
+                vectors = await asyncio.to_thread(
+                    embed_texts,
+                    names,
+                    self.embed_cfg["base_url"],
+                    self.embed_cfg["api_key"],
+                    self.embed_cfg["model"],
+                )
+                for entity, vector in zip(entities, vectors):
+                    self._entity_embeddings[entity.id] = vector
+            except Exception as e:
+                logger.warning("Failed to embed entity names: %s", e)
+
             self._embeddings_loaded = True
-            return
-
-        # Batch embed all entity canonical names
-        names = [e.canonical_name for e in entities]
-        try:
-            from memforge.retrieval.embeddings import embed_texts
-
-            vectors = await asyncio.to_thread(
-                embed_texts,
-                names,
-                self.embed_cfg["base_url"],
-                self.embed_cfg["api_key"],
-                self.embed_cfg["model"],
-            )
-            for entity, vector in zip(entities, vectors):
-                self._entity_embeddings[entity.id] = vector
-        except Exception as e:
-            logger.warning("Failed to embed entity names: %s", e)
-
-        self._embeddings_loaded = True
 
     def _find_similar_entities(
         self,
@@ -446,6 +466,11 @@ class EntityResolver:
 
     async def _get_entity_by_id(self, entity_id: int, db: Database) -> Entity | None:
         """Look up an entity by ID (scans all entities — OK for team scale)."""
+        cached = self._entity_by_id.get(entity_id)
+        if cached is not None:
+            return cached
+        if hasattr(db, "get_entity"):
+            return await db.get_entity(entity_id)
         all_entities = await db.get_all_entities()
         for e in all_entities:
             if e.id == entity_id:
@@ -481,6 +506,7 @@ class EntityResolver:
     def invalidate_cache(self) -> None:
         """Clear cached entity embeddings (call after new entities are created)."""
         self._entity_embeddings.clear()
+        self._entity_by_id.clear()
         self._embeddings_loaded = False
 
 
