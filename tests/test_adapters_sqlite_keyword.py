@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from memforge.models import Memory, content_hash
+from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch
@@ -75,6 +75,336 @@ async def test_search_filters_by_memory_type(db):
     keyword = SqliteKeywordSearch(db)
     assert await keyword.search('"deploy"', _scope(), ["decision"], limit=10) == []
     assert [mid for mid, _ in await keyword.search('"deploy"', _scope(), ["fact"], limit=10)] == ["m1"]
+
+
+@pytest.mark.asyncio
+async def test_metadata_title_tokens_recall_source_title(db):
+    now = datetime.now(timezone.utc).isoformat()
+    await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.db.execute(
+        """INSERT INTO documents
+           (doc_id, source, source_url, title, space_or_project, labels, last_modified, version, content_hash, last_synced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "SFPAY-179397",
+            "src-jira",
+            "https://jira.example/browse/SFPAY-179397",
+            "SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+            "PAY",
+            '["lifecycle"]',
+            now,
+            "1",
+            "doc-hash",
+            now,
+        ),
+    )
+    await db.add_memory_source(
+        "m-blocker",
+        "SFPAY-179397",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+
+    keyword = SqliteKeywordSearch(db)
+    assert keyword.metadata_search_channels == (
+        "bm25_metadata_tokens",
+        "metadata_alias",
+        "metadata_trigram",
+    )
+    assert keyword.disabled_metadata_search_channels == ()
+    hits = await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10)
+
+    assert [hit.memory_id for hit in hits] == ["m-blocker"]
+    assert hits[0].channel == "bm25_metadata_tokens"
+    assert "metadata_any" in hits[0].matched_fields
+    assert hits[0].source_refs[0].source_id == "src-jira"
+    assert hits[0].source_refs[0].doc_id == "SFPAY-179397"
+
+
+@pytest.mark.asyncio
+async def test_metadata_alias_recall_splits_camel_case_source_title(db):
+    await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _upsert_doc(
+        db,
+        title="SFPAY-179397: PeriodCutOffBlockerHint regression",
+    )
+    await db.add_memory_source(
+        "m-blocker",
+        "SFPAY-179397",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+
+    keyword = SqliteKeywordSearch(db)
+    hits = await keyword.search_metadata('"period" "cut" "off" "blocker" "hint"', _scope(), None, limit=10)
+
+    assert [hit.memory_id for hit in hits] == ["m-blocker"]
+    assert hits[0].channel == "metadata_alias"
+    assert "metadata_alias" in hits[0].matched_fields
+    assert any("PeriodCutOffBlockerHint" in text for text in hits[0].matched_text)
+
+
+@pytest.mark.asyncio
+async def test_metadata_trigram_recall_handles_compound_no_space_query(db):
+    await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _upsert_doc(
+        db,
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await db.add_memory_source(
+        "m-blocker",
+        "SFPAY-179397",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+
+    keyword = SqliteKeywordSearch(db)
+    hits = await keyword.search_metadata('"create" "blockerhints"', _scope(), None, limit=10)
+
+    assert [hit.memory_id for hit in hits] == ["m-blocker"]
+    assert hits[0].channel == "metadata_trigram"
+    assert "metadata_trigram" in hits[0].matched_fields
+    assert any("Create Blocker Hint" in text for text in hits[0].matched_text)
+
+
+@pytest.mark.asyncio
+async def test_metadata_index_populates_from_atomic_memory_source_insert(db):
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _upsert_doc(
+        db,
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await db.insert_memory_with_source_and_relation(
+        _memory("m-blocker", "Lifecycle assignment skips person assignment creation"),
+        doc_id="SFPAY-179397",
+        source_type="jira",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+
+    keyword = SqliteKeywordSearch(db)
+    hits = await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10)
+
+    assert [hit.memory_id for hit in hits] == ["m-blocker"]
+
+
+@pytest.mark.asyncio
+async def test_metadata_search_excludes_user_disabled_source_rows(db):
+    await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _upsert_doc(
+        db,
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await db.add_memory_source(
+        "m-blocker",
+        "SFPAY-179397",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+    await db.set_source_subscription("src-jira", LOCAL_DEV_USER_ID, False)
+
+    keyword = SqliteKeywordSearch(db)
+
+    assert await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10) == []
+
+
+async def _upsert_doc(
+    db: Database,
+    *,
+    doc_id: str = "SFPAY-179397",
+    title: str,
+    source: str = "src-jira",
+) -> None:
+    now = datetime.now(timezone.utc)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            source=source,
+            source_url=f"https://jira.example/browse/{doc_id}",
+            title=title,
+            space_or_project="PAY",
+            author="tester",
+            last_modified=now,
+            labels=["lifecycle"],
+            version="1",
+            content_hash=f"hash-{doc_id}-{title}",
+            token_count=1,
+            raw_content_uri=None,
+            raw_content_type="text/html",
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_metadata_index_refreshes_when_document_title_changes(db):
+    await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _upsert_doc(db, title="Old Lifecycle Title")
+    await db.add_memory_source(
+        "m-blocker",
+        "SFPAY-179397",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+
+    await _upsert_doc(
+        db,
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+
+    keyword = SqliteKeywordSearch(db)
+    hits = await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10)
+
+    assert [hit.memory_id for hit in hits] == ["m-blocker"]
+
+
+@pytest.mark.asyncio
+async def test_metadata_index_refreshes_when_source_name_changes(db):
+    await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _upsert_doc(db, title="SFPAY-179397")
+    await db.add_memory_source(
+        "m-blocker",
+        "SFPAY-179397",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+
+    keyword = SqliteKeywordSearch(db)
+    assert await keyword.search_metadata('"blocker" "hint" "queue"', _scope(), None, limit=10) == []
+
+    await db.upsert_source("src-jira", "jira", "Create Blocker Hint Queue", "{}")
+
+    hits = await keyword.search_metadata('"blocker" "hint" "queue"', _scope(), None, limit=10)
+    assert [hit.memory_id for hit in hits] == ["m-blocker"]
+
+
+@pytest.mark.asyncio
+async def test_rebuild_metadata_index_backfills_existing_sources(db):
+    await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _upsert_doc(
+        db,
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await db.add_memory_source(
+        "m-blocker",
+        "SFPAY-179397",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+    await db.db.execute("DELETE FROM memory_search_metadata_fts")
+    await db.db.execute("DELETE FROM memory_search_metadata_alias_fts")
+    await db.db.execute("DELETE FROM memory_search_metadata_trigram")
+    await db.db.commit()
+
+    keyword = SqliteKeywordSearch(db)
+    assert await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10) == []
+
+    await db.rebuild_memory_metadata_fts()
+
+    hits = await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10)
+    assert [hit.memory_id for hit in hits] == ["m-blocker"]
+
+
+@pytest.mark.asyncio
+async def test_metadata_index_drops_deleted_document_support(db):
+    await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _upsert_doc(
+        db,
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await db.add_memory_source(
+        "m-blocker",
+        "SFPAY-179397",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+    keyword = SqliteKeywordSearch(db)
+    assert [hit.memory_id for hit in await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10)] == [
+        "m-blocker"
+    ]
+
+    await db.delete_document("SFPAY-179397")
+
+    assert await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_metadata_search_collapses_multiple_matching_sources_per_memory(db):
+    await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _upsert_doc(
+        db,
+        doc_id="SFPAY-179397",
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await _upsert_doc(
+        db,
+        doc_id="SFPAY-179398",
+        title="SFPAY-179398: Create Blocker Hint follow-up",
+    )
+    await db.add_memory_source(
+        "m-blocker",
+        "SFPAY-179397",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+    await db.add_memory_source(
+        "m-blocker",
+        "SFPAY-179398",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+
+    keyword = SqliteKeywordSearch(db)
+    hits = await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10)
+
+    assert [hit.memory_id for hit in hits] == ["m-blocker"]
+    assert {ref.doc_id for ref in hits[0].source_refs} == {"SFPAY-179397", "SFPAY-179398"}
+
+
+@pytest.mark.asyncio
+async def test_metadata_search_preserves_source_refs_before_memory_limit(db):
+    await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    doc_ids = [f"SFPAY-17939{i}" for i in range(6)]
+    for doc_id in doc_ids:
+        await _upsert_doc(
+            db,
+            doc_id=doc_id,
+            title=f"{doc_id}: Create Blocker Hint follow-up",
+        )
+        await db.add_memory_source(
+            "m-blocker",
+            doc_id,
+            "jira",
+            support_kind="extracted",
+            source_updated_at=datetime.now(timezone.utc),
+        )
+
+    keyword = SqliteKeywordSearch(db)
+    hits = await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=1)
+
+    assert [hit.memory_id for hit in hits] == ["m-blocker"]
+    assert {ref.doc_id for ref in hits[0].source_refs} == set(doc_ids)
 
 
 @pytest.mark.asyncio

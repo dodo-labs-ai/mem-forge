@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import threading
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
@@ -37,6 +38,7 @@ from memforge.models import (
     content_hash as compute_content_hash,
 )
 from memforge.retrieval.document_index import DocumentVectorIndex
+from memforge.pipeline.sync_memory import SyncMemoryObserver
 
 from memforge.pipeline.document_units import ExtractionContextPacker, UnitizationPolicy, unitize_markdown
 from memforge.pipeline.document_update import DocumentUpdatePlan, plan_document_update
@@ -61,7 +63,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ExtractionWorkPool", "GeneSyncOrchestrator"]
+__all__ = [
+    "DocumentLifecycleAdmission",
+    "ExtractionWorkPool",
+    "GeneSyncOrchestrator",
+    "SyncMemoryObserver",
+    "get_process_document_lifecycle_admission",
+]
 
 DEFAULT_INCREMENTAL_SYNC_OVERLAP = timedelta(minutes=10)
 
@@ -135,6 +143,75 @@ class ExtractionWorkPool:
             if self._active_by_source[waiting_source] < fair_share:
                 return False
         return True
+
+
+class DocumentLifecycleAdmission:
+    """Process-wide admission control for memory-heavy document lifecycles."""
+
+    def __init__(self, max_active: int) -> None:
+        self.max_active = max(1, int(max_active))
+        self._semaphore = asyncio.Semaphore(self.max_active)
+        self._lock = asyncio.Lock()
+        self._active = 0
+        self._max_active_seen = 0
+
+    @asynccontextmanager
+    async def slot(self, source_id: str, doc_id: str):
+        del source_id, doc_id
+        await self._semaphore.acquire()
+        async with self._lock:
+            self._active += 1
+            self._max_active_seen = max(self._max_active_seen, self._active)
+        try:
+            yield
+        finally:
+            async with self._lock:
+                self._active -= 1
+            self._semaphore.release()
+
+    @property
+    def active_count(self) -> int:
+        return self._active
+
+    @property
+    def max_active_seen(self) -> int:
+        return self._max_active_seen
+
+
+_PROCESS_DOCUMENT_LIFECYCLE_LOCK = threading.Lock()
+_PROCESS_DOCUMENT_LIFECYCLE_ADMISSION: DocumentLifecycleAdmission | None = None
+_PROCESS_DOCUMENT_LIFECYCLE_LIMIT: int | None = None
+
+
+def get_process_document_lifecycle_admission(max_active: int) -> DocumentLifecycleAdmission | None:
+    """Return the process-wide admission controller for memory-heavy sync work."""
+    global _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION, _PROCESS_DOCUMENT_LIFECYCLE_LIMIT
+
+    if max_active <= 0:
+        return None
+
+    requested_limit = max(1, int(max_active))
+    with _PROCESS_DOCUMENT_LIFECYCLE_LOCK:
+        if _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION is None:
+            _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION = DocumentLifecycleAdmission(requested_limit)
+            _PROCESS_DOCUMENT_LIFECYCLE_LIMIT = requested_limit
+            return _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION
+
+        if requested_limit < (_PROCESS_DOCUMENT_LIFECYCLE_LIMIT or requested_limit) and (
+            _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION.active_count == 0
+        ):
+            _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION = DocumentLifecycleAdmission(requested_limit)
+            _PROCESS_DOCUMENT_LIFECYCLE_LIMIT = requested_limit
+            return _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION
+
+        if requested_limit != _PROCESS_DOCUMENT_LIFECYCLE_LIMIT:
+            logger.warning(
+                "Ignoring sync document lifecycle limit %d because process-wide limit %d is already active",
+                requested_limit,
+                _PROCESS_DOCUMENT_LIFECYCLE_LIMIT,
+            )
+
+        return _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION
 
 
 MAX_RETRIES = 3
@@ -331,6 +408,8 @@ class GeneSyncOrchestrator:
         source_support_detector: SourceSupportDetector | None = None,
         max_concurrent: int = 3,
         extraction_pool: ExtractionWorkPool | None = None,
+        document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
+        memory_observer: SyncMemoryObserver | None = None,
     ) -> None:
         self.db = db
         self.doc_store = doc_store
@@ -344,6 +423,8 @@ class GeneSyncOrchestrator:
         self.source_support_detector = source_support_detector
         self.max_concurrent = max(1, max_concurrent)
         self.extraction_pool = extraction_pool
+        self.document_lifecycle_admission = document_lifecycle_admission
+        self.memory_observer = memory_observer
 
         self._llm_semaphore = asyncio.Semaphore(self.max_concurrent)
         self._db_lock = asyncio.Lock()
@@ -367,8 +448,6 @@ class GeneSyncOrchestrator:
         self._llm_semaphore.release()
 
     def _source_parallelism_limit(self) -> int:
-        if self.extraction_pool is not None:
-            return self.extraction_pool.max_workers
         return self.max_concurrent
 
     @asynccontextmanager
@@ -379,6 +458,44 @@ class GeneSyncOrchestrator:
             return
         async with self._llm_semaphore:
             yield
+
+    @asynccontextmanager
+    async def _document_lifecycle_slot(self, source_id: str, doc_id: str):
+        if self.document_lifecycle_admission is None:
+            yield
+            return
+        async with self.document_lifecycle_admission.slot(source_id, doc_id):
+            yield
+
+    def _memory_sample(
+        self,
+        stage: str,
+        *,
+        source_id: str,
+        run_id: str | None,
+        doc_id: str | None = None,
+        ok: bool = True,
+        error: Exception | None = None,
+        **fields: Any,
+    ) -> None:
+        if self.memory_observer is None:
+            return
+        active = None
+        max_seen = None
+        if self.document_lifecycle_admission is not None:
+            active = self.document_lifecycle_admission.active_count
+            max_seen = self.document_lifecycle_admission.max_active_seen
+        self.memory_observer.sample(
+            stage,
+            source_id=source_id,
+            run_id=run_id or "",
+            doc_id=doc_id,
+            ok=ok,
+            error_class=type(error).__name__ if error is not None else None,
+            active_lifecycles=active,
+            max_active_seen=max_seen,
+            **fields,
+        )
 
     # ==================================================================
     # Public: sync_gene
@@ -423,6 +540,7 @@ class GeneSyncOrchestrator:
             source_id,
             run_id,
         )
+        self._memory_sample("sync_run_start", source_id=source_id, run_id=run_id)
 
         docs_processed = 0
         docs_updated = 0
@@ -499,6 +617,14 @@ class GeneSyncOrchestrator:
                 len(items),
                 source_name,
                 last_sync_time.isoformat() if last_sync_time else "full sync",
+            )
+            self._memory_sample(
+                "after_discovery",
+                source_id=source_id,
+                run_id=run_id,
+                item_count=len(items),
+                indexed_doc_count=len(indexed_doc_ids),
+                full_sync=last_sync_time is None,
             )
 
             if progress_callback:
@@ -787,6 +913,20 @@ class GeneSyncOrchestrator:
                 }
             )
 
+        item_count = len(items) if "items" in locals() else 0
+        self._memory_sample(
+            "sync_run_end",
+            source_id=source_id,
+            run_id=run_id,
+            status=status,
+            docs_processed=docs_processed,
+            docs_updated=docs_updated,
+            docs_failed=docs_failed,
+            memories_extracted=memories_extracted,
+            memories_corroborated=memories_corroborated,
+            item_count=item_count,
+        )
+
         logger.info(
             "Sync complete for %s (run_id=%s): "
             "%d processed, %d updated, %d failed, "
@@ -808,6 +948,47 @@ class GeneSyncOrchestrator:
     # ==================================================================
 
     async def _process_item(
+        self,
+        gene: Gene,
+        item: ContentItem,
+        source_name: str,
+        source_id: str,
+        run_id: str | None = None,
+        progress_callback: Callable[[dict], None] | None = None,
+        force_reprocess: bool = False,
+    ) -> dict:
+        doc_id = item.item_id
+        self._memory_sample("document_wait_start", source_id=source_id, run_id=run_id, doc_id=doc_id)
+        lifecycle_error: Exception | None = None
+        lifecycle_ok = False
+        async with self._document_lifecycle_slot(source_id, doc_id):
+            self._memory_sample("document_lifecycle_enter", source_id=source_id, run_id=run_id, doc_id=doc_id)
+            try:
+                result = await self._process_item_admitted(
+                    gene=gene,
+                    item=item,
+                    source_name=source_name,
+                    source_id=source_id,
+                    run_id=run_id,
+                    progress_callback=progress_callback,
+                    force_reprocess=force_reprocess,
+                )
+                lifecycle_ok = True
+                return result
+            except Exception as exc:
+                lifecycle_error = exc
+                raise
+            finally:
+                self._memory_sample(
+                    "document_lifecycle_exit",
+                    source_id=source_id,
+                    run_id=run_id,
+                    doc_id=doc_id,
+                    ok=lifecycle_ok,
+                    error=lifecycle_error,
+                )
+
+    async def _process_item_admitted(
         self,
         gene: Gene,
         item: ContentItem,
@@ -851,12 +1032,26 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         raw = await gene.fetch(item)
         logger.debug("Fetched %s (%d bytes)", doc_id, len(raw.body))
+        self._memory_sample(
+            "after_fetch",
+            source_id=source_id,
+            run_id=run_id,
+            doc_id=doc_id,
+            raw_bytes=len(raw.body),
+        )
 
         # ------------------------------------------------------------------
         # 2. Normalize to markdown
         # ------------------------------------------------------------------
         normalized = await gene.normalize(raw)
         markdown_body = normalized.markdown_body
+        self._memory_sample(
+            "after_normalize",
+            source_id=source_id,
+            run_id=run_id,
+            doc_id=doc_id,
+            content_chars=len(markdown_body or ""),
+        )
 
         if not markdown_body or not markdown_body.strip():
             logger.warning("Empty normalized content for %s, skipping", doc_id)
@@ -892,6 +1087,14 @@ class GeneSyncOrchestrator:
             title=item.title,
             markdown=markdown_body,
         )
+        self._memory_sample(
+            "after_raw_store",
+            source_id=source_id,
+            run_id=run_id,
+            doc_id=doc_id,
+            raw_bytes=len(raw.body),
+            content_chars=len(markdown_body),
+        )
 
         source_type = gene.metadata().name
         source_shape = gene.metadata().data_shape
@@ -925,6 +1128,13 @@ class GeneSyncOrchestrator:
                 logger.info("Stored PDF for %s (%d bytes)", item.title, len(pdf_bytes))
             elif requires_pdf_uri:
                 raise RuntimeError(f"Confluence PDF export did not produce a PDF for {item.title}")
+            self._memory_sample(
+                "after_pdf_export",
+                source_id=source_id,
+                run_id=run_id,
+                doc_id=doc_id,
+                pdf_bytes=len(pdf_bytes) if pdf_bytes else 0,
+            )
 
         vector_current = await self._document_vector_is_current(
             doc_id=doc_id,
@@ -1059,6 +1269,15 @@ class GeneSyncOrchestrator:
             len(enrichment.tags),
             enrichment.doc_type,
         )
+        self._memory_sample(
+            "after_enrich",
+            source_id=source_id,
+            run_id=run_id,
+            doc_id=doc_id,
+            entity_count=len(enrichment.entities),
+            tag_count=len(enrichment.tags),
+            content_chars=len(markdown_body),
+        )
 
         # ------------------------------------------------------------------
         # 6b. Upsert document embedding before memory mutations
@@ -1162,6 +1381,16 @@ class GeneSyncOrchestrator:
             len(raw_memories),
             doc_id,
         )
+        self._memory_sample(
+            "after_extract",
+            source_id=source_id,
+            run_id=run_id,
+            doc_id=doc_id,
+            raw_memory_count=len(raw_memories),
+            existing_memory_count=len(existing_memories),
+            entity_count=len(entity_ids),
+            content_chars=len(markdown_body),
+        )
 
         # ------------------------------------------------------------------
         # 7b. Build metadata once enrichment has resolved canonical entities
@@ -1235,6 +1464,17 @@ class GeneSyncOrchestrator:
             stats["memories_extracted"] = memory_stats.get("inserted", 0)
             stats["memories_corroborated"] = memory_stats.get("corroborated", 0)
 
+        self._memory_sample(
+            "after_memory_engine",
+            source_id=source_id,
+            run_id=run_id,
+            doc_id=doc_id,
+            raw_memory_count=len(raw_memories),
+            memories_extracted=stats["memories_extracted"],
+            memories_corroborated=stats["memories_corroborated"],
+            entity_count=len(entity_ids),
+        )
+
         if not extraction_result.error_type and self.source_support_detector:
             writer_visibility, writer_owner_user_id = default_visibility(
                 source_type,
@@ -1257,6 +1497,16 @@ class GeneSyncOrchestrator:
             stats["memory_supports_added"] = support_stats.get("added", 0)
             stats["memory_supports_updated"] = support_stats.get("updated", 0)
             stats["memory_supports_removed"] = support_stats.get("removed_stale", 0)
+            self._memory_sample(
+                "after_source_support",
+                source_id=source_id,
+                run_id=run_id,
+                doc_id=doc_id,
+                memory_supports_added=stats["memory_supports_added"],
+                memory_supports_updated=stats["memory_supports_updated"],
+                memory_supports_removed=stats["memory_supports_removed"],
+                entity_count=len(entity_ids),
+            )
 
         async with self._db_lock:
             await self.db.upsert_metadata(doc_metadata)

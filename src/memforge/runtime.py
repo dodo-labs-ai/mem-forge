@@ -23,7 +23,13 @@ from memforge.models import SyncState
 from memforge.pipeline.enricher import Enricher
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.source_support_detector import SourceSupportDetector
-from memforge.pipeline.sync import ExtractionWorkPool, GeneSyncOrchestrator
+from memforge.pipeline.sync_memory import SyncMemoryObserver
+from memforge.pipeline.sync import (
+    DocumentLifecycleAdmission,
+    ExtractionWorkPool,
+    GeneSyncOrchestrator,
+    get_process_document_lifecycle_admission,
+)
 from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.retrieval.embeddings import get_chroma_collection
 from memforge.source_secrets import decrypt_source_config_for_runtime, source_secret_fields
@@ -87,6 +93,8 @@ class SyncRuntime:
     llm_model: str
     source_support_detector: SourceSupportDetector | None
     extraction_pool: ExtractionWorkPool | None = None
+    document_lifecycle_admission: DocumentLifecycleAdmission | None = None
+    memory_observer: SyncMemoryObserver | None = None
     orchestrator_factory: Callable[["SyncRuntime"], GeneSyncOrchestrator] | None = None
 
     def orchestrator(self) -> GeneSyncOrchestrator:
@@ -104,6 +112,8 @@ class SyncRuntime:
             source_support_detector=self.source_support_detector,
             max_concurrent=self.config.llm.enrichment_max_concurrent,
             extraction_pool=self.extraction_pool,
+            document_lifecycle_admission=self.document_lifecycle_admission,
+            memory_observer=self.memory_observer,
         )
 
 
@@ -134,6 +144,7 @@ class RuntimeProvider(Protocol):
         config: AppConfig,
         *,
         extraction_pool: ExtractionWorkPool | None = None,
+        document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
     ) -> SyncRuntime: ...
 
     async def run_source_sync(
@@ -178,11 +189,13 @@ class DefaultRuntimeProvider:
         config: AppConfig,
         *,
         extraction_pool: ExtractionWorkPool | None = None,
+        document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
     ) -> SyncRuntime:
         return await build_sync_runtime(
             db=db,
             config=config,
             extraction_pool=extraction_pool,
+            document_lifecycle_admission=document_lifecycle_admission,
         )
 
     async def check_health(self, db: "Database", config: AppConfig) -> RuntimeHealthReport:
@@ -453,6 +466,7 @@ async def build_sync_runtime(
     config: AppConfig,
     *,
     extraction_pool: ExtractionWorkPool | None = None,
+    document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
 ) -> SyncRuntime:
     llm = await get_effective_llm_config(db, config)
     structured_llm_client = None
@@ -541,6 +555,8 @@ async def build_sync_runtime(
         llm_model=llm.enrichment_model,
         source_support_detector=source_support_detector,
         extraction_pool=extraction_pool,
+        document_lifecycle_admission=document_lifecycle_admission,
+        memory_observer=SyncMemoryObserver(),
     )
 
 
@@ -595,6 +611,8 @@ class SyncService:
             if max_extraction_workers
             else None
         )
+        max_document_lifecycles = max(0, int(config.sync.max_document_lifecycles))
+        self._document_lifecycle_admission = get_process_document_lifecycle_admission(max_document_lifecycles)
 
     def is_running(self, source_id: str) -> bool:
         task = self.tasks.get(source_id)
@@ -764,6 +782,7 @@ class SyncService:
                 self.db,
                 self.config,
                 extraction_pool=self._extraction_pool,
+                document_lifecycle_admission=self._document_lifecycle_admission,
             )
 
             def on_progress(progress: dict) -> None:

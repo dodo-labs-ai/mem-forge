@@ -49,6 +49,11 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["detect_cross_doc_contradictions"]
 
+MAX_CONTRADICTION_PAIRS_PER_RUN = 200
+CONTRADICTION_LLM_BATCH_SIZE = 20
+MAX_CONTRADICTION_PROMPT_CHARS = 120_000
+MAX_CONTRADICTION_MEMORY_CONTENT_CHARS = 4_000
+
 
 CONTRADICTION_PROMPT = """You are checking whether pairs of team knowledge memories contradict each other.
 These memories come from different source documents about the same entities.
@@ -67,6 +72,48 @@ Return a JSON object with a "decisions" array, one entry per pair:
 {{"decisions": [{{"pair_index": 0, "classification": "contradiction", "reason": "Memory A says PostgreSQL 14, Memory B says MySQL"}}]}}
 
 Return ONLY the JSON object."""
+
+
+def _prompt_memory(memory: Memory) -> dict[str, str]:
+    content = memory.content
+    if len(content) > MAX_CONTRADICTION_MEMORY_CONTENT_CHARS:
+        content = content[:MAX_CONTRADICTION_MEMORY_CONTENT_CHARS] + "\n[truncated]"
+    return {"id": memory.id, "content": content, "type": memory.memory_type}
+
+
+def _pairs_json(pairs: list[tuple[Memory, Memory]], *, pair_index_offset: int) -> str:
+    return json.dumps(
+        [
+            {
+                "pair_index": pair_index_offset + i,
+                "memory_a": _prompt_memory(a),
+                "memory_b": _prompt_memory(b),
+            }
+            for i, (a, b) in enumerate(pairs)
+        ],
+        indent=2,
+    )
+
+
+def _iter_prompt_sized_pair_batches(
+    pairs: list[tuple[Memory, Memory]],
+) -> list[tuple[int, list[tuple[Memory, Memory]]]]:
+    batches: list[tuple[int, list[tuple[Memory, Memory]]]] = []
+    start = 0
+    batch_size = max(1, int(CONTRADICTION_LLM_BATCH_SIZE))
+    while start < len(pairs):
+        end = min(len(pairs), start + batch_size)
+        while end > start:
+            batch = pairs[start:end]
+            prompt = CONTRADICTION_PROMPT.format(
+                pairs_json=_pairs_json(batch, pair_index_offset=start)
+            )
+            if len(prompt) <= MAX_CONTRADICTION_PROMPT_CHARS or len(batch) == 1:
+                batches.append((start, batch))
+                break
+            end = start + max(1, len(batch) // 2)
+        start = end
+    return batches
 
 
 async def detect_cross_doc_contradictions(
@@ -91,11 +138,26 @@ async def detect_cross_doc_contradictions(
     if not new_memory_ids or not structured_llm_client:
         return stats
 
-    # Collect candidate pairs: new memory + cross-doc memory sharing entities
+    # Collect candidate pairs: new memory + cross-doc memory sharing entities.
+    # This is a memory boundary as well as a behavior boundary: large workspaces
+    # can produce many candidates for a single synced document.
     pairs: list[tuple[Memory, Memory]] = []
     candidate_bucket_complete_by_challenger: dict[str, bool] = {}
 
     for mem_id in new_memory_ids:
+        if len(pairs) >= MAX_CONTRADICTION_PAIRS_PER_RUN:
+            memory = await db.get_memory(mem_id)
+            if memory and memory.status == "active":
+                await _record_truncated_cross_doc_candidate_page(
+                    challenger=memory,
+                    candidates=(),
+                    doc_id=doc_id,
+                    db=db,
+                )
+                stats["truncated"] += 1
+            continue
+
+        cap_reached_for_memory = False
         memory = await db.get_memory(mem_id)
         if not memory or memory.status != "active":
             continue
@@ -128,7 +190,14 @@ async def detect_cross_doc_contradictions(
             stats["truncated"] += 1
             continue
         for candidate in candidate_page.candidates:
+            if len(pairs) >= MAX_CONTRADICTION_PAIRS_PER_RUN:
+                cap_reached_for_memory = True
+                candidate_bucket_complete_by_challenger[mem_id] = False
+                break
             pairs.append((memory, candidate))
+        if cap_reached_for_memory:
+            stats["truncated"] += 1
+            continue
 
     if not pairs:
         await _record_detection_completed(
@@ -146,28 +215,17 @@ async def detect_cross_doc_contradictions(
 
     stats["checked"] = len(pairs)
 
-    # Batch LLM classification
-    pairs_json = json.dumps(
-        [
-            {
-                "pair_index": i,
-                "memory_a": {"id": a.id, "content": a.content, "type": a.memory_type},
-                "memory_b": {"id": b.id, "content": b.content, "type": b.memory_type},
-            }
-            for i, (a, b) in enumerate(pairs)
-        ],
-        indent=2,
-    )
-
-    prompt = CONTRADICTION_PROMPT.format(pairs_json=pairs_json)
-
     try:
-        response = await structured_llm_client.detect_contradictions(
-            prompt,
-            max_tokens=DEFAULT_ENRICHMENT_MAX_TOKENS,
-            model=llm_model,
-        )
-        decisions = [decision.model_dump() for decision in response.decisions]
+        decisions = []
+        for batch_start, batch in _iter_prompt_sized_pair_batches(pairs):
+            pairs_json = _pairs_json(batch, pair_index_offset=batch_start)
+            prompt = CONTRADICTION_PROMPT.format(pairs_json=pairs_json)
+            response = await structured_llm_client.detect_contradictions(
+                prompt,
+                max_tokens=DEFAULT_ENRICHMENT_MAX_TOKENS,
+                model=llm_model,
+            )
+            decisions.extend(decision.model_dump() for decision in response.decisions)
         classifications = {
             "contradiction": 0,
             "temporal": 0,
@@ -322,6 +380,7 @@ async def _record_detection_completed(
             "checked": stats["checked"],
             "contradictions": stats["contradictions"],
             "temporal": stats["temporal"],
+            "truncated": stats.get("truncated", 0),
             "classifications": classifications,
         },
     )
@@ -354,6 +413,7 @@ async def _record_detection_failed(
             "new_memory_count": new_memory_count,
             "candidate_pairs": candidate_pairs,
             "checked": checked,
+            "truncated": 0,
         },
     )
 
@@ -434,6 +494,9 @@ async def _build_cross_doc_relation_outcome_bundles(
             lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, decisions)
             lifecycle_action = lifecycle.action
             review_case = lifecycle.review_case
+        elif not bucket_complete:
+            lifecycle_action = LifecycleAction.CREATE_REVIEW
+            review_case = ReviewCase.MANDATORY_INCOMPLETE
         else:
             lifecycle_action = LifecycleAction.NONE
             review_case = None
@@ -451,6 +514,8 @@ async def _build_cross_doc_relation_outcome_bundles(
             status=(
                 "checked"
                 if lifecycle_action is LifecycleAction.NONE
+                else "review_required"
+                if review_case is ReviewCase.MANDATORY_INCOMPLETE
                 else "review"
                 if lifecycle_action is LifecycleAction.CREATE_REVIEW
                 else "applied"

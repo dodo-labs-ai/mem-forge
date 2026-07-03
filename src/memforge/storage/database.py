@@ -61,6 +61,7 @@ from memforge.memory.evidence import (
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
 from memforge.retrieval.access_predicate import visible_sql
+from memforge.retrieval.metadata_text import metadata_alias_text, metadata_compact_text
 from memforge.storage.admin_memory import (
     MemoryAdminListFilters,
     MemoryAdminQueryPage,
@@ -569,6 +570,37 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     entities_text,
     tags_text,
     tokenize='porter unicode61'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_search_metadata_fts USING fts5(
+    memory_id UNINDEXED,
+    source_id UNINDEXED,
+    doc_id UNINDEXED,
+    source_type UNINDEXED,
+    metadata_title_tokens,
+    metadata_external_id_tokens,
+    metadata_path_tokens,
+    metadata_source_name_tokens,
+    metadata_label_context_tokens,
+    tokenize='porter unicode61'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_search_metadata_alias_fts USING fts5(
+    memory_id UNINDEXED,
+    source_id UNINDEXED,
+    doc_id UNINDEXED,
+    source_type UNINDEXED,
+    metadata_alias_tokens,
+    tokenize='porter unicode61'
+);
+
+CREATE TABLE IF NOT EXISTS memory_search_metadata_trigram (
+    memory_id        TEXT NOT NULL,
+    source_id        TEXT,
+    doc_id           TEXT NOT NULL,
+    source_type      TEXT NOT NULL,
+    metadata_compact TEXT NOT NULL,
+    PRIMARY KEY (memory_id, doc_id)
 );
 
 -- ---------------------------------------------------------------
@@ -1476,6 +1508,46 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE memory_reviews ADD COLUMN replacement_kind TEXT NOT NULL DEFAULT 'supersession'",
         ],
     ),
+    (
+        30,
+        "Add metadata keyword search projection",
+        [
+            """CREATE VIRTUAL TABLE IF NOT EXISTS memory_search_metadata_fts USING fts5(
+                memory_id UNINDEXED,
+                source_id UNINDEXED,
+                doc_id UNINDEXED,
+                source_type UNINDEXED,
+                metadata_title_tokens,
+                metadata_external_id_tokens,
+                metadata_path_tokens,
+                metadata_source_name_tokens,
+                metadata_label_context_tokens,
+                tokenize='porter unicode61'
+            )""",
+        ],
+    ),
+    (
+        31,
+        "Add metadata alias and substring search projections",
+        [
+            """CREATE VIRTUAL TABLE IF NOT EXISTS memory_search_metadata_alias_fts USING fts5(
+                memory_id UNINDEXED,
+                source_id UNINDEXED,
+                doc_id UNINDEXED,
+                source_type UNINDEXED,
+                metadata_alias_tokens,
+                tokenize='porter unicode61'
+            )""",
+            """CREATE TABLE IF NOT EXISTS memory_search_metadata_trigram (
+                memory_id        TEXT NOT NULL,
+                source_id        TEXT,
+                doc_id           TEXT NOT NULL,
+                source_type      TEXT NOT NULL,
+                metadata_compact TEXT NOT NULL,
+                PRIMARY KEY (memory_id, doc_id)
+            )""",
+        ],
+    ),
 ]
 
 
@@ -1535,6 +1607,8 @@ class Database:
                         raise
             if version == 26:
                 await self._backfill_relation_run_snapshot_audit()
+            if version in (30, 31):
+                await self._rebuild_memory_metadata_fts_unlocked()
             await self.db.execute(
                 "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, _now_iso()),
@@ -1644,6 +1718,7 @@ class Database:
                     _now_iso(),
                 ),
             )
+            await self._refresh_metadata_fts_for_doc_unlocked(doc.doc_id)
             await self.db.commit()
 
     async def get_document(self, doc_id: str) -> DocumentRecord | None:
@@ -1852,6 +1927,9 @@ class Database:
                     async for row in cursor:
                         memory_ids.append(row[0])
 
+                await self.db.execute("DELETE FROM memory_search_metadata_fts WHERE doc_id = ?", (doc_id,))
+                await self.db.execute("DELETE FROM memory_search_metadata_alias_fts WHERE doc_id = ?", (doc_id,))
+                await self.db.execute("DELETE FROM memory_search_metadata_trigram WHERE doc_id = ?", (doc_id,))
                 await self.db.execute("DELETE FROM memory_sources WHERE doc_id = ?", (doc_id,))
                 await self._delete_evidence_graph_for_doc_ids_unlocked([doc_id])
                 retired_ids = await self._refresh_support_after_source_removal_unlocked(memory_ids)
@@ -3578,6 +3656,7 @@ class Database:
                 _utc_iso(source_updated_at) if source_updated_at is not None else None,
             ),
         )
+        await self._refresh_memory_metadata_fts_unlocked(memory_id, doc_id)
         if cursor.rowcount:
             await self.db.execute(
                 """UPDATE memories SET
@@ -4076,6 +4155,154 @@ class Database:
                 _utc_iso(source_updated_at) if source_updated_at is not None else None,
             ),
         )
+        await self._refresh_memory_metadata_fts_unlocked(memory_id, doc_id)
+
+    async def _refresh_memory_metadata_fts_unlocked(self, memory_id: str, doc_id: str) -> None:
+        await self.db.execute(
+            "DELETE FROM memory_search_metadata_fts WHERE memory_id = ? AND doc_id = ?",
+            (memory_id, doc_id),
+        )
+        await self.db.execute(
+            "DELETE FROM memory_search_metadata_alias_fts WHERE memory_id = ? AND doc_id = ?",
+            (memory_id, doc_id),
+        )
+        await self.db.execute(
+            "DELETE FROM memory_search_metadata_trigram WHERE memory_id = ? AND doc_id = ?",
+            (memory_id, doc_id),
+        )
+        rows = await self.db.execute_fetchall(
+            """SELECT
+                   ms.memory_id,
+                   ms.source_id,
+                   ms.doc_id,
+                   ms.source_type,
+                   d.title,
+                   d.source_url,
+                   d.space_or_project,
+                   d.labels,
+                   s.name AS source_name
+               FROM memory_sources ms
+               JOIN documents d ON d.doc_id = ms.doc_id
+               LEFT JOIN sources s ON s.id = ms.source_id
+              WHERE ms.memory_id = ? AND ms.doc_id = ?""",
+            (memory_id, doc_id),
+        )
+        if not rows:
+            return
+        record = rows[0]
+        labels_text = ""
+        try:
+            labels = json.loads(record["labels"] or "[]")
+            if isinstance(labels, list):
+                labels_text = " ".join(str(label) for label in labels)
+        except json.JSONDecodeError:
+            labels_text = str(record["labels"] or "")
+        await self.db.execute(
+            """INSERT INTO memory_search_metadata_fts (
+                   memory_id,
+                   source_id,
+                   doc_id,
+                   source_type,
+                   metadata_title_tokens,
+                   metadata_external_id_tokens,
+                   metadata_path_tokens,
+                   metadata_source_name_tokens,
+                   metadata_label_context_tokens
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record["memory_id"],
+                record["source_id"],
+                record["doc_id"],
+                record["source_type"],
+                record["title"] or "",
+                record["doc_id"] or "",
+                " ".join(
+                    part
+                    for part in (record["space_or_project"] or "", record["source_url"] or "")
+                    if part
+                ),
+                record["source_name"] or "",
+                labels_text,
+            ),
+        )
+        metadata_values = (
+            record["title"] or "",
+            record["doc_id"] or "",
+            record["space_or_project"] or "",
+            record["source_url"] or "",
+            record["source_name"] or "",
+            labels_text,
+        )
+        await self.db.execute(
+            """INSERT INTO memory_search_metadata_alias_fts (
+                   memory_id,
+                   source_id,
+                   doc_id,
+                   source_type,
+                   metadata_alias_tokens
+               ) VALUES (?, ?, ?, ?, ?)""",
+            (
+                record["memory_id"],
+                record["source_id"],
+                record["doc_id"],
+                record["source_type"],
+                metadata_alias_text(metadata_values),
+            ),
+        )
+        await self.db.execute(
+            """INSERT OR REPLACE INTO memory_search_metadata_trigram (
+                   memory_id,
+                   source_id,
+                   doc_id,
+                   source_type,
+                   metadata_compact
+               ) VALUES (?, ?, ?, ?, ?)""",
+            (
+                record["memory_id"],
+                record["source_id"],
+                record["doc_id"],
+                record["source_type"],
+                metadata_compact_text(metadata_values),
+            ),
+        )
+
+    async def _refresh_metadata_fts_for_doc_unlocked(self, doc_id: str) -> None:
+        rows = await self.db.execute_fetchall(
+            "SELECT memory_id FROM memory_sources WHERE doc_id = ?",
+            (doc_id,),
+        )
+        for row in rows:
+            await self._refresh_memory_metadata_fts_unlocked(row["memory_id"], doc_id)
+
+    async def _refresh_metadata_fts_for_source_unlocked(self, source_id: str) -> None:
+        rows = await self.db.execute_fetchall(
+            "SELECT memory_id, doc_id FROM memory_sources WHERE source_id = ?",
+            (source_id,),
+        )
+        for row in rows:
+            await self._refresh_memory_metadata_fts_unlocked(
+                row["memory_id"],
+                row["doc_id"],
+            )
+
+    async def rebuild_memory_metadata_fts(self) -> None:
+        """Rebuild the source-metadata FTS projection from durable support rows."""
+        async with self._write_lock:
+            await self._rebuild_memory_metadata_fts_unlocked()
+            await self.db.commit()
+
+    async def _rebuild_memory_metadata_fts_unlocked(self) -> None:
+        await self.db.execute("DELETE FROM memory_search_metadata_fts")
+        await self.db.execute("DELETE FROM memory_search_metadata_alias_fts")
+        await self.db.execute("DELETE FROM memory_search_metadata_trigram")
+        rows = await self.db.execute_fetchall(
+            "SELECT memory_id, doc_id FROM memory_sources ORDER BY memory_id, doc_id"
+        )
+        for row in rows:
+            await self._refresh_memory_metadata_fts_unlocked(
+                row["memory_id"],
+                row["doc_id"],
+            )
 
     async def _link_memory_entities_unlocked(
         self,
@@ -4870,6 +5097,18 @@ class Database:
         async with self._write_lock:
             await self._delete_evidence_graph_for_memory_doc_unlocked(memory_id, doc_id)
             await self.db.execute(
+                "DELETE FROM memory_search_metadata_fts WHERE memory_id = ? AND doc_id = ?",
+                (memory_id, doc_id),
+            )
+            await self.db.execute(
+                "DELETE FROM memory_search_metadata_alias_fts WHERE memory_id = ? AND doc_id = ?",
+                (memory_id, doc_id),
+            )
+            await self.db.execute(
+                "DELETE FROM memory_search_metadata_trigram WHERE memory_id = ? AND doc_id = ?",
+                (memory_id, doc_id),
+            )
+            await self.db.execute(
                 "DELETE FROM memory_sources WHERE memory_id = ? AND doc_id = ?",
                 (memory_id, doc_id),
             )
@@ -5240,6 +5479,16 @@ class Database:
                    created_by_user_id=COALESCE(sources.created_by_user_id, excluded.created_by_user_id)""",
                 (id, type, name, config_json, status, binding_json, created_by_user_id, status),
             )
+            stale_metadata_rows = await self.db.execute_fetchall(
+                """SELECT 1
+                     FROM memory_search_metadata_fts
+                    WHERE source_id = ?
+                      AND metadata_source_name_tokens IS NOT ?
+                    LIMIT 1""",
+                (id, name),
+            )
+            if stale_metadata_rows:
+                await self._refresh_metadata_fts_for_source_unlocked(id)
             await self.db.commit()
 
     async def get_source(self, source_id: str) -> dict | None:
@@ -5740,6 +5989,9 @@ class Database:
                         async for row in cursor:
                             memory_ids.append(row[0])
 
+                    await self.db.execute("DELETE FROM memory_search_metadata_fts WHERE doc_id = ?", (doc_id,))
+                    await self.db.execute("DELETE FROM memory_search_metadata_alias_fts WHERE doc_id = ?", (doc_id,))
+                    await self.db.execute("DELETE FROM memory_search_metadata_trigram WHERE doc_id = ?", (doc_id,))
                     await self.db.execute("DELETE FROM memory_sources WHERE doc_id = ?", (doc_id,))
                     await self._delete_evidence_graph_for_doc_ids_unlocked([doc_id])
 

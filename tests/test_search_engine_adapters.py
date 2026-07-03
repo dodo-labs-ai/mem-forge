@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 from memforge.config import RetrievalConfig
+from memforge.llm.structured import RerankResponse
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.search import SearchEngine
@@ -30,6 +31,15 @@ class FakeCollection:
 
     def get(self, **kwargs):
         return {"ids": []}
+
+
+class RecordingRerankClient:
+    def __init__(self) -> None:
+        self.prompt: str | None = None
+
+    async def rerank_memories(self, prompt: str, **kwargs):
+        self.prompt = prompt
+        return RerankResponse(ranking=[0])
 
 
 def _memory(
@@ -58,6 +68,7 @@ async def _document(
     source: str,
     *,
     client: str | None = None,
+    title: str = "t",
 ) -> None:
     now = datetime.now(timezone.utc)
     await db.upsert_document(
@@ -65,7 +76,7 @@ async def _document(
             doc_id=doc_id,
             source=source,
             source_url=f"https://x/{doc_id}",
-            title="t",
+            title=title,
             space_or_project="PAY",
             author="a",
             last_modified=now,
@@ -113,6 +124,134 @@ async def test_search_routes_vector_and_bm25_through_the_adapters(db, monkeypatc
 
     result = await engine.search("PostgreSQL", top_k=10)
     assert [r.memory_id for r in result["results"]] == [active.id]
+
+
+@pytest.mark.asyncio
+async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch):
+    target = _memory("m-blocker", "Lifecycle assignment skips person assignment creation")
+    await db.insert_memory(target)
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _document(
+        db,
+        "SFPAY-179397",
+        "src-jira",
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await db.add_memory_source("m-blocker", "SFPAY-179397", "jira", None, source_updated_at=None)
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    adapters = build_sqlite_adapters(db, FakeCollection([]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("create blocker hint", top_k=10)
+
+    assert [r.memory_id for r in result["results"]] == ["m-blocker"]
+    assert "bm25_metadata_tokens" in result["query_analysis"]["strategies_used"]
+    evidence = result["results"][0].retrieval_evidence
+    assert evidence == {
+        "metadata_lexical": {
+            "channel": "bm25_metadata_tokens",
+            "matched_fields": ["metadata_any"],
+            "matched_text": [
+                "SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment | "
+                "SFPAY-179397 | PAY | MountTai Defects | https://x/SFPAY-179397"
+            ],
+            "source_refs": [
+                {
+                    "source_id": "src-jira",
+                    "doc_id": "SFPAY-179397",
+                    "source_type": "jira",
+                }
+            ],
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_recalls_compound_query_from_metadata_trigram(db, monkeypatch):
+    target = _memory("m-blocker", "Lifecycle assignment skips person assignment creation")
+    await db.insert_memory(target)
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _document(
+        db,
+        "SFPAY-179397",
+        "src-jira",
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await db.add_memory_source("m-blocker", "SFPAY-179397", "jira", None, source_updated_at=None)
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    adapters = build_sqlite_adapters(db, FakeCollection([]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("create blockerhints", top_k=10)
+
+    assert [r.memory_id for r in result["results"]] == ["m-blocker"]
+    evidence = result["results"][0].retrieval_evidence
+    assert evidence is not None
+    assert evidence["metadata_lexical"]["channel"] == "metadata_trigram"
+    assert "metadata_trigram" in evidence["metadata_lexical"]["matched_fields"]
+
+
+@pytest.mark.asyncio
+async def test_rerank_prompt_includes_metadata_evidence_for_metadata_hits(db, monkeypatch):
+    target = _memory("m-blocker", "Lifecycle assignment skips person assignment creation")
+    await db.insert_memory(target)
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _document(
+        db,
+        "SFPAY-179397",
+        "src-jira",
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await db.add_memory_source("m-blocker", "SFPAY-179397", "jira", None, source_updated_at=None)
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    reranker = RecordingRerankClient()
+    adapters = build_sqlite_adapters(db, FakeCollection([]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(enable_reranking=True, rerank_candidates=10),
+        structured_llm_client=reranker,
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("create blocker hint", top_k=10)
+
+    assert [r.memory_id for r in result["results"]] == ["m-blocker"]
+    assert reranker.prompt is not None
+    assert "Retrieval evidence:" in reranker.prompt
+    assert "Create Blocker Hint in On Demand Lifecycle Assignment" in reranker.prompt
+    assert "jira:SFPAY-179397" in reranker.prompt
 
 
 @pytest.mark.asyncio
