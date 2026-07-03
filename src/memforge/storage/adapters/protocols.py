@@ -46,6 +46,28 @@ class KeywordCandidate:
     matched_text: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class EntityLinkCandidate:
+    """Visible entity candidate that can optionally activate graph retrieval."""
+
+    entity_id: int
+    canonical_name: str
+    matched_alias: str
+    channel: str
+    contributing_channels: tuple[str, ...]
+    score: float
+    matched_text: str
+    activates_graph: bool
+
+
+@dataclass(frozen=True)
+class EntityLinkResult:
+    """Query-time entity-linking result with unmatched explicit hints."""
+
+    candidates: tuple[EntityLinkCandidate, ...] = ()
+    unmatched_explicit_entities: tuple[str, ...] = ()
+
+
 class RankingMetadata(TypedDict, total=False):
     """The per-memory inputs the ranker needs alongside RRF scores.
 
@@ -108,6 +130,16 @@ class RelationalStore(Protocol):
         memory_types: list[str] | None,
         limit: int,
     ) -> list[tuple[str, float]]: ...
+    async def link_query_entities(
+        self,
+        query: str,
+        *,
+        scope: AccessScope,
+        explicit_entities: Sequence[str] = (),
+        source_filter: MemorySourceFilter | None = None,
+        memory_types: Sequence[str] | None = None,
+        limit: int = 5,
+    ) -> EntityLinkResult: ...
     async def add_memory_source(
         self,
         memory_id: str,

@@ -28,6 +28,7 @@ from memforge.retrieval.access_predicate import visible_sql
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope
+from memforge.storage.adapters.protocols import EntityLinkResult
 
 logger = logging.getLogger(__name__)
 
@@ -456,6 +457,18 @@ class SqliteRelationalStore:
                 logger.exception("Graph 1-hop expansion failed")
 
         return scored
+
+    async def link_query_entities(
+        self,
+        query: str,
+        *,
+        scope: AccessScope,
+        explicit_entities: Sequence[str] = (),
+        source_filter: MemorySourceFilter | None = None,
+        memory_types: Sequence[str] | None = None,
+        limit: int = 5,
+    ) -> EntityLinkResult:
+        raise NotImplementedError("query-time entity linking is implemented in the next refactor slice")
 
     async def fetch_ranking_metadata(self, ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         """Return ranking and curation metadata for each id in one read.
