@@ -142,7 +142,17 @@ def _entity_link_fts_query(tokens: Sequence[str]) -> str:
         seen.add(token)
         escaped = token.replace('"', '""')
         terms.append(f'"{escaped}"')
+    if len(terms) < 2:
+        return ""
     return " OR ".join(terms)
+
+
+def _entity_link_fts_token_set(tokens: Sequence[str]) -> set[str]:
+    return {
+        token
+        for token in tokens
+        if token not in _ENTITY_LINK_STOPWORDS and len(token) >= 3
+    }
 
 
 def _explicit_entity_terms(explicit_entities: Sequence[str]) -> dict[str, str]:
@@ -649,6 +659,7 @@ class SqliteRelationalStore:
         if fts_query:
             for row in await self._lookup_entity_fts_rows(
                 fts_query,
+                query_tokens=_entity_link_fts_token_set(tokens),
                 matched_text=" ".join(tokens),
                 scope=scope,
                 source_filter=source_filter,
@@ -806,12 +817,15 @@ class SqliteRelationalStore:
         self,
         fts_query: str,
         *,
+        query_tokens: set[str],
         matched_text: str,
         scope: AccessScope,
         source_filter: MemorySourceFilter | None,
         memory_types: Sequence[str] | None,
         limit: int,
     ) -> list[dict[str, Any]]:
+        if len(query_tokens) < 2:
+            return []
         predicate_sql, predicate_params = visible_sql(scope, "m")
         joins: list[str] = []
         clauses = [predicate_sql]
@@ -847,19 +861,19 @@ class SqliteRelationalStore:
         where_sql = " AND ".join(clauses)
         sql = (
             "WITH matched_aliases AS ("
-            "SELECT entity_id, canonical_name, alias_normalized, rank AS fts_rank "
+            "SELECT entity_id, canonical_name, alias_normalized, search_text, rank AS fts_rank "
             "FROM entity_alias_search_fts "
             "WHERE entity_alias_search_fts MATCH ?"
             ") "
             "SELECT ma.entity_id, e.canonical_name, ma.alias_normalized AS matched_alias, "
-            "MIN(ma.fts_rank) AS best_rank, COUNT(DISTINCT m.id) AS visible_memory_count "
+            "ma.search_text, MIN(ma.fts_rank) AS best_rank, COUNT(DISTINCT m.id) AS visible_memory_count "
             "FROM matched_aliases ma "
             "JOIN entities e ON e.id = ma.entity_id "
             "JOIN memory_entities me ON me.entity_id = ma.entity_id "
             "JOIN memories m ON m.id = me.memory_id "
             f"{join_sql} "
             f"WHERE {where_sql} "
-            "GROUP BY ma.entity_id, e.canonical_name, ma.alias_normalized "
+            "GROUP BY ma.entity_id, e.canonical_name, ma.alias_normalized, ma.search_text "
             "ORDER BY best_rank ASC, visible_memory_count DESC, e.canonical_name ASC "
             "LIMIT ?"
         )
@@ -869,9 +883,14 @@ class SqliteRelationalStore:
         except (aiosqlite.Error, sqlite3.Error):
             logger.exception("SQLite entity alias FTS query failed")
             return []
+        kept: list[dict[str, Any]] = []
         for row in rows:
+            row_tokens = set(_entity_link_tokens(str(row.get("search_text") or "")))
+            if len(query_tokens.intersection(row_tokens)) < 2:
+                continue
             row["matched_text"] = matched_text
-        return rows
+            kept.append(row)
+        return kept
 
     async def fetch_ranking_metadata(self, ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         """Return ranking and curation metadata for each id in one read.

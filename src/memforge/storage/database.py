@@ -1588,13 +1588,16 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                    e.id,
                    e.canonical_name,
                    e.canonical_name,
-                   e.canonical_name || ' ' || e.display_name || ' ' || e.tags || ' ' ||
-                   COALESCE((
-                       SELECT group_concat(ea.alias || ' ' || ea.alias_normalized, ' ')
-                       FROM entity_aliases ea
-                       WHERE ea.canonical_id = e.id
-                   ), '')
-               FROM entities e""",
+                   COALESCE(e.canonical_name, '') || ' ' || COALESCE(e.display_name, '')
+               FROM entities e
+               UNION ALL
+               SELECT
+                   ea.canonical_id,
+                   e.canonical_name,
+                   ea.alias_normalized,
+                   COALESCE(ea.alias, '') || ' ' || COALESCE(ea.alias_normalized, '')
+               FROM entity_aliases ea
+               JOIN entities e ON e.id = ea.canonical_id""",
         ],
     ),
 ]
@@ -5318,27 +5321,11 @@ class Database:
             entity_row = await cursor.fetchone()
         if entity_row is None:
             return
-        aliases: list[str] = []
-        async with self.db.execute(
-            "SELECT alias, alias_normalized FROM entity_aliases WHERE canonical_id = ?",
-            (entity_id,),
-        ) as cursor:
-            async for row in cursor:
-                aliases.extend([str(row["alias"] or ""), str(row["alias_normalized"] or "")])
-        tags_text = ""
-        try:
-            tags = json.loads(entity_row["tags"] or "[]")
-            if isinstance(tags, list):
-                tags_text = " ".join(str(tag) for tag in tags)
-        except json.JSONDecodeError:
-            tags_text = str(entity_row["tags"] or "")
         search_text = " ".join(
             part
             for part in (
                 entity_row["canonical_name"] or "",
                 entity_row["display_name"] or "",
-                tags_text,
-                " ".join(aliases),
             )
             if part
         )
@@ -5356,6 +5343,30 @@ class Database:
                 search_text,
             ),
         )
+        async with self.db.execute(
+            "SELECT alias, alias_normalized FROM entity_aliases WHERE canonical_id = ?",
+            (entity_id,),
+        ) as cursor:
+            async for row in cursor:
+                alias_text = " ".join(
+                    part
+                    for part in (row["alias"] or "", row["alias_normalized"] or "")
+                    if part
+                )
+                await self.db.execute(
+                    """INSERT INTO entity_alias_search_fts (
+                           entity_id,
+                           canonical_name,
+                           alias_normalized,
+                           search_text
+                       ) VALUES (?, ?, ?, ?)""",
+                    (
+                        entity_id,
+                        entity_row["canonical_name"],
+                        row["alias_normalized"],
+                        alias_text,
+                    ),
+                )
 
     async def get_entity_by_canonical(self, canonical_name: str) -> Entity | None:
         async with self.db.execute("SELECT * FROM entities WHERE canonical_name = ?", (canonical_name,)) as cursor:
