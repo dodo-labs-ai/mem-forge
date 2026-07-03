@@ -179,6 +179,43 @@ async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_search_recalls_compound_query_from_metadata_trigram(db, monkeypatch):
+    target = _memory("m-blocker", "Lifecycle assignment skips person assignment creation")
+    await db.insert_memory(target)
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _document(
+        db,
+        "SFPAY-179397",
+        "src-jira",
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await db.add_memory_source("m-blocker", "SFPAY-179397", "jira", None, source_updated_at=None)
+
+    async def fake_analyze_query(*args, **kwargs):
+        return QueryAnalysis()
+
+    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+
+    adapters = build_sqlite_adapters(db, FakeCollection([]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("create blockerhints", top_k=10)
+
+    assert [r.memory_id for r in result["results"]] == ["m-blocker"]
+    evidence = result["results"][0].retrieval_evidence
+    assert evidence is not None
+    assert evidence["metadata_lexical"]["channel"] == "metadata_trigram"
+    assert "metadata_trigram" in evidence["metadata_lexical"]["matched_fields"]
+
+
+@pytest.mark.asyncio
 async def test_rerank_prompt_includes_metadata_evidence_for_metadata_hits(db, monkeypatch):
     target = _memory("m-blocker", "Lifecycle assignment skips person assignment creation")
     await db.insert_memory(target)
