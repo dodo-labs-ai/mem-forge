@@ -84,11 +84,13 @@ _ENTITY_LINK_STOPWORDS = frozenset(
 _ENTITY_LINK_CHANNEL_SCORE = {
     "explicit": 1.0,
     "alias_exact": 0.95,
+    "alias_fts": 0.70,
     "alias_compact": 0.35,
 }
 _ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH = {
     "explicit": True,
     "alias_exact": True,
+    "alias_fts": True,
     "alias_compact": False,
 }
 
@@ -127,6 +129,20 @@ def _entity_link_compact_terms(tokens: Sequence[str]) -> dict[str, str]:
         if compact.endswith("s") and len(compact) > 5:
             terms.setdefault(compact[:-1], matched_text)
     return terms
+
+
+def _entity_link_fts_query(tokens: Sequence[str]) -> str:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token in _ENTITY_LINK_STOPWORDS or len(token) < 3:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        escaped = token.replace('"', '""')
+        terms.append(f'"{escaped}"')
+    return " OR ".join(terms)
 
 
 def _explicit_entity_terms(explicit_entities: Sequence[str]) -> dict[str, str]:
@@ -629,6 +645,57 @@ class SqliteRelationalStore:
 
         tokens = _entity_link_tokens(query)
         await add_matches("alias_exact", _entity_link_windows(tokens))
+        fts_query = _entity_link_fts_query(tokens)
+        if fts_query:
+            for row in await self._lookup_entity_fts_rows(
+                fts_query,
+                matched_text=" ".join(tokens),
+                scope=scope,
+                source_filter=source_filter,
+                memory_types=memory_types,
+                limit=max(max_candidates * 4, max_candidates),
+            ):
+                entity_id = int(row["entity_id"])
+                channel = "alias_fts"
+                candidate = EntityLinkCandidate(
+                    entity_id=entity_id,
+                    canonical_name=str(row["canonical_name"]),
+                    matched_alias=str(row["matched_alias"]),
+                    channel=channel,
+                    contributing_channels=(channel,),
+                    score=_ENTITY_LINK_CHANNEL_SCORE[channel],
+                    matched_text=str(row["matched_text"]),
+                    activates_graph=_ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH[channel],
+                )
+                existing = candidates.get(entity_id)
+                if existing is None:
+                    candidates[entity_id] = candidate
+                else:
+                    contributing_channels = tuple(
+                        dict.fromkeys((*existing.contributing_channels, channel))
+                    )
+                    if candidate.score > existing.score:
+                        candidates[entity_id] = EntityLinkCandidate(
+                            entity_id=existing.entity_id,
+                            canonical_name=candidate.canonical_name,
+                            matched_alias=candidate.matched_alias,
+                            channel=channel,
+                            contributing_channels=contributing_channels,
+                            score=candidate.score,
+                            matched_text=candidate.matched_text,
+                            activates_graph=candidate.activates_graph,
+                        )
+                    else:
+                        candidates[entity_id] = EntityLinkCandidate(
+                            entity_id=existing.entity_id,
+                            canonical_name=existing.canonical_name,
+                            matched_alias=existing.matched_alias,
+                            channel=existing.channel,
+                            contributing_channels=contributing_channels,
+                            score=existing.score,
+                            matched_text=existing.matched_text,
+                            activates_graph=existing.activates_graph,
+                        )
         await add_matches("alias_compact", _entity_link_compact_terms(tokens))
 
         ranked = sorted(
@@ -734,6 +801,77 @@ class SqliteRelationalStore:
         except (aiosqlite.Error, sqlite3.Error):
             logger.exception("SQLite entity linker query failed")
             return []
+
+    async def _lookup_entity_fts_rows(
+        self,
+        fts_query: str,
+        *,
+        matched_text: str,
+        scope: AccessScope,
+        source_filter: MemorySourceFilter | None,
+        memory_types: Sequence[str] | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        predicate_sql, predicate_params = visible_sql(scope, "m")
+        joins: list[str] = []
+        clauses = [predicate_sql]
+        params: list[Any] = [fts_query, *predicate_params]
+
+        source_filter = source_filter or MemorySourceFilter()
+        _append_source_time_predicates(
+            source_filter=source_filter,
+            time_range=None,
+            joins=joins,
+            clauses=clauses,
+            params=params,
+        )
+
+        if memory_types:
+            type_placeholders = ",".join("?" for _ in memory_types)
+            clauses.append(f"m.memory_type IN ({type_placeholders})")
+            params.extend(memory_types)
+
+        disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
+        has_source_row_join = any("memory_sources ms" in join for join in joins)
+        if has_source_row_join and disabled_source_ids:
+            disabled_placeholders = ", ".join("?" for _ in disabled_source_ids)
+            clauses.append(f"(ms.source_id IS NULL OR ms.source_id NOT IN ({disabled_placeholders}))")
+            params.extend(disabled_source_ids)
+        else:
+            source_visibility_sql, source_visibility_params = _enabled_source_visibility_condition(disabled_source_ids)
+            if source_visibility_sql:
+                clauses.append(source_visibility_sql)
+                params.extend(source_visibility_params)
+
+        join_sql = " ".join(joins)
+        where_sql = " AND ".join(clauses)
+        sql = (
+            "WITH matched_aliases AS ("
+            "SELECT entity_id, canonical_name, alias_normalized, rank AS fts_rank "
+            "FROM entity_alias_search_fts "
+            "WHERE entity_alias_search_fts MATCH ?"
+            ") "
+            "SELECT ma.entity_id, e.canonical_name, ma.alias_normalized AS matched_alias, "
+            "MIN(ma.fts_rank) AS best_rank, COUNT(DISTINCT m.id) AS visible_memory_count "
+            "FROM matched_aliases ma "
+            "JOIN entities e ON e.id = ma.entity_id "
+            "JOIN memory_entities me ON me.entity_id = ma.entity_id "
+            "JOIN memories m ON m.id = me.memory_id "
+            f"{join_sql} "
+            f"WHERE {where_sql} "
+            "GROUP BY ma.entity_id, e.canonical_name, ma.alias_normalized "
+            "ORDER BY best_rank ASC, visible_memory_count DESC, e.canonical_name ASC "
+            "LIMIT ?"
+        )
+        try:
+            async with self._db.db.execute(sql, [*params, limit]) as cursor:
+                rows = [dict(row) async for row in cursor]
+        except (aiosqlite.Error, sqlite3.Error):
+            logger.exception("SQLite entity alias FTS query failed")
+            return []
+        for row in rows:
+            row["matched_text"] = matched_text
+        return rows
 
     async def fetch_ranking_metadata(self, ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         """Return ranking and curation metadata for each id in one read.
