@@ -142,6 +142,9 @@ def _entity_link_fts_query(tokens: Sequence[str]) -> str:
         seen.add(token)
         escaped = token.replace('"', '""')
         terms.append(f'"{escaped}"')
+    # alias_fts is trusted enough to seed graph retrieval, so require more
+    # than a single generic noun. Exact and compact channels still cover
+    # single-surface formatting cases separately.
     if len(terms) < 2:
         return ""
     return " OR ".join(terms)
@@ -886,6 +889,9 @@ class SqliteRelationalStore:
         kept: list[dict[str, Any]] = []
         for row in rows:
             row_tokens = set(_entity_link_tokens(str(row.get("search_text") or "")))
+            # FTS rows are one canonical or alias surface. Require the query to
+            # overlap that same surface by at least two tokens before treating
+            # the match as a graph-activating entity link.
             if len(query_tokens.intersection(row_tokens)) < 2:
                 continue
             row["matched_text"] = matched_text

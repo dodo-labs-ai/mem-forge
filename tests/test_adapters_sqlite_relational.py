@@ -556,6 +556,31 @@ async def test_entity_alias_search_fts_migration_backfills_existing_entities(db)
 
 
 @pytest.mark.asyncio
+async def test_entity_alias_search_fts_rebuild_migration_removes_stale_tag_tokens(db):
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.db.execute("DELETE FROM entity_alias_search_fts")
+    await db.db.execute(
+        """INSERT INTO entity_alias_search_fts (
+               entity_id,
+               canonical_name,
+               alias_normalized,
+               search_text
+           ) VALUES (?, ?, ?, ?)""",
+        (entity_id, "payroll control center", "payroll control center", "payroll control center product"),
+    )
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 34")
+    await db.db.commit()
+
+    await db._run_migrations()
+
+    rows = await db.db.execute_fetchall(
+        "SELECT entity_id FROM entity_alias_search_fts WHERE entity_alias_search_fts MATCH ?",
+        ('"product"',),
+    )
+    assert rows == []
+
+
+@pytest.mark.asyncio
 async def test_source_id_invariant_rejects_unresolved_blank_provenance(db):
     await db.insert_memory(_memory("m1"))
     await _document(db, "doc1", source="src-backfill")

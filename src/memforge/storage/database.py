@@ -1600,6 +1600,33 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                JOIN entities e ON e.id = ea.canonical_id""",
         ],
     ),
+    (
+        34,
+        "Rebuild entity alias lexical search projection without tag tokens",
+        [
+            "DELETE FROM entity_alias_search_fts",
+            """INSERT INTO entity_alias_search_fts (
+                   entity_id,
+                   canonical_name,
+                   alias_normalized,
+                   search_text
+               )
+               SELECT
+                   e.id,
+                   e.canonical_name,
+                   e.canonical_name,
+                   COALESCE(e.canonical_name, '') || ' ' || COALESCE(e.display_name, '')
+               FROM entities e
+               UNION ALL
+               SELECT
+                   ea.canonical_id,
+                   e.canonical_name,
+                   ea.alias_normalized,
+                   COALESCE(ea.alias, '') || ' ' || COALESCE(ea.alias_normalized, '')
+               FROM entity_aliases ea
+               JOIN entities e ON e.id = ea.canonical_id""",
+        ],
+    ),
 ]
 
 
