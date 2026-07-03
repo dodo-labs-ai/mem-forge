@@ -23,6 +23,7 @@ from memforge.models import SyncState
 from memforge.pipeline.enricher import Enricher
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.source_support_detector import SourceSupportDetector
+from memforge.pipeline.sync_memory import SyncMemoryObserver
 from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
     ExtractionWorkPool,
@@ -93,6 +94,7 @@ class SyncRuntime:
     source_support_detector: SourceSupportDetector | None
     extraction_pool: ExtractionWorkPool | None = None
     document_lifecycle_admission: DocumentLifecycleAdmission | None = None
+    memory_observer: SyncMemoryObserver | None = None
     orchestrator_factory: Callable[["SyncRuntime"], GeneSyncOrchestrator] | None = None
 
     def orchestrator(self) -> GeneSyncOrchestrator:
@@ -111,6 +113,7 @@ class SyncRuntime:
             max_concurrent=self.config.llm.enrichment_max_concurrent,
             extraction_pool=self.extraction_pool,
             document_lifecycle_admission=self.document_lifecycle_admission,
+            memory_observer=self.memory_observer,
         )
 
 
@@ -553,6 +556,7 @@ async def build_sync_runtime(
         source_support_detector=source_support_detector,
         extraction_pool=extraction_pool,
         document_lifecycle_admission=document_lifecycle_admission,
+        memory_observer=SyncMemoryObserver(),
     )
 
 
