@@ -832,6 +832,8 @@ CREATE INDEX IF NOT EXISTS idx_memory_derivations_child ON memory_derivations(ch
 CREATE INDEX IF NOT EXISTS idx_memory_curation_runs_scope ON memory_curation_runs(source_type, client, repo_identifier, project_key);
 CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_id);
 CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized ON entity_aliases(alias_normalized);
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_compact ON entity_aliases(REPLACE(alias_normalized, ' ', ''));
+CREATE INDEX IF NOT EXISTS idx_entities_canonical_compact ON entities(REPLACE(canonical_name, ' ', ''));
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_status ON auth_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_source_subscriptions_user ON source_subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_agent_session_receipts_session ON agent_session_receipts(session_id);
@@ -1546,6 +1548,14 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                 metadata_compact TEXT NOT NULL,
                 PRIMARY KEY (memory_id, doc_id)
             )""",
+        ],
+    ),
+    (
+        32,
+        "Add compact entity alias lookup indexes",
+        [
+            "CREATE INDEX IF NOT EXISTS idx_entity_aliases_compact ON entity_aliases(REPLACE(alias_normalized, ' ', ''))",
+            "CREATE INDEX IF NOT EXISTS idx_entities_canonical_compact ON entities(REPLACE(canonical_name, ' ', ''))",
         ],
     ),
 ]

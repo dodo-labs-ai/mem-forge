@@ -21,6 +21,7 @@ from typing import Any
 
 from memforge.llm.structured import StructuredLlmError
 from memforge.models import canonicalize_entity_name
+from memforge.storage.adapters.protocols import EntityLinkCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,12 @@ class QueryAnalysis:
     use_vector: bool = True      # always on
     use_bm25: bool = True        # always on
     use_graph: bool = False      # only when entities detected
+
+    # Query-time linker diagnostics. Compact-only candidates may be present
+    # here without activating graph retrieval.
+    entity_linking: list[EntityLinkCandidate] = field(default_factory=list)
+    entity_linking_channels: tuple[str, ...] = ()
+    unmatched_explicit_entities: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------

@@ -24,9 +24,10 @@ from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
-from memforge.retrieval.query_analyzer import QueryAnalysis, analyze_query
+from memforge.retrieval.query_analyzer import QueryAnalysis
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import (
+    EntityLinkCandidate,
     KeywordCandidate,
     KeywordSearch,
     RelationalStore,
@@ -167,6 +168,19 @@ def _sanitize_fts_query(text: str) -> str:
     return " ".join(safe)
 
 
+def _entity_link_candidate_payload(candidate: EntityLinkCandidate) -> dict[str, Any]:
+    return {
+        "entity_id": candidate.entity_id,
+        "canonical_name": candidate.canonical_name,
+        "matched_alias": candidate.matched_alias,
+        "channel": candidate.channel,
+        "contributing_channels": list(candidate.contributing_channels),
+        "score": candidate.score,
+        "matched_text": candidate.matched_text,
+        "activates_graph": candidate.activates_graph,
+    }
+
+
 def _default_access_scope(include_superseded: bool) -> AccessScope:
     """The permissive single-datastore scope: real lifecycle filtering, no
     access narrowing. Carries only the status set the request asked for."""
@@ -284,6 +298,9 @@ class SearchEngine:
             return {
                 "query_analysis": {
                     "detected_entities": [],
+                    "entity_linking": [],
+                    "entity_linking_channels": [],
+                    "unmatched_explicit_entities": [],
                     "strategies_used": ["source_time_listing"],
                 },
                 "results": results,
@@ -294,29 +311,35 @@ class SearchEngine:
                 "retrieval_time_ms": elapsed_ms,
             }
 
-        # ----- 1. Build known entities dict for query analysis -----
-        known_entities = await self._build_known_entities()
+        # ----- 1. Link query entities through the scoped relational channel -----
+        analysis = QueryAnalysis()
+        try:
+            link_result = await self._relational.link_query_entities(
+                query,
+                scope=scope,
+                explicit_entities=entities or (),
+                source_filter=combined_source_filter,
+                memory_types=memory_types,
+            )
+            analysis.entity_linking = list(link_result.candidates)
+            analysis.entity_linking_channels = tuple(
+                dict.fromkeys(
+                    channel
+                    for candidate in link_result.candidates
+                    for channel in candidate.contributing_channels
+                )
+            )
+            analysis.unmatched_explicit_entities = link_result.unmatched_explicit_entities
+            graph_candidates = [
+                candidate for candidate in link_result.candidates if candidate.activates_graph
+            ]
+            analysis.detected_entities = [candidate.canonical_name for candidate in graph_candidates]
+            analysis.detected_entity_ids = [candidate.entity_id for candidate in graph_candidates]
+            analysis.use_graph = bool(graph_candidates)
+        except Exception:
+            logger.exception("Query-time entity linking failed; continuing without graph channel")
 
-        # ----- 2. Analyze query -----
-        analysis = await analyze_query(
-            query,
-            known_entities,
-            entity_model=self._config.entity_model,
-            entity_timeout_s=self._config.entity_timeout_s,
-            structured_llm_client=self._structured_llm_client,
-        )
-
-        # ----- 3. Override analysis with explicit params -----
-        if entities:
-            for ent_name in entities:
-                norm = ent_name.strip().lower()
-                if norm in known_entities and norm not in analysis.detected_entities:
-                    analysis.detected_entities.append(norm)
-                    analysis.detected_entity_ids.append(known_entities[norm])
-            if analysis.detected_entities:
-                analysis.use_graph = True
-
-        # ----- 4. Run active channels in parallel -----
+        # ----- 2. Run active channels in parallel -----
         fetch_k = max(top_k * 2, top_k + offset)
         tasks: list[asyncio.Task] = []
         channel_names: list[str] = []
@@ -401,6 +424,12 @@ class SearchEngine:
         return {
             "query_analysis": {
                 "detected_entities": analysis.detected_entities,
+                "entity_linking": [
+                    _entity_link_candidate_payload(candidate)
+                    for candidate in analysis.entity_linking
+                ],
+                "entity_linking_channels": list(analysis.entity_linking_channels),
+                "unmatched_explicit_entities": list(analysis.unmatched_explicit_entities),
                 "strategies_used": channel_names,
             },
             "results": results,
