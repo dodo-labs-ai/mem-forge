@@ -11,7 +11,6 @@ from memforge.llm.structured import RerankResponse
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.search import SearchEngine
-from memforge.retrieval.query_analyzer import QueryAnalysis
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
@@ -107,11 +106,6 @@ async def test_search_routes_vector_and_bm25_through_the_adapters(db, monkeypatc
     active = _memory("m-active", "PostgreSQL pooling memory")
     await db.insert_memory(active)
 
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
-
     adapters = build_sqlite_adapters(db, FakeCollection([active.id]))
     engine = SearchEngine(
         relational=adapters.relational,
@@ -127,20 +121,13 @@ async def test_search_routes_vector_and_bm25_through_the_adapters(db, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_current_search_path_does_not_call_entity_linking_stub(db, monkeypatch):
+async def test_search_path_uses_entity_linker_not_legacy_query_analysis(db, monkeypatch):
     active = _memory("m-active", "PostgreSQL pooling memory")
     await db.insert_memory(active)
-
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    async def fail_link_query_entities(*args, **kwargs):
-        raise AssertionError("link_query_entities is not wired until the deterministic linker slice")
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
+    entity_id = await db.upsert_entity("postgresql", "PostgreSQL", ["database"])
+    await db.link_memory_entity(active.id, entity_id)
 
     adapters = build_sqlite_adapters(db, FakeCollection([active.id]))
-    monkeypatch.setattr(adapters.relational, "link_query_entities", fail_link_query_entities)
     engine = SearchEngine(
         relational=adapters.relational,
         keyword=adapters.keyword,
@@ -149,10 +136,17 @@ async def test_current_search_path_does_not_call_entity_linking_stub(db, monkeyp
         config=RetrievalConfig(),
     )
     engine._get_or_compute_embedding = lambda query: [0.1]
+    monkeypatch.setattr(
+        engine,
+        "_build_known_entities",
+        lambda: (_ for _ in ()).throw(AssertionError("_build_known_entities must not run")),
+    )
 
     result = await engine.search("PostgreSQL", entities=["postgresql"], top_k=10)
 
     assert [r.memory_id for r in result["results"]] == [active.id]
+    assert result["query_analysis"]["detected_entities"] == ["postgresql"]
+    assert result["query_analysis"]["entity_linking"][0]["channel"] == "explicit"
 
 
 @pytest.mark.asyncio
@@ -167,11 +161,6 @@ async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch)
         title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
     )
     await db.add_memory_source("m-blocker", "SFPAY-179397", "jira", None, source_updated_at=None)
-
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     adapters = build_sqlite_adapters(db, FakeCollection([]))
     engine = SearchEngine(
@@ -220,11 +209,6 @@ async def test_search_recalls_compound_query_from_metadata_trigram(db, monkeypat
     )
     await db.add_memory_source("m-blocker", "SFPAY-179397", "jira", None, source_updated_at=None)
 
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
-
     adapters = build_sqlite_adapters(db, FakeCollection([]))
     engine = SearchEngine(
         relational=adapters.relational,
@@ -256,11 +240,6 @@ async def test_rerank_prompt_includes_metadata_evidence_for_metadata_hits(db, mo
         title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
     )
     await db.add_memory_source("m-blocker", "SFPAY-179397", "jira", None, source_updated_at=None)
-
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     reranker = RecordingRerankClient()
     adapters = build_sqlite_adapters(db, FakeCollection([]))
@@ -298,11 +277,6 @@ async def test_source_filter_applies_to_vector_hits(db, monkeypatch):
     await db.add_memory_source("m-backed", "doc-wiki", "wiki", None, source_updated_at=None)
     await db.add_memory_source("m-unbacked", "doc-other", "other", None, source_updated_at=None)
 
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
-
     adapters = build_sqlite_adapters(db, FakeCollection(["m-backed", "m-unbacked"]))
     engine = SearchEngine(
         relational=adapters.relational,
@@ -331,11 +305,6 @@ async def test_structured_source_filter_accepts_multiple_source_ids(db, monkeypa
     await db.add_memory_source("m-structured", "doc-wiki", "confluence", None, source_updated_at=None)
     await db.add_memory_source("m-top-level", "doc-jira", "jira", None, source_updated_at=None)
     await db.add_memory_source("m-other", "doc-slack", "slack", None, source_updated_at=None)
-
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     adapters = build_sqlite_adapters(
         db,
@@ -388,11 +357,6 @@ async def test_structured_source_filter_applies_to_vector_hits(db, monkeypatch):
         source_updated_at=None,
     )
 
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
-
     adapters = build_sqlite_adapters(
         db,
         FakeCollection(["m-codex", "m-jira", "m-other-repo"]),
@@ -441,11 +405,6 @@ async def test_explicit_time_range_filters_vector_hits_before_ranking(db, monkey
         source_updated_at=datetime(2026, 6, 10, tzinfo=timezone.utc),
     )
 
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
-
     adapters = build_sqlite_adapters(
         db,
         FakeCollection(["m-out-of-window", "m-in-window"]),
@@ -481,13 +440,8 @@ async def test_queried_search_honors_offset_after_ranking(db, monkeypatch):
     for memory in (first, second, third):
         await db.insert_memory(memory)
 
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
     async def no_bm25(*args, **kwargs):
         return []
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     adapters = build_sqlite_adapters(
         db,
@@ -523,13 +477,8 @@ async def test_search_engine_returns_only_memory_results_even_when_top_k_has_roo
         source_updated_at=datetime(2026, 6, 25, tzinfo=timezone.utc),
     )
 
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
     async def no_bm25(*args, **kwargs):
         return []
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     memory_adapters = build_sqlite_adapters(db, FakeCollection(["m-target"]))
     engine = SearchEngine(
@@ -584,11 +533,6 @@ async def test_queryless_source_id_time_range_uses_relational_listing_only(db, m
         None,
         source_updated_at=datetime(2026, 6, 26, tzinfo=timezone.utc),
     )
-
-    async def fail_analyze_query(*args, **kwargs):
-        raise AssertionError("queryless search must not run semantic query analysis")
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fail_analyze_query)
 
     adapters = build_sqlite_adapters(
         db,
