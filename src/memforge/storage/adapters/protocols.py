@@ -7,6 +7,7 @@ adapter's job, never the caller's.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping, Protocol, Sequence, TypedDict, runtime_checkable
 
@@ -22,6 +23,27 @@ from memforge.models import (
 )
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.storage.adapters.context import AccessScope
+
+
+@dataclass(frozen=True)
+class KeywordSourceRef:
+    """Authorized source support row that contributed keyword evidence."""
+
+    source_id: str | None
+    doc_id: str
+    source_type: str
+
+
+@dataclass(frozen=True)
+class KeywordCandidate:
+    """Structured keyword candidate with channel and matched metadata evidence."""
+
+    memory_id: str
+    score: float
+    channel: str
+    matched_fields: tuple[str, ...] = ()
+    source_refs: tuple[KeywordSourceRef, ...] = ()
+    matched_text: tuple[str, ...] = ()
 
 
 class RankingMetadata(TypedDict, total=False):
@@ -183,6 +205,14 @@ class KeywordSearch(Protocol):
         memory_types: list[str] | None,
         limit: int,
     ) -> list[tuple[str, float]]: ...
+
+    async def search_metadata(
+        self,
+        fts_query: str,
+        scope: AccessScope,
+        memory_types: list[str] | None,
+        limit: int,
+    ) -> list[KeywordCandidate]: ...
 
 
 @runtime_checkable

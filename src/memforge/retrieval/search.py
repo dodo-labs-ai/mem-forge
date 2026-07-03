@@ -26,7 +26,12 @@ from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.query_analyzer import QueryAnalysis, analyze_query
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
-from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
+from memforge.storage.adapters.protocols import (
+    KeywordCandidate,
+    KeywordSearch,
+    RelationalStore,
+    VectorStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +72,7 @@ class _RankedCandidate:
     memory_level: str | None = None
     curation_cluster_id: str | None = None
     covered_memory_count: int = 0
+    retrieval_evidence: dict[str, Any] | None = None
 
 
 def _affinity_penalty(project_key: str | None, scope: AccessScope) -> float:
@@ -327,6 +333,11 @@ class SearchEngine:
         ))
         channel_names.append("bm25")
 
+        tasks.append(asyncio.ensure_future(
+            self._bm25_metadata_search(query, memory_types, scope, fetch_k)
+        ))
+        channel_names.append("bm25_metadata_tokens")
+
         # Graph traversal — only when entities detected
         if analysis.use_graph and analysis.detected_entity_ids:
             tasks.append(asyncio.ensure_future(
@@ -338,15 +349,26 @@ class SearchEngine:
 
         # Collect channel results, logging any errors
         channel_results: list[list[tuple[str, float]]] = []
+        metadata_evidence: dict[str, dict[str, Any]] = {}
         for name, result in zip(channel_names, raw_results):
             if isinstance(result, BaseException):
                 logger.error("Channel %s failed: %s", name, result, exc_info=result)
                 channel_results.append([])
+            elif name == "bm25_metadata_tokens":
+                hits = list(result)
+                channel_results.append([(hit.memory_id, hit.score) for hit in hits])
+                metadata_evidence.update(
+                    {
+                        hit.memory_id: _metadata_keyword_evidence(hit)
+                        for hit in hits
+                    }
+                )
             else:
                 channel_results.append(result)
 
         # ----- 5. Fuse via RRF, then apply the source-of-truth re-checks -----
         fused = self._rrf_fusion(channel_results, k=self._config.rrf_k)
+        self._attach_retrieval_evidence(fused, metadata_evidence)
         fused = await self._filter_candidates_by_status(fused, scope)
         if (
             (combined_source_filter is not None and not combined_source_filter.is_empty())
@@ -440,6 +462,24 @@ class SearchEngine:
         )
         return await self._keyword.search(fts_query, scope, memory_types, limit)
 
+    async def _bm25_metadata_search(
+        self,
+        query: str,
+        memory_types: list[str] | None,
+        scope: AccessScope,
+        limit: int,
+    ) -> list[KeywordCandidate]:
+        """Query the source-metadata keyword channel."""
+        sanitized_query = _sanitize_fts_query(query)
+        if not sanitized_query:
+            return []
+        return await self._keyword.search_metadata(
+            sanitized_query,
+            scope,
+            memory_types,
+            limit,
+        )
+
     async def _graph_search(
         self,
         entity_ids: list[int],
@@ -482,6 +522,16 @@ class SearchEngine:
             for mid, s in sorted(scores.items(), key=lambda x: x[1], reverse=True)
         ]
         return candidates
+
+    @staticmethod
+    def _attach_retrieval_evidence(
+        candidates: list[_RankedCandidate],
+        metadata_evidence: dict[str, dict[str, Any]],
+    ) -> None:
+        for candidate in candidates:
+            evidence = metadata_evidence.get(candidate.memory_id)
+            if evidence:
+                candidate.retrieval_evidence = {"metadata_lexical": evidence}
 
     async def _filter_candidates_by_status(
         self,
@@ -645,7 +695,7 @@ class SearchEngine:
         for i, c in enumerate(to_rerank):
             content = id_to_content.get(c.memory_id, "")
             if content:
-                numbered.append(f"{i}. {content}")
+                numbered.append(_rerank_memory_card(i, content, c.retrieval_evidence))
                 idx_to_id[i] = c.memory_id
 
         if not numbered:
@@ -769,6 +819,7 @@ class SearchEngine:
                     memory,
                     contradiction_warning=contradiction_warning,
                 ),
+                retrieval_evidence=candidate.retrieval_evidence,
             ))
 
         return results
@@ -874,6 +925,49 @@ class SearchEngine:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+def _metadata_keyword_evidence(hit: KeywordCandidate) -> dict[str, Any]:
+    return {
+        "channel": hit.channel,
+        "matched_fields": list(hit.matched_fields),
+        "matched_text": list(hit.matched_text),
+        "source_refs": [
+            {
+                "source_id": ref.source_id,
+                "doc_id": ref.doc_id,
+                "source_type": ref.source_type,
+            }
+            for ref in hit.source_refs
+        ],
+    }
+
+
+def _rerank_memory_card(
+    index: int,
+    content: str,
+    retrieval_evidence: dict[str, Any] | None,
+) -> str:
+    card = f"{index}. Memory: {content}"
+    metadata_evidence = (retrieval_evidence or {}).get("metadata_lexical")
+    if not metadata_evidence:
+        return card
+    evidence_lines = []
+    matched_texts = metadata_evidence.get("matched_text") or []
+    if matched_texts:
+        evidence_lines.append("metadata: " + " || ".join(str(text) for text in matched_texts[:3]))
+    source_refs = metadata_evidence.get("source_refs") or []
+    if source_refs:
+        refs = [
+            f"{ref.get('source_type')}:{ref.get('doc_id')}"
+            for ref in source_refs[:3]
+            if isinstance(ref, dict)
+        ]
+        if refs:
+            evidence_lines.append("source_refs: " + ", ".join(refs))
+    if evidence_lines:
+        return card + "\n   Retrieval evidence: " + " ; ".join(evidence_lines)
+    return card
+
 
 def _compute_freshness(memory: Memory, has_source: bool) -> str:
     """Determine the freshness label for a memory.
