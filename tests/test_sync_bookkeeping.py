@@ -1117,6 +1117,52 @@ async def test_sync_memory_observer_records_discovery_and_document_stages(db: Da
 
 
 @pytest.mark.asyncio
+async def test_sync_memory_observer_records_pdf_export_stage(db: Database):
+    source_id = "src-sync-memory-pdf"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Confluence Space",
+        config_json="{}",
+    )
+    release = asyncio.Event()
+    release.set()
+    log = RecordingSyncMemoryLogger()
+    observer = SyncMemoryObserver(
+        sampler=ConstantMemorySampler(),
+        logger=log,
+    )
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+        memory_observer=observer,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=PdfBackfillGene(item_count=1, release=release),
+        source_name="Confluence Space",
+        source_id=source_id,
+        force_full_sync=True,
+    )
+
+    assert state.last_sync_status == "success"
+    pdf_events = [
+        event
+        for _level, event in log.records
+        if event["stage"] == "after_pdf_export"
+    ]
+    assert len(pdf_events) == 1
+    assert pdf_events[0]["source_id"] == source_id
+    assert pdf_events[0]["doc_id"] == "jira-0"
+    assert pdf_events[0]["pdf_bytes"] == 137
+
+
+@pytest.mark.asyncio
 async def test_sync_memory_observer_records_lifecycle_exit_when_document_fails(db: Database):
     source_id = "src-sync-memory-error"
     await db.upsert_source(id=source_id, type="jira", name="Jira Board", config_json="{}")
