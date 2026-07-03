@@ -836,6 +836,156 @@ class TestDetectCrossDocContradictions:
         ] == [(mem_a.id, False, False)]
 
     @pytest.mark.asyncio
+    async def test_total_pair_cap_and_batching_bound_llm_prompt_size(self, seeded_db, memory_store, monkeypatch):
+        db, _, _, mem_b, _ = seeded_db
+        candidates = []
+        for i in range(5):
+            doc_id = f"doc-cap-{i}"
+            memory = _make_memory(f"mem-cap{i:04d}", f"candidate memory {i}")
+            await _insert_document(db, doc_id)
+            await db.insert_memory(memory)
+            await db.db.execute(
+                "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
+                (memory.id, doc_id, "confluence"),
+            )
+            candidates.append(memory)
+        await db.db.commit()
+
+        async def capped_candidates(
+            memory_id,
+            entity_ids,
+            doc_id,
+            *,
+            owner_user_id=None,
+            visibility=None,
+            project_key=None,
+            excluded_source_ids=(),
+            limit=200,
+        ):
+            del (
+                memory_id,
+                entity_ids,
+                doc_id,
+                owner_user_id,
+                visibility,
+                project_key,
+                excluded_source_ids,
+            )
+            return CandidatePage(candidates=candidates[:limit], complete=True, requested_limit=limit)
+
+        monkeypatch.setattr(db, "get_cross_doc_candidates", capped_candidates)
+        monkeypatch.setattr(
+            "memforge.pipeline.contradiction_detector.MAX_CONTRADICTION_PAIRS_PER_RUN",
+            2,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "memforge.pipeline.contradiction_detector.CONTRADICTION_LLM_BATCH_SIZE",
+            1,
+            raising=False,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.detect_contradictions = AsyncMock(
+            return_value=_mock_contradiction_response([])
+        )
+
+        stats = await detect_cross_doc_contradictions(
+            new_memory_ids=[mem_b.id],
+            doc_id="doc-bbb",
+            db=db,
+            memory_store=memory_store,
+            structured_llm_client=mock_client,
+        )
+
+        assert stats["checked"] == 2
+        assert stats["truncated"] == 1
+        assert mock_client.detect_contradictions.call_count == 2
+        prompts = [call.args[0] for call in mock_client.detect_contradictions.call_args_list]
+        assert all(prompt.count('"memory_a"') == 1 for prompt in prompts)
+        async with db.db.execute(
+            """SELECT status, review_case
+               FROM relation_runs
+               WHERE evidence_unit_id LIKE 'eu-contradiction-%'
+               ORDER BY started_at DESC LIMIT 1"""
+        ) as cursor:
+            run = await cursor.fetchone()
+        assert run is not None
+        assert run["status"] == "review_required"
+        assert run["review_case"] == ReviewCase.MANDATORY_INCOMPLETE.value
+
+    @pytest.mark.asyncio
+    async def test_pair_cap_records_incomplete_run_for_skipped_challenger(self, seeded_db, memory_store, monkeypatch):
+        db, entity_id, mem_a, mem_b, _ = seeded_db
+        skipped = _make_memory("mem-skip0001", "pay-api has an unverified runtime version")
+        await db.insert_memory(skipped)
+        await db.db.execute(
+            "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
+            (skipped.id, "doc-bbb", "confluence"),
+        )
+        await db.db.execute(
+            "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
+            (skipped.id, entity_id),
+        )
+        await db.db.commit()
+
+        async def exact_cap_candidates(
+            memory_id,
+            entity_ids,
+            doc_id,
+            *,
+            owner_user_id=None,
+            visibility=None,
+            project_key=None,
+            excluded_source_ids=(),
+            limit=200,
+        ):
+            del (
+                memory_id,
+                entity_ids,
+                doc_id,
+                owner_user_id,
+                visibility,
+                project_key,
+                excluded_source_ids,
+            )
+            return CandidatePage(candidates=(mem_a,)[:limit], complete=True, requested_limit=limit)
+
+        monkeypatch.setattr(db, "get_cross_doc_candidates", exact_cap_candidates)
+        monkeypatch.setattr(
+            "memforge.pipeline.contradiction_detector.MAX_CONTRADICTION_PAIRS_PER_RUN",
+            1,
+            raising=False,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.detect_contradictions = AsyncMock(
+            return_value=_mock_contradiction_response([])
+        )
+
+        stats = await detect_cross_doc_contradictions(
+            new_memory_ids=[mem_b.id, skipped.id],
+            doc_id="doc-bbb",
+            db=db,
+            memory_store=memory_store,
+            structured_llm_client=mock_client,
+        )
+
+        assert stats["checked"] == 1
+        assert stats["truncated"] == 1
+        async with db.db.execute(
+            """SELECT status, review_case, audit_json
+               FROM relation_runs
+               WHERE review_case = ?
+               ORDER BY started_at DESC LIMIT 1""",
+            (ReviewCase.MANDATORY_INCOMPLETE.value,),
+        ) as cursor:
+            run = await cursor.fetchone()
+        assert run is not None
+        assert run["status"] == "review_required"
+        assert skipped.id in run["audit_json"]
+
+    @pytest.mark.asyncio
     async def test_multiple_contradictions_create_one_review_per_challenger(self, seeded_db, memory_store):
         """One challenger can conflict with several memories but needs one decision row."""
         db, entity_id, _, mem_b, _ = seeded_db

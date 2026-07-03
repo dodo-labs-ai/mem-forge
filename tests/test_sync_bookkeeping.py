@@ -23,6 +23,7 @@ from memforge.models import (
     content_hash,
 )
 from memforge.pipeline.sync import (
+    DocumentLifecycleAdmission,
     ExtractionWorkPool,
     GeneSyncOrchestrator,
     summarize_failed_documents,
@@ -219,6 +220,57 @@ async def test_shared_extraction_pool_caps_orchestrator_work_across_sources(db: 
     assert enricher.max_active == 4
 
     release_enrichment.set()
+    states = await asyncio.gather(task_a, task_b)
+    assert [state.last_sync_status for state in states] == ["success", "success"]
+
+
+@pytest.mark.asyncio
+async def test_document_lifecycle_admission_caps_fetch_across_sources(db: Database):
+    for source_id in ("src-doc-a", "src-doc-b"):
+        await db.upsert_source(
+            id=source_id,
+            type="jira",
+            name=f"Source {source_id}",
+            config_json="{}",
+        )
+
+    admission = DocumentLifecycleAdmission(max_active=1)
+    release_fetch = asyncio.Event()
+    tracker = SharedFetchTracker(target_entries=1)
+
+    def make_orchestrator() -> GeneSyncOrchestrator:
+        return GeneSyncOrchestrator(
+            db=db,
+            doc_store=StubDocumentStore(),
+            enricher=InstantEnricher(),
+            memory_extractor=NoopMemoryExtractor(),
+            memory_engine=NoopMemoryEngine(),
+            memory_store=None,
+            max_concurrent=2,
+            document_lifecycle_admission=admission,
+        )
+
+    task_a = asyncio.create_task(
+        make_orchestrator().sync_gene(
+            gene=TrackedFetchGene(prefix="a", release=release_fetch, tracker=tracker),
+            source_name="Source A",
+            source_id="src-doc-a",
+        )
+    )
+    task_b = asyncio.create_task(
+        make_orchestrator().sync_gene(
+            gene=TrackedFetchGene(prefix="b", release=release_fetch, tracker=tracker),
+            source_name="Source B",
+            source_id="src-doc-b",
+        )
+    )
+
+    await asyncio.wait_for(tracker.target_reached.wait(), timeout=2)
+    await asyncio.sleep(0.05)
+
+    assert tracker.max_active == 1
+
+    release_fetch.set()
     states = await asyncio.gather(task_a, task_b)
     assert [state.last_sync_status for state in states] == ["success", "success"]
 
@@ -623,6 +675,49 @@ class BlockingFetchGene:
         return NormalizedContent(item=raw.item, markdown_body=f"# {raw.item.title}\n\nBody")
 
 
+class SharedFetchTracker:
+    def __init__(self, target_entries: int) -> None:
+        self.active = 0
+        self.max_active = 0
+        self.target_entries = target_entries
+        self.target_reached = asyncio.Event()
+
+    def enter(self) -> None:
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        if self.max_active >= self.target_entries:
+            self.target_reached.set()
+
+    def exit(self) -> None:
+        self.active -= 1
+
+
+class TrackedFetchGene(BlockingFetchGene):
+    def __init__(self, *, prefix: str, release: asyncio.Event, tracker: SharedFetchTracker):
+        super().__init__(item_count=1, release=release)
+        self.prefix = prefix
+        self.tracker = tracker
+
+    async def discover(self, since=None):
+        yield ContentItem(
+            item_id=f"jira-{self.prefix}-0",
+            title=f"Jira {self.prefix}",
+            source_url=f"https://jira.example/browse/{self.prefix}",
+            last_modified=datetime.now(timezone.utc),
+            content_type="application/json",
+            space_or_project="PAY",
+            version=self.prefix,
+        )
+
+    async def fetch(self, item):
+        self.tracker.enter()
+        try:
+            await self.release.wait()
+            return RawContent(item=item, body=b'{"summary":"test"}', content_type="application/json")
+        finally:
+            self.tracker.exit()
+
+
 class PdfBackfillGene(BlockingFetchGene):
     def requires_pdf_artifact(
         self,
@@ -762,6 +857,19 @@ class EntityMentioningEnricher:
                     aliases=["Raw Alias"],
                 )
             ],
+            relationships=[],
+            doc_type="jira_issue",
+            complexity="low",
+        )
+
+
+class InstantEnricher:
+    async def enrich_document(self, *, doc_id, content, source_type):
+        del doc_id, content, source_type
+        return EnrichmentResult(
+            summary="Summary",
+            tags=[],
+            entities=[],
             relationships=[],
             doc_type="jira_issue",
             complexity="low",
@@ -1585,6 +1693,12 @@ def test_sync_max_extraction_workers_can_be_set_from_env(monkeypatch):
     assert AppConfig().sync.max_extraction_workers == 6
 
 
+def test_sync_max_document_lifecycles_can_be_set_from_env(monkeypatch):
+    monkeypatch.setenv("MEMFORGE_SYNC_MAX_DOCUMENT_LIFECYCLES", "1")
+
+    assert AppConfig().sync.max_document_lifecycles == 1
+
+
 @pytest.mark.asyncio
 async def test_sync_service_passes_shared_extraction_pool_to_runtime_provider(db: Database):
     source_id = "src-shared-pool"
@@ -1605,8 +1719,9 @@ async def test_sync_service_passes_shared_extraction_pool_to_runtime_provider(db
             config: AppConfig,
             *,
             extraction_pool: ExtractionWorkPool | None = None,
+            document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
         ):
-            del db, config
+            del db, config, document_lifecycle_admission
             self.extraction_pools.append(extraction_pool)
             return object()
 
@@ -1625,6 +1740,60 @@ async def test_sync_service_passes_shared_extraction_pool_to_runtime_provider(db
     await task
 
     assert provider.extraction_pools == [service._extraction_pool]
+
+
+@pytest.mark.asyncio
+async def test_sync_service_passes_shared_document_lifecycle_admission_to_runtime_provider(db: Database):
+    source_id = "src-shared-doc-admission"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Shared Document Admission Source",
+        config_json="{}",
+    )
+
+    class CapturingRuntimeProvider:
+        def __init__(self) -> None:
+            self.document_lifecycle_admissions: list[DocumentLifecycleAdmission | None] = []
+
+        async def build_sync_runtime(
+            self,
+            db: Database,
+            config: AppConfig,
+            *,
+            extraction_pool: ExtractionWorkPool | None = None,
+            document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
+        ):
+            del db, config, extraction_pool
+            self.document_lifecycle_admissions.append(document_lifecycle_admission)
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            return None
+
+    provider = CapturingRuntimeProvider()
+    service = SyncService(
+        db,
+        AppConfig(sync=SyncConfig(max_document_lifecycles=1)),
+        runtime_provider=provider,
+    )
+
+    task = await service.start_source(source_id)
+    await task
+
+    assert provider.document_lifecycle_admissions == [service._document_lifecycle_admission]
+
+
+@pytest.mark.asyncio
+async def test_sync_services_share_process_document_lifecycle_admission(db: Database):
+    config = AppConfig(sync=SyncConfig(max_document_lifecycles=1))
+
+    service_a = SyncService(db, config)
+    service_b = SyncService(db, config)
+
+    assert service_a._document_lifecycle_admission is not None
+    assert service_a._document_lifecycle_admission is service_b._document_lifecycle_admission
 
 
 @pytest.mark.asyncio
