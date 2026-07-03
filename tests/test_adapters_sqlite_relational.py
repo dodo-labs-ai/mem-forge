@@ -236,18 +236,105 @@ async def test_link_query_entities_alias_fts_refreshes_after_insert_alias(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))
     entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
-    await db.insert_alias("PCC Engine", "pcc engine", entity_id, "admin_manual")
+    await db.insert_alias("PCC Engine Lifecycle", "pcc engine lifecycle", entity_id, "admin_manual")
     await db.link_memory_entity("m1", entity_id)
 
     result = await store.link_query_entities(
-        "engine validation failures",
+        "engine lifecycle validation failures",
         scope=_scope(),
         limit=5,
     )
 
     assert [(c.entity_id, c.channel, c.matched_alias, c.activates_graph) for c in result.candidates] == [
-        (entity_id, "alias_fts", "payroll control center", True)
+        (entity_id, "alias_fts", "pcc engine lifecycle", True)
     ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_alias_fts_ignores_tag_only_overlap(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m1"))
+    await store.insert_memory(_memory("m2"))
+    tagged_entity = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    named_entity = await db.upsert_entity("product release calendar", "Product Release Calendar", ["planning"])
+    await db.link_memory_entity("m1", tagged_entity)
+    await db.link_memory_entity("m2", named_entity)
+
+    result = await store.link_query_entities(
+        "product release status",
+        scope=_scope(),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
+        (named_entity, "alias_fts", "product release calendar")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_alias_fts_honors_source_filter(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-wiki"))
+    await store.insert_memory(_memory("m-jira"))
+    await _document(db, "doc-wiki", source="wiki")
+    await _document(db, "doc-jira", source="jira")
+    wiki_entity = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    jira_entity = await db.upsert_entity("payroll control process", "Payroll Control Process", ["product"])
+    await db.link_memory_entity("m-wiki", wiki_entity)
+    await db.link_memory_entity("m-jira", jira_entity)
+    await store.add_memory_source("m-wiki", "doc-wiki", "confluence", None, source_updated_at=None)
+    await store.add_memory_source("m-jira", "doc-jira", "jira", None, source_updated_at=None)
+
+    result = await store.link_query_entities(
+        "control center validation",
+        scope=_scope(),
+        source_filter=MemorySourceFilter(source_ids=("wiki",)),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
+        (wiki_entity, "alias_fts", "payroll control center")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_alias_fts_honors_memory_types(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-fact", memory_type="fact"))
+    await store.insert_memory(_memory("m-procedure", memory_type="procedure"))
+    fact_entity = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    procedure_entity = await db.upsert_entity("payroll control process", "Payroll Control Process", ["product"])
+    await db.link_memory_entity("m-fact", fact_entity)
+    await db.link_memory_entity("m-procedure", procedure_entity)
+
+    result = await store.link_query_entities(
+        "control process validation",
+        scope=_scope(),
+        memory_types=("procedure",),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
+        (procedure_entity, "alias_fts", "payroll control process")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_alias_fts_refreshes_after_remove_alias(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m1"))
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.insert_alias("PCC Engine", "pcc engine", entity_id, "admin_manual")
+    await db.link_memory_entity("m1", entity_id)
+
+    assert (
+        await store.link_query_entities("pcc engine validation", scope=_scope(), limit=5)
+    ).candidates
+
+    await db.remove_entity_alias(entity_id=entity_id, alias_normalized="pcc engine")
+
+    result = await store.link_query_entities("pcc engine validation", scope=_scope(), limit=5)
+    assert result.candidates == ()
 
 
 @pytest.mark.asyncio
