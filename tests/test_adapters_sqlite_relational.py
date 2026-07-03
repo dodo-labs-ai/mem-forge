@@ -214,6 +214,43 @@ async def test_link_query_entities_compact_match_does_not_activate_graph(db):
 
 
 @pytest.mark.asyncio
+async def test_link_query_entities_alias_fts_recalls_partial_alias_overlap(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m1"))
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.link_memory_entity("m1", entity_id)
+
+    result = await store.link_query_entities(
+        "control center validation failures",
+        scope=_scope(),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias, c.activates_graph) for c in result.candidates] == [
+        (entity_id, "alias_fts", "payroll control center", True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_alias_fts_refreshes_after_insert_alias(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m1"))
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.insert_alias("PCC Engine", "pcc engine", entity_id, "admin_manual")
+    await db.link_memory_entity("m1", entity_id)
+
+    result = await store.link_query_entities(
+        "engine validation failures",
+        scope=_scope(),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias, c.activates_graph) for c in result.candidates] == [
+        (entity_id, "alias_fts", "payroll control center", True)
+    ]
+
+
+@pytest.mark.asyncio
 async def test_link_query_entities_honors_disabled_sources(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m-disabled"))
@@ -412,6 +449,23 @@ async def test_compact_entity_lookup_indexes_migration(db):
     entity_indexes = await db.db.execute_fetchall("PRAGMA index_list(entities)")
     assert "idx_entity_aliases_compact" in {row["name"] for row in alias_indexes}
     assert "idx_entities_canonical_compact" in {row["name"] for row in entity_indexes}
+
+
+@pytest.mark.asyncio
+async def test_entity_alias_search_fts_migration_backfills_existing_entities(db):
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.insert_alias("PCC Engine", "pcc engine", entity_id, "admin_manual")
+    await db.db.execute("DELETE FROM entity_alias_search_fts")
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 33")
+    await db.db.commit()
+
+    await db._run_migrations()
+
+    rows = await db.db.execute_fetchall(
+        "SELECT entity_id FROM entity_alias_search_fts WHERE entity_alias_search_fts MATCH ?",
+        ('"engine"',),
+    )
+    assert [row["entity_id"] for row in rows] == [entity_id]
 
 
 @pytest.mark.asyncio
