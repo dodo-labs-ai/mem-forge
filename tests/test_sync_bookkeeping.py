@@ -22,6 +22,7 @@ from memforge.models import (
     FailedDoc,
     content_hash,
 )
+from memforge.pipeline.sync_memory import MemorySample, SyncMemoryObserver
 from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
     ExtractionWorkPool,
@@ -418,6 +419,21 @@ class StubDocumentStore:
         return None
 
 
+class RecordingSyncMemoryLogger:
+    def __init__(self):
+        self.records: list[tuple[str, dict]] = []
+
+    def info(self, message):
+        import json
+
+        self.records.append(("info", json.loads(message)))
+
+    def debug(self, message):
+        import json
+
+        self.records.append(("debug", json.loads(message)))
+
+
 class FailingPdfDocumentStore(StubDocumentStore):
     def store_raw(self, *, source_name, title, content, content_type, extension=None):
         if content_type == "application/pdf":
@@ -440,6 +456,15 @@ class NoopMemoryEngine:
 
     async def reconcile_and_persist(self, **kwargs):
         return {"added": 0, "updated": 0, "superseded": 0, "deleted": 0, "noop": 0}
+
+
+class RecordingSourceSupportDetector:
+    async def detect_and_persist(self, **kwargs):
+        return {
+            "added": 1,
+            "updated": 0,
+            "removed_stale": 0,
+        }
 
 
 class FailingDocumentDeleteMemoryStore:
@@ -911,6 +936,20 @@ class ExplodingEnricher:
         raise AssertionError("unchanged document should not be enriched")
 
 
+class RaisingEnricher:
+    async def enrich_document(self, *, doc_id, content, source_type):
+        raise RuntimeError("enrichment exploded")
+
+
+class ConstantMemorySampler:
+    def __init__(self):
+        self.rss = 100.0
+
+    def sample(self):
+        self.rss += 1.0
+        return MemorySample(rss_mb=self.rss, peak_rss_mb=self.rss)
+
+
 async def _insert_source_and_doc(db: Database, source_id: str) -> None:
     await db.upsert_source(
         id=source_id,
@@ -1014,6 +1053,95 @@ def _audited_memory_store(db: Database) -> MemoryStore:
             default_context=AuditContext(actor_type="test", run_id="run-sync-bookkeeping"),
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_sync_memory_observer_records_discovery_and_document_stages(db: Database):
+    source_id = "src-sync-memory"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Board",
+        config_json="{}",
+    )
+    release = asyncio.Event()
+    release.set()
+    log = RecordingSyncMemoryLogger()
+    observer = SyncMemoryObserver(
+        sampler=ConstantMemorySampler(),
+        logger=log,
+    )
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        source_support_detector=RecordingSourceSupportDetector(),
+        max_concurrent=1,
+        memory_observer=observer,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=BlockingFetchGene(item_count=1, release=release),
+        source_name="Jira Board",
+        source_id=source_id,
+        force_full_sync=True,
+    )
+
+    assert state.last_sync_status == "success"
+    events = [event for _level, event in log.records]
+    stages = [event["stage"] for event in events]
+    assert "sync_run_start" in stages
+    assert "after_discovery" in stages
+    assert "document_wait_start" in stages
+    assert "document_lifecycle_enter" in stages
+    assert "after_fetch" in stages
+    assert "after_normalize" in stages
+    assert "after_raw_store" in stages
+    assert "after_enrich" in stages
+    assert "after_extract" in stages
+    assert "after_memory_engine" in stages
+    assert "after_source_support" in stages
+    assert "document_lifecycle_exit" in stages
+    assert "sync_run_end" in stages
+    discovery = next(event for event in events if event["stage"] == "after_discovery")
+    assert discovery["item_count"] == 1
+    assert discovery["indexed_doc_count"] == 0
+    assert discovery["full_sync"] is True
+    support = next(event for event in events if event["stage"] == "after_source_support")
+    assert support["memory_supports_added"] == 1
+    assert "title" not in support
+    assert "source_url" not in support
+
+
+@pytest.mark.asyncio
+async def test_sync_memory_observer_records_lifecycle_exit_when_document_fails(db: Database):
+    source_id = "src-sync-memory-error"
+    await db.upsert_source(id=source_id, type="jira", name="Jira Board", config_json="{}")
+    release = asyncio.Event()
+    release.set()
+    log = RecordingSyncMemoryLogger()
+    observer = SyncMemoryObserver(sampler=ConstantMemorySampler(), logger=log)
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=RaisingEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+        memory_observer=observer,
+    )
+
+    state = await orchestrator.sync_gene(gene=BlockingFetchGene(1, release), source_name="Jira Board", source_id=source_id)
+
+    assert state.last_sync_status == "failed"
+    exits = [event for _level, event in log.records if event["stage"] == "document_lifecycle_exit"]
+    assert exits
+    assert all(event["ok"] is False for event in exits)
+    assert all(event["error_class"] == "RuntimeError" for event in exits)
 
 
 @pytest.mark.asyncio
