@@ -20,3 +20,13 @@
 - Keep Codex and Claude Code on the same remote plugin source. Neither client should reference `/Users/i551096/Dev/mem-inception` as a marketplace or plugin source, because local path installs hide packaging and cache drift.
 - If Codex Desktop still falls back after a restart, check for workspace plugin sources such as `.agents/plugins/marketplace.json` in saved workspace roots. A local checkout can silently reinstall `memory@memforge` from its own `integrations/codex/memforge-memory` tree even when the configured marketplace points at the remote tag.
 - Release gates for plugin changes should include unit tests, lint, package/install parity, MCP `initialize` and `tools/list` version/tool checks after restart, SessionStart and Stop/PreCompact hook smoke tests, and at least one harmless read/write MCP smoke in a test workspace when write tools change.
+
+## Refactor/Deploy Goal Workflow
+
+- Before starting a goal-scoped refactor, pull `main` first in every affected repo, then create a fresh `codex/` branch or isolated worktree from the updated main. Do not keep implementing on an older feature branch just because it is convenient.
+- Treat the approved design and implementation plan as the completion contract. Audit the current implementation against every design requirement before claiming the design is fully covered.
+- Run review incrementally while implementing. When the user asks for two reviewers, use exactly two independent reviewer lanes: one Claude Code reviewer and one Codex reviewer. Do not defer review until a large final diff.
+- Reviewer feedback is evidence to evaluate. For each finding, decide whether it is valid for the design/runtime contract, whether the proposed fix is proportionate, and whether it should be implemented, rejected, or deferred; record that decision in a handoff log outside the repo.
+- Continue the review/fix loop until both reviewers and the implementer approve the result, with no accepted blocker left open.
+- For cloud-impacting changes, CF deploy and detailed smoke testing are required before the goal can be considered complete. Record the deployment target, smoke commands or UI/API steps, and redacted evidence in the handoff log.
+- Open PRs for every repo with committed changes. The goal is not complete until the relevant PRs exist, verification evidence is recorded, and no required repo is left with uncommitted goal work.
