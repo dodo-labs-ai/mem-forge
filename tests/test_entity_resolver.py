@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
+
+import pytest
+
 from memforge.memory.entity_resolver import validate_alias, EntityResolver
 from memforge.models import Entity, canonicalize_entity_name
 
@@ -127,3 +133,112 @@ class TestEntityTags:
         """EntityResolver class is importable and has resolve method."""
         assert hasattr(EntityResolver, "resolve")
         assert hasattr(EntityResolver, "invalidate_cache")
+
+    @pytest.mark.asyncio
+    async def test_embedding_cache_load_is_single_flight_under_concurrent_resolve(self, monkeypatch):
+        class FakeDb:
+            def __init__(self) -> None:
+                self.entities = [
+                    Entity(id=1, canonical_name="pay api", display_name="pay-api"),
+                    Entity(id=2, canonical_name="auth service", display_name="auth-service"),
+                ]
+                self.full_embedding_batches = 0
+
+            async def get_entity_by_canonical(self, canonical_name: str):
+                del canonical_name
+                return None
+
+            async def get_entity_by_alias(self, alias_normalized: str):
+                del alias_normalized
+                return None
+
+            async def get_all_entities(self):
+                await asyncio.sleep(0.01)
+                return self.entities
+
+            async def insert_alias(self, **_kwargs):
+                return None
+
+            async def upsert_entity(self, canonical_name: str, display_name: str, tags=None):
+                raise AssertionError(f"unexpected new entity: {canonical_name}/{display_name}/{tags}")
+
+        db = FakeDb()
+
+        def fake_embed_texts(names, base_url, api_key, model):
+            del base_url, api_key, model
+            if len(names) == len(db.entities):
+                db.full_embedding_batches += 1
+            return [[1.0, 0.0] for _ in names]
+
+        monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
+
+        resolver = EntityResolver(
+            db=db,  # type: ignore[arg-type]
+            embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        )
+
+        results = await asyncio.gather(*(resolver.resolve("pay-api") for _ in range(5)))
+
+        assert results == [1, 1, 1, 1, 1]
+        assert db.full_embedding_batches == 1
+
+    @pytest.mark.asyncio
+    async def test_embedding_cache_full_load_is_single_flight_across_resolvers(self, monkeypatch):
+        class FakeDb:
+            def __init__(self) -> None:
+                self.entities = [
+                    Entity(id=1, canonical_name="pay api", display_name="pay-api"),
+                    Entity(id=2, canonical_name="auth service", display_name="auth-service"),
+                ]
+
+            async def get_entity_by_canonical(self, canonical_name: str):
+                del canonical_name
+                return None
+
+            async def get_entity_by_alias(self, alias_normalized: str):
+                del alias_normalized
+                return None
+
+            async def get_all_entities(self):
+                await asyncio.sleep(0.01)
+                return self.entities
+
+            async def insert_alias(self, **_kwargs):
+                return None
+
+            async def upsert_entity(self, canonical_name: str, display_name: str, tags=None):
+                raise AssertionError(f"unexpected new entity: {canonical_name}/{display_name}/{tags}")
+
+        active_full_loads = 0
+        max_active_full_loads = 0
+        counter_lock = threading.Lock()
+        db = FakeDb()
+
+        def fake_embed_texts(names, base_url, api_key, model):
+            nonlocal active_full_loads, max_active_full_loads
+            del base_url, api_key, model
+            if len(names) == len(db.entities):
+                with counter_lock:
+                    active_full_loads += 1
+                    max_active_full_loads = max(max_active_full_loads, active_full_loads)
+                try:
+                    time.sleep(0.05)
+                finally:
+                    with counter_lock:
+                        active_full_loads -= 1
+            return [[1.0, 0.0] for _ in names]
+
+        monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
+
+        resolvers = [
+            EntityResolver(
+                db=db,  # type: ignore[arg-type]
+                embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+            )
+            for _ in range(3)
+        ]
+
+        results = await asyncio.gather(*(resolver.resolve("pay-api") for resolver in resolvers))
+
+        assert results == [1, 1, 1]
+        assert max_active_full_loads == 1

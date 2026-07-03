@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import threading
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
@@ -61,7 +62,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ExtractionWorkPool", "GeneSyncOrchestrator"]
+__all__ = [
+    "DocumentLifecycleAdmission",
+    "ExtractionWorkPool",
+    "GeneSyncOrchestrator",
+    "get_process_document_lifecycle_admission",
+]
 
 DEFAULT_INCREMENTAL_SYNC_OVERLAP = timedelta(minutes=10)
 
@@ -135,6 +141,75 @@ class ExtractionWorkPool:
             if self._active_by_source[waiting_source] < fair_share:
                 return False
         return True
+
+
+class DocumentLifecycleAdmission:
+    """Process-wide admission control for memory-heavy document lifecycles."""
+
+    def __init__(self, max_active: int) -> None:
+        self.max_active = max(1, int(max_active))
+        self._semaphore = asyncio.Semaphore(self.max_active)
+        self._lock = asyncio.Lock()
+        self._active = 0
+        self._max_active_seen = 0
+
+    @asynccontextmanager
+    async def slot(self, source_id: str, doc_id: str):
+        del source_id, doc_id
+        await self._semaphore.acquire()
+        async with self._lock:
+            self._active += 1
+            self._max_active_seen = max(self._max_active_seen, self._active)
+        try:
+            yield
+        finally:
+            async with self._lock:
+                self._active -= 1
+            self._semaphore.release()
+
+    @property
+    def active_count(self) -> int:
+        return self._active
+
+    @property
+    def max_active_seen(self) -> int:
+        return self._max_active_seen
+
+
+_PROCESS_DOCUMENT_LIFECYCLE_LOCK = threading.Lock()
+_PROCESS_DOCUMENT_LIFECYCLE_ADMISSION: DocumentLifecycleAdmission | None = None
+_PROCESS_DOCUMENT_LIFECYCLE_LIMIT: int | None = None
+
+
+def get_process_document_lifecycle_admission(max_active: int) -> DocumentLifecycleAdmission | None:
+    """Return the process-wide admission controller for memory-heavy sync work."""
+    global _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION, _PROCESS_DOCUMENT_LIFECYCLE_LIMIT
+
+    if max_active <= 0:
+        return None
+
+    requested_limit = max(1, int(max_active))
+    with _PROCESS_DOCUMENT_LIFECYCLE_LOCK:
+        if _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION is None:
+            _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION = DocumentLifecycleAdmission(requested_limit)
+            _PROCESS_DOCUMENT_LIFECYCLE_LIMIT = requested_limit
+            return _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION
+
+        if requested_limit < (_PROCESS_DOCUMENT_LIFECYCLE_LIMIT or requested_limit) and (
+            _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION.active_count == 0
+        ):
+            _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION = DocumentLifecycleAdmission(requested_limit)
+            _PROCESS_DOCUMENT_LIFECYCLE_LIMIT = requested_limit
+            return _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION
+
+        if requested_limit != _PROCESS_DOCUMENT_LIFECYCLE_LIMIT:
+            logger.warning(
+                "Ignoring sync document lifecycle limit %d because process-wide limit %d is already active",
+                requested_limit,
+                _PROCESS_DOCUMENT_LIFECYCLE_LIMIT,
+            )
+
+        return _PROCESS_DOCUMENT_LIFECYCLE_ADMISSION
 
 
 MAX_RETRIES = 3
@@ -331,6 +406,7 @@ class GeneSyncOrchestrator:
         source_support_detector: SourceSupportDetector | None = None,
         max_concurrent: int = 3,
         extraction_pool: ExtractionWorkPool | None = None,
+        document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
     ) -> None:
         self.db = db
         self.doc_store = doc_store
@@ -344,6 +420,7 @@ class GeneSyncOrchestrator:
         self.source_support_detector = source_support_detector
         self.max_concurrent = max(1, max_concurrent)
         self.extraction_pool = extraction_pool
+        self.document_lifecycle_admission = document_lifecycle_admission
 
         self._llm_semaphore = asyncio.Semaphore(self.max_concurrent)
         self._db_lock = asyncio.Lock()
@@ -367,8 +444,6 @@ class GeneSyncOrchestrator:
         self._llm_semaphore.release()
 
     def _source_parallelism_limit(self) -> int:
-        if self.extraction_pool is not None:
-            return self.extraction_pool.max_workers
         return self.max_concurrent
 
     @asynccontextmanager
@@ -378,6 +453,14 @@ class GeneSyncOrchestrator:
                 yield
             return
         async with self._llm_semaphore:
+            yield
+
+    @asynccontextmanager
+    async def _document_lifecycle_slot(self, source_id: str, doc_id: str):
+        if self.document_lifecycle_admission is None:
+            yield
+            return
+        async with self.document_lifecycle_admission.slot(source_id, doc_id):
             yield
 
     # ==================================================================
@@ -808,6 +891,28 @@ class GeneSyncOrchestrator:
     # ==================================================================
 
     async def _process_item(
+        self,
+        gene: Gene,
+        item: ContentItem,
+        source_name: str,
+        source_id: str,
+        run_id: str | None = None,
+        progress_callback: Callable[[dict], None] | None = None,
+        force_reprocess: bool = False,
+    ) -> dict:
+        doc_id = item.item_id
+        async with self._document_lifecycle_slot(source_id, doc_id):
+            return await self._process_item_admitted(
+                gene=gene,
+                item=item,
+                source_name=source_name,
+                source_id=source_id,
+                run_id=run_id,
+                progress_callback=progress_callback,
+                force_reprocess=force_reprocess,
+            )
+
+    async def _process_item_admitted(
         self,
         gene: Gene,
         item: ContentItem,
