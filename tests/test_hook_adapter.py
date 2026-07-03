@@ -1174,6 +1174,67 @@ def test_mcp_proxy_forwards_search_to_service_with_token(monkeypatch):
     }
 
 
+def test_mcp_proxy_forwards_explicit_search_entities(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "query": "deployment owner",
+            "entities": ["payroll control center", "deployment owner"],
+        },
+    )
+
+    assert result == {"results": []}
+    assert json.loads(captured["body"].decode()) == {
+        "query": "deployment owner",
+        "entities": ["payroll control center", "deployment owner"],
+        "include_private": True,
+        "include_superseded": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "entities",
+    [
+        "payroll control center",
+        ["payroll control center", 3],
+        ["payroll control center", ""],
+        ["payroll control center", "   "],
+    ],
+)
+def test_mcp_proxy_rejects_invalid_explicit_search_entities(monkeypatch, entities):
+    proxy = _load_plugin_mcp_proxy()
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool("search", {"query": "deployment owner", "entities": entities})
+
+    assert result == {"error": "entities must be an array of non-empty strings"}
+
+
 def test_mcp_proxy_forwards_list_sources_to_searchable_sources(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
     captured = {}
@@ -1535,7 +1596,10 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "repo_identifiers" not in properties["source_filter"]["properties"]
     assert "source_instance_ids" not in properties["source_filter"]["properties"]
     assert "sources" not in properties
-    assert set(properties) == {"query", "source_filter", "time_range", "top_k", "offset"}
+    assert set(properties) == {"query", "source_filter", "time_range", "top_k", "offset", "entities"}
+    assert properties["entities"]["type"] == "array"
+    assert properties["entities"]["items"]["type"] == "string"
+    assert "explicit entity hints" in properties["entities"]["description"]
     assert "total_candidates" in tools["search"]["description"]
     assert "complete list" in tools["search"]["description"]
     assert "enumeration" in tools["search"]["description"]
@@ -1563,7 +1627,6 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "include_superseded" not in properties
     assert "status" not in properties
     assert "memory_types" not in properties
-    assert "entities" not in properties
     assert "active_repo_identifier" not in properties
     assert "follow_up" in tools["search"]["description"]
     assert "call get_memory" in tools["search"]["description"]
