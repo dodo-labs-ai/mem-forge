@@ -136,11 +136,7 @@ async def test_search_path_uses_entity_linker_not_legacy_query_analysis(db, monk
         config=RetrievalConfig(),
     )
     engine._get_or_compute_embedding = lambda query: [0.1]
-    monkeypatch.setattr(
-        engine,
-        "_build_known_entities",
-        lambda: (_ for _ in ()).throw(AssertionError("_build_known_entities must not run")),
-    )
+    assert not hasattr(engine, "_build_known_entities")
 
     result = await engine.search("PostgreSQL", entities=["postgresql"], top_k=10)
 

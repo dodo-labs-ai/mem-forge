@@ -313,31 +313,28 @@ class SearchEngine:
 
         # ----- 1. Link query entities through the scoped relational channel -----
         analysis = QueryAnalysis()
-        try:
-            link_result = await self._relational.link_query_entities(
-                query,
-                scope=scope,
-                explicit_entities=entities or (),
-                source_filter=combined_source_filter,
-                memory_types=memory_types,
+        link_result = await self._relational.link_query_entities(
+            query,
+            scope=scope,
+            explicit_entities=entities or (),
+            source_filter=combined_source_filter,
+            memory_types=memory_types,
+        )
+        analysis.entity_linking = list(link_result.candidates)
+        analysis.entity_linking_channels = tuple(
+            dict.fromkeys(
+                channel
+                for candidate in link_result.candidates
+                for channel in candidate.contributing_channels
             )
-            analysis.entity_linking = list(link_result.candidates)
-            analysis.entity_linking_channels = tuple(
-                dict.fromkeys(
-                    channel
-                    for candidate in link_result.candidates
-                    for channel in candidate.contributing_channels
-                )
-            )
-            analysis.unmatched_explicit_entities = link_result.unmatched_explicit_entities
-            graph_candidates = [
-                candidate for candidate in link_result.candidates if candidate.activates_graph
-            ]
-            analysis.detected_entities = [candidate.canonical_name for candidate in graph_candidates]
-            analysis.detected_entity_ids = [candidate.entity_id for candidate in graph_candidates]
-            analysis.use_graph = bool(graph_candidates)
-        except Exception:
-            logger.exception("Query-time entity linking failed; continuing without graph channel")
+        )
+        analysis.unmatched_explicit_entities = link_result.unmatched_explicit_entities
+        graph_candidates = [
+            candidate for candidate in link_result.candidates if candidate.activates_graph
+        ]
+        analysis.detected_entities = [candidate.canonical_name for candidate in graph_candidates]
+        analysis.detected_entity_ids = [candidate.entity_id for candidate in graph_candidates]
+        analysis.use_graph = bool(graph_candidates)
 
         # ----- 2. Run active channels in parallel -----
         fetch_k = max(top_k * 2, top_k + offset)
@@ -905,26 +902,6 @@ class SearchEngine:
 
         or_clause = " OR ".join(f'"{t}"' for t in unique)
         return f"({or_clause})"
-
-    # ==================================================================
-    # Internal helpers
-    # ==================================================================
-
-    async def _build_known_entities(self) -> dict[str, int]:
-        """Build a mapping of canonical_name + aliases -> entity_id."""
-        entities: dict[str, int] = {}
-        try:
-            all_entities = await self._relational.get_all_entities()
-            for ent in all_entities:
-                entities[ent.canonical_name] = ent.id
-            # Layer in aliases — canonical names take precedence on collision
-            all_aliases = await self._relational.get_all_aliases()
-            for alias_name, canonical_id in all_aliases:
-                if alias_name not in entities:
-                    entities[alias_name] = canonical_id
-        except Exception:
-            logger.exception("Failed to build known entities map")
-        return entities
 
     def _get_or_compute_embedding(self, text: str) -> list[float] | None:
         """Return cached embedding or compute via the embedding API.

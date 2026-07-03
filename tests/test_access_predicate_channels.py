@@ -167,14 +167,6 @@ async def test_search_engine_team_search_excludes_private(db, monkeypatch):
     # build a SearchEngine over the adapters with a stubbed embedding.
     from memforge.retrieval.search import SearchEngine
     from memforge.config import RetrievalConfig
-    from memforge.retrieval.query_analyzer import QueryAnalysis
-
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr(
-        "memforge.retrieval.search.analyze_query", fake_analyze_query
-    )
 
     coll = _Coll()
     coll.upsert(
@@ -225,14 +217,6 @@ async def test_agent_hook_uses_personalized_predicate(db, monkeypatch):
     )
     from memforge.retrieval.search import SearchEngine
     from memforge.config import RetrievalConfig
-    from memforge.retrieval.query_analyzer import QueryAnalysis
-
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr(
-        "memforge.retrieval.search.analyze_query", fake_analyze_query
-    )
 
     coll = _Coll()
     coll.upsert(
