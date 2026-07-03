@@ -189,8 +189,8 @@ TOOLS: list[dict[str, Any]] = [
                     "items": {"type": "string"},
                     "description": (
                         "Optional explicit entity hints. Use only when the caller intentionally "
-                        "wants graph linking for known entities; natural-language entity detection "
-                        "is handled by indexed linking, not by this field."
+                        "wants graph linking for known entities; do not infer or extract values "
+                        "from the natural-language query before calling."
                     ),
                 },
             },
@@ -690,6 +690,8 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
         entities = body["entities"]
         if not isinstance(entities, list) or not all(isinstance(item, str) and item.strip() for item in entities):
             raise ValueError("entities must be an array of non-empty strings")
+        if not entities:
+            body.pop("entities")
     body["include_private"] = True
     body["include_superseded"] = False
     repo_identifier = _active_repo_identifier()

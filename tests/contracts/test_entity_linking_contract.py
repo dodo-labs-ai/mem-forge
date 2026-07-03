@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import inspect
 
-from memforge.storage.adapters.protocols import EntityLinkCandidate, EntityLinkResult, RelationalStore
+from memforge.storage.adapters.protocols import (
+    DEFAULT_ENTITY_LINK_LIMIT,
+    EntityLinkCandidate,
+    EntityLinkResult,
+    RelationalStore,
+)
 
 
 def test_entity_link_candidate_carries_channel_evidence() -> None:
@@ -47,4 +52,4 @@ def test_relational_store_exposes_query_entity_linking_contract() -> None:
     assert signature.parameters["explicit_entities"].default == ()
     assert signature.parameters["source_filter"].default is None
     assert signature.parameters["memory_types"].default is None
-    assert signature.parameters["limit"].default == 5
+    assert signature.parameters["limit"].default == DEFAULT_ENTITY_LINK_LIMIT

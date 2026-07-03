@@ -25,6 +25,7 @@
 
 - Before starting a goal-scoped refactor, pull `main` first in every affected repo, then create a fresh `codex/` branch or isolated worktree from the updated main. Do not keep implementing on an older feature branch just because it is convenient.
 - Treat the approved design and implementation plan as the completion contract. Audit the current implementation against every design requirement before claiming the design is fully covered.
+- Use online research when making design or technical judgment calls, especially for retrieval, ranking, database search, GraphRAG, deployment, security, or API-contract decisions. Prefer primary sources and current official docs; when useful, inspect relevant open-source project designs or code for implementation insight before settling the approach.
 - Run review incrementally while implementing. When the user asks for two reviewers, use exactly two independent reviewer lanes: one Claude Code reviewer and one Codex reviewer. Do not defer review until a large final diff.
 - Reviewer feedback is evidence to evaluate. For each finding, decide whether it is valid for the design/runtime contract, whether the proposed fix is proportionate, and whether it should be implemented, rejected, or deferred; record that decision in a handoff log outside the repo.
 - Continue the review/fix loop until both reviewers and the implementer approve the result, with no accepted blocker left open.
