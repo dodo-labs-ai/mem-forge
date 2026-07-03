@@ -18,6 +18,7 @@ from tests.contracts._support import (
     AdaptersFactory,
     ContractAdapters,
     FactoryResult,
+    make_document,
     make_memory,
     make_scope,
 )
@@ -99,3 +100,38 @@ class KeywordSearchContract:
             '"PostgreSQL"', make_scope(), None, limit=10
         )
         assert after == []
+
+    async def test_metadata_title_tokens_recall_memory(
+        self, adapters: ContractAdapters
+    ) -> None:
+        await adapters.relational.insert_memory(
+            make_memory(
+                "m-blocker",
+                content="Lifecycle assignment skips person assignment creation",
+            )
+        )
+        await adapters.relational.upsert_document(
+            make_document(
+                "SFPAY-179397",
+                source="src-jira",
+                title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+                labels=["lifecycle"],
+            )
+        )
+        await adapters.relational.add_memory_source(
+            "m-blocker",
+            "SFPAY-179397",
+            "jira",
+            None,
+            support_kind="extracted",
+            source_updated_at=None,
+        )
+
+        hits = await adapters.keyword.search_metadata(
+            '"create" "blocker" "hint"', make_scope(), None, limit=10
+        )
+
+        assert [hit.memory_id for hit in hits] == ["m-blocker"]
+        assert hits[0].channel == "bm25_metadata_tokens"
+        assert "metadata_any" in hits[0].matched_fields
+        assert hits[0].source_refs[0].doc_id == "SFPAY-179397"

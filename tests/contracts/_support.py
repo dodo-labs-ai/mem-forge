@@ -123,17 +123,19 @@ def make_document(
     *,
     source: str = "src-contract",
     client: str | None = None,
+    title: str | None = None,
+    labels: list[str] | None = None,
 ) -> DocumentRecord:
     now = datetime.now(timezone.utc)
     return DocumentRecord(
         doc_id=doc_id,
         source=source,
         source_url=f"https://example.test/{doc_id}",
-        title=f"Document {doc_id}",
+        title=title or f"Document {doc_id}",
         space_or_project="CONTRACT",
         author="contract",
         last_modified=now,
-        labels=[],
+        labels=labels or [],
         version="1",
         content_hash=f"hash-{doc_id}",
         token_count=1,

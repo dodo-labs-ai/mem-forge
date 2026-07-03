@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +564,7 @@ class SearchResult:
     covered_memory_count: int = 0
     repo_identifier: str | None = None
     follow_up: dict[str, str] | None = None
+    retrieval_evidence: dict[str, Any] | None = None
 
 
 @dataclass
