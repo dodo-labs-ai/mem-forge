@@ -392,6 +392,14 @@ CREATE TABLE IF NOT EXISTS entity_aliases (
     PRIMARY KEY (alias_normalized, canonical_id)
 );
 
+CREATE VIRTUAL TABLE IF NOT EXISTS entity_alias_search_fts USING fts5(
+    entity_id UNINDEXED,
+    canonical_name UNINDEXED,
+    alias_normalized UNINDEXED,
+    search_text,
+    tokenize='porter unicode61'
+);
+
 -- ---------------------------------------------------------------
 -- Memories
 -- ---------------------------------------------------------------
@@ -832,6 +840,8 @@ CREATE INDEX IF NOT EXISTS idx_memory_derivations_child ON memory_derivations(ch
 CREATE INDEX IF NOT EXISTS idx_memory_curation_runs_scope ON memory_curation_runs(source_type, client, repo_identifier, project_key);
 CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_id);
 CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized ON entity_aliases(alias_normalized);
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_compact ON entity_aliases(REPLACE(alias_normalized, ' ', ''));
+CREATE INDEX IF NOT EXISTS idx_entities_canonical_compact ON entities(REPLACE(canonical_name, ' ', ''));
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_status ON auth_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_source_subscriptions_user ON source_subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_agent_session_receipts_session ON agent_session_receipts(session_id);
@@ -1546,6 +1556,75 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                 metadata_compact TEXT NOT NULL,
                 PRIMARY KEY (memory_id, doc_id)
             )""",
+        ],
+    ),
+    (
+        32,
+        "Add compact entity alias lookup indexes",
+        [
+            "CREATE INDEX IF NOT EXISTS idx_entity_aliases_compact ON entity_aliases(REPLACE(alias_normalized, ' ', ''))",
+            "CREATE INDEX IF NOT EXISTS idx_entities_canonical_compact ON entities(REPLACE(canonical_name, ' ', ''))",
+        ],
+    ),
+    (
+        33,
+        "Add entity alias lexical search projection",
+        [
+            """CREATE VIRTUAL TABLE IF NOT EXISTS entity_alias_search_fts USING fts5(
+                entity_id UNINDEXED,
+                canonical_name UNINDEXED,
+                alias_normalized UNINDEXED,
+                search_text,
+                tokenize='porter unicode61'
+            )""",
+            "DELETE FROM entity_alias_search_fts",
+            """INSERT INTO entity_alias_search_fts (
+                   entity_id,
+                   canonical_name,
+                   alias_normalized,
+                   search_text
+               )
+               SELECT
+                   e.id,
+                   e.canonical_name,
+                   e.canonical_name,
+                   COALESCE(e.canonical_name, '') || ' ' || COALESCE(e.display_name, '')
+               FROM entities e
+               UNION ALL
+               SELECT
+                   ea.canonical_id,
+                   e.canonical_name,
+                   ea.alias_normalized,
+                   COALESCE(ea.alias, '') || ' ' || COALESCE(ea.alias_normalized, '')
+               FROM entity_aliases ea
+               JOIN entities e ON e.id = ea.canonical_id""",
+        ],
+    ),
+    (
+        34,
+        "Rebuild entity alias lexical search projection without tag tokens",
+        [
+            "DELETE FROM entity_alias_search_fts",
+            """INSERT INTO entity_alias_search_fts (
+                   entity_id,
+                   canonical_name,
+                   alias_normalized,
+                   search_text
+               )
+               SELECT
+                   e.id,
+                   e.canonical_name,
+                   e.canonical_name,
+                   COALESCE(e.canonical_name, '') || ' ' || COALESCE(e.display_name, '')
+               FROM entities e
+               UNION ALL
+               SELECT
+                   ea.canonical_id,
+                   e.canonical_name,
+                   ea.alias_normalized,
+                   COALESCE(ea.alias, '') || ' ' || COALESCE(ea.alias_normalized, '')
+               FROM entity_aliases ea
+               JOIN entities e ON e.id = ea.canonical_id""",
         ],
     ),
 ]
@@ -5252,11 +5331,69 @@ class Database:
                    display_name=excluded.display_name""",
                 (canonical_name, entity_type, tags_json, display_name),
             )
+            async with self.db.execute("SELECT id FROM entities WHERE canonical_name = ?", (canonical_name,)) as cursor:
+                row = await cursor.fetchone()
+                assert row is not None
+                entity_id = int(row[0])
+            await self._refresh_entity_alias_search_unlocked(entity_id)
             await self.db.commit()
-        async with self.db.execute("SELECT id FROM entities WHERE canonical_name = ?", (canonical_name,)) as cursor:
-            row = await cursor.fetchone()
-            assert row is not None
-            return row[0]
+            return entity_id
+
+    async def _refresh_entity_alias_search_unlocked(self, entity_id: int) -> None:
+        await self.db.execute(
+            "DELETE FROM entity_alias_search_fts WHERE entity_id = ?",
+            (entity_id,),
+        )
+        async with self.db.execute("SELECT * FROM entities WHERE id = ?", (entity_id,)) as cursor:
+            entity_row = await cursor.fetchone()
+        if entity_row is None:
+            return
+        search_text = " ".join(
+            part
+            for part in (
+                entity_row["canonical_name"] or "",
+                entity_row["display_name"] or "",
+            )
+            if part
+        )
+        await self.db.execute(
+            """INSERT INTO entity_alias_search_fts (
+                   entity_id,
+                   canonical_name,
+                   alias_normalized,
+                   search_text
+               ) VALUES (?, ?, ?, ?)""",
+            (
+                entity_id,
+                entity_row["canonical_name"],
+                entity_row["canonical_name"],
+                search_text,
+            ),
+        )
+        async with self.db.execute(
+            "SELECT alias, alias_normalized FROM entity_aliases WHERE canonical_id = ?",
+            (entity_id,),
+        ) as cursor:
+            async for row in cursor:
+                alias_text = " ".join(
+                    part
+                    for part in (row["alias"] or "", row["alias_normalized"] or "")
+                    if part
+                )
+                await self.db.execute(
+                    """INSERT INTO entity_alias_search_fts (
+                           entity_id,
+                           canonical_name,
+                           alias_normalized,
+                           search_text
+                       ) VALUES (?, ?, ?, ?)""",
+                    (
+                        entity_id,
+                        entity_row["canonical_name"],
+                        row["alias_normalized"],
+                        alias_text,
+                    ),
+                )
 
     async def get_entity_by_canonical(self, canonical_name: str) -> Entity | None:
         async with self.db.execute("SELECT * FROM entities WHERE canonical_name = ?", (canonical_name,)) as cursor:
@@ -5384,6 +5521,8 @@ class Database:
                 ),
             )
             await self.db.execute("DELETE FROM entities WHERE id = ?", (source_id,))
+            await self.db.execute("DELETE FROM entity_alias_search_fts WHERE entity_id = ?", (source_id,))
+            await self._refresh_entity_alias_search_unlocked(target_id)
             await self.db.commit()
 
         return {
@@ -5399,6 +5538,8 @@ class Database:
                 "DELETE FROM entity_aliases WHERE alias_normalized = ? AND canonical_id = ?",
                 (alias_normalized, entity_id),
             )
+            if result.rowcount > 0:
+                await self._refresh_entity_alias_search_unlocked(entity_id)
             await self.db.commit()
             return result.rowcount > 0
 
@@ -5416,6 +5557,7 @@ class Database:
                 ) VALUES (?, ?, ?, ?)""",
                 (alias, alias_normalized, canonical_id, source),
             )
+            await self._refresh_entity_alias_search_unlocked(canonical_id)
             await self.db.commit()
 
     async def get_aliases_for_entity(self, entity_id: int) -> list[EntityAlias]:

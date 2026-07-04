@@ -10,6 +10,7 @@ from memforge.models import (
     DocumentRecord,
     Memory,
     MemorySource,
+    Visibility,
     content_hash,
 )
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
@@ -29,13 +30,22 @@ def _scope(statuses=("active",)) -> AccessScope:
     )
 
 
-def _memory(mem_id: str, status: str = "active") -> Memory:
+def _memory(
+    mem_id: str,
+    status: str = "active",
+    *,
+    memory_type: str = "fact",
+    visibility: str = Visibility.WORKSPACE.value,
+    owner_user_id: str | None = None,
+) -> Memory:
     now = datetime.now(timezone.utc)
     return Memory(
         id=mem_id,
-        memory_type="fact",
+        memory_type=memory_type,
         content=f"content for {mem_id}",
         content_hash=content_hash(f"content for {mem_id}"),
+        visibility=visibility,
+        owner_user_id=owner_user_id,
         confidence=0.9,
         created_at=now,
         updated_at=now,
@@ -135,6 +145,272 @@ async def test_graph_search_filters_retired_by_scope(db):
     entity_id = await db.upsert_entity("argocd", "ArgoCD", ["tool"])
     await db.link_memory_entity("m1", entity_id)
     assert await store.graph_search([entity_id], _scope(), None, limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_resolves_explicit_aliases_and_reports_unmatched(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m1"))
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.insert_alias("PCC", "pcc", entity_id, "admin_manual")
+    await db.link_memory_entity("m1", entity_id)
+
+    result = await store.link_query_entities(
+        "why did the deployment fail",
+        scope=_scope(),
+        explicit_entities=("PCC", "unknown thing"),
+        limit=5,
+    )
+
+    assert result.unmatched_explicit_entities == ("unknown thing",)
+    assert [(c.entity_id, c.channel, c.matched_alias, c.activates_graph) for c in result.candidates] == [
+        (entity_id, "explicit", "PCC", True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_exact_window_is_visibility_constrained(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("visible"))
+    await store.insert_memory(
+        _memory(
+            "private-other-user",
+            visibility=Visibility.PRIVATE.value,
+            owner_user_id="other-user",
+        )
+    )
+    visible_entity = await db.upsert_entity("blocker hint", "Blocker Hint", ["feature"])
+    hidden_entity = await db.upsert_entity("secret project", "Secret Project", ["feature"])
+    await db.link_memory_entity("visible", visible_entity)
+    await db.link_memory_entity("private-other-user", hidden_entity)
+
+    result = await store.link_query_entities(
+        "create blocker hint for the secret project",
+        scope=_scope(),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias, c.activates_graph) for c in result.candidates] == [
+        (visible_entity, "alias_exact", "blocker hint", True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_compact_match_does_not_activate_graph(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m1"))
+    entity_id = await db.upsert_entity("blocker hint", "Blocker Hint", ["feature"])
+    await db.link_memory_entity("m1", entity_id)
+
+    result = await store.link_query_entities(
+        "create blockerhints",
+        scope=_scope(),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias, c.activates_graph) for c in result.candidates] == [
+        (entity_id, "alias_compact", "blocker hint", False)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_alias_fts_recalls_partial_alias_overlap(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m1"))
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.link_memory_entity("m1", entity_id)
+
+    result = await store.link_query_entities(
+        "control center validation failures",
+        scope=_scope(),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias, c.activates_graph) for c in result.candidates] == [
+        (entity_id, "alias_fts", "payroll control center", True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_alias_fts_refreshes_after_insert_alias(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m1"))
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.insert_alias("PCC Engine Lifecycle", "pcc engine lifecycle", entity_id, "admin_manual")
+    await db.link_memory_entity("m1", entity_id)
+
+    result = await store.link_query_entities(
+        "engine lifecycle validation failures",
+        scope=_scope(),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias, c.activates_graph) for c in result.candidates] == [
+        (entity_id, "alias_fts", "pcc engine lifecycle", True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_alias_fts_ignores_tag_only_overlap(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m1"))
+    await store.insert_memory(_memory("m2"))
+    tagged_entity = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    named_entity = await db.upsert_entity("product release calendar", "Product Release Calendar", ["planning"])
+    await db.link_memory_entity("m1", tagged_entity)
+    await db.link_memory_entity("m2", named_entity)
+
+    result = await store.link_query_entities(
+        "product release status",
+        scope=_scope(),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
+        (named_entity, "alias_fts", "product release calendar")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_alias_fts_honors_source_filter(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-wiki"))
+    await store.insert_memory(_memory("m-jira"))
+    await _document(db, "doc-wiki", source="wiki")
+    await _document(db, "doc-jira", source="jira")
+    wiki_entity = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    jira_entity = await db.upsert_entity("payroll control process", "Payroll Control Process", ["product"])
+    await db.link_memory_entity("m-wiki", wiki_entity)
+    await db.link_memory_entity("m-jira", jira_entity)
+    await store.add_memory_source("m-wiki", "doc-wiki", "confluence", None, source_updated_at=None)
+    await store.add_memory_source("m-jira", "doc-jira", "jira", None, source_updated_at=None)
+
+    result = await store.link_query_entities(
+        "control center validation",
+        scope=_scope(),
+        source_filter=MemorySourceFilter(source_ids=("wiki",)),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
+        (wiki_entity, "alias_fts", "payroll control center")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_alias_fts_honors_memory_types(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-fact", memory_type="fact"))
+    await store.insert_memory(_memory("m-procedure", memory_type="procedure"))
+    fact_entity = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    procedure_entity = await db.upsert_entity("payroll control process", "Payroll Control Process", ["product"])
+    await db.link_memory_entity("m-fact", fact_entity)
+    await db.link_memory_entity("m-procedure", procedure_entity)
+
+    result = await store.link_query_entities(
+        "control process validation",
+        scope=_scope(),
+        memory_types=("procedure",),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
+        (procedure_entity, "alias_fts", "payroll control process")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_alias_fts_refreshes_after_remove_alias(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m1"))
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.insert_alias("PCC Engine", "pcc engine", entity_id, "admin_manual")
+    await db.link_memory_entity("m1", entity_id)
+
+    assert (
+        await store.link_query_entities("pcc engine validation", scope=_scope(), limit=5)
+    ).candidates
+
+    await db.remove_entity_alias(entity_id=entity_id, alias_normalized="pcc engine")
+
+    result = await store.link_query_entities("pcc engine validation", scope=_scope(), limit=5)
+    assert result.candidates == ()
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_honors_disabled_sources(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-disabled"))
+    await store.insert_memory(_memory("m-enabled"))
+    await db.upsert_source("src-disabled", "jira", "Disabled Jira", "{}")
+    await db.upsert_source("src-enabled", "jira", "Enabled Jira", "{}")
+    await _document(db, "doc-disabled", source="src-disabled")
+    await _document(db, "doc-enabled", source="src-enabled")
+    disabled_entity = await db.upsert_entity("disabled blocker", "Disabled Blocker", ["feature"])
+    enabled_entity = await db.upsert_entity("enabled blocker", "Enabled Blocker", ["feature"])
+    await db.link_memory_entity("m-disabled", disabled_entity)
+    await db.link_memory_entity("m-enabled", enabled_entity)
+    await store.add_memory_source("m-disabled", "doc-disabled", "jira", None, source_updated_at=None)
+    await store.add_memory_source("m-enabled", "doc-enabled", "jira", None, source_updated_at=None)
+    await db.set_source_subscription("src-disabled", LOCAL_DEV_USER_ID, False)
+
+    result = await store.link_query_entities(
+        "disabled blocker and enabled blocker",
+        scope=_scope(),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
+        (enabled_entity, "alias_exact", "enabled blocker")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_honors_source_filter(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-wiki"))
+    await store.insert_memory(_memory("m-jira"))
+    await _document(db, "doc-wiki", source="wiki")
+    await _document(db, "doc-jira", source="jira")
+    wiki_entity = await db.upsert_entity("wiki blocker", "Wiki Blocker", ["feature"])
+    jira_entity = await db.upsert_entity("jira blocker", "Jira Blocker", ["feature"])
+    await db.link_memory_entity("m-wiki", wiki_entity)
+    await db.link_memory_entity("m-jira", jira_entity)
+    await store.add_memory_source("m-wiki", "doc-wiki", "confluence", None, source_updated_at=None)
+    await store.add_memory_source("m-jira", "doc-jira", "jira", None, source_updated_at=None)
+
+    result = await store.link_query_entities(
+        "wiki blocker and jira blocker",
+        scope=_scope(),
+        source_filter=MemorySourceFilter(source_ids=("wiki",)),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
+        (wiki_entity, "alias_exact", "wiki blocker")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_honors_memory_types(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-fact", memory_type="fact"))
+    await store.insert_memory(_memory("m-procedure", memory_type="procedure"))
+    fact_entity = await db.upsert_entity("fact blocker", "Fact Blocker", ["feature"])
+    procedure_entity = await db.upsert_entity("procedure blocker", "Procedure Blocker", ["feature"])
+    await db.link_memory_entity("m-fact", fact_entity)
+    await db.link_memory_entity("m-procedure", procedure_entity)
+
+    result = await store.link_query_entities(
+        "fact blocker and procedure blocker",
+        scope=_scope(),
+        memory_types=("procedure",),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
+        (procedure_entity, "alias_exact", "procedure blocker")
+    ]
 
 
 @pytest.mark.asyncio
@@ -245,6 +521,63 @@ async def test_source_id_backfill_migration_repairs_legacy_memory_sources(db):
     await db._run_migrations()
 
     assert await db.count_source_memories("src-backfill") == 1
+
+
+@pytest.mark.asyncio
+async def test_compact_entity_lookup_indexes_migration(db):
+    await db.db.execute("DROP INDEX IF EXISTS idx_entity_aliases_compact")
+    await db.db.execute("DROP INDEX IF EXISTS idx_entities_canonical_compact")
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 32")
+    await db.db.commit()
+
+    await db._run_migrations()
+
+    alias_indexes = await db.db.execute_fetchall("PRAGMA index_list(entity_aliases)")
+    entity_indexes = await db.db.execute_fetchall("PRAGMA index_list(entities)")
+    assert "idx_entity_aliases_compact" in {row["name"] for row in alias_indexes}
+    assert "idx_entities_canonical_compact" in {row["name"] for row in entity_indexes}
+
+
+@pytest.mark.asyncio
+async def test_entity_alias_search_fts_migration_backfills_existing_entities(db):
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.insert_alias("PCC Engine", "pcc engine", entity_id, "admin_manual")
+    await db.db.execute("DELETE FROM entity_alias_search_fts")
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 33")
+    await db.db.commit()
+
+    await db._run_migrations()
+
+    rows = await db.db.execute_fetchall(
+        "SELECT entity_id FROM entity_alias_search_fts WHERE entity_alias_search_fts MATCH ?",
+        ('"engine"',),
+    )
+    assert [row["entity_id"] for row in rows] == [entity_id]
+
+
+@pytest.mark.asyncio
+async def test_entity_alias_search_fts_rebuild_migration_removes_stale_tag_tokens(db):
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.db.execute("DELETE FROM entity_alias_search_fts")
+    await db.db.execute(
+        """INSERT INTO entity_alias_search_fts (
+               entity_id,
+               canonical_name,
+               alias_normalized,
+               search_text
+           ) VALUES (?, ?, ?, ?)""",
+        (entity_id, "payroll control center", "payroll control center", "payroll control center product"),
+    )
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 34")
+    await db.db.commit()
+
+    await db._run_migrations()
+
+    rows = await db.db.execute_fetchall(
+        "SELECT entity_id FROM entity_alias_search_fts WHERE entity_alias_search_fts MATCH ?",
+        ('"product"',),
+    )
+    assert rows == []
 
 
 @pytest.mark.asyncio

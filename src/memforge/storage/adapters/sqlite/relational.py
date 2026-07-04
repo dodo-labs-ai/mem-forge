@@ -9,8 +9,11 @@ today, so no caller reaches a connection directly.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import datetime
 from typing import Any, Sequence
+
+import aiosqlite
 
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.models import (
@@ -23,11 +26,17 @@ from memforge.models import (
     MemorySource,
     Project,
     Visibility,
+    canonicalize_entity_name,
 )
 from memforge.retrieval.access_predicate import visible_sql
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope
+from memforge.storage.adapters.protocols import (
+    DEFAULT_ENTITY_LINK_LIMIT,
+    EntityLinkCandidate,
+    EntityLinkResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +53,118 @@ _MIN_SHARED_ENTITIES_FOR_EXPANSION = 2
 
 # The 1-hop expansion contributes at half the weight of a direct entity hit.
 _EXPANSION_WEIGHT = 0.5
+
+_MAX_ENTITY_LINK_QUERY_TOKENS = 48
+_MAX_ENTITY_LINK_WINDOW_TOKENS = 6
+_MAX_ENTITY_LINK_WINDOWS = 128
+_ENTITY_LINK_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "for",
+        "from",
+        "how",
+        "in",
+        "is",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "was",
+        "what",
+        "when",
+        "where",
+        "why",
+        "with",
+    }
+)
+_ENTITY_LINK_CHANNEL_SCORE = {
+    "explicit": 1.0,
+    "alias_exact": 0.95,
+    "alias_fts": 0.70,
+    "alias_compact": 0.35,
+}
+_ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH = {
+    "explicit": True,
+    "alias_exact": True,
+    "alias_fts": True,
+    "alias_compact": False,
+}
+
+
+def _entity_link_tokens(query: str) -> list[str]:
+    normalized = canonicalize_entity_name(query)
+    return [token for token in normalized.split() if token][:_MAX_ENTITY_LINK_QUERY_TOKENS]
+
+
+def _entity_link_windows(tokens: Sequence[str]) -> dict[str, str]:
+    windows: dict[str, str] = {}
+    for start in range(len(tokens)):
+        for size in range(1, _MAX_ENTITY_LINK_WINDOW_TOKENS + 1):
+            if len(windows) >= _MAX_ENTITY_LINK_WINDOWS:
+                return windows
+            end = start + size
+            if end > len(tokens):
+                break
+            window_tokens = list(tokens[start:end])
+            if size == 1:
+                token = window_tokens[0]
+                if token in _ENTITY_LINK_STOPWORDS or len(token) < 3:
+                    continue
+            window = " ".join(window_tokens)
+            windows.setdefault(window, window)
+    return windows
+
+
+def _entity_link_compact_terms(tokens: Sequence[str]) -> dict[str, str]:
+    terms: dict[str, str] = {}
+    for window, matched_text in _entity_link_windows(tokens).items():
+        compact = window.replace(" ", "")
+        if len(compact) < 4:
+            continue
+        terms.setdefault(compact, matched_text)
+        if compact.endswith("s") and len(compact) > 5:
+            terms.setdefault(compact[:-1], matched_text)
+    return terms
+
+
+def _entity_link_fts_query(tokens: Sequence[str]) -> str:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token in _ENTITY_LINK_STOPWORDS or len(token) < 3:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        escaped = token.replace('"', '""')
+        terms.append(f'"{escaped}"')
+    # alias_fts is trusted enough to seed graph retrieval, so require more
+    # than a single generic noun. Exact and compact channels still cover
+    # single-surface formatting cases separately.
+    if len(terms) < 2:
+        return ""
+    return " OR ".join(terms)
+
+
+def _entity_link_fts_token_set(tokens: Sequence[str]) -> set[str]:
+    return {
+        token
+        for token in tokens
+        if token not in _ENTITY_LINK_STOPWORDS and len(token) >= 3
+    }
+
+
+def _explicit_entity_terms(explicit_entities: Sequence[str]) -> dict[str, str]:
+    terms: dict[str, str] = {}
+    for value in explicit_entities:
+        normalized = canonicalize_entity_name(value)
+        if normalized:
+            terms.setdefault(normalized, value)
+    return terms
 
 
 def _enabled_source_visibility_condition(
@@ -456,6 +577,326 @@ class SqliteRelationalStore:
                 logger.exception("Graph 1-hop expansion failed")
 
         return scored
+
+    async def link_query_entities(
+        self,
+        query: str,
+        *,
+        scope: AccessScope,
+        explicit_entities: Sequence[str] = (),
+        source_filter: MemorySourceFilter | None = None,
+        memory_types: Sequence[str] | None = None,
+        limit: int = DEFAULT_ENTITY_LINK_LIMIT,
+    ) -> EntityLinkResult:
+        max_candidates = max(0, int(limit))
+        explicit_terms = _explicit_entity_terms(explicit_entities)
+        if max_candidates == 0:
+            return EntityLinkResult(unmatched_explicit_entities=tuple(explicit_terms.values()))
+
+        candidates: dict[int, EntityLinkCandidate] = {}
+        matched_explicit_terms: set[str] = set()
+
+        async def add_matches(channel: str, terms: dict[str, str]) -> None:
+            if not terms:
+                return
+            rows = await self._lookup_entity_link_rows(
+                terms,
+                channel=channel,
+                scope=scope,
+                source_filter=source_filter,
+                memory_types=memory_types,
+                limit=max(max_candidates * 4, max_candidates),
+            )
+            for row in rows:
+                entity_id = int(row["entity_id"])
+                if channel == "explicit":
+                    matched_explicit_terms.add(str(row["match_key"]))
+                score = _ENTITY_LINK_CHANNEL_SCORE[channel]
+                activates_graph = _ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH[channel]
+                candidate = EntityLinkCandidate(
+                    entity_id=entity_id,
+                    canonical_name=str(row["canonical_name"]),
+                    matched_alias=str(row["matched_alias"]),
+                    channel=channel,
+                    contributing_channels=(channel,),
+                    score=score,
+                    matched_text=terms.get(str(row["match_key"]), str(row["match_key"])),
+                    activates_graph=activates_graph,
+                )
+                existing = candidates.get(entity_id)
+                if existing is None:
+                    candidates[entity_id] = candidate
+                    continue
+
+                contributing_channels = tuple(
+                    dict.fromkeys((*existing.contributing_channels, channel))
+                )
+                if score > existing.score:
+                    candidates[entity_id] = EntityLinkCandidate(
+                        entity_id=existing.entity_id,
+                        canonical_name=candidate.canonical_name,
+                        matched_alias=candidate.matched_alias,
+                        channel=channel,
+                        contributing_channels=contributing_channels,
+                        score=score,
+                        matched_text=candidate.matched_text,
+                        activates_graph=activates_graph,
+                    )
+                else:
+                    candidates[entity_id] = EntityLinkCandidate(
+                        entity_id=existing.entity_id,
+                        canonical_name=existing.canonical_name,
+                        matched_alias=existing.matched_alias,
+                        channel=existing.channel,
+                        contributing_channels=contributing_channels,
+                        score=existing.score,
+                        matched_text=existing.matched_text,
+                        activates_graph=existing.activates_graph,
+                    )
+
+        await add_matches("explicit", explicit_terms)
+
+        tokens = _entity_link_tokens(query)
+        await add_matches("alias_exact", _entity_link_windows(tokens))
+        fts_query = _entity_link_fts_query(tokens)
+        if fts_query:
+            for row in await self._lookup_entity_fts_rows(
+                fts_query,
+                query_tokens=_entity_link_fts_token_set(tokens),
+                matched_text=" ".join(tokens),
+                scope=scope,
+                source_filter=source_filter,
+                memory_types=memory_types,
+                limit=max(max_candidates * 4, max_candidates),
+            ):
+                entity_id = int(row["entity_id"])
+                channel = "alias_fts"
+                candidate = EntityLinkCandidate(
+                    entity_id=entity_id,
+                    canonical_name=str(row["canonical_name"]),
+                    matched_alias=str(row["matched_alias"]),
+                    channel=channel,
+                    contributing_channels=(channel,),
+                    score=_ENTITY_LINK_CHANNEL_SCORE[channel],
+                    matched_text=str(row["matched_text"]),
+                    activates_graph=_ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH[channel],
+                )
+                existing = candidates.get(entity_id)
+                if existing is None:
+                    candidates[entity_id] = candidate
+                else:
+                    contributing_channels = tuple(
+                        dict.fromkeys((*existing.contributing_channels, channel))
+                    )
+                    if candidate.score > existing.score:
+                        candidates[entity_id] = EntityLinkCandidate(
+                            entity_id=existing.entity_id,
+                            canonical_name=candidate.canonical_name,
+                            matched_alias=candidate.matched_alias,
+                            channel=channel,
+                            contributing_channels=contributing_channels,
+                            score=candidate.score,
+                            matched_text=candidate.matched_text,
+                            activates_graph=candidate.activates_graph,
+                        )
+                    else:
+                        candidates[entity_id] = EntityLinkCandidate(
+                            entity_id=existing.entity_id,
+                            canonical_name=existing.canonical_name,
+                            matched_alias=existing.matched_alias,
+                            channel=existing.channel,
+                            contributing_channels=contributing_channels,
+                            score=existing.score,
+                            matched_text=existing.matched_text,
+                            activates_graph=existing.activates_graph,
+                        )
+        await add_matches("alias_compact", _entity_link_compact_terms(tokens))
+
+        ranked = sorted(
+            candidates.values(),
+            key=lambda candidate: (
+                -candidate.score,
+                candidate.canonical_name,
+                candidate.entity_id,
+            ),
+        )[:max_candidates]
+        unmatched_explicit_entities = tuple(
+            raw_value
+            for normalized, raw_value in explicit_terms.items()
+            if normalized not in matched_explicit_terms
+        )
+        return EntityLinkResult(
+            candidates=tuple(ranked),
+            unmatched_explicit_entities=unmatched_explicit_entities,
+        )
+
+    async def _lookup_entity_link_rows(
+        self,
+        terms: dict[str, str],
+        *,
+        channel: str,
+        scope: AccessScope,
+        source_filter: MemorySourceFilter | None,
+        memory_types: Sequence[str] | None,
+        limit: int,
+    ) -> list[Any]:
+        term_values = list(terms)
+        if not term_values:
+            return []
+
+        placeholders = ",".join("?" for _ in term_values)
+        if channel == "alias_compact":
+            entity_match = f"REPLACE(e.canonical_name, ' ', '') IN ({placeholders})"
+            alias_match = f"REPLACE(ea.alias_normalized, ' ', '') IN ({placeholders})"
+            entity_match_key = "REPLACE(e.canonical_name, ' ', '')"
+            alias_match_key = "REPLACE(ea.alias_normalized, ' ', '')"
+        else:
+            entity_match = f"e.canonical_name IN ({placeholders})"
+            alias_match = f"ea.alias_normalized IN ({placeholders})"
+            entity_match_key = "e.canonical_name"
+            alias_match_key = "ea.alias_normalized"
+
+        predicate_sql, predicate_params = visible_sql(scope, "m")
+        joins: list[str] = []
+        clauses = [predicate_sql]
+        params: list[Any] = [*term_values, *term_values, *predicate_params]
+
+        source_filter = source_filter or MemorySourceFilter()
+        _append_source_time_predicates(
+            source_filter=source_filter,
+            time_range=None,
+            joins=joins,
+            clauses=clauses,
+            params=params,
+        )
+
+        if memory_types:
+            type_placeholders = ",".join("?" for _ in memory_types)
+            clauses.append(f"m.memory_type IN ({type_placeholders})")
+            params.extend(memory_types)
+
+        disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
+        has_source_row_join = any("memory_sources ms" in join for join in joins)
+        if has_source_row_join and disabled_source_ids:
+            disabled_placeholders = ", ".join("?" for _ in disabled_source_ids)
+            clauses.append(f"(ms.source_id IS NULL OR ms.source_id NOT IN ({disabled_placeholders}))")
+            params.extend(disabled_source_ids)
+        else:
+            source_visibility_sql, source_visibility_params = _enabled_source_visibility_condition(disabled_source_ids)
+            if source_visibility_sql:
+                clauses.append(source_visibility_sql)
+                params.extend(source_visibility_params)
+
+        join_sql = " ".join(joins)
+        where_sql = " AND ".join(clauses)
+        sql = (
+            "WITH matched_aliases(entity_id, matched_alias, alias_normalized, match_key) AS ("
+            f"SELECT e.id, e.canonical_name, e.canonical_name, {entity_match_key} "
+            f"FROM entities e WHERE {entity_match} "
+            "UNION ALL "
+            f"SELECT ea.canonical_id, ea.alias, ea.alias_normalized, {alias_match_key} "
+            f"FROM entity_aliases ea WHERE {alias_match}"
+            ") "
+            "SELECT ma.entity_id, e.canonical_name, ma.matched_alias, "
+            "ma.alias_normalized, ma.match_key, COUNT(DISTINCT m.id) AS visible_memory_count "
+            "FROM matched_aliases ma "
+            "JOIN entities e ON e.id = ma.entity_id "
+            "JOIN memory_entities me ON me.entity_id = ma.entity_id "
+            "JOIN memories m ON m.id = me.memory_id "
+            f"{join_sql} "
+            f"WHERE {where_sql} "
+            "GROUP BY ma.entity_id, e.canonical_name, ma.matched_alias, ma.alias_normalized, ma.match_key "
+            "ORDER BY visible_memory_count DESC, LENGTH(ma.alias_normalized) DESC, e.canonical_name ASC "
+            "LIMIT ?"
+        )
+        try:
+            async with self._db.db.execute(sql, [*params, limit]) as cursor:
+                return [row async for row in cursor]
+        except (aiosqlite.Error, sqlite3.Error):
+            logger.exception("SQLite entity linker query failed")
+            return []
+
+    async def _lookup_entity_fts_rows(
+        self,
+        fts_query: str,
+        *,
+        query_tokens: set[str],
+        matched_text: str,
+        scope: AccessScope,
+        source_filter: MemorySourceFilter | None,
+        memory_types: Sequence[str] | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if len(query_tokens) < 2:
+            return []
+        predicate_sql, predicate_params = visible_sql(scope, "m")
+        joins: list[str] = []
+        clauses = [predicate_sql]
+        params: list[Any] = [fts_query, *predicate_params]
+
+        source_filter = source_filter or MemorySourceFilter()
+        _append_source_time_predicates(
+            source_filter=source_filter,
+            time_range=None,
+            joins=joins,
+            clauses=clauses,
+            params=params,
+        )
+
+        if memory_types:
+            type_placeholders = ",".join("?" for _ in memory_types)
+            clauses.append(f"m.memory_type IN ({type_placeholders})")
+            params.extend(memory_types)
+
+        disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
+        has_source_row_join = any("memory_sources ms" in join for join in joins)
+        if has_source_row_join and disabled_source_ids:
+            disabled_placeholders = ", ".join("?" for _ in disabled_source_ids)
+            clauses.append(f"(ms.source_id IS NULL OR ms.source_id NOT IN ({disabled_placeholders}))")
+            params.extend(disabled_source_ids)
+        else:
+            source_visibility_sql, source_visibility_params = _enabled_source_visibility_condition(disabled_source_ids)
+            if source_visibility_sql:
+                clauses.append(source_visibility_sql)
+                params.extend(source_visibility_params)
+
+        join_sql = " ".join(joins)
+        where_sql = " AND ".join(clauses)
+        sql = (
+            "WITH matched_aliases AS ("
+            "SELECT entity_id, canonical_name, alias_normalized, search_text, rank AS fts_rank "
+            "FROM entity_alias_search_fts "
+            "WHERE entity_alias_search_fts MATCH ?"
+            ") "
+            "SELECT ma.entity_id, e.canonical_name, ma.alias_normalized AS matched_alias, "
+            "ma.search_text, MIN(ma.fts_rank) AS best_rank, COUNT(DISTINCT m.id) AS visible_memory_count "
+            "FROM matched_aliases ma "
+            "JOIN entities e ON e.id = ma.entity_id "
+            "JOIN memory_entities me ON me.entity_id = ma.entity_id "
+            "JOIN memories m ON m.id = me.memory_id "
+            f"{join_sql} "
+            f"WHERE {where_sql} "
+            "GROUP BY ma.entity_id, e.canonical_name, ma.alias_normalized, ma.search_text "
+            "ORDER BY best_rank ASC, visible_memory_count DESC, e.canonical_name ASC "
+            "LIMIT ?"
+        )
+        try:
+            async with self._db.db.execute(sql, [*params, limit]) as cursor:
+                rows = [dict(row) async for row in cursor]
+        except (aiosqlite.Error, sqlite3.Error):
+            logger.exception("SQLite entity alias FTS query failed")
+            return []
+        kept: list[dict[str, Any]] = []
+        for row in rows:
+            row_tokens = set(_entity_link_tokens(str(row.get("search_text") or "")))
+            # FTS rows are one canonical or alias surface. Require the query to
+            # overlap that same surface by at least two tokens before treating
+            # the match as a graph-activating entity link.
+            if len(query_tokens.intersection(row_tokens)) < 2:
+                continue
+            row["matched_text"] = matched_text
+            kept.append(row)
+        return kept
 
     async def fetch_ranking_metadata(self, ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         """Return ranking and curation metadata for each id in one read.

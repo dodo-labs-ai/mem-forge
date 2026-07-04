@@ -25,7 +25,6 @@ from memforge.models import (
     Visibility,
     content_hash,
 )
-from memforge.retrieval.query_analyzer import QueryAnalysis
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.adapters.context import AccessScope
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -131,13 +130,6 @@ async def test_search_with_admin_styled_caller_still_hides_other_users_private(
     (here, an attempt to attach a `role` and `is_admin` flag to the scope's
     user_id), `SearchEngine.search` only consults the AccessScope predicate.
     There is no admin retrieval channel to query; the predicate decides."""
-
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr(
-        "memforge.retrieval.search.analyze_query", fake_analyze_query,
-    )
 
     coll = _Coll()
     coll.upsert(
