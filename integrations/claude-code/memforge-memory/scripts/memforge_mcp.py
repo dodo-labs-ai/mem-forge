@@ -55,6 +55,7 @@ SEARCH_ALLOWED_KEYS = frozenset(
         "time_range",
         "top_k",
         "offset",
+        "entities",
     }
 )
 SOURCE_FILTER_ALLOWED_KEYS = frozenset(
@@ -181,6 +182,15 @@ TOOLS: list[dict[str, Any]] = [
                         "Zero-based result offset for the next page. Use when total_candidates "
                         "is greater than the number of returned results and the user asked for a "
                         "complete list or inventory."
+                    ),
+                },
+                "entities": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional explicit entity hints. Use only when the caller intentionally "
+                        "wants graph linking for known entities; do not infer or extract values "
+                        "from the natural-language query before calling."
                     ),
                 },
             },
@@ -676,6 +686,12 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
         )
     if "offset" in body:
         body["offset"] = _required_non_negative_int_arg(body, "offset")
+    if "entities" in body:
+        entities = body["entities"]
+        if not isinstance(entities, list) or not all(isinstance(item, str) and item.strip() for item in entities):
+            raise ValueError("entities must be an array of non-empty strings")
+        if not entities:
+            body.pop("entities")
     body["include_private"] = True
     body["include_superseded"] = False
     repo_identifier = _active_repo_identifier()
