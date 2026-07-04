@@ -188,9 +188,11 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Optional explicit entity hints. Use only when the caller intentionally "
-                        "wants graph linking for known entities; do not infer or extract values "
-                        "from the natural-language query before calling."
+                        "Optional agent-selected entity hints for graph-linking recall. When "
+                        "the user's query clearly names a domain concept, pass a small list "
+                        "of exact phrases while keeping query unchanged. Omit when unsure; "
+                        "do not pass every noun, source IDs, broad action words, or hidden "
+                        "guesses. Entity hints are not filters or authority."
                     ),
                 },
             },
