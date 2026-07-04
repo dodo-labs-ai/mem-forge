@@ -9,7 +9,6 @@ import pytest
 
 from memforge.config import AppConfig, RetrievalConfig
 from memforge.models import DocumentRecord, Memory, content_hash
-from memforge.retrieval.query_analyzer import QueryAnalysis
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -95,11 +94,6 @@ async def test_default_search_returns_only_active_memories(db, monkeypatch):
     for mem in [active, retired, pending, superseded]:
         await db.insert_memory(mem)
 
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
-
     adapters = build_sqlite_adapters(db, FakeCollection([retired.id, pending.id, superseded.id, active.id]))
     engine = SearchEngine(
         relational=adapters.relational,
@@ -125,11 +119,6 @@ async def test_search_results_do_not_expose_top_level_provenance_fields(
     await db.insert_memory(active)
     doc = await _document(db, tmp_path, "doc-search-artifact")
     await db.add_memory_source(active.id, doc.doc_id, "confluence", excerpt="source excerpt", source_updated_at=None)
-
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     config = _config(tmp_path)
     adapters = build_sqlite_adapters(db, FakeCollection([active.id]))
@@ -159,11 +148,6 @@ async def test_search_result_without_sources_remains_unverified(db, tmp_path, mo
     active = _memory("mem-no-source", "Active HANA memory without sources", "active")
     await db.insert_memory(active)
 
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
-
     adapters = build_sqlite_adapters(db, FakeCollection([active.id]))
     engine = SearchEngine(
         relational=adapters.relational,
@@ -185,11 +169,6 @@ async def test_search_result_with_source_row_but_no_source_url_is_current(db, tm
     await db.insert_memory(active)
     doc = await _document(db, tmp_path, "doc-no-source-url", source_url="")
     await db.add_memory_source(active.id, doc.doc_id, "confluence", source_updated_at=None)
-
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     adapters = build_sqlite_adapters(db, FakeCollection([active.id]))
     engine = SearchEngine(
@@ -220,11 +199,6 @@ async def test_search_result_suggests_detail_for_procedure_memory(
     procedure.memory_type = "procedure"
     await db.insert_memory(procedure)
 
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
-
     adapters = build_sqlite_adapters(db, FakeCollection([procedure.id]))
     engine = SearchEngine(
         relational=adapters.relational,
@@ -252,11 +226,6 @@ async def test_search_result_omits_follow_up_for_simple_fact_memory(
 ):
     fact = _memory("mem-fact-no-follow-up", "Service uses HANA.", "active")
     await db.insert_memory(fact)
-
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     adapters = build_sqlite_adapters(db, FakeCollection([fact.id]))
     engine = SearchEngine(
@@ -305,11 +274,6 @@ async def test_search_results_do_not_resolve_artifacts_through_configured_store(
     await db.upsert_document(doc)
     await db.add_memory_source(active.id, doc.doc_id, "jira", excerpt="source excerpt", source_updated_at=None)
 
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
-
     adapters = build_sqlite_adapters(db, FakeCollection([active.id]))
     engine = SearchEngine(
         relational=adapters.relational,
@@ -337,11 +301,6 @@ async def test_include_superseded_includes_history_but_not_retired_or_pending(db
     superseded = _memory("mem-supers", "Superseded PostgreSQL memory", "superseded")
     for mem in [active, retired, pending, superseded]:
         await db.insert_memory(mem)
-
-    async def fake_analyze_query(*args, **kwargs):
-        return QueryAnalysis()
-
-    monkeypatch.setattr("memforge.retrieval.search.analyze_query", fake_analyze_query)
 
     adapters = build_sqlite_adapters(db, FakeCollection([retired.id, pending.id, superseded.id, active.id]))
     engine = SearchEngine(
