@@ -1635,7 +1635,9 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert set(properties) == {"query", "source_filter", "time_range", "top_k", "offset", "entities"}
     assert properties["entities"]["type"] == "array"
     assert properties["entities"]["items"]["type"] == "string"
-    assert "explicit entity hints" in properties["entities"]["description"]
+    assert "agent-selected entity hints" in properties["entities"]["description"]
+    assert "keeping query unchanged" in properties["entities"]["description"]
+    assert "not filters or authority" in properties["entities"]["description"]
     assert "total_candidates" in tools["search"]["description"]
     assert "complete list" in tools["search"]["description"]
     assert "enumeration" in tools["search"]["description"]
