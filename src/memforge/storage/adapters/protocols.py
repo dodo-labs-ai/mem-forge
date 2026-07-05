@@ -261,6 +261,7 @@ class KeywordSearch(Protocol):
         *,
         source_filter: MemorySourceFilter | None = None,
         time_range: MemoryTimeRange | None = None,
+        include_subchannel_hits: bool = False,
     ) -> list[KeywordCandidate]: ...
 
 
