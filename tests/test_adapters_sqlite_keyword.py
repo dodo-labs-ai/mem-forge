@@ -24,7 +24,13 @@ def _scope(statuses=("active",)) -> AccessScope:
     )
 
 
-def _memory(mem_id: str, content: str, status: str = "active") -> Memory:
+def _memory(
+    mem_id: str,
+    content: str,
+    status: str = "active",
+    repo_identifier: str | None = None,
+    updated_at: datetime | None = None,
+) -> Memory:
     now = datetime.now(timezone.utc)
     return Memory(
         id=mem_id,
@@ -33,8 +39,9 @@ def _memory(mem_id: str, content: str, status: str = "active") -> Memory:
         content_hash=content_hash(content),
         confidence=0.9,
         created_at=now,
-        updated_at=now,
+        updated_at=updated_at or now,
         status=status,
+        repo_identifier=repo_identifier,
     )
 
 
@@ -290,12 +297,150 @@ async def test_metadata_search_applies_source_time_range_to_matching_support_row
     ) == []
 
 
+@pytest.mark.asyncio
+async def test_metadata_search_applies_client_filter_to_matching_support_row(db):
+    await db.insert_memory(_memory("m-codex", "Agent session summary"))
+    await db.upsert_source("src-codex", "agent_session", "Codex Sessions", "{}")
+    await _upsert_doc(
+        db,
+        doc_id="codex-session-1",
+        source="src-codex",
+        title="Create Blocker Hint investigation",
+        client="codex",
+    )
+    await db.add_memory_source(
+        "m-codex",
+        "codex-session-1",
+        "agent_session",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+
+    keyword = SqliteKeywordSearch(db)
+
+    hits = await keyword.search_metadata(
+        '"create" "blocker" "hint"',
+        _scope(),
+        None,
+        limit=10,
+        source_filter=MemorySourceFilter(clients=("codex",)),
+    )
+
+    assert [hit.memory_id for hit in hits] == ["m-codex"]
+    assert hits[0].source_refs[0].doc_id == "codex-session-1"
+    assert await keyword.search_metadata(
+        '"create" "blocker" "hint"',
+        _scope(),
+        None,
+        limit=10,
+        source_filter=MemorySourceFilter(clients=("claude-code",)),
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_metadata_search_applies_repo_identifier_filter(db):
+    await db.insert_memory(
+        _memory(
+            "m-repo",
+            "Repository investigation summary",
+            repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        )
+    )
+    await db.upsert_source("src-codex", "agent_session", "Codex Sessions", "{}")
+    await _upsert_doc(
+        db,
+        doc_id="codex-session-1",
+        source="src-codex",
+        title="Create Blocker Hint investigation",
+        client="codex",
+    )
+    await db.add_memory_source(
+        "m-repo",
+        "codex-session-1",
+        "agent_session",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+
+    keyword = SqliteKeywordSearch(db)
+
+    hits = await keyword.search_metadata(
+        '"create" "blocker" "hint"',
+        _scope(),
+        None,
+        limit=10,
+        source_filter=MemorySourceFilter(
+            repo_identifiers=("github.tools.sap/hcm/memforge-cloud",),
+        ),
+    )
+
+    assert [hit.memory_id for hit in hits] == ["m-repo"]
+    assert await keyword.search_metadata(
+        '"create" "blocker" "hint"',
+        _scope(),
+        None,
+        limit=10,
+        source_filter=MemorySourceFilter(repo_identifiers=("github.tools.sap/hcm/other",)),
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_metadata_search_applies_memory_updated_time_range(db):
+    await db.insert_memory(
+        _memory(
+            "m-updated",
+            "Lifecycle assignment skips person assignment creation",
+            updated_at=datetime(2026, 6, 20, tzinfo=timezone.utc),
+        )
+    )
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _upsert_doc(
+        db,
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await db.add_memory_source(
+        "m-updated",
+        "SFPAY-179397",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime(2026, 6, 10, tzinfo=timezone.utc),
+    )
+
+    keyword = SqliteKeywordSearch(db)
+
+    hits = await keyword.search_metadata(
+        '"create" "blocker" "hint"',
+        _scope(),
+        None,
+        limit=10,
+        time_range=MemoryTimeRange(
+            after=datetime(2026, 6, 19, tzinfo=timezone.utc),
+            before=datetime(2026, 6, 21, tzinfo=timezone.utc),
+            date_type="memory_updated_at",
+        ),
+    )
+
+    assert [hit.memory_id for hit in hits] == ["m-updated"]
+    assert await keyword.search_metadata(
+        '"create" "blocker" "hint"',
+        _scope(),
+        None,
+        limit=10,
+        time_range=MemoryTimeRange(
+            after=datetime(2026, 6, 21, tzinfo=timezone.utc),
+            before=datetime(2026, 6, 22, tzinfo=timezone.utc),
+            date_type="memory_updated_at",
+        ),
+    ) == []
+
+
 async def _upsert_doc(
     db: Database,
     *,
     doc_id: str = "SFPAY-179397",
     title: str,
     source: str = "src-jira",
+    client: str | None = None,
 ) -> None:
     now = datetime.now(timezone.utc)
     await db.upsert_document(
@@ -316,6 +461,7 @@ async def _upsert_doc(
             normalized_content_uri=None,
             pdf_content_uri=None,
             last_synced=now,
+            client=client,
         )
     )
 

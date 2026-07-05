@@ -186,3 +186,46 @@ class KeywordSearchContract:
         )
 
         assert hits == []
+
+    async def test_metadata_client_filter_matches_document_client(
+        self, adapters: ContractAdapters
+    ) -> None:
+        await adapters.relational.insert_memory(
+            make_memory(
+                "m-codex",
+                content="Agent session summary",
+            )
+        )
+        await adapters.relational.upsert_document(
+            make_document(
+                "codex-session-1",
+                source="src-codex",
+                client="codex",
+                title="Create Blocker Hint investigation",
+            )
+        )
+        await adapters.relational.add_memory_source(
+            "m-codex",
+            "codex-session-1",
+            "agent_session",
+            None,
+            support_kind="extracted",
+            source_updated_at=None,
+        )
+
+        hits = await adapters.keyword.search_metadata(
+            '"create" "blocker" "hint"',
+            make_scope(),
+            None,
+            limit=10,
+            source_filter=MemorySourceFilter(clients=("codex",)),
+        )
+
+        assert [hit.memory_id for hit in hits] == ["m-codex"]
+        assert await adapters.keyword.search_metadata(
+            '"create" "blocker" "hint"',
+            make_scope(),
+            None,
+            limit=10,
+            source_filter=MemorySourceFilter(clients=("claude-code",)),
+        ) == []
