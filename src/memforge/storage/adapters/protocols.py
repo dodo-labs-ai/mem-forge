@@ -254,6 +254,9 @@ class KeywordSearch(Protocol):
         scope: AccessScope,
         memory_types: list[str] | None,
         limit: int,
+        *,
+        source_filter: MemorySourceFilter | None = None,
+        time_range: MemoryTimeRange | None = None,
     ) -> list[KeywordCandidate]: ...
 
 
