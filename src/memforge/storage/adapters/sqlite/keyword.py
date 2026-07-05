@@ -183,7 +183,8 @@ class SqliteKeywordSearch:
             return []
 
         try:
-            source_filter = source_filter or MemorySourceFilter()
+            if source_filter is None:
+                source_filter = MemorySourceFilter()
             hits: list[KeywordCandidate] = []
             hits.extend(
                 await self._search_metadata_fts(
