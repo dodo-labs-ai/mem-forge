@@ -354,7 +354,14 @@ class SearchEngine:
         channel_names.append("bm25")
 
         tasks.append(asyncio.ensure_future(
-            self._bm25_metadata_search(query, memory_types, scope, fetch_k)
+            self._bm25_metadata_search(
+                query,
+                memory_types,
+                scope,
+                fetch_k,
+                source_filter=combined_source_filter,
+                time_range=time_range,
+            )
         ))
         channel_names.append("bm25_metadata_tokens")
 
@@ -494,6 +501,9 @@ class SearchEngine:
         memory_types: list[str] | None,
         scope: AccessScope,
         limit: int,
+        *,
+        source_filter: MemorySourceFilter | None,
+        time_range: MemoryTimeRange | None,
     ) -> list[KeywordCandidate]:
         """Query the source-metadata keyword channel."""
         sanitized_query = _sanitize_fts_query(query)
@@ -504,6 +514,8 @@ class SearchEngine:
             scope,
             memory_types,
             limit,
+            source_filter=source_filter,
+            time_range=time_range,
         )
 
     async def _graph_search(

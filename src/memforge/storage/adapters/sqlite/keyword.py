@@ -12,6 +12,7 @@ import logging
 from typing import Any
 
 from memforge.retrieval.access_predicate import visible_sql
+from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.metadata_text import compact_query_variants, quoted_query_terms
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope
@@ -59,6 +60,46 @@ def _metadata_match_text(
     if source_url:
         parts.append(str(source_url).strip())
     return " | ".join(part for part in parts if part)
+
+
+def _append_metadata_source_time_predicates(
+    *,
+    source_filter: MemorySourceFilter,
+    time_range: MemoryTimeRange | None,
+    conditions: list[str],
+    params: list[Any],
+) -> None:
+    if source_filter.source_ids:
+        placeholders = ",".join("?" for _ in source_filter.source_ids)
+        conditions.append(f"f.source_id IN ({placeholders})")
+        params.extend(source_filter.source_ids)
+    if source_filter.clients:
+        placeholders = ",".join("?" for _ in source_filter.clients)
+        conditions.append(f"d.client IN ({placeholders})")
+        params.extend(source_filter.clients)
+    if source_filter.repo_identifiers:
+        placeholders = ",".join("?" for _ in source_filter.repo_identifiers)
+        conditions.append(f"m.repo_identifier IN ({placeholders})")
+        params.extend(source_filter.repo_identifiers)
+
+    if time_range is None or time_range.is_empty():
+        return
+    if time_range.date_type == "source_updated_at":
+        if time_range.after is not None:
+            conditions.append("ms.source_updated_at >= ?")
+            params.append(time_range.after.isoformat())
+        if time_range.before is not None:
+            conditions.append("ms.source_updated_at < ?")
+            params.append(time_range.before.isoformat())
+    elif time_range.date_type == "memory_updated_at":
+        if time_range.after is not None:
+            conditions.append("m.updated_at >= ?")
+            params.append(time_range.after.isoformat())
+        if time_range.before is not None:
+            conditions.append("m.updated_at < ?")
+            params.append(time_range.before.isoformat())
+    else:
+        raise ValueError(f"Unsupported memory time range date_type: {time_range.date_type}")
 
 
 class SqliteKeywordSearch:
@@ -134,11 +175,15 @@ class SqliteKeywordSearch:
         scope: AccessScope,
         memory_types: list[str] | None,
         limit: int,
+        *,
+        source_filter: MemorySourceFilter | None = None,
+        time_range: MemoryTimeRange | None = None,
     ) -> list[KeywordCandidate]:
         if limit <= 0:
             return []
 
         try:
+            source_filter = source_filter or MemorySourceFilter()
             hits: list[KeywordCandidate] = []
             hits.extend(
                 await self._search_metadata_fts(
@@ -150,6 +195,8 @@ class SqliteKeywordSearch:
                     channel="bm25_metadata_tokens",
                     matched_field="metadata_any",
                     score_scale=1.0,
+                    source_filter=source_filter,
+                    time_range=time_range,
                 )
             )
             hits.extend(
@@ -162,6 +209,8 @@ class SqliteKeywordSearch:
                     channel="metadata_alias",
                     matched_field="metadata_alias",
                     score_scale=0.75,
+                    source_filter=source_filter,
+                    time_range=time_range,
                 )
             )
             hits.extend(
@@ -170,6 +219,8 @@ class SqliteKeywordSearch:
                     scope,
                     memory_types,
                     limit,
+                    source_filter,
+                    time_range,
                 )
             )
             return _dedupe_metadata_hits(hits, limit)
@@ -188,6 +239,8 @@ class SqliteKeywordSearch:
         channel: str,
         matched_field: str,
         score_scale: float,
+        source_filter: MemorySourceFilter,
+        time_range: MemoryTimeRange | None,
     ) -> list[KeywordCandidate]:
         predicate_sql, predicate_params = visible_sql(scope, "m")
         conditions = [f"{table} MATCH ?"]
@@ -199,6 +252,13 @@ class SqliteKeywordSearch:
             type_placeholders = ",".join("?" for _ in memory_types)
             conditions.append(f"m.memory_type IN ({type_placeholders})")
             params.extend(memory_types)
+
+        _append_metadata_source_time_predicates(
+            source_filter=source_filter,
+            time_range=time_range,
+            conditions=conditions,
+            params=params,
+        )
 
         disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
         if disabled_source_ids:
@@ -256,6 +316,8 @@ class SqliteKeywordSearch:
         scope: AccessScope,
         memory_types: list[str] | None,
         limit: int,
+        source_filter: MemorySourceFilter,
+        time_range: MemoryTimeRange | None,
     ) -> list[KeywordCandidate]:
         terms = quoted_query_terms(fts_query)
         variant_groups = [compact_query_variants(term) for term in terms]
@@ -271,6 +333,13 @@ class SqliteKeywordSearch:
             type_placeholders = ",".join("?" for _ in memory_types)
             conditions.append(f"m.memory_type IN ({type_placeholders})")
             params.extend(memory_types)
+
+        _append_metadata_source_time_predicates(
+            source_filter=source_filter,
+            time_range=time_range,
+            conditions=conditions,
+            params=params,
+        )
 
         disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
         if disabled_source_ids:

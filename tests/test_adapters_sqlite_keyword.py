@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 from memforge.models import DocumentRecord, Memory, content_hash
+from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch
@@ -213,6 +214,80 @@ async def test_metadata_search_excludes_user_disabled_source_rows(db):
     keyword = SqliteKeywordSearch(db)
 
     assert await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_metadata_search_applies_source_filter_to_matching_support_row(db):
+    await db.insert_memory(_memory("m-shared", "Lifecycle assignment skips person assignment creation"))
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-wiki", "confluence", "Payroll Wiki", "{}")
+    await _upsert_doc(
+        db,
+        doc_id="SFPAY-179397",
+        source="src-jira",
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await _upsert_doc(
+        db,
+        doc_id="wiki-runbook",
+        source="src-wiki",
+        title="Payroll lifecycle runbook",
+    )
+    await db.add_memory_source(
+        "m-shared",
+        "SFPAY-179397",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime(2026, 6, 10, tzinfo=timezone.utc),
+    )
+    await db.add_memory_source(
+        "m-shared",
+        "wiki-runbook",
+        "confluence",
+        support_kind="extracted",
+        source_updated_at=datetime(2026, 6, 20, tzinfo=timezone.utc),
+    )
+
+    keyword = SqliteKeywordSearch(db)
+
+    assert await keyword.search_metadata(
+        '"create" "blocker" "hint"',
+        _scope(),
+        None,
+        limit=10,
+        source_filter=MemorySourceFilter(source_ids=("src-wiki",)),
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_metadata_search_applies_source_time_range_to_matching_support_row(db):
+    await db.insert_memory(_memory("m-shared", "Lifecycle assignment skips person assignment creation"))
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await _upsert_doc(
+        db,
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await db.add_memory_source(
+        "m-shared",
+        "SFPAY-179397",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime(2026, 6, 10, tzinfo=timezone.utc),
+    )
+
+    keyword = SqliteKeywordSearch(db)
+
+    assert await keyword.search_metadata(
+        '"create" "blocker" "hint"',
+        _scope(),
+        None,
+        limit=10,
+        time_range=MemoryTimeRange(
+            after=datetime(2026, 6, 19, tzinfo=timezone.utc),
+            before=datetime(2026, 6, 21, tzinfo=timezone.utc),
+            date_type="source_updated_at",
+        ),
+    ) == []
 
 
 async def _upsert_doc(

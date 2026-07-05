@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from memforge.retrieval.filters import MemorySourceFilter
 from memforge.storage.adapters.protocols import KeywordSearch
 
 from tests.contracts._support import (
@@ -135,3 +136,53 @@ class KeywordSearchContract:
         assert hits[0].channel == "bm25_metadata_tokens"
         assert "metadata_any" in hits[0].matched_fields
         assert hits[0].source_refs[0].doc_id == "SFPAY-179397"
+
+    async def test_metadata_source_filter_applies_to_matching_support_row(
+        self, adapters: ContractAdapters
+    ) -> None:
+        await adapters.relational.insert_memory(
+            make_memory(
+                "m-shared",
+                content="Lifecycle assignment skips person assignment creation",
+            )
+        )
+        await adapters.relational.upsert_document(
+            make_document(
+                "SFPAY-179397",
+                source="src-jira",
+                title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+            )
+        )
+        await adapters.relational.upsert_document(
+            make_document(
+                "wiki-runbook",
+                source="src-wiki",
+                title="Payroll lifecycle runbook",
+            )
+        )
+        await adapters.relational.add_memory_source(
+            "m-shared",
+            "SFPAY-179397",
+            "jira",
+            None,
+            support_kind="extracted",
+            source_updated_at=None,
+        )
+        await adapters.relational.add_memory_source(
+            "m-shared",
+            "wiki-runbook",
+            "confluence",
+            None,
+            support_kind="extracted",
+            source_updated_at=None,
+        )
+
+        hits = await adapters.keyword.search_metadata(
+            '"create" "blocker" "hint"',
+            make_scope(),
+            None,
+            limit=10,
+            source_filter=MemorySourceFilter(source_ids=("src-wiki",)),
+        )
+
+        assert hits == []

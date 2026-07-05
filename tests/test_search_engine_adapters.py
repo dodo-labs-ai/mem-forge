@@ -225,6 +225,48 @@ async def test_search_recalls_compound_query_from_metadata_trigram(db, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_source_filter_prevents_non_matching_metadata_evidence(db, monkeypatch):
+    shared = _memory("m-shared", "Lifecycle assignment skips person assignment creation")
+    await db.insert_memory(shared)
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-wiki", "confluence", "Payroll Wiki", "{}")
+    await _document(
+        db,
+        "SFPAY-179397",
+        "src-jira",
+        title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await _document(
+        db,
+        "wiki-runbook",
+        "src-wiki",
+        title="Payroll lifecycle runbook",
+    )
+    await db.add_memory_source("m-shared", "SFPAY-179397", "jira", None, source_updated_at=None)
+    await db.add_memory_source("m-shared", "wiki-runbook", "confluence", None, source_updated_at=None)
+
+    adapters = build_sqlite_adapters(db, FakeCollection(["m-shared"]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search(
+        "create blocker hint",
+        source_filter=MemorySourceFilter(source_ids=("src-wiki",)),
+        top_k=10,
+    )
+
+    assert [r.memory_id for r in result["results"]] == ["m-shared"]
+    evidence = result["results"][0].retrieval_evidence or {}
+    assert "metadata_lexical" not in evidence
+
+
+@pytest.mark.asyncio
 async def test_rerank_prompt_includes_metadata_evidence_for_metadata_hits(db, monkeypatch):
     target = _memory("m-blocker", "Lifecycle assignment skips person assignment creation")
     await db.insert_memory(target)
