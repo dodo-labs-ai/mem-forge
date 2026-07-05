@@ -153,10 +153,18 @@ async def test_graph_search_honors_source_filter_and_time_range(db):
     await store.insert_memory(_memory("m-target"))
     await store.insert_memory(_memory("m-other"))
     await _document(db, "doc-target", source="src-target")
+    await _document(db, "doc-target-2", source="src-target")
     await _document(db, "doc-other", source="src-other")
     await store.add_memory_source(
         "m-target",
         "doc-target",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 6, 24, tzinfo=timezone.utc),
+    )
+    await store.add_memory_source(
+        "m-target",
+        "doc-target-2",
         "jira",
         None,
         source_updated_at=datetime(2026, 6, 24, tzinfo=timezone.utc),
@@ -185,7 +193,7 @@ async def test_graph_search_honors_source_filter_and_time_range(db):
         ),
     )
 
-    assert [mid for mid, _ in hits] == ["m-target"]
+    assert hits == [("m-target", 1.0)]
 
 
 @pytest.mark.asyncio
