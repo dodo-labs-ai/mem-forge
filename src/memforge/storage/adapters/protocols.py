@@ -68,6 +68,9 @@ class EntityLinkCandidate:
     score: float
     matched_text: str
     activates_graph: bool
+    visible_memory_count: int = 0
+    visible_source_count: int = 0
+    specificity: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -147,6 +150,7 @@ class RelationalStore(Protocol):
         scope: AccessScope,
         explicit_entities: Sequence[str] = (),
         source_filter: MemorySourceFilter | None = None,
+        time_range: MemoryTimeRange | None = None,
         memory_types: Sequence[str] | None = None,
         limit: int = DEFAULT_ENTITY_LINK_LIMIT,
     ) -> EntityLinkResult: ...

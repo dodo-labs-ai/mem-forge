@@ -1217,6 +1217,47 @@ def test_mcp_proxy_forwards_explicit_search_entities(monkeypatch):
     }
 
 
+def test_mcp_proxy_trims_and_dedupes_explicit_search_entities(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool(
+        "search",
+        {
+            "query": "deployment owner",
+            "entities": [" Payroll Control Center ", "payroll control center", "Deployment Owner"],
+        },
+    )
+
+    assert result == {"results": []}
+    assert json.loads(captured["body"].decode())["entities"] == [
+        "Payroll Control Center",
+        "Deployment Owner",
+    ]
+
+
 def test_mcp_proxy_omits_empty_explicit_search_entities(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
     captured = {}
@@ -1260,6 +1301,8 @@ def test_mcp_proxy_omits_empty_explicit_search_entities(monkeypatch):
         ["payroll control center", 3],
         ["payroll control center", ""],
         ["payroll control center", "   "],
+        ["e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9"],
+        ["x" * 129],
     ],
 )
 def test_mcp_proxy_rejects_invalid_explicit_search_entities(monkeypatch, entities):
@@ -1268,7 +1311,7 @@ def test_mcp_proxy_rejects_invalid_explicit_search_entities(monkeypatch, entitie
 
     result = proxy._call_tool("search", {"query": "deployment owner", "entities": entities})
 
-    assert result == {"error": "entities must be an array of non-empty strings"}
+    assert result == {"error": "entities must be an array of 1-8 strings, each 1-128 characters after trimming"}
 
 
 def test_mcp_proxy_forwards_list_sources_to_searchable_sources(monkeypatch):
@@ -1634,7 +1677,10 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "sources" not in properties
     assert set(properties) == {"query", "source_filter", "time_range", "top_k", "offset", "entities"}
     assert properties["entities"]["type"] == "array"
+    assert properties["entities"]["maxItems"] == 8
     assert properties["entities"]["items"]["type"] == "string"
+    assert properties["entities"]["items"]["minLength"] == 1
+    assert properties["entities"]["items"]["maxLength"] == 128
     assert "agent-selected entity hints" in properties["entities"]["description"]
     assert "keeping query unchanged" in properties["entities"]["description"]
     assert "not filters or authority" in properties["entities"]["description"]
