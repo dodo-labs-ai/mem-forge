@@ -188,7 +188,8 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "entities": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "maxItems": 8,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 128},
                     "description": (
                         "Optional agent-selected entity hints for graph-linking recall. When "
                         "the user's query clearly names a domain concept, pass a small list "
@@ -694,10 +695,11 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
         body["offset"] = _required_non_negative_int_arg(body, "offset")
     if "entities" in body:
         entities = body["entities"]
-        if not isinstance(entities, list) or not all(isinstance(item, str) and item.strip() for item in entities):
-            raise ValueError("entities must be an array of non-empty strings")
-        if not entities:
+        normalized_entities = _validate_search_entities(entities)
+        if not normalized_entities:
             body.pop("entities")
+        else:
+            body["entities"] = normalized_entities
     body["include_private"] = True
     body["include_superseded"] = False
     repo_identifier = _active_repo_identifier()
@@ -729,6 +731,29 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
     if not query and not has_deterministic_filter:
         raise ValueError("search.query may be omitted only when source_filter or time_range is provided")
     return body
+
+
+def _validate_search_entities(entities: Any) -> list[str]:
+    error = "entities must be an array of 1-8 strings, each 1-128 characters after trimming"
+    if not isinstance(entities, list):
+        raise ValueError(error)
+    if len(entities) > 8:
+        raise ValueError(error)
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for entity in entities:
+        if not isinstance(entity, str):
+            raise ValueError(error)
+        value = entity.strip()
+        if not value or len(value) > 128:
+            raise ValueError(error)
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(value)
+    return normalized
 
 
 def _validate_time_range(value: Any) -> dict[str, str]:

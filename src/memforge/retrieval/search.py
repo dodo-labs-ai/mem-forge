@@ -115,6 +115,10 @@ _GRAPH_INVENTORY_TERMS = {
     "risks", "list", "show", "find",
 }
 _EXTERNAL_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b|#\d+\b|\bINC\d+\b", re.IGNORECASE)
+_CODE_SYMBOL_RE = re.compile(
+    r"(?:\b[A-Za-z][A-Za-z0-9]*[./][A-Za-z0-9_./-]+\b)"
+    r"|(?:\b[A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*\b)"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +144,7 @@ class _RankedCandidate:
 class _QueryFeatures:
     tokens: tuple[str, ...]
     has_external_id: bool
+    has_code_symbol: bool
     natural_language_ratio: float
     graph_intent: float
 
@@ -228,6 +233,7 @@ def _compute_query_features(
     return _QueryFeatures(
         tokens=tokens,
         has_external_id=bool(_EXTERNAL_ID_RE.search(query)),
+        has_code_symbol=bool(_CODE_SYMBOL_RE.search(query)),
         natural_language_ratio=natural_language_ratio,
         graph_intent=graph_intent,
     )
@@ -243,8 +249,12 @@ def _select_ranking_profile(
         return "identifier_lookup"
     if any(hit.channel in {"bm25_metadata_tokens", "metadata_alias"} for hit in metadata_hits):
         query_token_set = set(features.tokens)
-        if len(query_token_set) > 1 and any(
-            query_token_set.issubset(set(_query_tokens(" ".join(hit.matched_text))))
+        if any(
+            (
+                len(query_token_set) > 1
+                and query_token_set.issubset(set(_query_tokens(" ".join(hit.matched_text))))
+            )
+            or features.has_code_symbol
             for hit in metadata_hits
             if hit.matched_text
         ):
@@ -766,6 +776,7 @@ class SearchEngine:
             limit,
             source_filter=source_filter,
             time_range=time_range,
+            include_subchannel_hits=True,
         )
 
     async def _graph_search(

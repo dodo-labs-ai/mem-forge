@@ -505,6 +505,43 @@ async def test_identifier_lookup_prefers_rank_one_metadata_over_vector_plus_cont
 
 
 @pytest.mark.asyncio
+async def test_code_symbol_metadata_hit_uses_identifier_profile(db, monkeypatch):
+    metadata_target = _memory("m-code-symbol", "Implementation note with durable source support")
+    semantic_competitor = _memory("m-semantic", "Payroll cutoff command retries after lock contention")
+    await db.insert_memory(metadata_target)
+    await db.insert_memory(semantic_competitor)
+    await db.upsert_source("src-code", "github", "Payroll Repository", "{}")
+    await _document(
+        db,
+        "src/payroll/PayrollCutoffCommand.py",
+        "src-code",
+        title="PayrollCutoffCommand.resolveWindow source reference",
+    )
+    await db.add_memory_source(
+        "m-code-symbol",
+        "src/payroll/PayrollCutoffCommand.py",
+        "github",
+        None,
+        source_updated_at=None,
+    )
+
+    adapters = build_sqlite_adapters(db, FakeCollection(["m-semantic", "m-code-symbol"]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("PayrollCutoffCommand", top_k=2)
+
+    assert result["query_analysis"]["ranking_profile"] == "identifier_lookup"
+    assert result["results"][0].memory_id == "m-code-symbol"
+
+
+@pytest.mark.asyncio
 async def test_explanatory_query_uses_semantic_profile_instead_of_lexical_fallback(db, monkeypatch):
     memory = _memory("m-semantic", "Payment retry policy after payroll cutoff")
     await db.insert_memory(memory)

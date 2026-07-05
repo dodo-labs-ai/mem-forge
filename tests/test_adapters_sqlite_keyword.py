@@ -132,6 +132,53 @@ async def test_metadata_title_tokens_recall_source_title(db):
 
 
 @pytest.mark.asyncio
+async def test_metadata_search_can_return_subchannel_hits_for_ranker(db):
+    now = datetime.now(timezone.utc).isoformat()
+    await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.db.execute(
+        """INSERT INTO documents
+           (doc_id, source, source_url, title, space_or_project, labels, last_modified, version, content_hash, last_synced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "SFPAY-179397",
+            "src-jira",
+            "https://jira.example/browse/SFPAY-179397",
+            "SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+            "PAY",
+            '["lifecycle"]',
+            now,
+            "1",
+            "doc-hash",
+            now,
+        ),
+    )
+    await db.add_memory_source(
+        "m-blocker",
+        "SFPAY-179397",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+
+    keyword = SqliteKeywordSearch(db)
+    hits = await keyword.search_metadata(
+        '"create" "blocker" "hint"',
+        _scope(),
+        None,
+        limit=10,
+        include_subchannel_hits=True,
+    )
+
+    assert [hit.memory_id for hit in hits] == ["m-blocker", "m-blocker", "m-blocker"]
+    assert [hit.channel for hit in hits] == [
+        "bm25_metadata_tokens",
+        "metadata_alias",
+        "metadata_trigram",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_metadata_alias_recall_splits_camel_case_source_title(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
     await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
