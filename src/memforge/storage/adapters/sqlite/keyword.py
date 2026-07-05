@@ -456,23 +456,22 @@ class SqliteKeywordSearch:
 
 
 def _dedupe_metadata_hits(hits: list[KeywordCandidate], limit: int) -> list[KeywordCandidate]:
-    best: dict[str, KeywordCandidate] = {}
+    best: dict[tuple[str, str], KeywordCandidate] = {}
     channel_priority = {
         "bm25_metadata_tokens": 3,
         "metadata_alias": 2,
         "metadata_trigram": 1,
     }
     for hit in hits:
-        previous = best.get(hit.memory_id)
+        key = (hit.memory_id, hit.channel)
+        previous = best.get(key)
         if previous is None:
-            best[hit.memory_id] = hit
+            best[key] = hit
             continue
-        current_key = (channel_priority.get(hit.channel, 0), hit.score)
-        previous_key = (channel_priority.get(previous.channel, 0), previous.score)
-        if current_key > previous_key:
-            best[hit.memory_id] = hit
+        if hit.score > previous.score:
+            best[key] = hit
     return sorted(
         best.values(),
         key=lambda hit: (channel_priority.get(hit.channel, 0), hit.score),
         reverse=True,
-    )[:limit]
+    )[: max(limit, limit * len(channel_priority))]

@@ -366,6 +366,28 @@ async def test_link_query_entities_honors_disabled_sources(db):
 
 
 @pytest.mark.asyncio
+async def test_link_query_entities_visible_source_count_excludes_disabled_sources(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-mixed"))
+    await db.upsert_source("src-enabled", "jira", "Enabled Jira", "{}")
+    await db.upsert_source("src-disabled", "jira", "Disabled Jira", "{}")
+    await _document(db, "doc-enabled", source="src-enabled")
+    await _document(db, "doc-disabled", source="src-disabled")
+    entity_id = await db.upsert_entity("mixed blocker", "Mixed Blocker", ["feature"])
+    await db.link_memory_entity("m-mixed", entity_id)
+    await store.add_memory_source("m-mixed", "doc-enabled", "jira", None, source_updated_at=None)
+    await store.add_memory_source("m-mixed", "doc-disabled", "jira", None, source_updated_at=None)
+    await db.set_source_subscription("src-disabled", LOCAL_DEV_USER_ID, False)
+
+    result = await store.link_query_entities("mixed blocker", scope=_scope(), limit=5)
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].entity_id == entity_id
+    assert result.candidates[0].visible_memory_count == 1
+    assert result.candidates[0].visible_source_count == 1
+
+
+@pytest.mark.asyncio
 async def test_link_query_entities_honors_source_filter(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m-wiki"))
@@ -411,6 +433,51 @@ async def test_link_query_entities_honors_memory_types(db):
     assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
         (procedure_entity, "alias_exact", "procedure blocker")
     ]
+
+
+@pytest.mark.asyncio
+async def test_link_query_entities_fanout_honors_time_range(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-fresh"))
+    await store.insert_memory(_memory("m-stale"))
+    await _document(db, "doc-fresh", source="src-payroll")
+    await _document(db, "doc-stale", source="src-payroll")
+    entity_id = await db.upsert_entity("cutoff blocker", "Cutoff Blocker", ["feature"])
+    await db.link_memory_entity("m-fresh", entity_id)
+    await db.link_memory_entity("m-stale", entity_id)
+    await store.add_memory_source(
+        "m-fresh",
+        "doc-fresh",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 6, 20, tzinfo=timezone.utc),
+    )
+    await store.add_memory_source(
+        "m-stale",
+        "doc-stale",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 6, 10, tzinfo=timezone.utc),
+    )
+
+    result = await store.link_query_entities(
+        "cutoff blocker",
+        scope=_scope(),
+        source_filter=MemorySourceFilter(source_ids=("src-payroll",)),
+        time_range=MemoryTimeRange(
+            after=datetime(2026, 6, 19, tzinfo=timezone.utc),
+            before=datetime(2026, 6, 21, tzinfo=timezone.utc),
+            date_type="source_updated_at",
+        ),
+        limit=5,
+    )
+
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert candidate.entity_id == entity_id
+    assert candidate.visible_memory_count == 1
+    assert candidate.visible_source_count == 1
+    assert candidate.specificity == pytest.approx(1.0)
 
 
 @pytest.mark.asyncio
