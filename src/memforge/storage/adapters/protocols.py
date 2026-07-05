@@ -142,6 +142,9 @@ class RelationalStore(Protocol):
         scope: AccessScope,
         memory_types: list[str] | None,
         limit: int,
+        *,
+        source_filter: MemorySourceFilter | None = None,
+        time_range: MemoryTimeRange | None = None,
     ) -> list[tuple[str, float]]: ...
     async def link_query_entities(
         self,

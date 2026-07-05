@@ -1,9 +1,8 @@
 """Hybrid search engine for MemForge.
 
-Three retrieval channels run in parallel (vector, BM25/FTS5, entity-graph),
-fused via Reciprocal Rank Fusion (RRF), then strictly filtered by source/time
-facets and ranked with a recency-weighted final score. Optional cross-encoder
-reranking via LLM can be enabled for higher precision at scale.
+Vector, content BM25/FTS, metadata lexical, and entity-graph channels run in
+parallel, then fuse through query-adaptive weighted RRF before the final ranking
+and source/time page slicing.
 
 Architecture reference: docs/architecture.md Section 10.
 """
@@ -593,7 +592,14 @@ class SearchEngine:
             tasks.append(asyncio.ensure_future(
                 asyncio.gather(
                     *[
-                        self._graph_search([candidate.entity_id], memory_types, scope, fetch_k)
+                        self._graph_search(
+                            [candidate.entity_id],
+                            memory_types,
+                            scope,
+                            fetch_k,
+                            source_filter=combined_source_filter,
+                            time_range=time_range,
+                        )
                         for candidate in graph_candidates
                     ],
                     return_exceptions=True,
@@ -785,10 +791,18 @@ class SearchEngine:
         memory_types: list[str] | None,
         scope: AccessScope,
         limit: int,
+        *,
+        source_filter: MemorySourceFilter | None = None,
+        time_range: MemoryTimeRange | None = None,
     ) -> list[tuple[str, float]]:
         """Entity-graph traversal via the relational channel."""
         return await self._relational.graph_search(
-            entity_ids, scope, memory_types, limit
+            entity_ids,
+            scope,
+            memory_types,
+            limit,
+            source_filter=source_filter,
+            time_range=time_range,
         )
 
     # ==================================================================
