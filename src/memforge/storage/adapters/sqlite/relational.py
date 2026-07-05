@@ -538,6 +538,9 @@ class SqliteRelationalStore:
         scope: AccessScope,
         memory_types: list[str] | None,
         limit: int,
+        *,
+        source_filter: MemorySourceFilter | None = None,
+        time_range: MemoryTimeRange | None = None,
     ) -> list[tuple[str, float]]:
         ids = list(entity_ids)
         if not ids:
@@ -545,24 +548,49 @@ class SqliteRelationalStore:
 
         placeholders = ",".join("?" for _ in ids)
         predicate_sql, predicate_params = visible_sql(scope, "m")
-        type_filter = ""
-        type_params: list[Any] = []
+        joins: list[str] = []
+        clauses = [predicate_sql]
+        params: list[Any] = [*predicate_params]
+
+        source_filter = source_filter or MemorySourceFilter()
+        _, has_source_row_join = _append_source_time_predicates(
+            source_filter=source_filter,
+            time_range=time_range,
+            joins=joins,
+            clauses=clauses,
+            params=params,
+        )
         if memory_types:
             type_placeholders = ",".join("?" for _ in memory_types)
-            type_filter = f"AND m.memory_type IN ({type_placeholders})"
-            type_params = list(memory_types)
+            clauses.append(f"m.memory_type IN ({type_placeholders})")
+            params.extend(memory_types)
+
+        disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
+        if has_source_row_join and disabled_source_ids:
+            disabled_placeholders = ", ".join("?" for _ in disabled_source_ids)
+            clauses.append(f"(ms.source_id IS NULL OR ms.source_id NOT IN ({disabled_placeholders}))")
+            params.extend(disabled_source_ids)
+        else:
+            source_visibility_sql, source_visibility_params = _enabled_source_visibility_condition(disabled_source_ids)
+            if source_visibility_sql:
+                clauses.append(source_visibility_sql)
+                params.extend(source_visibility_params)
+
+        join_sql = " ".join(joins)
+        where_sql = " AND ".join(clauses)
 
         direct_sql = (
             "SELECT m.id, COUNT(me.entity_id) AS entity_overlap "
             "FROM memories m "
             "JOIN memory_entities me ON m.id = me.memory_id "
+            f"{join_sql} "
             f"WHERE me.entity_id IN ({placeholders}) "
-            f"AND {predicate_sql} {type_filter} "
+            f"AND {where_sql} "
             "GROUP BY m.id "
             "ORDER BY entity_overlap DESC "
             "LIMIT ?"
         )
-        direct_params: list[Any] = [*ids, *predicate_params, *type_params, limit]
+        direct_params: list[Any] = [*ids, *params, limit]
 
         direct_results: list[tuple[str, int]] = []
         try:
@@ -586,9 +614,10 @@ class SqliteRelationalStore:
                 "FROM memory_entities me1 "
                 "JOIN memory_entities me2 ON me1.entity_id = me2.entity_id "
                 "JOIN memories m ON me2.memory_id = m.id "
+                f"{join_sql} "
                 f"WHERE me1.memory_id IN ({d_placeholders}) "
                 f"AND m.id NOT IN ({d_placeholders}) "
-                f"AND {predicate_sql} {type_filter} "
+                f"AND {where_sql} "
                 "GROUP BY m.id "
                 f"HAVING shared_entities >= {_MIN_SHARED_ENTITIES_FOR_EXPANSION} "
                 "ORDER BY shared_entities DESC "
@@ -597,8 +626,7 @@ class SqliteRelationalStore:
             expanded_params: list[Any] = [
                 *direct_ids,
                 *direct_ids,
-                *predicate_params,
-                *type_params,
+                *params,
                 limit,
             ]
             try:

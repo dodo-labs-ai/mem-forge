@@ -148,6 +148,47 @@ async def test_graph_search_filters_retired_by_scope(db):
 
 
 @pytest.mark.asyncio
+async def test_graph_search_honors_source_filter_and_time_range(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-target"))
+    await store.insert_memory(_memory("m-other"))
+    await _document(db, "doc-target", source="src-target")
+    await _document(db, "doc-other", source="src-other")
+    await store.add_memory_source(
+        "m-target",
+        "doc-target",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 6, 24, tzinfo=timezone.utc),
+    )
+    await store.add_memory_source(
+        "m-other",
+        "doc-other",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 5, 24, tzinfo=timezone.utc),
+    )
+    entity_id = await db.upsert_entity("argocd", "ArgoCD", ["tool"])
+    await db.link_memory_entity("m-target", entity_id)
+    await db.link_memory_entity("m-other", entity_id)
+
+    hits = await store.graph_search(
+        [entity_id],
+        _scope(),
+        None,
+        limit=10,
+        source_filter=MemorySourceFilter(source_ids=("src-target",)),
+        time_range=MemoryTimeRange(
+            after=datetime(2026, 6, 20, tzinfo=timezone.utc),
+            before=datetime(2026, 6, 27, tzinfo=timezone.utc),
+            date_type="source_updated_at",
+        ),
+    )
+
+    assert [mid for mid, _ in hits] == ["m-target"]
+
+
+@pytest.mark.asyncio
 async def test_link_query_entities_resolves_explicit_aliases_and_reports_unmatched(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))
