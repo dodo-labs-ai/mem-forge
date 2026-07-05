@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
-from memforge.config import RetrievalConfig
+from memforge.config import DEFAULT_RANK_WINDOW_SIZE, RetrievalConfig
 from memforge.llm.structured import RerankResponse
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.database import Database
+from memforge.storage.adapters.protocols import KeywordCandidate
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
 
@@ -500,6 +502,170 @@ async def test_queried_search_honors_offset_after_ranking(db, monkeypatch):
     assert [r.memory_id for r in result["results"]] == ["m-second"]
     assert result["total_candidates"] == 3
     assert "total_count" not in result
+
+
+@pytest.mark.asyncio
+async def test_queried_search_top_k_does_not_change_ranking_prefix(db, monkeypatch):
+    memories = [
+        _memory(f"m-{index}", f"Payroll rank window memory {index}")
+        for index in range(40)
+    ]
+    for memory in memories:
+        await db.insert_memory(memory)
+
+    vector_order = [memory.id for memory in memories]
+    adapters = build_sqlite_adapters(db, FakeCollection(vector_order))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    lexical_order = [f"m-{index}" for index in range(20, 40)] + [f"m-{index}" for index in range(20)]
+
+    async def bm25_results(_query, _analysis, _memory_types, _scope, limit):
+        return [
+            (memory_id, float(len(lexical_order) - index))
+            for index, memory_id in enumerate(lexical_order[:limit])
+        ]
+
+    async def metadata_results(
+        _query,
+        _memory_types,
+        _scope,
+        limit,
+        *,
+        source_filter,
+        time_range,
+    ):
+        return [
+            KeywordCandidate(
+                memory_id=memory_id,
+                score=float(len(lexical_order) - index),
+                channel="bm25_metadata_tokens",
+            )
+            for index, memory_id in enumerate(lexical_order[:limit])
+        ]
+
+    monkeypatch.setattr(engine, "_bm25_search", bm25_results)
+    monkeypatch.setattr(engine, "_bm25_metadata_search", metadata_results)
+
+    first_page = await engine.search("Payroll rank window", top_k=10)
+    larger_page = await engine.search("Payroll rank window", top_k=20)
+
+    assert [r.memory_id for r in first_page["results"]] == [
+        r.memory_id for r in larger_page["results"][:10]
+    ]
+    assert first_page["ranking_window_size"] == larger_page["ranking_window_size"]
+    assert first_page["candidate_count_kind"] == "windowed"
+    assert first_page["has_more"] is True
+
+
+@pytest.mark.asyncio
+async def test_queried_search_top_k_prefix_stable_with_sqlite_metadata_channel(db, monkeypatch):
+    memories = [
+        _memory(f"m-sqlite-{index}", f"Unrelated memory body {index}")
+        for index in range(40)
+    ]
+    for index, memory in enumerate(memories):
+        await db.insert_memory(memory)
+        await _document(
+            db,
+            f"doc-sqlite-{index}",
+            "src-jira",
+            title=f"Create Blocker Hint source title {index:02d}",
+        )
+        await db.add_memory_source(
+            memory.id,
+            f"doc-sqlite-{index}",
+            "jira",
+            support_kind="extracted",
+            source_updated_at=None,
+        )
+
+    vector_order = [memory.id for memory in reversed(memories)]
+    adapters = build_sqlite_adapters(db, FakeCollection(vector_order))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    first_page = await engine.search("create blocker hint", top_k=10)
+    larger_page = await engine.search("create blocker hint", top_k=20)
+
+    assert [r.memory_id for r in first_page["results"]] == [
+        r.memory_id for r in larger_page["results"][:10]
+    ]
+    assert (
+        first_page["ranking_window_size"]
+        == larger_page["ranking_window_size"]
+        == DEFAULT_RANK_WINDOW_SIZE
+    )
+    assert "bm25_metadata_tokens" in first_page["query_analysis"]["strategies_used"]
+    assert any(
+        result.retrieval_evidence
+        and result.retrieval_evidence.get("metadata_lexical", {}).get("channel")
+        == "bm25_metadata_tokens"
+        for result in first_page["results"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_queried_search_legacy_config_uses_default_rank_window(db, monkeypatch):
+    memory = _memory("m-legacy", "Payroll rank window memory")
+    await db.insert_memory(memory)
+
+    adapters = build_sqlite_adapters(db, FakeCollection([memory.id]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=SimpleNamespace(
+            embedding_cache_size=256,
+            rrf_k=60,
+            recency_half_life_days=90,
+            enable_reranking=False,
+        ),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+    seen_limits = []
+
+    async def vector_results(_query, _memory_types, _scope, limit):
+        seen_limits.append(limit)
+        return [(memory.id, 1.0)]
+
+    async def bm25_results(_query, _analysis, _memory_types, _scope, limit):
+        seen_limits.append(limit)
+        return []
+
+    async def metadata_results(
+        _query,
+        _memory_types,
+        _scope,
+        limit,
+        *,
+        source_filter,
+        time_range,
+    ):
+        seen_limits.append(limit)
+        return []
+
+    monkeypatch.setattr(engine, "_vector_search", vector_results)
+    monkeypatch.setattr(engine, "_bm25_search", bm25_results)
+    monkeypatch.setattr(engine, "_bm25_metadata_search", metadata_results)
+
+    result = await engine.search("Payroll rank window", top_k=10)
+
+    assert seen_limits == [DEFAULT_RANK_WINDOW_SIZE] * 3
+    assert result["ranking_window_size"] == DEFAULT_RANK_WINDOW_SIZE
 
 
 @pytest.mark.asyncio

@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.23"
+SERVER_VERSION = "0.1.24"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 WORKSPACE_ROOT_ENV_VARS = ("CODEX_WORKSPACE_ROOT",)
@@ -90,7 +90,9 @@ TOOLS: list[dict[str, Any]] = [
             "the previous offset plus the number of results returned. Stop when results is empty "
             "or the next offset is greater than or equal to total_candidates. For complete-list "
             "inventory tasks, choose a larger top_k page size up to 50 instead of assuming the default 10 is "
-            "enough. A result may include follow_up with suggested_tool and reason. Search results "
+            "enough. Queried/ranked search uses candidate_count_kind=windowed; in that mode "
+            "has_more means more results inside the current ranking window, not an exhaustive "
+            "corpus count. A result may include follow_up with suggested_tool and reason. Search results "
             "do not include source links or artifact URLs; call get_memory for provenance, source "
             "titles, exact links, quotes, and lifecycle details before relying on source evidence."
         ),
@@ -329,7 +331,7 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "expected_content_hash": {
                     "type": "string",
-                    "description": "Content hash from get_memory/search used as a stale guard.",
+                    "description": "Content hash from get_memory used as a stale guard.",
                 },
             },
             "required": ["memory_id", "reason", "expected_content_hash"],
@@ -376,7 +378,7 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "expected_content_hash": {
                     "type": "string",
-                    "description": "Content hash from get_memory/search used as a stale guard.",
+                    "description": "Content hash from get_memory used as a stale guard.",
                 },
                 "replacement_kind": {
                     "type": "string",
@@ -522,7 +524,7 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             body = _search_args_with_context(args)
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("POST", "/api/memories/search", body)
+        return _compact_search_response(_http_json("POST", "/api/memories/search", body))
     if name == "list_sources":
         if args:
             return {"error": "list_sources does not accept parameters"}
@@ -531,7 +533,9 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         memory_id = str(args.get("memory_id") or "").strip()
         if not memory_id:
             return {"error": "memory_id is required"}
-        return _http_json("GET", f"/api/memories/{quote(memory_id, safe='')}?include_private=true", None)
+        return _compact_memory_response(
+            _http_json("GET", f"/api/memories/{quote(memory_id, safe='')}?include_private=true", None)
+        )
     if name == "get_resource":
         return _handle_get_resource(args)
     if name == "create_memory":
@@ -914,6 +918,111 @@ def _tool_result(payload: dict[str, Any]) -> dict[str, Any]:
         "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
         "isError": False,
     }
+
+
+def _compact_search_response(payload: dict[str, Any]) -> dict[str, Any]:
+    if "error" in payload:
+        return payload
+
+    compact: dict[str, Any] = {}
+    results = payload.get("results")
+    if isinstance(results, list):
+        compact["results"] = [
+            _compact_search_result(result)
+            for result in results
+            if isinstance(result, dict)
+        ]
+
+    for key in (
+        "total_candidates",
+        "candidate_count_kind",
+        "ranking_window_size",
+        "limit",
+        "offset",
+        "has_more",
+    ):
+        if key in payload:
+            compact[key] = payload[key]
+
+    if "has_more" not in compact and compact.get("candidate_count_kind") != "windowed":
+        total = compact.get("total_candidates")
+        limit = compact.get("limit")
+        offset = compact.get("offset", 0)
+        if isinstance(total, int) and isinstance(limit, int) and isinstance(offset, int):
+            compact["has_more"] = offset + limit < total
+
+    query_analysis = payload.get("query_analysis")
+    if isinstance(query_analysis, dict):
+        strategies = query_analysis.get("strategies_used")
+        if isinstance(strategies, list):
+            compact["strategies_used"] = [
+                strategy for strategy in strategies if isinstance(strategy, str)
+            ]
+
+    return compact
+
+
+def _compact_search_result(result: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in (
+        "memory_id",
+        "memory_type",
+        "summary",
+        "confidence",
+        "relevance_score",
+        "tags",
+        "freshness",
+        "status",
+        "follow_up",
+    ):
+        if key in result:
+            compact[key] = result[key]
+    return compact
+
+
+def _compact_memory_response(payload: dict[str, Any]) -> dict[str, Any]:
+    if "error" in payload:
+        return payload
+
+    compact: dict[str, Any] = {}
+    for key in (
+        "id",
+        "memory_type",
+        "content",
+        "content_hash",
+        "confidence",
+        "tags",
+        "status",
+        "entity_refs",
+    ):
+        if key in payload:
+            compact[key] = payload[key]
+
+    sources = payload.get("sources")
+    if isinstance(sources, list):
+        compact["sources"] = [
+            _compact_memory_source(source)
+            for source in sources
+            if isinstance(source, dict)
+        ]
+    return compact
+
+
+def _compact_memory_source(source: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in (
+        "doc_id",
+        "source_type",
+        "support_kind",
+        "doc_title",
+        "source_url",
+        "content_url",
+        "pdf_url",
+        "source_updated_at",
+    ):
+        if key in source:
+            compact[key] = source[key]
+    return compact
 
 
 def _api_base_url() -> str:
