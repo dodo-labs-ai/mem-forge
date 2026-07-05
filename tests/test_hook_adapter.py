@@ -2216,7 +2216,10 @@ def test_mcp_proxy_forwards_search_offset_for_deterministic_listing(monkeypatch)
             return False
 
         def read(self, _size=-1):
-            return b'{"results":[],"total_candidates":52,"limit":10,"offset":10}'
+            return (
+                b'{"results":[],"total_candidates":52,"candidate_count_kind":"exact",'
+                b'"limit":10,"offset":10}'
+            )
 
     class FakeOpener:
         def open(self, request, timeout):
@@ -2240,6 +2243,7 @@ def test_mcp_proxy_forwards_search_offset_for_deterministic_listing(monkeypatch)
     )
 
     assert result["total_candidates"] == 52
+    assert result["has_more"] is True
     assert json.loads(captured["body"].decode()) == {
         "include_private": True,
         "include_superseded": False,
@@ -2247,6 +2251,206 @@ def test_mcp_proxy_forwards_search_offset_for_deterministic_listing(monkeypatch)
         "time_range": {"date_type": "source_updated_at", "start_date": "2026-06-29"},
         "top_k": 10,
         "offset": 10,
+    }
+
+
+def test_mcp_proxy_does_not_guess_has_more_for_windowed_legacy_response(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"results":[],"total_candidates":61,"candidate_count_kind":"windowed","limit":10,"offset":0}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool("search", {"query": "create blocker hint"})
+
+    assert result == {
+        "results": [],
+        "total_candidates": 61,
+        "candidate_count_kind": "windowed",
+        "limit": 10,
+        "offset": 0,
+    }
+
+
+def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return json.dumps(
+                {
+                    "query_analysis": {
+                        "detected_entities": ["periodcutoffblockerhint"],
+                        "entity_linking": [{"entity_id": 95, "matched_alias": "blocker hint"}],
+                        "strategies_used": ["vector", "bm25_metadata_tokens", "graph"],
+                    },
+                    "results": [
+                        {
+                            "memory_id": "mem-1",
+                            "memory_type": "fact",
+                            "summary": "Create blocker hint task details",
+                            "confidence": 0.9,
+                            "relevance_score": 0.99,
+                            "tags": ["blocker-hint"],
+                            "freshness": "current",
+                            "status": "active",
+                            "follow_up": {"suggested_tool": "get_memory"},
+                            "retrieval_evidence": {
+                                "metadata_lexical": {"matched_text": ["large debug text"]}
+                            },
+                            "repo_identifier": "repo",
+                            "memory_level": "atomic",
+                        }
+                    ],
+                    "total_candidates": 61,
+                    "candidate_count_kind": "windowed",
+                    "ranking_window_size": 50,
+                    "limit": 10,
+                    "offset": 0,
+                    "has_more": True,
+                    "retrieval_time_ms": 123,
+                }
+            ).encode()
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+
+    result = proxy._call_tool("search", {"query": "create blocker hint"})
+
+    assert result == {
+        "results": [
+            {
+                "memory_id": "mem-1",
+                "memory_type": "fact",
+                "summary": "Create blocker hint task details",
+                "confidence": 0.9,
+                "relevance_score": 0.99,
+                "tags": ["blocker-hint"],
+                "freshness": "current",
+                "status": "active",
+                "follow_up": {"suggested_tool": "get_memory"},
+            }
+        ],
+        "total_candidates": 61,
+        "candidate_count_kind": "windowed",
+        "ranking_window_size": 50,
+        "limit": 10,
+        "offset": 0,
+        "has_more": True,
+        "strategies_used": ["vector", "bm25_metadata_tokens", "graph"],
+    }
+
+
+def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return json.dumps(
+                {
+                    "id": "mem-1",
+                    "memory_type": "procedure",
+                    "content": "Persist blocker hints.",
+                    "content_hash": "sha256-secret",
+                    "visibility": "workspace",
+                    "owner_user_id": "user-1",
+                    "project_key": "PAY",
+                    "tags": ["blocker-hint"],
+                    "confidence": 0.93,
+                    "corroboration_count": 1,
+                    "contradiction_count": 0,
+                    "status": "active",
+                    "retirement_reason": None,
+                    "replacement_reason": None,
+                    "extraction_context": "large admin context",
+                    "entity_refs": ["periodcutoffblockerhint"],
+                    "sources": [
+                        {
+                            "doc_id": "jira-SFPAY-179397",
+                            "source_type": "jira",
+                            "support_kind": "extracted",
+                            "doc_title": "SFPAY-179397: Create Blocker Hint",
+                            "source_url": "https://jira.example/browse/SFPAY-179397",
+                            "content_url": "/api/documents/jira-SFPAY-179397/content",
+                            "pdf_url": None,
+                            "source_updated_at": "2026-07-02T03:50:32+00:00",
+                            "excerpt": "large excerpt",
+                            "added_at": "2026-07-02T04:00:00+00:00",
+                        }
+                    ],
+                }
+            ).encode()
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    result = proxy._call_tool("get_memory", {"memory_id": "mem-1"})
+
+    assert result == {
+        "id": "mem-1",
+        "memory_type": "procedure",
+        "content": "Persist blocker hints.",
+        "content_hash": "sha256-secret",
+        "confidence": 0.93,
+        "tags": ["blocker-hint"],
+        "status": "active",
+        "entity_refs": ["periodcutoffblockerhint"],
+        "sources": [
+            {
+                "doc_id": "jira-SFPAY-179397",
+                "source_type": "jira",
+                "support_kind": "extracted",
+                "doc_title": "SFPAY-179397: Create Blocker Hint",
+                "source_url": "https://jira.example/browse/SFPAY-179397",
+                "content_url": "/api/documents/jira-SFPAY-179397/content",
+                "pdf_url": None,
+                "source_updated_at": "2026-07-02T03:50:32+00:00",
+            }
+        ],
     }
 
 

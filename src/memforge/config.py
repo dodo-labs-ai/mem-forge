@@ -16,6 +16,7 @@ __all__ = ["AppConfig", "SyncConfig", "load_config"]
 
 DEFAULT_BASE_DIR = Path.home() / ".memforge"
 DEFAULT_ENRICHMENT_MAX_TOKENS = 8192
+DEFAULT_RANK_WINDOW_SIZE = 50
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +70,7 @@ class MemoryConfig:
 @dataclass
 class RetrievalConfig:
     default_top_k: int = 10
+    rank_window_size: int = DEFAULT_RANK_WINDOW_SIZE
     rrf_k: int = 60
     recency_half_life_days: int = 90
     embedding_cache_size: int = 256

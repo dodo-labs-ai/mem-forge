@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from memforge.config import RetrievalConfig
+from memforge.config import DEFAULT_RANK_WINDOW_SIZE, RetrievalConfig
 from memforge.llm.structured import StructuredLlmError
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
@@ -306,8 +306,11 @@ class SearchEngine:
                 "results": results,
                 "total_candidates": total_candidates,
                 "total_count": total_candidates,
+                "candidate_count_kind": "exact",
+                "ranking_window_size": len(ids),
                 "limit": top_k,
                 "offset": offset,
+                "has_more": offset + len(results) < total_candidates,
                 "retrieval_time_ms": elapsed_ms,
             }
 
@@ -337,7 +340,11 @@ class SearchEngine:
         analysis.use_graph = bool(graph_candidates)
 
         # ----- 2. Run active channels in parallel -----
-        fetch_k = max(top_k * 2, top_k + offset)
+        configured_window = max(
+            1,
+            int(getattr(self._config, "rank_window_size", DEFAULT_RANK_WINDOW_SIZE)),
+        )
+        fetch_k = max(configured_window, top_k + offset)
         tasks: list[asyncio.Task] = []
         channel_names: list[str] = []
 
@@ -417,6 +424,7 @@ class SearchEngine:
 
         # ----- 7. Collapse duplicate families and apply the requested page -----
         ranked = self._collapse_curation_families(ranked)
+        ranked_count = len(ranked)
         ranked = ranked[offset: offset + top_k]
 
         # ----- 8. Enrich results -----
@@ -438,8 +446,11 @@ class SearchEngine:
             },
             "results": results,
             "total_candidates": total_candidates,
+            "candidate_count_kind": "windowed",
+            "ranking_window_size": fetch_k,
             "limit": top_k,
             "offset": offset,
+            "has_more": offset + len(results) < ranked_count,
             "retrieval_time_ms": elapsed_ms,
         }
 
