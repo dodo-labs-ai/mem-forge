@@ -580,7 +580,7 @@ class SqliteRelationalStore:
         where_sql = " AND ".join(clauses)
 
         direct_sql = (
-            "SELECT m.id, COUNT(me.entity_id) AS entity_overlap "
+            "SELECT m.id, COUNT(DISTINCT me.entity_id) AS entity_overlap "
             "FROM memories m "
             "JOIN memory_entities me ON m.id = me.memory_id "
             f"{join_sql} "
