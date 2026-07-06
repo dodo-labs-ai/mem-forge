@@ -2414,7 +2414,6 @@ def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
         "limit": 10,
         "offset": 0,
         "has_more": True,
-        "strategies_used": ["vector", "bm25_metadata_tokens", "graph"],
     }
 
 
