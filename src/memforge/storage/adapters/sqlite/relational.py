@@ -911,6 +911,10 @@ class SqliteRelationalStore:
             has_source_row_join=has_source_row_join,
             disabled_source_ids=disabled_source_ids,
         )
+        count_select = (
+            "COUNT(DISTINCT m.id) AS visible_memory_count, "
+            f"{source_count_expr} AS visible_source_count"
+        )
         where_sql = " AND ".join(clauses)
         sql = (
             "WITH matched_aliases(entity_id, matched_alias, alias_normalized, match_key) AS ("
@@ -921,7 +925,7 @@ class SqliteRelationalStore:
             f"FROM entity_aliases ea WHERE {alias_match}"
             ") "
             "SELECT ma.entity_id, e.canonical_name, ma.matched_alias, "
-            "ma.alias_normalized, ma.match_key, COUNT(DISTINCT m.id) AS visible_memory_count "
+            f"ma.alias_normalized, ma.match_key, {count_select} "
             "FROM matched_aliases ma "
             "JOIN entities e ON e.id = ma.entity_id "
             "JOIN memory_entities me ON me.entity_id = ma.entity_id "
@@ -932,9 +936,6 @@ class SqliteRelationalStore:
             "GROUP BY ma.entity_id, e.canonical_name, ma.matched_alias, ma.alias_normalized, ma.match_key "
             "ORDER BY visible_memory_count DESC, LENGTH(ma.alias_normalized) DESC, e.canonical_name ASC "
             "LIMIT ?"
-        ).replace(
-            "COUNT(DISTINCT m.id) AS visible_memory_count",
-            f"COUNT(DISTINCT m.id) AS visible_memory_count, {source_count_expr} AS visible_source_count",
         )
         bound_params = _entity_link_bound_params(
             pre_source_count_params=(*term_values, *term_values),
@@ -998,6 +999,10 @@ class SqliteRelationalStore:
             has_source_row_join=has_source_row_join,
             disabled_source_ids=disabled_source_ids,
         )
+        count_select = (
+            "COUNT(DISTINCT m.id) AS visible_memory_count, "
+            f"{source_count_expr} AS visible_source_count"
+        )
         where_sql = " AND ".join(clauses)
         sql = (
             "WITH matched_aliases AS ("
@@ -1006,7 +1011,7 @@ class SqliteRelationalStore:
             "WHERE entity_alias_search_fts MATCH ?"
             ") "
             "SELECT ma.entity_id, e.canonical_name, ma.alias_normalized AS matched_alias, "
-            "ma.search_text, MIN(ma.fts_rank) AS best_rank, COUNT(DISTINCT m.id) AS visible_memory_count "
+            f"ma.search_text, MIN(ma.fts_rank) AS best_rank, {count_select} "
             "FROM matched_aliases ma "
             "JOIN entities e ON e.id = ma.entity_id "
             "JOIN memory_entities me ON me.entity_id = ma.entity_id "
@@ -1017,9 +1022,6 @@ class SqliteRelationalStore:
             "GROUP BY ma.entity_id, e.canonical_name, ma.alias_normalized, ma.search_text "
             "ORDER BY best_rank ASC, visible_memory_count DESC, e.canonical_name ASC "
             "LIMIT ?"
-        ).replace(
-            "COUNT(DISTINCT m.id) AS visible_memory_count",
-            f"COUNT(DISTINCT m.id) AS visible_memory_count, {source_count_expr} AS visible_source_count",
         )
         bound_params = _entity_link_bound_params(
             pre_source_count_params=(fts_query,),
