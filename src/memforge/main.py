@@ -14,6 +14,7 @@ import time
 from importlib import metadata
 from itertools import islice
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Any
 
 try:
@@ -324,6 +325,91 @@ def _dispatch_interactive() -> int:
         click.echo(cli.get_help(click.Context(cli)))
         return 0
     return _run_interactive_script()
+
+
+@cli.group("eval")
+def eval_group() -> None:
+    """Run deterministic MemForge evaluations."""
+
+
+@eval_group.command("retrieval")
+@click.option("--case-set", default="retrieval-core-v1", show_default=True, help="Packaged retrieval case set id.")
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["json", "text"]),
+    default="json",
+    show_default=True,
+    help="Output format.",
+)
+@click.option(
+    "--db-path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Base SQLite path for temporary per-case databases.",
+)
+@click.option("--keep-databases", is_flag=True, help="Keep per-case SQLite databases for debugging.")
+@click.option("--fail-on-hard-failure", is_flag=True, help="Exit non-zero when hard failures are present.")
+def eval_retrieval(
+    case_set: str,
+    output_format: str,
+    db_path: Path | None,
+    keep_databases: bool,
+    fail_on_hard_failure: bool,
+) -> None:
+    """Run the packaged deterministic retrieval golden eval."""
+
+    logging.getLogger().setLevel(logging.WARNING)
+    if keep_databases and db_path is None:
+        raise click.ClickException("--keep-databases requires --db-path so artifacts have a durable location.")
+    exit_code = asyncio.run(
+        _run_retrieval_eval_cli(
+            case_set=case_set,
+            output_format=output_format,
+            db_path=db_path,
+            keep_databases=keep_databases,
+            fail_on_hard_failure=fail_on_hard_failure,
+        )
+    )
+    raise click.exceptions.Exit(exit_code)
+
+
+async def _run_retrieval_eval_cli(
+    *,
+    case_set: str,
+    output_format: str,
+    db_path: Path | None,
+    keep_databases: bool,
+    fail_on_hard_failure: bool,
+) -> int:
+    from memforge.evals.retrieval import load_case_set
+    from memforge.evals.retrieval.runner import run_sqlite_case_set
+
+    if db_path is not None:
+        report = await run_sqlite_case_set(
+            load_case_set(case_set),
+            db_path=db_path,
+            keep_databases=keep_databases,
+        )
+    else:
+        with TemporaryDirectory() as tmp:
+            report = await run_sqlite_case_set(
+                load_case_set(case_set),
+                db_path=Path(tmp) / "retrieval-eval.db",
+            )
+
+    payload = report.to_json()
+    if output_format == "json":
+        click.echo(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        summary = payload["summary"]
+        click.echo(
+            f"retrieval eval {case_set}: "
+            f"{summary['case_count']} cases, {summary['hard_failures']} hard failures"
+        )
+        for failure in payload["hard_failures"]:
+            click.echo(f"- {failure['case_id']}: {failure['message']}")
+    return 1 if fail_on_hard_failure and report.hard_failures else 0
 
 
 def _interactive_resource_dir() -> Path:

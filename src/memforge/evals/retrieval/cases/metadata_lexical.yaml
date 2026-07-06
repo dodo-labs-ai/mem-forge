@@ -1,0 +1,108 @@
+- id: exact_external_id_lookup
+  family: exact_id_lookup
+  description: exact external id should identify its canonical memory
+  query: SFPAY-179397
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-blocker-hint: 3
+    max_rank:
+      mem-blocker-hint: 1
+    required_channels:
+      mem-blocker-hint:
+        - bm25_metadata_tokens
+    required_profile: identifier_lookup
+
+- id: metadata_title_exact
+  family: exact_title_lookup
+  description: target terms appear in source title, not memory content
+  query: Create Access Review in Quarterly Payroll
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-access-review: 3
+    max_rank:
+      mem-access-review: 3
+    required_channels:
+      mem-access-review:
+        - bm25_metadata_tokens
+    required_profile: identifier_lookup
+
+- id: compact_trigram_metadata_recall
+  family: compact_lexical_recall
+  description: no-space metadata query should recall through trigram metadata
+  query: create blockerhints
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-blocker-hint: 3
+    max_rank:
+      mem-blocker-hint: 10
+    required_channels:
+      mem-blocker-hint:
+        - metadata_trigram
+
+- id: queryless_source_listing
+  family: source_scoped_lookup
+  description: queryless source listing honors exact visible pre-page count
+  query: ""
+  top_k: 10
+  offset: 0
+  source_filter:
+    source_ids:
+      - src-payroll
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    total_candidates: 17
+    relevant:
+      mem-access-review: 3

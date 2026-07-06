@@ -1,0 +1,147 @@
+case_schema_version: 1
+case_set_id: retrieval-core-v1
+case_set_sha: sha256:7602cd8fa8846a1c21a829519fb00e8ee13de0326079afbe8efda5ad4d0d2b97
+case_files:
+  - metadata_lexical.yaml
+fixtures:
+  default:
+    workspace_id: ws-eval
+    tenant_id: tenant-eval
+    users:
+      - eval-user
+    sources:
+      - id: src-payroll
+        type: jira
+        name: Payroll Jira
+        status: active
+      - id: src-muted
+        type: confluence
+        name: Muted Source
+        status: active
+    source_subscriptions:
+      - user_id: eval-user
+        source_id: src-payroll
+        enabled: true
+      - user_id: eval-user
+        source_id: src-muted
+        enabled: false
+    documents:
+      - doc_id: SFPAY-179397
+        source_id: src-payroll
+        title: SFPAY-179397 Create Blocker Hint in On Demand Lifecycle Assignment
+        source_url: https://eval.example/SFPAY-179397
+        space_or_project: PAY
+      - doc_id: doc-access-review
+        source_id: src-payroll
+        title: Create Access Review in Quarterly Payroll
+        source_url: https://eval.example/doc-access-review
+        space_or_project: PAY
+      - doc_id: doc-listing
+        source_id: src-payroll
+        title: Payroll Listing Evaluation Source
+        source_url: https://eval.example/doc-listing
+        space_or_project: PAY
+    memories:
+      - id: mem-blocker-hint
+        content: Lifecycle assignment skips person assignment creation in one onboarding branch.
+        project_key: PAY
+      - id: mem-access-review
+        content: Reviewer setup is required before the quarterly payroll control can proceed.
+        project_key: PAY
+      - id: mem-listing-01
+        content: Payroll listing fixture memory 01.
+        project_key: PAY
+      - id: mem-listing-02
+        content: Payroll listing fixture memory 02.
+        project_key: PAY
+      - id: mem-listing-03
+        content: Payroll listing fixture memory 03.
+        project_key: PAY
+      - id: mem-listing-04
+        content: Payroll listing fixture memory 04.
+        project_key: PAY
+      - id: mem-listing-05
+        content: Payroll listing fixture memory 05.
+        project_key: PAY
+      - id: mem-listing-06
+        content: Payroll listing fixture memory 06.
+        project_key: PAY
+      - id: mem-listing-07
+        content: Payroll listing fixture memory 07.
+        project_key: PAY
+      - id: mem-listing-08
+        content: Payroll listing fixture memory 08.
+        project_key: PAY
+      - id: mem-listing-09
+        content: Payroll listing fixture memory 09.
+        project_key: PAY
+      - id: mem-listing-10
+        content: Payroll listing fixture memory 10.
+        project_key: PAY
+      - id: mem-listing-11
+        content: Payroll listing fixture memory 11.
+        project_key: PAY
+      - id: mem-listing-12
+        content: Payroll listing fixture memory 12.
+        project_key: PAY
+      - id: mem-listing-13
+        content: Payroll listing fixture memory 13.
+        project_key: PAY
+      - id: mem-listing-14
+        content: Payroll listing fixture memory 14.
+        project_key: PAY
+      - id: mem-listing-15
+        content: Payroll listing fixture memory 15.
+        project_key: PAY
+    memory_sources:
+      - memory_id: mem-blocker-hint
+        doc_id: SFPAY-179397
+        source_type: jira
+      - memory_id: mem-access-review
+        doc_id: doc-access-review
+        source_type: jira
+      - memory_id: mem-listing-01
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-02
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-03
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-04
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-05
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-06
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-07
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-08
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-09
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-10
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-11
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-12
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-13
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-14
+        doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-listing-15
+        doc_id: doc-listing
+        source_type: jira
