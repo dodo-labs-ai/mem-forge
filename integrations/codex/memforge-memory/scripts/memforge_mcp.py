@@ -976,14 +976,6 @@ def _compact_search_response(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(total, int) and isinstance(limit, int) and isinstance(offset, int):
             compact["has_more"] = offset + limit < total
 
-    query_analysis = payload.get("query_analysis")
-    if isinstance(query_analysis, dict):
-        strategies = query_analysis.get("strategies_used")
-        if isinstance(strategies, list):
-            compact["strategies_used"] = [
-                strategy for strategy in strategies if isinstance(strategy, str)
-            ]
-
     return compact
 
 
