@@ -227,6 +227,9 @@ def _write_adapter_config(data: dict[str, Any]) -> None:
             continue
         lines.append(f"[github.{_toml_key(str(name))}]")
         lines.append(f"repo_url = {_toml_string(str(profile.get('repo_url') or ''))}")
+        repo_path = str(profile.get("repo_path") or "").strip()
+        if repo_path:
+            lines.append(f"repo_path = {_toml_string(repo_path)}")
         lines.append(f"ref = {_toml_string(str(profile.get('ref') or 'main'))}")
         lines.append(f"include_paths = {_toml_string_list(_string_list(profile.get('include_paths')))}")
         lines.append(
@@ -363,6 +366,82 @@ def _gh_api_json(repo: dict[str, str], endpoint: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _git_run(repo_path: Path, args: list[str], *, text: bool = True) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo_path), *args],
+            capture_output=True,
+            text=text,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise click.ClickException("Git is required for local GitHub repository clone sync.") from exc
+
+
+def _git_checked(repo_path: Path, args: list[str], *, text: bool = True) -> subprocess.CompletedProcess:
+    result = _git_run(repo_path, args, text=text)
+    if result.returncode != 0:
+        stderr = result.stderr if isinstance(result.stderr, str) else bytes(result.stderr or b"").decode("utf-8", "replace")
+        stdout = result.stdout if isinstance(result.stdout, str) else bytes(result.stdout or b"").decode("utf-8", "replace")
+        detail = (stderr or stdout or "git command failed").strip()
+        raise click.ClickException(f"Local Git repository request failed: {detail}")
+    return result
+
+
+def _repo_path_from_profile(profile: dict[str, Any], repo: dict[str, str]) -> Path | None:
+    raw_path = str(profile.get("repo_path") or "").strip()
+    if not raw_path:
+        return None
+    candidate = Path(raw_path).expanduser()
+    if not candidate.exists() or not candidate.is_dir():
+        raise click.ClickException(f"GitHub repository path does not exist or is not a directory: {candidate}")
+    top_level = _git_checked(candidate, ["rev-parse", "--show-toplevel"]).stdout.strip()
+    repo_path = Path(top_level).resolve()
+    remote = _git_checked(repo_path, ["remote", "get-url", "origin"]).stdout.strip()
+    try:
+        remote_repo = parse_github_repo_url(remote)
+    except ValueError as exc:
+        raise click.ClickException("GitHub repository path origin remote must be an https GitHub URL.") from exc
+    if remote_repo["repo_url"] != repo["repo_url"]:
+        raise click.ClickException(
+            f"GitHub repository path origin {remote_repo['repo_url']} does not match configured repo_url {repo['repo_url']}."
+        )
+    return repo_path
+
+
+def _github_local_tree(repo_path: Path, ref: str) -> list[dict[str, Any]]:
+    result = _git_checked(repo_path, ["ls-tree", "-z", "-r", "-l", ref, "--"])
+    entries: list[dict[str, Any]] = []
+    for line in result.stdout.split("\0"):
+        if not line:
+            continue
+        metadata, separator, path = line.partition("\t")
+        if not separator:
+            continue
+        parts = metadata.split()
+        if len(parts) < 4 or parts[1] != "blob":
+            continue
+        size_raw = parts[3]
+        try:
+            size = int(size_raw)
+        except ValueError:
+            size = 0
+        entries.append({"path": path, "type": "blob", "sha": parts[2], "size": size})
+    return entries
+
+
+def _github_tree_for_profile(repo: dict[str, str], ref: str, profile: dict[str, Any]) -> tuple[list[dict[str, Any]], Path | None]:
+    repo_path = _repo_path_from_profile(profile, repo)
+    if repo_path is not None:
+        return _github_local_tree(repo_path, ref), repo_path
+    return _github_tree(repo, ref), None
+
+
+def _github_local_content(repo_path: Path, ref: str, relative_path: str) -> bytes:
+    result = _git_checked(repo_path, ["show", f"{ref}:{relative_path}"], text=False)
+    return result.stdout
+
+
 def _github_tree(repo: dict[str, str], ref: str) -> list[dict[str, Any]]:
     payload = _gh_api_json(
         repo,
@@ -395,6 +474,8 @@ def _github_content(repo: dict[str, str], ref: str, relative_path: str) -> bytes
 def _resolve_github_profile(name: str, profile: dict[str, Any]) -> tuple[dict[str, str], str, list[str], list[str]]:
     repo = _parse_github_repo_url(str(profile.get("repo_url") or ""))
     ref = str(profile.get("ref") or "main").strip() or "main"
+    if ref.startswith("-"):
+        raise click.ClickException("GitHub repository ref must not start with '-'.")
     try:
         include_paths = github_include_paths(profile)
     except ValueError as exc:
@@ -416,7 +497,8 @@ def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | 
     counts = {"included": 0, "ignored": 0}
     extension_counts: dict[str, int] = {}
     items: list[dict[str, Any]] = []
-    for entry in _github_tree(repo, ref):
+    tree, repo_path = _github_tree_for_profile(repo, ref, profile)
+    for entry in tree:
         if entry.get("type") != "blob":
             continue
         relative_path = str(entry.get("path") or "")
@@ -439,7 +521,7 @@ def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | 
                     "content_type": github_content_type(relative_path),
                 }
             )
-    return {
+    payload = {
         "profile": name,
         "repo_url": repo["repo_url"],
         "ref": ref,
@@ -449,6 +531,9 @@ def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | 
         "extension_counts": dict(sorted(extension_counts.items())),
         "items": items,
     }
+    if repo_path is not None:
+        payload["repo_path"] = str(repo_path)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -1461,6 +1546,8 @@ def adapter_github():
 @adapter_github.command("add")
 @click.argument("name")
 @click.option("--repo-url", required=True, help="GitHub or GitHub Enterprise repository URL.")
+@click.option("--repo-path", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path),
+              help="Optional local clone path used for local_push preview and push.")
 @click.option("--ref", "repo_ref", default="main", show_default=True, help="Branch, tag, or commit to sync.")
 @click.option("--include-path", "include_paths", multiple=True,
               help="Repo-relative folder or file to include. Repeatable. Empty means all paths.")
@@ -1472,6 +1559,7 @@ def adapter_github_add(
     ctx,
     name: str,
     repo_url: str,
+    repo_path: Path | None,
     repo_ref: str,
     include_paths: tuple[str, ...],
     include_extensions: tuple[str, ...],
@@ -1494,6 +1582,8 @@ def adapter_github_add(
             if ext.strip()
         ],
     }
+    if repo_path is not None:
+        profile["repo_path"] = str(_repo_path_from_profile({"repo_path": str(repo_path)}, repo))
     if source_id:
         profile["source_id"] = source_id.strip()
     data = _read_adapter_config()
@@ -1552,6 +1642,7 @@ def adapter_github_push(
         )
 
     repo, ref, _include_paths, _include_extensions = _resolve_github_profile(name, profile)
+    repo_path = _repo_path_from_profile(profile, repo)
     preview = _preview_github_profile(name, profile, limit=None if limit == 0 else max(limit, 0))
     selected_entries = list(preview["items"])
 
@@ -1562,7 +1653,9 @@ def adapter_github_push(
     for entry in selected_entries:
         relative_path = str(entry["relative_path"])
         try:
-            raw = _github_content(repo, ref, relative_path)
+            raw = _github_local_content(repo_path, ref, relative_path) if repo_path is not None else _github_content(
+                repo, ref, relative_path
+            )
             text_body = raw.decode("utf-8")
         except UnicodeDecodeError:
             failed.append({"relative_path": relative_path, "error": "invalid utf-8"})
