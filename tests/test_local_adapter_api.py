@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
+from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.storage.database import Database
 
 
@@ -55,6 +56,33 @@ def _create_unmapped_local_markdown_source(client: TestClient, *, name: str = "E
     return response.json()
 
 
+def _create_github_repo_source(
+    client: TestClient,
+    *,
+    name: str = "Matterhorn Architecture",
+    connection_mode: str = "local_push",
+    max_files: int = 500,
+) -> dict:
+    response = client.post(
+        "/api/sources",
+        json={
+            "type": "github_repo",
+            "name": name,
+            "config": {
+                "connection_mode": connection_mode,
+                "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                "ref": "main",
+                "include_paths": ["Payroll Processing/"],
+                "include_extensions": ["md"],
+                "max_files": max_files,
+            },
+            "project_binding": {"mode": "fixed", "project_key": "MATTERHORN"},
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def test_create_local_markdown_source_populates_inbox_path(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
@@ -71,6 +99,27 @@ def test_create_local_markdown_source_populates_inbox_path(tmp_path):
         config = row["config"]
         assert config["vault_id"] == "engineering"
         documents_dir = Path(config["documents_dir"])
+        assert documents_dir.exists()
+        expected_root = Path(cfg.storage.docs_path).parent / "local-adapter-submissions"
+        assert documents_dir.is_relative_to(expected_root)
+    finally:
+        asyncio.run(database.close())
+
+
+def test_create_github_repo_source_populates_inbox_path_for_local_push(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            created = _create_github_repo_source(client)
+            row = asyncio.run(database.get_source(created["id"]))
+        assert row is not None
+        assert row["type"] == "github_repo"
+        assert row["config"]["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
+        documents_dir = Path(row["config"]["documents_dir"])
         assert documents_dir.exists()
         expected_root = Path(cfg.storage.docs_path).parent / "local-adapter-submissions"
         assert documents_dir.is_relative_to(expected_root)
@@ -115,6 +164,203 @@ def test_local_adapter_document_push_writes_package(tmp_path):
         assert package["relative_path"] == "decisions/cutoff.md"
         assert package["title"] == "Cutoff Decision"
         assert package["markdown"].startswith("# Cutoff")
+    finally:
+        asyncio.run(database.close())
+
+
+def test_github_repo_adapter_document_push_writes_package(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            created = _create_github_repo_source(client)
+            source_id = created["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": "Payroll Processing/README.md",
+                    "title": "Payroll Processing",
+                    "markdown_body": "# Payroll Processing\n\nArchitecture notes.",
+                    "content_type": "text/markdown",
+                    "blob_sha": "blob-sha-1",
+                    "raw_hash": "raw-hash-1",
+                    "submitted_by": "github-adapter",
+                    "process_now": False,
+                },
+            )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["source_id"] == source_id
+        assert body["doc_id"] == build_github_repo_doc_id(
+            source_id=source_id,
+            repo_url="https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+            repo_ref="main",
+            relative_path="Payroll Processing/README.md",
+        )
+        assert body["relative_path"] == "Payroll Processing/README.md"
+
+        package = json.loads(Path(body["package_path"]).read_text())
+        assert package["package_kind"] == "github_repo_document"
+        assert package["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
+        assert package["repo_ref"] == "main"
+        assert package["relative_path"] == "Payroll Processing/README.md"
+        assert package["blob_sha"] == "blob-sha-1"
+        assert package["markdown"].startswith("# Payroll Processing")
+    finally:
+        asyncio.run(database.close())
+
+
+def test_github_repo_adapter_document_push_requires_local_push_mode(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            source_id = _create_github_repo_source(client, connection_mode="cloud_pull")["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": "Payroll Processing/README.md",
+                    "markdown_body": "# Payroll Processing",
+                    "process_now": False,
+                },
+            )
+        assert response.status_code == 400
+        assert "local_push" in response.json()["detail"]
+    finally:
+        asyncio.run(database.close())
+
+
+def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            source_id = _create_github_repo_source(client)["id"]
+            wrong_ref = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "feature",
+                    "relative_path": "Payroll Processing/README.md",
+                    "markdown_body": "# Payroll Processing",
+                    "process_now": False,
+                },
+            )
+            wrong_path = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": "Flexible Payroll/README.md",
+                    "markdown_body": "# Flexible Payroll",
+                    "process_now": False,
+                },
+            )
+            wrong_extension = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": "Payroll Processing/diagram.png",
+                    "markdown_body": "png bytes",
+                    "process_now": False,
+                },
+            )
+        assert wrong_ref.status_code == 400
+        assert "configured ref" in wrong_ref.json()["detail"]
+        assert wrong_path.status_code == 400
+        assert "include_paths" in wrong_path.json()["detail"]
+        assert wrong_extension.status_code == 400
+        assert "include_extensions" in wrong_extension.json()["detail"]
+    finally:
+        asyncio.run(database.close())
+
+
+def test_github_repo_adapter_document_push_enforces_max_files(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            source_id = _create_github_repo_source(client, max_files=1)["id"]
+            first = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": "Payroll Processing/README.md",
+                    "markdown_body": "# Payroll Processing",
+                    "process_now": False,
+                },
+            )
+            second = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": "Payroll Processing/Second.md",
+                    "markdown_body": "# Second",
+                    "process_now": False,
+                },
+            )
+        assert first.status_code == 200, first.text
+        assert second.status_code == 400
+        assert "max_files" in second.json()["detail"]
+    finally:
+        asyncio.run(database.close())
+
+
+def test_github_repo_adapter_document_push_max_files_counts_current_scope_only(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            source_id = _create_github_repo_source(client, max_files=1)["id"]
+            row = asyncio.run(database.get_source(source_id))
+            inbox = Path(row["config"]["documents_dir"])
+            inbox.mkdir(parents=True, exist_ok=True)
+            (inbox / "stale.json").write_text(
+                json.dumps(
+                    {
+                        "package_kind": "github_repo_document",
+                        "doc_id": "stale",
+                        "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                        "repo_ref": "main",
+                        "relative_path": "Flexible Payroll/README.md",
+                        "content_type": "text/markdown",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": "Payroll Processing/README.md",
+                    "markdown_body": "# Payroll Processing",
+                    "process_now": False,
+                },
+            )
+        assert response.status_code == 200, response.text
     finally:
         asyncio.run(database.close())
 
@@ -293,8 +539,8 @@ def test_local_adapter_push_rejects_paused_source(tmp_path):
         asyncio.run(database.close())
 
 
-def test_local_adapter_push_requires_local_markdown_source(tmp_path):
-    """Pushing to a non-local-markdown source must be rejected."""
+def test_local_adapter_push_requires_local_adapter_source(tmp_path):
+    """Pushing to a non-local-adapter source must be rejected."""
     from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
@@ -323,7 +569,7 @@ def test_local_adapter_push_requires_local_markdown_source(tmp_path):
                 },
             )
         assert response.status_code == 400
-        assert "local_markdown" in response.json()["detail"]
+        assert "local adapter source" in response.json()["detail"]
     finally:
         asyncio.run(database.close())
 

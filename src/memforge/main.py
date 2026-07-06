@@ -16,6 +16,7 @@ from itertools import islice
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from typing import Any
+from urllib.parse import quote
 
 try:
     import tomllib
@@ -29,6 +30,16 @@ from rich.table import Table
 
 from memforge.auth import browser_session
 from memforge.config import AppConfig, load_config
+from memforge.github_repo_utils import (
+    DEFAULT_INCLUDE_EXTENSION_LIST,
+    decode_github_base64_content,
+    github_content_type,
+    github_extension,
+    github_include_extensions,
+    github_include_paths,
+    github_path_in_scope,
+    parse_github_repo_url,
+)
 from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
     SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES,
@@ -62,6 +73,8 @@ KB_SCHEDULE_PRESETS = {
 KB_CRON_MARK_START = "# >>> memforge:kb:{name} >>>"
 KB_CRON_MARK_END = "# <<< memforge:kb:{name} <<<"
 LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
+GITHUB_REPO_SOURCE_TYPE = "github_repo"
+DEFAULT_GITHUB_INCLUDE_EXTENSIONS = DEFAULT_INCLUDE_EXTENSION_LIST
 INTERACTIVE_DISABLE_ENV = "MEMFORGE_NO_INTERACTIVE"
 INTERACTIVE_SCRIPT_ENV = "MEMFORGE_INTERACTIVE_SCRIPT"
 INTERACTIVE_BIN_ENV = "MEMFORGE_CLI_BIN"
@@ -176,19 +189,23 @@ def _adapter_config_path() -> Path:
 def _read_adapter_config() -> dict[str, Any]:
     path = _adapter_config_path()
     if not path.exists():
-        return {"kb": {}}
+        return {"kb": {}, "github": {}}
     with path.open("rb") as handle:
         data = tomllib.load(handle)
     kb = data.get("kb")
     if not isinstance(kb, dict):
         kb = {}
-    return {"kb": kb}
+    github = data.get("github")
+    if not isinstance(github, dict):
+        github = {}
+    return {"kb": kb, "github": github}
 
 
 def _write_adapter_config(data: dict[str, Any]) -> None:
     path = _adapter_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     kb = data.get("kb") if isinstance(data.get("kb"), dict) else {}
+    github = data.get("github") if isinstance(data.get("github"), dict) else {}
     lines: list[str] = []
     for name, profile in sorted(kb.items()):
         if not isinstance(profile, dict):
@@ -198,6 +215,23 @@ def _write_adapter_config(data: dict[str, Any]) -> None:
         lines.append(f"vault_id = {_toml_string(str(profile.get('vault_id') or name))}")
         lines.append(f"include = {_toml_string_list(_string_list(profile.get('include')) or DEFAULT_KB_INCLUDE)}")
         lines.append(f"exclude = {_toml_string_list(_string_list(profile.get('exclude')) or DEFAULT_KB_EXCLUDE)}")
+        source_id = str(profile.get("source_id") or "").strip()
+        if source_id:
+            lines.append(f"source_id = {_toml_string(source_id)}")
+        schedule = str(profile.get("schedule") or "").strip()
+        if schedule:
+            lines.append(f"schedule = {_toml_string(schedule)}")
+        lines.append("")
+    for name, profile in sorted(github.items()):
+        if not isinstance(profile, dict):
+            continue
+        lines.append(f"[github.{_toml_key(str(name))}]")
+        lines.append(f"repo_url = {_toml_string(str(profile.get('repo_url') or ''))}")
+        lines.append(f"ref = {_toml_string(str(profile.get('ref') or 'main'))}")
+        lines.append(f"include_paths = {_toml_string_list(_string_list(profile.get('include_paths')))}")
+        lines.append(
+            f"include_extensions = {_toml_string_list(_string_list(profile.get('include_extensions')) or DEFAULT_GITHUB_INCLUDE_EXTENSIONS)}"
+        )
         source_id = str(profile.get("source_id") or "").strip()
         if source_id:
             lines.append(f"source_id = {_toml_string(source_id)}")
@@ -289,6 +323,132 @@ def _link_local_markdown_source(
     if isinstance(created, dict) and created.get("error"):
         return {"error": str(created.get("error")), "detail": created.get("detail")}
     return {"source_id": str(created["id"]), "reused": False}
+
+
+def _parse_github_repo_url(repo_url: str) -> dict[str, str]:
+    try:
+        parsed = parse_github_repo_url(repo_url)
+    except ValueError as exc:
+        raise click.ClickException(str(exc).replace("repo_url", "Repository URL")) from exc
+    return {"repo_url": parsed["repo_url"], "host": parsed["host"], "owner": parsed["owner"], "repo": parsed["repo"]}
+
+
+def _github_gh_env(host: str) -> dict[str, str]:
+    env = dict(os.environ)
+    if host != "github.com":
+        env["GH_HOST"] = host
+    else:
+        env.pop("GH_HOST", None)
+    return env
+
+
+def _gh_api_json(repo: dict[str, str], endpoint: str) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            ["gh", "api", endpoint],
+            capture_output=True,
+            text=True,
+            env=_github_gh_env(repo["host"]),
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise click.ClickException("GitHub CLI `gh` is required for local GitHub repository sync.") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "gh api failed").strip()
+        raise click.ClickException(f"GitHub CLI request failed: {detail}")
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except ValueError as exc:
+        raise click.ClickException("GitHub CLI returned invalid JSON.") from exc
+    return payload if isinstance(payload, dict) else {}
+
+
+def _github_tree(repo: dict[str, str], ref: str) -> list[dict[str, Any]]:
+    payload = _gh_api_json(
+        repo,
+        f"repos/{repo['owner']}/{repo['repo']}/git/trees/{quote(ref, safe='')}?recursive=1",
+    )
+    if payload.get("truncated") is True:
+        raise click.ClickException(
+            "GitHub tree response was truncated; use local_push for this large repository until non-recursive cloud pull is supported."
+        )
+    tree = payload.get("tree")
+    return tree if isinstance(tree, list) else []
+
+
+def _github_content(repo: dict[str, str], ref: str, relative_path: str) -> bytes:
+    payload = _gh_api_json(
+        repo,
+        f"repos/{repo['owner']}/{repo['repo']}/contents/{quote(relative_path, safe='/')}?ref={quote(ref, safe='')}",
+    )
+    try:
+        return decode_github_base64_content(
+            content=payload.get("content"),
+            encoding=payload.get("encoding"),
+            size=payload.get("size"),
+            label=relative_path,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _resolve_github_profile(name: str, profile: dict[str, Any]) -> tuple[dict[str, str], str, list[str], list[str]]:
+    repo = _parse_github_repo_url(str(profile.get("repo_url") or ""))
+    ref = str(profile.get("ref") or "main").strip() or "main"
+    try:
+        include_paths = github_include_paths(profile)
+    except ValueError as exc:
+        raise click.ClickException(str(exc).replace("relative_path", "GitHub include path")) from exc
+    include_extensions = sorted(github_include_extensions(profile))
+    return repo, ref, include_paths, include_extensions
+
+
+def _github_title(markdown_body: str, fallback: str) -> str:
+    for line in markdown_body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# ") and stripped[2:].strip():
+            return stripped[2:].strip()
+    return fallback
+
+
+def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | None) -> dict[str, Any]:
+    repo, ref, include_paths, include_extensions = _resolve_github_profile(name, profile)
+    counts = {"included": 0, "ignored": 0}
+    extension_counts: dict[str, int] = {}
+    items: list[dict[str, Any]] = []
+    for entry in _github_tree(repo, ref):
+        if entry.get("type") != "blob":
+            continue
+        relative_path = str(entry.get("path") or "")
+        if not github_path_in_scope(relative_path, include_paths):
+            counts["ignored"] += 1
+            continue
+        extension = github_extension(relative_path)
+        if extension:
+            extension_counts[extension] = extension_counts.get(extension, 0) + 1
+        if include_extensions and extension not in include_extensions:
+            counts["ignored"] += 1
+            continue
+        counts["included"] += 1
+        if limit is None or len(items) < limit:
+            items.append(
+                {
+                    "relative_path": relative_path,
+                    "blob_sha": entry.get("sha"),
+                    "bytes": entry.get("size", 0),
+                    "content_type": github_content_type(relative_path),
+                }
+            )
+    return {
+        "profile": name,
+        "repo_url": repo["repo_url"],
+        "ref": ref,
+        "include_paths": include_paths,
+        "include_extensions": include_extensions,
+        "counts": counts,
+        "extension_counts": dict(sorted(extension_counts.items())),
+        "items": items,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1261,6 +1421,7 @@ def adapter_list(ctx):
             "data": [
                 {"type": "jira", "auth": "browser_session"},
                 {"type": "kb", "kind": "markdown"},
+                {"type": "github", "kind": "repository"},
             ]
         },
     )
@@ -1274,7 +1435,13 @@ def adapter_status(ctx):
         ctx,
         {
             "status": "available",
-            "capabilities": ["jira.browser_session", "kb.markdown_preview", "kb.markdown_push"],
+            "capabilities": [
+                "jira.browser_session",
+                "kb.markdown_preview",
+                "kb.markdown_push",
+                "github.repo_preview",
+                "github.repo_push",
+            ],
         },
     )
 
@@ -1283,6 +1450,172 @@ def adapter_status(ctx):
 def adapter_kb():
     """Manage local repository adapter profiles (Markdown, text, JSON, HTML)."""
     pass
+
+
+@adapter.group("github")
+def adapter_github():
+    """Manage local GitHub repository adapter profiles."""
+    pass
+
+
+@adapter_github.command("add")
+@click.argument("name")
+@click.option("--repo-url", required=True, help="GitHub or GitHub Enterprise repository URL.")
+@click.option("--ref", "repo_ref", default="main", show_default=True, help="Branch, tag, or commit to sync.")
+@click.option("--include-path", "include_paths", multiple=True,
+              help="Repo-relative folder or file to include. Repeatable. Empty means all paths.")
+@click.option("--include-extension", "include_extensions", multiple=True,
+              help="File extension to include. Repeatable. Defaults to markdown/text-like files.")
+@click.option("--source-id", default=None, help="Existing github_repo source id to link to this profile.")
+@click.pass_context
+def adapter_github_add(
+    ctx,
+    name: str,
+    repo_url: str,
+    repo_ref: str,
+    include_paths: tuple[str, ...],
+    include_extensions: tuple[str, ...],
+    source_id: str | None,
+):
+    """Add or update a local GitHub repository profile."""
+    name = _validate_kb_profile_name(name)
+    repo = _parse_github_repo_url(repo_url)
+    try:
+        normalized_include_paths = github_include_paths({"include_paths": list(include_paths)})
+    except ValueError as exc:
+        raise click.ClickException(str(exc).replace("relative_path", "GitHub include path")) from exc
+    profile = {
+        "repo_url": repo["repo_url"],
+        "ref": repo_ref.strip() or "main",
+        "include_paths": normalized_include_paths,
+        "include_extensions": [
+            ext.lower().lstrip(".")
+            for ext in (list(include_extensions) or DEFAULT_GITHUB_INCLUDE_EXTENSIONS)
+            if ext.strip()
+        ],
+    }
+    if source_id:
+        profile["source_id"] = source_id.strip()
+    data = _read_adapter_config()
+    data.setdefault("github", {})[name] = profile
+    _write_adapter_config(data)
+    _emit_tool_payload(ctx, {"ok": True, "profile": name, "config": profile})
+
+
+@adapter_github.command("list")
+@click.pass_context
+def adapter_github_list(ctx):
+    """List local GitHub repository profiles."""
+    _emit_tool_payload(ctx, {"profiles": _read_adapter_config().get("github", {})})
+
+
+@adapter_github.command("preview")
+@click.argument("name")
+@click.option("--limit", default=20, show_default=True, type=int, help="Maximum included files to return.")
+@click.pass_context
+def adapter_github_preview(ctx, name: str, limit: int):
+    """Preview the files selected by a GitHub repository profile."""
+    profiles = _read_adapter_config().get("github", {})
+    profile = profiles.get(name)
+    if not isinstance(profile, dict):
+        raise click.ClickException(f"Unknown GitHub repository profile: {name}")
+    _emit_tool_payload(ctx, _preview_github_profile(name, profile, limit=limit))
+
+
+@adapter_github.command("push")
+@click.argument("name")
+@click.option("--source-id", default=None,
+              help="MemForge github_repo source id (defaults to the profile's linked source).")
+@click.option("--limit", default=0, show_default=True, type=int,
+              help="Maximum files to push. 0 means push every included file.")
+@click.option("--process-now/--no-process-now", default=False, show_default=True,
+              help="Trigger source sync after the push completes.")
+@click.option("--submitted-by", default=None, help="Optional label recorded with each push.")
+@click.pass_context
+def adapter_github_push(
+    ctx,
+    name: str,
+    source_id: str | None,
+    limit: int,
+    process_now: bool,
+    submitted_by: str | None,
+):
+    """Push selected GitHub repository files into a configured github_repo source."""
+    profiles = _read_adapter_config().get("github", {})
+    profile = profiles.get(name)
+    if not isinstance(profile, dict):
+        raise click.ClickException(f"Unknown GitHub repository profile: {name}")
+    source_id = (source_id or "").strip() or str(profile.get("source_id") or "").strip()
+    if not source_id:
+        raise click.ClickException(
+            "No source id for this profile. Re-run with --source-id, or link one with `adapter github add ... --source-id`."
+        )
+
+    repo, ref, _include_paths, _include_extensions = _resolve_github_profile(name, profile)
+    preview = _preview_github_profile(name, profile, limit=None if limit == 0 else max(limit, 0))
+    selected_entries = list(preview["items"])
+
+    client = _tool_client(ctx)
+    pushed: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    prepared: list[dict[str, Any]] = []
+    for entry in selected_entries:
+        relative_path = str(entry["relative_path"])
+        try:
+            raw = _github_content(repo, ref, relative_path)
+            text_body = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            failed.append({"relative_path": relative_path, "error": "invalid utf-8"})
+            continue
+        except click.ClickException as exc:
+            failed.append({"relative_path": relative_path, "error": str(exc)})
+            continue
+        raw_hash = hashlib.sha256(raw).hexdigest()
+        prepared.append(
+            {
+                "relative_path": relative_path,
+                "markdown_body": text_body,
+                "content_type": str(entry.get("content_type") or "text/plain"),
+                "title": _github_title(text_body, relative_path),
+                "raw_hash": raw_hash,
+                "blob_sha": str(entry.get("blob_sha") or ""),
+            }
+        )
+
+    for index, doc in enumerate(prepared):
+        response = client.push_github_repo_document(
+            source_id=source_id,
+            repo_url=repo["repo_url"],
+            repo_ref=ref,
+            relative_path=str(doc["relative_path"]),
+            markdown_body=str(doc["markdown_body"]),
+            content_type=str(doc["content_type"]),
+            title=str(doc["title"]),
+            raw_hash=str(doc["raw_hash"]),
+            blob_sha=str(doc["blob_sha"]),
+            submitted_by=submitted_by,
+            process_now=process_now and index == len(prepared) - 1,
+        )
+        if isinstance(response, dict) and response.get("error"):
+            failed.append({"relative_path": doc["relative_path"], "error": response.get("error"),
+                           "detail": response.get("detail"), "status_code": response.get("status_code")})
+        else:
+            pushed.append({"relative_path": doc["relative_path"],
+                           "doc_id": response.get("doc_id"),
+                           "document_hash": response.get("document_hash")})
+
+    payload = {
+        "profile": name,
+        "repo_url": repo["repo_url"],
+        "ref": ref,
+        "source_id": source_id,
+        "counts": {"selected": len(selected_entries), "pushed": len(pushed), "failed": len(failed)},
+        "pushed": pushed,
+        "failed": failed,
+    }
+    if failed:
+        payload["error"] = "one or more documents failed to push"
+    _emit_tool_payload(ctx, payload)
 
 
 @adapter_kb.command("add")

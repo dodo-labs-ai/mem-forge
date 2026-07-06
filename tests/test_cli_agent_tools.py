@@ -67,6 +67,13 @@ class FakeToolClient:
         ))
         return self.response
 
+    def push_github_repo_document(self, **kwargs):
+        self.calls.append((
+            "push_github_repo_document",
+            {"api_url": self.api_url, "api_token": self.api_token, **kwargs},
+        ))
+        return self.response
+
     def health(self):
         self.calls.append(("health", {"api_url": self.api_url, "api_token": self.api_token}))
         return self.response
@@ -979,6 +986,351 @@ def test_adapter_kb_push_reports_service_errors(monkeypatch, tmp_path: Path):
     assert payload["counts"]["failed"] == 1
     assert payload["failed"][0]["status_code"] == 400
     assert "error" in payload
+
+
+def test_adapter_github_add_and_preview_uses_local_gh_tree(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+
+    def fake_run(cmd, *, capture_output, text, env=None, check=False):
+        assert cmd[:2] == ["gh", "api"]
+        assert env["GH_HOST"] == "github.wdf.sap.corp"
+        assert cmd[2] == "repos/nextgenpayroll-matterhorn/architecture/git/trees/main?recursive=1"
+
+        class Result:
+            returncode = 0
+            stdout = json.dumps(
+                {
+                    "tree": [
+                        {"path": "Payroll Processing/README.md", "type": "blob", "sha": "md-sha", "size": 10},
+                        {"path": "Payroll Processing/images/diagram.png", "type": "blob", "sha": "png-sha", "size": 20},
+                        {"path": "Flexible Payroll/README.md", "type": "blob", "sha": "other-sha", "size": 30},
+                    ]
+                }
+            )
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    add_result = CliRunner().invoke(
+        cli,
+        [
+            "adapter",
+            "github",
+            "add",
+            "matterhorn",
+            "--repo-url",
+            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+            "--ref",
+            "main",
+            "--include-path",
+            "Payroll Processing/",
+            "--include-extension",
+            "md",
+        ],
+    )
+    preview_result = CliRunner().invoke(cli, ["adapter", "github", "preview", "matterhorn", "--limit", "5"])
+
+    assert add_result.exit_code == 0, add_result.output
+    assert preview_result.exit_code == 0, preview_result.output
+    payload = json.loads(preview_result.output)
+    assert payload["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
+    assert payload["counts"]["included"] == 1
+    assert payload["counts"]["ignored"] == 2
+    assert payload["extension_counts"] == {"md": 1, "png": 1}
+    assert payload["items"][0]["relative_path"] == "Payroll Processing/README.md"
+
+
+def test_adapter_github_preview_rejects_truncated_tree(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+
+    def fake_run(cmd, *, capture_output, text, env=None, check=False):
+        assert cmd[:2] == ["gh", "api"]
+
+        class Result:
+            returncode = 0
+            stdout = json.dumps({"tree": [], "truncated": True})
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    add_result = CliRunner().invoke(
+        cli,
+        [
+            "adapter",
+            "github",
+            "add",
+            "matterhorn",
+            "--repo-url",
+            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+            "--ref",
+            "main",
+            "--include-extension",
+            "md",
+        ],
+    )
+    preview_result = CliRunner().invoke(cli, ["adapter", "github", "preview", "matterhorn"])
+
+    assert add_result.exit_code == 0, add_result.output
+    assert preview_result.exit_code != 0
+    assert "truncated" in preview_result.output
+
+
+def test_adapter_github_push_rejects_malformed_base64_content(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
+
+    def fake_run(cmd, *, capture_output, text, env=None, check=False):
+        assert cmd[:2] == ["gh", "api"]
+
+        class Result:
+            returncode = 0
+            stderr = ""
+
+        result = Result()
+        if cmd[2].endswith("/git/trees/main?recursive=1"):
+            result.stdout = json.dumps(
+                {"tree": [{"path": "docs/broken.md", "type": "blob", "sha": "broken-sha", "size": 10}]}
+            )
+            return result
+        if cmd[2].endswith("/contents/docs/broken.md?ref=main"):
+            result.stdout = json.dumps({"encoding": "base64", "content": "!!!!", "size": 10})
+            return result
+        raise AssertionError(f"unexpected gh api call: {cmd}")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    add_result = CliRunner().invoke(
+        cli,
+        [
+            "adapter",
+            "github",
+            "add",
+            "repo",
+            "--repo-url",
+            "https://github.com/example/repo",
+            "--ref",
+            "main",
+            "--include-path",
+            "docs/",
+            "--include-extension",
+            "md",
+        ],
+    )
+    push_result = CliRunner().invoke(cli, ["adapter", "github", "push", "repo", "--source-id", "src-gh"])
+
+    assert add_result.exit_code == 0, add_result.output
+    assert push_result.exit_code != 0
+    payload = json.loads(push_result.output)
+    assert payload["counts"] == {"selected": 1, "pushed": 0, "failed": 1}
+    assert "base64" in payload["failed"][0]["error"]
+
+
+def test_adapter_github_push_uses_profile_source_id_and_pushes_content(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
+
+    def fake_run(cmd, *, capture_output, text, env=None, check=False):
+        assert cmd[:2] == ["gh", "api"]
+
+        class Result:
+            returncode = 0
+            stderr = ""
+
+        result = Result()
+        if cmd[2].endswith("/git/trees/main?recursive=1"):
+            result.stdout = json.dumps(
+                {
+                    "tree": [
+                        {
+                            "path": "Payroll Processing/README.md",
+                            "type": "blob",
+                            "sha": "md-sha",
+                            "size": 10,
+                        }
+                    ]
+                }
+            )
+            return result
+        if cmd[2].endswith("/contents/Payroll%20Processing/README.md?ref=main"):
+            import base64
+
+            result.stdout = json.dumps({"content": base64.b64encode(b"# Payroll Processing\n\nBody").decode()})
+            return result
+        raise AssertionError(f"unexpected gh api call: {cmd}")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    CliRunner().invoke(
+        cli,
+        [
+            "adapter",
+            "github",
+            "add",
+            "matterhorn",
+            "--repo-url",
+            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+            "--ref",
+            "main",
+            "--include-path",
+            "Payroll Processing/",
+            "--include-extension",
+            "md",
+        ],
+    )
+    push_result = CliRunner().invoke(
+        cli,
+        ["adapter", "github", "push", "matterhorn", "--source-id", "src-gh", "--submitted-by", "cli-test"],
+    )
+
+    assert push_result.exit_code == 0, push_result.output
+    payload = json.loads(push_result.output)
+    assert payload["counts"]["pushed"] == 1
+    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
+    assert len(push_calls) == 1
+    kwargs = push_calls[0][1]
+    assert kwargs["source_id"] == "src-gh"
+    assert kwargs["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
+    assert kwargs["repo_ref"] == "main"
+    assert kwargs["relative_path"] == "Payroll Processing/README.md"
+    assert kwargs["blob_sha"] == "md-sha"
+    assert kwargs["markdown_body"] == "# Payroll Processing\n\nBody"
+    assert kwargs["submitted_by"] == "cli-test"
+
+
+def test_adapter_github_push_limit_selects_first_matching_files(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
+
+    def fake_run(cmd, *, capture_output, text, env=None, check=False):
+        assert cmd[:2] == ["gh", "api"]
+
+        class Result:
+            returncode = 0
+            stderr = ""
+
+        result = Result()
+        if cmd[2].endswith("/git/trees/main?recursive=1"):
+            result.stdout = json.dumps(
+                {
+                    "tree": [
+                        {"path": "docs/first.md", "type": "blob", "sha": "first-sha", "size": 10},
+                        {"path": "docs/second.md", "type": "blob", "sha": "second-sha", "size": 10},
+                    ]
+                }
+            )
+            return result
+        if cmd[2].endswith("/contents/docs/first.md?ref=main"):
+            import base64
+
+            result.stdout = json.dumps({"content": base64.b64encode(b"# First\n").decode()})
+            return result
+        raise AssertionError(f"unexpected gh api call: {cmd}")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    add_result = CliRunner().invoke(
+        cli,
+        [
+            "adapter",
+            "github",
+            "add",
+            "repo",
+            "--repo-url",
+            "https://github.com/example/repo",
+            "--ref",
+            "main",
+            "--include-path",
+            "docs/",
+            "--include-extension",
+            "md",
+        ],
+    )
+    push_result = CliRunner().invoke(
+        cli,
+        ["adapter", "github", "push", "repo", "--source-id", "src-gh", "--limit", "1"],
+    )
+
+    assert add_result.exit_code == 0, add_result.output
+    assert push_result.exit_code == 0, push_result.output
+    payload = json.loads(push_result.output)
+    assert payload["counts"]["pushed"] == 1
+    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
+    assert [call[1]["relative_path"] for call in push_calls] == ["docs/first.md"]
+
+
+def test_adapter_github_push_process_now_uses_last_successful_push(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
+
+    def fake_run(cmd, *, capture_output, text, env=None, check=False):
+        assert cmd[:2] == ["gh", "api"]
+
+        class Result:
+            returncode = 0
+            stderr = ""
+
+        result = Result()
+        if cmd[2].endswith("/git/trees/main?recursive=1"):
+            result.stdout = json.dumps(
+                {
+                    "tree": [
+                        {"path": "docs/first.md", "type": "blob", "sha": "first-sha", "size": 10},
+                        {"path": "docs/second.md", "type": "blob", "sha": "second-sha", "size": 10},
+                    ]
+                }
+            )
+            return result
+        if cmd[2].endswith("/contents/docs/first.md?ref=main"):
+            import base64
+
+            result.stdout = json.dumps({"content": base64.b64encode(b"# First\n").decode()})
+            return result
+        if cmd[2].endswith("/contents/docs/second.md?ref=main"):
+            result.returncode = 1
+            result.stdout = ""
+            result.stderr = "not found"
+            return result
+        raise AssertionError(f"unexpected gh api call: {cmd}")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    add_result = CliRunner().invoke(
+        cli,
+        [
+            "adapter",
+            "github",
+            "add",
+            "repo",
+            "--repo-url",
+            "https://github.com/example/repo",
+            "--ref",
+            "main",
+            "--include-path",
+            "docs/",
+            "--include-extension",
+            "md",
+        ],
+    )
+    push_result = CliRunner().invoke(
+        cli,
+        ["adapter", "github", "push", "repo", "--source-id", "src-gh", "--process-now"],
+    )
+
+    assert add_result.exit_code == 0, add_result.output
+    assert push_result.exit_code != 0
+    payload = json.loads(push_result.output)
+    assert payload["counts"] == {"selected": 2, "pushed": 1, "failed": 1}
+    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
+    assert [call[1]["relative_path"] for call in push_calls] == ["docs/first.md"]
+    assert [call[1]["process_now"] for call in push_calls] == [True]
 
 
 def test_adapter_jira_watch_command_is_registered():

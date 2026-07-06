@@ -5,6 +5,7 @@ import {
   canConfigureSourceType,
   canDeleteSourceType,
   isManagedSourceType,
+  isPushBasedSourceType,
   userConfigurableGenes,
 } from "../src/views/sources/managedSources.js";
 
@@ -19,6 +20,9 @@ assert.equal(canConfigureSourceType("agent_session"), false);
 assert.equal(canDeleteSourceType("agent_session"), false);
 assert.equal(canConfigureSourceType("confluence"), true);
 assert.equal(canDeleteSourceType("confluence"), true);
+assert.equal(canConfigureSourceType("github_repo"), true);
+assert.equal(canDeleteSourceType("github_repo"), true);
+assert.equal(isPushBasedSourceType("github_repo"), false);
 assert.deepEqual(userConfigurableGenes(genes).map((gene) => gene.name), ["confluence", "jira"]);
 
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");

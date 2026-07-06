@@ -87,6 +87,45 @@ def test_update_source_schedule_puts_source_schedule_payload():
     ]
 
 
+def test_push_github_repo_document_posts_adapter_payload():
+    client = _RecordingClient({"package_id": "github_repo_document:hash"})
+
+    result = client.push_github_repo_document(
+        source_id="src-github",
+        repo_url="https://github.tools.sap/org/repo",
+        repo_ref="main",
+        relative_path="docs/design.md",
+        markdown_body="# Design",
+        title="Design",
+        raw_hash="raw-1",
+        blob_sha="blob-1",
+        submitted_by="codex",
+        submitted_at="2026-07-07T08:00:00Z",
+        process_now=True,
+    )
+
+    assert result["package_id"] == "github_repo_document:hash"
+    assert client.calls == [
+        (
+            "POST",
+            "/api/sources/src-github/adapter/documents",
+            {
+                "repo_url": "https://github.tools.sap/org/repo",
+                "repo_ref": "main",
+                "relative_path": "docs/design.md",
+                "markdown_body": "# Design",
+                "content_type": "text/markdown",
+                "process_now": True,
+                "title": "Design",
+                "raw_hash": "raw-1",
+                "blob_sha": "blob-1",
+                "submitted_by": "codex",
+                "submitted_at": "2026-07-07T08:00:00Z",
+            },
+        )
+    ]
+
+
 def test_tool_client_forwards_search_to_hosted_workspace(monkeypatch):
     captured = {}
 
