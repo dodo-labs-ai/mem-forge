@@ -113,6 +113,12 @@ _GRAPH_INVENTORY_TERMS = {
     "around", "dependencies", "upstream", "downstream", "affected", "impact",
     "risks", "list", "show", "find",
 }
+_METADATA_LOOKUP_MODIFIER_TOKENS = {
+    "bug", "bugs", "find", "issue", "issues", "jira", "list", "pr", "prs",
+    "pull", "request", "requests", "search", "show", "stories", "story",
+    "task", "tasks", "ticket", "tickets",
+}
+_METADATA_IDENTIFIER_COVERAGE_THRESHOLD = 0.75
 _EXTERNAL_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b|#\d+\b|\bINC\d+\b", re.IGNORECASE)
 _CODE_SYMBOL_RE = re.compile(
     r"(?:\b[A-Za-z][A-Za-z0-9]*[./][A-Za-z0-9_./-]+\b)"
@@ -144,6 +150,7 @@ class _QueryFeatures:
     tokens: tuple[str, ...]
     has_external_id: bool
     has_code_symbol: bool
+    code_symbol_terms: tuple[str, ...]
     natural_language_ratio: float
     graph_intent: float
 
@@ -201,12 +208,24 @@ def _query_tokens(query: str) -> tuple[str, ...]:
     return tuple(token for token in re.split(r"[^0-9a-z]+", normalized) if token)
 
 
+def _query_code_symbol_terms(query: str) -> tuple[str, ...]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for match in _CODE_SYMBOL_RE.finditer(query):
+        for token in _query_tokens(match.group(0)):
+            if token not in seen:
+                terms.append(token)
+                seen.add(token)
+    return tuple(terms)
+
+
 def _compute_query_features(
     query: str,
     *,
     graph_candidates: list[EntityLinkCandidate],
 ) -> _QueryFeatures:
     tokens = _query_tokens(query)
+    code_symbol_terms = _query_code_symbol_terms(query)
     token_set = set(tokens)
     has_question_word = bool(token_set & _QUESTION_WORDS) or "?" in query
     has_explanatory_verb = bool(token_set & _EXPLANATORY_VERBS)
@@ -232,10 +251,57 @@ def _compute_query_features(
     return _QueryFeatures(
         tokens=tokens,
         has_external_id=bool(_EXTERNAL_ID_RE.search(query)),
-        has_code_symbol=bool(_CODE_SYMBOL_RE.search(query)),
+        has_code_symbol=bool(code_symbol_terms),
+        code_symbol_terms=code_symbol_terms,
         natural_language_ratio=natural_language_ratio,
         graph_intent=graph_intent,
     )
+
+
+def _metadata_identifier_core_tokens(tokens: tuple[str, ...]) -> set[str]:
+    return {
+        token for token in tokens
+        if len(token) > 1
+        and token not in _METADATA_LOOKUP_MODIFIER_TOKENS
+        and token not in _QUESTION_WORDS
+        and token not in _SENTENCE_CONNECTORS
+    }
+
+
+def _metadata_identifier_core_query(query: str) -> str:
+    tokens = _query_tokens(query)
+    core_tokens = [
+        token for token in tokens
+        if len(token) > 1
+        and token not in _METADATA_LOOKUP_MODIFIER_TOKENS
+        and token not in _QUESTION_WORDS
+        and token not in _SENTENCE_CONNECTORS
+    ]
+    deduped_core_tokens = tuple(dict.fromkeys(core_tokens))
+    if len(deduped_core_tokens) < 2:
+        return query
+    return " ".join(deduped_core_tokens)
+
+
+def _metadata_identifier_coverage(
+    query_tokens: tuple[str, ...],
+    matched_text: tuple[str, ...],
+) -> float:
+    core_tokens = _metadata_identifier_core_tokens(query_tokens)
+    if len(core_tokens) < 2:
+        return 0.0
+    matched_tokens = set(_query_tokens(" ".join(matched_text)))
+    return len(core_tokens & matched_tokens) / len(core_tokens)
+
+
+def _metadata_supports_code_symbol(
+    features: _QueryFeatures,
+    matched_text: tuple[str, ...],
+) -> bool:
+    if not features.code_symbol_terms:
+        return False
+    matched_tokens = set(_query_tokens(" ".join(matched_text)))
+    return set(features.code_symbol_terms).issubset(matched_tokens)
 
 
 def _select_ranking_profile(
@@ -247,13 +313,13 @@ def _select_ranking_profile(
     if features.has_external_id:
         return "identifier_lookup"
     if any(hit.channel in {"bm25_metadata_tokens", "metadata_alias"} for hit in metadata_hits):
-        query_token_set = set(features.tokens)
         if any(
-            (
-                len(query_token_set) > 1
-                and query_token_set.issubset(set(_query_tokens(" ".join(hit.matched_text))))
+            _metadata_identifier_coverage(features.tokens, hit.matched_text)
+            >= _METADATA_IDENTIFIER_COVERAGE_THRESHOLD
+            or (
+                features.has_code_symbol
+                and _metadata_supports_code_symbol(features, hit.matched_text)
             )
-            or features.has_code_symbol
             for hit in metadata_hits
             if hit.matched_text
         ):
@@ -772,7 +838,7 @@ class SearchEngine:
         time_range: MemoryTimeRange | None,
     ) -> list[KeywordCandidate]:
         """Query the source-metadata keyword channel."""
-        sanitized_query = _sanitize_fts_query(query)
+        sanitized_query = _sanitize_fts_query(_metadata_identifier_core_query(query))
         if not sanitized_query:
             return []
         return await self._keyword.search_metadata(

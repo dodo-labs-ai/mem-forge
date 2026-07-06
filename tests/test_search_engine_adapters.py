@@ -542,6 +542,87 @@ async def test_code_symbol_metadata_hit_uses_identifier_profile(db, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_code_symbol_without_metadata_support_does_not_force_identifier_profile(db, monkeypatch):
+    metadata_target = _memory("m-metadata", "Blocker hint Jira task summary")
+    semantic_competitor = _memory("m-semantic", "Command implementation retry analysis")
+    await db.insert_memory(metadata_target)
+    await db.insert_memory(semantic_competitor)
+    await db.upsert_source("src-jira", "jira", "Mount Tai Jira", "{}")
+    await _document(
+        db,
+        "SFPAY-100",
+        "src-jira",
+        title="Create blocker hint lifecycle task",
+    )
+    await db.add_memory_source("m-metadata", "SFPAY-100", "jira", None, source_updated_at=None)
+
+    adapters = build_sqlite_adapters(db, FakeCollection(["m-semantic", "m-metadata"]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    async def metadata_results(
+        _query,
+        _memory_types,
+        _scope,
+        limit,
+        *,
+        source_filter,
+        time_range,
+    ):
+        return [
+            KeywordCandidate(
+                memory_id="m-metadata",
+                score=10.0,
+                channel="bm25_metadata_tokens",
+                matched_text=("Create blocker hint lifecycle task",),
+            )
+        ]
+
+    monkeypatch.setattr(engine, "_bm25_metadata_search", metadata_results)
+
+    result = await engine.search("PersistCutOffBlockerHintsCommand blocker hint", top_k=2)
+
+    assert result["query_analysis"]["ranking_profile"] == "lexical_lookup"
+
+
+@pytest.mark.asyncio
+async def test_metadata_core_token_coverage_ignores_generic_work_item_modifiers(db, monkeypatch):
+    metadata_target = _memory("m-metadata", "Durable source-backed note with different wording")
+    content_competitor = _memory("m-content", "General Jira task discussion")
+    await db.insert_memory(metadata_target)
+    await db.insert_memory(content_competitor)
+    await db.upsert_source("src-jira", "jira", "Mount Tai Jira", "{}")
+    await _document(
+        db,
+        "SFPAY-179397",
+        "src-jira",
+        title="Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await db.add_memory_source("m-metadata", "SFPAY-179397", "jira", None, source_updated_at=None)
+
+    adapters = build_sqlite_adapters(db, FakeCollection(["m-content", "m-metadata"]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("create blocker hint jira task", top_k=2)
+
+    assert result["query_analysis"]["ranking_profile"] == "identifier_lookup"
+    assert result["results"][0].memory_id == "m-metadata"
+
+
+@pytest.mark.asyncio
 async def test_explanatory_query_uses_semantic_profile_instead_of_lexical_fallback(db, monkeypatch):
     memory = _memory("m-semantic", "Payment retry policy after payroll cutoff")
     await db.insert_memory(memory)
