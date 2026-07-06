@@ -17,7 +17,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from memforge.config import DEFAULT_RANK_WINDOW_SIZE, RetrievalConfig
 from memforge.llm.structured import StructuredLlmError
@@ -508,6 +508,7 @@ class SearchEngine:
         embed_cfg: dict,
         config: RetrievalConfig,
         structured_llm_client: Any | None = None,
+        embedding_provider: Callable[[str], list[float] | None] | None = None,
     ) -> None:
         self._relational = relational
         self._keyword = keyword
@@ -516,6 +517,7 @@ class SearchEngine:
         self._config = config
         self._embed_cache = EmbeddingCache(max_size=config.embedding_cache_size)
         self._structured_llm_client = structured_llm_client
+        self._embedding_provider = embedding_provider
 
     # ==================================================================
     # Public API
@@ -1295,6 +1297,13 @@ class SearchEngine:
         Returns ``None`` if the embedding call fails (caller should degrade
         gracefully).
         """
+        if self._embedding_provider is not None:
+            try:
+                return self._embedding_provider(text)
+            except Exception:
+                logger.exception("Injected embedding provider failed for query")
+                return None
+
         cached = self._embed_cache.get(text)
         if cached is not None:
             return cached
