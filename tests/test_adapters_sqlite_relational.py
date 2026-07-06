@@ -369,6 +369,30 @@ async def test_link_query_entities_alias_fts_honors_memory_types(db):
 
 
 @pytest.mark.asyncio
+async def test_link_query_entities_alias_fts_binds_query_before_source_count_params(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-enabled"))
+    await db.upsert_source("src-enabled", "jira", "Enabled Jira", "{}")
+    await db.upsert_source("src-disabled", "jira", "Disabled Jira", "{}")
+    await _document(db, "doc-enabled", source="src-enabled")
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.link_memory_entity("m-enabled", entity_id)
+    await store.add_memory_source("m-enabled", "doc-enabled", "jira", None, source_updated_at=None)
+    await db.set_source_subscription("src-disabled", LOCAL_DEV_USER_ID, False)
+
+    result = await store.link_query_entities(
+        "control center validation failures",
+        scope=_scope(),
+        limit=5,
+    )
+
+    assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
+        (entity_id, "alias_fts", "payroll control center")
+    ]
+    assert result.candidates[0].visible_source_count == 1
+
+
+@pytest.mark.asyncio
 async def test_link_query_entities_alias_fts_refreshes_after_remove_alias(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))

@@ -1022,9 +1022,9 @@ class SqliteRelationalStore:
             f"COUNT(DISTINCT m.id) AS visible_memory_count, {source_count_expr} AS visible_source_count",
         )
         bound_params = _entity_link_bound_params(
-            pre_source_count_params=(),
+            pre_source_count_params=(fts_query,),
             source_count_params=source_count_params,
-            post_source_count_params=(fts_query, *filter_params),
+            post_source_count_params=filter_params,
             limit=limit,
         )
         try:
