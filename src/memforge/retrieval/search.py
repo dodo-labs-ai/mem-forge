@@ -90,6 +90,7 @@ _METADATA_SUBCHANNEL_WEIGHTS = {
     "metadata_alias": 0.30,
     "metadata_trigram": 0.10,
 }
+_METADATA_IDENTIFIER_CHANNELS = {"bm25_metadata_tokens", "metadata_alias"}
 
 _QUESTION_WORDS = {
     "what", "why", "how", "when", "where", "which", "who", "whom", "whose",
@@ -312,7 +313,7 @@ def _select_ranking_profile(
 ) -> str:
     if features.has_external_id:
         return "identifier_lookup"
-    if any(hit.channel in {"bm25_metadata_tokens", "metadata_alias"} for hit in metadata_hits):
+    if any(hit.channel in _METADATA_IDENTIFIER_CHANNELS for hit in metadata_hits):
         if any(
             _metadata_identifier_coverage(features.tokens, hit.matched_text)
             >= _METADATA_IDENTIFIER_COVERAGE_THRESHOLD
@@ -321,7 +322,7 @@ def _select_ranking_profile(
                 and _metadata_supports_code_symbol(features, hit.matched_text)
             )
             for hit in metadata_hits
-            if hit.matched_text
+            if hit.channel in _METADATA_IDENTIFIER_CHANNELS and hit.matched_text
         ):
             return "identifier_lookup"
     if (

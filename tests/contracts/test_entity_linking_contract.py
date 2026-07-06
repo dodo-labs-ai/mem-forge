@@ -61,3 +61,23 @@ def test_relational_store_exposes_query_entity_linking_contract() -> None:
     assert signature.parameters["time_range"].default is None
     assert signature.parameters["memory_types"].default is None
     assert signature.parameters["limit"].default == DEFAULT_ENTITY_LINK_LIMIT
+
+
+def test_relational_store_exposes_graph_search_source_contract() -> None:
+    signature = inspect.signature(RelationalStore.graph_search)
+
+    assert list(signature.parameters) == [
+        "self",
+        "entity_ids",
+        "scope",
+        "memory_types",
+        "limit",
+        "source_filter",
+        "time_range",
+    ]
+    assert signature.parameters["entity_ids"].default is inspect.Parameter.empty
+    assert signature.parameters["scope"].default is inspect.Parameter.empty
+    assert signature.parameters["memory_types"].default is inspect.Parameter.empty
+    assert signature.parameters["limit"].default is inspect.Parameter.empty
+    assert signature.parameters["source_filter"].default is None
+    assert signature.parameters["time_range"].default is None
