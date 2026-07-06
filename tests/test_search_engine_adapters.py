@@ -13,7 +13,7 @@ from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.database import Database
-from memforge.storage.adapters.protocols import KeywordCandidate
+from memforge.storage.adapters.protocols import EntityLinkCandidate, KeywordCandidate
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
 
@@ -470,6 +470,305 @@ async def test_explicit_time_range_filters_vector_hits_before_ranking(db, monkey
     )
 
     assert [r.memory_id for r in result["results"]] == ["m-in-window"]
+
+
+@pytest.mark.asyncio
+async def test_identifier_lookup_prefers_rank_one_metadata_over_vector_plus_content(db, monkeypatch):
+    metadata_target = _memory("m-metadata", "Durable source-backed note with different wording")
+    content_competitor = _memory("m-content", "ISSUE 12345 lifecycle blocker note from content")
+    await db.insert_memory(metadata_target)
+    await db.insert_memory(content_competitor)
+    await db.upsert_source("src-issues", "issue", "Issue Tracker", "{}")
+    await _document(
+        db,
+        "ISSUE-12345",
+        "src-issues",
+        title="ISSUE-12345 lifecycle blocker",
+    )
+    await db.add_memory_source("m-metadata", "ISSUE-12345", "issue", None, source_updated_at=None)
+
+    adapters = build_sqlite_adapters(db, FakeCollection(["m-content", "m-metadata"]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("ISSUE-12345 lifecycle blocker", top_k=2)
+
+    assert result["query_analysis"]["ranking_profile"] == "identifier_lookup"
+    assert [r.memory_id for r in result["results"]][:2] == ["m-metadata", "m-content"]
+    assert result["results"][0].retrieval_evidence["metadata_lexical"]["channel"] == "bm25_metadata_tokens"
+
+
+@pytest.mark.asyncio
+async def test_code_symbol_metadata_hit_uses_identifier_profile(db, monkeypatch):
+    metadata_target = _memory("m-code-symbol", "Implementation note with durable source support")
+    semantic_competitor = _memory("m-semantic", "Payroll cutoff command retries after lock contention")
+    await db.insert_memory(metadata_target)
+    await db.insert_memory(semantic_competitor)
+    await db.upsert_source("src-code", "github", "Payroll Repository", "{}")
+    await _document(
+        db,
+        "src/payroll/PayrollCutoffCommand.py",
+        "src-code",
+        title="PayrollCutoffCommand.resolveWindow source reference",
+    )
+    await db.add_memory_source(
+        "m-code-symbol",
+        "src/payroll/PayrollCutoffCommand.py",
+        "github",
+        None,
+        source_updated_at=None,
+    )
+
+    adapters = build_sqlite_adapters(db, FakeCollection(["m-semantic", "m-code-symbol"]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("PayrollCutoffCommand", top_k=2)
+
+    assert result["query_analysis"]["ranking_profile"] == "identifier_lookup"
+    assert result["results"][0].memory_id == "m-code-symbol"
+
+
+@pytest.mark.asyncio
+async def test_code_symbol_without_metadata_support_does_not_force_identifier_profile(db, monkeypatch):
+    metadata_target = _memory("m-metadata", "Blocker hint Jira task summary")
+    semantic_competitor = _memory("m-semantic", "Command implementation retry analysis")
+    await db.insert_memory(metadata_target)
+    await db.insert_memory(semantic_competitor)
+    await db.upsert_source("src-jira", "jira", "Mount Tai Jira", "{}")
+    await _document(
+        db,
+        "SFPAY-100",
+        "src-jira",
+        title="Create blocker hint lifecycle task",
+    )
+    await db.add_memory_source("m-metadata", "SFPAY-100", "jira", None, source_updated_at=None)
+
+    adapters = build_sqlite_adapters(db, FakeCollection(["m-semantic", "m-metadata"]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    async def metadata_results(
+        _query,
+        _memory_types,
+        _scope,
+        limit,
+        *,
+        source_filter,
+        time_range,
+    ):
+        return [
+            KeywordCandidate(
+                memory_id="m-metadata",
+                score=10.0,
+                channel="bm25_metadata_tokens",
+                matched_text=("Create blocker hint lifecycle task",),
+            )
+        ]
+
+    monkeypatch.setattr(engine, "_bm25_metadata_search", metadata_results)
+
+    result = await engine.search("PersistCutOffBlockerHintsCommand blocker hint", top_k=2)
+
+    assert result["query_analysis"]["ranking_profile"] == "lexical_lookup"
+
+
+@pytest.mark.asyncio
+async def test_metadata_core_token_coverage_ignores_generic_work_item_modifiers(db, monkeypatch):
+    metadata_target = _memory("m-metadata", "Durable source-backed note with different wording")
+    content_competitor = _memory("m-content", "General Jira task discussion")
+    await db.insert_memory(metadata_target)
+    await db.insert_memory(content_competitor)
+    await db.upsert_source("src-jira", "jira", "Mount Tai Jira", "{}")
+    await _document(
+        db,
+        "SFPAY-179397",
+        "src-jira",
+        title="Create Blocker Hint in On Demand Lifecycle Assignment",
+    )
+    await db.add_memory_source("m-metadata", "SFPAY-179397", "jira", None, source_updated_at=None)
+
+    adapters = build_sqlite_adapters(db, FakeCollection(["m-content", "m-metadata"]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("create blocker hint jira task", top_k=2)
+
+    assert result["query_analysis"]["ranking_profile"] == "identifier_lookup"
+    assert result["results"][0].memory_id == "m-metadata"
+
+
+@pytest.mark.asyncio
+async def test_metadata_trigram_hit_does_not_force_identifier_profile(db, monkeypatch):
+    metadata_target = _memory("m-metadata", "Durable source-backed note")
+    await db.insert_memory(metadata_target)
+
+    adapters = build_sqlite_adapters(db, FakeCollection(["m-metadata"]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    async def metadata_results(
+        _query,
+        _memory_types,
+        _scope,
+        limit,
+        *,
+        source_filter,
+        time_range,
+    ):
+        return [
+            KeywordCandidate(
+                memory_id="m-metadata",
+                score=10.0,
+                channel="metadata_trigram",
+                matched_text=("Create Blocker Hint in On Demand Lifecycle Assignment",),
+            )
+        ]
+
+    monkeypatch.setattr(engine, "_bm25_metadata_search", metadata_results)
+
+    result = await engine.search("create blocker hint", top_k=1)
+
+    assert result["query_analysis"]["ranking_profile"] == "lexical_lookup"
+
+
+@pytest.mark.asyncio
+async def test_explanatory_query_uses_semantic_profile_instead_of_lexical_fallback(db, monkeypatch):
+    memory = _memory("m-semantic", "Payment retry policy after payroll cutoff")
+    await db.insert_memory(memory)
+
+    adapters = build_sqlite_adapters(db, FakeCollection([memory.id]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search(
+        "why does payroll cutoff affect payment retry policy",
+        top_k=1,
+    )
+
+    assert result["query_analysis"]["ranking_profile"] == "semantic_lookup"
+
+
+@pytest.mark.asyncio
+async def test_graph_exploration_downweights_broad_entity_fanout(db, monkeypatch):
+    specific = _memory("m-specific-target", "Specific graph target")
+    broad_target = _memory("m-broad-target", "Broad graph target")
+    await db.insert_memory(specific)
+    await db.insert_memory(broad_target)
+    specific_entity = await db.upsert_entity("specific topic", "Specific Topic", ["feature"])
+    broad_entity = await db.upsert_entity("broad topic", "Broad Topic", ["team"])
+    await db.link_memory_entity(specific.id, specific_entity)
+    await db.link_memory_entity(broad_target.id, broad_entity)
+    for index in range(100):
+        memory = _memory(f"m-broad-{index:03d}", f"Broad related memory {index}")
+        await db.insert_memory(memory)
+        await db.link_memory_entity(memory.id, broad_entity)
+
+    adapters = build_sqlite_adapters(db, FakeCollection([]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    async def empty_channel(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(engine, "_vector_search", empty_channel)
+    monkeypatch.setattr(engine, "_bm25_search", empty_channel)
+    monkeypatch.setattr(engine, "_bm25_metadata_search", empty_channel)
+
+    result = await engine.search(
+        "related risks dependencies around",
+        entities=["specific topic", "broad topic"],
+        top_k=5,
+    )
+
+    assert result["query_analysis"]["ranking_profile"] == "graph_exploration"
+    linked = {
+        item["canonical_name"]: item
+        for item in result["query_analysis"]["entity_linking"]
+    }
+    assert linked["specific topic"]["specificity"] == pytest.approx(1.0)
+    assert linked["broad topic"]["visible_memory_count"] >= 100
+    assert linked["broad topic"]["specificity"] < 1.0
+    assert result["results"][0].memory_id == specific.id
+
+
+def test_graph_contributions_choose_best_specific_entity_without_summing() -> None:
+    broad = EntityLinkCandidate(
+        entity_id=1,
+        canonical_name="Broad Topic",
+        matched_alias="Broad Topic",
+        channel="explicit",
+        contributing_channels=("explicit",),
+        score=1.0,
+        matched_text="Broad Topic",
+        activates_graph=True,
+        visible_memory_count=250,
+        visible_source_count=20,
+        specificity=0.3,
+    )
+    specific = EntityLinkCandidate(
+        entity_id=2,
+        canonical_name="Specific Topic",
+        matched_alias="Specific Topic",
+        channel="explicit",
+        contributing_channels=("explicit",),
+        score=1.0,
+        matched_text="Specific Topic",
+        activates_graph=True,
+        visible_memory_count=1,
+        visible_source_count=1,
+        specificity=1.0,
+    )
+
+    contributions = SearchEngine._graph_contributions(
+        [broad, specific],
+        [[("m-shared", 1.0)], [("m-shared", 1.0)]],
+    )
+
+    assert contributions["m-shared"].entity_id == specific.entity_id
+    assert contributions["m-shared"].multiplier == 1.0
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ today, so no caller reaches a connection directly.
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 from datetime import datetime
 from typing import Any, Sequence
@@ -93,6 +94,24 @@ _ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH = {
     "alias_fts": True,
     "alias_compact": False,
 }
+_ENTITY_SPECIFICITY_FULL_WEIGHT_MAX_MEMORIES = 8
+_ENTITY_SPECIFICITY_BROAD_ENTITY_MIN_MEMORIES = 100
+_ENTITY_SPECIFICITY_NORMALIZATION = 0.30
+_ENTITY_SPECIFICITY_BROAD_ENTITY_CAP = 0.50
+
+
+def _entity_specificity(visible_memory_count: int) -> float:
+    if visible_memory_count <= 0:
+        return 0.0
+    if visible_memory_count <= _ENTITY_SPECIFICITY_FULL_WEIGHT_MAX_MEMORIES:
+        return 1.0
+    raw = 1.0 / math.log2(2 + visible_memory_count)
+    normalized = raw / _ENTITY_SPECIFICITY_NORMALIZATION
+    # Keep the transition smooth near the full-weight cutoff while preventing
+    # very broad team/source entities from contributing like specific terms.
+    if visible_memory_count >= _ENTITY_SPECIFICITY_BROAD_ENTITY_MIN_MEMORIES:
+        return min(_ENTITY_SPECIFICITY_BROAD_ENTITY_CAP, normalized)
+    return min(1.0, normalized)
 
 
 def _entity_link_tokens(query: str) -> list[str]:
@@ -198,7 +217,7 @@ def _append_source_time_predicates(
     joins: list[str],
     clauses: list[str],
     params: list[Any],
-) -> str:
+) -> tuple[str, bool]:
     """Append canonical source/time predicates and return the deterministic order.
 
     `source_updated_at` intentionally lives on the same `memory_sources` row as
@@ -251,8 +270,50 @@ def _append_source_time_predicates(
             raise ValueError(f"Unsupported memory time range date_type: {time_range.date_type}")
 
     if has_time_filter and time_range is not None and time_range.date_type == "source_updated_at":
-        return "MAX(ms.source_updated_at) DESC, m.id DESC"
-    return "m.updated_at DESC, m.id DESC"
+        return "MAX(ms.source_updated_at) DESC, m.id DESC", needs_source_join
+    return "m.updated_at DESC, m.id DESC", needs_source_join
+
+
+def _source_count_sql(
+    *,
+    has_source_row_join: bool,
+    disabled_source_ids: Sequence[str],
+) -> tuple[str, str, list[str]]:
+    if has_source_row_join:
+        return "", "COUNT(DISTINCT ms.source_id)", []
+    if not disabled_source_ids:
+        return (
+            "LEFT JOIN memory_sources ms_count ON m.id = ms_count.memory_id",
+            "COUNT(DISTINCT ms_count.source_id)",
+            [],
+        )
+    placeholders = ", ".join("?" for _ in disabled_source_ids)
+    return (
+        "LEFT JOIN memory_sources ms_count ON m.id = ms_count.memory_id "
+        f"AND (ms_count.source_id IS NULL OR ms_count.source_id NOT IN ({placeholders}))",
+        "COUNT(DISTINCT ms_count.source_id)",
+        list(disabled_source_ids),
+    )
+
+
+def _entity_link_bound_params(
+    *,
+    pre_source_count_params: Sequence[Any],
+    source_count_params: Sequence[Any],
+    post_source_count_params: Sequence[Any],
+    limit: int,
+) -> list[Any]:
+    """Bind entity-link SQL in the same order its placeholders appear.
+
+    `visible_source_count` is projected in the SELECT list, so its placeholders
+    must come after CTE parameters but before FROM/WHERE filter parameters.
+    """
+    return [
+        *pre_source_count_params,
+        *source_count_params,
+        *post_source_count_params,
+        limit,
+    ]
 
 
 class SqliteRelationalStore:
@@ -463,14 +524,13 @@ class SqliteRelationalStore:
         clauses = [predicate_sql]
         params: list[Any] = list(predicate_params)
         disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
-        order_sql = _append_source_time_predicates(
+        order_sql, has_source_row_join = _append_source_time_predicates(
             source_filter=source_filter,
             time_range=time_range,
             joins=joins,
             clauses=clauses,
             params=params,
         )
-        has_source_row_join = any("memory_sources ms" in join for join in joins)
         if has_source_row_join and disabled_source_ids:
             placeholders = ", ".join("?" for _ in disabled_source_ids)
             clauses.append(f"(ms.source_id IS NULL OR ms.source_id NOT IN ({placeholders}))")
@@ -505,6 +565,9 @@ class SqliteRelationalStore:
         scope: AccessScope,
         memory_types: list[str] | None,
         limit: int,
+        *,
+        source_filter: MemorySourceFilter | None = None,
+        time_range: MemoryTimeRange | None = None,
     ) -> list[tuple[str, float]]:
         ids = list(entity_ids)
         if not ids:
@@ -512,24 +575,49 @@ class SqliteRelationalStore:
 
         placeholders = ",".join("?" for _ in ids)
         predicate_sql, predicate_params = visible_sql(scope, "m")
-        type_filter = ""
-        type_params: list[Any] = []
+        joins: list[str] = []
+        clauses = [predicate_sql]
+        params: list[Any] = [*predicate_params]
+
+        source_filter = source_filter or MemorySourceFilter()
+        _, has_source_row_join = _append_source_time_predicates(
+            source_filter=source_filter,
+            time_range=time_range,
+            joins=joins,
+            clauses=clauses,
+            params=params,
+        )
         if memory_types:
             type_placeholders = ",".join("?" for _ in memory_types)
-            type_filter = f"AND m.memory_type IN ({type_placeholders})"
-            type_params = list(memory_types)
+            clauses.append(f"m.memory_type IN ({type_placeholders})")
+            params.extend(memory_types)
+
+        disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
+        if has_source_row_join and disabled_source_ids:
+            disabled_placeholders = ", ".join("?" for _ in disabled_source_ids)
+            clauses.append(f"(ms.source_id IS NULL OR ms.source_id NOT IN ({disabled_placeholders}))")
+            params.extend(disabled_source_ids)
+        else:
+            source_visibility_sql, source_visibility_params = _enabled_source_visibility_condition(disabled_source_ids)
+            if source_visibility_sql:
+                clauses.append(source_visibility_sql)
+                params.extend(source_visibility_params)
+
+        join_sql = " ".join(joins)
+        where_sql = " AND ".join(clauses)
 
         direct_sql = (
-            "SELECT m.id, COUNT(me.entity_id) AS entity_overlap "
+            "SELECT m.id, COUNT(DISTINCT me.entity_id) AS entity_overlap "
             "FROM memories m "
             "JOIN memory_entities me ON m.id = me.memory_id "
+            f"{join_sql} "
             f"WHERE me.entity_id IN ({placeholders}) "
-            f"AND {predicate_sql} {type_filter} "
+            f"AND {where_sql} "
             "GROUP BY m.id "
             "ORDER BY entity_overlap DESC "
             "LIMIT ?"
         )
-        direct_params: list[Any] = [*ids, *predicate_params, *type_params, limit]
+        direct_params: list[Any] = [*ids, *params, limit]
 
         direct_results: list[tuple[str, int]] = []
         try:
@@ -553,9 +641,10 @@ class SqliteRelationalStore:
                 "FROM memory_entities me1 "
                 "JOIN memory_entities me2 ON me1.entity_id = me2.entity_id "
                 "JOIN memories m ON me2.memory_id = m.id "
+                f"{join_sql} "
                 f"WHERE me1.memory_id IN ({d_placeholders}) "
                 f"AND m.id NOT IN ({d_placeholders}) "
-                f"AND {predicate_sql} {type_filter} "
+                f"AND {where_sql} "
                 "GROUP BY m.id "
                 f"HAVING shared_entities >= {_MIN_SHARED_ENTITIES_FOR_EXPANSION} "
                 "ORDER BY shared_entities DESC "
@@ -564,8 +653,7 @@ class SqliteRelationalStore:
             expanded_params: list[Any] = [
                 *direct_ids,
                 *direct_ids,
-                *predicate_params,
-                *type_params,
+                *params,
                 limit,
             ]
             try:
@@ -585,6 +673,7 @@ class SqliteRelationalStore:
         scope: AccessScope,
         explicit_entities: Sequence[str] = (),
         source_filter: MemorySourceFilter | None = None,
+        time_range: MemoryTimeRange | None = None,
         memory_types: Sequence[str] | None = None,
         limit: int = DEFAULT_ENTITY_LINK_LIMIT,
     ) -> EntityLinkResult:
@@ -604,15 +693,21 @@ class SqliteRelationalStore:
                 channel=channel,
                 scope=scope,
                 source_filter=source_filter,
+                time_range=time_range,
                 memory_types=memory_types,
                 limit=max(max_candidates * 4, max_candidates),
             )
             for row in rows:
                 entity_id = int(row["entity_id"])
+                visible_memory_count = int(row["visible_memory_count"] or 0)
+                visible_source_count = int(row["visible_source_count"] or 0)
                 if channel == "explicit":
                     matched_explicit_terms.add(str(row["match_key"]))
                 score = _ENTITY_LINK_CHANNEL_SCORE[channel]
-                activates_graph = _ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH[channel]
+                activates_graph = (
+                    _ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH[channel]
+                    and visible_memory_count > 0
+                )
                 candidate = EntityLinkCandidate(
                     entity_id=entity_id,
                     canonical_name=str(row["canonical_name"]),
@@ -622,6 +717,9 @@ class SqliteRelationalStore:
                     score=score,
                     matched_text=terms.get(str(row["match_key"]), str(row["match_key"])),
                     activates_graph=activates_graph,
+                    visible_memory_count=visible_memory_count,
+                    visible_source_count=visible_source_count,
+                    specificity=_entity_specificity(visible_memory_count),
                 )
                 existing = candidates.get(entity_id)
                 if existing is None:
@@ -641,6 +739,9 @@ class SqliteRelationalStore:
                         score=score,
                         matched_text=candidate.matched_text,
                         activates_graph=activates_graph,
+                        visible_memory_count=candidate.visible_memory_count,
+                        visible_source_count=candidate.visible_source_count,
+                        specificity=candidate.specificity,
                     )
                 else:
                     candidates[entity_id] = EntityLinkCandidate(
@@ -652,6 +753,9 @@ class SqliteRelationalStore:
                         score=existing.score,
                         matched_text=existing.matched_text,
                         activates_graph=existing.activates_graph,
+                        visible_memory_count=existing.visible_memory_count,
+                        visible_source_count=existing.visible_source_count,
+                        specificity=existing.specificity,
                     )
 
         await add_matches("explicit", explicit_terms)
@@ -666,11 +770,14 @@ class SqliteRelationalStore:
                 matched_text=" ".join(tokens),
                 scope=scope,
                 source_filter=source_filter,
+                time_range=time_range,
                 memory_types=memory_types,
                 limit=max(max_candidates * 4, max_candidates),
             ):
                 entity_id = int(row["entity_id"])
                 channel = "alias_fts"
+                visible_memory_count = int(row["visible_memory_count"] or 0)
+                visible_source_count = int(row["visible_source_count"] or 0)
                 candidate = EntityLinkCandidate(
                     entity_id=entity_id,
                     canonical_name=str(row["canonical_name"]),
@@ -679,7 +786,13 @@ class SqliteRelationalStore:
                     contributing_channels=(channel,),
                     score=_ENTITY_LINK_CHANNEL_SCORE[channel],
                     matched_text=str(row["matched_text"]),
-                    activates_graph=_ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH[channel],
+                    activates_graph=(
+                        _ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH[channel]
+                        and visible_memory_count > 0
+                    ),
+                    visible_memory_count=visible_memory_count,
+                    visible_source_count=visible_source_count,
+                    specificity=_entity_specificity(visible_memory_count),
                 )
                 existing = candidates.get(entity_id)
                 if existing is None:
@@ -698,6 +811,9 @@ class SqliteRelationalStore:
                             score=candidate.score,
                             matched_text=candidate.matched_text,
                             activates_graph=candidate.activates_graph,
+                            visible_memory_count=candidate.visible_memory_count,
+                            visible_source_count=candidate.visible_source_count,
+                            specificity=candidate.specificity,
                         )
                     else:
                         candidates[entity_id] = EntityLinkCandidate(
@@ -709,6 +825,9 @@ class SqliteRelationalStore:
                             score=existing.score,
                             matched_text=existing.matched_text,
                             activates_graph=existing.activates_graph,
+                            visible_memory_count=existing.visible_memory_count,
+                            visible_source_count=existing.visible_source_count,
+                            specificity=existing.specificity,
                         )
         await add_matches("alias_compact", _entity_link_compact_terms(tokens))
 
@@ -737,6 +856,7 @@ class SqliteRelationalStore:
         channel: str,
         scope: AccessScope,
         source_filter: MemorySourceFilter | None,
+        time_range: MemoryTimeRange | None,
         memory_types: Sequence[str] | None,
         limit: int,
     ) -> list[Any]:
@@ -759,35 +879,42 @@ class SqliteRelationalStore:
         predicate_sql, predicate_params = visible_sql(scope, "m")
         joins: list[str] = []
         clauses = [predicate_sql]
-        params: list[Any] = [*term_values, *term_values, *predicate_params]
+        filter_params: list[Any] = [*predicate_params]
 
         source_filter = source_filter or MemorySourceFilter()
-        _append_source_time_predicates(
+        _, has_source_row_join = _append_source_time_predicates(
             source_filter=source_filter,
-            time_range=None,
+            time_range=time_range,
             joins=joins,
             clauses=clauses,
-            params=params,
+            params=filter_params,
         )
 
         if memory_types:
             type_placeholders = ",".join("?" for _ in memory_types)
             clauses.append(f"m.memory_type IN ({type_placeholders})")
-            params.extend(memory_types)
+            filter_params.extend(memory_types)
 
         disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
-        has_source_row_join = any("memory_sources ms" in join for join in joins)
         if has_source_row_join and disabled_source_ids:
             disabled_placeholders = ", ".join("?" for _ in disabled_source_ids)
             clauses.append(f"(ms.source_id IS NULL OR ms.source_id NOT IN ({disabled_placeholders}))")
-            params.extend(disabled_source_ids)
+            filter_params.extend(disabled_source_ids)
         else:
             source_visibility_sql, source_visibility_params = _enabled_source_visibility_condition(disabled_source_ids)
             if source_visibility_sql:
                 clauses.append(source_visibility_sql)
-                params.extend(source_visibility_params)
+                filter_params.extend(source_visibility_params)
 
         join_sql = " ".join(joins)
+        source_count_join, source_count_expr, source_count_params = _source_count_sql(
+            has_source_row_join=has_source_row_join,
+            disabled_source_ids=disabled_source_ids,
+        )
+        count_select = (
+            "COUNT(DISTINCT m.id) AS visible_memory_count, "
+            f"{source_count_expr} AS visible_source_count"
+        )
         where_sql = " AND ".join(clauses)
         sql = (
             "WITH matched_aliases(entity_id, matched_alias, alias_normalized, match_key) AS ("
@@ -798,19 +925,26 @@ class SqliteRelationalStore:
             f"FROM entity_aliases ea WHERE {alias_match}"
             ") "
             "SELECT ma.entity_id, e.canonical_name, ma.matched_alias, "
-            "ma.alias_normalized, ma.match_key, COUNT(DISTINCT m.id) AS visible_memory_count "
+            f"ma.alias_normalized, ma.match_key, {count_select} "
             "FROM matched_aliases ma "
             "JOIN entities e ON e.id = ma.entity_id "
             "JOIN memory_entities me ON me.entity_id = ma.entity_id "
             "JOIN memories m ON m.id = me.memory_id "
             f"{join_sql} "
+            f"{source_count_join} "
             f"WHERE {where_sql} "
             "GROUP BY ma.entity_id, e.canonical_name, ma.matched_alias, ma.alias_normalized, ma.match_key "
             "ORDER BY visible_memory_count DESC, LENGTH(ma.alias_normalized) DESC, e.canonical_name ASC "
             "LIMIT ?"
         )
+        bound_params = _entity_link_bound_params(
+            pre_source_count_params=(*term_values, *term_values),
+            source_count_params=source_count_params,
+            post_source_count_params=filter_params,
+            limit=limit,
+        )
         try:
-            async with self._db.db.execute(sql, [*params, limit]) as cursor:
+            async with self._db.db.execute(sql, bound_params) as cursor:
                 return [row async for row in cursor]
         except (aiosqlite.Error, sqlite3.Error):
             logger.exception("SQLite entity linker query failed")
@@ -824,6 +958,7 @@ class SqliteRelationalStore:
         matched_text: str,
         scope: AccessScope,
         source_filter: MemorySourceFilter | None,
+        time_range: MemoryTimeRange | None,
         memory_types: Sequence[str] | None,
         limit: int,
     ) -> list[dict[str, Any]]:
@@ -832,35 +967,42 @@ class SqliteRelationalStore:
         predicate_sql, predicate_params = visible_sql(scope, "m")
         joins: list[str] = []
         clauses = [predicate_sql]
-        params: list[Any] = [fts_query, *predicate_params]
+        filter_params: list[Any] = [*predicate_params]
 
         source_filter = source_filter or MemorySourceFilter()
-        _append_source_time_predicates(
+        _, has_source_row_join = _append_source_time_predicates(
             source_filter=source_filter,
-            time_range=None,
+            time_range=time_range,
             joins=joins,
             clauses=clauses,
-            params=params,
+            params=filter_params,
         )
 
         if memory_types:
             type_placeholders = ",".join("?" for _ in memory_types)
             clauses.append(f"m.memory_type IN ({type_placeholders})")
-            params.extend(memory_types)
+            filter_params.extend(memory_types)
 
         disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
-        has_source_row_join = any("memory_sources ms" in join for join in joins)
         if has_source_row_join and disabled_source_ids:
             disabled_placeholders = ", ".join("?" for _ in disabled_source_ids)
             clauses.append(f"(ms.source_id IS NULL OR ms.source_id NOT IN ({disabled_placeholders}))")
-            params.extend(disabled_source_ids)
+            filter_params.extend(disabled_source_ids)
         else:
             source_visibility_sql, source_visibility_params = _enabled_source_visibility_condition(disabled_source_ids)
             if source_visibility_sql:
                 clauses.append(source_visibility_sql)
-                params.extend(source_visibility_params)
+                filter_params.extend(source_visibility_params)
 
         join_sql = " ".join(joins)
+        source_count_join, source_count_expr, source_count_params = _source_count_sql(
+            has_source_row_join=has_source_row_join,
+            disabled_source_ids=disabled_source_ids,
+        )
+        count_select = (
+            "COUNT(DISTINCT m.id) AS visible_memory_count, "
+            f"{source_count_expr} AS visible_source_count"
+        )
         where_sql = " AND ".join(clauses)
         sql = (
             "WITH matched_aliases AS ("
@@ -869,19 +1011,26 @@ class SqliteRelationalStore:
             "WHERE entity_alias_search_fts MATCH ?"
             ") "
             "SELECT ma.entity_id, e.canonical_name, ma.alias_normalized AS matched_alias, "
-            "ma.search_text, MIN(ma.fts_rank) AS best_rank, COUNT(DISTINCT m.id) AS visible_memory_count "
+            f"ma.search_text, MIN(ma.fts_rank) AS best_rank, {count_select} "
             "FROM matched_aliases ma "
             "JOIN entities e ON e.id = ma.entity_id "
             "JOIN memory_entities me ON me.entity_id = ma.entity_id "
             "JOIN memories m ON m.id = me.memory_id "
             f"{join_sql} "
+            f"{source_count_join} "
             f"WHERE {where_sql} "
             "GROUP BY ma.entity_id, e.canonical_name, ma.alias_normalized, ma.search_text "
             "ORDER BY best_rank ASC, visible_memory_count DESC, e.canonical_name ASC "
             "LIMIT ?"
         )
+        bound_params = _entity_link_bound_params(
+            pre_source_count_params=(fts_query,),
+            source_count_params=source_count_params,
+            post_source_count_params=filter_params,
+            limit=limit,
+        )
         try:
-            async with self._db.db.execute(sql, [*params, limit]) as cursor:
+            async with self._db.db.execute(sql, bound_params) as cursor:
                 rows = [dict(row) async for row in cursor]
         except (aiosqlite.Error, sqlite3.Error):
             logger.exception("SQLite entity alias FTS query failed")

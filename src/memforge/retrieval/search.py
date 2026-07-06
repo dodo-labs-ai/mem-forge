@@ -1,9 +1,8 @@
 """Hybrid search engine for MemForge.
 
-Three retrieval channels run in parallel (vector, BM25/FTS5, entity-graph),
-fused via Reciprocal Rank Fusion (RRF), then strictly filtered by source/time
-facets and ranked with a recency-weighted final score. Optional cross-encoder
-reranking via LLM can be enabled for higher precision at scale.
+Vector, content BM25/FTS, metadata lexical, and entity-graph channels run in
+parallel, then fuse through query-adaptive weighted RRF before the final ranking
+and source/time page slicing.
 
 Architecture reference: docs/architecture.md Section 10.
 """
@@ -13,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -55,6 +56,75 @@ W_RECENCY_DEFAULT = 0.15
 CROSS_PROJECT_PENALTY = 0.20
 REPO_AFFINITY_BOOST = 0.05
 CURATION_CHILD_EXACT_MATCH_MARGIN = 0.15
+QUERY_ADAPTIVE_RRF_K = 60
+
+_PROFILE_WEIGHTS: dict[str, dict[str, float]] = {
+    "identifier_lookup": {
+        "vector": 0.15,
+        "bm25_content": 0.25,
+        "metadata_lexical": 0.50,
+        "graph": 0.10,
+    },
+    "semantic_lookup": {
+        "vector": 0.45,
+        "bm25_content": 0.30,
+        "metadata_lexical": 0.15,
+        "graph": 0.10,
+    },
+    "graph_exploration": {
+        "vector": 0.25,
+        "bm25_content": 0.25,
+        "metadata_lexical": 0.20,
+        "graph": 0.30,
+    },
+    "lexical_lookup": {
+        "vector": 0.25,
+        "bm25_content": 0.35,
+        "metadata_lexical": 0.30,
+        "graph": 0.10,
+    },
+}
+
+_METADATA_SUBCHANNEL_WEIGHTS = {
+    "bm25_metadata_tokens": 0.60,
+    "metadata_alias": 0.30,
+    "metadata_trigram": 0.10,
+}
+_METADATA_IDENTIFIER_CHANNELS = {"bm25_metadata_tokens", "metadata_alias"}
+
+_QUESTION_WORDS = {
+    "what", "why", "how", "when", "where", "which", "who", "whom", "whose",
+}
+_EXPLANATORY_VERBS = {
+    "explain", "understand", "diagnose", "debug", "troubleshoot", "analyze",
+    "compare", "cause", "causes", "caused", "reason", "reasons", "affect",
+    "affects", "affected",
+}
+_SENTENCE_CONNECTORS = {
+    "the", "a", "an", "to", "for", "of", "in", "on", "with", "after",
+    "before", "because", "when", "while", "if", "does", "did", "is", "are",
+}
+_GRAPH_ACTION_TERMS = {
+    "related", "relation", "relationship", "dependency", "dependencies",
+    "depends", "impact", "impacts", "similar", "connected", "owner",
+    "neighborhood", "upstream", "downstream", "risk", "risks", "affected",
+}
+_GRAPH_INVENTORY_TERMS = {
+    "related", "nearby", "neighbor", "neighbors", "neighborhood", "connected",
+    "around", "dependencies", "upstream", "downstream", "affected", "impact",
+    "risks", "list", "show", "find",
+}
+_METADATA_LOOKUP_MODIFIER_TOKENS = {
+    "bug", "bugs", "find", "issue", "issues", "jira", "list", "pr", "prs",
+    "pull", "request", "requests", "search", "show", "stories", "story",
+    "task", "tasks", "ticket", "tickets",
+}
+_METADATA_IDENTIFIER_COVERAGE_THRESHOLD = 0.75
+_EXTERNAL_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b|#\d+\b|\bINC\d+\b", re.IGNORECASE)
+_CODE_SYMBOL_RE = re.compile(
+    r"(?:\b[A-Za-z][A-Za-z0-9]*[./][A-Za-z0-9_./-]+\b)"
+    r"|(?:\b[A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*\b)"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +144,24 @@ class _RankedCandidate:
     curation_cluster_id: str | None = None
     covered_memory_count: int = 0
     retrieval_evidence: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _QueryFeatures:
+    tokens: tuple[str, ...]
+    has_external_id: bool
+    has_code_symbol: bool
+    code_symbol_terms: tuple[str, ...]
+    natural_language_ratio: float
+    graph_intent: float
+
+
+@dataclass(frozen=True)
+class _GraphContribution:
+    memory_id: str
+    rank: int
+    multiplier: float
+    entity_id: int
 
 
 def _affinity_penalty(project_key: str | None, scope: AccessScope) -> float:
@@ -114,6 +202,193 @@ def _age_days(dt: datetime | None) -> float:
 def _recency_score(age_days: float, half_life: float = 90.0) -> float:
     """Exponential decay: exp(-0.693 * age_days / half_life)."""
     return math.exp(-0.693 * age_days / half_life)
+
+
+def _query_tokens(query: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", query).lower()
+    return tuple(token for token in re.split(r"[^0-9a-z]+", normalized) if token)
+
+
+def _query_code_symbol_terms(query: str) -> tuple[str, ...]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for match in _CODE_SYMBOL_RE.finditer(query):
+        for token in _query_tokens(match.group(0)):
+            if token not in seen:
+                terms.append(token)
+                seen.add(token)
+    return tuple(terms)
+
+
+def _compute_query_features(
+    query: str,
+    *,
+    graph_candidates: list[EntityLinkCandidate],
+) -> _QueryFeatures:
+    tokens = _query_tokens(query)
+    code_symbol_terms = _query_code_symbol_terms(query)
+    token_set = set(tokens)
+    has_question_word = bool(token_set & _QUESTION_WORDS) or "?" in query
+    has_explanatory_verb = bool(token_set & _EXPLANATORY_VERBS)
+    has_sentence_shape = len(tokens) >= 5 and bool(token_set & _SENTENCE_CONNECTORS)
+    natural_language_ratio = min(
+        1.0,
+        min(0.30, len(tokens) / 25)
+        + (0.15 if has_question_word else 0.0)
+        + (0.15 if has_explanatory_verb else 0.0)
+        + (0.10 if has_sentence_shape else 0.0),
+    )
+
+    if graph_candidates:
+        graph_action_count = len(token_set & _GRAPH_ACTION_TERMS)
+        graph_intent = min(
+            1.0,
+            0.35 * graph_action_count
+            + (0.25 if token_set & _GRAPH_INVENTORY_TERMS else 0.0),
+        )
+    else:
+        graph_intent = 0.0
+
+    return _QueryFeatures(
+        tokens=tokens,
+        has_external_id=bool(_EXTERNAL_ID_RE.search(query)),
+        has_code_symbol=bool(code_symbol_terms),
+        code_symbol_terms=code_symbol_terms,
+        natural_language_ratio=natural_language_ratio,
+        graph_intent=graph_intent,
+    )
+
+
+def _metadata_identifier_core_tokens(tokens: tuple[str, ...]) -> set[str]:
+    return {
+        token for token in tokens
+        if len(token) > 1
+        and token not in _METADATA_LOOKUP_MODIFIER_TOKENS
+        and token not in _QUESTION_WORDS
+        and token not in _SENTENCE_CONNECTORS
+    }
+
+
+def _metadata_identifier_core_query(query: str) -> str:
+    tokens = _query_tokens(query)
+    core_tokens = [
+        token for token in tokens
+        if len(token) > 1
+        and token not in _METADATA_LOOKUP_MODIFIER_TOKENS
+        and token not in _QUESTION_WORDS
+        and token not in _SENTENCE_CONNECTORS
+    ]
+    deduped_core_tokens = tuple(dict.fromkeys(core_tokens))
+    if len(deduped_core_tokens) < 2:
+        return query
+    return " ".join(deduped_core_tokens)
+
+
+def _metadata_identifier_coverage(
+    query_tokens: tuple[str, ...],
+    matched_text: tuple[str, ...],
+) -> float:
+    core_tokens = _metadata_identifier_core_tokens(query_tokens)
+    if len(core_tokens) < 2:
+        return 0.0
+    matched_tokens = set(_query_tokens(" ".join(matched_text)))
+    return len(core_tokens & matched_tokens) / len(core_tokens)
+
+
+def _metadata_supports_code_symbol(
+    features: _QueryFeatures,
+    matched_text: tuple[str, ...],
+) -> bool:
+    if not features.code_symbol_terms:
+        return False
+    matched_tokens = set(_query_tokens(" ".join(matched_text)))
+    return set(features.code_symbol_terms).issubset(matched_tokens)
+
+
+def _select_ranking_profile(
+    features: _QueryFeatures,
+    *,
+    metadata_hits: list[KeywordCandidate],
+    graph_candidates: list[EntityLinkCandidate],
+) -> str:
+    if features.has_external_id:
+        return "identifier_lookup"
+    if any(hit.channel in _METADATA_IDENTIFIER_CHANNELS for hit in metadata_hits):
+        if any(
+            _metadata_identifier_coverage(features.tokens, hit.matched_text)
+            >= _METADATA_IDENTIFIER_COVERAGE_THRESHOLD
+            or (
+                features.has_code_symbol
+                and _metadata_supports_code_symbol(features, hit.matched_text)
+            )
+            for hit in metadata_hits
+            if hit.channel in _METADATA_IDENTIFIER_CHANNELS and hit.matched_text
+        ):
+            return "identifier_lookup"
+    if (
+        graph_candidates
+        and features.graph_intent >= 0.65
+        and features.graph_intent >= features.natural_language_ratio + 0.15
+    ):
+        return "graph_exploration"
+    if features.natural_language_ratio >= 0.55:
+        return "semantic_lookup"
+    return "lexical_lookup"
+
+
+def _metadata_lexical_channel(
+    metadata_hits: list[KeywordCandidate],
+    *,
+    k: int,
+) -> list[tuple[str, float]]:
+    scores: dict[str, float] = {}
+    best_rank: dict[str, int] = {}
+    for channel, weight in _METADATA_SUBCHANNEL_WEIGHTS.items():
+        channel_hits = [
+            hit for hit in metadata_hits
+            if hit.channel == channel
+        ]
+        channel_hits.sort(key=lambda hit: hit.score, reverse=True)
+        for rank_0, hit in enumerate(channel_hits):
+            rank = rank_0 + 1
+            scores[hit.memory_id] = scores.get(hit.memory_id, 0.0) + weight / (k + rank)
+            best_rank[hit.memory_id] = min(best_rank.get(hit.memory_id, rank), rank)
+    return sorted(
+        scores.items(),
+        key=lambda item: (-item[1], best_rank.get(item[0], 10**9), item[0]),
+    )
+
+
+def _weighted_rrf_fusion(
+    *,
+    vector_results: list[tuple[str, float]],
+    content_results: list[tuple[str, float]],
+    metadata_results: list[tuple[str, float]],
+    graph_contributions: dict[str, _GraphContribution],
+    profile: str,
+    k: int,
+) -> list[_RankedCandidate]:
+    weights = _PROFILE_WEIGHTS[profile]
+    scores: dict[str, float] = {}
+
+    def add_ranked(channel: str, results: list[tuple[str, float]]) -> None:
+        sorted_channel = sorted(results, key=lambda x: x[1], reverse=True)
+        for rank_0, (memory_id, _score) in enumerate(sorted_channel):
+            rank = rank_0 + 1
+            scores[memory_id] = scores.get(memory_id, 0.0) + weights[channel] / (k + rank)
+
+    add_ranked("vector", vector_results)
+    add_ranked("bm25_content", content_results)
+    add_ranked("metadata_lexical", metadata_results)
+    for memory_id, contribution in graph_contributions.items():
+        scores[memory_id] = scores.get(memory_id, 0.0) + (
+            weights["graph"] / (k + contribution.rank) * contribution.multiplier
+        )
+
+    return [
+        _RankedCandidate(memory_id=mid, rrf_score=score)
+        for mid, score in sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    ]
 
 
 def _search_follow_up_for_memory(
@@ -178,6 +453,9 @@ def _entity_link_candidate_payload(candidate: EntityLinkCandidate) -> dict[str, 
         "score": candidate.score,
         "matched_text": candidate.matched_text,
         "activates_graph": candidate.activates_graph,
+        "visible_memory_count": candidate.visible_memory_count,
+        "visible_source_count": candidate.visible_source_count,
+        "specificity": candidate.specificity,
     }
 
 
@@ -321,6 +599,7 @@ class SearchEngine:
             scope=scope,
             explicit_entities=entities or (),
             source_filter=combined_source_filter,
+            time_range=time_range,
             memory_types=memory_types,
         )
         analysis.entity_linking = list(link_result.candidates)
@@ -354,11 +633,11 @@ class SearchEngine:
         ))
         channel_names.append("vector")
 
-        # BM25 is always on
+        # BM25 content is always on
         tasks.append(asyncio.ensure_future(
             self._bm25_search(query, analysis, memory_types, scope, fetch_k)
         ))
-        channel_names.append("bm25")
+        channel_names.append("bm25_content")
 
         tasks.append(asyncio.ensure_future(
             self._bm25_metadata_search(
@@ -372,36 +651,78 @@ class SearchEngine:
         ))
         channel_names.append("bm25_metadata_tokens")
 
-        # Graph traversal — only when entities detected
-        if analysis.use_graph and analysis.detected_entity_ids:
+        # Graph traversal — one bounded request per linked entity so each
+        # memory's graph rank can be tied to the specificity of the entity that
+        # actually contributed it.
+        graph_task_entities: list[EntityLinkCandidate] = []
+        if analysis.use_graph and graph_candidates:
             tasks.append(asyncio.ensure_future(
-                self._graph_search(analysis.detected_entity_ids, memory_types, scope, fetch_k)
+                asyncio.gather(
+                    *[
+                        self._graph_search(
+                            [candidate.entity_id],
+                            memory_types,
+                            scope,
+                            fetch_k,
+                            source_filter=combined_source_filter,
+                            time_range=time_range,
+                        )
+                        for candidate in graph_candidates
+                    ],
+                    return_exceptions=True,
+                )
             ))
             channel_names.append("graph")
+            graph_task_entities = graph_candidates
 
         raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Collect channel results, logging any errors
-        channel_results: list[list[tuple[str, float]]] = []
+        vector_results: list[tuple[str, float]] = []
+        content_results: list[tuple[str, float]] = []
+        metadata_hits: list[KeywordCandidate] = []
+        graph_contributions: dict[str, _GraphContribution] = {}
         metadata_evidence: dict[str, dict[str, Any]] = {}
         for name, result in zip(channel_names, raw_results):
             if isinstance(result, BaseException):
                 logger.error("Channel %s failed: %s", name, result, exc_info=result)
-                channel_results.append([])
+            elif name == "vector":
+                vector_results = list(result)
+            elif name == "bm25_content":
+                content_results = list(result)
             elif name == "bm25_metadata_tokens":
                 hits = list(result)
-                channel_results.append([(hit.memory_id, hit.score) for hit in hits])
-                metadata_evidence.update(
-                    {
-                        hit.memory_id: _metadata_keyword_evidence(hit)
-                        for hit in hits
-                    }
+                metadata_hits = hits
+                metadata_evidence.update(_best_metadata_evidence(hits))
+            elif name == "graph":
+                per_entity_results = list(result)
+                graph_contributions = self._graph_contributions(
+                    graph_task_entities,
+                    per_entity_results,
                 )
             else:
-                channel_results.append(result)
+                logger.warning("Unknown retrieval channel result ignored: %s", name)
 
-        # ----- 5. Fuse via RRF, then apply the source-of-truth re-checks -----
-        fused = self._rrf_fusion(channel_results, k=self._config.rrf_k)
+        features = _compute_query_features(query, graph_candidates=graph_candidates)
+        ranking_profile = _select_ranking_profile(
+            features,
+            metadata_hits=metadata_hits,
+            graph_candidates=graph_candidates,
+        )
+        metadata_channel = _metadata_lexical_channel(
+            metadata_hits,
+            k=getattr(self._config, "rrf_k", QUERY_ADAPTIVE_RRF_K),
+        )
+
+        # ----- 5. Fuse via query-adaptive Weighted RRF, then apply source-of-truth re-checks -----
+        fused = _weighted_rrf_fusion(
+            vector_results=vector_results,
+            content_results=content_results,
+            metadata_results=metadata_channel,
+            graph_contributions=graph_contributions,
+            profile=ranking_profile,
+            k=getattr(self._config, "rrf_k", QUERY_ADAPTIVE_RRF_K),
+        )
         self._attach_retrieval_evidence(fused, metadata_evidence)
         fused = await self._filter_candidates_by_status(fused, scope)
         if (
@@ -442,6 +763,7 @@ class SearchEngine:
                 ],
                 "entity_linking_channels": list(analysis.entity_linking_channels),
                 "unmatched_explicit_entities": list(analysis.unmatched_explicit_entities),
+                "ranking_profile": ranking_profile,
                 "strategies_used": channel_names,
             },
             "results": results,
@@ -517,7 +839,7 @@ class SearchEngine:
         time_range: MemoryTimeRange | None,
     ) -> list[KeywordCandidate]:
         """Query the source-metadata keyword channel."""
-        sanitized_query = _sanitize_fts_query(query)
+        sanitized_query = _sanitize_fts_query(_metadata_identifier_core_query(query))
         if not sanitized_query:
             return []
         return await self._keyword.search_metadata(
@@ -527,6 +849,7 @@ class SearchEngine:
             limit,
             source_filter=source_filter,
             time_range=time_range,
+            include_subchannel_hits=True,
         )
 
     async def _graph_search(
@@ -535,10 +858,18 @@ class SearchEngine:
         memory_types: list[str] | None,
         scope: AccessScope,
         limit: int,
+        *,
+        source_filter: MemorySourceFilter | None = None,
+        time_range: MemoryTimeRange | None = None,
     ) -> list[tuple[str, float]]:
         """Entity-graph traversal via the relational channel."""
         return await self._relational.graph_search(
-            entity_ids, scope, memory_types, limit
+            entity_ids,
+            scope,
+            memory_types,
+            limit,
+            source_filter=source_filter,
+            time_range=time_range,
         )
 
     # ==================================================================
@@ -571,6 +902,38 @@ class SearchEngine:
             for mid, s in sorted(scores.items(), key=lambda x: x[1], reverse=True)
         ]
         return candidates
+
+    @staticmethod
+    def _graph_contributions(
+        graph_candidates: list[EntityLinkCandidate],
+        per_entity_results: list[Any],
+    ) -> dict[str, _GraphContribution]:
+        contributions: dict[str, _GraphContribution] = {}
+        for candidate, result in zip(graph_candidates, per_entity_results):
+            if isinstance(result, BaseException):
+                logger.error("Graph channel failed for entity %s: %s", candidate.entity_id, result, exc_info=result)
+                continue
+            multiplier = max(0.0, min(1.0, float(candidate.specificity or 0.0)))
+            sorted_results = sorted(list(result), key=lambda item: item[1], reverse=True)
+            for rank_0, (memory_id, _score) in enumerate(sorted_results):
+                rank = rank_0 + 1
+                existing = contributions.get(memory_id)
+                if existing is None or (
+                    multiplier,
+                    -rank,
+                    -candidate.entity_id,
+                ) > (
+                    existing.multiplier,
+                    -existing.rank,
+                    -existing.entity_id,
+                ):
+                    contributions[memory_id] = _GraphContribution(
+                        memory_id=memory_id,
+                        rank=rank,
+                        multiplier=multiplier,
+                        entity_id=candidate.entity_id,
+                    )
+        return contributions
 
     @staticmethod
     def _attach_retrieval_evidence(
@@ -968,6 +1331,29 @@ def _metadata_keyword_evidence(hit: KeywordCandidate) -> dict[str, Any]:
             }
             for ref in hit.source_refs
         ],
+    }
+
+
+def _best_metadata_evidence(hits: list[KeywordCandidate]) -> dict[str, dict[str, Any]]:
+    priority = {
+        "bm25_metadata_tokens": 3,
+        "metadata_alias": 2,
+        "metadata_trigram": 1,
+    }
+    best: dict[str, KeywordCandidate] = {}
+    for hit in hits:
+        previous = best.get(hit.memory_id)
+        if previous is None or (
+            priority.get(hit.channel, 0),
+            hit.score,
+        ) > (
+            priority.get(previous.channel, 0),
+            previous.score,
+        ):
+            best[hit.memory_id] = hit
+    return {
+        memory_id: _metadata_keyword_evidence(hit)
+        for memory_id, hit in best.items()
     }
 
 

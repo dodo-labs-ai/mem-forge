@@ -178,6 +178,7 @@ class SqliteKeywordSearch:
         *,
         source_filter: MemorySourceFilter | None = None,
         time_range: MemoryTimeRange | None = None,
+        include_subchannel_hits: bool = False,
     ) -> list[KeywordCandidate]:
         if limit <= 0:
             return []
@@ -224,7 +225,11 @@ class SqliteKeywordSearch:
                     time_range,
                 )
             )
-            return _dedupe_metadata_hits(hits, limit)
+            return _dedupe_metadata_hits(
+                hits,
+                limit,
+                include_subchannel_hits=include_subchannel_hits,
+            )
         except Exception:
             logger.exception("Metadata keyword search failed")
             return []
@@ -455,24 +460,35 @@ class SqliteKeywordSearch:
         return {"source_refs": source_refs, "matched_text": matched_text}
 
 
-def _dedupe_metadata_hits(hits: list[KeywordCandidate], limit: int) -> list[KeywordCandidate]:
-    best: dict[str, KeywordCandidate] = {}
+def _dedupe_metadata_hits(
+    hits: list[KeywordCandidate],
+    limit: int,
+    *,
+    include_subchannel_hits: bool,
+) -> list[KeywordCandidate]:
+    best: dict[str | tuple[str, str], KeywordCandidate] = {}
     channel_priority = {
         "bm25_metadata_tokens": 3,
         "metadata_alias": 2,
         "metadata_trigram": 1,
     }
     for hit in hits:
-        previous = best.get(hit.memory_id)
+        key = (hit.memory_id, hit.channel) if include_subchannel_hits else hit.memory_id
+        previous = best.get(key)
         if previous is None:
-            best[hit.memory_id] = hit
+            best[key] = hit
             continue
-        current_key = (channel_priority.get(hit.channel, 0), hit.score)
-        previous_key = (channel_priority.get(previous.channel, 0), previous.score)
-        if current_key > previous_key:
-            best[hit.memory_id] = hit
+        if (
+            channel_priority.get(hit.channel, 0),
+            hit.score,
+        ) > (
+            channel_priority.get(previous.channel, 0),
+            previous.score,
+        ):
+            best[key] = hit
+    result_limit = limit * len(channel_priority) if include_subchannel_hits else limit
     return sorted(
         best.values(),
         key=lambda hit: (channel_priority.get(hit.channel, 0), hit.score),
         reverse=True,
-    )[:limit]
+    )[:result_limit]

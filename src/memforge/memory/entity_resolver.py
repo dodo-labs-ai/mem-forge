@@ -32,12 +32,12 @@ __all__ = [
     "insert_llm_alias",
 ]
 
-_ENTITY_EMBEDDING_LOAD_LOCKS: dict[int, asyncio.Lock] = {}
+_ENTITY_EMBEDDING_LOAD_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 _ENTITY_EMBEDDING_LOAD_LOCKS_GUARD = threading.Lock()
 
 
 def _embedding_load_lock_for(db: object) -> asyncio.Lock:
-    key = id(db)
+    key = (id(db), id(asyncio.get_running_loop()))
     with _ENTITY_EMBEDDING_LOAD_LOCKS_GUARD:
         lock = _ENTITY_EMBEDDING_LOAD_LOCKS.get(key)
         if lock is None:
