@@ -623,6 +623,46 @@ async def test_metadata_core_token_coverage_ignores_generic_work_item_modifiers(
 
 
 @pytest.mark.asyncio
+async def test_metadata_trigram_hit_does_not_force_identifier_profile(db, monkeypatch):
+    metadata_target = _memory("m-metadata", "Durable source-backed note")
+    await db.insert_memory(metadata_target)
+
+    adapters = build_sqlite_adapters(db, FakeCollection(["m-metadata"]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    async def metadata_results(
+        _query,
+        _memory_types,
+        _scope,
+        limit,
+        *,
+        source_filter,
+        time_range,
+    ):
+        return [
+            KeywordCandidate(
+                memory_id="m-metadata",
+                score=10.0,
+                channel="metadata_trigram",
+                matched_text=("Create Blocker Hint in On Demand Lifecycle Assignment",),
+            )
+        ]
+
+    monkeypatch.setattr(engine, "_bm25_metadata_search", metadata_results)
+
+    result = await engine.search("create blocker hint", top_k=1)
+
+    assert result["query_analysis"]["ranking_profile"] == "lexical_lookup"
+
+
+@pytest.mark.asyncio
 async def test_explanatory_query_uses_semantic_profile_instead_of_lexical_fallback(db, monkeypatch):
     memory = _memory("m-semantic", "Payment retry policy after payroll cutoff")
     await db.insert_memory(memory)

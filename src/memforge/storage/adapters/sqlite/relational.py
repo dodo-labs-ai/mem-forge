@@ -94,17 +94,24 @@ _ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH = {
     "alias_fts": True,
     "alias_compact": False,
 }
+_ENTITY_SPECIFICITY_FULL_WEIGHT_MAX_MEMORIES = 8
+_ENTITY_SPECIFICITY_BROAD_ENTITY_MIN_MEMORIES = 100
+_ENTITY_SPECIFICITY_NORMALIZATION = 0.30
+_ENTITY_SPECIFICITY_BROAD_ENTITY_CAP = 0.50
 
 
 def _entity_specificity(visible_memory_count: int) -> float:
     if visible_memory_count <= 0:
         return 0.0
-    if visible_memory_count <= 8:
+    if visible_memory_count <= _ENTITY_SPECIFICITY_FULL_WEIGHT_MAX_MEMORIES:
         return 1.0
     raw = 1.0 / math.log2(2 + visible_memory_count)
-    if visible_memory_count >= 100:
-        return min(0.5, raw / 0.30)
-    return min(1.0, raw / 0.30)
+    normalized = raw / _ENTITY_SPECIFICITY_NORMALIZATION
+    # Keep the transition smooth near the full-weight cutoff while preventing
+    # very broad team/source entities from contributing like specific terms.
+    if visible_memory_count >= _ENTITY_SPECIFICITY_BROAD_ENTITY_MIN_MEMORIES:
+        return min(_ENTITY_SPECIFICITY_BROAD_ENTITY_CAP, normalized)
+    return min(1.0, normalized)
 
 
 def _entity_link_tokens(query: str) -> list[str]:
@@ -287,6 +294,26 @@ def _source_count_sql(
         "COUNT(DISTINCT ms_count.source_id)",
         list(disabled_source_ids),
     )
+
+
+def _entity_link_bound_params(
+    *,
+    pre_source_count_params: Sequence[Any],
+    source_count_params: Sequence[Any],
+    post_source_count_params: Sequence[Any],
+    limit: int,
+) -> list[Any]:
+    """Bind entity-link SQL in the same order its placeholders appear.
+
+    `visible_source_count` is projected in the SELECT list, so its placeholders
+    must come after CTE parameters but before FROM/WHERE filter parameters.
+    """
+    return [
+        *pre_source_count_params,
+        *source_count_params,
+        *post_source_count_params,
+        limit,
+    ]
 
 
 class SqliteRelationalStore:
@@ -852,7 +879,7 @@ class SqliteRelationalStore:
         predicate_sql, predicate_params = visible_sql(scope, "m")
         joins: list[str] = []
         clauses = [predicate_sql]
-        params: list[Any] = [*term_values, *term_values, *predicate_params]
+        filter_params: list[Any] = [*predicate_params]
 
         source_filter = source_filter or MemorySourceFilter()
         _, has_source_row_join = _append_source_time_predicates(
@@ -860,24 +887,24 @@ class SqliteRelationalStore:
             time_range=time_range,
             joins=joins,
             clauses=clauses,
-            params=params,
+            params=filter_params,
         )
 
         if memory_types:
             type_placeholders = ",".join("?" for _ in memory_types)
             clauses.append(f"m.memory_type IN ({type_placeholders})")
-            params.extend(memory_types)
+            filter_params.extend(memory_types)
 
         disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
         if has_source_row_join and disabled_source_ids:
             disabled_placeholders = ", ".join("?" for _ in disabled_source_ids)
             clauses.append(f"(ms.source_id IS NULL OR ms.source_id NOT IN ({disabled_placeholders}))")
-            params.extend(disabled_source_ids)
+            filter_params.extend(disabled_source_ids)
         else:
             source_visibility_sql, source_visibility_params = _enabled_source_visibility_condition(disabled_source_ids)
             if source_visibility_sql:
                 clauses.append(source_visibility_sql)
-                params.extend(source_visibility_params)
+                filter_params.extend(source_visibility_params)
 
         join_sql = " ".join(joins)
         source_count_join, source_count_expr, source_count_params = _source_count_sql(
@@ -909,13 +936,12 @@ class SqliteRelationalStore:
             "COUNT(DISTINCT m.id) AS visible_memory_count",
             f"COUNT(DISTINCT m.id) AS visible_memory_count, {source_count_expr} AS visible_source_count",
         )
-        prefix_param_count = len(term_values) * 2
-        bound_params = [
-            *params[:prefix_param_count],
-            *source_count_params,
-            *params[prefix_param_count:],
-            limit,
-        ]
+        bound_params = _entity_link_bound_params(
+            pre_source_count_params=(*term_values, *term_values),
+            source_count_params=source_count_params,
+            post_source_count_params=filter_params,
+            limit=limit,
+        )
         try:
             async with self._db.db.execute(sql, bound_params) as cursor:
                 return [row async for row in cursor]
@@ -940,7 +966,7 @@ class SqliteRelationalStore:
         predicate_sql, predicate_params = visible_sql(scope, "m")
         joins: list[str] = []
         clauses = [predicate_sql]
-        params: list[Any] = [fts_query, *predicate_params]
+        filter_params: list[Any] = [*predicate_params]
 
         source_filter = source_filter or MemorySourceFilter()
         _, has_source_row_join = _append_source_time_predicates(
@@ -948,24 +974,24 @@ class SqliteRelationalStore:
             time_range=time_range,
             joins=joins,
             clauses=clauses,
-            params=params,
+            params=filter_params,
         )
 
         if memory_types:
             type_placeholders = ",".join("?" for _ in memory_types)
             clauses.append(f"m.memory_type IN ({type_placeholders})")
-            params.extend(memory_types)
+            filter_params.extend(memory_types)
 
         disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
         if has_source_row_join and disabled_source_ids:
             disabled_placeholders = ", ".join("?" for _ in disabled_source_ids)
             clauses.append(f"(ms.source_id IS NULL OR ms.source_id NOT IN ({disabled_placeholders}))")
-            params.extend(disabled_source_ids)
+            filter_params.extend(disabled_source_ids)
         else:
             source_visibility_sql, source_visibility_params = _enabled_source_visibility_condition(disabled_source_ids)
             if source_visibility_sql:
                 clauses.append(source_visibility_sql)
-                params.extend(source_visibility_params)
+                filter_params.extend(source_visibility_params)
 
         join_sql = " ".join(joins)
         source_count_join, source_count_expr, source_count_params = _source_count_sql(
@@ -995,7 +1021,12 @@ class SqliteRelationalStore:
             "COUNT(DISTINCT m.id) AS visible_memory_count",
             f"COUNT(DISTINCT m.id) AS visible_memory_count, {source_count_expr} AS visible_source_count",
         )
-        bound_params = [params[0], *source_count_params, *params[1:], limit]
+        bound_params = _entity_link_bound_params(
+            pre_source_count_params=(),
+            source_count_params=source_count_params,
+            post_source_count_params=(fts_query, *filter_params),
+            limit=limit,
+        )
         try:
             async with self._db.db.execute(sql, bound_params) as cursor:
                 rows = [dict(row) async for row in cursor]
