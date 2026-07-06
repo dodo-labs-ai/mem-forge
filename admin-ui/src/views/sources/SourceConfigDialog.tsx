@@ -887,8 +887,8 @@ function GitHubRepoLocalPushPanel({
 }) {
   const profile = githubRepoProfileName(repoUrl);
   const command = sourceId
-    ? `memforge adapter github add ${profile} --repo-url ${repoUrl || "<repo-url>"} --ref ${repoRef || "main"} --source-id ${sourceId} && memforge adapter github preview ${profile} && memforge adapter github push ${profile} --process-now`
-    : `memforge adapter github add ${profile} --repo-url ${repoUrl || "<repo-url>"} --ref ${repoRef || "main"}`;
+    ? `memforge adapter github add ${profile} --repo-url ${repoUrl || "<repo-url>"} --repo-path <local-clone-path> --ref ${repoRef || "main"} --source-id ${sourceId} && memforge adapter github preview ${profile} && memforge adapter github push ${profile} --process-now`
+    : `memforge adapter github add ${profile} --repo-url ${repoUrl || "<repo-url>"} --repo-path <local-clone-path> --ref ${repoRef || "main"}`;
   const ready = Boolean(repoUrl);
   const handleCopy = () => {
     if (typeof navigator === "undefined" || !navigator.clipboard) return;
@@ -899,9 +899,10 @@ function GitHubRepoLocalPushPanel({
     <div className="rounded-lg border bg-muted/30 p-3 text-xs">
       <div className="text-sm font-medium text-foreground">Push from the local GitHub adapter</div>
       <p className="mt-1 text-muted-foreground">
-        Use this mode when MemForge Cloud cannot reach the GitHub host directly. The local CLI uses
-        your machine's VPN and <code>gh</code> login, previews the selected folders, and pushes
-        matching repository files into this source.
+        Use this mode when MemForge Cloud cannot reach the GitHub host directly. Point the local CLI
+        at a checked-out clone; it validates the clone's origin, previews the selected folders, and
+        pushes matching repository files into this source. Omit <code>--repo-path</code> only when
+        your local <code>gh</code> login can reach the repository.
       </p>
       <div className="mt-3 flex items-center gap-2 rounded-md border bg-background p-2">
         <code className="flex-1 break-all font-mono text-[11px] text-foreground">{command}</code>

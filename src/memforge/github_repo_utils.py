@@ -34,14 +34,16 @@ def list_config(value: object) -> list[str]:
 
 def parse_github_repo_url(repo_url: str) -> dict[str, str]:
     parts = urlsplit(str(repo_url or "").strip())
-    if parts.scheme.lower() != "https" or not parts.netloc:
+    if parts.scheme.lower() != "https" or not parts.hostname:
         raise ValueError("repo_url must be an https GitHub repository URL")
     path_parts = [part for part in parts.path.split("/") if part]
     if len(path_parts) < 2:
         raise ValueError("repo_url must include owner and repository")
     owner = path_parts[0]
     repo = path_parts[1][:-4] if path_parts[1].endswith(".git") else path_parts[1]
-    host = parts.netloc.lower()
+    host = parts.hostname.lower()
+    if parts.port:
+        host = f"{host}:{parts.port}"
     origin = urlunsplit(("https", host, "", "", ""))
     normalized_url = urlunsplit(("https", host, f"/{owner}/{repo}", "", ""))
     return {"repo_url": normalized_url, "origin": origin, "host": host, "owner": owner, "repo": repo}

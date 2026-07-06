@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -1040,6 +1041,208 @@ def test_adapter_github_add_and_preview_uses_local_gh_tree(monkeypatch, tmp_path
     assert payload["counts"]["ignored"] == 2
     assert payload["extension_counts"] == {"md": 1, "png": 1}
     assert payload["items"][0]["relative_path"] == "Payroll Processing/README.md"
+
+
+def _init_github_local_clone(
+    tmp_path: Path,
+    *,
+    remote_url: str = "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture.git",
+) -> Path:
+    repo = tmp_path / "architecture"
+    (repo / "Payroll Processing V2" / "images").mkdir(parents=True)
+    (repo / "Flexible Payroll").mkdir(parents=True)
+    (repo / "Payroll Processing V2" / "README.md").write_text("# Payroll Processing V2\n\nBody", encoding="utf-8")
+    (repo / "Payroll Processing V2" / "Überblick.md").write_text("# Überblick\n", encoding="utf-8")
+    (repo / "Payroll Processing V2" / "images" / "Flow.puml").write_text("@startuml\n@enduml\n", encoding="utf-8")
+    (repo / "Payroll Processing V2" / "images" / "ignored.png").write_bytes(b"png")
+    (repo / "Flexible Payroll" / "README.md").write_text("# Flexible Payroll\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", remote_url],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=MemForge Test",
+            "-c",
+            "user.email=memforge@example.test",
+            "commit",
+            "-m",
+            "seed architecture docs",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return repo
+
+
+def test_adapter_github_local_clone_accepts_credentialed_https_remote(monkeypatch, tmp_path: Path):
+    repo = _init_github_local_clone(
+        tmp_path,
+        remote_url="https://x-access-token:SECRET_TOKEN@github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture.git",
+    )
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "adapter",
+            "github",
+            "add",
+            "matterhorn",
+            "--repo-url",
+            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+            "--repo-path",
+            str(repo),
+            "--ref",
+            "main",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "SECRET_TOKEN" not in result.output
+
+
+def test_adapter_github_local_clone_mismatch_redacts_credentialed_remote(monkeypatch, tmp_path: Path):
+    repo = _init_github_local_clone(
+        tmp_path,
+        remote_url="https://x-access-token:SECRET_TOKEN@github.wdf.sap.corp/other-org/other-repo.git",
+    )
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "adapter",
+            "github",
+            "add",
+            "matterhorn",
+            "--repo-url",
+            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+            "--repo-path",
+            str(repo),
+            "--ref",
+            "main",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "does not match configured repo_url" in result.output
+    assert "SECRET_TOKEN" not in result.output
+    assert "x-access-token" not in result.output
+
+
+def test_adapter_github_preview_can_use_local_clone_without_gh_api(monkeypatch, tmp_path: Path):
+    repo = _init_github_local_clone(tmp_path)
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    original_run = main.subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["gh", "api"]:
+            raise AssertionError("repo_path preview must not call gh api")
+        return original_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    add_result = CliRunner().invoke(
+        cli,
+        [
+            "adapter",
+            "github",
+            "add",
+            "matterhorn",
+            "--repo-url",
+            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+            "--repo-path",
+            str(repo),
+            "--ref",
+            "main",
+            "--include-path",
+            "Payroll Processing V2",
+            "--include-extension",
+            "md",
+            "--include-extension",
+            "puml",
+        ],
+    )
+    preview_result = CliRunner().invoke(cli, ["adapter", "github", "preview", "matterhorn", "--limit", "10"])
+
+    assert add_result.exit_code == 0, add_result.output
+    assert preview_result.exit_code == 0, preview_result.output
+    payload = json.loads(preview_result.output)
+    assert payload["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
+    assert payload["repo_path"] == str(repo.resolve())
+    assert payload["counts"] == {"included": 3, "ignored": 2}
+    assert payload["extension_counts"] == {"md": 2, "png": 1, "puml": 1}
+    assert [item["relative_path"] for item in payload["items"]] == [
+        "Payroll Processing V2/README.md",
+        "Payroll Processing V2/images/Flow.puml",
+        "Payroll Processing V2/Überblick.md",
+    ]
+
+
+def test_adapter_github_push_can_read_local_clone_without_gh_api(monkeypatch, tmp_path: Path):
+    repo = _init_github_local_clone(tmp_path)
+    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
+    original_run = main.subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["gh", "api"]:
+            raise AssertionError("repo_path push must not call gh api")
+        return original_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    expected_blob_sha = original_run(
+        ["git", "-C", str(repo), "rev-parse", "main:Payroll Processing V2/README.md"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    add_result = CliRunner().invoke(
+        cli,
+        [
+            "adapter",
+            "github",
+            "add",
+            "matterhorn",
+            "--repo-url",
+            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+            "--repo-path",
+            str(repo),
+            "--ref",
+            "main",
+            "--include-path",
+            "Payroll Processing V2",
+            "--include-extension",
+            "md",
+        ],
+    )
+    push_result = CliRunner().invoke(
+        cli, ["adapter", "github", "push", "matterhorn", "--source-id", "src-gh", "--limit", "1"]
+    )
+
+    assert add_result.exit_code == 0, add_result.output
+    assert push_result.exit_code == 0, push_result.output
+    payload = json.loads(push_result.output)
+    assert payload["counts"]["pushed"] == 1
+    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
+    assert len(push_calls) == 1
+    kwargs = push_calls[0][1]
+    assert kwargs["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
+    assert kwargs["relative_path"] == "Payroll Processing V2/README.md"
+    assert kwargs["blob_sha"] == expected_blob_sha
+    assert kwargs["markdown_body"] == "# Payroll Processing V2\n\nBody"
 
 
 def test_adapter_github_preview_rejects_truncated_tree(monkeypatch, tmp_path: Path):
