@@ -162,6 +162,11 @@ function SourceConfigForm({
   const projectSectionRef = useRef<HTMLDivElement | null>(null);
   const scheduleSectionRef = useRef<HTMLDetailsElement | null>(null);
   const authMode = stringValue(config.auth_mode) || "browser_cookie";
+  const githubConnectionMode = sourceType === "github_repo"
+    ? stringValue(config.connection_mode) || "cloud_pull"
+    : "";
+  const githubRepoUrl = sourceType === "github_repo" ? stringValue(config.repo_url).trim() : "";
+  const githubRef = sourceType === "github_repo" ? stringValue(config.ref).trim() || "main" : "";
   const jiraBaseUrl = stringValue(config.base_url).trim();
   const confluenceUrlInfo = useMemo(
     () => sourceType === "confluence" ? parseConfluenceWikiUrl(stringValue(config.base_url)) : null,
@@ -351,10 +356,24 @@ function SourceConfigForm({
                         vaultId={stringValue(config.vault_id).trim()}
                       />
                     )}
+                    {sourceType === "github_repo" && field.key === "repo_url" && (
+                      <>
+                        <GitHubRepoDetectedPanel repoUrl={githubRepoUrl} />
+                        {githubConnectionMode === "local_push" && (
+                          <GitHubRepoLocalPushPanel
+                            sourceId={source?.id ?? null}
+                            repoUrl={githubRepoUrl}
+                            repoRef={githubRef}
+                          />
+                        )}
+                      </>
+                    )}
                   </div>
                 ))}
               </div>
-              {sourceType !== "local_markdown" && group.key === previewGroupKey && (
+              {sourceType !== "local_markdown"
+                && !(sourceType === "github_repo" && githubConnectionMode === "local_push")
+                && group.key === previewGroupKey && (
                 <DiscoveryPreviewPanel
                   ready={previewReady}
                   isPending={previewDiscovery.isPending}
@@ -817,6 +836,94 @@ function LocalMarkdownPushPanel({
   );
 }
 
+function parseGitHubRepoUrl(repoUrl: string): { host: string; owner: string; repo: string; normalized: string } | null {
+  const value = repoUrl.trim();
+  if (!value.startsWith("https://")) return null;
+  try {
+    const url = new URL(value);
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (parts.length < 2) return null;
+    const owner = parts[0];
+    const repo = parts[1].replace(/\.git$/, "");
+    return {
+      host: url.host.toLowerCase(),
+      owner,
+      repo,
+      normalized: `https://${url.host.toLowerCase()}/${owner}/${repo}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function GitHubRepoDetectedPanel({ repoUrl }: { repoUrl: string }) {
+  const parsed = parseGitHubRepoUrl(repoUrl);
+  if (!parsed) return null;
+  return (
+    <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs">
+      <div className="font-medium">Detected repository</div>
+      <dl className="mt-1 grid gap-1 sm:grid-cols-2">
+        <div className="min-w-0">
+          <dt className="text-muted-foreground">Host</dt>
+          <dd className="truncate font-medium">{parsed.host}</dd>
+        </div>
+        <div className="min-w-0">
+          <dt className="text-muted-foreground">Repository</dt>
+          <dd className="truncate font-medium">{parsed.owner}/{parsed.repo}</dd>
+        </div>
+      </dl>
+    </div>
+  );
+}
+
+function GitHubRepoLocalPushPanel({
+  sourceId,
+  repoUrl,
+  repoRef,
+}: {
+  sourceId: string | null;
+  repoUrl: string;
+  repoRef: string;
+}) {
+  const profile = githubRepoProfileName(repoUrl);
+  const command = sourceId
+    ? `memforge adapter github add ${profile} --repo-url ${repoUrl || "<repo-url>"} --ref ${repoRef || "main"} --source-id ${sourceId} && memforge adapter github preview ${profile} && memforge adapter github push ${profile} --process-now`
+    : `memforge adapter github add ${profile} --repo-url ${repoUrl || "<repo-url>"} --ref ${repoRef || "main"}`;
+  const ready = Boolean(repoUrl);
+  const handleCopy = () => {
+    if (typeof navigator === "undefined" || !navigator.clipboard) return;
+    void navigator.clipboard.writeText(command);
+  };
+
+  return (
+    <div className="rounded-lg border bg-muted/30 p-3 text-xs">
+      <div className="text-sm font-medium text-foreground">Push from the local GitHub adapter</div>
+      <p className="mt-1 text-muted-foreground">
+        Use this mode when MemForge Cloud cannot reach the GitHub host directly. The local CLI uses
+        your machine's VPN and <code>gh</code> login, previews the selected folders, and pushes
+        matching repository files into this source.
+      </p>
+      <div className="mt-3 flex items-center gap-2 rounded-md border bg-background p-2">
+        <code className="flex-1 break-all font-mono text-[11px] text-foreground">{command}</code>
+        <Button type="button" variant="outline" size="sm" onClick={handleCopy} disabled={!ready}>
+          Copy
+        </Button>
+      </div>
+      {!sourceId && (
+        <p className="mt-2 text-muted-foreground">
+          Save this source first to get a source id, then rerun setup with <code>--source-id</code>.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function githubRepoProfileName(repoUrl: string): string {
+  const parsed = parseGitHubRepoUrl(repoUrl);
+  if (!parsed) return "github-repo";
+  return `${parsed.owner}-${parsed.repo}`.toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
+}
+
 function DiscoveryPreviewPanel({
   ready,
   isPending,
@@ -1033,6 +1140,11 @@ function isFieldVisible(sourceType: string, field: ConfigField, config: ConfigFo
     }
     return true;
   }
+  if (sourceType === "github_repo") {
+    const connectionMode = stringValue(config.connection_mode) || "cloud_pull";
+    if (field.key === "pat") return connectionMode === "cloud_pull";
+    return true;
+  }
   return true;
 }
 
@@ -1055,6 +1167,10 @@ function isFieldRequired(sourceType: string, field: ConfigField, config: ConfigF
     if (field.key === "page_url") return syncMode === "single_page";
     if (field.key === "root_url") return syncMode === "subtree";
     if (field.key === "pages") return syncMode === "explicit_list";
+  }
+  if (sourceType === "github_repo") {
+    if (field.key === "pat") return false;
+    if (field.key === "include_paths") return false;
   }
   return field.required;
 }

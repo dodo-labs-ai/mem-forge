@@ -15,7 +15,7 @@ for (const [key, mark] of Object.entries(BRAND_MARKS)) {
 }
 
 // Source-type-keyed marks. agent_session resolves per-client; see below.
-const SOURCE_TYPES = ["confluence", "jira", "github_pages", "teams", "local_markdown"];
+const SOURCE_TYPES = ["confluence", "jira", "github_pages", "github_repo", "teams", "local_markdown"];
 for (const type of SOURCE_TYPES) {
   const keys = SOURCE_TYPE_MARKS[type];
   assert.ok(keys && keys.length > 0, `${type} should have at least one brand mark`);
@@ -39,6 +39,7 @@ assert.deepEqual(sourceBrandKeysFor("user_memory", "claude-code"), ["claude"]);
 assert.equal(sourceBrandKeysFor("user_memory", null), undefined);
 assert.deepEqual(SOURCE_TYPE_MARKS.local_markdown, ["obsidian"], "local markdown should show the Obsidian mark");
 assert.deepEqual(SOURCE_TYPE_MARKS.github_pages, ["github"], "GitHub Pages should show the GitHub mark");
+assert.deepEqual(SOURCE_TYPE_MARKS.github_repo, ["github"], "GitHub repositories should show the GitHub mark");
 
 // Brand colors are pinned so they can't silently drift. These four match the
 // exact hexes the README uses for the same logos.

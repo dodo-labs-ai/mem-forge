@@ -78,6 +78,7 @@ export const SOURCE_TYPE_MARKS: Record<string, BrandKey[]> = {
   confluence: ["confluence"],
   jira: ["jira"],
   github_pages: ["github"],
+  github_repo: ["github"],
   teams: ["teams"],
   local_markdown: ["obsidian"],
 };

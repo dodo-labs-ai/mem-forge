@@ -836,10 +836,13 @@ class LocalAdapterDocumentRequest(BaseModel):
     during sync; the CLI does no parsing.
     """
 
-    vault_id: str
+    vault_id: str | None = None
     relative_path: str
     markdown_body: str
     content_type: str = "text/markdown"
+    repo_url: str | None = None
+    repo_ref: str | None = None
+    blob_sha: str | None = None
     title: str | None = None
     raw_hash: str | None = None
     submitted_by: str | None = None
@@ -1304,6 +1307,8 @@ def _validate_source_config(
 ) -> None:
     if source_type == "github_pages":
         _validate_github_pages_config(config, existing_config=existing_config)
+    if source_type == "github_repo":
+        _validate_github_repo_config(config, existing_config=existing_config)
     validate_tls_ca_bundle(config)
     secret_fields = _source_secret_fields(source_type)
     gene_cls = GENE_REGISTRY.get(source_type)
@@ -1332,6 +1337,32 @@ def _validate_source_config(
     if source_type == "jira":
         _validate_jira_auth_config(config, existing_config=existing_config)
         _validate_jira_scope_config(config)
+
+
+def _validate_github_repo_config(
+    config: dict[str, Any],
+    existing_config: dict[str, Any] | None = None,
+) -> None:
+    existing_config = existing_config or {}
+    repo_url = str(config.get("repo_url") or existing_config.get("repo_url") or "").strip()
+    require_https_base_url(repo_url, "GitHub Repository")
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(repo_url)
+    path_parts = [part for part in parts.path.split("/") if part]
+    if len(path_parts) < 2:
+        raise ValueError("GitHub Repository URL must include owner and repository")
+    connection_mode = str(
+        config.get("connection_mode") or existing_config.get("connection_mode") or "cloud_pull"
+    ).strip().lower()
+    if connection_mode not in {"cloud_pull", "local_push"}:
+        raise ValueError("GitHub Repository Connection Mode must be Cloud pull or Local push")
+    max_files = config.get("max_files", existing_config.get("max_files", 500))
+    try:
+        if int(max_files) < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("GitHub Repository Max Files must be a positive integer") from None
 
 
 def _validate_confluence_config(
@@ -3628,7 +3659,10 @@ def create_admin_app(
             _validate_source_project_binding(req.project_binding)
             if req.type == "jira":
                 source_config = _drop_source_owned_jira_cookie(source_config)
-            if req.type == "local_markdown":
+            if req.type == "local_markdown" or (
+                req.type == "github_repo"
+                and str(source_config.get("connection_mode") or "").strip().lower() == "local_push"
+            ):
                 source_config = _populate_local_markdown_inbox(source_config, source_id, config)
         except (SecretConfigurationError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3675,7 +3709,10 @@ def create_admin_app(
                 )
                 if existing["type"] == "jira":
                     src_config = _drop_source_owned_jira_cookie(src_config)
-                if existing["type"] == "local_markdown":
+                if existing["type"] == "local_markdown" or (
+                    existing["type"] == "github_repo"
+                    and str(src_config.get("connection_mode") or "").strip().lower() == "local_push"
+                ):
                     src_config = _populate_local_markdown_inbox(src_config, source_id, config)
             except (SecretConfigurationError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3856,36 +3893,58 @@ def create_admin_app(
         leaves the rest of ingestion to the source's sync pipeline.
         """
         from memforge.local_adapter import (
+            GITHUB_REPO_SOURCE_TYPE,
             LOCAL_MARKDOWN_SOURCE_TYPE,
+            submit_github_repo_document,
             submit_local_markdown_document,
         )
 
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        if source.get("type") != LOCAL_MARKDOWN_SOURCE_TYPE:
+        source_type = source.get("type")
+        if source_type not in {LOCAL_MARKDOWN_SOURCE_TYPE, GITHUB_REPO_SOURCE_TYPE}:
             raise HTTPException(
                 status_code=400,
-                detail=(f"source {source_id} is type {source.get('type')!r}, not 'local_markdown'"),
+                detail=(
+                    f"source {source_id} is type {source_type!r}, not a local adapter source"
+                ),
             )
         _require_source_management(request, source)
         if source.get("status") == SOURCE_PAUSED_STATUS:
             raise HTTPException(status_code=400, detail="Source is paused")
 
         try:
-            result = await submit_local_markdown_document(
-                db=db,
-                config=config,
-                source=source,
-                vault_id=req.vault_id,
-                relative_path=req.relative_path,
-                markdown_body=req.markdown_body,
-                content_type=req.content_type,
-                title=req.title,
-                raw_hash=req.raw_hash,
-                submitted_by=req.submitted_by,
-                submitted_at=req.submitted_at,
-            )
+            if source_type == GITHUB_REPO_SOURCE_TYPE:
+                result = await submit_github_repo_document(
+                    db=db,
+                    config=config,
+                    source=source,
+                    repo_url=req.repo_url or "",
+                    repo_ref=req.repo_ref or "",
+                    relative_path=req.relative_path,
+                    markdown_body=req.markdown_body,
+                    content_type=req.content_type,
+                    title=req.title,
+                    raw_hash=req.raw_hash,
+                    blob_sha=req.blob_sha,
+                    submitted_by=req.submitted_by,
+                    submitted_at=req.submitted_at,
+                )
+            else:
+                result = await submit_local_markdown_document(
+                    db=db,
+                    config=config,
+                    source=source,
+                    vault_id=req.vault_id or "",
+                    relative_path=req.relative_path,
+                    markdown_body=req.markdown_body,
+                    content_type=req.content_type,
+                    title=req.title,
+                    raw_hash=req.raw_hash,
+                    submitted_by=req.submitted_by,
+                    submitted_at=req.submitted_at,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -206,6 +206,50 @@ class ToolClient:
             body,
         )
 
+    def push_github_repo_document(
+        self,
+        *,
+        source_id: str,
+        repo_url: str,
+        repo_ref: str,
+        relative_path: str,
+        markdown_body: str,
+        content_type: str = "text/markdown",
+        title: str | None = None,
+        raw_hash: str | None = None,
+        blob_sha: str | None = None,
+        submitted_by: str | None = None,
+        submitted_at: str | None = None,
+        process_now: bool = False,
+    ) -> dict[str, Any]:
+        """Push one GitHub repository file into a configured github_repo source."""
+        source_id = source_id.strip()
+        if not source_id:
+            return {"error": "source_id is required"}
+        body: dict[str, Any] = {
+            "repo_url": repo_url,
+            "repo_ref": repo_ref,
+            "relative_path": relative_path,
+            "markdown_body": markdown_body,
+            "content_type": content_type,
+            "process_now": process_now,
+        }
+        if title is not None:
+            body["title"] = title
+        if raw_hash is not None:
+            body["raw_hash"] = raw_hash
+        if blob_sha is not None:
+            body["blob_sha"] = blob_sha
+        if submitted_by is not None:
+            body["submitted_by"] = submitted_by
+        if submitted_at is not None:
+            body["submitted_at"] = submitted_at
+        return self._http_json(
+            "POST",
+            f"/api/sources/{quote(source_id, safe='')}/adapter/documents",
+            body,
+        )
+
     def list_sources(self) -> dict[str, Any]:
         """List configured sources. Returns the API ``{"data": [...]}`` envelope."""
         return self._http_json("GET", "/api/sources", None)

@@ -26,10 +26,22 @@ from memforge.genes.local_markdown_gene import (
     LOCAL_MARKDOWN_CONTENT_ROLE,
     LOCAL_MARKDOWN_PACKAGE_KIND,
 )
+from memforge.github_repo_utils import (
+    build_github_repo_doc_id,
+    github_extension_allowed,
+    github_include_extensions,
+    github_include_paths,
+    github_path_in_scope,
+    normalize_github_relative_path,
+    parse_github_repo_url,
+)
 from memforge.models import content_hash, slugify
 from memforge.storage.database import Database
 
 LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
+GITHUB_REPO_SOURCE_TYPE = "github_repo"
+GITHUB_REPO_PACKAGE_KIND = "github_repo_document"
+GITHUB_REPO_CONTENT_ROLE = "repository_file"
 
 logger = logging.getLogger(__name__)
 
@@ -192,3 +204,188 @@ async def submit_local_markdown_document(
         "package_path": str(package_path),
         "submitted_at": submitted_at,
     }
+
+
+async def submit_github_repo_document(
+    *,
+    db: Database,
+    config: AppConfig,
+    source: dict[str, Any],
+    repo_url: str,
+    repo_ref: str,
+    relative_path: str,
+    markdown_body: str,
+    content_type: str = "text/markdown",
+    title: str | None = None,
+    raw_hash: str | None = None,
+    blob_sha: str | None = None,
+    submitted_by: str | None = None,
+    submitted_at: str | None = None,
+) -> dict[str, Any]:
+    """Validate, package, and persist one GitHub repository file push."""
+    if source.get("type") != GITHUB_REPO_SOURCE_TYPE:
+        raise ValueError(
+            f"source {source.get('id')} is type {source.get('type')!r}, not 'github_repo'"
+        )
+
+    configured_repo = str((source.get("config") or {}).get("repo_url") or "").strip()
+    if not configured_repo:
+        raise ValueError("source has no configured repo_url")
+    connection_mode = str((source.get("config") or {}).get("connection_mode") or "cloud_pull").strip().lower()
+    if connection_mode != "local_push":
+        raise ValueError("github_repo adapter push requires connection_mode=local_push")
+    if _canonical_repo_url(repo_url) != _canonical_repo_url(configured_repo):
+        raise ValueError(
+            f"repo_url {repo_url!r} does not match the source's configured repo_url "
+            f"{configured_repo!r}"
+        )
+    if not markdown_body or not markdown_body.strip():
+        raise ValueError("markdown_body is required")
+
+    relative = normalize_github_relative_path(relative_path)
+    submitted_at = submitted_at or _now_iso()
+    source_id = str(source["id"])
+    source_config = dict(source.get("config") or {})
+    configured_ref = str(source_config.get("ref") or "main").strip() or "main"
+    ref = (repo_ref or configured_ref).strip() or configured_ref
+    if ref != configured_ref:
+        raise ValueError(f"repo_ref {ref!r} does not match the source's configured ref {configured_ref!r}")
+    include_paths = github_include_paths(source_config)
+    if not github_path_in_scope(relative, include_paths):
+        raise ValueError("relative_path is outside the source's configured include_paths")
+    include_extensions = github_include_extensions(source_config)
+    if not github_extension_allowed(relative, include_extensions):
+        raise ValueError("relative_path extension is outside the source's configured include_extensions")
+    repo = _repo_parts(configured_repo)
+    inbox = default_local_adapter_inbox(config, source_id)
+    inbox.mkdir(parents=True, exist_ok=True)
+
+    document_hash = content_hash(markdown_body)
+    doc_id = build_github_repo_doc_id(
+        source_id=source_id,
+        repo_url=repo["repo_url"],
+        repo_ref=ref,
+        relative_path=relative,
+    )
+    doc_title = (title or "").strip() or _markdown_title(markdown_body, fallback=relative)
+    source_url = _github_file_url(repo["repo_url"], ref, relative)
+    package_path = inbox / f"{doc_id}.json"
+    package_path.parent.mkdir(parents=True, exist_ok=True)
+    max_files = _positive_int(source_config.get("max_files"), default=500)
+    if not package_path.exists() and _github_package_count(inbox, source_config) >= max_files:
+        raise ValueError(f"github_repo local_push source already has max_files={max_files} packages")
+
+    package = {
+        "package_kind": GITHUB_REPO_PACKAGE_KIND,
+        "content_role": GITHUB_REPO_CONTENT_ROLE,
+        "doc_id": doc_id,
+        "title": doc_title,
+        "source_url": source_url,
+        "last_modified": submitted_at,
+        "space_or_project": f"{repo['owner']}/{repo['name']}",
+        "version": blob_sha or raw_hash or document_hash,
+        "repo_url": repo["repo_url"],
+        "repo_host": repo["host"],
+        "repo_owner": repo["owner"],
+        "repo_name": repo["name"],
+        "repo_ref": ref,
+        "relative_path": relative,
+        "blob_sha": blob_sha,
+        "content_type": content_type,
+        "raw_hash": raw_hash,
+        "submitted_at": submitted_at,
+        "submitted_by": submitted_by,
+        "markdown": markdown_body,
+    }
+
+    payload_text = json.dumps(package, indent=2, sort_keys=True)
+    package_existed = package_path.exists()
+    package_written = False
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(package_path.parent), suffix=".json.tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle.write(payload_text)
+        os.replace(tmp_name, package_path)
+        package_written = True
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        if package_written and not package_existed:
+            try:
+                os.unlink(package_path)
+            except OSError:
+                pass
+        raise
+
+    refreshed_config = dict(source_config)
+    refreshed_config["documents_dir"] = str(inbox)
+    await db.upsert_source(
+        id=source_id,
+        type=GITHUB_REPO_SOURCE_TYPE,
+        name=source.get("name") or source_id,
+        config_json=json.dumps(refreshed_config),
+        project_binding=source.get("project_binding"),
+    )
+
+    return {
+        "source_id": source_id,
+        "doc_id": doc_id,
+        "repo_url": repo["repo_url"],
+        "repo_ref": ref,
+        "relative_path": relative,
+        "document_hash": document_hash,
+        "package_path": str(package_path),
+        "submitted_at": submitted_at,
+    }
+
+
+def _canonical_repo_url(repo_url: str) -> str:
+    return _repo_parts(repo_url)["repo_url"]
+
+
+def _repo_parts(repo_url: str) -> dict[str, str]:
+    parsed = parse_github_repo_url(repo_url)
+    return {"repo_url": parsed["repo_url"], "host": parsed["host"], "owner": parsed["owner"], "name": parsed["repo"]}
+
+
+def _github_file_url(repo_url: str, repo_ref: str, relative_path: str) -> str:
+    from urllib.parse import quote
+
+    return f"{repo_url}/blob/{quote(repo_ref, safe='')}/{quote(relative_path, safe='/')}"
+
+
+def _positive_int(value: object, *, default: int) -> int:
+    try:
+        return max(int(value), 1)
+    except (TypeError, ValueError):
+        return default
+
+
+def _github_package_count(inbox: Path, config: dict[str, Any]) -> int:
+    count = 0
+    for package_path in inbox.glob("*.json"):
+        try:
+            package = json.loads(package_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if package.get("package_kind") == GITHUB_REPO_PACKAGE_KIND:
+            try:
+                repo_matches = _canonical_repo_url(str(package.get("repo_url") or "")) == _canonical_repo_url(
+                    str(config.get("repo_url") or "")
+                )
+                ref_matches = str(package.get("repo_ref") or "").strip() == (
+                    str(config.get("ref") or "main").strip() or "main"
+                )
+                path = normalize_github_relative_path(str(package.get("relative_path") or ""))
+            except ValueError:
+                continue
+            if (
+                repo_matches
+                and ref_matches
+                and github_path_in_scope(path, github_include_paths(config))
+                and github_extension_allowed(path, github_include_extensions(config))
+            ):
+                count += 1
+    return count
