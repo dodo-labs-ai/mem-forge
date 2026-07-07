@@ -40,8 +40,11 @@ from memforge.storage.database import Database
 
 LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
 GITHUB_REPO_SOURCE_TYPE = "github_repo"
+JIRA_SOURCE_TYPE = "jira"
 GITHUB_REPO_PACKAGE_KIND = "github_repo_document"
 GITHUB_REPO_CONTENT_ROLE = "repository_file"
+JIRA_PACKAGE_KIND = "jira_document"
+JIRA_CONTENT_ROLE = "jira_issue"
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,18 @@ def build_local_markdown_doc_id(*, source_id: str, vault_id: str, relative_path:
     ])
 
 
+def build_jira_doc_id(*, source_id: str, issue_key: str) -> str:
+    """Stable doc id for one Jira issue pushed by the local daemon."""
+    identity = "|".join([source_id.strip(), issue_key.strip().upper()])
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    return "-".join([
+        "jira",
+        slugify(source_id)[:30],
+        slugify(issue_key)[:30] or "issue",
+        digest,
+    ])
+
+
 def _normalize_relative_path(value: str) -> str:
     """Reject paths that try to escape the vault or use absolute paths."""
     candidate = (value or "").strip().lstrip("/").lstrip("\\")
@@ -78,6 +93,15 @@ def _normalize_relative_path(value: str) -> str:
     if any(part == ".." for part in cleaned):
         raise ValueError("relative_path must not contain '..' segments")
     return "/".join(cleaned)
+
+
+def _normalize_issue_key(value: str) -> str:
+    key = (value or "").strip().upper()
+    if not key:
+        raise ValueError("issue_key is required")
+    if not all(ch.isalnum() or ch in {"-", "_"} for ch in key):
+        raise ValueError("issue_key contains unsupported characters")
+    return key
 
 
 def _markdown_title(markdown_body: str, fallback: str) -> str:
@@ -335,6 +359,105 @@ async def submit_github_repo_document(
         "repo_url": repo["repo_url"],
         "repo_ref": ref,
         "relative_path": relative,
+        "document_hash": document_hash,
+        "package_path": str(package_path),
+        "submitted_at": submitted_at,
+    }
+
+
+async def submit_jira_document(
+    *,
+    db: Database,
+    config: AppConfig,
+    source: dict[str, Any],
+    base_url: str,
+    issue_key: str,
+    source_url: str,
+    markdown_body: str,
+    title: str | None = None,
+    raw_hash: str | None = None,
+    source_semantics: dict[str, Any] | None = None,
+    submitted_by: str | None = None,
+    submitted_at: str | None = None,
+) -> dict[str, Any]:
+    """Validate, package, and persist one Jira issue pushed by the local daemon."""
+    if source.get("type") != JIRA_SOURCE_TYPE:
+        raise ValueError(f"source {source.get('id')} is type {source.get('type')!r}, not 'jira'")
+
+    source_config = dict(source.get("config") or {})
+    if str(source_config.get("sync_mode") or "cloud").strip().lower() != "local_agent":
+        raise ValueError("Jira local adapter pushes require sync_mode=local_agent")
+    configured_base_url = str(source_config.get("base_url") or "").strip().rstrip("/")
+    if not configured_base_url:
+        raise ValueError("source has no configured base_url")
+    actual_base_url = (base_url or configured_base_url).strip().rstrip("/")
+    if actual_base_url != configured_base_url:
+        raise ValueError(
+            f"base_url {actual_base_url!r} does not match the source's configured base_url {configured_base_url!r}"
+        )
+    if not markdown_body or not markdown_body.strip():
+        raise ValueError("markdown_body is required")
+
+    normalized_issue_key = _normalize_issue_key(issue_key)
+    submitted_at = submitted_at or _now_iso()
+    source_id = str(source["id"])
+    inbox = default_local_adapter_inbox(config, source_id)
+    inbox.mkdir(parents=True, exist_ok=True)
+
+    document_hash = content_hash(markdown_body)
+    doc_id = build_jira_doc_id(source_id=source_id, issue_key=normalized_issue_key)
+    doc_title = (title or "").strip() or normalized_issue_key
+    issue_url = (source_url or f"{configured_base_url}/browse/{normalized_issue_key}").strip()
+    package_path = inbox / f"{doc_id}.json"
+    package_path.parent.mkdir(parents=True, exist_ok=True)
+
+    package = {
+        "package_kind": JIRA_PACKAGE_KIND,
+        "content_role": JIRA_CONTENT_ROLE,
+        "doc_id": doc_id,
+        "title": doc_title,
+        "source_url": issue_url,
+        "last_modified": submitted_at,
+        "space_or_project": normalized_issue_key.split("-", 1)[0],
+        "version": raw_hash or document_hash,
+        "base_url": configured_base_url,
+        "issue_key": normalized_issue_key,
+        "content_type": "text/markdown",
+        "raw_hash": raw_hash,
+        "source_semantics": source_semantics or {},
+        "submitted_at": submitted_at,
+        "submitted_by": submitted_by,
+        "markdown": markdown_body,
+    }
+
+    payload_text = json.dumps(package, indent=2, sort_keys=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(package_path.parent), suffix=".json.tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle.write(payload_text)
+        os.replace(tmp_name, package_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+    refreshed_config = dict(source_config)
+    refreshed_config["local_agent_documents_dir"] = str(inbox)
+    await db.upsert_source(
+        id=source_id,
+        type=JIRA_SOURCE_TYPE,
+        name=source.get("name") or source_id,
+        config_json=json.dumps(refreshed_config),
+        project_binding=source.get("project_binding"),
+    )
+
+    return {
+        "source_id": source_id,
+        "doc_id": doc_id,
+        "base_url": configured_base_url,
+        "issue_key": normalized_issue_key,
         "document_hash": document_hash,
         "package_path": str(package_path),
         "submitted_at": submitted_at,

@@ -90,6 +90,16 @@ class ToolClient:
             return {"error": "memory_id is required"}
         return self._http_json("GET", f"/api/memories/{quote(memory_id, safe='')}?include_private=true", None)
 
+    def start_source_sync(self, source_id: str, *, force_full_sync: bool = False) -> dict[str, Any]:
+        source_id = source_id.strip()
+        if not source_id:
+            return {"error": "source_id is required"}
+        return self._http_json(
+            "POST",
+            f"/api/sources/{quote(source_id, safe='')}/sync",
+            {"force_full_sync": force_full_sync},
+        )
+
     def create_memory(
         self,
         *,
@@ -240,6 +250,49 @@ class ToolClient:
             body["raw_hash"] = raw_hash
         if blob_sha is not None:
             body["blob_sha"] = blob_sha
+        if submitted_by is not None:
+            body["submitted_by"] = submitted_by
+        if submitted_at is not None:
+            body["submitted_at"] = submitted_at
+        return self._http_json(
+            "POST",
+            f"/api/sources/{quote(source_id, safe='')}/adapter/documents",
+            body,
+        )
+
+    def push_jira_document(
+        self,
+        *,
+        source_id: str,
+        base_url: str,
+        issue_key: str,
+        source_url: str,
+        markdown_body: str,
+        title: str | None = None,
+        raw_hash: str | None = None,
+        source_semantics: dict[str, Any] | None = None,
+        submitted_by: str | None = None,
+        submitted_at: str | None = None,
+        process_now: bool = False,
+    ) -> dict[str, Any]:
+        """Push one locally fetched Jira issue into a configured Jira source."""
+        source_id = source_id.strip()
+        if not source_id:
+            return {"error": "source_id is required"}
+        body: dict[str, Any] = {
+            "base_url": base_url,
+            "issue_key": issue_key,
+            "source_url": source_url,
+            "markdown_body": markdown_body,
+            "content_type": "text/markdown",
+            "process_now": process_now,
+        }
+        if title is not None:
+            body["title"] = title
+        if raw_hash is not None:
+            body["raw_hash"] = raw_hash
+        if source_semantics is not None:
+            body["source_semantics"] = source_semantics
         if submitted_by is not None:
             body["submitted_by"] = submitted_by
         if submitted_at is not None:
