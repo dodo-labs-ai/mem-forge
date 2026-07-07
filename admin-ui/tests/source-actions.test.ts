@@ -106,6 +106,16 @@ assert.match(
 );
 assert.match(
   sourcesPageSource,
+  /pollLocalAgentSyncJob/,
+  "Internal network GitHub sync should keep the row pending until the local daemon job finishes",
+);
+assert.match(
+  sourcesPageSource,
+  /\/api\/cloud\/local-agent\/jobs\/\$\{jobId\}/,
+  "Internal network GitHub sync should poll the local-agent job status endpoint",
+);
+assert.match(
+  sourcesPageSource,
   /onToggleStatus=\{\(\)\s*=>\s*\{/,
   "SourceActionsMenu should receive a pause/resume action per source row",
 );
@@ -149,6 +159,16 @@ assert.match(
   sourcesPageSource,
   /className="[^"]*cursor-pointer[^"]*disabled:cursor-not-allowed[^"]*"/,
   "enabled overflow menu actions should use a pointer cursor while disabled actions keep not-allowed",
+);
+assert.match(
+  sourcesPageSource,
+  /github_repo_sync/,
+  "Internal network GitHub source sync should enqueue a local-agent sync job",
+);
+assert.match(
+  sourcesPageSource,
+  /\/api\/cloud\/local-agent\/jobs/,
+  "Internal network GitHub source sync should use the cloud local-agent queue",
 );
 
 const sourceConfigDialogSource = readFileSync("src/views/sources/SourceConfigDialog.tsx", "utf8");

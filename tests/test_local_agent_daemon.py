@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import re
 
 from click.testing import CliRunner
 
@@ -214,6 +215,234 @@ def test_local_agent_marks_error_payloads_as_failed(tmp_path):
     assert report["results"][0]["error"] == "one or more documents failed to push"
 
 
+def test_local_agent_leases_runs_and_completes_cloud_jobs(tmp_path):
+    from memforge.local_agent.runner import LocalAgentRunner
+    from memforge.local_agent.state import LocalAgentStateStore
+    from memforge.local_agent.tasks import LocalAgentHandlers
+
+    completed: list[tuple[str, int, str, dict, str | None]] = []
+    handled_jobs: list[dict] = []
+
+    def run_cloud_job(job: dict) -> dict:
+        handled_jobs.append(job)
+        return {"count": 1, "items": [{"path": "README.md"}]}
+
+    runner = LocalAgentRunner(
+        adapter_config={},
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        handlers=LocalAgentHandlers(
+            run_kb_profile=lambda name: {},
+            run_github_profile=lambda name: {},
+            run_jira_auth=lambda origin, last_hash=None: {"action": "unchanged"},
+            run_cloud_job=run_cloud_job,
+        ),
+        cloud_jobs_provider=lambda: {
+            "jobs": [
+                {
+                    "job_id": "laj-1",
+                    "operation": "github_repo_preview_tree",
+                    "source_id": "src-gh",
+                    "attempt_count": 1,
+                    "payload": {"repo_url": "https://github.example/org/repo"},
+                }
+            ]
+        },
+        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: completed.append(
+            (job_id, attempt_count, status, result, error)
+        )
+        or {"ok": True},
+    )
+
+    report = runner.run_once(now=datetime(2026, 7, 7, tzinfo=timezone.utc), include_jira=False)
+
+    assert handled_jobs == [
+        {
+            "job_id": "laj-1",
+            "operation": "github_repo_preview_tree",
+            "source_id": "src-gh",
+            "attempt_count": 1,
+            "payload": {"repo_url": "https://github.example/org/repo"},
+        }
+    ]
+    assert completed == [
+        (
+            "laj-1",
+            1,
+            "succeeded",
+            {"count": 1, "items": [{"path": "README.md"}]},
+            None,
+        )
+    ]
+    assert report["counts"] == {"total": 1, "success": 1, "failed": 0, "skipped": 0}
+    assert report["results"][0]["task_id"] == "cloud-job:laj-1"
+
+
+def test_local_agent_cloud_lease_failure_does_not_abort_profile_tasks(tmp_path):
+    from memforge.local_agent.runner import LocalAgentRunner
+    from memforge.local_agent.state import LocalAgentStateStore
+    from memforge.local_agent.tasks import LocalAgentHandlers
+
+    calls: list[str] = []
+
+    runner = LocalAgentRunner(
+        adapter_config={"github": {"arch": {"repo_url": "https://github.example/org/repo", "source_id": "src-arch"}}},
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        handlers=LocalAgentHandlers(
+            run_kb_profile=lambda name: {},
+            run_github_profile=lambda name: calls.append(name) or {"counts": {"pushed": 1}},
+            run_jira_auth=lambda origin, last_hash=None: {"action": "unchanged"},
+        ),
+        cloud_jobs_provider=lambda: (_ for _ in ()).throw(RuntimeError("cloud unavailable")),
+    )
+
+    report = runner.run_once(now=datetime(2026, 7, 7, tzinfo=timezone.utc), include_jira=False)
+
+    assert calls == ["arch"]
+    assert report["counts"] == {"total": 2, "success": 1, "failed": 1, "skipped": 0}
+    assert report["results"][1]["task_id"] == "cloud-jobs:lease"
+    assert report["results"][1]["kind"] == "cloud_job"
+    assert report["results"][1]["status"] == "failed"
+    assert report["results"][1]["error"] == "cloud unavailable"
+
+
+def test_local_agent_cloud_lease_error_response_is_reported(tmp_path):
+    from memforge.local_agent.runner import LocalAgentRunner
+    from memforge.local_agent.state import LocalAgentStateStore
+    from memforge.local_agent.tasks import LocalAgentHandlers
+
+    runner = LocalAgentRunner(
+        adapter_config={},
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        handlers=LocalAgentHandlers(
+            run_kb_profile=lambda name: {},
+            run_github_profile=lambda name: {},
+            run_jira_auth=lambda origin, last_hash=None: {"action": "unchanged"},
+        ),
+        cloud_jobs_provider=lambda: {
+            "error": "MemForge API request failed",
+            "status_code": 401,
+            "detail": "invalid token",
+        },
+    )
+
+    report = runner.run_once(now=datetime(2026, 7, 7, tzinfo=timezone.utc), include_jira=False)
+
+    assert report["counts"] == {"total": 1, "success": 0, "failed": 1, "skipped": 0}
+    assert report["results"][0]["task_id"] == "cloud-jobs:lease"
+    assert report["results"][0]["error_type"] == "CloudJobLeaseError"
+    assert report["results"][0]["error"] == "MemForge API request failed: status_code=401: invalid token"
+
+
+def test_local_agent_cloud_completion_failure_does_not_abort_following_jobs(tmp_path):
+    from memforge.local_agent.runner import LocalAgentRunner
+    from memforge.local_agent.state import LocalAgentStateStore
+    from memforge.local_agent.tasks import LocalAgentHandlers
+
+    completed: list[str] = []
+
+    def complete(job_id: str, attempt_count: int, status: str, result: dict, error: str | None = None) -> dict:
+        if job_id == "laj-1":
+            raise RuntimeError("completion unavailable")
+        completed.append(f"{job_id}:{attempt_count}")
+        return {"ok": True}
+
+    runner = LocalAgentRunner(
+        adapter_config={},
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        handlers=LocalAgentHandlers(
+            run_kb_profile=lambda name: {},
+            run_github_profile=lambda name: {},
+            run_jira_auth=lambda origin, last_hash=None: {"action": "unchanged"},
+            run_cloud_job=lambda job: {"job": job["job_id"]},
+        ),
+        cloud_jobs_provider=lambda: {
+            "jobs": [
+                {"job_id": "laj-1", "source_id": "src-1", "attempt_count": 1},
+                {"job_id": "laj-2", "source_id": "src-2", "attempt_count": 2},
+            ]
+        },
+        cloud_job_completer=complete,
+    )
+
+    report = runner.run_once(now=datetime(2026, 7, 7, tzinfo=timezone.utc), include_jira=False)
+
+    assert completed == ["laj-2:2"]
+    assert report["counts"] == {"total": 2, "success": 1, "failed": 1, "skipped": 0}
+    assert report["results"][0]["task_id"] == "cloud-job:laj-1"
+    assert report["results"][0]["status"] == "failed"
+    assert report["results"][0]["error"] == "completion unavailable"
+    assert report["results"][1]["task_id"] == "cloud-job:laj-2"
+    assert report["results"][1]["status"] == "success"
+
+
+def test_local_agent_cloud_completion_error_response_does_not_abort_following_jobs(tmp_path):
+    from memforge.local_agent.runner import LocalAgentRunner
+    from memforge.local_agent.state import LocalAgentStateStore
+    from memforge.local_agent.tasks import LocalAgentHandlers
+
+    def complete(job_id: str, attempt_count: int, status: str, result: dict, error: str | None = None) -> dict:
+        if job_id == "laj-1":
+            return {
+                "error": "MemForge API request failed",
+                "status_code": 404,
+                "detail": "stale lease",
+            }
+        return {"ok": True}
+
+    runner = LocalAgentRunner(
+        adapter_config={},
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        handlers=LocalAgentHandlers(
+            run_kb_profile=lambda name: {},
+            run_github_profile=lambda name: {},
+            run_jira_auth=lambda origin, last_hash=None: {"action": "unchanged"},
+            run_cloud_job=lambda job: {"job": job["job_id"]},
+        ),
+        cloud_jobs_provider=lambda: {
+            "jobs": [
+                {"job_id": "laj-1", "source_id": "src-1", "attempt_count": 1},
+                {"job_id": "laj-2", "source_id": "src-2", "attempt_count": 2},
+            ]
+        },
+        cloud_job_completer=complete,
+    )
+
+    report = runner.run_once(now=datetime(2026, 7, 7, tzinfo=timezone.utc), include_jira=False)
+
+    assert report["counts"] == {"total": 2, "success": 1, "failed": 1, "skipped": 0}
+    assert report["results"][0]["task_id"] == "cloud-job:laj-1"
+    assert report["results"][0]["status"] == "failed"
+    assert report["results"][0]["error_type"] == "CloudJobCompletionError"
+    assert report["results"][0]["error"] == "MemForge API request failed: status_code=404: stale lease"
+    assert report["results"][1]["task_id"] == "cloud-job:laj-2"
+    assert report["results"][1]["status"] == "success"
+
+
+def test_local_agent_cloud_job_without_attempt_count_is_rejected_locally(tmp_path):
+    from memforge.local_agent.runner import LocalAgentRunner
+    from memforge.local_agent.state import LocalAgentStateStore
+    from memforge.local_agent.tasks import LocalAgentHandlers
+
+    runner = LocalAgentRunner(
+        adapter_config={},
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        handlers=LocalAgentHandlers(
+            run_kb_profile=lambda name: {},
+            run_github_profile=lambda name: {},
+            run_jira_auth=lambda origin, last_hash=None: {"action": "unchanged"},
+            run_cloud_job=lambda job: {"job": job["job_id"]},
+        ),
+        cloud_jobs_provider=lambda: {"jobs": [{"job_id": "laj-1", "source_id": "src-1"}]},
+        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: {"ok": True},
+    )
+
+    report = runner.run_once(now=datetime(2026, 7, 7, tzinfo=timezone.utc), include_jira=False)
+
+    assert report["counts"] == {"total": 1, "success": 0, "failed": 1, "skipped": 0}
+    assert report["results"][0]["task_id"] == "cloud-job:laj-1"
+    assert report["results"][0]["error"] == "cloud job is missing attempt_count"
+
+
 def test_local_agent_failed_tasks_retry_after_short_backoff(tmp_path):
     from datetime import timedelta
 
@@ -358,6 +587,13 @@ def test_adapter_daemon_run_accepts_interval_seconds_alias():
 
     assert result.exit_code == 0, result.output
     assert "--interval-seconds" in result.output
+
+
+def test_adapter_daemon_run_defaults_to_fast_cloud_job_poll():
+    result = CliRunner().invoke(cli, ["adapter", "daemon", "run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert re.search(r"\[default:\s*10\]", result.output)
 
 
 def test_local_agent_caches_jira_discovery_between_due_windows(tmp_path):

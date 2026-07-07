@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { AlertCircle, FileText, FolderTree, Loader2, RefreshCw } from "lucide-react";
 import client from "@/api/client";
-import type { GitHubRepoTreeResponse } from "@/api/types";
+import type { GitHubRepoTreeResponse, LocalAgentJobCreateResponse, LocalAgentJobStatusResponse } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -13,23 +13,9 @@ import {
 
 type ConfigValue = string | number | boolean | string[] | null;
 
-interface BrowserFileHandle {
-  kind: "file";
-  name: string;
-}
-
-interface BrowserDirectoryHandle {
-  kind: "directory";
-  name: string;
-  values(): AsyncIterable<BrowserFileHandle | BrowserDirectoryHandle>;
-}
-
-interface BrowserWindow extends Window {
-  showDirectoryPicker?: () => Promise<BrowserDirectoryHandle>;
-}
-
 const LOCAL_SCAN_LIMIT = 2_000;
-const SKIPPED_DIRECTORIES = new Set([".git", "node_modules", ".venv", "venv", "dist", "build", ".next"]);
+const LOCAL_AGENT_POLL_ATTEMPTS = 180;
+const LOCAL_AGENT_POLL_INTERVAL_MS = 1_000;
 
 export function GitHubRepoFolderPicker({
   connectionMode,
@@ -48,8 +34,6 @@ export function GitHubRepoFolderPicker({
   const [manualPath, setManualPath] = useState("");
   const selected = useMemo(() => new Set(value.map(normalizeRepoPickerPath)), [value]);
   const isLocalPush = connectionMode === "local_push";
-  const canPickLocalDirectory =
-    typeof window !== "undefined" && typeof (window as BrowserWindow).showDirectoryPicker === "function";
 
   const browseCloudTree = async () => {
     setLoading(true);
@@ -70,23 +54,30 @@ export function GitHubRepoFolderPicker({
     }
   };
 
-  const browseLocalClone = async () => {
-    if (!canPickLocalDirectory) {
-      setMessage("Local folder selection is not available in this browser.");
-      return;
-    }
+  const browseLocalAgentTree = async () => {
     setLoading(true);
     setMessage(null);
     try {
-      const root = await (window as BrowserWindow).showDirectoryPicker!();
-      const paths = await scanLocalDirectory(root);
+      const created = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
+        source_type: "github_repo",
+        operation: "github_repo_preview_tree",
+        payload: {
+          ...config,
+          limit: LOCAL_SCAN_LIMIT,
+        },
+      });
+      const status = await pollLocalAgentJob(created.data.job_id);
+      if (status.status === "failed") {
+        setMessage(status.last_error || "Local daemon could not load repository folders.");
+        return;
+      }
+      const paths = localAgentJobPaths(status);
       setItems(repoPickerItemsFromFilePaths(paths));
-      if (paths.length >= LOCAL_SCAN_LIMIT) {
-        setMessage("Local scan reached the preview limit. Choose a top-level folder or add a precise path.");
+      if (status.result?.truncated || paths.length >= LOCAL_SCAN_LIMIT) {
+        setMessage("Repository tree is large. Narrow the selection before syncing.");
       }
     } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") return;
-      setMessage(extractMessage(error) || "Could not scan local folder.");
+      setMessage(extractMessage(error) || "Could not reach the local daemon. Start memforge adapter daemon run.");
     } finally {
       setLoading(false);
     }
@@ -110,17 +101,17 @@ export function GitHubRepoFolderPicker({
           type="button"
           variant="outline"
           size="sm"
-          onClick={isLocalPush ? browseLocalClone : browseCloudTree}
+          onClick={isLocalPush ? browseLocalAgentTree : browseCloudTree}
           disabled={loading}
         >
           {loading ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
-          {isLocalPush ? "Choose clone" : "Browse repo"}
+          {isLocalPush ? "Fetch folders" : "Browse repo"}
         </Button>
       </div>
 
       {isLocalPush && (
         <p className="mt-2 text-xs text-muted-foreground">
-          Pick folders from your clone. The sync command still needs the clone path.
+          Start the local daemon, then fetch folders from the repository.
         </p>
       )}
 
@@ -154,7 +145,7 @@ export function GitHubRepoFolderPicker({
         </div>
       )}
 
-      <details className="mt-3" open={isLocalPush && !canPickLocalDirectory}>
+      <details className="mt-3">
         <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
           Type a path instead
         </summary>
@@ -200,24 +191,26 @@ function SelectedPaths({ paths, onRemove }: { paths: string[]; onRemove: (path: 
   );
 }
 
-async function scanLocalDirectory(root: BrowserDirectoryHandle): Promise<string[]> {
-  const paths: string[] = [];
-  await scanDirectory(root, "", paths);
-  return paths;
+async function pollLocalAgentJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
+  for (let attempt = 0; attempt < LOCAL_AGENT_POLL_ATTEMPTS; attempt += 1) {
+    const response = await client.get<LocalAgentJobStatusResponse>(`/api/cloud/local-agent/jobs/${jobId}`);
+    if (response.data.status === "succeeded" || response.data.status === "failed") {
+      return response.data;
+    }
+    await wait(LOCAL_AGENT_POLL_INTERVAL_MS);
+  }
+  throw new Error("Timed out waiting for the local daemon.");
 }
 
-async function scanDirectory(handle: BrowserDirectoryHandle, prefix: string, paths: string[]): Promise<void> {
-  if (paths.length >= LOCAL_SCAN_LIMIT) return;
-  for await (const child of handle.values()) {
-    if (paths.length >= LOCAL_SCAN_LIMIT) return;
-    const path = prefix ? `${prefix}/${child.name}` : child.name;
-    if (child.kind === "directory") {
-      if (SKIPPED_DIRECTORIES.has(child.name)) continue;
-      await scanDirectory(child, path, paths);
-    } else {
-      paths.push(path);
-    }
-  }
+function localAgentJobPaths(status: LocalAgentJobStatusResponse): string[] {
+  const items = status.result?.items ?? [];
+  return items
+    .map((item) => normalizeRepoPickerPath(item.relative_path ?? item.path ?? ""))
+    .filter((path) => path.length > 0);
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function extractMessage(error: unknown): string {

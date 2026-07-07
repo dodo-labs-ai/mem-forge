@@ -27,6 +27,8 @@ class LocalAgentRunner:
         state_store: LocalAgentStateStore,
         handlers: LocalAgentHandlers,
         jira_origins_provider: Callable[[], dict[str, Any]] | None = None,
+        cloud_jobs_provider: Callable[[], dict[str, Any]] | None = None,
+        cloud_job_completer: Callable[[str, int, str, dict[str, Any], str | None], dict[str, Any]] | None = None,
         default_sync_interval_seconds: int = 3600,
         jira_interval_seconds: int = 1800,
     ) -> None:
@@ -35,6 +37,8 @@ class LocalAgentRunner:
         self.state_store = state_store
         self.handlers = handlers
         self.jira_origins_provider = jira_origins_provider
+        self.cloud_jobs_provider = cloud_jobs_provider
+        self.cloud_job_completer = cloud_job_completer
         self.default_sync_interval_seconds = _positive_seconds(default_sync_interval_seconds, default=3600)
         self.jira_interval_seconds = _positive_seconds(jira_interval_seconds, default=1800)
         self._cached_jira_tasks: list[LocalAgentTask] = []
@@ -73,6 +77,14 @@ class LocalAgentRunner:
                 continue
             result = self._run_task(task, now, _previous_state_result(state, task.task_id))
             self.state_store.record_result(task.task_id, result)
+            results.append(result)
+        cloud_jobs, cloud_discovery_result = self._lease_cloud_jobs(now)
+        if cloud_discovery_result is not None:
+            self.state_store.record_result(cloud_discovery_result["task_id"], cloud_discovery_result)
+            results.append(cloud_discovery_result)
+        for job in cloud_jobs:
+            result = self._run_cloud_job(job, now)
+            self.state_store.record_result(result["task_id"], result)
             results.append(result)
         return {
             "status": "ok",
@@ -157,6 +169,108 @@ class LocalAgentRunner:
                 "error_type": type(exc).__name__,
             }
 
+    def _run_cloud_job(self, job: dict[str, Any], now: datetime) -> dict[str, Any]:
+        job_id = str(job.get("job_id") or "").strip()
+        task_id = f"cloud-job:{job_id or 'unknown'}"
+        started_at = now.isoformat()
+        if not job_id:
+            return _cloud_job_failed_result(task_id, started_at, "cloud job is missing job_id")
+        attempt_count = _job_attempt_count(job)
+        if attempt_count is None:
+            return _cloud_job_failed_result(task_id, started_at, "cloud job is missing attempt_count")
+        if self.handlers.run_cloud_job is None:
+            return _cloud_job_failed_result(task_id, started_at, "cloud job handler is not configured")
+        try:
+            payload = self.handlers.run_cloud_job(job)
+            error = str(payload.get("error") or "").strip()
+            status = "failed" if error else "success"
+            completion_status = "failed" if error else "succeeded"
+            completion_error = self._complete_cloud_job(job_id, attempt_count, completion_status, payload, error or None)
+            if completion_error:
+                return {
+                    "task_id": task_id,
+                    "kind": "cloud_job",
+                    "profile_name": None,
+                    "origin": job.get("source_id"),
+                    "status": "failed",
+                    "started_at": started_at,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                    "error": completion_error,
+                    "error_type": "CloudJobCompletionError",
+                    "payload": payload,
+                }
+            result = {
+                "task_id": task_id,
+                "kind": "cloud_job",
+                "profile_name": None,
+                "origin": job.get("source_id"),
+                "status": status,
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "payload": payload,
+            }
+            if error:
+                result["error"] = error
+            return result
+        except Exception as exc:  # cloud jobs must not stop the daemon loop
+            error = str(exc)
+            completion_error = self._complete_cloud_job(job_id, attempt_count, "failed", {}, error)
+            if completion_error:
+                error = f"{error}; completion failed: {completion_error}"
+            return {
+                "task_id": task_id,
+                "kind": "cloud_job",
+                "profile_name": None,
+                "origin": job.get("source_id"),
+                "status": "failed",
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "error": error,
+                "error_type": type(exc).__name__,
+            }
+
+    def _lease_cloud_jobs(self, now: datetime) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        if self.cloud_jobs_provider is None:
+            return [], None
+        try:
+            response = self.cloud_jobs_provider()
+        except Exception as exc:  # cloud polling must not block local profile work
+            started_at = now.isoformat()
+            return [], _cloud_job_failed_result(
+                "cloud-jobs:lease",
+                started_at,
+                str(exc),
+                error_type=type(exc).__name__,
+            )
+        if isinstance(response, dict) and response.get("error"):
+            return [], _cloud_job_failed_result(
+                "cloud-jobs:lease",
+                now.isoformat(),
+                _api_error_message(response),
+                error_type="CloudJobLeaseError",
+            )
+        jobs = response.get("jobs") if isinstance(response, dict) else None
+        if not isinstance(jobs, list):
+            return [], None
+        return [job for job in jobs if isinstance(job, dict)], None
+
+    def _complete_cloud_job(
+        self,
+        job_id: str,
+        attempt_count: int,
+        status: str,
+        result: dict[str, Any],
+        error: str | None,
+    ) -> str | None:
+        if self.cloud_job_completer is not None:
+            try:
+                response = self.cloud_job_completer(job_id, attempt_count, status, result, error)
+                if isinstance(response, dict) and response.get("error"):
+                    return _api_error_message(response)
+            except Exception as exc:  # completion failures should not abort later jobs
+                return str(exc)
+        return None
+
     def _discover_jira_tasks(
         self,
         now: datetime,
@@ -240,6 +354,51 @@ def _runner_failed_result(now: datetime, exc: Exception) -> dict[str, Any]:
         "error": str(exc),
         "error_type": type(exc).__name__,
     }
+
+
+def _cloud_job_failed_result(
+    task_id: str,
+    started_at: str,
+    error: str,
+    *,
+    error_type: str | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "task_id": task_id,
+        "kind": "cloud_job",
+        "profile_name": None,
+        "origin": None,
+        "status": "failed",
+        "started_at": started_at,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "error": error,
+    }
+    if error_type:
+        result["error_type"] = error_type
+    return result
+
+
+def _job_attempt_count(job: dict[str, Any]) -> int | None:
+    value = job.get("attempt_count")
+    if isinstance(value, bool):
+        return None
+    try:
+        attempt_count = int(value)
+    except (TypeError, ValueError):
+        return None
+    return attempt_count if attempt_count > 0 else None
+
+
+def _api_error_message(response: dict[str, Any]) -> str:
+    detail = str(response.get("detail") or "").strip()
+    status_code = response.get("status_code")
+    error = str(response.get("error") or "MemForge API request failed").strip()
+    parts = [error]
+    if status_code is not None:
+        parts.append(f"status_code={status_code}")
+    if detail:
+        parts.append(detail)
+    return ": ".join(parts)
 
 
 def _skipped_result(task: LocalAgentTask, now: datetime, *, reason: str) -> dict[str, Any]:

@@ -322,6 +322,36 @@ class ToolClient:
             {"enabled": enabled, "interval_minutes": interval_minutes},
         )
 
+    def lease_local_agent_jobs(
+        self,
+        *,
+        limit: int = 5,
+        lease_seconds: int = 3600,
+    ) -> dict[str, Any]:
+        return self._http_json(
+            "POST",
+            "/api/cloud/local-agent/jobs/lease",
+            {"limit": limit, "lease_seconds": lease_seconds},
+        )
+
+    def complete_local_agent_job(
+        self,
+        job_id: str,
+        *,
+        attempt_count: int,
+        status: str,
+        result: dict[str, Any],
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"status": status, "attempt_count": attempt_count, "result": result}
+        if error is not None:
+            body["error"] = error
+        return self._http_json(
+            "POST",
+            f"/api/cloud/local-agent/jobs/{quote(job_id, safe='')}/complete",
+            body,
+        )
+
     def get_jira_session(self, base_url: str) -> dict[str, Any]:
         return self._http_json("GET", f"/api/auth/jira-session?base_url={quote(base_url, safe='')}", None)
 
@@ -510,6 +540,8 @@ class ToolClient:
 
     def _request_url(self, path: str) -> str:
         if not self.workspace_id or not path.startswith("/api"):
+            return f"{self.api_url}{path}"
+        if path.startswith(("/api/cloud/", "/api/auth/")):
             return f"{self.api_url}{path}"
         quoted_workspace = quote(self.workspace_id, safe="")
         if path == "/api":

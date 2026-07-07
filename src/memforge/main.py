@@ -172,12 +172,25 @@ def _resolve_api_endpoint(config: AppConfig) -> tuple[str, str | None]:
     return f"http://127.0.0.1:{config.server.admin_api_port}", os.getenv("MEMFORGE_API_TOKEN")
 
 
-def _tool_client(ctx) -> ToolClient:
+def _tool_client(ctx, *, workspace_id: str | None = None) -> ToolClient:
     config: AppConfig = ctx.obj["config"]
     api_url, api_token = _resolve_api_endpoint(config)
     return ToolClient(
         api_url=api_url,
         api_token=api_token,
+        workspace_id=workspace_id,
+    )
+
+
+def _workspace_tool_client(client: ToolClient, workspace_id: str) -> ToolClient:
+    workspace_id = workspace_id.strip()
+    if not workspace_id:
+        return client
+    return ToolClient(
+        api_url=client.api_url,
+        api_token=client.api_token,
+        workspace_id=workspace_id,
+        timeout_seconds=client.timeout_seconds,
     )
 
 
@@ -208,7 +221,7 @@ def _build_local_agent_runner(
     from memforge.local_agent.runner import LocalAgentRunner
     from memforge.local_agent.tasks import LocalAgentHandlers
 
-    client = _tool_client(ctx)
+    client = _tool_client(ctx, workspace_id="")
     return LocalAgentRunner(
         adapter_config=_read_adapter_config(),
         adapter_config_provider=_read_adapter_config,
@@ -236,8 +249,17 @@ def _build_local_agent_runner(
                 browser=browser,
                 last_hash=last_hash,
             ),
+            run_cloud_job=lambda job: _run_cloud_local_agent_job(job, client),
         ),
         jira_origins_provider=client.list_jira_origins,
+        cloud_jobs_provider=client.lease_local_agent_jobs,
+        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: client.complete_local_agent_job(
+            job_id,
+            attempt_count=attempt_count,
+            status=status,
+            result=result,
+            error=error,
+        ),
         default_sync_interval_seconds=default_sync_interval_seconds,
         jira_interval_seconds=jira_interval_seconds,
     )
@@ -1691,7 +1713,7 @@ def adapter_daemon_once(
 @click.option("--include-jira/--no-include-jira", default=True, show_default=True,
               help="Also refresh known Jira browser-session origins.")
 @click.option("--browser", default=None, help="Browser to read Jira cookies from, for example chrome or edge.")
-@click.option("--interval-seconds", "poll_interval_seconds", default=60, show_default=True, type=int,
+@click.option("--interval-seconds", "poll_interval_seconds", default=10, show_default=True, type=int,
               help="Seconds between due-task checks.")
 @click.option("--default-sync-interval-seconds", default=3600, show_default=True, type=int,
               help="Default local-folder and GitHub sync interval.")
@@ -1879,13 +1901,36 @@ def _push_github_profile_payload(
         raise click.ClickException(
             "No source id for this profile. Re-run with --source-id, or link one with `adapter github add ... --source-id`."
         )
+    return _push_github_profile_to_source(
+        name,
+        profile,
+        source_id=source_id,
+        limit=limit,
+        process_now=process_now,
+        submitted_by=submitted_by,
+        client=_tool_client(ctx),
+    )
+
+
+def _push_github_profile_to_source(
+    name: str,
+    profile: dict[str, Any],
+    *,
+    source_id: str,
+    limit: int,
+    process_now: bool,
+    submitted_by: str | None,
+    client: ToolClient,
+) -> dict[str, Any]:
+    source_id = source_id.strip()
+    if not source_id:
+        raise click.ClickException("source_id is required")
 
     repo, ref, _include_paths, _include_extensions = _resolve_github_profile(name, profile)
     repo_path = _repo_path_from_profile(profile, repo)
     preview = _preview_github_profile(name, profile, limit=None if limit == 0 else max(limit, 0))
     selected_entries = list(preview["items"])
 
-    client = _tool_client(ctx)
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     prepared: list[dict[str, Any]] = []
@@ -1948,6 +1993,58 @@ def _push_github_profile_payload(
     if failed:
         payload["error"] = "one or more documents failed to push"
     return payload
+
+
+def _run_cloud_local_agent_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    profile = _github_profile_from_cloud_job(job)
+    source_id = str(job.get("source_id") or payload.get("source_id") or "").strip()
+    workspace_id = str(job.get("workspace_id") or payload.get("workspace_id") or "").strip()
+    profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
+
+    if operation == "github_repo_preview_tree":
+        limit = _cloud_job_limit(payload.get("limit"), default=200)
+        preview = _preview_github_profile(profile_name, profile, limit=limit)
+        return {"operation": operation, "source_id": source_id, **preview}
+
+    if operation == "github_repo_sync":
+        if not source_id:
+            return {"operation": operation, "error": "source_id is required"}
+        if not workspace_id:
+            return {"operation": operation, "source_id": source_id, "error": "workspace_id is required"}
+        result = _push_github_profile_to_source(
+            profile_name,
+            profile,
+            source_id=source_id,
+            limit=_cloud_job_limit(payload.get("limit"), default=0),
+            process_now=bool(payload.get("process_now", True)),
+            submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
+            client=_workspace_tool_client(client, workspace_id),
+        )
+        return {"operation": operation, **result}
+
+    return {"operation": operation, "error": f"unsupported cloud local-agent job operation: {operation or '<empty>'}"}
+
+
+def _github_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    profile: dict[str, Any] = {
+        "repo_url": str(payload.get("repo_url") or "").strip(),
+        "ref": str(payload.get("ref") or "main").strip() or "main",
+    }
+    for key in ("include_paths", "include_extensions", "repo_path"):
+        if key in payload:
+            profile[key] = payload[key]
+    return profile
+
+
+def _cloud_job_limit(value: Any, *, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(parsed, 0)
 
 
 @adapter_kb.command("add")
