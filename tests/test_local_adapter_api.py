@@ -235,7 +235,7 @@ def test_github_repo_adapter_document_push_requires_local_push_mode(tmp_path):
                 },
             )
         assert response.status_code == 400
-        assert "local_push" in response.json()["detail"]
+        assert "Internal network / VPN" in response.json()["detail"]
     finally:
         asyncio.run(database.close())
 

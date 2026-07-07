@@ -233,7 +233,7 @@ async def submit_github_repo_document(
         raise ValueError("source has no configured repo_url")
     connection_mode = str((source.get("config") or {}).get("connection_mode") or "cloud_pull").strip().lower()
     if connection_mode != "local_push":
-        raise ValueError("github_repo adapter push requires connection_mode=local_push")
+        raise ValueError("GitHub Repository adapter push requires Internal network / VPN access")
     if _canonical_repo_url(repo_url) != _canonical_repo_url(configured_repo):
         raise ValueError(
             f"repo_url {repo_url!r} does not match the source's configured repo_url "
@@ -273,7 +273,7 @@ async def submit_github_repo_document(
     package_path.parent.mkdir(parents=True, exist_ok=True)
     max_files = _positive_int(source_config.get("max_files"), default=500)
     if not package_path.exists() and _github_package_count(inbox, source_config) >= max_files:
-        raise ValueError(f"github_repo local_push source already has max_files={max_files} packages")
+        raise ValueError(f"GitHub Repository Internal network / VPN source already has max_files={max_files} packages")
 
     package = {
         "package_kind": GITHUB_REPO_PACKAGE_KIND,

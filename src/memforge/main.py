@@ -449,7 +449,7 @@ def _github_tree(repo: dict[str, str], ref: str) -> list[dict[str, Any]]:
     )
     if payload.get("truncated") is True:
         raise click.ClickException(
-            "GitHub tree response was truncated; use local_push for this large repository until non-recursive cloud pull is supported."
+            "GitHub tree response was truncated; use Internal network / VPN access for this large repository."
         )
     tree = payload.get("tree")
     return tree if isinstance(tree, list) else []
@@ -1547,7 +1547,7 @@ def adapter_github():
 @click.argument("name")
 @click.option("--repo-url", required=True, help="GitHub or GitHub Enterprise repository URL.")
 @click.option("--repo-path", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path),
-              help="Optional local clone path used for local_push preview and push.")
+              help="Local clone path for Internal network / VPN repositories.")
 @click.option("--ref", "repo_ref", default="main", show_default=True, help="Branch, tag, or commit to sync.")
 @click.option("--include-path", "include_paths", multiple=True,
               help="Repo-relative folder or file to include. Repeatable. Empty means all paths.")
