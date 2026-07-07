@@ -1599,6 +1599,21 @@ def adapter_github_list(ctx):
     _emit_tool_payload(ctx, {"profiles": _read_adapter_config().get("github", {})})
 
 
+@adapter_github.command("remove")
+@click.argument("name")
+@click.pass_context
+def adapter_github_remove(ctx, name: str):
+    """Remove a local GitHub repository profile."""
+    name = name.strip()
+    data = _read_adapter_config()
+    github = data.get("github", {})
+    if name not in github:
+        raise click.ClickException(f"Unknown GitHub repository profile: {name}")
+    github.pop(name)
+    _write_adapter_config(data)
+    _emit_tool_payload(ctx, {"ok": True, "removed": name})
+
+
 @adapter_github.command("preview")
 @click.argument("name")
 @click.option("--limit", default=20, show_default=True, type=int, help="Maximum included files to return.")

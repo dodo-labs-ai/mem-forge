@@ -14,6 +14,7 @@ const requiredLabels = [
   // Areas
   "Connect a MemForge server",
   "Local repository",
+  "GitHub repository",
   "Jira",
   "Search memory",
   "Status & diagnostics",
@@ -27,6 +28,11 @@ const requiredLabels = [
   "Schedule sync",
   "Remove repository",
   "Manage repositories",
+  "Set up GitHub repository",
+  "Manage GitHub repositories",
+  "Public internet",
+  "Internal network / VPN",
+  "Preview selected files",
   "Check session status",
   "Authenticate browser session",
   "Forget a session",
@@ -52,6 +58,10 @@ const requiredCommands = [
   ['"adapter", "kb", "unschedule"', "Manage schedules wraps `memforge adapter kb unschedule`"],
   ['"adapter", "kb", "remove"', "Manage vaults wraps `memforge adapter kb remove`"],
   ['"adapter", "kb", "list"', "Manage vaults / status wraps `memforge adapter kb list`"],
+  ['"adapter", "github", "list"', "GitHub profile discovery wraps `memforge adapter github list`"],
+  ['"adapter", "github", "preview"', "GitHub preview wraps `memforge adapter github preview`"],
+  ['"adapter", "github", "push"', "GitHub sync wraps `memforge adapter github push`"],
+  ['"adapter", "github", "remove"', "GitHub profile removal wraps `memforge adapter github remove`"],
   ['"adapter", "auth", "jira", "status"', "Jira status wraps `adapter auth jira status`"],
   ['"adapter", "auth", "jira", "refresh"', "Jira auth wraps `adapter auth jira refresh`"],
   ['"adapter", "auth", "jira", "forget"', "Forget wraps `adapter auth jira forget`"],
@@ -66,10 +76,19 @@ for (const [needle, message] of requiredCommands) {
   assert.ok(source.includes(needle), message);
 }
 
+assert.match(
+  source,
+  /"adapter",\s*"github",\s*"add"/,
+  "GitHub setup wraps `memforge adapter github add`",
+);
+
 assert.ok(
   !/\[\s*"auth",\s*"jira"/.test(source),
   "interactive UI must use `adapter auth jira`, never the removed `auth jira`",
 );
+
+assert.ok(!source.includes("local_push"), "interactive UI must not expose internal GitHub connection mode names");
+assert.ok(!source.includes("cloud_pull"), "interactive UI must not expose internal GitHub connection mode names");
 
 assert.ok(
   !source.includes("spawnSync"),
