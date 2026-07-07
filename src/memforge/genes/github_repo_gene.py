@@ -94,7 +94,7 @@ class GitHubRepoGene(Gene):
                     required=True,
                     options=[CONNECTION_MODE_CLOUD_PULL, CONNECTION_MODE_LOCAL_PUSH],
                     default=CONNECTION_MODE_CLOUD_PULL,
-                    help_text="Choose direct access for GitHub.com or reachable Enterprise hosts. Use local access for VPN-only repositories.",
+                    help_text="Use Public internet when MemForge Cloud can reach the repo. Use Internal network / VPN when only your machine can reach it.",
                     group="connection",
                     order=0,
                 ),
@@ -182,7 +182,7 @@ class GitHubRepoGene(Gene):
             self._documents_dir().mkdir(parents=True, exist_ok=True)
             return
         if self._connection_mode != CONNECTION_MODE_CLOUD_PULL:
-            raise ValueError("GitHub Repository Connection Mode must be Cloud pull or Local push")
+            raise ValueError("GitHub Repository Access must be Public internet or Internal network / VPN")
 
         headers = {
             "Accept": "application/vnd.github+json",
@@ -322,7 +322,9 @@ class GitHubRepoGene(Gene):
             selected.append((package_path, package))
         max_files = _int_config(self.config, "max_files", DEFAULT_MAX_FILES)
         if len(selected) > max_files:
-            raise RuntimeError(f"GitHub Repository local_push matched {len(selected)} files, exceeding max_files={max_files}")
+            raise RuntimeError(
+                f"GitHub Repository Internal network / VPN sync matched {len(selected)} files, exceeding max_files={max_files}"
+            )
         for package_path, package in selected:
             last_modified = _parse_dt(str(package.get("last_modified") or ""))
             if since and last_modified <= since:
@@ -346,7 +348,7 @@ class GitHubRepoGene(Gene):
     def _documents_dir(self) -> Path:
         configured = str(self.config.get("documents_dir") or "").strip()
         if not configured:
-            raise ValueError("github_repo local_push source is missing documents_dir")
+            raise ValueError("GitHub Repository Internal network / VPN source is missing documents_dir")
         return Path(configured).expanduser()
 
 

@@ -385,7 +385,7 @@ function SourceConfigForm({
                 ))}
               </div>
               {sourceType !== "local_markdown"
-                && !(sourceType === "github_repo" && githubConnectionMode === "local_push")
+                && sourceType !== "github_repo"
                 && group.key === previewGroupKey && (
                 <DiscoveryPreviewPanel
                   ready={previewReady}
@@ -1222,8 +1222,8 @@ function optionLabel(field: ConfigField, option: string): string {
     if (option === "explicit_list") return "Explicit list";
   }
   if (field.key === "connection_mode") {
-    if (option === "cloud_pull") return "MemForge can access it";
-    if (option === "local_push") return "Only my computer can access it";
+    if (option === "cloud_pull") return "Public internet";
+    if (option === "local_push") return "Internal network / VPN";
   }
   return option;
 }

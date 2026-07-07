@@ -1375,7 +1375,7 @@ def _validate_github_repo_config(
         config.get("connection_mode") or existing_config.get("connection_mode") or "cloud_pull"
     ).strip().lower()
     if connection_mode not in {"cloud_pull", "local_push"}:
-        raise ValueError("GitHub Repository Connection Mode must be Cloud pull or Local push")
+        raise ValueError("GitHub Repository Access must be Public internet or Internal network / VPN")
     max_files = config.get("max_files", existing_config.get("max_files", 500))
     try:
         if int(max_files) < 1:
@@ -3219,7 +3219,7 @@ def create_admin_app(
             _validate_source_config("github_repo", req.config)
             config = dict(req.config)
             if str(config.get("connection_mode") or "cloud_pull").strip().lower() != "cloud_pull":
-                raise ValueError("GitHub Repository folder browsing is available only for Cloud pull")
+                raise ValueError("GitHub Repository folder browsing is available only for Public internet access")
             gene = create_gene("github_repo", config, source_id="browse-github-repo")
             await gene.authenticate()
             repo_ref = getattr(gene, "_repo_ref")
