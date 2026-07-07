@@ -204,12 +204,14 @@ def test_derive_project_key_collapses_punctuation():
 def _local_markdown_source_payload(
     *,
     name: str = "Engineering Notes",
+    root: str = "/tmp/memforge-engineering-notes",
     project_binding: dict | None = None,
 ) -> dict:
     payload = {
         "type": "local_markdown",
         "name": name,
         "config": {
+            "root": root,
             "vault_id": "engineering-notes",
         },
     }
