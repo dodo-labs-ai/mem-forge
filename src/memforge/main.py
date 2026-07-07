@@ -50,6 +50,7 @@ console = Console()
 log_console = Console(stderr=True)
 DEFAULT_CLI_CONFIG_PATH = Path.home() / ".memforge" / "cli.toml"
 DEFAULT_ADAPTER_CONFIG_PATH = Path.home() / ".memforge" / "adapter.toml"
+DEFAULT_LOCAL_AGENT_STATE_PATH = Path.home() / ".memforge" / "local-agent-state.json"
 DEFAULT_KB_INCLUDE = [
     "*.md", "**/*.md",
     "*.markdown", "**/*.markdown",
@@ -75,6 +76,11 @@ KB_CRON_MARK_END = "# <<< memforge:kb:{name} <<<"
 LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
 GITHUB_REPO_SOURCE_TYPE = "github_repo"
 DEFAULT_GITHUB_INCLUDE_EXTENSIONS = DEFAULT_INCLUDE_EXTENSION_LIST
+# Watch defaults. The tick interval is deliberately shorter than a typical Jira
+# idle-session timeout so the stored copy is renewed while it is still valid.
+WATCH_DEFAULT_INTERVAL_SECONDS = 1800  # 30 minutes
+WATCH_BACKOFF_BASE_SECONDS = 5
+WATCH_BACKOFF_MAX_SECONDS = 300  # 5 minutes
 INTERACTIVE_DISABLE_ENV = "MEMFORGE_NO_INTERACTIVE"
 INTERACTIVE_SCRIPT_ENV = "MEMFORGE_INTERACTIVE_SCRIPT"
 INTERACTIVE_BIN_ENV = "MEMFORGE_CLI_BIN"
@@ -179,6 +185,87 @@ def _emit_tool_payload(ctx, payload: dict) -> None:
     click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
     if payload.get("error"):
         ctx.exit(1)
+
+
+def _local_agent_state_path() -> Path:
+    configured = os.getenv("MEMFORGE_LOCAL_AGENT_STATE", "").strip()
+    return Path(configured).expanduser() if configured else DEFAULT_LOCAL_AGENT_STATE_PATH
+
+
+def _local_agent_state_store():
+    from memforge.local_agent.state import LocalAgentStateStore
+
+    return LocalAgentStateStore(_local_agent_state_path())
+
+
+def _build_local_agent_runner(
+    ctx,
+    *,
+    browser: str | None,
+    default_sync_interval_seconds: int,
+    jira_interval_seconds: int,
+):
+    from memforge.local_agent.runner import LocalAgentRunner
+    from memforge.local_agent.tasks import LocalAgentHandlers
+
+    client = _tool_client(ctx)
+    return LocalAgentRunner(
+        adapter_config=_read_adapter_config(),
+        adapter_config_provider=_read_adapter_config,
+        state_store=_local_agent_state_store(),
+        handlers=LocalAgentHandlers(
+            run_kb_profile=lambda name: _push_kb_profile_payload(
+                ctx,
+                name,
+                source_id=None,
+                limit=0,
+                process_now=True,
+                submitted_by="memforge-local-agent",
+            ),
+            run_github_profile=lambda name: _push_github_profile_payload(
+                ctx,
+                name,
+                source_id=None,
+                limit=0,
+                process_now=True,
+                submitted_by="memforge-local-agent",
+            ),
+            run_jira_auth=lambda origin, last_hash=None: _run_jira_auth_once(
+                client=client,
+                origin=origin,
+                browser=browser,
+                last_hash=last_hash,
+            ),
+        ),
+        jira_origins_provider=client.list_jira_origins,
+        default_sync_interval_seconds=default_sync_interval_seconds,
+        jira_interval_seconds=jira_interval_seconds,
+    )
+
+
+def _run_jira_auth_once(
+    *,
+    client,
+    origin: str,
+    browser: str | None,
+    last_hash: str | None = None,
+) -> dict[str, Any]:
+    from memforge.auth import jira_capture
+
+    async def _capture(url, *, browser=None):
+        return await jira_capture.capture_and_prevalidate(url, browser=browser)
+
+    action, new_hash = asyncio.run(
+        run_watch_tick(
+            base_url=origin,
+            browser=browser,
+            client=client,
+            last_hash=last_hash,
+            capture=_capture,
+            log=lambda message: log_console.print(message),
+        )
+    )
+    return {"action": action, "cookie_hash": new_hash or last_hash, "ok": action in {"uploaded", "unchanged"}}
 
 
 def _adapter_config_path() -> Path:
@@ -1531,6 +1618,121 @@ def adapter_status(ctx):
     )
 
 
+@adapter.group("daemon")
+def adapter_daemon():
+    """Run the MemForge local agent daemon."""
+    pass
+
+
+@adapter_daemon.command("status")
+@click.option("--default-sync-interval-seconds", default=3600, show_default=True, type=int,
+              help="Default interval used when displaying local-folder and GitHub profile tasks.")
+@click.pass_context
+def adapter_daemon_status(ctx, default_sync_interval_seconds: int):
+    """Show local agent daemon state."""
+    from memforge.local_agent.tasks import discover_profile_tasks
+
+    state = _local_agent_state_store().load()
+    configured = discover_profile_tasks(
+        _read_adapter_config(),
+        default_interval_seconds=default_sync_interval_seconds,
+    )
+    _emit_tool_payload(
+        ctx,
+        {
+            "status": "stopped",
+            "state_path": str(_local_agent_state_path()),
+            "configured_tasks": [
+                {
+                    "task_id": task.task_id,
+                    "kind": task.kind,
+                    "profile_name": task.profile_name,
+                    "origin": task.origin,
+                    "interval_seconds": task.interval_seconds,
+                }
+                for task in configured
+            ],
+            "state": state,
+        },
+    )
+
+
+@adapter_daemon.command("once")
+@click.option("--include-jira/--no-include-jira", default=True, show_default=True,
+              help="Also refresh known Jira browser-session origins.")
+@click.option("--browser", default=None, help="Browser to read Jira cookies from, for example chrome or edge.")
+@click.option("--default-sync-interval-seconds", default=3600, show_default=True, type=int,
+              help="Default interval recorded for local-folder and GitHub profile tasks.")
+@click.option("--jira-interval-seconds", default=WATCH_DEFAULT_INTERVAL_SECONDS, show_default=True, type=int,
+              help="Default Jira browser-session refresh interval.")
+@click.pass_context
+def adapter_daemon_once(
+    ctx,
+    include_jira: bool,
+    browser: str | None,
+    default_sync_interval_seconds: int,
+    jira_interval_seconds: int,
+):
+    """Run one local agent daemon pass and exit."""
+    runner = _build_local_agent_runner(
+        ctx,
+        browser=browser,
+        default_sync_interval_seconds=default_sync_interval_seconds,
+        jira_interval_seconds=jira_interval_seconds,
+    )
+    report = runner.run_once(include_jira=include_jira)
+    if int(report.get("counts", {}).get("failed") or 0) > 0:
+        report = dict(report)
+        report["error"] = "one or more local agent tasks failed"
+    _emit_tool_payload(ctx, report)
+
+
+@adapter_daemon.command("run")
+@click.option("--include-jira/--no-include-jira", default=True, show_default=True,
+              help="Also refresh known Jira browser-session origins.")
+@click.option("--browser", default=None, help="Browser to read Jira cookies from, for example chrome or edge.")
+@click.option("--interval-seconds", "poll_interval_seconds", default=60, show_default=True, type=int,
+              help="Seconds between due-task checks.")
+@click.option("--default-sync-interval-seconds", default=3600, show_default=True, type=int,
+              help="Default local-folder and GitHub sync interval.")
+@click.option("--jira-interval-seconds", default=WATCH_DEFAULT_INTERVAL_SECONDS, show_default=True, type=int,
+              help="Default Jira browser-session refresh interval.")
+@click.pass_context
+def adapter_daemon_run(
+    ctx,
+    include_jira: bool,
+    browser: str | None,
+    poll_interval_seconds: int,
+    default_sync_interval_seconds: int,
+    jira_interval_seconds: int,
+):
+    """Run the local agent daemon until interrupted."""
+    runner = _build_local_agent_runner(
+        ctx,
+        browser=browser,
+        default_sync_interval_seconds=default_sync_interval_seconds,
+        jira_interval_seconds=jira_interval_seconds,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "status": "running",
+                "state_path": str(_local_agent_state_path()),
+                "poll_interval_seconds": max(int(poll_interval_seconds), 1),
+            },
+            ensure_ascii=False,
+        )
+    )
+    try:
+        runner.run_forever(
+            include_jira=include_jira,
+            poll_interval_seconds=poll_interval_seconds,
+            log=lambda message: click.echo(message, err=True),
+        )
+    except KeyboardInterrupt:
+        click.echo(json.dumps({"status": "stopped"}, ensure_ascii=False))
+
+
 @adapter.group("kb")
 def adapter_kb():
     """Manage local repository adapter profiles (Markdown, text, JSON, HTML)."""
@@ -1646,6 +1848,28 @@ def adapter_github_push(
     submitted_by: str | None,
 ):
     """Push selected GitHub repository files into a configured github_repo source."""
+    _emit_tool_payload(
+        ctx,
+        _push_github_profile_payload(
+            ctx,
+            name,
+            source_id=source_id,
+            limit=limit,
+            process_now=process_now,
+            submitted_by=submitted_by,
+        ),
+    )
+
+
+def _push_github_profile_payload(
+    ctx,
+    name: str,
+    *,
+    source_id: str | None,
+    limit: int,
+    process_now: bool,
+    submitted_by: str | None,
+) -> dict[str, Any]:
     profiles = _read_adapter_config().get("github", {})
     profile = profiles.get(name)
     if not isinstance(profile, dict):
@@ -1723,7 +1947,7 @@ def adapter_github_push(
     }
     if failed:
         payload["error"] = "one or more documents failed to push"
-    _emit_tool_payload(ctx, payload)
+    return payload
 
 
 @adapter_kb.command("add")
@@ -1869,6 +2093,28 @@ def adapter_kb_push(
     The source id defaults to the one stored in the profile by
     ``adapter kb add --create-source``; pass ``--source-id`` to override it.
     """
+    _emit_tool_payload(
+        ctx,
+        _push_kb_profile_payload(
+            ctx,
+            name,
+            source_id=source_id,
+            limit=limit,
+            process_now=process_now,
+            submitted_by=submitted_by,
+        ),
+    )
+
+
+def _push_kb_profile_payload(
+    ctx,
+    name: str,
+    *,
+    source_id: str | None,
+    limit: int,
+    process_now: bool,
+    submitted_by: str | None,
+) -> dict[str, Any]:
     profiles = _read_adapter_config().get("kb", {})
     profile = profiles.get(name)
     if not isinstance(profile, dict):
@@ -1922,7 +2168,7 @@ def adapter_kb_push(
     }
     if failed:
         payload["error"] = "one or more documents failed to push"
-    _emit_tool_payload(ctx, payload)
+    return payload
 
 
 @adapter_kb.command("schedule")
@@ -2226,13 +2472,6 @@ def _principal_change_payload(upload_result: dict) -> dict:
         "old_principal_id": inner.get("old_principal_id"),
         "new_principal_id": inner.get("new_principal_id"),
     }
-
-
-# Watch defaults. The tick interval is deliberately shorter than a typical Jira
-# idle-session timeout so the stored copy is renewed while it is still valid.
-WATCH_DEFAULT_INTERVAL_SECONDS = 1800  # 30 minutes
-WATCH_BACKOFF_BASE_SECONDS = 5
-WATCH_BACKOFF_MAX_SECONDS = 300  # 5 minutes
 
 
 def _cookie_hash(cookie_header: str) -> str:
