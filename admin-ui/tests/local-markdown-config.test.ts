@@ -1,22 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { buildLocalMarkdownPushCommand } from "../src/views/sources/localMarkdownConfig.js";
+import { isPushBasedSourceType } from "../src/views/sources/managedSources.js";
 
-assert.equal(
-  buildLocalMarkdownPushCommand({ vaultId: "engineering", sourceId: "src-abc" }),
-  "memforge adapter kb push engineering --source-id src-abc",
-);
-
-assert.equal(
-  buildLocalMarkdownPushCommand({ vaultId: "", sourceId: null }),
-  "memforge adapter kb push <vault-id> --source-id <source-id>",
-);
-
-assert.equal(
-  buildLocalMarkdownPushCommand({ vaultId: "  spaces  ", sourceId: "  src-1  " }),
-  "memforge adapter kb push spaces --source-id src-1",
-);
+assert.equal(isPushBasedSourceType("local_markdown"), true);
 
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
 
@@ -36,14 +23,24 @@ const sourceConfigDialogSource = readFileSync("src/views/sources/SourceConfigDia
 
 assert.match(
   sourceConfigDialogSource,
-  /LocalMarkdownPushPanel/,
-  "SourceConfigDialog should render the local-markdown push panel",
+  /local_markdown_preview_tree/,
+  "SourceConfigDialog should preview local_markdown through the local-agent queue",
 );
 
 assert.match(
   sourceConfigDialogSource,
-  /MemForge does not read your filesystem/,
-  "Local-markdown push panel should explain that the service does not read local files",
+  /pollLocalAgentPreviewJob/,
+  "SourceConfigDialog should poll the local-agent preview job",
+);
+assert.doesNotMatch(
+  sourceConfigDialogSource,
+  /sourceType !== "local_markdown"/,
+  "local_markdown preview should be reachable in the source dialog",
+);
+assert.doesNotMatch(
+  sourceConfigDialogSource,
+  /LocalRepoSetupInstructions/,
+  "local_markdown should use the normal source form instead of the legacy CLI-only setup panel",
 );
 
 const jiraGenePy = readFileSync("../src/memforge/genes/jira_gene.py", "utf8");
@@ -51,4 +48,16 @@ assert.match(
   jiraGenePy,
   /local CLI adapter/,
   "Jira config schema should reference the local CLI adapter for browser-session auth",
+);
+assert.match(
+  jiraGenePy,
+  /local_agent/,
+  "Jira config schema should expose local daemon sync mode",
+);
+
+const localMarkdownGenePy = readFileSync("../src/memforge/genes/local_markdown_gene.py", "utf8");
+assert.match(
+  localMarkdownGenePy,
+  /Folder Path/,
+  "local_markdown config schema should let the UI collect a daemon-side folder path",
 );
