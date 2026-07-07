@@ -35,6 +35,7 @@ import {
   parseConfluenceWikiUrl,
 } from "./confluenceConfig";
 import type { ParsedConfluenceWikiUrl } from "./confluenceConfig";
+import { GitHubRepoFolderPicker } from "./GitHubRepoFolderPicker";
 import { buildLocalMarkdownPushCommand } from "./localMarkdownConfig";
 import { canConfigureSourceType } from "./managedSources";
 import { ProjectBindingFields } from "./ProjectBindingFields";
@@ -167,6 +168,7 @@ function SourceConfigForm({
     : "";
   const githubRepoUrl = sourceType === "github_repo" ? stringValue(config.repo_url).trim() : "";
   const githubRef = sourceType === "github_repo" ? stringValue(config.ref).trim() || "main" : "";
+  const githubPickerConfig = sourceType === "github_repo" ? serializeConfig(schema.fields, config) : {};
   const jiraBaseUrl = stringValue(config.base_url).trim();
   const confluenceUrlInfo = useMemo(
     () => sourceType === "confluence" ? parseConfluenceWikiUrl(stringValue(config.base_url)) : null,
@@ -347,6 +349,17 @@ function SourceConfigForm({
                         error={jiraSessionQuery.error}
                         onRefresh={() => {
                           void jiraSessionQuery.refetch();
+                        }}
+                      />
+                    )}
+                    {sourceType === "github_repo" && field.key === "ref" && (
+                      <GitHubRepoFolderPicker
+                        connectionMode={githubConnectionMode}
+                        config={githubPickerConfig}
+                        value={listValue(config.include_paths)}
+                        onChange={(paths: string[]) => {
+                          setValidationMessage(null);
+                          setConfig((current) => ({ ...current, include_paths: paths }));
                         }}
                       />
                     )}
@@ -1144,6 +1157,7 @@ function isFieldVisible(sourceType: string, field: ConfigField, config: ConfigFo
   if (sourceType === "github_repo") {
     const connectionMode = stringValue(config.connection_mode) || "cloud_pull";
     if (field.key === "pat") return connectionMode === "cloud_pull";
+    if (field.key === "include_paths") return false;
     return true;
   }
   return true;

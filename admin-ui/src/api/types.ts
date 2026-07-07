@@ -349,6 +349,20 @@ export interface DiscoveryPreviewResponse {
   items: DiscoveryPreviewItem[];
 }
 
+export interface GitHubRepoTreeItem {
+  path: string;
+  type: "tree" | "blob";
+  size: number | null;
+}
+
+export interface GitHubRepoTreeResponse {
+  source_type: "github_repo";
+  ref: string;
+  count: number;
+  truncated: boolean;
+  items: GitHubRepoTreeItem[];
+}
+
 export interface LlmConfig {
   enrichment_model: string | null;
   enrichment_base_url: string | null;
