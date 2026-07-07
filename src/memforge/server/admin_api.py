@@ -599,6 +599,25 @@ class DiscoveryPreviewResponse(BaseModel):
     items: list[DiscoveryPreviewItemResponse]
 
 
+class GitHubRepoTreeRequest(BaseModel):
+    config: dict[str, Any]
+    limit: int = Field(default=2_000, ge=1, le=10_000)
+
+
+class GitHubRepoTreeItemResponse(BaseModel):
+    path: str
+    type: Literal["tree", "blob"]
+    size: int | None = None
+
+
+class GitHubRepoTreeResponse(BaseModel):
+    source_type: Literal["github_repo"] = "github_repo"
+    ref: str
+    count: int
+    truncated: bool
+    items: list[GitHubRepoTreeItemResponse]
+
+
 # -- Teams browse --
 
 
@@ -1745,6 +1764,36 @@ def _dt_iso(dt: date | datetime | None) -> str | None:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).isoformat()
+
+
+def _github_repo_tree_items(entries: list[dict], *, limit: int) -> list[GitHubRepoTreeItemResponse]:
+    folders: set[str] = set()
+    blobs: dict[str, int | None] = {}
+    for entry in entries:
+        raw_path = str(entry.get("path") or "").strip().strip("/")
+        if not raw_path:
+            continue
+        entry_type = str(entry.get("type") or "")
+        if entry_type == "tree":
+            folders.add(raw_path)
+            continue
+        if entry_type != "blob":
+            continue
+        try:
+            size = int(entry["size"]) if entry.get("size") is not None else None
+        except (TypeError, ValueError):
+            size = None
+        blobs[raw_path] = size
+        parts = raw_path.split("/")[:-1]
+        for index in range(1, len(parts) + 1):
+            folders.add("/".join(parts[:index]))
+
+    items = [GitHubRepoTreeItemResponse(path=path, type="tree") for path in sorted(folders)]
+    items.extend(
+        GitHubRepoTreeItemResponse(path=path, type="blob", size=size)
+        for path, size in sorted(blobs.items())
+    )
+    return items[: limit + 1]
 
 
 def _json_ready(value: Any) -> Any:
@@ -3161,6 +3210,41 @@ def create_admin_app(
             count=count,
             truncated=count > len(items),
             items=items,
+        )
+
+    @gene_router.post("/github_repo/browse-tree", response_model=GitHubRepoTreeResponse)
+    async def browse_github_repo_tree(req: GitHubRepoTreeRequest):
+        """List selectable repository paths for the GitHub Repository source UI."""
+        try:
+            _validate_source_config("github_repo", req.config)
+            config = dict(req.config)
+            if str(config.get("connection_mode") or "cloud_pull").strip().lower() != "cloud_pull":
+                raise ValueError("GitHub Repository folder browsing is available only for Cloud pull")
+            gene = create_gene("github_repo", config, source_id="browse-github-repo")
+            await gene.authenticate()
+            repo_ref = getattr(gene, "_repo_ref")
+            ref = str(config.get("ref") or "").strip()
+            if not ref:
+                ref = await gene._default_branch(repo_ref)  # noqa: SLF001 - shared source implementation.
+            entries = await gene._repo_tree(repo_ref, ref)  # noqa: SLF001 - shared source implementation.
+            items = _github_repo_tree_items(entries, limit=req.limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("GitHub Repository tree browse failed")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            client = locals().get("gene") and getattr(locals()["gene"], "_client", None)
+            if client is not None:
+                close = getattr(client, "aclose", None)
+                if close:
+                    await close()
+
+        return GitHubRepoTreeResponse(
+            ref=ref,
+            count=len(items),
+            truncated=len(items) > req.limit,
+            items=items[: req.limit],
         )
 
     @gene_router.get("/teams/auth-check", response_model=TeamsAuthCheckResponse)
