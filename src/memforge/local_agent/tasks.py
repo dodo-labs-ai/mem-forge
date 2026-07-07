@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
-TaskKind = Literal["kb_sync", "github_sync", "jira_auth"]
+TaskKind = Literal["kb_sync", "github_sync", "jira_auth", "cloud_job"]
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,7 @@ class LocalAgentHandlers:
     run_kb_profile: Callable[[str], dict[str, Any]]
     run_github_profile: Callable[[str], dict[str, Any]]
     run_jira_auth: Callable[[str, str | None], dict[str, Any]]
+    run_cloud_job: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
 
 def discover_profile_tasks(

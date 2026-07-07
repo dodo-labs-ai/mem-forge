@@ -126,6 +126,77 @@ def test_push_github_repo_document_posts_adapter_payload():
     ]
 
 
+def test_local_agent_job_methods_use_cloud_local_agent_contract():
+    client = _RecordingClient({"jobs": []})
+
+    lease = client.lease_local_agent_jobs(limit=3, lease_seconds=120)
+    complete = client.complete_local_agent_job(
+        "laj-1",
+        attempt_count=2,
+        status="succeeded",
+        result={"count": 1},
+    )
+
+    assert lease == {"jobs": []}
+    assert complete == {"jobs": []}
+    assert client.calls == [
+        (
+            "POST",
+            "/api/cloud/local-agent/jobs/lease",
+            {"limit": 3, "lease_seconds": 120},
+        ),
+        (
+            "POST",
+            "/api/cloud/local-agent/jobs/laj-1/complete",
+            {"status": "succeeded", "attempt_count": 2, "result": {"count": 1}},
+        ),
+    ]
+
+
+def test_local_agent_job_lease_default_matches_ui_sync_wait_window():
+    client = _RecordingClient({"jobs": []})
+
+    client.lease_local_agent_jobs()
+
+    assert client.calls == [
+        (
+            "POST",
+            "/api/cloud/local-agent/jobs/lease",
+            {"limit": 5, "lease_seconds": 3600},
+        )
+    ]
+
+
+def test_control_plane_routes_bypass_env_workspace(monkeypatch):
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "ws-env")
+    client = ToolClient(
+        api_url="https://memforge.example.test",
+        api_token="tok",
+    )
+
+    assert (
+        client._request_url("/api/cloud/local-agent/jobs/lease")
+        == "https://memforge.example.test/api/cloud/local-agent/jobs/lease"
+    )
+    assert (
+        client._request_url("/api/auth/api-keys")
+        == "https://memforge.example.test/api/auth/api-keys"
+    )
+
+
+def test_workspace_client_scopes_data_plane_push_routes():
+    client = ToolClient(
+        api_url="https://memforge.example.test",
+        api_token="tok",
+        workspace_id="ws-a",
+    )
+
+    assert (
+        client._request_url("/api/sources/src-github/adapter/documents")
+        == "https://memforge.example.test/api/workspaces/ws-a/api/sources/src-github/adapter/documents"
+    )
+
+
 def test_tool_client_forwards_search_to_hosted_workspace(monkeypatch):
     captured = {}
 

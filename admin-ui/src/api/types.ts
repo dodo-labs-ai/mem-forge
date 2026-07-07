@@ -363,6 +363,26 @@ export interface GitHubRepoTreeResponse {
   items: GitHubRepoTreeItem[];
 }
 
+export interface LocalAgentJobCreateResponse {
+  job_id: string;
+  status: "queued";
+}
+
+export interface LocalAgentJobStatusResponse {
+  job_id: string;
+  status: "queued" | "leased" | "succeeded" | "failed";
+  result: {
+    items?: Array<{
+      path?: string;
+      relative_path?: string;
+      type?: "tree" | "blob";
+      size?: number | null;
+    }>;
+    truncated?: boolean;
+  } | null;
+  last_error?: string | null;
+}
+
 export interface LlmConfig {
   enrichment_model: string | null;
   enrichment_base_url: string | null;
