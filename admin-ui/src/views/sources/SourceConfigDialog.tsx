@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, Check, Loader2, RefreshCw } from "lucide-react";
+import { AlertCircle, Check, ChevronRight, Loader2, RefreshCw } from "lucide-react";
 import client from "@/api/client";
 import type {
   ConfigField,
@@ -398,8 +398,9 @@ function SourceConfigForm({
             </section>
           ))}
           {advancedFields.length > 0 && (
-            <details className="space-y-3">
-              <summary className="inline-flex cursor-pointer select-none rounded-md px-1 py-0.5 text-sm font-semibold hover:bg-muted focus:outline-none focus-visible:ring-1 focus-visible:ring-ring/40">
+            <details className="group space-y-3">
+              <summary className="inline-flex cursor-pointer select-none items-center gap-1 rounded-md px-1 py-0.5 text-sm font-semibold hover:bg-muted focus:outline-none focus-visible:ring-1 focus-visible:ring-ring/40">
+                <ChevronRight className="size-4 transition-transform group-open:rotate-90" />
                 Advanced
               </summary>
               <div className="space-y-3 pt-2">
@@ -910,12 +911,9 @@ function GitHubRepoLocalPushPanel({
 
   return (
     <div className="rounded-lg border bg-muted/30 p-3 text-xs">
-      <div className="text-sm font-medium text-foreground">Push from the local GitHub adapter</div>
+      <div className="text-sm font-medium text-foreground">Sync from this computer</div>
       <p className="mt-1 text-muted-foreground">
-        Use this mode when MemForge Cloud cannot reach the GitHub host directly. Point the local CLI
-        at a checked-out clone; it validates the clone's origin, previews the selected folders, and
-        pushes matching repository files into this source. Omit <code>--repo-path</code> only when
-        your local <code>gh</code> login can reach the repository.
+        Use this for VPN or internal repos that MemForge Cloud cannot open.
       </p>
       <div className="mt-3 flex items-center gap-2 rounded-md border bg-background p-2">
         <code className="flex-1 break-all font-mono text-[11px] text-foreground">{command}</code>
@@ -954,7 +952,7 @@ function DiscoveryPreviewPanel({
   return (
     <section className="space-y-2">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold">Preview discovery</h3>
+        <h3 className="text-sm font-semibold">Preview files</h3>
         <Button
           type="button"
           variant="outline"
@@ -972,7 +970,7 @@ function DiscoveryPreviewPanel({
         </p>
       ) : !data && !error && !isPending ? (
         <p className="text-xs text-muted-foreground">
-          Run a dry discovery against the configured source to verify the result set before saving.
+          Check which files MemForge can see before saving.
         </p>
       ) : null}
       {error != null && (
@@ -1222,6 +1220,10 @@ function optionLabel(field: ConfigField, option: string): string {
     if (option === "single_page") return "Single page";
     if (option === "subtree") return "Subtree";
     if (option === "explicit_list") return "Explicit list";
+  }
+  if (field.key === "connection_mode") {
+    if (option === "cloud_pull") return "MemForge can access it";
+    if (option === "local_push") return "Only my computer can access it";
   }
   return option;
 }
