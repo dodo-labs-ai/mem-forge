@@ -88,6 +88,14 @@ def test_interactive_resources_are_packaged_with_python_distribution():
     assert (resources / "package-lock.json").is_file()
 
 
+def test_node_cli_and_packaged_interactive_script_stay_in_sync():
+    repo_root = Path(__file__).resolve().parents[1]
+    node_entrypoint = repo_root / "cli" / "index.mjs"
+    packaged_entrypoint = main._interactive_resource_dir() / "index.mjs"
+
+    assert packaged_entrypoint.read_text() == node_entrypoint.read_text()
+
+
 def test_interactive_script_path_resolves_to_packaged_resource(monkeypatch):
     monkeypatch.delenv(main.INTERACTIVE_SCRIPT_ENV, raising=False)
     resolved = main._interactive_script_path(main._interactive_resource_dir())

@@ -164,6 +164,11 @@ function httpsUrl(value) {
   return value && value.startsWith("https://") ? undefined : "Use an https:// URL";
 }
 
+function optionalInteger(value) {
+  const raw = (value || "").trim();
+  return !raw || /^\d+$/.test(raw) ? undefined : "Use a number, or leave blank";
+}
+
 function expandHome(value) {
   if (value === "~") return homedir();
   if (value.startsWith("~/")) return join(homedir(), value.slice(2));
@@ -223,6 +228,40 @@ async function pickKbProfile(message) {
       })),
     }),
   );
+}
+
+async function pickGitHubProfile(message) {
+  const profiles = parseJson((await runMemforge(["adapter", "github", "list"])).stdout)?.profiles ?? {};
+  const names = Object.keys(profiles);
+  if (!names.length) {
+    log.warn("No GitHub repositories configured yet. Use 'Set up GitHub repository' first.");
+    return null;
+  }
+  return ensureNotCancelled(
+    await select({
+      message,
+      maxItems: MENU_MAX_ITEMS,
+      options: names.map((name) => {
+        const profile = profiles[name] ?? {};
+        const access = profile.repo_path ? "Internal network / VPN" : "Public internet";
+        return {
+          value: name,
+          label: name,
+          hint: `${access}${profile.source_id ? ` → ${profile.source_id}` : ""}`,
+        };
+      }),
+    }),
+  );
+}
+
+function defaultGitHubProfileName(repoUrl) {
+  try {
+    const url = new URL(repoUrl);
+    const parts = url.pathname.replace(/\.git$/i, "").split("/").filter(Boolean);
+    return slugify(parts.at(-1) || "repo");
+  } catch {
+    return slugify(repoUrl);
+  }
 }
 
 function jiraOriginHint(origin) {
@@ -612,6 +651,254 @@ async function actionManageRepositories() {
 }
 
 // ---------------------------------------------------------------------------
+// Area: GitHub repository
+// ---------------------------------------------------------------------------
+
+async function actionSetupGitHubRepository() {
+  const repoUrl = ensureNotCancelled(
+    await text({
+      message: "Repository URL",
+      placeholder: "https://github.com/org/repo",
+      validate: httpsUrl,
+    }),
+  ).trim();
+  const access = ensureNotCancelled(
+    await select({
+      message: "Repository access",
+      options: [
+        { value: "public", label: "Public internet", hint: "MemForge can reach GitHub" },
+        { value: "internal", label: "Internal network / VPN", hint: "sync from this computer" },
+      ],
+    }),
+  );
+
+  let repoPath = "";
+  if (access === "internal") {
+    repoPath = ensureNotCancelled(
+      await text({
+        message: "Local clone path",
+        placeholder: "~/work/repo",
+        validate: validateFolder,
+      }),
+    ).trim();
+  }
+
+  const defaults = await group(
+    {
+      name: () =>
+        text({
+          message: "Profile name",
+          initialValue: defaultGitHubProfileName(repoUrl),
+          validate: required,
+        }),
+      ref: () => text({ message: "Branch, tag, or commit", placeholder: "main" }),
+      sourceId: () => text({ message: "MemForge source id (optional)", placeholder: "src-..." }),
+    },
+    { onCancel: goBack },
+  );
+
+  const customize = ensureNotCancelled(
+    await confirm({ message: "Choose folders or file types?", initialValue: true }),
+  );
+  let includePaths = [];
+  let includeExtensions = [];
+  if (customize) {
+    const scope = await group(
+      {
+        paths: () => text({ message: "Folders/files to sync (comma-separated)", placeholder: "docs, packages/api" }),
+        extensions: () => text({ message: "File types (comma-separated)", placeholder: "md, mdx, txt" }),
+      },
+      { onCancel: goBack },
+    );
+    includePaths = splitList(scope.paths);
+    includeExtensions = splitList(scope.extensions).map((entry) => entry.replace(/^\./, ""));
+  }
+
+  const args = [
+    "adapter",
+    "github",
+    "add",
+    defaults.name.trim(),
+    "--repo-url",
+    repoUrl,
+    "--ref",
+    defaults.ref?.trim() || "main",
+  ];
+  if (repoPath) args.push("--repo-path", expandHome(repoPath));
+  if (defaults.sourceId?.trim()) args.push("--source-id", defaults.sourceId.trim());
+  for (const path of includePaths) args.push("--include-path", path);
+  for (const extension of includeExtensions) args.push("--include-extension", extension);
+
+  const added = await runStep("Saving GitHub repository profile", args);
+  if (!added?.ok) return;
+
+  const previewNow = ensureNotCancelled(
+    await confirm({ message: "Preview selected files now?", initialValue: true }),
+  );
+  if (previewNow) await previewGitHubRepo(defaults.name.trim());
+}
+
+async function getGitHubProfile(name) {
+  return parseJson((await runMemforge(["adapter", "github", "list"])).stdout)?.profiles?.[name] ?? null;
+}
+
+function githubProfileAddArgs(name, profile, sourceId) {
+  const args = [
+    "adapter",
+    "github",
+    "add",
+    name,
+    "--repo-url",
+    String(profile.repo_url || ""),
+    "--ref",
+    String(profile.ref || "main"),
+  ];
+  if (profile.repo_path) args.push("--repo-path", String(profile.repo_path));
+  const linkedSourceId = String(sourceId || profile.source_id || "").trim();
+  if (linkedSourceId) args.push("--source-id", linkedSourceId);
+  for (const path of profile.include_paths ?? []) args.push("--include-path", String(path));
+  for (const extension of profile.include_extensions ?? []) args.push("--include-extension", String(extension));
+  return args;
+}
+
+async function saveGitHubSourceId(name, profile, sourceId) {
+  const result = await runMemforge(githubProfileAddArgs(name, profile, sourceId));
+  const payload = reportResult("Saving source link", result);
+  return Boolean(payload?.ok);
+}
+
+async function previewGitHubRepo(name) {
+  const limit = ensureNotCancelled(
+    await text({ message: "Max files to list", placeholder: "20", validate: optionalInteger }),
+  );
+  const args = ["adapter", "github", "preview", name];
+  if (limit && /^\d+$/.test(limit.trim())) args.push("--limit", limit.trim());
+  const payload = await runStep("Previewing selected files", args);
+  if (payload?.counts) note(formatCounts(payload.counts), `${payload.profile ?? name} preview counts`);
+  if (Array.isArray(payload?.items) && payload.items.length) {
+    note(payload.items.map((item) => `- ${item.relative_path}`).join("\n"), "Sample files");
+  }
+}
+
+async function syncGitHubRepo(name) {
+  const profile = await getGitHubProfile(name);
+  if (!profile) {
+    log.warn(`GitHub repository '${name}' is no longer configured.`);
+    return;
+  }
+  let sourceId = String(profile.source_id || "").trim();
+  if (!sourceId) {
+    sourceId = ensureNotCancelled(
+      await text({ message: "MemForge source id", placeholder: "src-...", validate: required }),
+    ).trim();
+    if (!(await saveGitHubSourceId(name, profile, sourceId))) {
+      note("Sync will use this source id once, but the local profile was not updated.", "Source link not saved");
+    }
+  }
+  const limit = ensureNotCancelled(
+    await text({ message: "Max files to sync (blank for all)", placeholder: "all", validate: optionalInteger }),
+  );
+  const processNow = ensureNotCancelled(
+    await confirm({ message: "Trigger extraction after sync?", initialValue: false }),
+  );
+  const args = ["adapter", "github", "push", name, "--source-id", sourceId];
+  if (limit && /^\d+$/.test(limit.trim())) args.push("--limit", limit.trim());
+  args.push(processNow ? "--process-now" : "--no-process-now");
+  const payload = await runStep("Syncing GitHub repository", args);
+  if (payload?.counts) note(formatCounts(payload.counts), "Sync counts");
+  if (Array.isArray(payload?.failed) && payload.failed.length) {
+    note(payload.failed.map((entry) => `- ${entry.relative_path}: ${entry.error}`).join("\n"), "Failed files");
+  }
+}
+
+async function removeGitHubRepo(name) {
+  const confirmRemove = ensureNotCancelled(
+    await confirm({ message: `Remove GitHub repository '${name}'? (local profile only; the server source stays)`, initialValue: false }),
+  );
+  if (!confirmRemove) return false;
+  await runStep("Removing GitHub repository", ["adapter", "github", "remove", name]);
+  return true;
+}
+
+async function runGitHubRepoMenu(name) {
+  while (true) {
+    const profile = await getGitHubProfile(name);
+    if (!profile) return;
+    header();
+    let choice;
+    try {
+      choice = ensureNotCancelled(
+        await select({
+          message: `GitHub repository: ${name}`,
+          options: [
+            { value: "sync", label: "Sync now", hint: "push selected files" },
+            { value: "preview", label: "Preview selected files", hint: "show what would sync" },
+            { value: "remove", label: "Remove repository", hint: "local profile only" },
+            { value: "__back__", label: "← Back" },
+          ],
+        }),
+      );
+    } catch (error) {
+      if (error === BACK) return;
+      throw error;
+    }
+    if (choice === "__back__") return;
+    try {
+      if (choice === "sync") await syncGitHubRepo(name);
+      else if (choice === "preview") await previewGitHubRepo(name);
+      else if (choice === "remove" && (await removeGitHubRepo(name))) return;
+    } catch (error) {
+      if (error === BACK) continue;
+      throw error;
+    }
+    await pause();
+  }
+}
+
+async function actionSyncGitHubNow() {
+  const name = await pickGitHubProfile("Sync which GitHub repository?");
+  if (name) await syncGitHubRepo(name);
+}
+
+async function actionManageGitHubRepositories() {
+  while (true) {
+    const profiles = parseJson((await runMemforge(["adapter", "github", "list"])).stdout)?.profiles ?? {};
+    const names = Object.keys(profiles);
+    if (!names.length) {
+      log.warn("No GitHub repositories configured yet. Use 'Set up GitHub repository' first.");
+      return;
+    }
+    header();
+    let choice;
+    try {
+      choice = ensureNotCancelled(
+        await select({
+          message: "Manage which GitHub repository?",
+          maxItems: MENU_MAX_ITEMS,
+          options: [
+            ...names.map((name) => {
+              const profile = profiles[name] ?? {};
+              const access = profile.repo_path ? "Internal network / VPN" : "Public internet";
+              return {
+                value: name,
+                label: name,
+                hint: `${access} · ${profile.repo_url || "?"}`,
+              };
+            }),
+            { value: "__back__", label: "← Back" },
+          ],
+        }),
+      );
+    } catch (error) {
+      if (error === BACK) return;
+      throw error;
+    }
+    if (choice === "__back__") return;
+    await runGitHubRepoMenu(choice);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Area: Jira
 // ---------------------------------------------------------------------------
 
@@ -744,9 +1031,13 @@ async function actionSearch() {
 async function actionAdapterStatus() {
   const status = await runStep("Adapter status", ["adapter", "status"]);
   if (status?.capabilities) note(status.capabilities.join("\n"), "Adapter capabilities");
-  const profiles = parseJson((await runMemforge(["adapter", "kb", "list"])).stdout)?.profiles ?? {};
-  const names = Object.keys(profiles);
-  note(names.length ? names.join("\n") : "(none)", "Configured repositories");
+  const kbProfiles = parseJson((await runMemforge(["adapter", "kb", "list"])).stdout)?.profiles ?? {};
+  const githubProfiles = parseJson((await runMemforge(["adapter", "github", "list"])).stdout)?.profiles ?? {};
+  const rows = [
+    ...Object.keys(kbProfiles).map((name) => `Local: ${name}`),
+    ...Object.keys(githubProfiles).map((name) => `GitHub: ${name}`),
+  ];
+  note(rows.length ? rows.join("\n") : "(none)", "Configured repositories");
 }
 
 async function actionDiagnostics() {
@@ -788,6 +1079,27 @@ const AREAS = [
       return [
         { value: "manage", label: "Manage repositories", hint: "per-repo: sync, preview, schedule, remove", run: actionManageRepositories, quiet: true },
         { value: "sync", label: "Sync now", hint: "push new and changed files", run: actionSyncNow },
+        setup,
+      ];
+    },
+  },
+  {
+    value: "github",
+    label: "GitHub repository",
+    hint: "sync repo files from Public internet or Internal network / VPN",
+    actions: async () => {
+      const hasRepos =
+        Object.keys(parseJson((await runMemforge(["adapter", "github", "list"])).stdout)?.profiles ?? {}).length > 0;
+      const setup = {
+        value: "setup",
+        label: "Set up GitHub repository",
+        hint: "guided: access → scope → first preview",
+        run: actionSetupGitHubRepository,
+      };
+      if (!hasRepos) return [setup];
+      return [
+        { value: "manage", label: "Manage GitHub repositories", hint: "per-repo: sync or preview", run: actionManageGitHubRepositories, quiet: true },
+        { value: "sync", label: "Sync now", hint: "push selected files", run: actionSyncGitHubNow },
         setup,
       ];
     },
