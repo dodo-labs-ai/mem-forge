@@ -120,7 +120,7 @@ export function GitHubRepoFolderPicker({
 
       {isLocalPush && (
         <p className="mt-2 text-xs text-muted-foreground">
-          The browser can choose scope from a local clone, but the CLI still needs the clone path for push.
+          Pick folders from your clone. The sync command still needs the clone path.
         </p>
       )}
 
@@ -156,7 +156,7 @@ export function GitHubRepoFolderPicker({
 
       <details className="mt-3" open={isLocalPush && !canPickLocalDirectory}>
         <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
-          Add path manually (fallback)
+          Type a path instead
         </summary>
         <div className="mt-2 flex gap-2">
           <Input

@@ -89,12 +89,12 @@ class GitHubRepoGene(Gene):
             fields=[
                 ConfigField(
                     key="connection_mode",
-                    label="Connection Mode",
+                    label="Repository Access",
                     field_type=ConfigFieldType.SELECT,
                     required=True,
                     options=[CONNECTION_MODE_CLOUD_PULL, CONNECTION_MODE_LOCAL_PUSH],
                     default=CONNECTION_MODE_CLOUD_PULL,
-                    help_text="Pull from MemForge Cloud when the host is reachable, or push from your local machine for VPN-only repositories.",
+                    help_text="Choose direct access for GitHub.com or reachable Enterprise hosts. Use local access for VPN-only repositories.",
                     group="connection",
                     order=0,
                 ),
