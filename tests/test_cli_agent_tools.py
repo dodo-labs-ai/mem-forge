@@ -1856,7 +1856,7 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     )
 
     assert payload["operation"] == "teams_sync"
-    assert payload["counts"] == {"selected": 2, "pushed": 2, "failed": 0, "skipped_existing": 0}
+    assert payload["counts"] == {"selected": 2, "pushed": 2, "failed": 0, "skipped_existing": 0, "polls": 0}
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_teams_document"]
     assert len(push_calls) == 2
     first = push_calls[0][1]
@@ -1931,7 +1931,7 @@ def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypat
         job,
         FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
     )
-    assert first["counts"] == {"selected": 1, "pushed": 1, "failed": 0, "skipped_existing": 0}
+    assert first["counts"] == {"selected": 1, "pushed": 1, "failed": 0, "skipped_existing": 0, "polls": 0}
     assert len([call for call in FakeToolClient.calls if call[0] == "push_teams_document"]) == 1
 
     FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
@@ -1940,7 +1940,7 @@ def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypat
         FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
     )
 
-    assert second["counts"] == {"selected": 1, "pushed": 0, "failed": 0, "skipped_existing": 1}
+    assert second["counts"] == {"selected": 1, "pushed": 0, "failed": 0, "skipped_existing": 1, "polls": 0}
     assert not [call for call in FakeToolClient.calls if call[0] == "push_teams_document"]
     assert not [call for call in FakeToolClient.calls if call[0] == "start_source_sync"]
 
@@ -1951,6 +1951,88 @@ def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypat
     assert second_run[0]["receipt_status"] == "existing"
     assert second_run[0]["receipt_skip_reason"] == "receipt_exists"
     assert second_run[-1]["skipped_existing_windows"] == 1
+
+
+def test_local_agent_cloud_teams_sync_writes_conversation_poll_audit(monkeypatch, tmp_path: Path):
+    from memforge.local_agent.teams_audit import validate_teams_audit_run
+
+    async def fake_collect(job, *, source_id, limit):
+        assert source_id == "src-teams"
+        return {
+            "documents": [
+                {
+                    "conversation_id": "19:conversation@thread.tacv2",
+                    "root_message_id": "1783500000000",
+                    "window_id": "teams-thread:v1:opaque-window",
+                    "window_type": "thread",
+                    "revision_hash": "sha256:revision-1",
+                    "title": "Thread window",
+                    "source_url": "https://teams.microsoft.com/l/message/19:conversation@thread.tacv2/1783500000001",
+                    "last_modified": "2026-07-08T09:24:57.5870000Z",
+                    "markdown_body": "# Thread window\n\nA redacted package body.",
+                    "raw_hash": "sha256:raw-1",
+                    "source_semantics": {"message_count": 2, "window_type": "thread"},
+                }
+            ],
+            "poll_audits": [
+                {
+                    "raw_conversation_id": "19:conversation@thread.tacv2",
+                    "thread_type": "chat",
+                    "product_thread_type": "Chat",
+                    "pagination_complete": True,
+                    "access_probe_status": "ok",
+                    "covered_created_from": "2026-07-08T09:00:00+00:00",
+                    "covered_created_to": "2026-07-08T10:00:00+00:00",
+                    "raw_messages_seen": 2,
+                    "unique_message_keys_seen": 2,
+                    "duplicate_raw_messages": 0,
+                    "upsert_new": 1,
+                    "upsert_updated": 0,
+                    "upsert_unchanged": 1,
+                    "explicit_delete_markers": 0,
+                    "missing_once_candidates": 0,
+                    "metadata_sync_state": "opaque-sync-state",
+                    "metadata_backward_link": "opaque-backward-link",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect, raising=False)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
+    audit_log_path = tmp_path / "teams-audit.jsonl"
+    ledger_state_path = tmp_path / "teams-ledger.json"
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-teams-sync",
+            "workspace_id": "ws-from-cloud",
+            "operation": "teams_sync",
+            "source_id": "src-teams",
+            "payload": {
+                "process_now": True,
+                "audit_log_path": str(audit_log_path),
+                "ledger_state_path": str(ledger_state_path),
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload["counts"]["polls"] == 1
+    audit_rows = [json.loads(line) for line in audit_log_path.read_text(encoding="utf-8").splitlines()]
+    assert [row["event"] for row in audit_rows] == [
+        "teams_conversation_poll",
+        "teams_window_projection",
+        "teams_memory_patch",
+        "teams_sync_run",
+    ]
+    assert validate_teams_audit_run(audit_rows) == []
+    poll = audit_rows[0]
+    assert poll["raw_conversation_id_hash"].startswith("sha256:")
+    assert "raw_conversation_id" not in poll
+    assert "metadata_sync_state_hash" in poll
+    assert "metadata_backward_link_hash" in poll
+    assert "opaque-sync-state" not in audit_log_path.read_text(encoding="utf-8")
 
 
 def test_collect_teams_documents_from_cloud_job_uses_gene_window_shape(monkeypatch):
@@ -2009,11 +2091,35 @@ def test_collect_teams_documents_from_cloud_job_uses_gene_window_shape(monkeypat
                 source_semantics={"conversation_type": "group_chat", "message_count": 3},
             )
 
+        def get_poll_audits(self):
+            return [
+                {
+                    "raw_conversation_id": "19:conversation@thread.tacv2",
+                    "field_contract_version": "teams_chatsvc_rest_v1",
+                    "pagination_complete": True,
+                    "access_probe_status": "ok",
+                    "stop_reason": "no_backward_link",
+                    "page_count": 1,
+                    "covered_created_from": "2026-07-08T09:00:00+00:00",
+                    "covered_created_to": "2026-07-08T09:24:57+00:00",
+                    "raw_messages_seen": 4,
+                    "unique_message_keys_seen": 3,
+                    "selected_message_keys_seen": 3,
+                    "duplicate_raw_messages": 1,
+                    "parse_filtered_messages": 1,
+                    "upsert_new": 3,
+                    "upsert_updated": 0,
+                    "upsert_unchanged": 0,
+                    "explicit_delete_markers": 0,
+                    "missing_once_candidates": 0,
+                }
+            ]
+
     import memforge.genes.teams_gene as teams_gene
 
     monkeypatch.setattr(teams_gene, "TeamsGene", FakeTeamsGene)
 
-    documents = main.asyncio.run(
+    collection = main.asyncio.run(
         main._collect_teams_documents_from_cloud_job(
             {
                 "payload": {
@@ -2029,7 +2135,19 @@ def test_collect_teams_documents_from_cloud_job_uses_gene_window_shape(monkeypat
     )
 
     assert closed["value"] is True
+    assert sorted(collection) == ["documents", "poll_audits"]
+    documents = collection["documents"]
+    poll_audits = collection["poll_audits"]
     assert len(documents) == 1
+    assert len(poll_audits) == 1
+    assert poll_audits[0]["raw_conversation_id"] == "19:conversation@thread.tacv2"
+    assert poll_audits[0]["pagination_complete"] is True
+    assert poll_audits[0]["access_probe_status"] == "ok"
+    assert poll_audits[0]["page_count"] == 1
+    assert poll_audits[0]["raw_messages_seen"] == 4
+    assert poll_audits[0]["unique_message_keys_seen"] == 3
+    assert poll_audits[0]["duplicate_raw_messages"] == 1
+    assert poll_audits[0]["upsert_new"] == 3
     doc = documents[0]
     assert doc["conversation_id"] == "19:conversation@thread.tacv2"
     assert doc["root_message_id"] == "1783500000000"

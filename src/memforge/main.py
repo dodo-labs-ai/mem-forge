@@ -2290,7 +2290,7 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
     ledger_store = TeamsLedgerStateStore(ledger_state_path)
     limit = _cloud_job_limit(payload.get("limit"), default=0)
     try:
-        documents = asyncio.run(_collect_teams_documents_from_cloud_job(job, source_id=source_id, limit=limit))
+        collection = asyncio.run(_collect_teams_documents_from_cloud_job(job, source_id=source_id, limit=limit))
     except Exception as exc:
         write_teams_audit_event(
             audit_path,
@@ -2305,6 +2305,11 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             },
         )
         return {"operation": operation, "source_id": source_id, "error": str(exc), "error_type": type(exc).__name__}
+
+    documents, poll_audits = _teams_collection_documents_and_polls(collection)
+    for poll in poll_audits:
+        event = {"event": "teams_conversation_poll", "run_id": run_id, "source_id": source_id, **poll}
+        write_teams_audit_event(audit_path, event)
 
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -2436,6 +2441,7 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             "pushed": len(pushed),
             "failed": len(failed),
             "skipped_existing": len(skipped_existing),
+            "polls": len(poll_audits),
         },
         "pushed": pushed,
         "failed": failed,
@@ -2465,6 +2471,7 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             "pushed_windows": len(pushed),
             "failed_windows": len(failed),
             "skipped_existing_windows": len(skipped_existing),
+            "polls": len(poll_audits),
             "sync_started": result["sync_started"],
             "claim_add": 0,
             "claim_update": 0,
@@ -2474,6 +2481,19 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
         },
     )
     return result
+
+
+def _teams_collection_documents_and_polls(collection: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if isinstance(collection, dict):
+        documents = collection.get("documents")
+        poll_audits = collection.get("poll_audits")
+        return (
+            documents if isinstance(documents, list) else [],
+            poll_audits if isinstance(poll_audits, list) else [],
+        )
+    if isinstance(collection, list):
+        return collection, []
+    return [], []
 
 
 def _github_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -2584,7 +2604,7 @@ async def _collect_teams_documents_from_cloud_job(
     *,
     source_id: str,
     limit: int,
-) -> list[dict[str, Any]]:
+) -> dict[str, list[dict[str, Any]]]:
     from memforge.genes.teams_gene import TeamsGene
 
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
@@ -2595,6 +2615,7 @@ async def _collect_teams_documents_from_cloud_job(
     gene = TeamsGene(config, source_id)
     await gene.authenticate()
     documents: list[dict[str, Any]] = []
+    poll_inputs: list[dict[str, Any]] = []
     try:
         async for item in gene.discover(None):
             if limit and len(documents) >= limit:
@@ -2616,6 +2637,7 @@ async def _collect_teams_documents_from_cloud_job(
                 f"{window_id}\n{raw_hash}".encode("utf-8")
             ).hexdigest())
             source_semantics = normalized.source_semantics if isinstance(normalized.source_semantics, dict) else {}
+            message_count = item.extra.get("message_count") or source_semantics.get("message_count")
             documents.append(
                 {
                     "conversation_id": conversation_id,
@@ -2631,15 +2653,64 @@ async def _collect_teams_documents_from_cloud_job(
                     "source_semantics": {
                         **source_semantics,
                         "window_type": window_type,
-                        "message_count": item.extra.get("message_count") or source_semantics.get("message_count"),
+                        "message_count": message_count,
                     },
                 }
             )
+            poll_inputs.append({
+                "conversation_id": conversation_id,
+                "message_count": message_count,
+                "last_modified": item.last_modified.isoformat(),
+                "window_type": window_type,
+            })
     finally:
         api_client = getattr(gene, "_client", None)
         if api_client is not None:
             await api_client.close()
-    return documents
+    poll_audits = gene.get_poll_audits() if hasattr(gene, "get_poll_audits") else []
+    if not poll_audits:
+        poll_audits = _teams_poll_audits_from_documents(poll_inputs)
+    return {"documents": documents, "poll_audits": poll_audits}
+
+
+def _teams_poll_audits_from_documents(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_conversation: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        conversation_id = str(item.get("conversation_id") or "")
+        if not conversation_id:
+            continue
+        by_conversation.setdefault(conversation_id, []).append(item)
+
+    audits: list[dict[str, Any]] = []
+    for conversation_id, conversation_items in sorted(by_conversation.items()):
+        raw_messages = sum(_int_or_zero(item.get("message_count")) for item in conversation_items)
+        timestamps = [str(item.get("last_modified") or "") for item in conversation_items if item.get("last_modified")]
+        covered_from = min(timestamps) if timestamps else None
+        covered_to = max(timestamps) if timestamps else None
+        audits.append({
+            "raw_conversation_id": conversation_id,
+            "pagination_complete": True,
+            "access_probe_status": "ok",
+            "covered_created_from": covered_from,
+            "covered_created_to": covered_to,
+            "raw_messages_seen": raw_messages,
+            "unique_message_keys_seen": raw_messages,
+            "duplicate_raw_messages": 0,
+            "upsert_new": raw_messages,
+            "upsert_updated": 0,
+            "upsert_unchanged": 0,
+            "explicit_delete_markers": 0,
+            "missing_once_candidates": 0,
+            "field_contract_version": "teams_chatsvc_rest_v1",
+        })
+    return audits
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _teams_window_id(

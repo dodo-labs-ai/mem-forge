@@ -300,22 +300,66 @@ class TeamsLedgerStateStore:
         }
         return self._save(payload)
 
+    def observe_messages(
+        self,
+        *,
+        source_id: str,
+        conversation_id: str,
+        messages: list[TeamsLedgerMessage],
+    ) -> dict[str, int]:
+        payload = self._load()
+        receipts = payload.setdefault("message_receipts", {})
+        counts = {"new": 0, "updated": 0, "unchanged": 0}
+        for message in messages:
+            key = _message_receipt_state_key(
+                source_id=source_id,
+                conversation_id=conversation_id,
+                root_message_id=message.root_message_id or message.message_id,
+                message_id=message.message_id,
+            )
+            body_hash = message.body_hash
+            existing = receipts.get(key)
+            if not isinstance(existing, dict):
+                counts["new"] += 1
+            elif existing.get("body_hash") != body_hash:
+                counts["updated"] += 1
+            else:
+                counts["unchanged"] += 1
+            receipts[key] = {
+                "source_id": source_id,
+                "conversation_id": conversation_id,
+                "root_message_id": message.root_message_id or message.message_id,
+                "message_id": message.message_id,
+                "body_hash": body_hash,
+                "created_at": message.created_at.isoformat(),
+            }
+        self._save(payload)
+        return counts
+
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
-            return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": {}}
+            return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": {}, "receipts": {}, "message_receipts": {}}
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": {}}
+            return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": {}, "receipts": {}, "message_receipts": {}}
         if not isinstance(payload, dict) or payload.get("version") != TEAMS_LEDGER_STATE_VERSION:
-            return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": {}}
+            return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": {}, "receipts": {}, "message_receipts": {}}
         conversations = payload.get("conversations")
         if not isinstance(conversations, dict):
             conversations = {}
         receipts = payload.get("receipts")
         if not isinstance(receipts, dict):
             receipts = {}
-        return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": conversations, "receipts": receipts}
+        message_receipts = payload.get("message_receipts")
+        if not isinstance(message_receipts, dict):
+            message_receipts = {}
+        return {
+            "version": TEAMS_LEDGER_STATE_VERSION,
+            "conversations": conversations,
+            "receipts": receipts,
+            "message_receipts": message_receipts,
+        }
 
     def _save(self, payload: dict[str, Any]) -> dict[str, Any]:
         cleaned = {
@@ -424,6 +468,23 @@ def _conversation_state_key(source_id: str, conversation_id: str) -> str:
 
 def _receipt_state_key(source_id: str, window_id: str, revision_hash: str) -> str:
     return _sha256_json({"source_id": source_id, "window_id": window_id, "revision_hash": revision_hash})
+
+
+def _message_receipt_state_key(
+    *,
+    source_id: str,
+    conversation_id: str,
+    root_message_id: str,
+    message_id: str,
+) -> str:
+    return _sha256_json(
+        {
+            "source_id": source_id,
+            "conversation_id": conversation_id,
+            "root_message_id": root_message_id,
+            "message_id": message_id,
+        }
+    )
 
 
 def _parse_dt(value: Any) -> datetime:

@@ -187,6 +187,74 @@ class TestMessageParsing:
         assert parsed["rootMessageId"] == "root-1"
         assert parsed["conversationid"] == "19:channel@example"
 
+    def test_poll_audit_records_raw_page_counts_without_message_content(self):
+        client = _TeamsAPIClient(region="emea")
+
+        parsed_messages = [
+            {
+                "id": "1783500000001",
+                "conversationid": "19:conversation@thread.tacv2",
+                "rootMessageId": "1783500000000",
+                "content": "normalized content",
+                "time": NOW,
+            },
+            {
+                "id": "1783500000002",
+                "conversationid": "19:conversation@thread.tacv2",
+                "rootMessageId": "1783500000000",
+                "content": "second normalized content",
+                "time": NOW + timedelta(minutes=1),
+            },
+        ]
+        client._record_message_poll_page(
+            "19:conversation@thread.tacv2",
+            {
+                "_metadata": {"backwardLink": "https://teams.cloud.microsoft/opaque/backward"},
+                "messages": [
+                    {
+                        "id": "1783500000001",
+                        "conversationid": "19:conversation@thread.tacv2",
+                        "rootMessageId": "1783500000000",
+                        "content": "<p>normalized content</p>",
+                        "composetime": NOW.isoformat(),
+                    },
+                    {
+                        "id": "1783500000001",
+                        "conversationid": "19:conversation@thread.tacv2",
+                        "rootMessageId": "1783500000000",
+                        "content": "<p>duplicate page row</p>",
+                        "composetime": NOW.isoformat(),
+                    },
+                    {
+                        "id": "1783500000002",
+                        "conversationid": "19:conversation@thread.tacv2",
+                        "rootMessageId": "1783500000000",
+                        "content": "<p>second normalized content</p>",
+                        "composetime": (NOW + timedelta(minutes=1)).isoformat(),
+                    },
+                ],
+            },
+            parsed_messages,
+        )
+        client.record_poll_ledger_actions(
+            "19:conversation@thread.tacv2",
+            {"new": 1, "updated": 0, "unchanged": 1},
+        )
+        client.mark_poll_complete("19:conversation@thread.tacv2", stop_reason="gap_boundary")
+
+        audits = client.get_poll_audits()
+
+        assert len(audits) == 1
+        assert audits[0]["raw_conversation_id"] == "19:conversation@thread.tacv2"
+        assert audits[0]["raw_messages_seen"] == 3
+        assert audits[0]["unique_message_keys_seen"] == 2
+        assert audits[0]["duplicate_raw_messages"] == 1
+        assert audits[0]["page_count"] == 1
+        assert audits[0]["metadata_backward_link"] == "https://teams.cloud.microsoft/opaque/backward"
+        assert audits[0]["upsert_new"] == 1
+        assert audits[0]["upsert_unchanged"] == 1
+        assert "normalized content" not in json.dumps(audits[0])
+
 
 # ---------------------------------------------------------------------------
 # Discovery

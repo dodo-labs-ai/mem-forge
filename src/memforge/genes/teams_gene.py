@@ -76,6 +76,7 @@ class _TeamsAPIClient:
         self._chat_base = _REGION_URLS.get(region, _REGION_URLS["emea"])
         self._chat_client: httpx.AsyncClient | None = None
         self._graph_client: httpx.AsyncClient | None = None
+        self._poll_audits: dict[str, dict] = {}
 
     async def _load_tokens(self) -> tuple[str, str]:
         """Load chat and graph tokens.
@@ -286,11 +287,14 @@ class _TeamsAPIClient:
             data = resp.json()
             messages = data.get("messages", data) if isinstance(data, dict) else data
 
+            parsed_page: list[dict] = []
             if isinstance(messages, list):
                 for m in messages:
                     parsed = self._parse_message(m)
                     if parsed:
+                        parsed_page.append(parsed)
                         all_messages.append(parsed)
+            self._record_message_poll_page(conversation_id, data, parsed_page)
 
             # Pagination: check for next link
             url = None
@@ -299,6 +303,8 @@ class _TeamsAPIClient:
                 next_link = data.get("_metadata", {}).get("backwardLink")
                 if next_link:
                     url = next_link
+            if not url:
+                self.mark_poll_complete(conversation_id, stop_reason="no_backward_link")
 
         return all_messages
 
@@ -322,6 +328,7 @@ class _TeamsAPIClient:
             messages = data.get("messages", data) if isinstance(data, dict) else data
 
             hit_cutoff = False
+            parsed_page: list[dict] = []
             if isinstance(messages, list):
                 for m in messages:
                     parsed = self._parse_message(m)
@@ -329,9 +336,12 @@ class _TeamsAPIClient:
                         if parsed["time"] < cutoff:
                             hit_cutoff = True
                             break
+                        parsed_page.append(parsed)
                         all_messages.append(parsed)
+            self._record_message_poll_page(conversation_id, data, parsed_page)
 
             if hit_cutoff:
+                self.mark_poll_complete(conversation_id, stop_reason="cutoff_reached")
                 break
 
             url = None
@@ -340,6 +350,8 @@ class _TeamsAPIClient:
                 next_link = data.get("_metadata", {}).get("backwardLink")
                 if next_link:
                     url = next_link
+            if not url:
+                self.mark_poll_complete(conversation_id, stop_reason="no_backward_link")
 
         return all_messages
 
@@ -388,6 +400,7 @@ class _TeamsAPIClient:
                     parsed = self._parse_message(m)
                     if parsed:
                         page.append(parsed)
+            self._record_message_poll_page(conversation_id, data, page)
 
             if page:
                 yield page
@@ -399,6 +412,78 @@ class _TeamsAPIClient:
                 next_link = data.get("_metadata", {}).get("backwardLink")
                 if next_link:
                     url = next_link
+            if not url:
+                self.mark_poll_complete(conversation_id, stop_reason="no_backward_link")
+
+    def _record_message_poll_page(
+        self,
+        conversation_id: str,
+        data: dict,
+        parsed_messages: list[dict],
+    ) -> None:
+        raw_messages = data.get("messages", data) if isinstance(data, dict) else data
+        if not isinstance(raw_messages, list):
+            raw_messages = []
+        audit = self._poll_audits.setdefault(conversation_id, _new_poll_audit(conversation_id))
+        audit["page_count"] += 1
+        audit["raw_messages_seen"] += len(raw_messages)
+        audit["parse_filtered_messages"] += max(0, len(raw_messages) - len(parsed_messages))
+
+        metadata = data.get("_metadata", {}) if isinstance(data, dict) else {}
+        if isinstance(metadata, dict):
+            if metadata.get("syncState"):
+                audit["metadata_sync_state"] = metadata["syncState"]
+            if metadata.get("backwardLink"):
+                audit["metadata_backward_link"] = metadata["backwardLink"]
+
+        seen_keys = audit["_seen_message_keys"]
+        for message in raw_messages:
+            key = _raw_message_key(conversation_id, message)
+            if key in seen_keys:
+                audit["duplicate_raw_messages"] += 1
+            else:
+                seen_keys.add(key)
+            timestamp = _raw_message_timestamp(message)
+            if timestamp:
+                audit["covered_created_from"] = _min_iso(audit.get("covered_created_from"), timestamp)
+                audit["covered_created_to"] = _max_iso(audit.get("covered_created_to"), timestamp)
+
+        selected_keys = audit["_selected_message_keys"]
+        for message in parsed_messages:
+            selected_keys.add(_parsed_message_key(conversation_id, message))
+
+    def record_poll_ledger_actions(self, conversation_id: str, counts: dict[str, int]) -> None:
+        audit = self._poll_audits.setdefault(conversation_id, _new_poll_audit(conversation_id))
+        audit["upsert_new"] += _int_or_zero(counts.get("new"))
+        audit["upsert_updated"] += _int_or_zero(counts.get("updated"))
+        audit["upsert_unchanged"] += _int_or_zero(counts.get("unchanged"))
+        audit["explicit_delete_markers"] += _int_or_zero(counts.get("deleted"))
+        audit["missing_once_candidates"] += _int_or_zero(counts.get("missing_once"))
+        audit["ledger_action_basis"] = "message_receipt"
+
+    def mark_poll_complete(self, conversation_id: str, *, stop_reason: str) -> None:
+        audit = self._poll_audits.setdefault(conversation_id, _new_poll_audit(conversation_id))
+        audit["pagination_complete"] = True
+        audit["stop_reason"] = stop_reason
+
+    def get_poll_audits(self) -> list[dict]:
+        result: list[dict] = []
+        for conversation_id, audit in sorted(self._poll_audits.items()):
+            unique_count = len(audit.get("_seen_message_keys", set()))
+            selected_count = len(audit.get("_selected_message_keys", set()))
+            clean = {
+                key: value
+                for key, value in audit.items()
+                if key not in {"_seen_message_keys", "_selected_message_keys"}
+            }
+            clean["raw_conversation_id"] = conversation_id
+            clean["unique_message_keys_seen"] = unique_count
+            clean["selected_message_keys_seen"] = selected_count
+            if not clean.get("ledger_action_basis"):
+                clean["upsert_new"] = selected_count
+                clean["ledger_action_basis"] = "selected_without_message_receipt"
+            result.append(clean)
+        return result
 
     # --- Graph API methods ---
 
@@ -705,6 +790,7 @@ class TeamsGene(Gene):
             self._log.info("Fetching messages for %s (topic=%s)", conv_id[:30], conv_meta.get("topic", "?"))
             messages = await self._fetch_with_context(conv_id, since)
             self._log.info("Got %d messages for %s", len(messages), conv_id[:30])
+            self._record_message_ledger_actions(conv_id, conv_meta, messages)
             if not messages:
                 continue
 
@@ -1066,6 +1152,7 @@ class TeamsGene(Gene):
                 if gap > gap_seconds and all_messages[i]["time"] < since:
                     all_messages = all_messages[i + 1:]
                     found_boundary = True
+                    self._client.mark_poll_complete(conv_id, stop_reason="gap_boundary")
                     break
 
             if found_boundary:
@@ -1073,6 +1160,7 @@ class TeamsGene(Gene):
 
             # Stop if we've gone past since + one full gap window
             if all_messages and all_messages[0]["time"] < since - timedelta(minutes=self._gap_minutes):
+                self._client.mark_poll_complete(conv_id, stop_reason="incremental_context_boundary")
                 break
 
         return all_messages
@@ -1084,6 +1172,49 @@ class TeamsGene(Gene):
     def _teams_ledger_state_path(self) -> Path | None:
         configured = str(self.config.get("ledger_state_path") or "").strip()
         return Path(configured).expanduser() if configured else None
+
+    def get_poll_audits(self) -> list[dict]:
+        if self._client is None or not hasattr(self._client, "get_poll_audits"):
+            return []
+        return self._client.get_poll_audits()
+
+    def _record_message_ledger_actions(
+        self,
+        conv_id: str,
+        conv_meta: dict,
+        messages: list[dict],
+    ) -> None:
+        if self._client is None or not hasattr(self._client, "record_poll_ledger_actions"):
+            return
+        ledger_state_path = self._teams_ledger_state_path()
+        if ledger_state_path is None:
+            self._client.record_poll_ledger_actions(conv_id, {"new": len(messages)})
+            return
+
+        from memforge.local_agent.teams_ledger import (
+            TeamsLedgerMessage,
+            TeamsLedgerStateStore,
+        )
+
+        ledger_messages = [
+            TeamsLedgerMessage(
+                source_id=self.source_id,
+                conversation_id=conv_id,
+                conversation_type=str(conv_meta.get("type") or "group_chat"),
+                message_id=str(message["id"]),
+                created_at=message["time"],
+                body_normalized=str(message.get("content") or ""),
+                root_message_id=str(message.get("rootMessageId") or message["id"]),
+                parent_message_id=message.get("parentMessageId"),
+            )
+            for message in messages
+        ]
+        counts = TeamsLedgerStateStore(ledger_state_path).observe_messages(
+            source_id=self.source_id,
+            conversation_id=conv_id,
+            messages=ledger_messages,
+        )
+        self._client.record_poll_ledger_actions(conv_id, counts)
 
     def _project_unthreaded_content_items(
         self,
@@ -1279,6 +1410,76 @@ def _format_date_range(min_time: datetime, max_time: datetime) -> str:
     if min_time.date() == max_time.date():
         return f"{min_time.strftime('%b %d')}, {min_time.strftime('%H:%M')}-{max_time.strftime('%H:%M')}"
     return f"{min_time.strftime('%b %d %H:%M')} - {max_time.strftime('%b %d %H:%M')}"
+
+
+def _new_poll_audit(conversation_id: str) -> dict:
+    return {
+        "raw_conversation_id": conversation_id,
+        "field_contract_version": "teams_chatsvc_rest_v1",
+        "access_probe_status": "ok",
+        "pagination_complete": False,
+        "stop_reason": "",
+        "page_count": 0,
+        "raw_messages_seen": 0,
+        "unique_message_keys_seen": 0,
+        "selected_message_keys_seen": 0,
+        "duplicate_raw_messages": 0,
+        "parse_filtered_messages": 0,
+        "upsert_new": 0,
+        "upsert_updated": 0,
+        "upsert_unchanged": 0,
+        "explicit_delete_markers": 0,
+        "missing_once_candidates": 0,
+        "ledger_action_basis": "",
+        "_seen_message_keys": set(),
+        "_selected_message_keys": set(),
+    }
+
+
+def _raw_message_key(conversation_id: str, message: dict) -> tuple[str, str, str]:
+    message_id = str(message.get("id") or message.get("clientmessageid") or "")
+    root_id = str(
+        message.get("rootMessageId")
+        or message.get("properties", {}).get("rootMessageId")
+        or message.get("properties", {}).get("parentMessageId")
+        or message_id
+    )
+    return (str(message.get("conversationid") or conversation_id), root_id, message_id)
+
+
+def _parsed_message_key(conversation_id: str, message: dict) -> tuple[str, str, str]:
+    message_id = str(message.get("id") or "")
+    root_id = str(message.get("rootMessageId") or message.get("parentMessageId") or message_id)
+    return (str(message.get("conversationid") or conversation_id), root_id, message_id)
+
+
+def _raw_message_timestamp(message: dict) -> str | None:
+    timestamp = message.get("composetime") or message.get("originalarrivaltime")
+    if not timestamp:
+        return None
+    parsed = _TeamsAPIClient._parse_timestamp(str(timestamp))
+    if parsed.year <= 2000:
+        return None
+    return parsed.isoformat()
+
+
+def _min_iso(current: str | None, candidate: str) -> str:
+    if not current:
+        return candidate
+    return min(current, candidate)
+
+
+def _max_iso(current: str | None, candidate: str) -> str:
+    if not current:
+        return candidate
+    return max(current, candidate)
+
+
+def _int_or_zero(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 # ============================================================================
