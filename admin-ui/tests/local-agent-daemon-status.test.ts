@@ -10,6 +10,7 @@ const sourceConfigDialogSource = readFileSync(
   "src/views/sources/SourceConfigDialog.tsx",
   "utf8",
 );
+const topbarSource = readFileSync("src/components/layout/Topbar.tsx", "utf8");
 const apiTypesSource = readFileSync("src/api/types.ts", "utf8");
 
 // --- Component contract --------------------------------------------------
@@ -28,20 +29,26 @@ assert.match(
 
 assert.match(
   componentSource,
-  /Local daemon online/,
-  "LocalAgentDaemonStatus should surface an online label in product language",
+  /Local sync ready/,
+  "LocalAgentDaemonStatus should surface the online label in product language",
 );
 
 assert.match(
   componentSource,
-  /Local daemon offline/,
-  "LocalAgentDaemonStatus should surface an offline label in product language",
+  /Local sync unavailable/,
+  "LocalAgentDaemonStatus should surface the offline label in product language",
+);
+
+assert.doesNotMatch(
+  componentSource,
+  /Local daemon online|Local daemon offline/,
+  "LocalAgentDaemonStatus should not surface the legacy daemon-oriented status labels",
 );
 
 assert.match(
   componentSource,
   /memforge adapter daemon run/,
-  "LocalAgentDaemonStatus offline state should show the daemon command",
+  "LocalAgentDaemonStatus offline state should still surface the daemon start command in the Add Source flow",
 );
 
 assert.doesNotMatch(
@@ -70,33 +77,35 @@ assert.match(
   "types.ts should export the daemon status response shape used by the admin UI",
 );
 
+// --- Topbar --------------------------------------------------------------
+
+assert.doesNotMatch(
+  topbarSource,
+  /<span>API<\/span>/,
+  "Topbar should not surface a hardcoded API status badge",
+);
+
+assert.doesNotMatch(
+  topbarSource,
+  /LocalAgentDaemonStatus/,
+  "Topbar should not render a local sync status chip",
+);
+
 // --- Sources list --------------------------------------------------------
 
+assert.doesNotMatch(
+  sourcesPageSource,
+  /hasLocalAgentSource/,
+  "SourcesPage should no longer surface a prominent daemon status strip above the configured sources list",
+);
+
+// The Add Source dialog lives inside SourcesPage; the daemon status should
+// only appear there, alongside the "Push from your local device" selection.
 assert.match(
   sourcesPageSource,
   /import \{ LocalAgentDaemonStatus \}/,
-  "SourcesPage should import the daemon status indicator",
+  "SourcesPage should import the daemon status indicator for the Add Source flow",
 );
-
-assert.match(
-  sourcesPageSource,
-  /function sourceUsesLocalAgent\(source: Source\)/,
-  "SourcesPage should have a predicate for sources that depend on the local daemon",
-);
-
-assert.match(
-  sourcesPageSource,
-  /hasLocalAgentSource\s*=\s*sources\.some\(sourceUsesLocalAgent\)/,
-  "SourcesPage should compute whether any configured source depends on the local daemon",
-);
-
-assert.match(
-  sourcesPageSource,
-  /hasLocalAgentSource\s*&&\s*\(\s*<div[\s\S]*?<LocalAgentDaemonStatus \/>/,
-  "SourcesPage should only surface the daemon status when at least one local-agent source is configured",
-);
-
-// --- Add Source dialog ---------------------------------------------------
 
 assert.match(
   sourcesPageSource,
@@ -104,22 +113,17 @@ assert.match(
   "Add Source push-from-local section should surface the daemon status inline",
 );
 
+const localAgentStatusUsages = sourcesPageSource.match(/<LocalAgentDaemonStatus \/>/g) ?? [];
+assert.equal(
+  localAgentStatusUsages.length,
+  1,
+  "SourcesPage should render the daemon status exactly once, inside the Add Source flow",
+);
+
 // --- Configure dialog ----------------------------------------------------
 
-assert.match(
+assert.doesNotMatch(
   sourceConfigDialogSource,
-  /import \{ LocalAgentDaemonStatus \}/,
-  "SourceConfigDialog should import the daemon status indicator",
-);
-
-assert.match(
-  sourceConfigDialogSource,
-  /usesLocalAgent\s*=\s*[\s\S]*?sourceType === "local_markdown"[\s\S]*?sourceType === "github_repo"[\s\S]*?"local_push"[\s\S]*?sourceType === "jira"[\s\S]*?"local_agent"/,
-  "SourceConfigDialog should mark local_markdown, GitHub local_push, and Jira local_agent configurations as daemon-backed",
-);
-
-assert.match(
-  sourceConfigDialogSource,
-  /\{usesLocalAgent && <LocalAgentDaemonStatus \/>\}/,
-  "SourceConfigDialog should render the daemon status only for daemon-backed source configurations",
+  /LocalAgentDaemonStatus/,
+  "SourceConfigDialog should not surface daemon status on the source configuration form",
 );

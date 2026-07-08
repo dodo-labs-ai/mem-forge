@@ -90,13 +90,6 @@ function localAgentSyncOperation(source: Source): string | null {
   return null;
 }
 
-function sourceUsesLocalAgent(source: Source): boolean {
-  if (isInternalGitHubSource(source)) return true;
-  if (source.type === "local_markdown") return true;
-  if (source.type === "jira" && String(source.config.sync_mode ?? "cloud") === "local_agent") return true;
-  return false;
-}
-
 const LOCAL_AGENT_SYNC_POLL_ATTEMPTS = 1_800;
 const LOCAL_AGENT_SYNC_POLL_INTERVAL_MS = 2_000;
 const LOCAL_AGENT_WAITING_MESSAGE = "Waiting for local daemon to sync this source.";
@@ -304,7 +297,6 @@ export function SourcesPage() {
   const totalDocs = sources.reduce((sum, source) => sum + source.doc_count, 0);
   const totalMemories = sources.reduce((sum, source) => sum + (source.memory_count ?? 0), 0);
   const projects = projectsQuery.data ?? [];
-  const hasLocalAgentSource = sources.some(sourceUsesLocalAgent);
 
   // Sources whose project assignment depends on per-document field values
   // need the resolver result to know which groups they appear in. Sources
@@ -383,11 +375,6 @@ export function SourcesPage() {
             {sources.length.toLocaleString()} configured ingestion sources.
           </p>
         </div>
-        {hasLocalAgentSource && (
-          <div className="border-b px-4 py-3">
-            <LocalAgentDaemonStatus />
-          </div>
-        )}
         {authorityMessage && (
           <div
             role="status"
