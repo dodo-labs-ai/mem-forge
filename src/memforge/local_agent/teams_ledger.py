@@ -7,7 +7,12 @@ from datetime import datetime, timedelta
 import base64
 import hashlib
 import json
+import os
+from pathlib import Path
+import tempfile
 from typing import Any
+
+TEAMS_LEDGER_STATE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -238,6 +243,74 @@ class TeamsLedgerProjector:
         )
 
 
+class TeamsLedgerStateStore:
+    """Durable JSON store for Teams block anchors and memberships."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path.expanduser()
+
+    def load_projection(self, *, source_id: str, conversation_id: str) -> TeamsProjectionResult | None:
+        payload = self._load()
+        record = payload.get("conversations", {}).get(_conversation_state_key(source_id, conversation_id))
+        if not isinstance(record, dict):
+            return None
+        blocks = record.get("blocks")
+        if not isinstance(blocks, list):
+            return None
+        return TeamsProjectionResult(blocks=tuple(_block_from_json(block) for block in blocks if isinstance(block, dict)))
+
+    def save_projection(
+        self,
+        *,
+        source_id: str,
+        conversation_id: str,
+        projection: TeamsProjectionResult,
+    ) -> dict[str, Any]:
+        payload = self._load()
+        conversations = payload.setdefault("conversations", {})
+        conversations[_conversation_state_key(source_id, conversation_id)] = {
+            "source_id": source_id,
+            "conversation_id": conversation_id,
+            "blocks": [_block_to_json(block) for block in projection.blocks],
+        }
+        return self._save(payload)
+
+    def _load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": {}}
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": {}}
+        if not isinstance(payload, dict) or payload.get("version") != TEAMS_LEDGER_STATE_VERSION:
+            return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": {}}
+        conversations = payload.get("conversations")
+        if not isinstance(conversations, dict):
+            conversations = {}
+        return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": conversations}
+
+    def _save(self, payload: dict[str, Any]) -> dict[str, Any]:
+        cleaned = {
+            "version": TEAMS_LEDGER_STATE_VERSION,
+            "conversations": payload.get("conversations") if isinstance(payload.get("conversations"), dict) else {},
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(self.path.parent), prefix=f".{self.path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(cleaned, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        return cleaned
+
+
 def build_teams_window_id(
     *,
     source_id: str,
@@ -278,6 +351,50 @@ def build_teams_receipt_key(*, source_id: str, window_id: str, revision_hash: st
         "window_id": window_id,
         "revision_hash": revision_hash,
     }
+
+
+def _block_to_json(block: TeamsBlockProjection) -> dict[str, Any]:
+    return {
+        "source_id": block.source_id,
+        "conversation_id": block.conversation_id,
+        "window_id": block.window_id,
+        "frozen_anchor_message_id": block.frozen_anchor_message_id,
+        "anchor_created_at": block.anchor_created_at.isoformat(),
+        "member_min_created_at": block.member_min_created_at.isoformat(),
+        "member_max_created_at": block.member_max_created_at.isoformat(),
+        "member_message_ids": list(block.member_message_ids),
+        "block_membership_fingerprint": block.block_membership_fingerprint,
+        "revision_hash": block.revision_hash,
+        "assignment_generation": block.assignment_generation,
+        "rebuild_generation": block.rebuild_generation,
+        "bridge_not_merged": block.bridge_not_merged,
+    }
+
+
+def _block_from_json(value: dict[str, Any]) -> TeamsBlockProjection:
+    return TeamsBlockProjection(
+        source_id=str(value["source_id"]),
+        conversation_id=str(value["conversation_id"]),
+        window_id=str(value["window_id"]),
+        frozen_anchor_message_id=str(value["frozen_anchor_message_id"]),
+        anchor_created_at=_parse_dt(value["anchor_created_at"]),
+        member_min_created_at=_parse_dt(value["member_min_created_at"]),
+        member_max_created_at=_parse_dt(value["member_max_created_at"]),
+        member_message_ids=tuple(str(item) for item in value.get("member_message_ids", [])),
+        block_membership_fingerprint=str(value["block_membership_fingerprint"]),
+        revision_hash=str(value["revision_hash"]),
+        assignment_generation=int(value.get("assignment_generation") or 0),
+        rebuild_generation=int(value.get("rebuild_generation") or 0),
+        bridge_not_merged=bool(value.get("bridge_not_merged")),
+    )
+
+
+def _conversation_state_key(source_id: str, conversation_id: str) -> str:
+    return _sha256_json({"source_id": source_id, "conversation_id": conversation_id})
+
+
+def _parse_dt(value: Any) -> datetime:
+    return datetime.fromisoformat(str(value))
 
 
 def _block_membership_fingerprint(window_id: str, messages: list[TeamsLedgerMessage]) -> str:
