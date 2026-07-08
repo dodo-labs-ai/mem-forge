@@ -832,7 +832,77 @@ def test_jira_auth_once_preserves_previous_hash_when_no_new_hash(monkeypatch):
     assert payload == {"action": "expired", "cookie_hash": "hash-1", "ok": False}
 
 
-def test_adapter_daemon_status_reads_state(monkeypatch, tmp_path):
+def test_adapter_daemon_status_summarizes_state_by_default(monkeypatch, tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tasks": {
+                    "github:arch": {
+                        "run_count": 2,
+                        "last_status": "success",
+                        "last_finished_at": "2026-07-07T01:00:00+00:00",
+                    },
+                    "cloud-jobs:lease": {
+                        "run_count": 3,
+                        "last_status": "failed",
+                        "last_error": "missing MEMFORGE_WORKSPACE_ID",
+                        "updated_at": "2026-07-07T01:02:00+00:00",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_STATE", str(state_path))
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "cli.toml"))
+    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
+    monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
+    monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
+    (tmp_path / "cli.toml").write_text(
+        'active = "dev"\n\n[targets.dev]\napi_url = "https://memforge.example.test"\ntoken_env = "MEMFORGE_API_TOKEN"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "_read_adapter_config", lambda: {"kb": {}, "github": {}})
+
+    result = CliRunner().invoke(cli, ["adapter", "daemon", "status"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "stopped"
+    assert "state" not in payload
+    assert payload["target"]["api_url"] == "https://memforge.example.test"
+    assert payload["target"]["api_token_configured"] is False
+    assert payload["target"]["workspace_id_configured"] is False
+    assert payload["recommendations"] == [
+        "Set MEMFORGE_API_TOKEN before starting the daemon.",
+        "Set MEMFORGE_WORKSPACE_ID for hosted multi-workspace MemForge targets.",
+    ]
+    assert payload["summary"]["total_recorded_tasks"] == 2
+    assert payload["summary"]["last_cloud_job_lease"]["status"] == "failed"
+    assert payload["summary"]["last_cloud_job_lease"]["error"] == "missing MEMFORGE_WORKSPACE_ID"
+    assert payload["recent_tasks"] == [
+        {
+            "task_id": "cloud-jobs:lease",
+            "status": "failed",
+            "last_finished_at": None,
+            "updated_at": "2026-07-07T01:02:00+00:00",
+            "run_count": 3,
+            "error": "missing MEMFORGE_WORKSPACE_ID",
+        },
+        {
+            "task_id": "github:arch",
+            "status": "success",
+            "last_finished_at": "2026-07-07T01:00:00+00:00",
+            "updated_at": None,
+            "run_count": 2,
+            "error": None,
+        },
+    ]
+
+
+def test_adapter_daemon_status_verbose_includes_raw_state(monkeypatch, tmp_path):
     state_path = tmp_path / "state.json"
     state_path.write_text(
         json.dumps(
@@ -852,9 +922,27 @@ def test_adapter_daemon_status_reads_state(monkeypatch, tmp_path):
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_STATE", str(state_path))
     monkeypatch.setattr(main, "_read_adapter_config", lambda: {"kb": {}, "github": {}})
 
-    result = CliRunner().invoke(cli, ["adapter", "daemon", "status"])
+    result = CliRunner().invoke(cli, ["adapter", "daemon", "status", "--verbose"])
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["status"] == "stopped"
     assert payload["state"]["tasks"]["github:arch"]["run_count"] == 2
+
+
+def test_recent_local_agent_tasks_sorts_mixed_timestamp_offsets():
+    tasks = {
+        "earlier-offset": {
+            "run_count": 1,
+            "last_status": "success",
+            "updated_at": "2026-07-07T02:00:00+02:00",
+        },
+        "later-z": {
+            "run_count": 1,
+            "last_status": "failed",
+            "updated_at": "2026-07-07T00:30:00Z",
+        },
+    }
+
+    recent = main._recent_local_agent_tasks(tasks, limit=2)
+
+    assert [task["task_id"] for task in recent] == ["later-z", "earlier-offset"]

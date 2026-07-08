@@ -116,6 +116,36 @@ assert.match(
 );
 assert.match(
   sourcesPageSource,
+  /Waiting for local daemon/,
+  "Local-agent sync should tell users when Cloud is waiting for their daemon",
+);
+assert.match(
+  sourcesPageSource,
+  /LOCAL_AGENT_TIMEOUT_MESSAGE/,
+  "Local-agent sync should use a distinct timeout message after polling gives up",
+);
+assert.match(
+  sourcesPageSource,
+  /memforge adapter daemon run/,
+  "Local-agent sync timeout should show the daemon command when a job is still waiting",
+);
+assert.match(
+  sourcesPageSource,
+  /current === LOCAL_AGENT_WAITING_MESSAGE \? null : current/,
+  "Successful local-agent sync should clear the optimistic waiting banner",
+);
+assert.match(
+  sourcesPageSource,
+  /function safeSourceErrorMessage/,
+  "Source sync errors should pass through only explicitly safe user-facing messages",
+);
+assert.doesNotMatch(
+  sourcesPageSource,
+  /setAuthorityMessage\(error instanceof Error && error\.message/,
+  "Source sync should not expose arbitrary backend Error.message text in the UI banner",
+);
+assert.match(
+  sourcesPageSource,
   /onToggleStatus=\{\(\)\s*=>\s*\{/,
   "SourceActionsMenu should receive a pause/resume action per source row",
 );

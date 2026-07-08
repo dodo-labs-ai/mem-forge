@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from importlib import metadata
 from itertools import islice
 from pathlib import Path, PurePosixPath
@@ -1649,10 +1650,11 @@ def adapter_daemon():
 
 
 @adapter_daemon.command("status")
+@click.option("--verbose", is_flag=True, help="Include the raw local daemon state file.")
 @click.option("--default-sync-interval-seconds", default=3600, show_default=True, type=int,
               help="Default interval used when displaying local-folder and GitHub profile tasks.")
 @click.pass_context
-def adapter_daemon_status(ctx, default_sync_interval_seconds: int):
+def adapter_daemon_status(ctx, verbose: bool, default_sync_interval_seconds: int):
     """Show local agent daemon state."""
     from memforge.local_agent.tasks import discover_profile_tasks
 
@@ -1661,24 +1663,123 @@ def adapter_daemon_status(ctx, default_sync_interval_seconds: int):
         _read_adapter_config(),
         default_interval_seconds=default_sync_interval_seconds,
     )
+    state_tasks = state.get("tasks") if isinstance(state.get("tasks"), dict) else {}
+    target_summary = _local_agent_target_summary(ctx)
+    payload = {
+        "status": "stopped",
+        "state_path": str(_local_agent_state_path()),
+        "target": target_summary,
+        "configured_tasks": [
+            {
+                "task_id": task.task_id,
+                "kind": task.kind,
+                "profile_name": task.profile_name,
+                "origin": task.origin,
+                "interval_seconds": task.interval_seconds,
+            }
+            for task in configured
+        ],
+        "summary": _summarize_local_agent_state_tasks(state_tasks),
+        "recent_tasks": _recent_local_agent_tasks(state_tasks, limit=5),
+    }
+    recommendations = _local_agent_status_recommendations(target_summary)
+    if recommendations:
+        payload["recommendations"] = recommendations
+    if verbose:
+        payload["state"] = state
     _emit_tool_payload(
         ctx,
-        {
-            "status": "stopped",
-            "state_path": str(_local_agent_state_path()),
-            "configured_tasks": [
-                {
-                    "task_id": task.task_id,
-                    "kind": task.kind,
-                    "profile_name": task.profile_name,
-                    "origin": task.origin,
-                    "interval_seconds": task.interval_seconds,
-                }
-                for task in configured
-            ],
-            "state": state,
-        },
+        payload,
     )
+
+
+def _local_agent_target_summary(ctx) -> dict[str, Any]:
+    config: AppConfig = ctx.obj["config"]
+    api_url, api_token = _resolve_api_endpoint(config)
+    cli_config = _read_cli_config()
+    active = str(cli_config.get("active") or "")
+    active_target = _active_target()
+    token_env = ""
+    if active_target is not None:
+        token_env = str(active_target.get("token_env") or "")
+    return {
+        "api_url": api_url,
+        "active_target": active,
+        "token_env": token_env,
+        "api_token_configured": bool(api_token),
+        "workspace_id_configured": bool(os.getenv("MEMFORGE_WORKSPACE_ID", "").strip()),
+    }
+
+
+def _local_agent_status_recommendations(target: dict[str, Any]) -> list[str]:
+    recommendations: list[str] = []
+    token_env = str(target.get("token_env") or "MEMFORGE_API_TOKEN")
+    if not target.get("api_token_configured"):
+        recommendations.append(f"Set {token_env} before starting the daemon.")
+    if not target.get("workspace_id_configured"):
+        recommendations.append("Set MEMFORGE_WORKSPACE_ID for hosted multi-workspace MemForge targets.")
+    return recommendations
+
+
+def _summarize_local_agent_state_tasks(tasks: dict[str, Any]) -> dict[str, Any]:
+    statuses: dict[str, int] = {}
+    last_cloud_job_lease: dict[str, Any] | None = None
+    for task_id, task in tasks.items():
+        if not isinstance(task, dict):
+            continue
+        status = str(task.get("last_status") or "unknown")
+        statuses[status] = statuses.get(status, 0) + 1
+        if task_id == "cloud-jobs:lease":
+            last_cloud_job_lease = _compact_local_agent_task(task_id, task)
+    return {
+        "total_recorded_tasks": sum(statuses.values()),
+        "statuses": statuses,
+        "last_cloud_job_lease": last_cloud_job_lease,
+    }
+
+
+def _recent_local_agent_tasks(tasks: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
+    compact_tasks = [
+        _compact_local_agent_task(task_id, task)
+        for task_id, task in tasks.items()
+        if isinstance(task, dict)
+    ]
+    compact_tasks.sort(
+        key=lambda task: (
+            _local_agent_task_timestamp(task.get("updated_at")),
+            _local_agent_task_timestamp(task.get("last_finished_at")),
+            str(task.get("task_id") or ""),
+        ),
+        reverse=True,
+    )
+    return compact_tasks[:limit]
+
+
+def _local_agent_task_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        return datetime.min.replace(tzinfo=timezone.utc)
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _compact_local_agent_task(task_id: str, task: dict[str, Any]) -> dict[str, Any]:
+    error = task.get("last_error")
+    return {
+        "task_id": task_id,
+        "status": task.get("last_status"),
+        "last_finished_at": task.get("last_finished_at"),
+        "updated_at": task.get("updated_at"),
+        "run_count": task.get("run_count"),
+        "error": str(error) if error else None,
+    }
 
 
 @adapter_daemon.command("once")
