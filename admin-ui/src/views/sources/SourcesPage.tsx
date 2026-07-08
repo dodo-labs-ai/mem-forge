@@ -91,12 +91,30 @@ function localAgentSyncOperation(source: Source): string | null {
 
 const LOCAL_AGENT_SYNC_POLL_ATTEMPTS = 1_800;
 const LOCAL_AGENT_SYNC_POLL_INTERVAL_MS = 2_000;
+const LOCAL_AGENT_WAITING_MESSAGE = "Waiting for local daemon to sync this source.";
+const LOCAL_AGENT_TIMEOUT_MESSAGE =
+  "Local daemon did not pick up this job. Start it with `memforge adapter daemon run` and try again.";
+const LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE = "Configure a folder path before syncing this local source.";
+const LOCAL_AGENT_SYNC_FAILED_MESSAGE = "Local daemon could not sync this source.";
+
+function safeSourceErrorMessage(error: unknown): string | null {
+  if (!(error instanceof Error)) return null;
+  if (
+    error.message === LOCAL_AGENT_WAITING_MESSAGE
+    || error.message === LOCAL_AGENT_TIMEOUT_MESSAGE
+    || error.message === LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE
+    || error.message === LOCAL_AGENT_SYNC_FAILED_MESSAGE
+  ) {
+    return error.message;
+  }
+  return null;
+}
 
 async function createLocalAgentSyncJob(source: Source): Promise<LocalAgentJobCreateResponse | null> {
   const operation = localAgentSyncOperation(source);
   if (!operation) {
     if (source.type === "local_markdown") {
-      throw new Error("Configure a folder path before syncing this local source.");
+      throw new Error(LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE);
     }
     return null;
   }
@@ -111,7 +129,10 @@ async function createLocalAgentSyncJob(source: Source): Promise<LocalAgentJobCre
   });
   const status = await pollLocalAgentSyncJob(response.data.job_id);
   if (status.status === "failed") {
-    throw new Error(status.last_error || "Local daemon could not sync this source.");
+    if (status.last_error) {
+      console.warn("Local daemon sync failed", status.last_error);
+    }
+    throw new Error(LOCAL_AGENT_SYNC_FAILED_MESSAGE);
   }
   return response.data;
 }
@@ -124,7 +145,7 @@ async function pollLocalAgentSyncJob(jobId: string): Promise<LocalAgentJobStatus
     }
     await new Promise((resolve) => window.setTimeout(resolve, LOCAL_AGENT_SYNC_POLL_INTERVAL_MS));
   }
-  throw new Error("Timed out waiting for the local daemon.");
+  throw new Error(LOCAL_AGENT_TIMEOUT_MESSAGE);
 }
 
 export function SourcesPage() {
@@ -154,7 +175,7 @@ export function SourcesPage() {
       queryClient.invalidateQueries({ queryKey: ["sources"] });
       return true;
     }
-    setAuthorityMessage(fallback);
+    setAuthorityMessage(safeSourceErrorMessage(error) ?? fallback);
     return false;
   };
 
@@ -181,6 +202,9 @@ export function SourcesPage() {
     mutationFn: async ({ source, forceFullSync = false }: { source: Source; forceFullSync?: boolean }) => {
       const sourceId = source.id;
       setPendingSyncIds((current) => new Set(current).add(sourceId));
+      if (localAgentSyncOperation(source)) {
+        setAuthorityMessage(LOCAL_AGENT_WAITING_MESSAGE);
+      }
       const localAgentJob = await createLocalAgentSyncJob(source);
       if (localAgentJob) {
         return { data: localAgentJob };
@@ -189,6 +213,9 @@ export function SourcesPage() {
     },
     onError: (error) => handleAuthorityError(error, "Failed to start sync."),
     onSettled: (_data, _error, variables) => {
+      if (!_error) {
+        setAuthorityMessage((current) => current === LOCAL_AGENT_WAITING_MESSAGE ? null : current);
+      }
       setPendingSyncIds((current) => {
         const next = new Set(current);
         next.delete(variables.source.id);
@@ -213,6 +240,9 @@ export function SourcesPage() {
   const forceResyncSource = useMutation({
     mutationFn: async (source: Source) => {
       setPendingSyncIds((current) => new Set(current).add(source.id));
+      if (localAgentSyncOperation(source)) {
+        setAuthorityMessage(LOCAL_AGENT_WAITING_MESSAGE);
+      }
       const localAgentJob = await createLocalAgentSyncJob(source);
       if (localAgentJob) {
         return { data: localAgentJob };
@@ -221,6 +251,9 @@ export function SourcesPage() {
     },
     onError: (error) => handleAuthorityError(error, "Failed to start refresh."),
     onSettled: (_data, _error, source) => {
+      if (!_error) {
+        setAuthorityMessage((current) => current === LOCAL_AGENT_WAITING_MESSAGE ? null : current);
+      }
       setPendingSyncIds((current) => {
         const next = new Set(current);
         next.delete(source.id);
