@@ -341,6 +341,40 @@ def test_local_agent_cloud_job_loop_sleeps_after_lease_failure(tmp_path):
     assert sleeps == [7]
 
 
+def test_local_agent_cloud_job_loop_sleeps_after_scheduled_task_failure(tmp_path):
+    from memforge.local_agent.runner import LocalAgentRunner
+    from memforge.local_agent.state import LocalAgentStateStore
+    from memforge.local_agent.tasks import LocalAgentHandlers
+
+    sleeps: list[float] = []
+
+    runner = LocalAgentRunner(
+        adapter_config={},
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        handlers=LocalAgentHandlers(
+            run_kb_profile=lambda name: {},
+            run_github_profile=lambda name: {},
+            run_jira_auth=lambda origin, last_hash=None: {"action": "unchanged"},
+        ),
+        cloud_jobs_provider=lambda wait_seconds=0: {"jobs": []},
+    )
+
+    def fail_scheduled_tasks(**kwargs) -> list[dict]:
+        raise RuntimeError("scheduled task discovery failed")
+
+    runner._run_scheduled_tasks = fail_scheduled_tasks  # type: ignore[method-assign]
+
+    runner.run_forever(
+        include_jira=False,
+        poll_interval_seconds=7,
+        cloud_job_wait_seconds=25,
+        stop_after_iterations=2,
+        sleep=sleeps.append,
+    )
+
+    assert sleeps == [7]
+
+
 def test_local_agent_cloud_lease_failure_does_not_abort_profile_tasks(tmp_path):
     from memforge.local_agent.runner import LocalAgentRunner
     from memforge.local_agent.state import LocalAgentStateStore

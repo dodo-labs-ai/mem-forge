@@ -1496,7 +1496,7 @@ def test_local_agent_cloud_local_markdown_pick_root_reports_cancellation(monkeyp
 
     assert payload == {
         "operation": "local_markdown_pick_root",
-        "error": "folder selection cancelled",
+        "cancelled": True,
     }
 
 
