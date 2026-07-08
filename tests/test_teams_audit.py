@@ -141,6 +141,37 @@ def test_validate_teams_audit_run_reports_duplicate_projection_and_missing_patch
     assert "new projection missing one matching memory patch for run run-1 window win-1 revision rev-1" in errors
 
 
+def test_validate_teams_audit_run_reports_summary_count_mismatches():
+    events = [
+        {
+            "event": "teams_sync_run",
+            "run_id": "run-1",
+            "selected_windows": 2,
+            "pushed_windows": 2,
+            "failed_windows": 0,
+        },
+        {
+            "event": "teams_window_projection",
+            "run_id": "run-1",
+            "window_id_hash": "win-1",
+            "revision_hash": "rev-1",
+            "receipt_status": "new",
+        },
+        {
+            "event": "teams_memory_patch",
+            "run_id": "run-1",
+            "window_id_hash": "win-1",
+            "revision_hash": "rev-1",
+            "patch_status": "pushed",
+        },
+    ]
+
+    errors = validate_teams_audit_run(events)
+
+    assert "sync summary selected_windows does not match projections for run run-1" in errors
+    assert "sync summary pushed_windows does not match pushed patches for run run-1" in errors
+
+
 def test_write_teams_audit_event_appends_redacted_jsonl(tmp_path):
     audit_path = tmp_path / "teams-audit.jsonl"
 
