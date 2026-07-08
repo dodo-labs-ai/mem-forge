@@ -366,6 +366,9 @@ class TeamsLedgerStateStore:
             "version": TEAMS_LEDGER_STATE_VERSION,
             "conversations": payload.get("conversations") if isinstance(payload.get("conversations"), dict) else {},
             "receipts": payload.get("receipts") if isinstance(payload.get("receipts"), dict) else {},
+            "message_receipts": (
+                payload.get("message_receipts") if isinstance(payload.get("message_receipts"), dict) else {}
+            ),
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(dir=str(self.path.parent), prefix=f".{self.path.name}.", suffix=".tmp")
