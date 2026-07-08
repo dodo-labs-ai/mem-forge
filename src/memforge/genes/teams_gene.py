@@ -335,7 +335,7 @@ class _TeamsAPIClient:
                     if parsed:
                         if parsed["time"] < cutoff:
                             hit_cutoff = True
-                            break
+                            continue
                         parsed_page.append(parsed)
                         all_messages.append(parsed)
             self._record_message_poll_page(conversation_id, data, parsed_page)
