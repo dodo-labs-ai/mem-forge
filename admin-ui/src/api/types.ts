@@ -372,12 +372,19 @@ export interface LocalAgentJobStatusResponse {
   job_id: string;
   status: "queued" | "leased" | "succeeded" | "failed";
   result: {
+    authenticated?: boolean;
+    expires_in_minutes?: number | null;
+    error?: string | null;
     items?: Array<{
       path?: string;
       relative_path?: string;
       type?: "tree" | "blob";
       size?: number | null;
     }>;
+    favorites?: TeamsChat[];
+    teams?: TeamsTeam[];
+    group_chats?: TeamsChat[];
+    individual_chats?: TeamsChat[];
     truncated?: boolean;
   } | null;
   last_error?: string | null;

@@ -900,25 +900,25 @@ class TeamsGene(Gene):
 
     async def normalize(self, raw: RawContent) -> NormalizedContent:
         """Convert Teams thread/block JSON to comprehensive markdown."""
-        data = json.loads(raw.body.decode("utf-8"))
-        if data.get("package_kind") == LOCAL_AGENT_TEAMS_PACKAGE_KIND:
-            source_semantics = data.get("source_semantics") if isinstance(data.get("source_semantics"), dict) else {}
-            return NormalizedContent(
-                item=raw.item,
-                markdown_body=str(data.get("markdown") or ""),
-                source_semantics={
-                    "source_kind": "teams",
-                    "conversation_id": data.get("conversation_id"),
-                    "root_message_id": data.get("root_message_id"),
-                    "window_id": data.get("window_id"),
-                    "window_type": data.get("window_type"),
-                    "revision_hash": data.get("revision_hash"),
-                    **source_semantics,
-                    "raw_hash": data.get("raw_hash"),
-                    "submitted_at": data.get("submitted_at"),
-                    "submitted_by": data.get("submitted_by"),
-                },
-            )
+        package = json.loads(raw.body.decode("utf-8"))
+        data = package
+        package_semantics = {}
+        if package.get("package_kind") == LOCAL_AGENT_TEAMS_PACKAGE_KIND:
+            raw_payload = package.get("raw_payload")
+            if not isinstance(raw_payload, dict):
+                raise ValueError("Teams local-agent package is missing raw_payload")
+            data = raw_payload
+            package_semantics = {
+                "source_kind": "teams",
+                "conversation_id": package.get("conversation_id"),
+                "root_message_id": package.get("root_message_id"),
+                "window_id": package.get("window_id"),
+                "window_type": package.get("window_type"),
+                "revision_hash": package.get("revision_hash"),
+                "raw_hash": package.get("raw_hash"),
+                "submitted_at": package.get("submitted_at"),
+                "submitted_by": package.get("submitted_by"),
+            }
 
         messages = data.get("messages", [])
         participants = data.get("participants", [])
@@ -991,6 +991,7 @@ class TeamsGene(Gene):
             item=raw.item,
             markdown_body=markdown,
             source_semantics={
+                **package_semantics,
                 "conversation_type": conv_type,
                 "channel_name": channel_name,
                 "team_name": team_name,

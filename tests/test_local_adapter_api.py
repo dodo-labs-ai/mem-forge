@@ -249,14 +249,27 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
             initial_documents_dir = Path(initial_row["config"]["local_agent_documents_dir"])
             assert initial_documents_dir.exists()
             response = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "base_url": "https://jira.example.test",
                     "issue_key": "PAY-1",
                     "source_url": "https://jira.example.test/browse/PAY-1",
                     "title": "Create daemon source support",
-                    "markdown_body": "# PAY-1\n\nCreate daemon source support.",
-                    "source_semantics": {"status": "Open", "issue_type": "Task"},
+                    "raw_payload": {
+                        "key": "PAY-1",
+                        "fields": {
+                            "summary": "Create daemon source support",
+                            "description": "Create daemon source support.",
+                            "status": {"name": "Open"},
+                            "issuetype": {"name": "Task"},
+                            "priority": {"name": "Medium"},
+                            "assignee": {"displayName": "Ada"},
+                            "labels": [],
+                            "issuelinks": [],
+                            "subtasks": [],
+                        },
+                        "_comments": [],
+                    },
                     "process_now": False,
                 },
             )
@@ -281,7 +294,7 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
 
         items, normalized = asyncio.run(_read_package())
         assert [item.extra["issue_key"] for item in items] == ["PAY-1"]
-        assert normalized.markdown_body == "# PAY-1\n\nCreate daemon source support."
+        assert "Create daemon source support." in normalized.markdown_body
         assert normalized.source_semantics["status"] == "Open"
         assert normalized.source_semantics["issue_key"] == "PAY-1"
     finally:
@@ -369,7 +382,18 @@ def test_jira_local_agent_package_discovery_normalizes_naive_timestamps(tmp_path
                 "title": "Naive timestamp package",
                 "source_url": "https://jira.example.test/browse/PAY-1",
                 "last_modified": "2026-07-07T12:00:00",
-                "markdown": "# PAY-1",
+                "raw_payload": {
+                    "key": "PAY-1",
+                    "fields": {
+                        "summary": "Naive timestamp package",
+                        "description": "PAY-1",
+                        "status": {"name": "Open"},
+                        "issuetype": {"name": "Task"},
+                        "issuelinks": [],
+                        "subtasks": [],
+                    },
+                    "_comments": [],
+                },
             }
         ),
         encoding="utf-8",
@@ -417,7 +441,7 @@ def test_jira_adapter_document_push_requires_local_agent_mode(tmp_path):
             )
             assert update.status_code == 200, update.text
             response = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "base_url": "https://jira.example.test",
                     "issue_key": "PAY-1",
@@ -442,7 +466,7 @@ def test_local_adapter_document_push_writes_package(tmp_path):
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "decisions/cutoff.md",
@@ -483,7 +507,7 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
             created = _create_github_repo_source(client)
             source_id = created["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -529,7 +553,7 @@ def test_github_repo_adapter_document_push_requires_local_push_mode(tmp_path):
         with TestClient(app) as client:
             source_id = _create_github_repo_source(client, connection_mode="cloud_pull")["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -554,7 +578,7 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
         with TestClient(app) as client:
             source_id = _create_github_repo_source(client)["id"]
             wrong_ref = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "feature",
@@ -564,7 +588,7 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
                 },
             )
             wrong_path = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -574,7 +598,7 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
                 },
             )
             wrong_extension = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -603,7 +627,7 @@ def test_github_repo_adapter_document_push_enforces_max_files(tmp_path):
         with TestClient(app) as client:
             source_id = _create_github_repo_source(client, max_files=1)["id"]
             first = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -613,7 +637,7 @@ def test_github_repo_adapter_document_push_enforces_max_files(tmp_path):
                 },
             )
             second = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -655,7 +679,7 @@ def test_github_repo_adapter_document_push_max_files_counts_current_scope_only(t
                 encoding="utf-8",
             )
             response = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -699,7 +723,7 @@ def test_local_adapter_document_push_requires_source_management(tmp_path):
         )
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-owned-local/adapter/documents",
+                "/api/sources/src-owned-local/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "decisions/cutoff.md",
@@ -725,7 +749,7 @@ def test_local_adapter_document_push_allows_unmapped_source(tmp_path):
             created = _create_unmapped_local_markdown_source(client)
             source_id = created["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "notes/unmapped.md",
@@ -759,8 +783,8 @@ def test_local_adapter_push_is_idempotent_on_doc_id(tmp_path):
                 "markdown_body": "# Index\n\nTop level.",
                 "process_now": False,
             }
-            first = client.post(f"/api/sources/{source_id}/adapter/documents", json=payload).json()
-            second = client.post(f"/api/sources/{source_id}/adapter/documents", json=payload).json()
+            first = client.post(f"/api/sources/{source_id}/adapter/packages", json=payload).json()
+            second = client.post(f"/api/sources/{source_id}/adapter/packages", json=payload).json()
         assert first["doc_id"] == second["doc_id"]
         assert first["package_path"] == second["package_path"]
     finally:
@@ -777,7 +801,7 @@ def test_teams_adapter_push_writes_window_package(tmp_path):
         with TestClient(app) as client:
             source_id = _create_teams_source(client)["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "conversation_id": "19:channel@example.test",
                     "window_id": "teams-thread:src:conversation:root",
@@ -786,8 +810,30 @@ def test_teams_adapter_push_writes_window_package(tmp_path):
                     "window_type": "thread",
                     "title": "Teams decision",
                     "source_url": "teams-window://src/conversation/window/rev-1",
-                    "markdown_body": "# Teams decision\n\nUse rootMessageId for channel threads.",
-                    "source_semantics": {"message_count": 2},
+                    "raw_payload": {
+                        "conversation_type": "channel",
+                        "title": "Teams decision",
+                        "channel_name": "architecture",
+                        "team_name": "Engineering",
+                        "messages": [
+                            {
+                                "id": "root-1",
+                                "from": "Alice",
+                                "content": "Use rootMessageId for channel threads.",
+                                "time": "2026-07-08T10:00:00+00:00",
+                                "is_root": True,
+                            },
+                            {
+                                "id": "reply-1",
+                                "from": "Bob",
+                                "content": "Agreed.",
+                                "time": "2026-07-08T10:05:00+00:00",
+                            },
+                        ],
+                        "participants": ["Alice", "Bob"],
+                        "first_message_time": "2026-07-08T10:00:00+00:00",
+                        "last_message_time": "2026-07-08T10:05:00+00:00",
+                    },
                     "process_now": False,
                 },
             )
@@ -803,7 +849,8 @@ def test_teams_adapter_push_writes_window_package(tmp_path):
         assert package["window_id"] == "teams-thread:src:conversation:root"
         assert package["revision_hash"] == "rev-1"
         assert package["conversation_id"] == "19:channel@example.test"
-        assert package["source_semantics"]["message_count"] == 2
+        assert "markdown" not in package
+        assert package["raw_payload"]["messages"][0]["content"] == "Use rootMessageId for channel threads."
 
         row = asyncio.run(database.get_source(source_id))
         assert row is not None
@@ -823,7 +870,7 @@ def test_local_adapter_push_rejects_vault_mismatch(tmp_path):
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "wrong-vault",
                     "relative_path": "notes/x.md",
@@ -848,7 +895,7 @@ def test_local_adapter_push_rejects_path_traversal(tmp_path):
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "../escape.md",
@@ -873,7 +920,7 @@ def test_teams_gene_discovers_local_agent_window_packages(tmp_path):
         with TestClient(app) as client:
             source_id = _create_teams_source(client)["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "conversation_id": "19:channel@example.test",
                     "window_id": "teams-block:src:conversation:anchor",
@@ -881,10 +928,22 @@ def test_teams_gene_discovers_local_agent_window_packages(tmp_path):
                     "root_message_id": "anchor-1",
                     "window_type": "block",
                     "title": "Group: July 8, 10:00-10:45",
-                    "markdown_body": "# Teams Conversation Window\n\nDecision captured.",
-                    "source_semantics": {
+                    "raw_payload": {
                         "conversation_type": "group_chat",
-                        "message_count": 4,
+                        "title": "Group: July 8, 10:00-10:45",
+                        "team_name": "Planning",
+                        "messages": [
+                            {
+                                "id": "anchor-1",
+                                "from": "Alice",
+                                "content": "Decision captured.",
+                                "time": "2026-07-08T10:00:00+00:00",
+                                "is_root": True,
+                            },
+                        ],
+                        "participants": ["Alice"],
+                        "first_message_time": "2026-07-08T10:00:00+00:00",
+                        "last_message_time": "2026-07-08T10:00:00+00:00",
                     },
                     "process_now": False,
                 },
@@ -908,10 +967,10 @@ def test_teams_gene_discovers_local_agent_window_packages(tmp_path):
         assert items[0].item_id.startswith("teams-")
         assert items[0].version == "rev-block-1"
         assert items[0].extra["window_id"] == "teams-block:src:conversation:anchor"
-        assert normalized.markdown_body == "# Teams Conversation Window\n\nDecision captured."
+        assert "Decision captured." in normalized.markdown_body
         assert normalized.source_semantics["source_kind"] == "teams"
         assert normalized.source_semantics["window_id"] == "teams-block:src:conversation:anchor"
-        assert normalized.source_semantics["message_count"] == 4
+        assert normalized.source_semantics["message_count"] == 1
     finally:
         asyncio.run(database.close())
 
@@ -928,7 +987,7 @@ def test_local_adapter_push_rejects_paused_source(tmp_path):
             source_id = created["id"]
             assert client.put(f"/api/sources/{source_id}", json={"status": "paused"}).status_code == 200
             response = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "notes.md",
@@ -963,7 +1022,7 @@ def test_local_adapter_push_requires_local_adapter_source(tmp_path):
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
             response = client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "x",
                     "relative_path": "x.md",
@@ -990,7 +1049,7 @@ def test_local_markdown_gene_discovers_pushed_packages(tmp_path):
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             client.post(
-                f"/api/sources/{source_id}/adapter/documents",
+                f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "release.md",
@@ -1054,7 +1113,7 @@ def test_local_markdown_gene_converts_by_content_type(tmp_path):
             ]
             for rel, ctype, body in docs:
                 resp = client.post(
-                    f"/api/sources/{source_id}/adapter/documents",
+                    f"/api/sources/{source_id}/adapter/packages",
                     json={
                         "vault_id": "engineering",
                         "relative_path": rel,
