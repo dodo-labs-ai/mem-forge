@@ -65,6 +65,17 @@ class TestMetadata:
         assert "conversation_gap_minutes" in field_keys
         assert "max_block_messages" in field_keys
 
+    def test_conversation_gap_defaults_to_one_hour(self):
+        schema = TeamsGene.config_schema()
+        gap = next(f for f in schema.fields if f.key == "conversation_gap_minutes")
+        assert gap.default == "60"
+
+        gene = TeamsGene(
+            config={"channels": "Team/Channel"},
+            source_id="test",
+        )
+        assert gene._gap_minutes == 60
+
     def test_numeric_fields_use_integer_type(self):
         schema = TeamsGene.config_schema()
         numeric_fields = {"max_age_days", "conversation_gap_minutes", "max_block_messages"}
@@ -144,6 +155,38 @@ class TestBlockGrouping:
         assert blocks[0][1]["id"] == "2"
         assert blocks[0][2]["id"] == "3"
 
+    def test_exact_gap_does_not_split_block(self):
+        msgs = [
+            _msg("1", "Alice", "First", NOW),
+            _msg("2", "Bob", "Exactly one hour later", NOW + timedelta(minutes=60)),
+        ]
+
+        blocks = _group_into_blocks(msgs, gap_minutes=60, max_messages=100)
+
+        assert [[msg["id"] for msg in block] for block in blocks] == [["1", "2"]]
+
+
+class TestMessageParsing:
+    def test_parse_message_preserves_real_rest_root_message_id(self):
+        client = _TeamsAPIClient(region="emea")
+
+        parsed = client._parse_message(
+            {
+                "id": "reply-1",
+                "rootMessageId": "root-1",
+                "conversationid": "19:channel@example",
+                "imdisplayname": "Alice",
+                "content": "<p>Confirmed</p>",
+                "messagetype": "RichText/Html",
+                "composetime": "2026-04-15T12:00:00Z",
+            }
+        )
+
+        assert parsed is not None
+        assert parsed["id"] == "reply-1"
+        assert parsed["rootMessageId"] == "root-1"
+        assert parsed["conversationid"] == "19:channel@example"
+
 
 # ---------------------------------------------------------------------------
 # Discovery
@@ -179,7 +222,7 @@ class TestDiscover:
 
     @pytest.mark.asyncio
     async def test_discovers_threads_from_channel(self, gene):
-        """Messages with parentMessageId are grouped into threads."""
+        """Messages with rootMessageId are grouped into threads."""
         conv_id = "19:abc@thread.tacv2"
         gene._client.list_conversations = AsyncMock(return_value=[{
             "id": conv_id,
@@ -192,8 +235,11 @@ class TestDiscover:
         gene._resolve_channel = AsyncMock(return_value=conv_id)
 
         root = _msg("root1", "Alice", "Should we use gRPC?", NOW - timedelta(minutes=30))
-        reply1 = _msg("r1", "Bob", "Yes, gRPC fits well", NOW - timedelta(minutes=20), parent_id="root1")
-        reply2 = _msg("r2", "Alice", "Confirmed, going with gRPC", NOW - timedelta(minutes=10), parent_id="root1")
+        root["rootMessageId"] = "root1"
+        reply1 = _msg("r1", "Bob", "Yes, gRPC fits well", NOW - timedelta(minutes=20))
+        reply1["rootMessageId"] = "root1"
+        reply2 = _msg("r2", "Alice", "Confirmed, going with gRPC", NOW - timedelta(minutes=10))
+        reply2["rootMessageId"] = "root1"
 
         gene._fetch_with_context = AsyncMock(return_value=[root, reply1, reply2])
 

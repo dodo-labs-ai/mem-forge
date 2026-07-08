@@ -9,7 +9,7 @@ Authentication extracts OAuth tokens from Chrome browser cookies via the
 ``~/.memforge/tokens/teams.json``.
 
 Document granularity:
-- Threaded messages (parentMessageId) → one thread = one document
+- Threaded channel messages (rootMessageId) → one thread = one document
 - Unthreaded messages → grouped into conversation blocks by time gaps
 """
 
@@ -512,12 +512,19 @@ class _TeamsAPIClient:
                 from_display = sender.get("displayName", sender.get("name", ""))
 
         composetime = m.get("composetime", m.get("originalarrivaltime", ""))
+        root_message_id = (
+            m.get("rootMessageId")
+            or m.get("properties", {}).get("rootMessageId")
+            or m.get("properties", {}).get("parentMessageId")
+        )
 
         return {
             "id": m.get("id", m.get("amsreferencesid", "")),
+            "conversationid": m.get("conversationid"),
             "from": from_display or "Unknown",
             "content": content,
             "time": self._parse_timestamp(composetime),
+            "rootMessageId": root_message_id,
             "parentMessageId": m.get("properties", {}).get("parentMessageId"),
             "mentions": m.get("properties", {}).get("mentions", []),
             "attachments": m.get("amsreferences", []),
@@ -623,7 +630,7 @@ class TeamsGene(Gene):
                 ConfigField(
                     key="conversation_gap_minutes", label="Conversation Gap (minutes)",
                     field_type=ConfigFieldType.INTEGER, required=False,
-                    default="180",
+                    default="60",
                     help_text="Minutes of silence that starts a new conversation block",
                     group="sync", order=1,
                 ),
@@ -644,7 +651,7 @@ class TeamsGene(Gene):
     def __init__(self, config: dict, source_id: str) -> None:
         super().__init__(config, source_id)
         self._client: _TeamsAPIClient | None = None
-        self._gap_minutes = int(config.get("conversation_gap_minutes", 180))
+        self._gap_minutes = int(config.get("conversation_gap_minutes", 60))
         self._max_block = int(config.get("max_block_messages", 100))
         self._max_age_days = int(config.get("max_age_days", 90))
         self._message_cache: dict[str, list[dict]] = {}  # conv_id → messages (per-sync)
@@ -697,9 +704,9 @@ class TeamsGene(Gene):
             unthreaded: list[dict] = []
 
             for msg in messages:
-                parent_id = msg.get("parentMessageId")
-                if parent_id:
-                    threaded[parent_id].append(msg)
+                root_id = msg.get("rootMessageId") or msg.get("parentMessageId")
+                if root_id and root_id != msg["id"]:
+                    threaded[root_id].append(msg)
                 else:
                     unthreaded.append(msg)
 
