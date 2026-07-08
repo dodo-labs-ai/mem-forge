@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from memforge.local_agent.teams_ledger import (
     TeamsLedgerMessage,
     TeamsLedgerProjector,
+    TeamsLedgerStateStore,
     build_teams_receipt_key,
     build_teams_window_id,
     decode_teams_window_id,
@@ -105,3 +106,39 @@ def test_receipt_key_uses_source_window_and_revision_without_policy_version():
         "window_id": "teams-block:v1:opaque",
         "revision_hash": "sha256:revision",
     }
+
+
+def test_teams_ledger_state_store_preserves_frozen_block_anchor_across_restart(tmp_path):
+    state_path = tmp_path / "teams-ledger.json"
+    projector = TeamsLedgerProjector(gap_minutes=60)
+    initial = projector.project_unthreaded(
+        [
+            _message("m2", "2026-07-08T10:00:00", "anchor"),
+            _message("m3", "2026-07-08T10:30:00", "follow-up"),
+        ]
+    )
+    original_block = initial.blocks[0]
+
+    TeamsLedgerStateStore(state_path).save_projection(
+        source_id="src-teams",
+        conversation_id="19:conversation@thread.tacv2",
+        projection=initial,
+    )
+
+    restored = TeamsLedgerStateStore(state_path).load_projection(
+        source_id="src-teams",
+        conversation_id="19:conversation@thread.tacv2",
+    )
+    updated = projector.project_unthreaded(
+        [
+            _message("m1", "2026-07-08T09:30:00", "late earlier"),
+            _message("m2", "2026-07-08T10:00:00", "anchor"),
+            _message("m3", "2026-07-08T10:30:00", "follow-up"),
+        ],
+        previous=restored,
+    )
+
+    assert len(updated.blocks) == 1
+    assert updated.blocks[0].window_id == original_block.window_id
+    assert updated.blocks[0].frozen_anchor_message_id == "m2"
+    assert updated.blocks[0].member_message_ids == ("m1", "m2", "m3")
