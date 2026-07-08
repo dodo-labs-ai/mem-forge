@@ -2367,7 +2367,6 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             markdown_body=str(doc["markdown_body"]),
             title=str(doc["title"]),
             source_url=str(doc.get("source_url") or ""),
-            last_modified=str(doc.get("last_modified") or ""),
             raw_hash=str(doc["raw_hash"]),
             source_semantics=doc.get("source_semantics") if isinstance(doc.get("source_semantics"), dict) else {},
             submitted_by=submitted_by,
@@ -2608,7 +2607,7 @@ async def _collect_teams_documents_from_cloud_job(
     from memforge.genes.teams_gene import TeamsGene
 
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    config = dict(payload)
+    config = _teams_direct_rest_config_from_cloud_payload(payload)
     config.pop("local_agent_documents_dir", None)
     config.pop("audit_log_path", None)
     config.setdefault("ledger_state_path", str(DEFAULT_TEAMS_LEDGER_STATE_PATH))
@@ -2671,6 +2670,47 @@ async def _collect_teams_documents_from_cloud_job(
     if not poll_audits:
         poll_audits = _teams_poll_audits_from_documents(poll_inputs)
     return {"documents": documents, "poll_audits": poll_audits}
+
+
+def _teams_direct_rest_config_from_cloud_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    config = dict(payload)
+    direct_ids: list[str] = []
+
+    for key in ("conversation_ids", "channels", "group_chats", "individual_chats"):
+        values = _teams_string_list(config.pop(key, []))
+        for value in values:
+            if not _is_direct_teams_conversation_id(value):
+                raise ValueError("teams_sync_requires_direct_conversation_ids")
+            direct_ids.append(value)
+
+    if not direct_ids:
+        raise ValueError("teams_sync_requires_direct_conversation_ids")
+
+    config["group_chats"] = _dedupe_preserving_order(direct_ids)
+    return config
+
+
+def _is_direct_teams_conversation_id(value: str) -> bool:
+    return bool(value and (":" in value or "@" in value))
+
+
+def _teams_string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _dedupe_preserving_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def _teams_poll_audits_from_documents(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

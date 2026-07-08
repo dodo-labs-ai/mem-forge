@@ -1868,6 +1868,7 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     assert first["window_type"] == "thread"
     assert first["revision_hash"] == "sha256:revision-1"
     assert first["source_semantics"]["message_count"] == 2
+    assert "last_modified" not in first
     assert first["process_now"] is False
     sync_calls = [call for call in FakeToolClient.calls if call[0] == "start_source_sync"]
     assert len(sync_calls) == 1
@@ -2165,6 +2166,65 @@ def test_collect_teams_documents_from_cloud_job_uses_gene_window_shape(monkeypat
     assert doc["last_modified"] == "2026-07-08T09:24:57+00:00"
     assert doc["raw_hash"]
     assert doc["revision_hash"]
+
+
+def test_collect_teams_documents_from_cloud_job_maps_cloud_conversation_ids_to_direct_rest_config(monkeypatch):
+    class FakeTeamsClient:
+        async def close(self):
+            pass
+
+    class FakeTeamsGene:
+        def __init__(self, config, source_id):
+            assert config["group_chats"] == ["19:conversation@thread.tacv2"]
+            assert "conversation_ids" not in config
+            assert "channels" not in config
+            assert "individual_chats" not in config
+            self._client = FakeTeamsClient()
+
+        async def authenticate(self):
+            pass
+
+        async def discover(self, since):
+            if False:
+                yield
+
+    import memforge.genes.teams_gene as teams_gene
+
+    monkeypatch.setattr(teams_gene, "TeamsGene", FakeTeamsGene)
+
+    collection = main.asyncio.run(
+        main._collect_teams_documents_from_cloud_job(
+            {"payload": {"conversation_ids": ["19:conversation@thread.tacv2"]}},
+            source_id="src-teams",
+            limit=0,
+        )
+    )
+
+    assert collection == {"documents": [], "poll_audits": []}
+
+
+def test_collect_teams_documents_from_cloud_job_rejects_name_based_teams_config():
+    result = main.asyncio.run(
+        _capture_collect_teams_documents_error(
+            {
+                "payload": {
+                    "channels": ["Engineering/architecture"],
+                    "group_chats": ["Planning Chat"],
+                    "individual_chats": ["Alice"],
+                },
+            }
+        )
+    )
+
+    assert result == "teams_sync_requires_direct_conversation_ids"
+
+
+async def _capture_collect_teams_documents_error(job):
+    try:
+        await main._collect_teams_documents_from_cloud_job(job, source_id="src-teams", limit=0)
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def test_adapter_github_preview_rejects_truncated_tree(monkeypatch, tmp_path: Path):

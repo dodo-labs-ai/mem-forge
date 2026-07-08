@@ -142,3 +142,28 @@ def test_teams_ledger_state_store_preserves_frozen_block_anchor_across_restart(t
     assert updated.blocks[0].window_id == original_block.window_id
     assert updated.blocks[0].frozen_anchor_message_id == "m2"
     assert updated.blocks[0].member_message_ids == ("m1", "m2", "m3")
+
+
+def test_teams_ledger_state_store_persists_message_receipts_across_restart(tmp_path):
+    state_path = tmp_path / "teams-ledger.json"
+    first = TeamsLedgerStateStore(state_path).observe_messages(
+        source_id="src-teams",
+        conversation_id="19:conversation@thread.tacv2",
+        messages=[
+            _message("m1", "2026-07-08T09:00:00", "same"),
+            _message("m2", "2026-07-08T09:01:00", "old"),
+        ],
+    )
+
+    second = TeamsLedgerStateStore(state_path).observe_messages(
+        source_id="src-teams",
+        conversation_id="19:conversation@thread.tacv2",
+        messages=[
+            _message("m1", "2026-07-08T09:00:00", "same"),
+            _message("m2", "2026-07-08T09:01:00", "new"),
+            _message("m3", "2026-07-08T09:02:00", "fresh"),
+        ],
+    )
+
+    assert first == {"new": 2, "updated": 0, "unchanged": 0}
+    assert second == {"new": 1, "updated": 1, "unchanged": 1}
