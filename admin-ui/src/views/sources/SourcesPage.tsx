@@ -6,6 +6,8 @@ import client from "@/api/client";
 import type {
   AgentSessionCompleteness,
   GeneMetadata,
+  LocalAgentJobCreateResponse,
+  LocalAgentJobStatusResponse,
   Project,
   ResolvedProjectsResponse,
   Source,
@@ -74,6 +76,24 @@ function normalizeSources(payload: SourcesResponse | Source[] | undefined): Sour
   return [];
 }
 
+function isInternalGitHubSource(source: Source): boolean {
+  return source.type === "github_repo" && String(source.config.connection_mode ?? "cloud_pull") === "local_push";
+}
+
+const LOCAL_AGENT_SYNC_POLL_ATTEMPTS = 1_800;
+const LOCAL_AGENT_SYNC_POLL_INTERVAL_MS = 2_000;
+
+async function pollLocalAgentSyncJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
+  for (let attempt = 0; attempt < LOCAL_AGENT_SYNC_POLL_ATTEMPTS; attempt += 1) {
+    const response = await client.get<LocalAgentJobStatusResponse>(`/api/cloud/local-agent/jobs/${jobId}`);
+    if (response.data.status === "succeeded" || response.data.status === "failed") {
+      return response.data;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, LOCAL_AGENT_SYNC_POLL_INTERVAL_MS));
+  }
+  throw new Error("Timed out waiting for the local daemon.");
+}
+
 export function SourcesPage() {
   const queryClient = useQueryClient();
   const [addOpen, setAddOpen] = useState(false);
@@ -125,15 +145,33 @@ export function SourcesPage() {
   });
 
   const syncSource = useMutation({
-    mutationFn: ({ sourceId, forceFullSync = false }: { sourceId: string; forceFullSync?: boolean }) => {
+    mutationFn: ({ source, forceFullSync = false }: { source: Source; forceFullSync?: boolean }) => {
+      const sourceId = source.id;
       setPendingSyncIds((current) => new Set(current).add(sourceId));
+      if (isInternalGitHubSource(source)) {
+        return client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
+          source_id: source.id,
+          source_type: "github_repo",
+          operation: "github_repo_sync",
+          payload: {
+            ...source.config,
+            process_now: true,
+          },
+        }).then(async (response) => {
+          const status = await pollLocalAgentSyncJob(response.data.job_id);
+          if (status.status === "failed") {
+            throw new Error(status.last_error || "Local daemon could not sync this source.");
+          }
+          return response;
+        });
+      }
       return client.post(`/api/sources/${sourceId}/sync`, { force_full_sync: forceFullSync });
     },
     onError: (error) => handleAuthorityError(error, "Failed to start sync."),
     onSettled: (_data, _error, variables) => {
       setPendingSyncIds((current) => {
         const next = new Set(current);
-        next.delete(variables.sourceId);
+        next.delete(variables.source.id);
         return next;
       });
       queryClient.invalidateQueries({ queryKey: ["sources"] });
@@ -382,7 +420,7 @@ export function SourcesPage() {
                         }}
                         onSync={() => {
                           if (!capabilities.can_sync || source.status === "paused") return;
-                          syncSource.mutate({ sourceId: source.id });
+                          syncSource.mutate({ source });
                         }}
                         onResume={() =>
                           setSourceStatus.mutate({ sourceId: source.id, status: "active" })

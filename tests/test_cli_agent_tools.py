@@ -15,9 +15,18 @@ class FakeToolClient:
     list_response: dict = {"data": []}
     create_response: dict = {"id": "src-created"}
 
-    def __init__(self, *, api_url: str, api_token: str | None = None):
+    def __init__(
+        self,
+        *,
+        api_url: str,
+        api_token: str | None = None,
+        workspace_id: str | None = None,
+        timeout_seconds: float = 60.0,
+    ):
         self.api_url = api_url
         self.api_token = api_token
+        self.workspace_id = (workspace_id or "").strip()
+        self.timeout_seconds = timeout_seconds
 
     @classmethod
     def reset(cls, response: dict, *, list_response: dict | None = None, create_response: dict | None = None) -> None:
@@ -64,14 +73,14 @@ class FakeToolClient:
     def push_local_markdown_document(self, **kwargs):
         self.calls.append((
             "push_local_markdown_document",
-            {"api_url": self.api_url, "api_token": self.api_token, **kwargs},
+            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
         ))
         return self.response
 
     def push_github_repo_document(self, **kwargs):
         self.calls.append((
             "push_github_repo_document",
-            {"api_url": self.api_url, "api_token": self.api_token, **kwargs},
+            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
         ))
         return self.response
 
@@ -1284,6 +1293,119 @@ def test_adapter_github_push_can_read_local_clone_without_gh_api(monkeypatch, tm
     assert kwargs["relative_path"] == "Payroll Processing V2/README.md"
     assert kwargs["blob_sha"] == expected_blob_sha
     assert kwargs["markdown_body"] == "# Payroll Processing V2\n\nBody"
+
+
+def test_local_agent_cloud_github_preview_uses_job_payload_without_profile(monkeypatch, tmp_path: Path):
+    repo = _init_github_local_clone(tmp_path)
+    original_run = main.subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["gh", "api"]:
+            raise AssertionError("cloud local-agent preview should use the job repo_path, not a local profile or gh api")
+        return original_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-preview",
+            "operation": "github_repo_preview_tree",
+            "source_id": "src-gh",
+            "payload": {
+                "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                "repo_path": str(repo),
+                "ref": "main",
+                "include_paths": ["Payroll Processing V2"],
+                "include_extensions": ["md"],
+                "limit": 10,
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload["operation"] == "github_repo_preview_tree"
+    assert payload["source_id"] == "src-gh"
+    assert payload["counts"] == {"included": 2, "ignored": 3}
+    assert [item["relative_path"] for item in payload["items"]] == [
+        "Payroll Processing V2/README.md",
+        "Payroll Processing V2/Überblick.md",
+    ]
+
+
+def test_local_agent_cloud_github_sync_pushes_job_source_and_snapshot(monkeypatch, tmp_path: Path):
+    repo = _init_github_local_clone(tmp_path)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
+    original_run = main.subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["gh", "api"]:
+            raise AssertionError("cloud local-agent sync should use the job repo_path, not gh api")
+        return original_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-sync",
+            "workspace_id": "ws-from-cloud",
+            "operation": "github_repo_sync",
+            "source_id": "src-from-cloud",
+            "payload": {
+                "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                "repo_path": str(repo),
+                "ref": "main",
+                "include_paths": ["Payroll Processing V2"],
+                "include_extensions": ["md"],
+                "limit": 1,
+                "process_now": True,
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload["operation"] == "github_repo_sync"
+    assert payload["source_id"] == "src-from-cloud"
+    assert payload["counts"] == {"selected": 1, "pushed": 1, "failed": 0}
+    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
+    assert len(push_calls) == 1
+    kwargs = push_calls[0][1]
+    assert kwargs["workspace_id"] == "ws-from-cloud"
+    assert kwargs["source_id"] == "src-from-cloud"
+    assert kwargs["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
+    assert kwargs["relative_path"] == "Payroll Processing V2/README.md"
+    assert kwargs["process_now"] is True
+    assert kwargs["submitted_by"] == "memforge-local-agent"
+
+
+def test_local_agent_cloud_github_sync_requires_job_workspace(monkeypatch, tmp_path: Path):
+    repo = _init_github_local_clone(tmp_path)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-sync",
+            "operation": "github_repo_sync",
+            "source_id": "src-from-cloud",
+            "payload": {
+                "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                "repo_path": str(repo),
+                "ref": "main",
+                "include_paths": ["Payroll Processing V2"],
+                "include_extensions": ["md"],
+                "limit": 1,
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload == {
+        "operation": "github_repo_sync",
+        "source_id": "src-from-cloud",
+        "error": "workspace_id is required",
+    }
+    assert FakeToolClient.calls == []
 
 
 def test_adapter_github_preview_rejects_truncated_tree(monkeypatch, tmp_path: Path):
