@@ -3318,14 +3318,14 @@ def create_admin_app(
         if not tokens:
             return TeamsAuthCheckResponse(
                 authenticated=False,
-                error="No Teams tokens found. Run: memforge auth teams",
+                error="No Teams session found.",
             )
 
         validity = TeamsAuthenticator.check_token_expiry(tokens)
         if not any(validity.values()):
             return TeamsAuthCheckResponse(
                 authenticated=False,
-                error="All Teams tokens have expired. Run: memforge auth teams",
+                error="Teams session expired.",
             )
 
         # Find the shortest time-to-expiry across valid tokens
@@ -3354,7 +3354,7 @@ def create_admin_app(
         if not tokens:
             raise HTTPException(
                 status_code=401,
-                detail="No Teams tokens. Run: memforge auth teams",
+                detail="No Teams session found.",
             )
 
         client = _TeamsAPIClient(region=region)

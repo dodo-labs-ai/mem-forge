@@ -10,12 +10,17 @@ import {
   Loader2,
   MessageSquare,
   Search,
-  Terminal,
   User,
   X,
 } from "lucide-react";
 import client from "@/api/client";
-import type { TeamsAuthStatus, TeamsBrowseData, TeamsChannel } from "@/api/types";
+import type {
+  LocalAgentJobCreateResponse,
+  LocalAgentJobStatusResponse,
+  TeamsAuthStatus,
+  TeamsBrowseData,
+  TeamsChannel,
+} from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -34,6 +39,9 @@ import {
   type TeamsSelectionItem,
   type TeamsSourceConfig,
 } from "./teamsSourceConfig";
+
+const TEAMS_AUTH_POLL_ATTEMPTS = 120;
+const TEAMS_AUTH_POLL_INTERVAL_MS = 1_000;
 
 export function TeamsSourceWizard({
   open,
@@ -71,7 +79,7 @@ function TeamsSourceWizardBody({
 
   return (
     <>
-      {step === 0 && <AuthCheckStep onAuthenticated={() => setStep(1)} />}
+      {step === 0 && <AuthCheckStep region={config.region} onAuthenticated={() => setStep(1)} />}
       {step === 1 && (
         <BrowseSelectStep
           region={config.region}
@@ -104,16 +112,43 @@ function TeamsSourceWizardBody({
   );
 }
 
-function AuthCheckStep({ onAuthenticated }: { onAuthenticated: () => void }) {
+function AuthCheckStep({ region, onAuthenticated }: { region: string; onAuthenticated: () => void }) {
+  const [message, setMessage] = useState<string | null>(null);
   const { data, isLoading, isFetching, refetch } = useQuery<TeamsAuthStatus>({
     queryKey: ["teams-auth-check"],
     queryFn: () => client.get("/api/genes/teams/auth-check").then((response) => response.data),
     retry: false,
   });
+  const connectMutation = useMutation({
+    mutationFn: async () => {
+      setMessage(null);
+      const created = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
+        source_type: "teams",
+        operation: "teams_auth",
+        payload: { region },
+      });
+      const status = await pollTeamsAuthJob(created.data.job_id);
+      if (status.status === "failed") {
+        throw new Error(teamsAuthJobMessage(status));
+      }
+      return status;
+    },
+    onSuccess: async () => {
+      setMessage("Connected. Loading conversations...");
+      const result = await refetch();
+      if (result.data?.authenticated) onAuthenticated();
+    },
+    onError: (error) => {
+      setMessage(error instanceof Error ? error.message : "Could not connect Teams.");
+    },
+  });
 
   useEffect(() => {
     if (data?.authenticated) onAuthenticated();
   }, [data?.authenticated, onAuthenticated]);
+
+  const busy = isFetching || connectMutation.isPending;
+  const statusMessage = message || cleanTeamsAuthMessage(data?.error) || "Teams session required.";
 
   return (
     <>
@@ -136,17 +171,7 @@ function AuthCheckStep({ onAuthenticated }: { onAuthenticated: () => void }) {
           <div className="space-y-4 pt-4">
             <div className="flex items-start gap-3 rounded-lg bg-muted p-3 text-sm">
               <AlertCircle className="mt-0.5 size-4 shrink-0 text-amber-600" />
-              <span>{data?.error || "Teams authentication required."}</span>
-            </div>
-            <div className="space-y-2">
-              <p className="text-sm text-muted-foreground">Run this from the project directory:</p>
-              <div className="flex items-center gap-2 rounded-lg bg-muted p-3 font-mono text-sm">
-                <Terminal className="size-4 shrink-0 text-muted-foreground" />
-                <code>.venv/bin/memforge auth teams</code>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Log into Teams in Chrome first, then run the command to extract your session.
-              </p>
+              <span>{statusMessage}</span>
             </div>
           </div>
         )}
@@ -154,14 +179,49 @@ function AuthCheckStep({ onAuthenticated }: { onAuthenticated: () => void }) {
 
       {!data?.authenticated && !isLoading && (
         <DialogFooter>
-          <Button type="button" onClick={() => refetch()} disabled={isFetching}>
-            {isFetching && <Loader2 className="size-4 animate-spin" />}
+          <Button type="button" variant="outline" onClick={() => refetch()} disabled={busy}>
+            {isFetching && !connectMutation.isPending && <Loader2 className="size-4 animate-spin" />}
             Check Again
+          </Button>
+          <Button type="button" onClick={() => connectMutation.mutate()} disabled={busy}>
+            {connectMutation.isPending && <Loader2 className="size-4 animate-spin" />}
+            Connect
           </Button>
         </DialogFooter>
       )}
     </>
   );
+}
+
+async function pollTeamsAuthJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
+  for (let attempt = 0; attempt < TEAMS_AUTH_POLL_ATTEMPTS; attempt += 1) {
+    const response = await client.get<LocalAgentJobStatusResponse>(`/api/cloud/local-agent/jobs/${jobId}`);
+    if (response.data.status === "succeeded" || response.data.status === "failed") {
+      return response.data;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, TEAMS_AUTH_POLL_INTERVAL_MS));
+  }
+  throw new Error("Timed out waiting for the local daemon.");
+}
+
+function teamsAuthJobMessage(status: LocalAgentJobStatusResponse): string {
+  const result = status.result as { error?: unknown } | null;
+  if (typeof result?.error === "string" && result.error.trim()) {
+    return result.error.trim();
+  }
+  if (status.last_error?.trim()) {
+    return cleanTeamsAuthMessage(status.last_error) || "Could not connect Teams.";
+  }
+  return "Could not connect Teams.";
+}
+
+function cleanTeamsAuthMessage(value: string | null | undefined): string | null {
+  const text = value?.trim();
+  if (!text) return null;
+  if (text.toLowerCase().includes("tokens") || text.toLowerCase().includes("run:")) {
+    return "No Teams session found. Select Connect after signing in to Teams in Chrome.";
+  }
+  return text;
 }
 
 function BrowseSelectStep({

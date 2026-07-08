@@ -1796,6 +1796,47 @@ def test_local_agent_cloud_jira_sync_starts_source_sync_when_last_push_fails(mon
     assert sync_calls[0]["source_id"] == "src-jira"
 
 
+def test_local_agent_cloud_teams_auth_captures_session(monkeypatch):
+    captured_regions: list[str] = []
+
+    class FakeTeamsAuthenticator:
+        def authenticate(self, *, region: str = "emea") -> dict[str, object]:
+            captured_regions.append(region)
+            return {
+                "region": region,
+                "tokens": {
+                    "https://ic3.teams.office.com": {
+                        "expiresAt": 4_102_444_800,
+                        "scopes": "Chat.Read",
+                    }
+                },
+            }
+
+    import memforge.auth.teams_auth as teams_auth
+
+    monkeypatch.setattr(teams_auth, "TeamsAuthenticator", FakeTeamsAuthenticator)
+    FakeToolClient.reset({})
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-teams-auth",
+            "operation": "teams_auth",
+            "source_type": "teams",
+            "payload": {"region": "amer"},
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload == {
+        "operation": "teams_auth",
+        "authenticated": True,
+        "region": "amer",
+        "token_count": 1,
+    }
+    assert captured_regions == ["amer"]
+    assert FakeToolClient.calls == []
+
+
 def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_path: Path):
     from memforge.local_agent.teams_audit import validate_teams_audit_run
 

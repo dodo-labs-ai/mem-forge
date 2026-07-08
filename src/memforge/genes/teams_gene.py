@@ -92,7 +92,7 @@ class _TeamsAPIClient:
         tokens = TeamsAuthenticator.load_tokens()
         if not tokens:
             raise AuthenticationError(
-                "No Teams tokens found. Run: memforge auth teams"
+                "No Teams session found. Connect Teams from the source wizard."
             )
 
         now = datetime.now(timezone.utc).timestamp()
@@ -116,7 +116,7 @@ class _TeamsAPIClient:
 
         if not chat_token:
             raise AuthenticationError(
-                "Teams Chat API token not found or expired. Run: memforge auth teams"
+                "Teams session expired. Connect Teams from the source wizard."
             )
         if not graph_token:
             # Graph is optional — some operations work without it
@@ -150,7 +150,7 @@ class _TeamsAPIClient:
             resp = await self._chat_client.get("/conversations", params={"pageSize": 1})
             if resp.status_code == 401:
                 raise AuthenticationError(
-                    "Teams API returned 401. Run: memforge auth teams"
+                    "Teams session expired. Connect Teams from the source wizard."
                 )
             resp.raise_for_status()
         except httpx.HTTPError as e:
