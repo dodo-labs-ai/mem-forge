@@ -167,8 +167,33 @@ assert.match(
 );
 assert.match(
   sourcesPageSource,
+  /local_markdown_sync/,
+  "Local repository sync should enqueue a local-agent sync job",
+);
+assert.match(
+  sourcesPageSource,
+  /jira_sync/,
+  "Jira sources configured for local daemon sync should enqueue a local-agent sync job",
+);
+assert.match(
+  sourcesPageSource,
   /\/api\/cloud\/local-agent\/jobs/,
   "Internal network GitHub source sync should use the cloud local-agent queue",
+);
+assert.match(
+  sourcesPageSource,
+  /forceResyncSource[\s\S]*createLocalAgentSyncJob\(source\)/,
+  "Force refresh for local-agent sources should use the daemon job path instead of Cloud-side source sync",
+);
+assert.match(
+  sourcesPageSource,
+  /Configure a folder path before syncing this local source\./,
+  "Local markdown sources without a daemon folder should fail explicitly instead of falling through",
+);
+assert.doesNotMatch(
+  sourcesPageSource,
+  /localMarkdownCanUseServerInbox/,
+  "Local markdown sync should not keep a legacy server-inbox compatibility branch",
 );
 
 const sourceConfigDialogSource = readFileSync("src/views/sources/SourceConfigDialog.tsx", "utf8");
@@ -201,6 +226,21 @@ assert.match(
   sourceConfigDialogSource,
   /jiraSessionQuery\.refetch\(\)/,
   "Jira browser-session guidance should allow users to re-check after running the CLI refresh",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /field\.key === "auth_mode"[\s\S]*next\.sync_mode = "cloud"/,
+  "Jira PAT mode should not leave Local daemon sync selected because the UI cannot pass redacted PAT secrets to daemon jobs",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /field\.key === "sync_mode"[\s\S]*next\.auth_mode = "browser_cookie"/,
+  "Jira Local daemon sync should use browser-session auth in the current contract",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /showDiscoveryPreview[\s\S]*sourceType === "jira"[\s\S]*config\.sync_mode[\s\S]*local_agent/,
+  "Jira Local daemon sync should not expose the server-side discovery preview",
 );
 assert.match(
   sourceConfigDialogSource,

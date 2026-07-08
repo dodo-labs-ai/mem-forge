@@ -856,12 +856,16 @@ class LocalAdapterDocumentRequest(BaseModel):
     """
 
     vault_id: str | None = None
-    relative_path: str
+    relative_path: str | None = None
     markdown_body: str
     content_type: str = "text/markdown"
+    base_url: str | None = None
     repo_url: str | None = None
     repo_ref: str | None = None
     blob_sha: str | None = None
+    issue_key: str | None = None
+    source_url: str | None = None
+    source_semantics: dict[str, Any] = Field(default_factory=dict)
     title: str | None = None
     raw_hash: str | None = None
     submitted_by: str | None = None
@@ -1545,6 +1549,12 @@ def _validate_jira_auth_config(
     if auth_mode not in {"browser_cookie", "pat"}:
         raise ValueError("Jira Authentication Method must be Browser session or Personal access token")
 
+    sync_mode = str(config.get("sync_mode") or existing_config.get("sync_mode") or "cloud").strip().lower()
+    if sync_mode not in {"cloud", "local_agent"}:
+        raise ValueError("Jira Sync Location must be Cloud or Local daemon")
+    if sync_mode == "local_agent" and auth_mode != "browser_cookie":
+        raise ValueError("Jira Local daemon sync currently requires Browser session authentication")
+
     if auth_mode == "browser_cookie":
         return
 
@@ -1638,10 +1648,12 @@ def _drop_source_owned_jira_cookie(config: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
-def _populate_local_markdown_inbox(
+def _populate_local_adapter_inbox(
     config: dict[str, Any],
     source_id: str,
     app_config: AppConfig,
+    *,
+    key: str,
 ) -> dict[str, Any]:
     """Fill the per-source inbox path so the gene can read pushed packages."""
     from memforge.local_adapter import default_local_adapter_inbox
@@ -1649,8 +1661,53 @@ def _populate_local_markdown_inbox(
     cleaned = dict(config)
     inbox = default_local_adapter_inbox(app_config, source_id)
     inbox.mkdir(parents=True, exist_ok=True)
-    cleaned["documents_dir"] = str(inbox)
+    cleaned[key] = str(inbox)
     return cleaned
+
+
+def _populate_local_markdown_inbox(
+    config: dict[str, Any],
+    source_id: str,
+    app_config: AppConfig,
+) -> dict[str, Any]:
+    return _populate_local_adapter_inbox(config, source_id, app_config, key="documents_dir")
+
+
+def _ensure_local_markdown_vault_id(
+    config: dict[str, Any],
+    source_id: str,
+    existing_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cleaned = dict(config)
+    existing_config = existing_config or {}
+    vault_id = str(cleaned.get("vault_id") or existing_config.get("vault_id") or "").strip()
+    cleaned["vault_id"] = vault_id or f"local-{source_id}"
+    return cleaned
+
+
+def _ensure_jira_sync_mode(
+    config: dict[str, Any],
+    existing_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cleaned = dict(config)
+    existing_config = existing_config or {}
+    if not str(cleaned.get("sync_mode") or "").strip():
+        sync_mode = str(existing_config.get("sync_mode") or "").strip()
+        if sync_mode:
+            cleaned["sync_mode"] = sync_mode
+    return cleaned
+
+
+def _populate_jira_local_agent_inbox(
+    config: dict[str, Any],
+    source_id: str,
+    app_config: AppConfig,
+) -> dict[str, Any]:
+    cleaned = dict(config)
+    if str(cleaned.get("sync_mode") or "cloud").strip().lower() != "local_agent":
+        cleaned.pop("local_agent_documents_dir", None)
+        return cleaned
+    return _populate_local_adapter_inbox(cleaned, source_id, app_config, key="local_agent_documents_dir")
 
 
 async def _cancel_running_jira_browser_sources_for_origin(
@@ -3735,14 +3792,20 @@ def create_admin_app(
 
         source_id = f"src-{uuid.uuid4().hex[:8]}"
         try:
-            _validate_source_config(req.type, req.config)
+            incoming_config = (
+                _ensure_local_markdown_vault_id(req.config, source_id)
+                if req.type == "local_markdown"
+                else req.config
+            )
+            _validate_source_config(req.type, incoming_config)
             source_config = prepare_source_config_for_storage(
-                req.config,
+                incoming_config,
                 secret_fields=_source_secret_fields(req.type),
             )
             _validate_source_project_binding(req.project_binding)
             if req.type == "jira":
                 source_config = _drop_source_owned_jira_cookie(source_config)
+                source_config = _populate_jira_local_agent_inbox(source_config, source_id, config)
             if req.type == "local_markdown" or (
                 req.type == "github_repo"
                 and str(source_config.get("connection_mode") or "").strip().lower() == "local_push"
@@ -3785,14 +3848,22 @@ def create_admin_app(
         name = req.name or existing["name"]
         if req.config is not None:
             try:
-                _validate_source_config(existing["type"], req.config, existing_config=existing["config"])
+                incoming_config = (
+                    _ensure_local_markdown_vault_id(req.config, source_id, existing["config"])
+                    if existing["type"] == "local_markdown"
+                    else req.config
+                )
+                if existing["type"] == "jira":
+                    incoming_config = _ensure_jira_sync_mode(incoming_config, existing["config"])
+                _validate_source_config(existing["type"], incoming_config, existing_config=existing["config"])
                 src_config = prepare_source_config_for_storage(
-                    req.config,
+                    incoming_config,
                     existing_config=existing["config"],
                     secret_fields=_source_secret_fields(existing["type"]),
                 )
                 if existing["type"] == "jira":
                     src_config = _drop_source_owned_jira_cookie(src_config)
+                    src_config = _populate_jira_local_agent_inbox(src_config, source_id, config)
                 if existing["type"] == "local_markdown" or (
                     existing["type"] == "github_repo"
                     and str(src_config.get("connection_mode") or "").strip().lower() == "local_push"
@@ -3978,8 +4049,10 @@ def create_admin_app(
         """
         from memforge.local_adapter import (
             GITHUB_REPO_SOURCE_TYPE,
+            JIRA_SOURCE_TYPE,
             LOCAL_MARKDOWN_SOURCE_TYPE,
             submit_github_repo_document,
+            submit_jira_document,
             submit_local_markdown_document,
         )
 
@@ -3987,7 +4060,7 @@ def create_admin_app(
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         source_type = source.get("type")
-        if source_type not in {LOCAL_MARKDOWN_SOURCE_TYPE, GITHUB_REPO_SOURCE_TYPE}:
+        if source_type not in {LOCAL_MARKDOWN_SOURCE_TYPE, GITHUB_REPO_SOURCE_TYPE, JIRA_SOURCE_TYPE}:
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -4012,6 +4085,21 @@ def create_admin_app(
                     title=req.title,
                     raw_hash=req.raw_hash,
                     blob_sha=req.blob_sha,
+                    submitted_by=req.submitted_by,
+                    submitted_at=req.submitted_at,
+                )
+            elif source_type == JIRA_SOURCE_TYPE:
+                result = await submit_jira_document(
+                    db=db,
+                    config=config,
+                    source=source,
+                    base_url=req.base_url or "",
+                    issue_key=req.issue_key or "",
+                    source_url=req.source_url or "",
+                    markdown_body=req.markdown_body,
+                    title=req.title,
+                    raw_hash=req.raw_hash,
+                    source_semantics=req.source_semantics,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                 )

@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, Check, ChevronRight, Loader2, RefreshCw } from "lucide-react";
+import { AlertCircle, Check, ChevronRight, FolderOpen, Loader2, RefreshCw } from "lucide-react";
 import client from "@/api/client";
 import type {
   ConfigField,
   DiscoveryPreviewResponse,
   GeneConfigSchema,
   JiraAuthSession,
+  LocalAgentJobCreateResponse,
+  LocalAgentJobStatusResponse,
   ProjectBinding,
   Source,
 } from "@/api/types";
@@ -36,7 +38,6 @@ import {
 } from "./confluenceConfig";
 import type { ParsedConfluenceWikiUrl } from "./confluenceConfig";
 import { GitHubRepoFolderPicker } from "./GitHubRepoFolderPicker";
-import { buildLocalMarkdownPushCommand } from "./localMarkdownConfig";
 import { canConfigureSourceType } from "./managedSources";
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
@@ -44,6 +45,8 @@ import { projectBindingIsComplete } from "./projectBinding";
 type ConfigValue = string | number | boolean | string[] | null;
 type ConfigForm = Record<string, ConfigValue>;
 const DISCOVERY_PREVIEW_LIMIT = 5;
+const LOCAL_AGENT_PREVIEW_POLL_ATTEMPTS = 90;
+const LOCAL_AGENT_PREVIEW_POLL_INTERVAL_MS = 2_000;
 
 export function SourceConfigDialog({
   open,
@@ -60,11 +63,6 @@ export function SourceConfigDialog({
   onSaved?: () => void;
   initialFocus?: { step: "project" };
 }) {
-  // A local repository is created from the CLI (which scans the folder and
-  // pushes), not by hand in the UI, so a new one shows setup instructions
-  // instead of a config form.
-  const isNewLocalRepo = sourceType === "local_markdown" && !source;
-
   // Backend authority: an existing source the viewer cannot configure should
   // not open the form. Type-level managed sources (agent_session) are also
   // blocked. New-source flows have no source row yet, so the type check is
@@ -79,8 +77,7 @@ export function SourceConfigDialog({
       open
       && Boolean(sourceType)
       && canConfigureSourceType(sourceType ?? "")
-      && canConfigureExisting
-      && !isNewLocalRepo,
+      && canConfigureExisting,
   });
 
   if (!sourceType || !canConfigureSourceType(sourceType)) return null;
@@ -89,9 +86,7 @@ export function SourceConfigDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex max-h-[90vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl">
-        {isNewLocalRepo ? (
-          <LocalRepoSetupInstructions onClose={() => onOpenChange(false)} />
-        ) : schemaQuery.isPending ? (
+        {schemaQuery.isPending ? (
           <div className="flex items-center justify-center gap-2 p-12 text-sm text-muted-foreground">
             <Loader2 className="size-4 animate-spin" />
             Loading source schema...
@@ -225,13 +220,62 @@ function SourceConfigForm({
   });
 
   const previewDiscovery = useMutation<DiscoveryPreviewResponse, unknown, void>({
-    mutationFn: () =>
-      client
+    mutationFn: async () => {
+      const serializedConfig = serializeConfig(schema.fields, config);
+      if (sourceType === "local_markdown") {
+        const created = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
+          source_id: source?.id ?? "",
+          source_type: "local_markdown",
+          operation: "local_markdown_preview_tree",
+          payload: {
+            ...localMarkdownPreviewJobConfig(serializedConfig, source),
+            limit: DISCOVERY_PREVIEW_LIMIT,
+          },
+        });
+        const status = await pollLocalAgentPreviewJob(created.data.job_id);
+        if (status.status === "failed") {
+          throw new Error(status.last_error || "Local daemon could not preview this folder.");
+        }
+        return localMarkdownPreviewFromJob(status);
+      }
+      return client
         .post(`/api/genes/${sourceType}/preview-discovery`, {
-          config: serializeConfig(schema.fields, config),
+          config: serializedConfig,
           limit: DISCOVERY_PREVIEW_LIMIT,
         })
-        .then((response) => response.data as DiscoveryPreviewResponse),
+        .then((response) => response.data as DiscoveryPreviewResponse);
+    },
+  });
+  const pickLocalMarkdownRoot = useMutation<string | null, unknown, void>({
+    mutationFn: async () => {
+      const created = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
+        source_id: source?.id ?? "",
+        source_type: "local_markdown",
+        operation: "local_markdown_pick_root",
+        payload: {
+          title: "Choose folder to sync",
+          initial_directory: stringValue(config.root).trim() || undefined,
+        },
+      });
+      const status = await pollLocalAgentPreviewJob(created.data.job_id);
+      if (status.status === "failed") {
+        throw new Error(status.last_error || "Local daemon could not open the folder picker.");
+      }
+      const result = status.result as { cancelled?: unknown; root?: unknown } | null;
+      if (result?.cancelled === true) {
+        return null;
+      }
+      const root = typeof result?.root === "string" ? result.root.trim() : "";
+      if (!root) {
+        throw new Error("Local daemon did not return a folder path.");
+      }
+      return root;
+    },
+    onSuccess: (root) => {
+      if (root === null) return;
+      setValidationMessage(null);
+      setConfig((current) => ({ ...current, root }));
+    },
   });
 
   const fieldsByGroup = useMemo(() => {
@@ -255,6 +299,8 @@ function SourceConfigForm({
   const scheduleIntervalValid = parseScheduleInterval(scheduleInterval) >= 5;
 
   const previewReady = firstMissingField === null;
+  const showDiscoveryPreview = sourceType !== "github_repo"
+    && !(sourceType === "jira" && stringValue(config.sync_mode) === "local_agent");
   const scheduleSummary = scheduleEnabled
     ? `Scheduled: ${scheduleIntervalLabel(scheduleInterval)}`
     : "Manual sync only";
@@ -263,6 +309,14 @@ function SourceConfigForm({
     setValidationMessage(null);
     setConfig((current) => {
       const next = { ...current, [field.key]: value };
+      if (sourceType === "jira") {
+        if (field.key === "auth_mode" && stringValue(value) === "pat") {
+          next.sync_mode = "cloud";
+        }
+        if (field.key === "sync_mode" && stringValue(value) === "local_agent") {
+          next.auth_mode = "browser_cookie";
+        }
+      }
       if (sourceType === "confluence" && field.key === "base_url") {
         return applyConfluenceUrlInference(next) as ConfigForm;
       }
@@ -338,6 +392,13 @@ function SourceConfigForm({
                     {sourceType === "confluence" && field.key === "base_url" && confluenceUrlInfo && (
                       <ConfluenceDetectedPanel info={confluenceUrlInfo} />
                     )}
+                    {sourceType === "local_markdown" && field.key === "root" && (
+                      <LocalMarkdownFolderPickerPanel
+                        isPending={pickLocalMarkdownRoot.isPending}
+                        error={pickLocalMarkdownRoot.isError ? pickLocalMarkdownRoot.error : null}
+                        onChoose={() => pickLocalMarkdownRoot.mutate()}
+                      />
+                    )}
                     {sourceType === "jira" && field.key === "jql" && (
                       <JiraEffectiveQueryPanel jql={stringValue(config.jql)} />
                     )}
@@ -363,12 +424,6 @@ function SourceConfigForm({
                         }}
                       />
                     )}
-                    {sourceType === "local_markdown" && field.key === "vault_id" && (
-                      <LocalMarkdownPushPanel
-                        sourceId={source?.id ?? null}
-                        vaultId={stringValue(config.vault_id).trim()}
-                      />
-                    )}
                     {sourceType === "github_repo" && field.key === "repo_url" && (
                       <>
                         <GitHubRepoDetectedPanel repoUrl={githubRepoUrl} />
@@ -384,9 +439,7 @@ function SourceConfigForm({
                   </div>
                 ))}
               </div>
-              {sourceType !== "local_markdown"
-                && sourceType !== "github_repo"
-                && group.key === previewGroupKey && (
+              {showDiscoveryPreview && group.key === previewGroupKey && (
                 <DiscoveryPreviewPanel
                   ready={previewReady}
                   isPending={previewDiscovery.isPending}
@@ -757,99 +810,6 @@ function JiraBrowserSessionPanel({
   );
 }
 
-function CliCommand({ command }: { command: string }) {
-  const copy = () => {
-    if (typeof navigator !== "undefined" && navigator.clipboard) void navigator.clipboard.writeText(command);
-  };
-  return (
-    <div className="flex items-center gap-2 rounded-md border bg-muted/30 p-2">
-      <code className="flex-1 break-all font-mono text-[11px] text-foreground">{command}</code>
-      <Button type="button" variant="outline" size="sm" onClick={copy}>
-        Copy
-      </Button>
-    </div>
-  );
-}
-
-function LocalRepoSetupInstructions({ onClose }: { onClose: () => void }) {
-  return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
-      <DialogHeader>
-        <DialogTitle>Add a local repository</DialogTitle>
-      </DialogHeader>
-      <p className="text-sm text-muted-foreground">
-        A local repository is set up from the CLI. MemForge does not read your filesystem, so the
-        CLI scans your folder and pushes its files into a source it creates for you.
-      </p>
-
-      <div className="space-y-2">
-        <div className="text-sm font-medium text-foreground">Guided setup (recommended)</div>
-        <CliCommand command="memforge" />
-        <p className="text-xs text-muted-foreground">
-          Run the CLI and choose{" "}
-          <span className="font-medium text-foreground">Local repository &rarr; Set up a repository</span>.
-          It walks you through the folder, shows a quick scan, creates this source, and runs the
-          first sync.
-        </p>
-      </div>
-
-      <details className="text-sm">
-        <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
-          Prefer one-off commands?
-        </summary>
-        <div className="mt-2 space-y-2">
-          <CliCommand command="memforge adapter kb add my-repo --root /path/to/folder --create-source" />
-          <CliCommand command="memforge adapter kb push my-repo --process-now" />
-        </div>
-      </details>
-
-      <DialogFooter className="mx-0 mb-0 flex-row justify-end rounded-none rounded-b-xl bg-background p-3">
-        <Button type="button" onClick={onClose}>
-          Got it
-        </Button>
-      </DialogFooter>
-    </div>
-  );
-}
-
-function LocalMarkdownPushPanel({
-  sourceId,
-  vaultId,
-}: {
-  sourceId: string | null;
-  vaultId: string;
-}) {
-  const command = buildLocalMarkdownPushCommand({ vaultId, sourceId });
-  const ready = Boolean(sourceId) && vaultId.length > 0;
-  const handleCopy = () => {
-    if (typeof navigator === "undefined" || !navigator.clipboard) return;
-    void navigator.clipboard.writeText(command);
-  };
-
-  return (
-    <div className="rounded-lg border bg-muted/30 p-3 text-xs">
-      <div className="text-sm font-medium text-foreground">Push from the local CLI adapter</div>
-      <p className="mt-1 text-muted-foreground">
-        MemForge does not read your filesystem. The local CLI adapter scans your markdown
-        folder, normalizes each file, and pushes documents into this source. Configure a
-        local profile with <code>memforge adapter kb add</code>, then run the push command
-        below to send documents through the service.
-      </p>
-      <div className="mt-3 flex items-center gap-2 rounded-md border bg-background p-2">
-        <code className="flex-1 break-all font-mono text-[11px] text-foreground">{command}</code>
-        <Button type="button" variant="outline" size="sm" onClick={handleCopy} disabled={!ready}>
-          Copy
-        </Button>
-      </div>
-      {!sourceId && (
-        <p className="mt-2 text-muted-foreground">
-          Save this source first to get a stable source id, then run the push command.
-        </p>
-      )}
-    </div>
-  );
-}
-
 function parseGitHubRepoUrl(repoUrl: string): { host: string; owner: string; repo: string; normalized: string } | null {
   const value = repoUrl.trim();
   if (!value.startsWith("https://")) return null;
@@ -868,6 +828,26 @@ function parseGitHubRepoUrl(repoUrl: string): { host: string; owner: string; rep
   } catch {
     return null;
   }
+}
+
+function LocalMarkdownFolderPickerPanel({
+  isPending,
+  error,
+  onChoose,
+}: {
+  isPending: boolean;
+  error: unknown;
+  onChoose: () => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <Button type="button" variant="outline" size="sm" onClick={onChoose} disabled={isPending}>
+        {isPending ? <Loader2 className="size-3.5 animate-spin" /> : <FolderOpen className="size-3.5" />}
+        Choose folder
+      </Button>
+      {error ? <span className="text-xs text-destructive">{extractSaveError(error)}</span> : null}
+    </div>
+  );
 }
 
 function GitHubRepoDetectedPanel({ repoUrl }: { repoUrl: string }) {
@@ -1107,6 +1087,14 @@ function serializeConfig(fields: ConfigField[], config: ConfigForm): ConfigForm 
   }, {});
 }
 
+function localMarkdownPreviewJobConfig(config: ConfigForm, source?: Source | null): ConfigForm {
+  const sourceVaultId = source?.config?.vault_id;
+  return {
+    ...config,
+    vault_id: (typeof sourceVaultId === "string" ? sourceVaultId.trim() : "") || "preview",
+  };
+}
+
 function firstMissingRequiredField(
   sourceType: string,
   fields: ConfigField[],
@@ -1215,6 +1203,8 @@ function optionLabel(field: ConfigField, option: string): string {
     if (option === "none") return "No authentication";
   }
   if (field.key === "sync_mode") {
+    if (option === "cloud") return "Cloud";
+    if (option === "local_agent") return "Local daemon";
     if (option === "page_tree") return "This page tree";
     if (option === "space") return "Whole space";
     if (option === "single_page") return "Single page";
@@ -1281,6 +1271,39 @@ function scheduleIntervalLabel(value: string): string {
     default:
       return "Daily";
   }
+}
+
+async function pollLocalAgentPreviewJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
+  for (let attempt = 0; attempt < LOCAL_AGENT_PREVIEW_POLL_ATTEMPTS; attempt += 1) {
+    const response = await client.get<LocalAgentJobStatusResponse>(`/api/cloud/local-agent/jobs/${jobId}`);
+    if (response.data.status === "succeeded" || response.data.status === "failed") {
+      return response.data;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, LOCAL_AGENT_PREVIEW_POLL_INTERVAL_MS));
+  }
+  throw new Error("Timed out waiting for the local daemon.");
+}
+
+function localMarkdownPreviewFromJob(status: LocalAgentJobStatusResponse): DiscoveryPreviewResponse {
+  const result = status.result as {
+    counts?: { included?: number };
+    items?: Array<{ relative_path?: string; title?: string }>;
+  } | null;
+  const items = result?.items ?? [];
+  return {
+    source_type: "local_markdown",
+    count: Number(result?.counts?.included ?? items.length),
+    truncated: false,
+    items: items.map((item) => {
+      const path = item.relative_path ?? "";
+      return {
+        item_id: path,
+        title: item.title || path,
+        source_url: `local-agent://${path}`,
+        last_modified: null,
+      };
+    }),
+  };
 }
 
 function extractSaveError(error: unknown): string {

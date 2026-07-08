@@ -11,6 +11,7 @@ import logging
 import re
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
@@ -49,6 +50,7 @@ COMMENT_MAX_RESULTS = 100
 HYDRATED_SEARCH_MAX_RESULTS = 25
 JIRA_SEARCH_FIELDS = ["*all"]
 JIRA_SEARCH_EXPAND = ["changelog", "renderedFields"]
+LOCAL_AGENT_JIRA_PACKAGE_KIND = "jira_document"
 
 JIRA_QUERY_MODE_SIMPLE = "simple"
 JIRA_QUERY_MODE_ADVANCED = "advanced"
@@ -159,6 +161,15 @@ def _zero_quota_message(mode: str) -> str:
     )
 
 
+def _parse_local_package_dt(value: str) -> datetime:
+    if not value:
+        return datetime.fromtimestamp(0, timezone.utc)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _issue_payload_from_search(issue: dict, config: dict) -> dict:
     """Build the issue payload used by normalization from the hydrated search result."""
     payload = dict(issue)
@@ -263,6 +274,17 @@ class JiraGene(Gene):
                     group="connection", order=1,
                 ),
                 ConfigField(
+                    key="sync_mode", label="Sync Location",
+                    field_type=ConfigFieldType.SELECT, required=False,
+                    options=["cloud", "local_agent"],
+                    default="cloud",
+                    help_text=(
+                        "Cloud runs Jira sync from the MemForge service. Local agent runs Jira sync "
+                        "from the machine where the daemon is running, useful for VPN-only Jira."
+                    ),
+                    group="connection", order=2,
+                ),
+                ConfigField(
                     key="query_mode", label="Query mode",
                     field_type=ConfigFieldType.SELECT, required=False,
                     options=[JIRA_QUERY_MODE_SIMPLE, JIRA_QUERY_MODE_ADVANCED],
@@ -314,7 +336,7 @@ class JiraGene(Gene):
                     key="pat", label="Personal Access Token",
                     field_type=ConfigFieldType.SECRET, required=False,
                     help_text="Stored encrypted and sent as a bearer token when PAT mode is selected",
-                    group="connection", order=2,
+                    group="connection", order=3,
                 ),
             ],
         )
@@ -333,6 +355,17 @@ class JiraGene(Gene):
         mode = _auth_mode(self.config)
         self._base_url = base_url
         self._auth_mode = mode
+        sync_mode = str(self.config.get("sync_mode") or "cloud").strip().lower()
+        if sync_mode == "local_agent":
+            local_documents_dir = self._local_agent_documents_dir()
+            if local_documents_dir is None:
+                raise ValueError("Jira local-agent sync requires a local package inbox")
+            local_documents_dir.mkdir(parents=True, exist_ok=True)
+            self._client = None
+            self._request_limiter = None
+            self._hydrated_issues = {}
+            logger.info("Jira client using local-agent package inbox: %s", local_documents_dir)
+            return
         client = httpx.AsyncClient(
             base_url=base_url,
             headers=_jira_headers(self.config),
@@ -351,6 +384,14 @@ class JiraGene(Gene):
 
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         """Discover issues via JQL search."""
+        if str(self.config.get("sync_mode") or "cloud").strip().lower() == "local_agent":
+            local_documents_dir = self._local_agent_documents_dir()
+            if local_documents_dir is None:
+                raise ValueError("Jira local-agent sync requires a local package inbox")
+            async for item in self._discover_local_agent_packages(local_documents_dir, since):
+                yield item
+            return
+
         jql = _build_jql(self.config, since)
 
         self._hydrated_issues = {}
@@ -418,6 +459,14 @@ class JiraGene(Gene):
 
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full issue data with comments and links."""
+        package_path = item.extra.get("package_path")
+        if package_path:
+            return RawContent(
+                item=item,
+                body=Path(str(package_path)).read_bytes(),
+                content_type="application/json",
+            )
+
         key = item.extra.get("issue_key", item.item_id.replace("jira-", ""))
         hydrated_issue = getattr(self, "_hydrated_issues", {}).get(key)
         if isinstance(hydrated_issue, dict):
@@ -486,6 +535,20 @@ class JiraGene(Gene):
         from the issue payload.
         """
         data = json.loads(raw.body)
+        if data.get("package_kind") == LOCAL_AGENT_JIRA_PACKAGE_KIND:
+            return NormalizedContent(
+                item=raw.item,
+                markdown_body=str(data.get("markdown") or ""),
+                source_semantics={
+                    "source_kind": "jira",
+                    "base_url": data.get("base_url"),
+                    "issue_key": data.get("issue_key"),
+                    **(data.get("source_semantics") if isinstance(data.get("source_semantics"), dict) else {}),
+                    "raw_hash": data.get("raw_hash"),
+                    "submitted_at": data.get("submitted_at"),
+                    "submitted_by": data.get("submitted_by"),
+                },
+            )
         fields = data.get("fields", {})
         key = raw.item.extra.get("issue_key", "")
 
@@ -599,3 +662,37 @@ class JiraGene(Gene):
             markdown_body=markdown_body,
             source_semantics=source_semantics,
         )
+
+    def _local_agent_documents_dir(self) -> Path | None:
+        configured = str(self.config.get("local_agent_documents_dir") or "").strip()
+        return Path(configured).expanduser() if configured else None
+
+    async def _discover_local_agent_packages(
+        self,
+        documents_dir: Path,
+        since: datetime | None,
+    ) -> AsyncIterator[ContentItem]:
+        for package_path in sorted(documents_dir.rglob("*.json")):
+            try:
+                package = json.loads(package_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                logger.warning("Skipping unreadable Jira local-agent package: %s", package_path)
+                continue
+            if package.get("package_kind") != LOCAL_AGENT_JIRA_PACKAGE_KIND:
+                continue
+            last_modified = _parse_local_package_dt(str(package.get("last_modified") or ""))
+            if since and last_modified <= since:
+                continue
+            issue_key = str(package.get("issue_key") or "").strip()
+            yield ContentItem(
+                item_id=str(package.get("doc_id") or issue_key),
+                title=str(package.get("title") or issue_key),
+                source_url=str(package.get("source_url") or ""),
+                last_modified=last_modified,
+                content_type="text/markdown",
+                space_or_project=str(package.get("space_or_project") or issue_key.split("-", 1)[0]),
+                version=str(package.get("version") or ""),
+                author=package.get("author"),
+                labels=["jira"],
+                extra={"package_path": str(package_path), "issue_key": issue_key},
+            )

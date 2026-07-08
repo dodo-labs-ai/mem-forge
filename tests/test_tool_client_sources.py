@@ -126,10 +126,64 @@ def test_push_github_repo_document_posts_adapter_payload():
     ]
 
 
+def test_push_jira_document_posts_jira_payload_without_file_path_field():
+    client = _RecordingClient({"doc_id": "jira-doc"})
+
+    result = client.push_jira_document(
+        source_id="src-jira",
+        base_url="https://jira.example.test",
+        issue_key="PAY-1",
+        source_url="https://jira.example.test/browse/PAY-1",
+        markdown_body="# PAY-1",
+        title="Payroll task",
+        raw_hash="raw-1",
+        source_semantics={"status": "Open"},
+        submitted_by="codex",
+        submitted_at="2026-07-07T08:00:00Z",
+        process_now=False,
+    )
+
+    assert result["doc_id"] == "jira-doc"
+    assert client.calls == [
+        (
+            "POST",
+            "/api/sources/src-jira/adapter/documents",
+            {
+                "base_url": "https://jira.example.test",
+                "issue_key": "PAY-1",
+                "source_url": "https://jira.example.test/browse/PAY-1",
+                "markdown_body": "# PAY-1",
+                "content_type": "text/markdown",
+                "process_now": False,
+                "title": "Payroll task",
+                "raw_hash": "raw-1",
+                "source_semantics": {"status": "Open"},
+                "submitted_by": "codex",
+                "submitted_at": "2026-07-07T08:00:00Z",
+            },
+        )
+    ]
+
+
+def test_start_source_sync_posts_source_sync_payload():
+    client = _RecordingClient({"ok": True})
+
+    result = client.start_source_sync("src-jira")
+
+    assert result["ok"] is True
+    assert client.calls == [
+        (
+            "POST",
+            "/api/sources/src-jira/sync",
+            {"force_full_sync": False},
+        )
+    ]
+
+
 def test_local_agent_job_methods_use_cloud_local_agent_contract():
     client = _RecordingClient({"jobs": []})
 
-    lease = client.lease_local_agent_jobs(limit=3, lease_seconds=120)
+    lease = client.lease_local_agent_jobs(limit=3, lease_seconds=120, wait_seconds=25)
     complete = client.complete_local_agent_job(
         "laj-1",
         attempt_count=2,
@@ -143,7 +197,7 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
         (
             "POST",
             "/api/cloud/local-agent/jobs/lease",
-            {"limit": 3, "lease_seconds": 120},
+            {"limit": 3, "lease_seconds": 120, "wait_seconds": 25},
         ),
         (
             "POST",
@@ -162,7 +216,7 @@ def test_local_agent_job_lease_default_matches_ui_sync_wait_window():
         (
             "POST",
             "/api/cloud/local-agent/jobs/lease",
-            {"limit": 5, "lease_seconds": 3600},
+            {"limit": 5, "lease_seconds": 3600, "wait_seconds": 0},
         )
     ]
 
