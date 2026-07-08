@@ -19,6 +19,12 @@ assert.match(
   "SourcesPage should describe local_markdown items as 'files'",
 );
 
+assert.doesNotMatch(
+  sourcesPageSource,
+  /const isPushBased = isPushBasedSourceType\(gene\.name\)/,
+  "Add Source configurable cards should not turn local_markdown into a setup-only card",
+);
+
 const sourceConfigDialogSource = readFileSync("src/views/sources/SourceConfigDialog.tsx", "utf8");
 
 assert.match(
