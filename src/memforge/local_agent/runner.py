@@ -140,6 +140,7 @@ class LocalAgentRunner:
     ) -> None:
         iterations = 0
         while True:
+            iteration_failed = False
             try:
                 if int(cloud_job_wait_seconds) <= 0:
                     self.run_once(include_jira=include_jira, only_due=True)
@@ -152,6 +153,7 @@ class LocalAgentRunner:
                         wait_seconds=max(int(cloud_job_wait_seconds), 0),
                     )
             except Exception as exc:
+                iteration_failed = True
                 cloud_results = []
                 if log is not None:
                     log(f"Local agent daemon iteration failed: {exc}")
@@ -167,6 +169,7 @@ class LocalAgentRunner:
             if (
                 int(cloud_job_wait_seconds) <= 0
                 or self.cloud_jobs_provider is None
+                or iteration_failed
                 or _cloud_lease_failed(cloud_results)
             ):
                 sleep(max(int(poll_interval_seconds), 1))

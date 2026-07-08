@@ -2073,7 +2073,9 @@ def _run_cloud_local_markdown_pick_root_job(job: dict[str, Any]) -> dict[str, An
             title=str(payload.get("title") or "Choose folder to sync"),
             initial_directory=str(payload.get("initial_directory") or "").strip() or None,
         )
-    except (FolderPickerCancelled, FolderPickerUnavailable) as exc:
+    except FolderPickerCancelled:
+        return {"operation": operation, "cancelled": True}
+    except FolderPickerUnavailable as exc:
         return {"operation": operation, "error": str(exc)}
     return {"operation": operation, "root": root}
 

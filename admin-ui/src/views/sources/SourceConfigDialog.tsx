@@ -246,7 +246,7 @@ function SourceConfigForm({
         .then((response) => response.data as DiscoveryPreviewResponse);
     },
   });
-  const pickLocalMarkdownRoot = useMutation<string, unknown, void>({
+  const pickLocalMarkdownRoot = useMutation<string | null, unknown, void>({
     mutationFn: async () => {
       const created = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
         source_id: source?.id ?? "",
@@ -261,7 +261,10 @@ function SourceConfigForm({
       if (status.status === "failed") {
         throw new Error(status.last_error || "Local daemon could not open the folder picker.");
       }
-      const result = status.result as { root?: unknown } | null;
+      const result = status.result as { cancelled?: unknown; root?: unknown } | null;
+      if (result?.cancelled === true) {
+        return null;
+      }
       const root = typeof result?.root === "string" ? result.root.trim() : "";
       if (!root) {
         throw new Error("Local daemon did not return a folder path.");
@@ -269,6 +272,7 @@ function SourceConfigForm({
       return root;
     },
     onSuccess: (root) => {
+      if (root === null) return;
       setValidationMessage(null);
       setConfig((current) => ({ ...current, root }));
     },
