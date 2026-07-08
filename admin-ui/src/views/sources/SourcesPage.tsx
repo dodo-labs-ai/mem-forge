@@ -30,6 +30,7 @@ import {
 import { timeAgo } from "@/utils/date";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { SourceConfigDialog } from "./SourceConfigDialog";
+import { LocalAgentDaemonStatus } from "./LocalAgentDaemonStatus";
 import { isManagedSourceId, isManagedSourceType, isPushBasedSourceType, userConfigurableGenes } from "./managedSources";
 import { getSourceActionEndpoint, getSourceMenuStyle, sourceActionLayout } from "./sourceActions";
 import { ProjectGroup } from "./ProjectGroup";
@@ -87,6 +88,13 @@ function localAgentSyncOperation(source: Source): string | null {
   }
   if (source.type === "jira" && String(source.config.sync_mode ?? "cloud") === "local_agent") return "jira_sync";
   return null;
+}
+
+function sourceUsesLocalAgent(source: Source): boolean {
+  if (isInternalGitHubSource(source)) return true;
+  if (source.type === "local_markdown") return true;
+  if (source.type === "jira" && String(source.config.sync_mode ?? "cloud") === "local_agent") return true;
+  return false;
 }
 
 const LOCAL_AGENT_SYNC_POLL_ATTEMPTS = 1_800;
@@ -296,6 +304,7 @@ export function SourcesPage() {
   const totalDocs = sources.reduce((sum, source) => sum + source.doc_count, 0);
   const totalMemories = sources.reduce((sum, source) => sum + (source.memory_count ?? 0), 0);
   const projects = projectsQuery.data ?? [];
+  const hasLocalAgentSource = sources.some(sourceUsesLocalAgent);
 
   // Sources whose project assignment depends on per-document field values
   // need the resolver result to know which groups they appear in. Sources
@@ -374,6 +383,11 @@ export function SourcesPage() {
             {sources.length.toLocaleString()} configured ingestion sources.
           </p>
         </div>
+        {hasLocalAgentSource && (
+          <div className="border-b px-4 py-3">
+            <LocalAgentDaemonStatus />
+          </div>
+        )}
         {authorityMessage && (
           <div
             role="status"
@@ -1025,6 +1039,7 @@ function AddSourceDialog({
 
               <section className="space-y-3">
                 <SectionDivider label="Push from your local device" />
+                <LocalAgentDaemonStatus />
                 <div className="grid gap-3 sm:grid-cols-2">
                   {pushGenes.map(renderConfigurableGene)}
                   {AGENT_SESSION_CARDS.map((card) => (

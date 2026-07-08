@@ -38,6 +38,7 @@ import {
 } from "./confluenceConfig";
 import type { ParsedConfluenceWikiUrl } from "./confluenceConfig";
 import { GitHubRepoFolderPicker } from "./GitHubRepoFolderPicker";
+import { LocalAgentDaemonStatus } from "./LocalAgentDaemonStatus";
 import { canConfigureSourceType } from "./managedSources";
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
@@ -165,6 +166,11 @@ function SourceConfigForm({
   const githubRef = sourceType === "github_repo" ? stringValue(config.ref).trim() || "main" : "";
   const githubPickerConfig = sourceType === "github_repo" ? serializeConfig(schema.fields, config) : {};
   const jiraBaseUrl = stringValue(config.base_url).trim();
+  const jiraSyncMode = sourceType === "jira" ? stringValue(config.sync_mode) || "cloud" : "";
+  const usesLocalAgent =
+    sourceType === "local_markdown"
+    || (sourceType === "github_repo" && githubConnectionMode === "local_push")
+    || (sourceType === "jira" && jiraSyncMode === "local_agent");
   const confluenceUrlInfo = useMemo(
     () => sourceType === "confluence" ? parseConfluenceWikiUrl(stringValue(config.base_url)) : null,
     [config.base_url, sourceType],
@@ -373,6 +379,8 @@ function SourceConfigForm({
             />
           </Field>
         </div>
+
+        {usesLocalAgent && <LocalAgentDaemonStatus />}
 
         <div ref={configFieldsRef} className="min-h-0 flex-1 space-y-5 overflow-y-auto pr-1">
           {fieldsByGroup.map((group) => (
