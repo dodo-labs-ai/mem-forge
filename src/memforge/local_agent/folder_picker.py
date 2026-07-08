@@ -6,6 +6,8 @@ from pathlib import Path
 import platform
 import subprocess
 
+DEFAULT_FOLDER_PICKER_TIMEOUT_SECONDS = 150
+
 
 class FolderPickerCancelled(RuntimeError):
     """Raised when the user dismisses the native folder picker."""
@@ -19,17 +21,19 @@ def pick_folder(
     *,
     title: str | None = None,
     initial_directory: str | None = None,
+    timeout_seconds: float = DEFAULT_FOLDER_PICKER_TIMEOUT_SECONDS,
 ) -> str:
     """Open a native folder picker and return the selected absolute path."""
     if platform.system() != "Darwin":
-        raise FolderPickerUnavailable("folder picker is currently supported on macOS only")
-    return _pick_folder_macos(title=title, initial_directory=initial_directory)
+        raise FolderPickerUnavailable("folder picker is only available on macOS daemons; type the folder path instead")
+    return _pick_folder_macos(title=title, initial_directory=initial_directory, timeout_seconds=timeout_seconds)
 
 
 def _pick_folder_macos(
     *,
     title: str | None,
     initial_directory: str | None,
+    timeout_seconds: float,
 ) -> str:
     prompt = _applescript_string(title or "Choose folder to sync")
     script_lines = []
@@ -50,9 +54,12 @@ def _pick_folder_macos(
             capture_output=True,
             check=False,
             text=True,
+            timeout=timeout_seconds,
         )
     except FileNotFoundError as exc:
         raise FolderPickerUnavailable("osascript is not available on this machine") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise FolderPickerCancelled("folder selection timed out") from exc
 
     if completed.returncode != 0:
         stderr = completed.stderr.strip()

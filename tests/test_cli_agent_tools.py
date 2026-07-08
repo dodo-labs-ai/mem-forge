@@ -6,6 +6,7 @@ import pytest
 from click.testing import CliRunner
 
 import memforge.main as main
+from memforge.local_agent import folder_picker
 from memforge.main import cli
 
 
@@ -1498,6 +1499,32 @@ def test_local_agent_cloud_local_markdown_pick_root_reports_cancellation(monkeyp
         "operation": "local_markdown_pick_root",
         "cancelled": True,
     }
+
+
+def test_native_folder_picker_times_out_as_cancellation(monkeypatch):
+    calls: list[dict] = []
+
+    def fake_system() -> str:
+        return "Darwin"
+
+    def fake_run(args, **kwargs):
+        calls.append({"args": args, **kwargs})
+        raise subprocess.TimeoutExpired(cmd=args, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(folder_picker.platform, "system", fake_system)
+    monkeypatch.setattr(folder_picker.subprocess, "run", fake_run)
+
+    with pytest.raises(folder_picker.FolderPickerCancelled, match="timed out"):
+        folder_picker.pick_folder(timeout_seconds=1.5)
+
+    assert calls[0]["timeout"] == 1.5
+
+
+def test_native_folder_picker_non_macos_error_points_to_manual_path(monkeypatch):
+    monkeypatch.setattr(folder_picker.platform, "system", lambda: "Linux")
+
+    with pytest.raises(folder_picker.FolderPickerUnavailable, match="type the folder path instead"):
+        folder_picker.pick_folder()
 
 
 def test_local_agent_cloud_local_markdown_sync_pushes_workspace_source(monkeypatch, tmp_path: Path):
