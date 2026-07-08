@@ -504,9 +504,7 @@ export function SourcesPage() {
           setTeamsWizardOpen(true);
         }}
         onConfigureSelected={(sourceType) => {
-          if (!isPushBasedSourceType(sourceType)) {
-            setAddOpen(false);
-          }
+          setAddOpen(false);
           setConfigDialog({ sourceType, source: null });
         }}
       />
@@ -936,10 +934,6 @@ function AddSourceDialog({
       description: gene.description,
     };
     const isTeams = gene.name === "teams";
-    // Push-based sources open a setup walkthrough rather than a server-side
-    // form; they share the "View setup" affordance with the agent-session cards
-    // so the dialog reads as a single push group instead of mixed treatments.
-    const isPushBased = isPushBasedSourceType(gene.name);
     return (
       <div key={gene.name} className="rounded-lg border p-4">
         <div className="flex items-start gap-3">
@@ -953,17 +947,9 @@ function AddSourceDialog({
           <Button
             type="button"
             size="sm"
-            variant={isPushBased ? "outline" : "default"}
             onClick={() => onConfigureSelected(gene.name)}
           >
-            {isPushBased ? (
-              <>
-                <Info className="size-3.5" />
-                View setup
-              </>
-            ) : (
-              "Configure"
-            )}
+            Configure
           </Button>
           {isTeams && (
             <Button type="button" size="sm" variant="outline" onClick={onTeamsSelected}>
