@@ -112,6 +112,24 @@ def _create_jira_source(client: TestClient, *, name: str = "Payroll Jira") -> di
     return response.json()
 
 
+def _create_teams_source(client: TestClient, *, name: str = "Teams Channel") -> dict:
+    response = client.post(
+        "/api/sources",
+        json={
+            "type": "teams",
+            "name": name,
+            "config": {
+                "region": "emea",
+                "channels": ["19:channel@example.test"],
+                "conversation_gap_minutes": 60,
+            },
+            "project_binding": {"mode": "fixed", "project_key": "TEAMS"},
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def test_create_local_markdown_source_populates_inbox_path(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
@@ -749,6 +767,51 @@ def test_local_adapter_push_is_idempotent_on_doc_id(tmp_path):
         asyncio.run(database.close())
 
 
+def test_teams_adapter_push_writes_window_package(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            source_id = _create_teams_source(client)["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "conversation_id": "19:channel@example.test",
+                    "window_id": "teams-thread:src:conversation:root",
+                    "revision_hash": "rev-1",
+                    "root_message_id": "root-1",
+                    "window_type": "thread",
+                    "title": "Teams decision",
+                    "source_url": "teams-window://src/conversation/window/rev-1",
+                    "markdown_body": "# Teams decision\n\nUse rootMessageId for channel threads.",
+                    "source_semantics": {"message_count": 2},
+                    "process_now": False,
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["source_id"] == source_id
+        assert body["doc_id"].startswith("teams-")
+        package_path = Path(body["package_path"])
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+        assert package["package_kind"] == "teams_window_document"
+        assert package["content_role"] == "teams_conversation_window"
+        assert package["window_id"] == "teams-thread:src:conversation:root"
+        assert package["revision_hash"] == "rev-1"
+        assert package["conversation_id"] == "19:channel@example.test"
+        assert package["source_semantics"]["message_count"] == 2
+
+        row = asyncio.run(database.get_source(source_id))
+        assert row is not None
+        assert Path(row["config"]["local_agent_documents_dir"]).exists()
+    finally:
+        asyncio.run(database.close())
+
+
 def test_local_adapter_push_rejects_vault_mismatch(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
@@ -795,6 +858,60 @@ def test_local_adapter_push_rejects_path_traversal(tmp_path):
             )
         assert response.status_code == 400
         assert ".." in response.json()["detail"]
+    finally:
+        asyncio.run(database.close())
+
+
+def test_teams_gene_discovers_local_agent_window_packages(tmp_path):
+    from memforge.genes import create_gene
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            source_id = _create_teams_source(client)["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "conversation_id": "19:channel@example.test",
+                    "window_id": "teams-block:src:conversation:anchor",
+                    "revision_hash": "rev-block-1",
+                    "root_message_id": "anchor-1",
+                    "window_type": "block",
+                    "title": "Group: July 8, 10:00-10:45",
+                    "markdown_body": "# Teams Conversation Window\n\nDecision captured.",
+                    "source_semantics": {
+                        "conversation_type": "group_chat",
+                        "message_count": 4,
+                    },
+                    "process_now": False,
+                },
+            )
+            assert response.status_code == 200, response.text
+
+        row = asyncio.run(database.get_source(source_id))
+        gene = create_gene("teams", row["config"], source_id)
+        asyncio.run(gene.authenticate())
+
+        async def _collect_normalized():
+            items = []
+            async for item in gene.discover():
+                items.append(item)
+            raw = await gene.fetch(items[0])
+            normalized = await gene.normalize(raw)
+            return items, normalized
+
+        items, normalized = asyncio.run(_collect_normalized())
+        assert len(items) == 1
+        assert items[0].item_id.startswith("teams-")
+        assert items[0].version == "rev-block-1"
+        assert items[0].extra["window_id"] == "teams-block:src:conversation:anchor"
+        assert normalized.markdown_body == "# Teams Conversation Window\n\nDecision captured."
+        assert normalized.source_semantics["source_kind"] == "teams"
+        assert normalized.source_semantics["window_id"] == "teams-block:src:conversation:anchor"
+        assert normalized.source_semantics["message_count"] == 4
     finally:
         asyncio.run(database.close())
 

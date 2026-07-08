@@ -41,10 +41,13 @@ from memforge.storage.database import Database
 LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
 GITHUB_REPO_SOURCE_TYPE = "github_repo"
 JIRA_SOURCE_TYPE = "jira"
+TEAMS_SOURCE_TYPE = "teams"
 GITHUB_REPO_PACKAGE_KIND = "github_repo_document"
 GITHUB_REPO_CONTENT_ROLE = "repository_file"
 JIRA_PACKAGE_KIND = "jira_document"
 JIRA_CONTENT_ROLE = "jira_issue"
+TEAMS_PACKAGE_KIND = "teams_window_document"
+TEAMS_CONTENT_ROLE = "teams_conversation_window"
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +82,18 @@ def build_jira_doc_id(*, source_id: str, issue_key: str) -> str:
         "jira",
         slugify(source_id)[:30],
         slugify(issue_key)[:30] or "issue",
+        digest,
+    ])
+
+
+def build_teams_doc_id(*, source_id: str, window_id: str) -> str:
+    """Stable doc id for one Teams conversation window pushed by the local daemon."""
+    identity = "|".join([source_id.strip(), window_id.strip()])
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    return "-".join([
+        "teams",
+        slugify(source_id)[:30],
+        slugify(window_id)[:50] or "window",
         digest,
     ])
 
@@ -458,6 +473,110 @@ async def submit_jira_document(
         "doc_id": doc_id,
         "base_url": configured_base_url,
         "issue_key": normalized_issue_key,
+        "document_hash": document_hash,
+        "package_path": str(package_path),
+        "submitted_at": submitted_at,
+    }
+
+
+async def submit_teams_document(
+    *,
+    db: Database,
+    config: AppConfig,
+    source: dict[str, Any],
+    conversation_id: str,
+    window_id: str,
+    revision_hash: str,
+    markdown_body: str,
+    title: str | None = None,
+    root_message_id: str | None = None,
+    window_type: str | None = None,
+    source_url: str | None = None,
+    raw_hash: str | None = None,
+    source_semantics: dict[str, Any] | None = None,
+    submitted_by: str | None = None,
+    submitted_at: str | None = None,
+) -> dict[str, Any]:
+    """Validate, package, and persist one Teams conversation window pushed by the local daemon."""
+    if source.get("type") != TEAMS_SOURCE_TYPE:
+        raise ValueError(f"source {source.get('id')} is type {source.get('type')!r}, not 'teams'")
+
+    normalized_conversation_id = (conversation_id or "").strip()
+    normalized_window_id = (window_id or "").strip()
+    normalized_revision_hash = (revision_hash or "").strip()
+    if not normalized_conversation_id:
+        raise ValueError("conversation_id is required")
+    if not normalized_window_id:
+        raise ValueError("window_id is required")
+    if not normalized_revision_hash:
+        raise ValueError("revision_hash is required")
+    if not markdown_body or not markdown_body.strip():
+        raise ValueError("markdown_body is required")
+
+    submitted_at = submitted_at or _now_iso()
+    source_id = str(source["id"])
+    source_config = dict(source.get("config") or {})
+    inbox = default_local_adapter_inbox(config, source_id)
+    inbox.mkdir(parents=True, exist_ok=True)
+
+    document_hash = content_hash(markdown_body)
+    doc_id = build_teams_doc_id(source_id=source_id, window_id=normalized_window_id)
+    doc_title = (title or "").strip() or _markdown_title(markdown_body, fallback=normalized_window_id)
+    package_path = inbox / f"{doc_id}.json"
+    package_path.parent.mkdir(parents=True, exist_ok=True)
+    semantics = source_semantics if isinstance(source_semantics, dict) else {}
+
+    package = {
+        "package_kind": TEAMS_PACKAGE_KIND,
+        "content_role": TEAMS_CONTENT_ROLE,
+        "doc_id": doc_id,
+        "title": doc_title,
+        "source_url": (source_url or f"teams-window://{source_id}/{doc_id}/{normalized_revision_hash}").strip(),
+        "last_modified": submitted_at,
+        "space_or_project": str(semantics.get("team_name") or semantics.get("chat_title") or source.get("name") or ""),
+        "version": normalized_revision_hash,
+        "conversation_id": normalized_conversation_id,
+        "root_message_id": (root_message_id or "").strip(),
+        "window_id": normalized_window_id,
+        "window_type": (window_type or "").strip(),
+        "revision_hash": normalized_revision_hash,
+        "content_type": "text/markdown",
+        "raw_hash": raw_hash,
+        "source_semantics": semantics,
+        "submitted_at": submitted_at,
+        "submitted_by": submitted_by,
+        "markdown": markdown_body,
+    }
+
+    payload_text = json.dumps(package, indent=2, sort_keys=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(package_path.parent), suffix=".json.tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle.write(payload_text)
+        os.replace(tmp_name, package_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+    refreshed_config = dict(source_config)
+    refreshed_config["local_agent_documents_dir"] = str(inbox)
+    await db.upsert_source(
+        id=source_id,
+        type=TEAMS_SOURCE_TYPE,
+        name=source.get("name") or source_id,
+        config_json=json.dumps(refreshed_config),
+        project_binding=source.get("project_binding"),
+    )
+
+    return {
+        "source_id": source_id,
+        "doc_id": doc_id,
+        "conversation_id": normalized_conversation_id,
+        "window_id": normalized_window_id,
+        "revision_hash": normalized_revision_hash,
         "document_hash": document_hash,
         "package_path": str(package_path),
         "submitted_at": submitted_at,

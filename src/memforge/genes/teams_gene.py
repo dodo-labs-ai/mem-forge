@@ -21,6 +21,7 @@ import logging
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 
@@ -56,6 +57,7 @@ _REGION_URLS = {
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 _MAX_PAGE_SIZE = 200
+LOCAL_AGENT_TEAMS_PACKAGE_KIND = "teams_window_document"
 
 
 # ============================================================================
@@ -667,6 +669,10 @@ class TeamsGene(Gene):
 
     async def authenticate(self) -> None:
         """Authenticate using tokens from Chrome cookies."""
+        local_documents_dir = self._local_agent_documents_dir()
+        if local_documents_dir is not None:
+            local_documents_dir.mkdir(parents=True, exist_ok=True)
+            return
         region = self.config.get("region", "emea")
         self._client = _TeamsAPIClient(region=region)
         await self._client.validate()
@@ -674,6 +680,12 @@ class TeamsGene(Gene):
 
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         """Discover threads and conversation blocks from configured sources."""
+        local_documents_dir = self._local_agent_documents_dir()
+        if local_documents_dir is not None:
+            async for item in self._discover_local_agent_packages(local_documents_dir, since):
+                yield item
+            return
+
         self._message_cache.clear()  # fresh cache per sync run
         conversations = await self._client.list_conversations()
         conv_lookup = {c["id"]: c for c in conversations}
@@ -739,6 +751,14 @@ class TeamsGene(Gene):
 
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full thread/block content."""
+        if item.extra.get("package_path"):
+            package_path = Path(item.extra["package_path"])
+            return RawContent(
+                item=item,
+                body=package_path.read_bytes(),
+                content_type="application/json",
+            )
+
         conv_id = item.extra["conversation_id"]
         root_msg_id = item.extra["root_message_id"]
         conv_type = item.extra["conversation_type"]
@@ -799,6 +819,25 @@ class TeamsGene(Gene):
     async def normalize(self, raw: RawContent) -> NormalizedContent:
         """Convert Teams thread/block JSON to comprehensive markdown."""
         data = json.loads(raw.body.decode("utf-8"))
+        if data.get("package_kind") == LOCAL_AGENT_TEAMS_PACKAGE_KIND:
+            source_semantics = data.get("source_semantics") if isinstance(data.get("source_semantics"), dict) else {}
+            return NormalizedContent(
+                item=raw.item,
+                markdown_body=str(data.get("markdown") or ""),
+                source_semantics={
+                    "source_kind": "teams",
+                    "conversation_id": data.get("conversation_id"),
+                    "root_message_id": data.get("root_message_id"),
+                    "window_id": data.get("window_id"),
+                    "window_type": data.get("window_type"),
+                    "revision_hash": data.get("revision_hash"),
+                    **source_semantics,
+                    "raw_hash": data.get("raw_hash"),
+                    "submitted_at": data.get("submitted_at"),
+                    "submitted_by": data.get("submitted_by"),
+                },
+            )
+
         messages = data.get("messages", [])
         participants = data.get("participants", [])
         conv_type = data.get("conversation_type", "")
@@ -1041,6 +1080,47 @@ class TeamsGene(Gene):
                 break
 
         return all_messages
+
+    def _local_agent_documents_dir(self) -> Path | None:
+        configured = str(self.config.get("local_agent_documents_dir") or "").strip()
+        return Path(configured).expanduser() if configured else None
+
+    async def _discover_local_agent_packages(
+        self,
+        documents_dir: Path,
+        since: datetime | None,
+    ) -> AsyncIterator[ContentItem]:
+        for package_path in sorted(documents_dir.rglob("*.json")):
+            try:
+                package = json.loads(package_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                logger.warning("Skipping unreadable Teams local-agent package: %s", package_path)
+                continue
+            if package.get("package_kind") != LOCAL_AGENT_TEAMS_PACKAGE_KIND:
+                continue
+            last_modified = _TeamsAPIClient._parse_timestamp(str(package.get("last_modified") or ""))
+            if since and last_modified <= since:
+                continue
+            window_id = str(package.get("window_id") or package.get("doc_id") or "")
+            yield ContentItem(
+                item_id=str(package.get("doc_id") or window_id),
+                title=str(package.get("title") or window_id),
+                source_url=str(package.get("source_url") or ""),
+                last_modified=last_modified,
+                content_type="text/markdown",
+                space_or_project=str(package.get("space_or_project") or ""),
+                version=str(package.get("revision_hash") or package.get("version") or ""),
+                author=package.get("submitted_by"),
+                labels=["teams", str(package.get("window_type") or "")],
+                extra={
+                    "package_path": str(package_path),
+                    "conversation_id": package.get("conversation_id"),
+                    "root_message_id": package.get("root_message_id"),
+                    "window_id": window_id,
+                    "window_type": package.get("window_type"),
+                    "revision_hash": package.get("revision_hash"),
+                },
+            )
 
     def _make_content_item(
         self,

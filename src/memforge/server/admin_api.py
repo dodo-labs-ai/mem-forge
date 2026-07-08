@@ -864,6 +864,11 @@ class LocalAdapterDocumentRequest(BaseModel):
     repo_ref: str | None = None
     blob_sha: str | None = None
     issue_key: str | None = None
+    conversation_id: str | None = None
+    root_message_id: str | None = None
+    window_id: str | None = None
+    window_type: str | None = None
+    revision_hash: str | None = None
     source_url: str | None = None
     source_semantics: dict[str, Any] = Field(default_factory=dict)
     title: str | None = None
@@ -4051,16 +4056,18 @@ def create_admin_app(
             GITHUB_REPO_SOURCE_TYPE,
             JIRA_SOURCE_TYPE,
             LOCAL_MARKDOWN_SOURCE_TYPE,
+            TEAMS_SOURCE_TYPE,
             submit_github_repo_document,
             submit_jira_document,
             submit_local_markdown_document,
+            submit_teams_document,
         )
 
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         source_type = source.get("type")
-        if source_type not in {LOCAL_MARKDOWN_SOURCE_TYPE, GITHUB_REPO_SOURCE_TYPE, JIRA_SOURCE_TYPE}:
+        if source_type not in {LOCAL_MARKDOWN_SOURCE_TYPE, GITHUB_REPO_SOURCE_TYPE, JIRA_SOURCE_TYPE, TEAMS_SOURCE_TYPE}:
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -4098,6 +4105,24 @@ def create_admin_app(
                     source_url=req.source_url or "",
                     markdown_body=req.markdown_body,
                     title=req.title,
+                    raw_hash=req.raw_hash,
+                    source_semantics=req.source_semantics,
+                    submitted_by=req.submitted_by,
+                    submitted_at=req.submitted_at,
+                )
+            elif source_type == TEAMS_SOURCE_TYPE:
+                result = await submit_teams_document(
+                    db=db,
+                    config=config,
+                    source=source,
+                    conversation_id=req.conversation_id or "",
+                    window_id=req.window_id or "",
+                    revision_hash=req.revision_hash or "",
+                    markdown_body=req.markdown_body,
+                    title=req.title,
+                    root_message_id=req.root_message_id,
+                    window_type=req.window_type,
+                    source_url=req.source_url,
                     raw_hash=req.raw_hash,
                     source_semantics=req.source_semantics,
                     submitted_by=req.submitted_by,

@@ -303,6 +303,58 @@ class ToolClient:
             body,
         )
 
+    def push_teams_document(
+        self,
+        *,
+        source_id: str,
+        conversation_id: str,
+        window_id: str,
+        revision_hash: str,
+        markdown_body: str,
+        title: str | None = None,
+        root_message_id: str | None = None,
+        window_type: str | None = None,
+        source_url: str | None = None,
+        raw_hash: str | None = None,
+        source_semantics: dict[str, Any] | None = None,
+        submitted_by: str | None = None,
+        submitted_at: str | None = None,
+        process_now: bool = False,
+    ) -> dict[str, Any]:
+        """Push one locally projected Teams conversation window into a configured Teams source."""
+        source_id = source_id.strip()
+        if not source_id:
+            return {"error": "source_id is required"}
+        body: dict[str, Any] = {
+            "conversation_id": conversation_id,
+            "window_id": window_id,
+            "revision_hash": revision_hash,
+            "markdown_body": markdown_body,
+            "content_type": "text/markdown",
+            "process_now": process_now,
+        }
+        if title is not None:
+            body["title"] = title
+        if root_message_id is not None:
+            body["root_message_id"] = root_message_id
+        if window_type is not None:
+            body["window_type"] = window_type
+        if source_url is not None:
+            body["source_url"] = source_url
+        if raw_hash is not None:
+            body["raw_hash"] = raw_hash
+        if source_semantics is not None:
+            body["source_semantics"] = source_semantics
+        if submitted_by is not None:
+            body["submitted_by"] = submitted_by
+        if submitted_at is not None:
+            body["submitted_at"] = submitted_at
+        return self._http_json(
+            "POST",
+            f"/api/sources/{quote(source_id, safe='')}/adapter/documents",
+            body,
+        )
+
     def list_sources(self) -> dict[str, Any]:
         """List configured sources. Returns the API ``{"data": [...]}`` envelope."""
         return self._http_json("GET", "/api/sources", None)
