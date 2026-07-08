@@ -2611,8 +2611,14 @@ def _teams_window_id(
     root_message_id: str,
     window_type: str,
 ) -> str:
-    prefix = "teams-thread" if window_type == "thread" else "teams-block"
-    return f"{prefix}:{source_id}:{conversation_id}:{root_message_id}"
+    from memforge.local_agent.teams_ledger import build_teams_window_id
+
+    return build_teams_window_id(
+        source_id=source_id,
+        conversation_id=conversation_id,
+        root_or_anchor_message_id=root_message_id,
+        window_type=window_type,
+    )
 
 
 def _cloud_job_limit(value: Any, *, default: int) -> int:

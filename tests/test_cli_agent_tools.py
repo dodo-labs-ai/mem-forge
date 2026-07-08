@@ -1891,6 +1891,7 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
 def test_collect_teams_documents_from_cloud_job_uses_gene_window_shape(monkeypatch):
     from datetime import datetime, timezone
 
+    from memforge.local_agent.teams_ledger import decode_teams_window_id
     from memforge.models import ContentItem, NormalizedContent, RawContent
 
     closed = {"value": False}
@@ -1966,7 +1967,14 @@ def test_collect_teams_documents_from_cloud_job_uses_gene_window_shape(monkeypat
     doc = documents[0]
     assert doc["conversation_id"] == "19:conversation@thread.tacv2"
     assert doc["root_message_id"] == "1783500000000"
-    assert doc["window_id"] == "teams-block:src-teams:19:conversation@thread.tacv2:1783500000000"
+    assert doc["window_id"].startswith("teams-block:v1:")
+    assert "19:conversation@thread.tacv2" not in doc["window_id"]
+    assert decode_teams_window_id(doc["window_id"]) == {
+        "source_id": "src-teams",
+        "conversation_id": "19:conversation@thread.tacv2",
+        "root_or_anchor_message_id": "1783500000000",
+        "window_type": "time_block",
+    }
     assert doc["window_type"] == "time_block"
     assert doc["source_semantics"]["message_count"] == 3
     assert doc["source_semantics"]["window_type"] == "time_block"
