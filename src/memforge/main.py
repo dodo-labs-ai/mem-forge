@@ -2119,7 +2119,9 @@ def _run_cloud_local_agent_job(
         "local_markdown_preview_tree": lambda: _run_cloud_local_markdown_preview_job(job),
         "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(job, client),
         "jira_sync": lambda: _run_cloud_jira_sync_job(job, client, browser=browser),
+        "teams_auth_check": lambda: _run_cloud_teams_auth_check_job(job),
         "teams_auth": lambda: _run_cloud_teams_auth_job(job),
+        "teams_browse": lambda: _run_cloud_teams_browse_job(job),
         "teams_sync": lambda: _run_cloud_teams_sync_job(job, client),
     }
     handler = handlers.get(operation)
@@ -2233,15 +2235,14 @@ def _run_cloud_jira_sync_job(
     should_process = bool(payload.get("process_now", True))
     sync_result: dict[str, Any] | None = None
     for doc in documents:
-        response = scoped_client.push_jira_document(
+        response = scoped_client.push_jira_package(
             source_id=source_id,
             base_url=str(doc["base_url"]),
             issue_key=str(doc["issue_key"]),
             source_url=str(doc["source_url"]),
-            markdown_body=str(doc["markdown_body"]),
+            raw_payload=doc.get("raw_payload") if isinstance(doc.get("raw_payload"), dict) else {},
             title=str(doc["title"]),
             raw_hash=str(doc["raw_hash"]),
-            source_semantics=doc.get("source_semantics") if isinstance(doc.get("source_semantics"), dict) else {},
             submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
             process_now=False,
         )
@@ -2276,15 +2277,13 @@ def _run_cloud_jira_sync_job(
 
 
 def _run_cloud_teams_auth_job(job: dict[str, Any]) -> dict[str, Any]:
-    from memforge.auth.teams_auth import TeamsAuthenticator
+    from memforge.auth import teams_auth
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    region = str(payload.get("region") or "emea").strip().lower()
-    if region not in {"emea", "amer", "apac"}:
-        region = "emea"
+    region = _teams_region_from_payload(payload)
     try:
-        token_data = TeamsAuthenticator().authenticate(region=region)
+        token_data = teams_auth.TeamsAuthenticator().authenticate(region=region)
     except RuntimeError:
         return {
             "operation": operation,
@@ -2308,6 +2307,36 @@ def _run_cloud_teams_auth_job(job: dict[str, Any]) -> dict[str, Any]:
         "region": region,
         "token_count": len(tokens) if isinstance(tokens, dict) else 0,
     }
+
+
+def _run_cloud_teams_auth_check_job(job: dict[str, Any]) -> dict[str, Any]:
+    from memforge.local_agent.teams_browse import teams_auth_status
+
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    return {
+        "operation": operation,
+        "region": _teams_region_from_payload(payload),
+        **teams_auth_status(),
+    }
+
+
+def _run_cloud_teams_browse_job(job: dict[str, Any]) -> dict[str, Any]:
+    from memforge.local_agent.teams_browse import browse_teams_conversations
+
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    region = _teams_region_from_payload(payload)
+    try:
+        data = asyncio.run(browse_teams_conversations(region=region))
+    except Exception as exc:
+        return {"operation": operation, "region": region, "error": str(exc), "error_type": type(exc).__name__}
+    return {"operation": operation, "region": region, **data}
+
+
+def _teams_region_from_payload(payload: dict[str, Any]) -> str:
+    region = str(payload.get("region") or "emea").strip().lower()
+    return region if region in {"emea", "amer", "apac"} else "emea"
 
 
 def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:
@@ -2374,7 +2403,7 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
                     "revision_hash": revision_hash,
                     "receipt_status": "existing",
                     "receipt_skip_reason": "receipt_exists",
-                    "message_count": (doc.get("source_semantics") or {}).get("message_count"),
+                    "message_count": doc.get("message_count"),
                 },
             )
             continue
@@ -2390,21 +2419,20 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
                 "window_type": doc.get("window_type"),
                 "revision_hash": revision_hash,
                 "receipt_status": "new",
-                "message_count": (doc.get("source_semantics") or {}).get("message_count"),
+                "message_count": doc.get("message_count"),
             },
         )
-        response = scoped_client.push_teams_document(
+        response = scoped_client.push_teams_window_package(
             source_id=source_id,
             conversation_id=str(doc["conversation_id"]),
             root_message_id=str(doc.get("root_message_id") or ""),
             window_id=window_id,
             window_type=str(doc.get("window_type") or ""),
             revision_hash=revision_hash,
-            markdown_body=str(doc["markdown_body"]),
+            raw_payload=doc.get("raw_payload") if isinstance(doc.get("raw_payload"), dict) else {},
             title=str(doc["title"]),
             source_url=str(doc.get("source_url") or ""),
             raw_hash=str(doc["raw_hash"]),
-            source_semantics=doc.get("source_semantics") if isinstance(doc.get("source_semantics"), dict) else {},
             submitted_by=submitted_by,
             process_now=False,
         )
@@ -2612,19 +2640,17 @@ async def _collect_jira_documents_from_cloud_job(
             if limit and len(documents) >= limit:
                 break
             raw = await gene.fetch(item)
-            normalized = await gene.normalize(raw)
             issue_key = str(item.extra.get("issue_key") or item.item_id.replace("jira-", "")).strip()
-            markdown = normalized.markdown_body
-            raw_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+            raw_payload = json.loads(raw.body.decode("utf-8"))
+            raw_hash = hashlib.sha256(raw.body).hexdigest()
             documents.append(
                 {
                     "base_url": base_url,
                     "issue_key": issue_key,
                     "source_url": item.source_url,
                     "title": item.title,
-                    "markdown_body": markdown,
+                    "raw_payload": raw_payload,
                     "raw_hash": raw_hash,
-                    "source_semantics": normalized.source_semantics,
                 }
             )
     finally:
@@ -2656,9 +2682,8 @@ async def _collect_teams_documents_from_cloud_job(
             if limit and len(documents) >= limit:
                 break
             raw = await gene.fetch(item)
-            normalized = await gene.normalize(raw)
-            markdown = normalized.markdown_body
-            raw_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+            raw_payload = json.loads(raw.body.decode("utf-8"))
+            raw_hash = hashlib.sha256(raw.body).hexdigest()
             conversation_id = str(item.extra.get("conversation_id") or "")
             root_message_id = str(item.extra.get("root_message_id") or item.item_id)
             window_type = "thread" if item.extra.get("is_thread") else "time_block"
@@ -2671,8 +2696,8 @@ async def _collect_teams_documents_from_cloud_job(
             revision_hash = str(item.version or hashlib.sha256(
                 f"{window_id}\n{raw_hash}".encode("utf-8")
             ).hexdigest())
-            source_semantics = normalized.source_semantics if isinstance(normalized.source_semantics, dict) else {}
-            message_count = item.extra.get("message_count") or source_semantics.get("message_count")
+            messages = raw_payload.get("messages") if isinstance(raw_payload, dict) else []
+            message_count = item.extra.get("message_count") or (len(messages) if isinstance(messages, list) else None)
             documents.append(
                 {
                     "conversation_id": conversation_id,
@@ -2683,13 +2708,9 @@ async def _collect_teams_documents_from_cloud_job(
                     "title": item.title,
                     "source_url": item.source_url,
                     "last_modified": item.last_modified.isoformat(),
-                    "markdown_body": markdown,
+                    "raw_payload": raw_payload,
                     "raw_hash": raw_hash,
-                    "source_semantics": {
-                        **source_semantics,
-                        "window_type": window_type,
-                        "message_count": message_count,
-                    },
+                    "message_count": message_count,
                 }
             )
             poll_inputs.append({

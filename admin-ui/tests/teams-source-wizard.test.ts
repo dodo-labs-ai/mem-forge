@@ -79,8 +79,23 @@ assert.match(
 );
 assert.match(
   teamsWizardSource,
-  /operation:\s*"teams_auth"/,
+  /runTeamsLocalAgentJob\("teams_auth"/,
   "Teams auth should be triggered through the local daemon instead of CLI instructions",
+);
+assert.match(
+  teamsWizardSource,
+  /runTeamsLocalAgentJob\("teams_auth_check"/,
+  "Teams auth check should be triggered through the local daemon",
+);
+assert.match(
+  teamsWizardSource,
+  /runTeamsLocalAgentJob\("teams_browse"/,
+  "Teams browse should be triggered through the local daemon",
+);
+assert.doesNotMatch(
+  teamsWizardSource,
+  /\/api\/genes\/teams\/(?:auth-check|browse)/,
+  "Teams wizard should not call direct server-side Teams auth or browse endpoints",
 );
 assert.match(
   teamsWizardSource,

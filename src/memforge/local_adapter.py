@@ -1,13 +1,13 @@
-"""Service-side intake for the local CLI adapter push flow.
+"""Service-side intake for local daemon/adapter source packages.
 
-The local CLI adapter (``memforge adapter kb push``) sends one normalized
-markdown document at a time. The service owns the inbox directory and the
-package layout; the CLI never touches MemForge storage directly.
+Local clients send raw file text or structured source payloads. The service owns
+the inbox directory and package layout; local clients never touch MemForge
+storage directly and never own canonical document normalization.
 
 A configured ``local_markdown`` source has a stable per-source inbox under
 ``{docs_path}/../local-adapter-submissions/{source_id}/``. Each push writes one
 JSON package, then the source's sync pipeline picks it up via
-``LocalMarkdownGene.discover``.
+the corresponding source gene.
 """
 
 from __future__ import annotations
@@ -126,6 +126,42 @@ def _markdown_title(markdown_body: str, fallback: str) -> str:
             extracted = stripped[2:].strip()
             if extracted:
                 return extracted
+    return fallback
+
+
+def _canonical_json_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _hash_json(payload: Any) -> str:
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def _jira_title_from_payload(payload: dict[str, Any], fallback: str) -> str:
+    fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+    summary = str(fields.get("summary") or "").strip()
+    key = str(payload.get("key") or fallback).strip()
+    return summary or key or fallback
+
+
+def _teams_title_from_payload(payload: dict[str, Any], fallback: str) -> str:
+    title = str(payload.get("title") or "").strip()
+    if title:
+        return title
+    channel = str(payload.get("channel_name") or "").strip()
+    team = str(payload.get("team_name") or "").strip()
+    if channel:
+        return f"{team} / {channel}" if team else channel
+    conversation_type = str(payload.get("conversation_type") or "").strip()
+    if conversation_type == "group_chat":
+        return str(payload.get("team_name") or "Group chat").strip()
+    if conversation_type == "individual_chat":
+        participants = payload.get("participants")
+        if isinstance(participants, list):
+            names = ", ".join(str(name) for name in participants if str(name).strip())
+            if names:
+                return names
+        return "Direct message"
     return fallback
 
 
@@ -380,28 +416,29 @@ async def submit_github_repo_document(
     }
 
 
-async def submit_jira_document(
+async def submit_jira_package(
     *,
     db: Database,
     config: AppConfig,
     source: dict[str, Any],
     base_url: str,
     issue_key: str,
-    source_url: str,
-    markdown_body: str,
+    raw_payload: dict[str, Any],
+    source_url: str | None = None,
     title: str | None = None,
     raw_hash: str | None = None,
-    source_semantics: dict[str, Any] | None = None,
     submitted_by: str | None = None,
     submitted_at: str | None = None,
 ) -> dict[str, Any]:
-    """Validate, package, and persist one Jira issue pushed by the local daemon."""
+    """Validate, package, and persist one raw Jira issue captured by the local daemon."""
     if source.get("type") != JIRA_SOURCE_TYPE:
         raise ValueError(f"source {source.get('id')} is type {source.get('type')!r}, not 'jira'")
 
     source_config = dict(source.get("config") or {})
     if str(source_config.get("sync_mode") or "cloud").strip().lower() != "local_agent":
         raise ValueError("Jira local adapter pushes require sync_mode=local_agent")
+    if not isinstance(raw_payload, dict) or not raw_payload:
+        raise ValueError("raw_payload is required")
     configured_base_url = str(source_config.get("base_url") or "").strip().rstrip("/")
     if not configured_base_url:
         raise ValueError("source has no configured base_url")
@@ -410,18 +447,16 @@ async def submit_jira_document(
         raise ValueError(
             f"base_url {actual_base_url!r} does not match the source's configured base_url {configured_base_url!r}"
         )
-    if not markdown_body or not markdown_body.strip():
-        raise ValueError("markdown_body is required")
 
-    normalized_issue_key = _normalize_issue_key(issue_key)
+    normalized_issue_key = _normalize_issue_key(issue_key or str(raw_payload.get("key") or ""))
     submitted_at = submitted_at or _now_iso()
     source_id = str(source["id"])
     inbox = default_local_adapter_inbox(config, source_id)
     inbox.mkdir(parents=True, exist_ok=True)
 
-    document_hash = content_hash(markdown_body)
+    payload_hash = raw_hash or _hash_json(raw_payload)
     doc_id = build_jira_doc_id(source_id=source_id, issue_key=normalized_issue_key)
-    doc_title = (title or "").strip() or normalized_issue_key
+    doc_title = (title or "").strip() or _jira_title_from_payload(raw_payload, normalized_issue_key)
     issue_url = (source_url or f"{configured_base_url}/browse/{normalized_issue_key}").strip()
     package_path = inbox / f"{doc_id}.json"
     package_path.parent.mkdir(parents=True, exist_ok=True)
@@ -434,15 +469,14 @@ async def submit_jira_document(
         "source_url": issue_url,
         "last_modified": submitted_at,
         "space_or_project": normalized_issue_key.split("-", 1)[0],
-        "version": raw_hash or document_hash,
+        "version": payload_hash,
         "base_url": configured_base_url,
         "issue_key": normalized_issue_key,
-        "content_type": "text/markdown",
-        "raw_hash": raw_hash,
-        "source_semantics": source_semantics or {},
+        "content_type": "application/json",
+        "raw_hash": payload_hash,
         "submitted_at": submitted_at,
         "submitted_by": submitted_by,
-        "markdown": markdown_body,
+        "raw_payload": raw_payload,
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
@@ -473,13 +507,13 @@ async def submit_jira_document(
         "doc_id": doc_id,
         "base_url": configured_base_url,
         "issue_key": normalized_issue_key,
-        "document_hash": document_hash,
+        "document_hash": payload_hash,
         "package_path": str(package_path),
         "submitted_at": submitted_at,
     }
 
 
-async def submit_teams_document(
+async def submit_teams_window_package(
     *,
     db: Database,
     config: AppConfig,
@@ -487,19 +521,20 @@ async def submit_teams_document(
     conversation_id: str,
     window_id: str,
     revision_hash: str,
-    markdown_body: str,
+    raw_payload: dict[str, Any],
     title: str | None = None,
     root_message_id: str | None = None,
     window_type: str | None = None,
     source_url: str | None = None,
     raw_hash: str | None = None,
-    source_semantics: dict[str, Any] | None = None,
     submitted_by: str | None = None,
     submitted_at: str | None = None,
 ) -> dict[str, Any]:
-    """Validate, package, and persist one Teams conversation window pushed by the local daemon."""
+    """Validate, package, and persist one raw Teams window captured by the local daemon."""
     if source.get("type") != TEAMS_SOURCE_TYPE:
         raise ValueError(f"source {source.get('id')} is type {source.get('type')!r}, not 'teams'")
+    if not isinstance(raw_payload, dict) or not raw_payload:
+        raise ValueError("raw_payload is required")
 
     normalized_conversation_id = (conversation_id or "").strip()
     normalized_window_id = (window_id or "").strip()
@@ -510,8 +545,6 @@ async def submit_teams_document(
         raise ValueError("window_id is required")
     if not normalized_revision_hash:
         raise ValueError("revision_hash is required")
-    if not markdown_body or not markdown_body.strip():
-        raise ValueError("markdown_body is required")
 
     submitted_at = submitted_at or _now_iso()
     source_id = str(source["id"])
@@ -519,12 +552,11 @@ async def submit_teams_document(
     inbox = default_local_adapter_inbox(config, source_id)
     inbox.mkdir(parents=True, exist_ok=True)
 
-    document_hash = content_hash(markdown_body)
+    payload_hash = raw_hash or _hash_json(raw_payload)
     doc_id = build_teams_doc_id(source_id=source_id, window_id=normalized_window_id)
-    doc_title = (title or "").strip() or _markdown_title(markdown_body, fallback=normalized_window_id)
+    doc_title = (title or "").strip() or _teams_title_from_payload(raw_payload, normalized_window_id)
     package_path = inbox / f"{doc_id}.json"
     package_path.parent.mkdir(parents=True, exist_ok=True)
-    semantics = source_semantics if isinstance(source_semantics, dict) else {}
 
     package = {
         "package_kind": TEAMS_PACKAGE_KIND,
@@ -533,19 +565,20 @@ async def submit_teams_document(
         "title": doc_title,
         "source_url": (source_url or f"teams-window://{source_id}/{doc_id}/{normalized_revision_hash}").strip(),
         "last_modified": submitted_at,
-        "space_or_project": str(semantics.get("team_name") or semantics.get("chat_title") or source.get("name") or ""),
+        "space_or_project": str(
+            raw_payload.get("team_name") or raw_payload.get("channel_name") or raw_payload.get("title") or source.get("name") or ""
+        ),
         "version": normalized_revision_hash,
         "conversation_id": normalized_conversation_id,
         "root_message_id": (root_message_id or "").strip(),
         "window_id": normalized_window_id,
         "window_type": (window_type or "").strip(),
         "revision_hash": normalized_revision_hash,
-        "content_type": "text/markdown",
-        "raw_hash": raw_hash,
-        "source_semantics": semantics,
+        "content_type": "application/json",
+        "raw_hash": payload_hash,
         "submitted_at": submitted_at,
         "submitted_by": submitted_by,
-        "markdown": markdown_body,
+        "raw_payload": raw_payload,
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
@@ -577,7 +610,7 @@ async def submit_teams_document(
         "conversation_id": normalized_conversation_id,
         "window_id": normalized_window_id,
         "revision_hash": normalized_revision_hash,
-        "document_hash": document_hash,
+        "document_hash": payload_hash,
         "package_path": str(package_path),
         "submitted_at": submitted_at,
     }

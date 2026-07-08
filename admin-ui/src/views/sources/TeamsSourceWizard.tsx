@@ -114,20 +114,16 @@ function TeamsSourceWizardBody({
 
 function AuthCheckStep({ region, onAuthenticated }: { region: string; onAuthenticated: () => void }) {
   const [message, setMessage] = useState<string | null>(null);
+  const queryClient = useQueryClient();
   const { data, isLoading, isFetching, refetch } = useQuery<TeamsAuthStatus>({
-    queryKey: ["teams-auth-check"],
-    queryFn: () => client.get("/api/genes/teams/auth-check").then((response) => response.data),
+    queryKey: ["teams-auth-check", region],
+    queryFn: () => runTeamsAuthCheck(region),
     retry: false,
   });
   const connectMutation = useMutation({
     mutationFn: async () => {
       setMessage(null);
-      const created = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
-        source_type: "teams",
-        operation: "teams_auth",
-        payload: { region },
-      });
-      const status = await pollTeamsAuthJob(created.data.job_id);
+      const status = await runTeamsLocalAgentJob("teams_auth", { region });
       if (status.status === "failed") {
         throw new Error(teamsAuthJobMessage(status));
       }
@@ -135,8 +131,8 @@ function AuthCheckStep({ region, onAuthenticated }: { region: string; onAuthenti
     },
     onSuccess: async () => {
       setMessage("Connected. Loading conversations...");
-      const result = await refetch();
-      if (result.data?.authenticated) onAuthenticated();
+      await queryClient.invalidateQueries({ queryKey: ["teams-auth-check", region] });
+      onAuthenticated();
     },
     onError: (error) => {
       setMessage(error instanceof Error ? error.message : "Could not connect Teams.");
@@ -193,7 +189,21 @@ function AuthCheckStep({ region, onAuthenticated }: { region: string; onAuthenti
   );
 }
 
-async function pollTeamsAuthJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
+async function runTeamsAuthCheck(region: string): Promise<TeamsAuthStatus> {
+  const status = await runTeamsLocalAgentJob("teams_auth_check", { region });
+  return teamsAuthStatusFromJob(status);
+}
+
+async function runTeamsLocalAgentJob(operation: string, payload: Record<string, unknown>): Promise<LocalAgentJobStatusResponse> {
+  const created = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
+    source_type: "teams",
+    operation,
+    payload,
+  });
+  return pollTeamsLocalAgentJob(created.data.job_id);
+}
+
+async function pollTeamsLocalAgentJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
   for (let attempt = 0; attempt < TEAMS_AUTH_POLL_ATTEMPTS; attempt += 1) {
     const response = await client.get<LocalAgentJobStatusResponse>(`/api/cloud/local-agent/jobs/${jobId}`);
     if (response.data.status === "succeeded" || response.data.status === "failed") {
@@ -202,6 +212,15 @@ async function pollTeamsAuthJob(jobId: string): Promise<LocalAgentJobStatusRespo
     await new Promise((resolve) => window.setTimeout(resolve, TEAMS_AUTH_POLL_INTERVAL_MS));
   }
   throw new Error("Timed out waiting for the local daemon.");
+}
+
+function teamsAuthStatusFromJob(status: LocalAgentJobStatusResponse): TeamsAuthStatus {
+  const result = status.result as Partial<TeamsAuthStatus> | null;
+  return {
+    authenticated: result?.authenticated === true,
+    expires_in_minutes: typeof result?.expires_in_minutes === "number" ? result.expires_in_minutes : null,
+    error: typeof result?.error === "string" ? result.error : status.last_error ?? null,
+  };
 }
 
 function teamsAuthJobMessage(status: LocalAgentJobStatusResponse): string {
@@ -240,9 +259,8 @@ function BrowseSelectStep({
   const [search, setSearch] = useState("");
   const { data, isLoading, isError, refetch } = useQuery<TeamsBrowseData>({
     queryKey: ["teams-browse", region],
-    queryFn: () =>
-      client.get("/api/genes/teams/browse", { params: { region } }).then((response) => response.data),
-    retry: 1,
+    queryFn: () => runTeamsBrowse(region),
+    retry: false,
     staleTime: 60_000,
   });
 
@@ -445,6 +463,24 @@ function ConfirmStep({
       </DialogFooter>
     </>
   );
+}
+
+async function runTeamsBrowse(region: string): Promise<TeamsBrowseData> {
+  const status = await runTeamsLocalAgentJob("teams_browse", { region });
+  if (status.status === "failed") {
+    throw new Error(teamsAuthJobMessage(status));
+  }
+  return teamsBrowseDataFromJob(status);
+}
+
+function teamsBrowseDataFromJob(status: LocalAgentJobStatusResponse): TeamsBrowseData {
+  const result = status.result as Partial<TeamsBrowseData> | null;
+  return {
+    favorites: Array.isArray(result?.favorites) ? result.favorites : [],
+    teams: Array.isArray(result?.teams) ? result.teams : [],
+    group_chats: Array.isArray(result?.group_chats) ? result.group_chats : [],
+    individual_chats: Array.isArray(result?.individual_chats) ? result.individual_chats : [],
+  };
 }
 
 function flattenTeamsData(data: TeamsBrowseData | undefined): TeamsSelectionItem[] {

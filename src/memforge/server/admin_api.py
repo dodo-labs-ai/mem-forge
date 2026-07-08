@@ -6,7 +6,6 @@ sources/genes, schedule, LLM configuration, and system health/stats.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import asdict, is_dataclass
 import json
 import logging
@@ -618,39 +617,6 @@ class GitHubRepoTreeResponse(BaseModel):
     items: list[GitHubRepoTreeItemResponse]
 
 
-# -- Teams browse --
-
-
-class TeamsAuthCheckResponse(BaseModel):
-    authenticated: bool
-    expires_in_minutes: int | None = None
-    error: str | None = None
-
-
-class TeamsChannelResponse(BaseModel):
-    id: str
-    displayName: str
-
-
-class TeamsTeamResponse(BaseModel):
-    id: str
-    displayName: str
-    channels: list[TeamsChannelResponse] = []
-
-
-class TeamsChatResponse(BaseModel):
-    id: str
-    topic: str
-    lastActivity: str | None = None
-
-
-class TeamsBrowseResponse(BaseModel):
-    favorites: list[TeamsChatResponse] = []
-    teams: list[TeamsTeamResponse] = []
-    group_chats: list[TeamsChatResponse] = []
-    individual_chats: list[TeamsChatResponse] = []
-
-
 class JiraSessionUploadRequest(BaseModel):
     base_url: str
     cookie_header: str
@@ -847,17 +813,18 @@ class AgentSessionDocumentRequest(BaseModel):
     process_now: bool = True
 
 
-class LocalAdapterDocumentRequest(BaseModel):
-    """One file pushed by the local CLI adapter into a configured source.
+class LocalSourcePackageRequest(BaseModel):
+    """One raw local-source package pushed by the local daemon/adapter.
 
-    ``markdown_body`` carries the raw file text for the declared ``content_type``
-    (Markdown, plain text, JSON, or HTML). The service converts it to markdown
-    during sync; the CLI does no parsing.
+    File-like sources use ``markdown_body`` as raw file text for the declared
+    ``content_type``. Structured sources such as Jira and Teams use
+    ``raw_payload`` and defer canonical markdown rendering to the source gene.
     """
 
     vault_id: str | None = None
     relative_path: str | None = None
-    markdown_body: str
+    markdown_body: str = ""
+    raw_payload: dict[str, Any] = Field(default_factory=dict)
     content_type: str = "text/markdown"
     base_url: str | None = None
     repo_url: str | None = None
@@ -870,7 +837,6 @@ class LocalAdapterDocumentRequest(BaseModel):
     window_type: str | None = None
     revision_hash: str | None = None
     source_url: str | None = None
-    source_semantics: dict[str, Any] = Field(default_factory=dict)
     title: str | None = None
     raw_hash: str | None = None
     submitted_by: str | None = None
@@ -3309,218 +3275,6 @@ def create_admin_app(
             items=items[: req.limit],
         )
 
-    @gene_router.get("/teams/auth-check", response_model=TeamsAuthCheckResponse)
-    async def teams_auth_check():
-        """Check if Teams authentication tokens are available and valid."""
-        from memforge.auth.teams_auth import TeamsAuthenticator
-
-        tokens = TeamsAuthenticator.load_tokens()
-        if not tokens:
-            return TeamsAuthCheckResponse(
-                authenticated=False,
-                error="No Teams session found.",
-            )
-
-        validity = TeamsAuthenticator.check_token_expiry(tokens)
-        if not any(validity.values()):
-            return TeamsAuthCheckResponse(
-                authenticated=False,
-                error="Teams session expired.",
-            )
-
-        # Find the shortest time-to-expiry across valid tokens
-        now = datetime.now(timezone.utc).timestamp()
-        min_minutes = None
-        for aud, is_valid in validity.items():
-            if is_valid and isinstance(tokens.get(aud), dict):
-                exp = tokens[aud].get("expiresAt", 0)
-                if exp > 0:
-                    remaining = int((exp - now) / 60)
-                    if min_minutes is None or remaining < min_minutes:
-                        min_minutes = remaining
-
-        return TeamsAuthCheckResponse(
-            authenticated=True,
-            expires_in_minutes=min_minutes,
-        )
-
-    @gene_router.get("/teams/browse", response_model=TeamsBrowseResponse)
-    async def teams_browse(region: str = "emea"):
-        """Browse available Teams conversations for the picker UI."""
-        from memforge.auth.teams_auth import TeamsAuthenticator
-        from memforge.genes.teams_gene import _TeamsAPIClient
-
-        tokens = TeamsAuthenticator.load_tokens()
-        if not tokens:
-            raise HTTPException(
-                status_code=401,
-                detail="No Teams session found.",
-            )
-
-        client = _TeamsAPIClient(region=region)
-        try:
-            # Load chat token — only the Chat API is needed for browsing
-            chat_token = TeamsAuthenticator.get_token_for_audience(
-                tokens,
-                "https://ic3.teams.office.com",
-            )
-
-            if not chat_token:
-                raise HTTPException(status_code=401, detail="Missing Chat API token")
-
-            import httpx
-
-            client._chat_client = httpx.AsyncClient(
-                base_url=client._chat_base,
-                headers={"Authorization": f"Bearer {chat_token}"},
-                timeout=30.0,
-            )
-            # Set graph_client to a dummy so _ensure_clients() is a no-op
-            client._graph_client = httpx.AsyncClient(
-                base_url="https://localhost",
-                timeout=1.0,
-            )
-
-            # Fetch channels (grouped by team) + conversations concurrently
-            raw_channel_teams, raw_convos = await asyncio.gather(
-                client.list_channels(),
-                client.list_conversations(),
-                return_exceptions=True,
-            )
-
-            # Handle errors gracefully
-            if isinstance(raw_channel_teams, Exception):
-                logger.warning("Failed to fetch channels: %s", raw_channel_teams)
-                raw_channel_teams = []
-            if isinstance(raw_convos, Exception):
-                logger.warning("Failed to fetch conversations: %s", raw_convos)
-                raw_convos = []
-
-            # Build teams result from Chat API channel data
-            teams_result: list[TeamsTeamResponse] = [
-                TeamsTeamResponse(
-                    id=t["id"],
-                    displayName=t["displayName"],
-                    channels=[TeamsChannelResponse(id=ch["id"], displayName=ch["displayName"]) for ch in t["channels"]],
-                )
-                for t in raw_channel_teams
-                if t.get("channels")  # skip teams with no named channels
-            ]
-
-            # Filter out system conversations (48:notifications, 48:mentions, etc.)
-            user_convos = [c for c in raw_convos if c.get("id", "").startswith("19:")]
-
-            # Resolve individual chat display names from lastMessage sender info.
-            # Build a GUID→name map from all conversations' last message senders,
-            # then use it to name DMs where the last sender was the current user.
-            import base64 as _b64
-
-            my_oid = ""
-            try:
-                parts = chat_token.split(".")
-                payload = parts[1] + "=" * (4 - len(parts[1]) % 4)
-                jwt_data = json.loads(_b64.b64decode(payload))
-                my_oid = jwt_data.get("oid", "")
-            except Exception:
-                pass
-
-            guid_to_name: dict[str, str] = {}
-            if my_oid:
-                for c in user_convos:
-                    sender_id = c.get("lastMessageSenderId", "")
-                    sender_name = c.get("lastMessageSender", "")
-                    if sender_name and "orgid:" in sender_id:
-                        guid = sender_id.split("orgid:")[-1].split("/")[0]
-                        if guid and guid != my_oid:
-                            guid_to_name[guid] = sender_name
-
-            def _resolve_dm_name(conv: dict) -> str:
-                """Get the other person's name for a 1:1 chat."""
-                sender_id = conv.get("lastMessageSenderId", "")
-                is_me = my_oid and my_oid in sender_id
-                if not is_me:
-                    return conv.get("lastMessageSender", "")
-                # Last message was from me — look up other person from GUID map
-                cid = conv["id"]
-                id_part = cid.replace("19:", "").split("@")[0]
-                guids = id_part.split("_")
-                other_guid = next((g for g in guids if g != my_oid), None)
-                return guid_to_name.get(other_guid, "") if other_guid else ""
-
-            # Partition chats by type, sorted by recency
-            group_chats = sorted(
-                [
-                    TeamsChatResponse(
-                        id=c["id"],
-                        topic=c.get("topic", "Untitled"),
-                        lastActivity=c["lastActivity"].isoformat() if c.get("lastActivity") else None,
-                    )
-                    for c in user_convos
-                    if c.get("type") == "group_chat"
-                ],
-                key=lambda x: x.lastActivity or "",
-                reverse=True,
-            )
-            # Include individual chats with resolved display names
-            individual_chats_raw = [c for c in user_convos if c.get("type") == "individual_chat"]
-            individual_chats = sorted(
-                [
-                    TeamsChatResponse(
-                        id=c["id"],
-                        topic=name,
-                        lastActivity=c["lastActivity"].isoformat() if c.get("lastActivity") else None,
-                    )
-                    for c in individual_chats_raw
-                    if (name := _resolve_dm_name(c))
-                ],
-                key=lambda x: x.lastActivity or "",
-                reverse=True,
-            )
-
-            # Deduplicate by ID (keep most recent)
-            seen_ids: set[str] = set()
-            deduped_individual: list[TeamsChatResponse] = []
-            for chat in individual_chats:
-                if chat.id not in seen_ids:
-                    seen_ids.add(chat.id)
-                    deduped_individual.append(chat)
-
-            # Build favorites from teams/channels marked as favorite
-            favorites: list[TeamsChatResponse] = []
-            for t in raw_channel_teams:
-                if t.get("favorite"):
-                    # Favorited team — add the team name as a selectable item
-                    # using the first channel's ID (General channel) as the identifier
-                    fav_channels = [ch for ch in t["channels"] if ch.get("favorite")]
-                    if fav_channels:
-                        # Use the specific favorite channel
-                        for ch in fav_channels:
-                            favorites.append(
-                                TeamsChatResponse(
-                                    id=ch["id"],
-                                    topic=f"{t['displayName']} / {ch['displayName']}",
-                                )
-                            )
-                    else:
-                        # Team is favorite but no specific channel — show team name
-                        # Pick the first channel as representative
-                        if t["channels"]:
-                            favorites.append(
-                                TeamsChatResponse(
-                                    id=t["channels"][0]["id"],
-                                    topic=t["displayName"],
-                                )
-                            )
-
-            return TeamsBrowseResponse(
-                favorites=favorites,
-                teams=teams_result,
-                group_chats=group_chats,
-                individual_chats=deduped_individual,
-            )
-        finally:
-            await client.close()
-
     @source_router.get("")
     async def list_sources(
         request: Request,
@@ -4036,21 +3790,20 @@ def create_admin_app(
         )
         return {"ok": True, "source_id": source_id}
 
-    @source_router.post("/{source_id}/adapter/documents")
-    async def push_local_adapter_document(
+    @source_router.post("/{source_id}/adapter/packages")
+    async def push_local_source_package(
         source_id: str,
-        req: LocalAdapterDocumentRequest,
+        req: LocalSourcePackageRequest,
         request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         sync_service: SyncService = Depends(get_sync_service),
     ):
-        """Receive one markdown document pushed by the local CLI adapter.
+        """Receive one local-source package pushed by the local daemon/adapter.
 
-        The service owns the inbox layout and the package format. The CLI never
-        writes into MemForge storage directly: it sends the normalized body and
-        the service creates a stable doc id, atomically writes the package, and
-        leaves the rest of ingestion to the source's sync pipeline.
+        The service owns the inbox layout and package format. Local clients
+        send raw file text or structured source payloads; source genes perform
+        canonical markdown normalization during sync.
         """
         from memforge.local_adapter import (
             GITHUB_REPO_SOURCE_TYPE,
@@ -4058,9 +3811,9 @@ def create_admin_app(
             LOCAL_MARKDOWN_SOURCE_TYPE,
             TEAMS_SOURCE_TYPE,
             submit_github_repo_document,
-            submit_jira_document,
+            submit_jira_package,
             submit_local_markdown_document,
-            submit_teams_document,
+            submit_teams_window_package,
         )
 
         source = await db.get_source(source_id)
@@ -4096,35 +3849,33 @@ def create_admin_app(
                     submitted_at=req.submitted_at,
                 )
             elif source_type == JIRA_SOURCE_TYPE:
-                result = await submit_jira_document(
+                result = await submit_jira_package(
                     db=db,
                     config=config,
                     source=source,
                     base_url=req.base_url or "",
                     issue_key=req.issue_key or "",
+                    raw_payload=req.raw_payload,
                     source_url=req.source_url or "",
-                    markdown_body=req.markdown_body,
                     title=req.title,
                     raw_hash=req.raw_hash,
-                    source_semantics=req.source_semantics,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                 )
             elif source_type == TEAMS_SOURCE_TYPE:
-                result = await submit_teams_document(
+                result = await submit_teams_window_package(
                     db=db,
                     config=config,
                     source=source,
                     conversation_id=req.conversation_id or "",
                     window_id=req.window_id or "",
                     revision_hash=req.revision_hash or "",
-                    markdown_body=req.markdown_body,
+                    raw_payload=req.raw_payload,
                     title=req.title,
                     root_message_id=req.root_message_id,
                     window_type=req.window_type,
                     source_url=req.source_url,
                     raw_hash=req.raw_hash,
-                    source_semantics=req.source_semantics,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                 )
