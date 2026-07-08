@@ -51,7 +51,7 @@ const SOURCE_LABELS: Record<string, { name: string; subtitle: string; descriptio
   confluence: { name: "Confluence", subtitle: "Knowledge source", description: "Wiki pages and documentation" },
   github_pages: { name: "GitHub Pages", subtitle: "Documentation source", description: "Published documentation pages" },
   jira: { name: "Jira", subtitle: "Work tracking source", description: "Tickets, decisions, and work items" },
-  local_markdown: { name: "Local Repository", subtitle: "Local folder source", description: "Push files from a folder on your machine." },
+  local_markdown: { name: "Local Repository", subtitle: "Local folder source", description: "Sync files through your local daemon." },
   teams: { name: "Microsoft Teams", subtitle: "Conversation source", description: "Channel messages, group chats, and direct messages" },
 };
 
@@ -80,8 +80,41 @@ function isInternalGitHubSource(source: Source): boolean {
   return source.type === "github_repo" && String(source.config.connection_mode ?? "cloud_pull") === "local_push";
 }
 
+function localAgentSyncOperation(source: Source): string | null {
+  if (isInternalGitHubSource(source)) return "github_repo_sync";
+  if (source.type === "local_markdown" && String(source.config.root ?? "").trim().length > 0) {
+    return "local_markdown_sync";
+  }
+  if (source.type === "jira" && String(source.config.sync_mode ?? "cloud") === "local_agent") return "jira_sync";
+  return null;
+}
+
 const LOCAL_AGENT_SYNC_POLL_ATTEMPTS = 1_800;
 const LOCAL_AGENT_SYNC_POLL_INTERVAL_MS = 2_000;
+
+async function createLocalAgentSyncJob(source: Source): Promise<LocalAgentJobCreateResponse | null> {
+  const operation = localAgentSyncOperation(source);
+  if (!operation) {
+    if (source.type === "local_markdown") {
+      throw new Error("Configure a folder path before syncing this local source.");
+    }
+    return null;
+  }
+  const response = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
+    source_id: source.id,
+    source_type: source.type,
+    operation,
+    payload: {
+      ...source.config,
+      process_now: true,
+    },
+  });
+  const status = await pollLocalAgentSyncJob(response.data.job_id);
+  if (status.status === "failed") {
+    throw new Error(status.last_error || "Local daemon could not sync this source.");
+  }
+  return response.data;
+}
 
 async function pollLocalAgentSyncJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
   for (let attempt = 0; attempt < LOCAL_AGENT_SYNC_POLL_ATTEMPTS; attempt += 1) {
@@ -145,25 +178,12 @@ export function SourcesPage() {
   });
 
   const syncSource = useMutation({
-    mutationFn: ({ source, forceFullSync = false }: { source: Source; forceFullSync?: boolean }) => {
+    mutationFn: async ({ source, forceFullSync = false }: { source: Source; forceFullSync?: boolean }) => {
       const sourceId = source.id;
       setPendingSyncIds((current) => new Set(current).add(sourceId));
-      if (isInternalGitHubSource(source)) {
-        return client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
-          source_id: source.id,
-          source_type: "github_repo",
-          operation: "github_repo_sync",
-          payload: {
-            ...source.config,
-            process_now: true,
-          },
-        }).then(async (response) => {
-          const status = await pollLocalAgentSyncJob(response.data.job_id);
-          if (status.status === "failed") {
-            throw new Error(status.last_error || "Local daemon could not sync this source.");
-          }
-          return response;
-        });
+      const localAgentJob = await createLocalAgentSyncJob(source);
+      if (localAgentJob) {
+        return { data: localAgentJob };
       }
       return client.post(`/api/sources/${sourceId}/sync`, { force_full_sync: forceFullSync });
     },
@@ -191,15 +211,19 @@ export function SourcesPage() {
   });
 
   const forceResyncSource = useMutation({
-    mutationFn: (sourceId: string) => {
-      setPendingSyncIds((current) => new Set(current).add(sourceId));
-      return client.post(getSourceActionEndpoint(sourceId, "force-resync"));
+    mutationFn: async (source: Source) => {
+      setPendingSyncIds((current) => new Set(current).add(source.id));
+      const localAgentJob = await createLocalAgentSyncJob(source);
+      if (localAgentJob) {
+        return { data: localAgentJob };
+      }
+      return client.post(getSourceActionEndpoint(source.id, "force-resync"));
     },
     onError: (error) => handleAuthorityError(error, "Failed to start refresh."),
-    onSettled: (_data, _error, sourceId) => {
+    onSettled: (_data, _error, source) => {
       setPendingSyncIds((current) => {
         const next = new Set(current);
-        next.delete(sourceId);
+        next.delete(source.id);
         return next;
       });
       queryClient.invalidateQueries({ queryKey: ["sources"] });
@@ -445,7 +469,7 @@ export function SourcesPage() {
                               }}
                               onForceResync={() => {
                                 setOpenMenuSourceId(null);
-                                forceResyncSource.mutate(source.id);
+                                forceResyncSource.mutate(source);
                               }}
                               onToggleStatus={() => {
                                 setOpenMenuSourceId(null);
@@ -480,9 +504,7 @@ export function SourcesPage() {
           setTeamsWizardOpen(true);
         }}
         onConfigureSelected={(sourceType) => {
-          if (!isPushBasedSourceType(sourceType)) {
-            setAddOpen(false);
-          }
+          setAddOpen(false);
           setConfigDialog({ sourceType, source: null });
         }}
       />
@@ -912,10 +934,6 @@ function AddSourceDialog({
       description: gene.description,
     };
     const isTeams = gene.name === "teams";
-    // Push-based sources open a setup walkthrough rather than a server-side
-    // form; they share the "View setup" affordance with the agent-session cards
-    // so the dialog reads as a single push group instead of mixed treatments.
-    const isPushBased = isPushBasedSourceType(gene.name);
     return (
       <div key={gene.name} className="rounded-lg border p-4">
         <div className="flex items-start gap-3">
@@ -929,17 +947,9 @@ function AddSourceDialog({
           <Button
             type="button"
             size="sm"
-            variant={isPushBased ? "outline" : "default"}
             onClick={() => onConfigureSelected(gene.name)}
           >
-            {isPushBased ? (
-              <>
-                <Info className="size-3.5" />
-                View setup
-              </>
-            ) : (
-              "Configure"
-            )}
+            Configure
           </Button>
           {isTeams && (
             <Button type="button" size="sm" variant="outline" onClick={onTeamsSelected}>

@@ -40,6 +40,7 @@ from memforge.github_repo_utils import (
     github_path_in_scope,
     parse_github_repo_url,
 )
+from memforge.local_agent.folder_picker import FolderPickerCancelled, FolderPickerUnavailable, pick_folder
 from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
     SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES,
@@ -75,6 +76,7 @@ KB_CRON_MARK_START = "# >>> memforge:kb:{name} >>>"
 KB_CRON_MARK_END = "# <<< memforge:kb:{name} <<<"
 LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
 GITHUB_REPO_SOURCE_TYPE = "github_repo"
+JIRA_SOURCE_TYPE = "jira"
 DEFAULT_GITHUB_INCLUDE_EXTENSIONS = DEFAULT_INCLUDE_EXTENSION_LIST
 # Watch defaults. The tick interval is deliberately shorter than a typical Jira
 # idle-session timeout so the stored copy is renewed while it is still valid.
@@ -249,10 +251,10 @@ def _build_local_agent_runner(
                 browser=browser,
                 last_hash=last_hash,
             ),
-            run_cloud_job=lambda job: _run_cloud_local_agent_job(job, client),
+            run_cloud_job=lambda job: _run_cloud_local_agent_job(job, client, browser=browser),
         ),
         jira_origins_provider=client.list_jira_origins,
-        cloud_jobs_provider=client.lease_local_agent_jobs,
+        cloud_jobs_provider=lambda wait_seconds=0: client.lease_local_agent_jobs(wait_seconds=wait_seconds),
         cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: client.complete_local_agent_job(
             job_id,
             attempt_count=attempt_count,
@@ -1715,6 +1717,8 @@ def adapter_daemon_once(
 @click.option("--browser", default=None, help="Browser to read Jira cookies from, for example chrome or edge.")
 @click.option("--interval-seconds", "poll_interval_seconds", default=10, show_default=True, type=int,
               help="Seconds between due-task checks.")
+@click.option("--cloud-job-wait-seconds", default=25, show_default=True, type=int,
+              help="Long-poll wait for Cloud-triggered local-agent jobs.")
 @click.option("--default-sync-interval-seconds", default=3600, show_default=True, type=int,
               help="Default local-folder and GitHub sync interval.")
 @click.option("--jira-interval-seconds", default=WATCH_DEFAULT_INTERVAL_SECONDS, show_default=True, type=int,
@@ -1725,6 +1729,7 @@ def adapter_daemon_run(
     include_jira: bool,
     browser: str | None,
     poll_interval_seconds: int,
+    cloud_job_wait_seconds: int,
     default_sync_interval_seconds: int,
     jira_interval_seconds: int,
 ):
@@ -1741,6 +1746,7 @@ def adapter_daemon_run(
                 "status": "running",
                 "state_path": str(_local_agent_state_path()),
                 "poll_interval_seconds": max(int(poll_interval_seconds), 1),
+                "cloud_job_wait_seconds": max(int(cloud_job_wait_seconds), 0),
             },
             ensure_ascii=False,
         )
@@ -1749,6 +1755,7 @@ def adapter_daemon_run(
         runner.run_forever(
             include_jira=include_jira,
             poll_interval_seconds=poll_interval_seconds,
+            cloud_job_wait_seconds=cloud_job_wait_seconds,
             log=lambda message: click.echo(message, err=True),
         )
     except KeyboardInterrupt:
@@ -1995,36 +2002,172 @@ def _push_github_profile_to_source(
     return payload
 
 
-def _run_cloud_local_agent_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:
+def _run_cloud_local_agent_job(
+    job: dict[str, Any],
+    client: ToolClient,
+    *,
+    browser: str | None = None,
+) -> dict[str, Any]:
+    operation = str(job.get("operation") or "").strip()
+    handlers = {
+        "github_repo_preview_tree": lambda: _run_cloud_github_preview_job(job),
+        "github_repo_sync": lambda: _run_cloud_github_sync_job(job, client),
+        "local_markdown_pick_root": lambda: _run_cloud_local_markdown_pick_root_job(job),
+        "local_markdown_preview_tree": lambda: _run_cloud_local_markdown_preview_job(job),
+        "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(job, client),
+        "jira_sync": lambda: _run_cloud_jira_sync_job(job, client, browser=browser),
+    }
+    handler = handlers.get(operation)
+    if handler is None:
+        return {"operation": operation, "error": f"unsupported cloud local-agent job operation: {operation or '<empty>'}"}
+    return handler()
+
+
+def _run_cloud_github_preview_job(job: dict[str, Any]) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     profile = _github_profile_from_cloud_job(job)
     source_id = str(job.get("source_id") or payload.get("source_id") or "").strip()
-    workspace_id = str(job.get("workspace_id") or payload.get("workspace_id") or "").strip()
     profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
 
-    if operation == "github_repo_preview_tree":
-        limit = _cloud_job_limit(payload.get("limit"), default=200)
-        preview = _preview_github_profile(profile_name, profile, limit=limit)
-        return {"operation": operation, "source_id": source_id, **preview}
+    limit = _cloud_job_limit(payload.get("limit"), default=200)
+    preview = _preview_github_profile(profile_name, profile, limit=limit)
+    return {"operation": operation, "source_id": source_id, **preview}
 
-    if operation == "github_repo_sync":
-        if not source_id:
-            return {"operation": operation, "error": "source_id is required"}
-        if not workspace_id:
-            return {"operation": operation, "source_id": source_id, "error": "workspace_id is required"}
-        result = _push_github_profile_to_source(
-            profile_name,
-            profile,
-            source_id=source_id,
-            limit=_cloud_job_limit(payload.get("limit"), default=0),
-            process_now=bool(payload.get("process_now", True)),
-            submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
-            client=_workspace_tool_client(client, workspace_id),
+
+def _run_cloud_github_sync_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    profile = _github_profile_from_cloud_job(job)
+    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    if error:
+        return error
+    profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
+    result = _push_github_profile_to_source(
+        profile_name,
+        profile,
+        source_id=source_id,
+        limit=_cloud_job_limit(payload.get("limit"), default=0),
+        process_now=bool(payload.get("process_now", True)),
+        submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
+        client=_workspace_tool_client(client, workspace_id),
+    )
+    return {"operation": operation, **result}
+
+
+def _run_cloud_local_markdown_preview_job(job: dict[str, Any]) -> dict[str, Any]:
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    source_id = str(job.get("source_id") or payload.get("source_id") or "").strip()
+    profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
+    profile = _kb_profile_from_cloud_job(job)
+    preview = _preview_kb_profile(profile_name, profile, limit=_cloud_job_limit(payload.get("limit"), default=200))
+    return {"operation": operation, "source_id": source_id, **preview}
+
+
+def _run_cloud_local_markdown_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    try:
+        root = pick_folder(
+            title=str(payload.get("title") or "Choose folder to sync"),
+            initial_directory=str(payload.get("initial_directory") or "").strip() or None,
         )
-        return {"operation": operation, **result}
+    except FolderPickerCancelled:
+        return {"operation": operation, "cancelled": True}
+    except FolderPickerUnavailable as exc:
+        return {"operation": operation, "error": str(exc)}
+    return {"operation": operation, "root": root}
 
-    return {"operation": operation, "error": f"unsupported cloud local-agent job operation: {operation or '<empty>'}"}
+
+def _run_cloud_local_markdown_sync_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    if error:
+        return error
+    profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
+    result = _push_kb_profile_to_source(
+        profile_name,
+        _kb_profile_from_cloud_job(job),
+        source_id=source_id,
+        limit=_cloud_job_limit(payload.get("limit"), default=0),
+        process_now=bool(payload.get("process_now", True)),
+        submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
+        client=_workspace_tool_client(client, workspace_id),
+    )
+    return {"operation": operation, **result}
+
+
+def _run_cloud_jira_sync_job(
+    job: dict[str, Any],
+    client: ToolClient,
+    *,
+    browser: str | None,
+) -> dict[str, Any]:
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    if error:
+        return error
+    try:
+        documents = asyncio.run(
+            _collect_jira_documents_from_cloud_job(
+                job,
+                source_id=source_id,
+                browser=browser,
+                limit=_cloud_job_limit(payload.get("limit"), default=0),
+            )
+        )
+    except Exception as exc:
+        return {"operation": operation, "source_id": source_id, "error": str(exc), "error_type": type(exc).__name__}
+
+    pushed: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    scoped_client = _workspace_tool_client(client, workspace_id)
+    should_process = bool(payload.get("process_now", True))
+    sync_result: dict[str, Any] | None = None
+    for doc in documents:
+        response = scoped_client.push_jira_document(
+            source_id=source_id,
+            base_url=str(doc["base_url"]),
+            issue_key=str(doc["issue_key"]),
+            source_url=str(doc["source_url"]),
+            markdown_body=str(doc["markdown_body"]),
+            title=str(doc["title"]),
+            raw_hash=str(doc["raw_hash"]),
+            source_semantics=doc.get("source_semantics") if isinstance(doc.get("source_semantics"), dict) else {},
+            submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
+            process_now=False,
+        )
+        if isinstance(response, dict) and response.get("error"):
+            failed.append({"issue_key": doc["issue_key"], "error": response.get("error"),
+                           "detail": response.get("detail"), "status_code": response.get("status_code")})
+        else:
+            pushed.append({"issue_key": doc["issue_key"],
+                           "doc_id": response.get("doc_id"),
+                           "document_hash": response.get("document_hash")})
+    if should_process and pushed:
+        sync_result = scoped_client.start_source_sync(source_id=source_id, force_full_sync=False)
+    result = {
+        "operation": operation,
+        "source_id": source_id,
+        "base_url": str(payload.get("base_url") or ""),
+        "counts": {"selected": len(documents), "pushed": len(pushed), "failed": len(failed)},
+        "pushed": pushed,
+        "failed": failed,
+        "sync_started": bool(sync_result and not sync_result.get("error")),
+    }
+    sync_failed = isinstance(sync_result, dict) and bool(sync_result.get("error"))
+    if sync_failed:
+        result["sync_error"] = sync_result
+    if failed and sync_failed:
+        result["error"] = "one or more documents failed to push; source sync failed to start"
+    elif sync_failed:
+        result["error"] = "source sync failed to start"
+    elif failed:
+        result["error"] = "one or more documents failed to push"
+    return result
 
 
 def _github_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -2037,6 +2180,97 @@ def _github_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
         if key in payload:
             profile[key] = payload[key]
     return profile
+
+
+def _kb_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    root = str(payload.get("root") or "").strip()
+    vault_id = str(payload.get("vault_id") or "").strip()
+    if not root:
+        raise click.ClickException("local_markdown root is required")
+    if not vault_id:
+        raise click.ClickException("local_markdown vault_id is required")
+    profile: dict[str, Any] = {
+        "root": root,
+        "vault_id": vault_id,
+    }
+    if "include" in payload:
+        profile["include"] = payload["include"]
+    if "exclude" in payload:
+        profile["exclude"] = payload["exclude"]
+    return profile
+
+
+def _cloud_job_source_scope(
+    job: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    operation: str,
+) -> tuple[str, str, dict[str, Any] | None]:
+    source_id = str(job.get("source_id") or payload.get("source_id") or "").strip()
+    if not source_id:
+        return "", "", {"operation": operation, "error": "source_id is required"}
+    workspace_id = str(job.get("workspace_id") or payload.get("workspace_id") or "").strip()
+    if not workspace_id:
+        return source_id, "", {"operation": operation, "source_id": source_id, "error": "workspace_id is required"}
+    return source_id, workspace_id, None
+
+
+async def _collect_jira_documents_from_cloud_job(
+    job: dict[str, Any],
+    *,
+    source_id: str,
+    browser: str | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    from memforge.auth.jira_capture import capture_and_prevalidate
+    from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE, JiraGene
+
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    config = dict(payload)
+    config.pop("local_agent_documents_dir", None)
+    config.pop("pat", None)
+    config.pop("pat_encrypted", None)
+    config.pop("pat_configured", None)
+    config["sync_mode"] = "cloud"
+    base_url = str(config.get("base_url") or "").strip().rstrip("/")
+    if not base_url:
+        raise click.ClickException("Jira base_url is required")
+    auth_mode = str(config.get("auth_mode") or JIRA_AUTH_MODE_COOKIE).strip().lower()
+    if auth_mode != JIRA_AUTH_MODE_COOKIE:
+        raise click.ClickException("Jira local sync requires browser-session authentication")
+    if not str(config.get("jira_cookie") or "").strip():
+        captured = await capture_and_prevalidate(base_url, browser=browser, tls_config=config)
+        config["jira_cookie"] = captured.cookie_header
+
+    gene = JiraGene(config, source_id)
+    await gene.authenticate()
+    documents: list[dict[str, Any]] = []
+    try:
+        async for item in gene.discover(None):
+            if limit and len(documents) >= limit:
+                break
+            raw = await gene.fetch(item)
+            normalized = await gene.normalize(raw)
+            issue_key = str(item.extra.get("issue_key") or item.item_id.replace("jira-", "")).strip()
+            markdown = normalized.markdown_body
+            raw_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+            documents.append(
+                {
+                    "base_url": base_url,
+                    "issue_key": issue_key,
+                    "source_url": item.source_url,
+                    "title": item.title,
+                    "markdown_body": markdown,
+                    "raw_hash": raw_hash,
+                    "source_semantics": normalized.source_semantics,
+                }
+            )
+    finally:
+        client = getattr(gene, "_client", None)
+        if client is not None:
+            await client.aclose()
+    return documents
 
 
 def _cloud_job_limit(value: Any, *, default: int) -> int:
@@ -2223,10 +2457,29 @@ def _push_kb_profile_payload(
             "No source id for this profile. Re-run with --source-id, or link one "
             "with `adapter kb add " + name + " --root <path> --create-source`."
         )
+    return _push_kb_profile_to_source(
+        name,
+        profile,
+        source_id=source_id,
+        limit=limit,
+        process_now=process_now,
+        submitted_by=submitted_by,
+        client=_tool_client(ctx),
+    )
 
+
+def _push_kb_profile_to_source(
+    name: str,
+    profile: dict[str, Any],
+    *,
+    source_id: str,
+    limit: int,
+    process_now: bool,
+    submitted_by: str | None,
+    client: ToolClient,
+) -> dict[str, Any]:
     root, include, exclude, vault_id = _resolve_kb_profile(name, profile)
     counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
-    client = _tool_client(ctx)
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
 

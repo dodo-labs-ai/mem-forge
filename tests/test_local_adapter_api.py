@@ -34,7 +34,11 @@ def _create_local_markdown_source(client: TestClient, *, name: str = "Engineerin
         json={
             "type": "local_markdown",
             "name": name,
-            "config": {"vault_id": vault_id, "display_label": "Engineering notes"},
+            "config": {
+                "root": "/Users/test/engineering-notes",
+                "vault_id": vault_id,
+                "display_label": "Engineering notes",
+            },
             "project_binding": {"mode": "fixed", "project_key": vault_id.upper()},
         },
     )
@@ -49,7 +53,11 @@ def _create_unmapped_local_markdown_source(client: TestClient, *, name: str = "E
         json={
             "type": "local_markdown",
             "name": name,
-            "config": {"vault_id": vault_id, "display_label": "Engineering notes"},
+            "config": {
+                "root": "/Users/test/engineering-notes",
+                "vault_id": vault_id,
+                "display_label": "Engineering notes",
+            },
         },
     )
     assert response.status_code == 200, response.text
@@ -83,6 +91,27 @@ def _create_github_repo_source(
     return response.json()
 
 
+def _create_jira_source(client: TestClient, *, name: str = "Payroll Jira") -> dict:
+    response = client.post(
+        "/api/sources",
+        json={
+            "type": "jira",
+            "name": name,
+            "config": {
+                "base_url": "https://jira.example.test",
+                "auth_mode": "browser_cookie",
+                "sync_mode": "local_agent",
+                "projects": ["PAY"],
+                "issue_types": ["Task"],
+                "include_comments": True,
+            },
+            "project_binding": {"mode": "fixed", "project_key": "PAY"},
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def test_create_local_markdown_source_populates_inbox_path(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
@@ -106,6 +135,65 @@ def test_create_local_markdown_source_populates_inbox_path(tmp_path):
         asyncio.run(database.close())
 
 
+def test_create_local_markdown_source_generates_internal_vault_id(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/sources",
+                json={
+                    "type": "local_markdown",
+                    "name": "Engineering notes",
+                    "config": {
+                        "root": "/Users/test/engineering-notes",
+                        "display_label": "Engineering notes",
+                    },
+                },
+            )
+            assert response.status_code == 200, response.text
+            source_id = response.json()["id"]
+            row = asyncio.run(database.get_source(source_id))
+        assert row is not None
+        config = row["config"]
+        assert config["vault_id"].startswith("local-")
+        assert config["display_label"] == "Engineering notes"
+        assert Path(config["documents_dir"]).exists()
+    finally:
+        asyncio.run(database.close())
+
+
+def test_update_local_markdown_source_preserves_internal_vault_id(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            created = _create_local_markdown_source(client, vault_id="engineering")
+            response = client.put(
+                f"/api/sources/{created['id']}",
+                json={
+                    "name": "Engineering docs",
+                    "config": {
+                        "root": "/Users/test/engineering-docs",
+                        "display_label": "Engineering docs",
+                    },
+                },
+            )
+            assert response.status_code == 200, response.text
+            row = asyncio.run(database.get_source(created["id"]))
+        assert row is not None
+        assert row["config"]["vault_id"] == "engineering"
+        assert row["config"]["display_label"] == "Engineering docs"
+    finally:
+        asyncio.run(database.close())
+
+
 def test_create_github_repo_source_populates_inbox_path_for_local_push(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
@@ -123,6 +211,204 @@ def test_create_github_repo_source_populates_inbox_path_for_local_push(tmp_path)
         assert documents_dir.exists()
         expected_root = Path(cfg.storage.docs_path).parent / "local-adapter-submissions"
         assert documents_dir.is_relative_to(expected_root)
+    finally:
+        asyncio.run(database.close())
+
+
+def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
+    from memforge.genes.jira_gene import JiraGene
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            created = _create_jira_source(client)
+            source_id = created["id"]
+            initial_row = asyncio.run(database.get_source(source_id))
+            assert initial_row is not None
+            initial_documents_dir = Path(initial_row["config"]["local_agent_documents_dir"])
+            assert initial_documents_dir.exists()
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "base_url": "https://jira.example.test",
+                    "issue_key": "PAY-1",
+                    "source_url": "https://jira.example.test/browse/PAY-1",
+                    "title": "Create daemon source support",
+                    "markdown_body": "# PAY-1\n\nCreate daemon source support.",
+                    "source_semantics": {"status": "Open", "issue_type": "Task"},
+                    "process_now": False,
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["issue_key"] == "PAY-1"
+        row = asyncio.run(database.get_source(source_id))
+        assert row is not None
+        documents_dir = Path(row["config"]["local_agent_documents_dir"])
+        package_path = documents_dir / f"{payload['doc_id']}.json"
+        assert package_path.exists()
+
+        gene = JiraGene(row["config"], source_id)
+
+        async def _read_package():
+            await gene.authenticate()
+            items = [item async for item in gene.discover(None)]
+            raw = await gene.fetch(items[0])
+            normalized = await gene.normalize(raw)
+            return items, normalized
+
+        items, normalized = asyncio.run(_read_package())
+        assert [item.extra["issue_key"] for item in items] == ["PAY-1"]
+        assert normalized.markdown_body == "# PAY-1\n\nCreate daemon source support."
+        assert normalized.source_semantics["status"] == "Open"
+        assert normalized.source_semantics["issue_key"] == "PAY-1"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_jira_local_agent_mode_rejects_pat_auth(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/sources",
+                json={
+                    "type": "jira",
+                    "name": "Payroll Jira",
+                    "config": {
+                        "base_url": "https://jira.example.test",
+                        "auth_mode": "pat",
+                        "sync_mode": "local_agent",
+                        "pat": "local-pat",
+                        "projects": ["PAY"],
+                    },
+                    "project_binding": {"mode": "fixed", "project_key": "PAY"},
+                },
+            )
+
+        assert response.status_code == 400, response.text
+        assert "Browser session" in response.json()["detail"]
+    finally:
+        asyncio.run(database.close())
+
+
+def test_update_jira_local_agent_source_preserves_sync_mode_when_omitted(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            created = _create_jira_source(client)
+            source_id = created["id"]
+            before = asyncio.run(database.get_source(source_id))
+            assert before is not None
+            initial_documents_dir = before["config"]["local_agent_documents_dir"]
+            response = client.put(
+                f"/api/sources/{source_id}",
+                json={
+                    "config": {
+                        "base_url": "https://jira.example.test",
+                        "auth_mode": "browser_cookie",
+                        "projects": ["PAY", "ENG"],
+                        "issue_types": ["Task"],
+                        "include_comments": True,
+                    }
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        row = asyncio.run(database.get_source(source_id))
+        assert row is not None
+        assert row["config"]["sync_mode"] == "local_agent"
+        assert row["config"]["local_agent_documents_dir"] == initial_documents_dir
+    finally:
+        asyncio.run(database.close())
+
+
+def test_jira_local_agent_package_discovery_normalizes_naive_timestamps(tmp_path):
+    from datetime import datetime, timezone
+
+    from memforge.genes.jira_gene import JiraGene
+
+    documents_dir = tmp_path / "jira-inbox"
+    documents_dir.mkdir()
+    (documents_dir / "pay-1.json").write_text(
+        json.dumps(
+            {
+                "package_kind": "jira_document",
+                "doc_id": "jira-pay-1",
+                "issue_key": "PAY-1",
+                "title": "Naive timestamp package",
+                "source_url": "https://jira.example.test/browse/PAY-1",
+                "last_modified": "2026-07-07T12:00:00",
+                "markdown": "# PAY-1",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    gene = JiraGene(
+        {
+            "base_url": "https://jira.example.test",
+            "auth_mode": "browser_cookie",
+            "sync_mode": "local_agent",
+            "local_agent_documents_dir": str(documents_dir),
+        },
+        "src-jira",
+    )
+
+    async def _discover():
+        await gene.authenticate()
+        return [item async for item in gene.discover(datetime(2026, 7, 7, 11, 0, tzinfo=timezone.utc))]
+
+    items = asyncio.run(_discover())
+    assert [item.extra["issue_key"] for item in items] == ["PAY-1"]
+    assert items[0].last_modified.tzinfo is timezone.utc
+
+
+def test_jira_adapter_document_push_requires_local_agent_mode(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            created = _create_jira_source(client)
+            source_id = created["id"]
+            update = client.put(
+                f"/api/sources/{source_id}",
+                json={
+                    "config": {
+                        "base_url": "https://jira.example.test",
+                        "auth_mode": "browser_cookie",
+                        "sync_mode": "cloud",
+                        "projects": ["PAY"],
+                    }
+                },
+            )
+            assert update.status_code == 200, update.text
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/documents",
+                json={
+                    "base_url": "https://jira.example.test",
+                    "issue_key": "PAY-1",
+                    "markdown_body": "# PAY-1",
+                },
+            )
+
+        assert response.status_code == 400, response.text
+        assert "sync_mode=local_agent" in response.json()["detail"]
     finally:
         asyncio.run(database.close())
 

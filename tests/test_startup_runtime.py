@@ -1666,6 +1666,7 @@ async def test_non_secret_source_noop_update_preserves_sync_cursor(db, tmp_path)
     source_id = "src-local-markdown"
     cfg = _config(tmp_path)
     source_config = {
+        "root": str(tmp_path / "engineering-notes"),
         "vault_id": "engineering-notes",
         "documents_dir": str(default_local_adapter_inbox(cfg, source_id)),
     }

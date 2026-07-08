@@ -6,6 +6,7 @@ import pytest
 from click.testing import CliRunner
 
 import memforge.main as main
+from memforge.local_agent import folder_picker
 from memforge.main import cli
 
 
@@ -70,6 +71,13 @@ class FakeToolClient:
         self.calls.append(("get_resource", {"api_url": self.api_url, "api_token": self.api_token, **kwargs}))
         return self.response
 
+    def start_source_sync(self, **kwargs):
+        self.calls.append((
+            "start_source_sync",
+            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+        ))
+        return self.response
+
     def push_local_markdown_document(self, **kwargs):
         self.calls.append((
             "push_local_markdown_document",
@@ -80,6 +88,13 @@ class FakeToolClient:
     def push_github_repo_document(self, **kwargs):
         self.calls.append((
             "push_github_repo_document",
+            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+        ))
+        return self.response
+
+    def push_jira_document(self, **kwargs):
+        self.calls.append((
+            "push_jira_document",
             {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
         ))
         return self.response
@@ -1406,6 +1421,372 @@ def test_local_agent_cloud_github_sync_requires_job_workspace(monkeypatch, tmp_p
         "error": "workspace_id is required",
     }
     assert FakeToolClient.calls == []
+
+
+def test_local_agent_cloud_local_markdown_preview_uses_job_payload(tmp_path: Path):
+    root = tmp_path / "notes"
+    root.mkdir()
+    (root / "Decision.md").write_text("# Decision\n\nUse the daemon.", encoding="utf-8")
+    (root / "scratch.bin").write_bytes(b"\x00\x01")
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-local-preview",
+            "operation": "local_markdown_preview_tree",
+            "payload": {
+                "root": str(root),
+                "vault_id": "engineering",
+                "include": ["*.md", "**/*.md"],
+                "exclude": [],
+                "limit": 20,
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload["operation"] == "local_markdown_preview_tree"
+    assert payload["vault_id"] == "engineering"
+    assert payload["counts"]["included"] == 1
+    assert [item["relative_path"] for item in payload["items"]] == ["Decision.md"]
+
+
+def test_local_agent_cloud_local_markdown_pick_root_uses_local_picker(monkeypatch, tmp_path: Path):
+    selected = tmp_path / "notes"
+    selected.mkdir()
+    calls: list[dict] = []
+
+    def fake_pick_folder(*, title: str | None = None, initial_directory: str | None = None) -> str:
+        calls.append({"title": title, "initial_directory": initial_directory})
+        return str(selected)
+
+    monkeypatch.setattr(main, "pick_folder", fake_pick_folder)
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-pick-root",
+            "operation": "local_markdown_pick_root",
+            "payload": {
+                "title": "Choose folder to sync",
+                "initial_directory": str(tmp_path),
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload == {
+        "operation": "local_markdown_pick_root",
+        "root": str(selected),
+    }
+    assert calls == [{"title": "Choose folder to sync", "initial_directory": str(tmp_path)}]
+
+
+def test_local_agent_cloud_local_markdown_pick_root_reports_cancellation(monkeypatch):
+    def fake_pick_folder(*, title: str | None = None, initial_directory: str | None = None) -> str:
+        raise main.FolderPickerCancelled("folder selection cancelled")
+
+    monkeypatch.setattr(main, "pick_folder", fake_pick_folder)
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-pick-root",
+            "operation": "local_markdown_pick_root",
+            "payload": {"title": "Choose folder to sync"},
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload == {
+        "operation": "local_markdown_pick_root",
+        "cancelled": True,
+    }
+
+
+def test_native_folder_picker_times_out_as_cancellation(monkeypatch):
+    calls: list[dict] = []
+
+    def fake_system() -> str:
+        return "Darwin"
+
+    def fake_run(args, **kwargs):
+        calls.append({"args": args, **kwargs})
+        raise subprocess.TimeoutExpired(cmd=args, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(folder_picker.platform, "system", fake_system)
+    monkeypatch.setattr(folder_picker.subprocess, "run", fake_run)
+
+    with pytest.raises(folder_picker.FolderPickerCancelled, match="timed out"):
+        folder_picker.pick_folder(timeout_seconds=1.5)
+
+    assert calls[0]["timeout"] == 1.5
+
+
+def test_native_folder_picker_non_macos_error_points_to_manual_path(monkeypatch):
+    monkeypatch.setattr(folder_picker.platform, "system", lambda: "Linux")
+
+    with pytest.raises(folder_picker.FolderPickerUnavailable, match="type the folder path instead"):
+        folder_picker.pick_folder()
+
+
+def test_local_agent_cloud_local_markdown_sync_pushes_workspace_source(monkeypatch, tmp_path: Path):
+    root = tmp_path / "notes"
+    root.mkdir()
+    (root / "Decision.md").write_text("# Decision\n\nUse the daemon.", encoding="utf-8")
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "local-doc", "document_hash": "hash"})
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-local-sync",
+            "workspace_id": "ws-from-cloud",
+            "operation": "local_markdown_sync",
+            "source_id": "src-local",
+            "payload": {
+                "root": str(root),
+                "vault_id": "engineering",
+                "include": ["*.md", "**/*.md"],
+                "exclude": [],
+                "limit": 1,
+                "process_now": True,
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload["operation"] == "local_markdown_sync"
+    assert payload["source_id"] == "src-local"
+    assert payload["counts"]["pushed"] == 1
+    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_local_markdown_document"]
+    assert len(push_calls) == 1
+    kwargs = push_calls[0][1]
+    assert kwargs["workspace_id"] == "ws-from-cloud"
+    assert kwargs["source_id"] == "src-local"
+    assert kwargs["vault_id"] == "engineering"
+    assert kwargs["relative_path"] == "Decision.md"
+    assert kwargs["process_now"] is True
+
+
+def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
+    from datetime import datetime, timezone
+
+    from memforge.auth import jira_capture
+    from memforge.models import ContentItem, NormalizedContent, RawContent
+
+    class FakeJiraGene:
+        def __init__(self, config, source_id):
+            self.config = config
+            self.source_id = source_id
+            self._client = None
+
+        async def authenticate(self):
+            assert self.config["auth_mode"] == "browser_cookie"
+            assert self.config["jira_cookie"] == "JSESSIONID=local"
+            assert self.config["sync_mode"] == "cloud"
+            assert "local_agent_documents_dir" not in self.config
+            assert "pat" not in self.config
+
+        async def discover(self, since):
+            assert since is None
+            yield ContentItem(
+                item_id="jira-PAY-1",
+                title="Create daemon source support",
+                source_url="https://jira.example.test/browse/PAY-1",
+                last_modified=datetime(2026, 7, 7, tzinfo=timezone.utc),
+                content_type="application/json",
+                space_or_project="PAY",
+                version="v1",
+                author="Andrew",
+                labels=["jira"],
+                extra={"issue_key": "PAY-1"},
+            )
+
+        async def fetch(self, item):
+            return RawContent(item=item, body=b"{}", content_type="application/json")
+
+        async def normalize(self, raw):
+            return NormalizedContent(
+                item=raw.item,
+                markdown_body="# PAY-1\n\nCreate daemon source support.",
+                source_semantics={"issue_key": "PAY-1", "status": "Open"},
+            )
+
+    import memforge.genes.jira_gene as jira_gene
+
+    async def fake_capture(base_url, *, browser=None, tls_config=None):
+        assert base_url == "https://jira.example.test"
+        assert browser == "chrome"
+        assert tls_config["auth_mode"] == "browser_cookie"
+        assert tls_config["sync_mode"] == "cloud"
+        assert "local_agent_documents_dir" not in tls_config
+        assert "pat" not in tls_config
+        return jira_capture.JiraCaptureResult(
+            origin="https://jira.example.test",
+            cookie_header="JSESSIONID=local",
+            browser="chrome",
+            principal={"name": "tester"},
+        )
+
+    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
+    monkeypatch.setattr(jira_gene, "JiraGene", FakeJiraGene)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "jira-doc", "document_hash": "hash"})
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-jira-sync",
+            "workspace_id": "ws-from-cloud",
+            "operation": "jira_sync",
+            "source_id": "src-jira",
+            "payload": {
+                "base_url": "https://jira.example.test",
+                "auth_mode": "browser_cookie",
+                "sync_mode": "local_agent",
+                "local_agent_documents_dir": "/srv/memforge/inbox/src-jira",
+                "pat": "must-not-enter-daemon-runtime-config",
+                "projects": ["PAY"],
+                "limit": 1,
+                "process_now": True,
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        browser="chrome",
+    )
+
+    assert payload["operation"] == "jira_sync"
+    assert payload["counts"] == {"selected": 1, "pushed": 1, "failed": 0}
+    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_jira_document"]
+    assert len(push_calls) == 1
+    kwargs = push_calls[0][1]
+    assert kwargs["workspace_id"] == "ws-from-cloud"
+    assert kwargs["source_id"] == "src-jira"
+    assert kwargs["base_url"] == "https://jira.example.test"
+    assert kwargs["issue_key"] == "PAY-1"
+    assert kwargs["source_semantics"]["status"] == "Open"
+    assert kwargs["process_now"] is False
+    sync_calls = [call for call in FakeToolClient.calls if call[0] == "start_source_sync"]
+    assert len(sync_calls) == 1
+    assert sync_calls[0][1]["source_id"] == "src-jira"
+
+
+def test_local_agent_cloud_jira_sync_rejects_pat_payload():
+    FakeToolClient.reset({"doc_id": "jira-doc", "document_hash": "hash"})
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-jira-sync",
+            "workspace_id": "ws-from-cloud",
+            "operation": "jira_sync",
+            "source_id": "src-jira",
+            "payload": {
+                "base_url": "https://jira.example.test",
+                "auth_mode": "pat",
+                "pat": "should-not-travel",
+                "projects": ["PAY"],
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload["operation"] == "jira_sync"
+    assert payload["error_type"] == "ClickException"
+    assert "browser-session" in payload["error"]
+    assert not [call for call in FakeToolClient.calls if call[0] == "push_jira_document"]
+
+
+def test_local_agent_cloud_jira_sync_starts_source_sync_when_last_push_fails(monkeypatch):
+    from datetime import datetime, timezone
+
+    from memforge.auth import jira_capture
+    from memforge.models import ContentItem, NormalizedContent, RawContent
+
+    class FakeJiraGene:
+        def __init__(self, config, source_id):
+            self.config = config
+            self.source_id = source_id
+            self._client = None
+
+        async def authenticate(self):
+            assert self.config["sync_mode"] == "cloud"
+
+        async def discover(self, since):
+            assert since is None
+            for key in ("PAY-1", "PAY-2"):
+                yield ContentItem(
+                    item_id=f"jira-{key}",
+                    title=f"{key} title",
+                    source_url=f"https://jira.example.test/browse/{key}",
+                    last_modified=datetime(2026, 7, 7, tzinfo=timezone.utc),
+                    content_type="application/json",
+                    space_or_project="PAY",
+                    version="v1",
+                    author="Andrew",
+                    labels=["jira"],
+                    extra={"issue_key": key},
+                )
+
+        async def fetch(self, item):
+            return RawContent(item=item, body=b"{}", content_type="application/json")
+
+        async def normalize(self, raw):
+            key = raw.item.extra["issue_key"]
+            return NormalizedContent(
+                item=raw.item,
+                markdown_body=f"# {key}\n\nLocal daemon package.",
+                source_semantics={"issue_key": key, "status": "Open"},
+            )
+
+    async def fake_capture(base_url, *, browser=None, tls_config=None):
+        return jira_capture.JiraCaptureResult(
+            origin=base_url,
+            cookie_header="JSESSIONID=local",
+            browser=browser,
+            principal={"name": "tester"},
+        )
+
+    def fake_push_jira_document(self, **kwargs):
+        self.calls.append((
+            "push_jira_document",
+            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+        ))
+        if kwargs["issue_key"] == "PAY-2":
+            return {"error": "push failed", "status_code": 500}
+        return {"doc_id": f"jira-{kwargs['issue_key'].lower()}", "document_hash": "hash"}
+
+    import memforge.genes.jira_gene as jira_gene
+
+    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
+    monkeypatch.setattr(jira_gene, "JiraGene", FakeJiraGene)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    monkeypatch.setattr(FakeToolClient, "push_jira_document", fake_push_jira_document)
+    FakeToolClient.reset({})
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-jira-sync",
+            "workspace_id": "ws-from-cloud",
+            "operation": "jira_sync",
+            "source_id": "src-jira",
+            "payload": {
+                "base_url": "https://jira.example.test",
+                "auth_mode": "browser_cookie",
+                "sync_mode": "local_agent",
+                "local_agent_documents_dir": "/srv/memforge/inbox/src-jira",
+                "projects": ["PAY"],
+                "process_now": True,
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        browser="chrome",
+    )
+
+    assert payload["counts"] == {"selected": 2, "pushed": 1, "failed": 1}
+    push_calls = [call[1] for call in FakeToolClient.calls if call[0] == "push_jira_document"]
+    assert [(call["issue_key"], call["process_now"]) for call in push_calls] == [
+        ("PAY-1", False),
+        ("PAY-2", False),
+    ]
+    sync_calls = [call[1] for call in FakeToolClient.calls if call[0] == "start_source_sync"]
+    assert len(sync_calls) == 1
+    assert sync_calls[0]["source_id"] == "src-jira"
 
 
 def test_adapter_github_preview_rejects_truncated_tree(monkeypatch, tmp_path: Path):

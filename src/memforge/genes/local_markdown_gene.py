@@ -78,15 +78,12 @@ class LocalMarkdownGene(Gene):
             groups=[ConfigGroup(key="vault", label="Vault", order=0)],
             fields=[
                 ConfigField(
-                    key="vault_id",
-                    label="Vault ID",
+                    key="root",
+                    label="Folder Path",
                     field_type=ConfigFieldType.STRING,
                     required=True,
-                    placeholder="work-vault",
-                    help_text=(
-                        "Stable identifier the local CLI adapter uses to address this source. "
-                        "Match the vault-id you set with `memforge adapter kb add`."
-                    ),
+                    placeholder="/Users/me/notes",
+                    help_text="Folder path on the machine running the local daemon.",
                     group="vault",
                     order=0,
                 ),
@@ -96,9 +93,29 @@ class LocalMarkdownGene(Gene):
                     field_type=ConfigFieldType.STRING,
                     required=False,
                     placeholder="Engineering notes",
-                    help_text="Optional human-readable label shown alongside the vault id.",
+                    help_text="Optional human-readable label shown in source metadata.",
                     group="vault",
                     order=1,
+                ),
+                ConfigField(
+                    key="include",
+                    label="Include Patterns",
+                    field_type=ConfigFieldType.TAG_LIST,
+                    required=False,
+                    default="*.md,**/*.md,*.markdown,**/*.markdown,*.txt,**/*.txt,*.json,**/*.json,*.html,**/*.html,*.htm,**/*.htm",
+                    help_text="Glob patterns relative to the folder path.",
+                    group="vault",
+                    order=2,
+                ),
+                ConfigField(
+                    key="exclude",
+                    label="Exclude Patterns",
+                    field_type=ConfigFieldType.TAG_LIST,
+                    required=False,
+                    default=".obsidian/**,.trash/**,.git/**,**/.git/**",
+                    help_text="Glob patterns to skip.",
+                    group="vault",
+                    order=3,
                 ),
             ],
         )
