@@ -1910,6 +1910,7 @@ def test_collect_teams_documents_from_cloud_job_uses_gene_window_shape(monkeypat
             assert self.source_id == "src-teams"
             assert self.config["group_chats"] == ["19:conversation@thread.tacv2"]
             assert self.config["conversation_gap_minutes"] == 60
+            assert self.config["ledger_state_path"].endswith("teams-ledger-state.json")
             assert "local_agent_documents_dir" not in self.config
             assert "audit_log_path" not in self.config
 
