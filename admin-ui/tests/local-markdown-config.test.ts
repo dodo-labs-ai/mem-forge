@@ -79,3 +79,9 @@ assert.match(
   /Folder Path/,
   "local_markdown config schema should let the UI collect a daemon-side folder path",
 );
+
+assert.doesNotMatch(
+  localMarkdownGenePy,
+  /Vault ID|vault-id you set|memforge adapter kb add/,
+  "local_markdown config schema should not expose the internal vault id in the normal source form",
+);

@@ -1673,6 +1673,18 @@ def _populate_local_markdown_inbox(
     return _populate_local_adapter_inbox(config, source_id, app_config, key="documents_dir")
 
 
+def _ensure_local_markdown_vault_id(
+    config: dict[str, Any],
+    source_id: str,
+    existing_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cleaned = dict(config)
+    existing_config = existing_config or {}
+    vault_id = str(cleaned.get("vault_id") or existing_config.get("vault_id") or "").strip()
+    cleaned["vault_id"] = vault_id or f"local-{source_id}"
+    return cleaned
+
+
 def _populate_jira_local_agent_inbox(
     config: dict[str, Any],
     source_id: str,
@@ -3767,9 +3779,14 @@ def create_admin_app(
 
         source_id = f"src-{uuid.uuid4().hex[:8]}"
         try:
-            _validate_source_config(req.type, req.config)
+            incoming_config = (
+                _ensure_local_markdown_vault_id(req.config, source_id)
+                if req.type == "local_markdown"
+                else req.config
+            )
+            _validate_source_config(req.type, incoming_config)
             source_config = prepare_source_config_for_storage(
-                req.config,
+                incoming_config,
                 secret_fields=_source_secret_fields(req.type),
             )
             _validate_source_project_binding(req.project_binding)
@@ -3818,9 +3835,14 @@ def create_admin_app(
         name = req.name or existing["name"]
         if req.config is not None:
             try:
-                _validate_source_config(existing["type"], req.config, existing_config=existing["config"])
+                incoming_config = (
+                    _ensure_local_markdown_vault_id(req.config, source_id, existing["config"])
+                    if existing["type"] == "local_markdown"
+                    else req.config
+                )
+                _validate_source_config(existing["type"], incoming_config, existing_config=existing["config"])
                 src_config = prepare_source_config_for_storage(
-                    req.config,
+                    incoming_config,
                     existing_config=existing["config"],
                     secret_fields=_source_secret_fields(existing["type"]),
                 )
