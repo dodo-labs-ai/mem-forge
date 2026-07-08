@@ -61,6 +61,7 @@ assert.equal(Object.hasOwn(payload.config, "group_chats"), false);
 assert.equal(Object.hasOwn(payload.config, "individual_chats"), false);
 
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
+const teamsWizardSource = readFileSync("src/views/sources/TeamsSourceWizard.tsx", "utf8");
 assert.match(
   sourcesPageSource,
   /isTeams\s*\?\s*onTeamsSelected\(\)\s*:\s*onConfigureSelected\(gene\.name\)/,
@@ -75,4 +76,19 @@ assert.match(
   sourcesPageSource,
   /source\.type === "teams"[\s\S]*return "teams_sync"/,
   "Teams source sync should enqueue a local-agent teams_sync job instead of server-side sync",
+);
+assert.match(
+  teamsWizardSource,
+  /operation:\s*"teams_auth"/,
+  "Teams auth should be triggered through the local daemon instead of CLI instructions",
+);
+assert.match(
+  teamsWizardSource,
+  /Connect\s*<\/Button>/,
+  "Teams auth prompt should expose a short Connect action",
+);
+assert.doesNotMatch(
+  teamsWizardSource,
+  /memforge auth teams|\.venv\/bin\/memforge auth teams|Run this from the project directory|Terminal/,
+  "Teams auth prompt should not expose CLI fallback instructions",
 );

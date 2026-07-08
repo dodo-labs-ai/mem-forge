@@ -2119,6 +2119,7 @@ def _run_cloud_local_agent_job(
         "local_markdown_preview_tree": lambda: _run_cloud_local_markdown_preview_job(job),
         "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(job, client),
         "jira_sync": lambda: _run_cloud_jira_sync_job(job, client, browser=browser),
+        "teams_auth": lambda: _run_cloud_teams_auth_job(job),
         "teams_sync": lambda: _run_cloud_teams_sync_job(job, client),
     }
     handler = handlers.get(operation)
@@ -2272,6 +2273,41 @@ def _run_cloud_jira_sync_job(
     elif failed:
         result["error"] = "one or more documents failed to push"
     return result
+
+
+def _run_cloud_teams_auth_job(job: dict[str, Any]) -> dict[str, Any]:
+    from memforge.auth.teams_auth import TeamsAuthenticator
+
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    region = str(payload.get("region") or "emea").strip().lower()
+    if region not in {"emea", "amer", "apac"}:
+        region = "emea"
+    try:
+        token_data = TeamsAuthenticator().authenticate(region=region)
+    except RuntimeError:
+        return {
+            "operation": operation,
+            "authenticated": False,
+            "region": region,
+            "error": "Sign in to Teams in Chrome, then select Connect again.",
+        }
+    except Exception as exc:
+        return {
+            "operation": operation,
+            "authenticated": False,
+            "region": region,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+        }
+
+    tokens = token_data.get("tokens") if isinstance(token_data, dict) else {}
+    return {
+        "operation": operation,
+        "authenticated": True,
+        "region": region,
+        "token_count": len(tokens) if isinstance(tokens, dict) else 0,
+    }
 
 
 def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:
