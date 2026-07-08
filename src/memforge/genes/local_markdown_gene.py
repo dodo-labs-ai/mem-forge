@@ -88,27 +88,14 @@ class LocalMarkdownGene(Gene):
                     order=0,
                 ),
                 ConfigField(
-                    key="vault_id",
-                    label="Vault ID",
-                    field_type=ConfigFieldType.STRING,
-                    required=True,
-                    placeholder="work-vault",
-                    help_text=(
-                        "Stable identifier the local CLI adapter uses to address this source. "
-                        "Match the vault-id you set with `memforge adapter kb add`."
-                    ),
-                    group="vault",
-                    order=1,
-                ),
-                ConfigField(
                     key="display_label",
                     label="Display Label",
                     field_type=ConfigFieldType.STRING,
                     required=False,
                     placeholder="Engineering notes",
-                    help_text="Optional human-readable label shown alongside the vault id.",
+                    help_text="Optional human-readable label shown in source metadata.",
                     group="vault",
-                    order=2,
+                    order=1,
                 ),
                 ConfigField(
                     key="include",
@@ -118,7 +105,7 @@ class LocalMarkdownGene(Gene):
                     default="*.md,**/*.md,*.markdown,**/*.markdown,*.txt,**/*.txt,*.json,**/*.json,*.html,**/*.html,*.htm,**/*.htm",
                     help_text="Glob patterns relative to the folder path.",
                     group="vault",
-                    order=3,
+                    order=2,
                 ),
                 ConfigField(
                     key="exclude",
@@ -128,7 +115,7 @@ class LocalMarkdownGene(Gene):
                     default=".obsidian/**,.trash/**,.git/**,**/.git/**",
                     help_text="Glob patterns to skip.",
                     group="vault",
-                    order=4,
+                    order=3,
                 ),
             ],
         )

@@ -228,7 +228,7 @@ function SourceConfigForm({
           source_type: "local_markdown",
           operation: "local_markdown_preview_tree",
           payload: {
-            ...serializedConfig,
+            ...localMarkdownPreviewJobConfig(serializedConfig, source),
             limit: DISCOVERY_PREVIEW_LIMIT,
           },
         });
@@ -1081,6 +1081,14 @@ function serializeConfig(fields: ConfigField[], config: ConfigForm): ConfigForm 
     }
     return acc;
   }, {});
+}
+
+function localMarkdownPreviewJobConfig(config: ConfigForm, source?: Source | null): ConfigForm {
+  const sourceVaultId = source?.config?.vault_id;
+  return {
+    ...config,
+    vault_id: (typeof sourceVaultId === "string" ? sourceVaultId.trim() : "") || "preview",
+  };
 }
 
 function firstMissingRequiredField(

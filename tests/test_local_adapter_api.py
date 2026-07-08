@@ -135,6 +135,65 @@ def test_create_local_markdown_source_populates_inbox_path(tmp_path):
         asyncio.run(database.close())
 
 
+def test_create_local_markdown_source_generates_internal_vault_id(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/sources",
+                json={
+                    "type": "local_markdown",
+                    "name": "Engineering notes",
+                    "config": {
+                        "root": "/Users/test/engineering-notes",
+                        "display_label": "Engineering notes",
+                    },
+                },
+            )
+            assert response.status_code == 200, response.text
+            source_id = response.json()["id"]
+            row = asyncio.run(database.get_source(source_id))
+        assert row is not None
+        config = row["config"]
+        assert config["vault_id"].startswith("local-")
+        assert config["display_label"] == "Engineering notes"
+        assert Path(config["documents_dir"]).exists()
+    finally:
+        asyncio.run(database.close())
+
+
+def test_update_local_markdown_source_preserves_internal_vault_id(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            created = _create_local_markdown_source(client, vault_id="engineering")
+            response = client.put(
+                f"/api/sources/{created['id']}",
+                json={
+                    "name": "Engineering docs",
+                    "config": {
+                        "root": "/Users/test/engineering-docs",
+                        "display_label": "Engineering docs",
+                    },
+                },
+            )
+            assert response.status_code == 200, response.text
+            row = asyncio.run(database.get_source(created["id"]))
+        assert row is not None
+        assert row["config"]["vault_id"] == "engineering"
+        assert row["config"]["display_label"] == "Engineering docs"
+    finally:
+        asyncio.run(database.close())
+
+
 def test_create_github_repo_source_populates_inbox_path_for_local_push(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
