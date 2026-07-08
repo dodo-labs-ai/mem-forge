@@ -187,6 +187,49 @@ class TestMessageParsing:
         assert parsed["rootMessageId"] == "root-1"
         assert parsed["conversationid"] == "19:channel@example"
 
+    @pytest.mark.asyncio
+    async def test_get_messages_until_keeps_newer_messages_after_old_row_in_same_page(self):
+        client = _TeamsAPIClient(region="emea")
+        client._ensure_clients = AsyncMock()
+        client._chat_client = object()
+
+        old_time = NOW - timedelta(days=2)
+        new_time = NOW
+        cutoff = NOW - timedelta(days=1)
+
+        response = MagicMock()
+        response.json.return_value = {
+            "_metadata": {
+                "backwardLink": "https://teams.cloud.microsoft/opaque/backward",
+            },
+            "messages": [
+                {
+                    "id": "old",
+                    "conversationid": "19:conversation@thread.tacv2",
+                    "content": "<p>too old</p>",
+                    "messagetype": "RichText/Html",
+                    "composetime": old_time.isoformat(),
+                },
+                {
+                    "id": "new",
+                    "conversationid": "19:conversation@thread.tacv2",
+                    "content": "<p>keep me</p>",
+                    "messagetype": "RichText/Html",
+                    "composetime": new_time.isoformat(),
+                },
+            ],
+        }
+        client._request = AsyncMock(return_value=response)
+
+        messages = await client.get_messages_until("19:conversation@thread.tacv2", cutoff)
+
+        assert [message["id"] for message in messages] == ["new"]
+        audits = client.get_poll_audits()
+        assert audits[0]["raw_messages_seen"] == 2
+        assert audits[0]["selected_message_keys_seen"] == 1
+        assert audits[0]["parse_filtered_messages"] == 1
+        assert audits[0]["stop_reason"] == "cutoff_reached"
+
     def test_poll_audit_records_raw_page_counts_without_message_content(self):
         client = _TeamsAPIClient(region="emea")
 
