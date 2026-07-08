@@ -2276,6 +2276,7 @@ def _run_cloud_jira_sync_job(
 
 def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:
     from memforge.local_agent.teams_audit import write_teams_audit_event
+    from memforge.local_agent.teams_ledger import TeamsLedgerStateStore
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
@@ -2285,6 +2286,8 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
 
     run_id = str(job.get("job_id") or f"teams-sync-{int(time.time())}")
     audit_path = Path(str(payload.get("audit_log_path") or DEFAULT_TEAMS_AUDIT_LOG_PATH))
+    ledger_state_path = Path(str(payload.get("ledger_state_path") or DEFAULT_TEAMS_LEDGER_STATE_PATH))
+    ledger_store = TeamsLedgerStateStore(ledger_state_path)
     limit = _cloud_job_limit(payload.get("limit"), default=0)
     try:
         documents = asyncio.run(_collect_teams_documents_from_cloud_job(job, source_id=source_id, limit=limit))
@@ -2305,6 +2308,7 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
 
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    skipped_existing: list[dict[str, Any]] = []
     scoped_client = _workspace_tool_client(client, workspace_id)
     should_process = bool(payload.get("process_now", True))
     submitted_by = str(payload.get("submitted_by") or "memforge-local-agent")
@@ -2314,6 +2318,25 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
         window_id = str(doc["window_id"])
         revision_hash = str(doc["revision_hash"])
         window_id_hash = hashlib.sha256(window_id.encode("utf-8")).hexdigest()
+        if ledger_store.has_receipt(source_id=source_id, window_id=window_id, revision_hash=revision_hash):
+            skipped_existing.append({"window_id": window_id, "revision_hash": revision_hash})
+            write_teams_audit_event(
+                audit_path,
+                {
+                    "event": "teams_window_projection",
+                    "run_id": run_id,
+                    "source_id": source_id,
+                    "raw_conversation_id": doc.get("conversation_id"),
+                    "raw_root_message_id": doc.get("root_message_id"),
+                    "window_id_hash": window_id_hash,
+                    "window_type": doc.get("window_type"),
+                    "revision_hash": revision_hash,
+                    "receipt_status": "existing",
+                    "receipt_skip_reason": "receipt_exists",
+                    "message_count": (doc.get("source_semantics") or {}).get("message_count"),
+                },
+            )
+            continue
         write_teams_audit_event(
             audit_path,
             {
@@ -2378,6 +2401,12 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             "doc_id": response.get("doc_id") if isinstance(response, dict) else None,
             "document_hash": response.get("document_hash") if isinstance(response, dict) else None,
         })
+        ledger_store.record_receipt(
+            source_id=source_id,
+            window_id=window_id,
+            revision_hash=revision_hash,
+            document_hash=response.get("document_hash") if isinstance(response, dict) else None,
+        )
         write_teams_audit_event(
             audit_path,
             {
@@ -2402,9 +2431,15 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
     result = {
         "operation": operation,
         "source_id": source_id,
-        "counts": {"selected": len(documents), "pushed": len(pushed), "failed": len(failed)},
+        "counts": {
+            "selected": len(documents),
+            "pushed": len(pushed),
+            "failed": len(failed),
+            "skipped_existing": len(skipped_existing),
+        },
         "pushed": pushed,
         "failed": failed,
+        "skipped_existing": skipped_existing,
         "sync_started": bool(sync_result and not sync_result.get("error")),
         "audit_log_path": str(audit_path.expanduser()),
     }
@@ -2429,6 +2464,7 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             "selected_windows": len(documents),
             "pushed_windows": len(pushed),
             "failed_windows": len(failed),
+            "skipped_existing_windows": len(skipped_existing),
             "sync_started": result["sync_started"],
             "claim_add": 0,
             "claim_update": 0,

@@ -1836,6 +1836,7 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
     FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
     audit_log_path = tmp_path / "teams-audit.jsonl"
+    ledger_state_path = tmp_path / "teams-ledger.json"
 
     payload = main._run_cloud_local_agent_job(
         {
@@ -1848,13 +1849,14 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
                 "limit": 2,
                 "process_now": True,
                 "audit_log_path": str(audit_log_path),
+                "ledger_state_path": str(ledger_state_path),
             },
         },
         FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
     )
 
     assert payload["operation"] == "teams_sync"
-    assert payload["counts"] == {"selected": 2, "pushed": 2, "failed": 0}
+    assert payload["counts"] == {"selected": 2, "pushed": 2, "failed": 0, "skipped_existing": 0}
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_teams_document"]
     assert len(push_calls) == 2
     first = push_calls[0][1]
@@ -1886,6 +1888,69 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     assert {row["patch_status"] for row in audit_rows if row["event"] == "teams_memory_patch"} == {"pushed"}
     assert audit_rows[-1]["selected_windows"] == 2
     assert audit_rows[-1]["pushed_windows"] == 2
+
+
+def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypatch, tmp_path: Path):
+    from memforge.local_agent.teams_audit import validate_teams_audit_run
+
+    async def fake_collect(job, *, source_id, limit):
+        return [
+            {
+                "conversation_id": "19:conversation@thread.tacv2",
+                "root_message_id": "1783500000000",
+                "window_id": "teams-thread:v1:opaque-window",
+                "window_type": "thread",
+                "revision_hash": "sha256:revision-1",
+                "title": "Thread window",
+                "source_url": "https://teams.microsoft.com/l/message/19:conversation@thread.tacv2/1783500000001",
+                "last_modified": "2026-07-08T09:24:57.5870000Z",
+                "markdown_body": "# Thread window\n\nA redacted package body.",
+                "raw_hash": "sha256:raw-1",
+                "source_semantics": {"message_count": 2, "window_type": "thread"},
+            }
+        ]
+
+    monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect, raising=False)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    audit_log_path = tmp_path / "teams-audit.jsonl"
+    ledger_state_path = tmp_path / "teams-ledger.json"
+    job = {
+        "job_id": "laj-teams-sync",
+        "workspace_id": "ws-from-cloud",
+        "operation": "teams_sync",
+        "source_id": "src-teams",
+        "payload": {
+            "process_now": True,
+            "audit_log_path": str(audit_log_path),
+            "ledger_state_path": str(ledger_state_path),
+        },
+    }
+
+    FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
+    first = main._run_cloud_local_agent_job(
+        job,
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+    assert first["counts"] == {"selected": 1, "pushed": 1, "failed": 0, "skipped_existing": 0}
+    assert len([call for call in FakeToolClient.calls if call[0] == "push_teams_document"]) == 1
+
+    FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
+    second = main._run_cloud_local_agent_job(
+        {**job, "job_id": "laj-teams-sync-retry"},
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert second["counts"] == {"selected": 1, "pushed": 0, "failed": 0, "skipped_existing": 1}
+    assert not [call for call in FakeToolClient.calls if call[0] == "push_teams_document"]
+    assert not [call for call in FakeToolClient.calls if call[0] == "start_source_sync"]
+
+    audit_rows = [json.loads(line) for line in audit_log_path.read_text(encoding="utf-8").splitlines()]
+    second_run = [row for row in audit_rows if row["run_id"] == "laj-teams-sync-retry"]
+    assert validate_teams_audit_run(second_run) == []
+    assert second_run[0]["event"] == "teams_window_projection"
+    assert second_run[0]["receipt_status"] == "existing"
+    assert second_run[0]["receipt_skip_reason"] == "receipt_exists"
+    assert second_run[-1]["skipped_existing_windows"] == 1
 
 
 def test_collect_teams_documents_from_cloud_job_uses_gene_window_shape(monkeypatch):

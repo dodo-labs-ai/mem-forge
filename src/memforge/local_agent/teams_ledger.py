@@ -275,6 +275,31 @@ class TeamsLedgerStateStore:
         }
         return self._save(payload)
 
+    def has_receipt(self, *, source_id: str, window_id: str, revision_hash: str) -> bool:
+        payload = self._load()
+        receipts = payload.get("receipts")
+        if not isinstance(receipts, dict):
+            return False
+        return _receipt_state_key(source_id, window_id, revision_hash) in receipts
+
+    def record_receipt(
+        self,
+        *,
+        source_id: str,
+        window_id: str,
+        revision_hash: str,
+        document_hash: str | None = None,
+    ) -> dict[str, Any]:
+        payload = self._load()
+        receipts = payload.setdefault("receipts", {})
+        receipts[_receipt_state_key(source_id, window_id, revision_hash)] = {
+            "source_id": source_id,
+            "window_id": window_id,
+            "revision_hash": revision_hash,
+            "document_hash": document_hash,
+        }
+        return self._save(payload)
+
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
             return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": {}}
@@ -287,12 +312,16 @@ class TeamsLedgerStateStore:
         conversations = payload.get("conversations")
         if not isinstance(conversations, dict):
             conversations = {}
-        return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": conversations}
+        receipts = payload.get("receipts")
+        if not isinstance(receipts, dict):
+            receipts = {}
+        return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": conversations, "receipts": receipts}
 
     def _save(self, payload: dict[str, Any]) -> dict[str, Any]:
         cleaned = {
             "version": TEAMS_LEDGER_STATE_VERSION,
             "conversations": payload.get("conversations") if isinstance(payload.get("conversations"), dict) else {},
+            "receipts": payload.get("receipts") if isinstance(payload.get("receipts"), dict) else {},
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(dir=str(self.path.parent), prefix=f".{self.path.name}.", suffix=".tmp")
@@ -391,6 +420,10 @@ def _block_from_json(value: dict[str, Any]) -> TeamsBlockProjection:
 
 def _conversation_state_key(source_id: str, conversation_id: str) -> str:
     return _sha256_json({"source_id": source_id, "conversation_id": conversation_id})
+
+
+def _receipt_state_key(source_id: str, window_id: str, revision_hash: str) -> str:
+    return _sha256_json({"source_id": source_id, "window_id": window_id, "revision_hash": revision_hash})
 
 
 def _parse_dt(value: Any) -> datetime:
