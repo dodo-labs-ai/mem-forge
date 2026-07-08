@@ -27,31 +27,13 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
-
-interface SelectionItem {
-  id: string;
-  displayName: string;
-  type: "channel" | "group_chat" | "individual_chat";
-  teamName?: string;
-}
-
-interface SourceConfig {
-  name: string;
-  region: string;
-  max_age_days: number;
-  conversation_gap_minutes: number;
-  max_block_messages: number;
-}
-
-function defaultSourceConfig(): SourceConfig {
-  return {
-    name: "",
-    region: "emea",
-    max_age_days: 90,
-    conversation_gap_minutes: 180,
-    max_block_messages: 100,
-  };
-}
+import {
+  buildDefaultTeamsSourceConfig,
+  buildTeamsSourcePayload,
+  teamsSelectionLabel,
+  type TeamsSelectionItem,
+  type TeamsSourceConfig,
+} from "./teamsSourceConfig";
 
 export function TeamsSourceWizard({
   open,
@@ -84,8 +66,8 @@ function TeamsSourceWizardBody({
   onCreated: () => void;
 }) {
   const [step, setStep] = useState<0 | 1 | 2>(0);
-  const [selections, setSelections] = useState<Map<string, SelectionItem>>(new Map());
-  const [config, setConfig] = useState(defaultSourceConfig);
+  const [selections, setSelections] = useState<Map<string, TeamsSelectionItem>>(new Map());
+  const [config, setConfig] = useState(buildDefaultTeamsSourceConfig);
 
   return (
     <>
@@ -190,8 +172,8 @@ function BrowseSelectStep({
   onNext,
 }: {
   region: string;
-  selections: Map<string, SelectionItem>;
-  onSelectionsChange: (selections: Map<string, SelectionItem>) => void;
+  selections: Map<string, TeamsSelectionItem>;
+  onSelectionsChange: (selections: Map<string, TeamsSelectionItem>) => void;
   onBack: () => void;
   onNext: () => void;
 }) {
@@ -205,7 +187,7 @@ function BrowseSelectStep({
   });
 
   const toggleSelection = useCallback(
-    (item: SelectionItem) => {
+    (item: TeamsSelectionItem) => {
       const next = new Map(selections);
       if (next.has(item.id)) {
         next.delete(item.id);
@@ -230,7 +212,7 @@ function BrowseSelectStep({
     <>
       <div className="space-y-4 p-4">
         <DialogHeader>
-          <DialogTitle>Select conversations to sync</DialogTitle>
+          <DialogTitle>Select Teams conversations to sync</DialogTitle>
         </DialogHeader>
 
         {selections.size > 0 && (
@@ -238,7 +220,7 @@ function BrowseSelectStep({
             {[...selections.values()].map((item) => (
               <Badge key={item.id} variant="secondary" className="gap-1 pr-1">
                 <TypeIcon type={item.type} className="size-3" />
-                <span className="max-w-[160px] truncate text-xs">{item.displayName}</span>
+                <span className="max-w-[180px] truncate text-xs">{teamsSelectionLabel(item)}</span>
                 <button
                   type="button"
                   onClick={() => toggleSelection(item)}
@@ -318,9 +300,9 @@ function ConfirmStep({
   onBack,
   onCreated,
 }: {
-  selections: Map<string, SelectionItem>;
-  config: SourceConfig;
-  onConfigChange: (config: SourceConfig) => void;
+  selections: Map<string, TeamsSelectionItem>;
+  config: TeamsSourceConfig;
+  onConfigChange: (config: TeamsSourceConfig) => void;
   onBack: () => void;
   onCreated: () => void;
 }) {
@@ -335,28 +317,12 @@ function ConfirmStep({
   });
 
   const selectedItems = [...selections.values()];
-  const updateNumber = (field: keyof SourceConfig, fallback: number) => (value: string) => {
+  const updateNumber = (field: keyof TeamsSourceConfig, fallback: number) => (value: string) => {
     onConfigChange({ ...config, [field]: Number(value) || fallback });
   };
 
   const handleCreate = () => {
-    const channels = selectedItems.filter((item) => item.type === "channel").map((item) => item.id).join(", ");
-    const groupChats = selectedItems.filter((item) => item.type === "group_chat").map((item) => item.id).join(", ");
-    const individualChats = selectedItems.filter((item) => item.type === "individual_chat").map((item) => item.id).join(", ");
-
-    createSource.mutate({
-      type: "teams",
-      name: config.name,
-      config: {
-        region: config.region,
-        ...(channels && { channels }),
-        ...(groupChats && { group_chats: groupChats }),
-        ...(individualChats && { individual_chats: individualChats }),
-        max_age_days: config.max_age_days,
-        conversation_gap_minutes: config.conversation_gap_minutes,
-        max_block_messages: config.max_block_messages,
-      },
-    });
+    createSource.mutate(buildTeamsSourcePayload({ selections: selectedItems, config }));
   };
 
   return (
@@ -374,13 +340,12 @@ function ConfirmStep({
           />
         </Field>
 
-        <Field label={`Selected conversations (${selectedItems.length})`}>
+        <Field label={`Selected Teams conversations (${selectedItems.length})`}>
           <div className="flex flex-wrap gap-1.5">
             {selectedItems.map((item) => (
               <Badge key={item.id} variant="secondary" className="gap-1">
                 <TypeIcon type={item.type} className="size-3" />
-                {item.teamName && <span className="text-muted-foreground">{item.teamName}/</span>}
-                {item.displayName}
+                {teamsSelectionLabel(item)}
               </Badge>
             ))}
           </div>
@@ -393,7 +358,7 @@ function ConfirmStep({
             <Input type="number" value={config.max_age_days} onChange={(event) => updateNumber("max_age_days", 90)(event.target.value)} />
           </Field>
           <Field label="Gap (minutes)">
-            <Input type="number" value={config.conversation_gap_minutes} onChange={(event) => updateNumber("conversation_gap_minutes", 180)(event.target.value)} />
+            <Input type="number" value={config.conversation_gap_minutes} onChange={(event) => updateNumber("conversation_gap_minutes", 60)(event.target.value)} />
           </Field>
           <Field label="Max messages/block">
             <Input type="number" value={config.max_block_messages} onChange={(event) => updateNumber("max_block_messages", 100)(event.target.value)} />
@@ -422,10 +387,10 @@ function ConfirmStep({
   );
 }
 
-function flattenTeamsData(data: TeamsBrowseData | undefined): SelectionItem[] {
+function flattenTeamsData(data: TeamsBrowseData | undefined): TeamsSelectionItem[] {
   if (!data) return [];
 
-  const channels: SelectionItem[] = data.teams.flatMap((team) =>
+  const channels: TeamsSelectionItem[] = data.teams.flatMap((team) =>
     team.channels.map((channel: TeamsChannel) => ({
       id: channel.id,
       displayName: channel.displayName,
@@ -433,12 +398,12 @@ function flattenTeamsData(data: TeamsBrowseData | undefined): SelectionItem[] {
       teamName: team.displayName,
     })),
   );
-  const groups: SelectionItem[] = data.group_chats.map((chat) => ({
+  const groups: TeamsSelectionItem[] = data.group_chats.map((chat) => ({
     id: chat.id,
     displayName: chat.topic,
     type: "group_chat",
   }));
-  const dms: SelectionItem[] = data.individual_chats.map((chat) => ({
+  const dms: TeamsSelectionItem[] = data.individual_chats.map((chat) => ({
     id: chat.id,
     displayName: chat.topic,
     type: "individual_chat",
@@ -460,7 +425,7 @@ function TypeIcon({
   type,
   className,
 }: {
-  type: SelectionItem["type"];
+  type: TeamsSelectionItem["type"];
   className?: string;
 }) {
   if (type === "channel") return <Hash className={className} />;

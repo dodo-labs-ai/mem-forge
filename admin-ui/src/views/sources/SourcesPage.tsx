@@ -87,6 +87,7 @@ function localAgentSyncOperation(source: Source): string | null {
     return "local_markdown_sync";
   }
   if (source.type === "jira" && String(source.config.sync_mode ?? "cloud") === "local_agent") return "jira_sync";
+  if (source.type === "teams") return "teams_sync";
   return null;
 }
 
@@ -981,15 +982,10 @@ function AddSourceDialog({
           <Button
             type="button"
             size="sm"
-            onClick={() => onConfigureSelected(gene.name)}
+            onClick={() => (isTeams ? onTeamsSelected() : onConfigureSelected(gene.name))}
           >
-            Configure
+            {isTeams ? "Browse Teams" : "Configure"}
           </Button>
-          {isTeams && (
-            <Button type="button" size="sm" variant="outline" onClick={onTeamsSelected}>
-              Browse Teams
-            </Button>
-          )}
         </div>
       </div>
     );
