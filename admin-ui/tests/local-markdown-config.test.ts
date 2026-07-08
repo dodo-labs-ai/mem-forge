@@ -29,6 +29,18 @@ assert.match(
 
 assert.match(
   sourceConfigDialogSource,
+  /local_markdown_pick_root/,
+  "SourceConfigDialog should let local_markdown choose a folder through the local-agent queue",
+);
+
+assert.match(
+  sourceConfigDialogSource,
+  /Choose folder/,
+  "SourceConfigDialog should expose a friendly folder picker action",
+);
+
+assert.match(
+  sourceConfigDialogSource,
   /pollLocalAgentPreviewJob/,
   "SourceConfigDialog should poll the local-agent preview job",
 );

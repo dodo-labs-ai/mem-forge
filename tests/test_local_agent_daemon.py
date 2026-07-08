@@ -277,6 +277,70 @@ def test_local_agent_leases_runs_and_completes_cloud_jobs(tmp_path):
     assert report["results"][0]["task_id"] == "cloud-job:laj-1"
 
 
+def test_local_agent_cloud_job_loop_uses_long_poll_without_profile_tasks(tmp_path):
+    from memforge.local_agent.runner import LocalAgentRunner
+    from memforge.local_agent.state import LocalAgentStateStore
+    from memforge.local_agent.tasks import LocalAgentHandlers
+
+    lease_requests: list[dict] = []
+    profile_calls: list[str] = []
+
+    def lease_cloud_jobs(*, wait_seconds: int = 0) -> dict:
+        lease_requests.append({"wait_seconds": wait_seconds})
+        return {"jobs": []}
+
+    runner = LocalAgentRunner(
+        adapter_config={
+            "kb": {"notes": {"root": "/repo", "vault_id": "notes", "source_id": "src-notes"}},
+        },
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        handlers=LocalAgentHandlers(
+            run_kb_profile=lambda name: profile_calls.append(name) or {"counts": {"pushed": 1}},
+            run_github_profile=lambda name: {},
+            run_jira_auth=lambda origin, last_hash=None: {"action": "unchanged"},
+        ),
+        cloud_jobs_provider=lease_cloud_jobs,
+    )
+
+    report = runner.run_cloud_jobs_once(
+        now=datetime(2026, 7, 7, tzinfo=timezone.utc),
+        wait_seconds=25,
+    )
+
+    assert report["counts"] == {"total": 0, "success": 0, "failed": 0, "skipped": 0}
+    assert lease_requests == [{"wait_seconds": 25}]
+    assert profile_calls == []
+
+
+def test_local_agent_cloud_job_loop_sleeps_after_lease_failure(tmp_path):
+    from memforge.local_agent.runner import LocalAgentRunner
+    from memforge.local_agent.state import LocalAgentStateStore
+    from memforge.local_agent.tasks import LocalAgentHandlers
+
+    sleeps: list[float] = []
+
+    runner = LocalAgentRunner(
+        adapter_config={},
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        handlers=LocalAgentHandlers(
+            run_kb_profile=lambda name: {},
+            run_github_profile=lambda name: {},
+            run_jira_auth=lambda origin, last_hash=None: {"action": "unchanged"},
+        ),
+        cloud_jobs_provider=lambda wait_seconds=0: (_ for _ in ()).throw(RuntimeError("cloud unavailable")),
+    )
+
+    runner.run_forever(
+        include_jira=False,
+        poll_interval_seconds=7,
+        cloud_job_wait_seconds=25,
+        stop_after_iterations=2,
+        sleep=sleeps.append,
+    )
+
+    assert sleeps == [7]
+
+
 def test_local_agent_cloud_lease_failure_does_not_abort_profile_tasks(tmp_path):
     from memforge.local_agent.runner import LocalAgentRunner
     from memforge.local_agent.state import LocalAgentStateStore

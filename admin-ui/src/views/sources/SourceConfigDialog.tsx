@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, Check, ChevronRight, Loader2, RefreshCw } from "lucide-react";
+import { AlertCircle, Check, ChevronRight, FolderOpen, Loader2, RefreshCw } from "lucide-react";
 import client from "@/api/client";
 import type {
   ConfigField,
@@ -246,6 +246,33 @@ function SourceConfigForm({
         .then((response) => response.data as DiscoveryPreviewResponse);
     },
   });
+  const pickLocalMarkdownRoot = useMutation<string, unknown, void>({
+    mutationFn: async () => {
+      const created = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
+        source_id: source?.id ?? "",
+        source_type: "local_markdown",
+        operation: "local_markdown_pick_root",
+        payload: {
+          title: "Choose folder to sync",
+          initial_directory: stringValue(config.root).trim() || undefined,
+        },
+      });
+      const status = await pollLocalAgentPreviewJob(created.data.job_id);
+      if (status.status === "failed") {
+        throw new Error(status.last_error || "Local daemon could not open the folder picker.");
+      }
+      const result = status.result as { root?: unknown } | null;
+      const root = typeof result?.root === "string" ? result.root.trim() : "";
+      if (!root) {
+        throw new Error("Local daemon did not return a folder path.");
+      }
+      return root;
+    },
+    onSuccess: (root) => {
+      setValidationMessage(null);
+      setConfig((current) => ({ ...current, root }));
+    },
+  });
 
   const fieldsByGroup = useMemo(() => {
     const fields = [...schema.fields].sort((a, b) => a.order - b.order);
@@ -360,6 +387,13 @@ function SourceConfigForm({
                     />
                     {sourceType === "confluence" && field.key === "base_url" && confluenceUrlInfo && (
                       <ConfluenceDetectedPanel info={confluenceUrlInfo} />
+                    )}
+                    {sourceType === "local_markdown" && field.key === "root" && (
+                      <LocalMarkdownFolderPickerPanel
+                        isPending={pickLocalMarkdownRoot.isPending}
+                        error={pickLocalMarkdownRoot.isError ? pickLocalMarkdownRoot.error : null}
+                        onChoose={() => pickLocalMarkdownRoot.mutate()}
+                      />
                     )}
                     {sourceType === "jira" && field.key === "jql" && (
                       <JiraEffectiveQueryPanel jql={stringValue(config.jql)} />
@@ -790,6 +824,26 @@ function parseGitHubRepoUrl(repoUrl: string): { host: string; owner: string; rep
   } catch {
     return null;
   }
+}
+
+function LocalMarkdownFolderPickerPanel({
+  isPending,
+  error,
+  onChoose,
+}: {
+  isPending: boolean;
+  error: unknown;
+  onChoose: () => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <Button type="button" variant="outline" size="sm" onClick={onChoose} disabled={isPending}>
+        {isPending ? <Loader2 className="size-3.5 animate-spin" /> : <FolderOpen className="size-3.5" />}
+        Choose folder
+      </Button>
+      {error ? <span className="text-xs text-destructive">{extractSaveError(error)}</span> : null}
+    </div>
+  );
 }
 
 function GitHubRepoDetectedPanel({ repoUrl }: { repoUrl: string }) {

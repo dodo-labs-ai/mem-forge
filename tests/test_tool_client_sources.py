@@ -183,7 +183,7 @@ def test_start_source_sync_posts_source_sync_payload():
 def test_local_agent_job_methods_use_cloud_local_agent_contract():
     client = _RecordingClient({"jobs": []})
 
-    lease = client.lease_local_agent_jobs(limit=3, lease_seconds=120)
+    lease = client.lease_local_agent_jobs(limit=3, lease_seconds=120, wait_seconds=25)
     complete = client.complete_local_agent_job(
         "laj-1",
         attempt_count=2,
@@ -197,7 +197,7 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
         (
             "POST",
             "/api/cloud/local-agent/jobs/lease",
-            {"limit": 3, "lease_seconds": 120},
+            {"limit": 3, "lease_seconds": 120, "wait_seconds": 25},
         ),
         (
             "POST",
@@ -216,7 +216,7 @@ def test_local_agent_job_lease_default_matches_ui_sync_wait_window():
         (
             "POST",
             "/api/cloud/local-agent/jobs/lease",
-            {"limit": 5, "lease_seconds": 3600},
+            {"limit": 5, "lease_seconds": 3600, "wait_seconds": 0},
         )
     ]
 

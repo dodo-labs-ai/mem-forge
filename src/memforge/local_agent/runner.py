@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import inspect
 import time
 from typing import Any, Callable
 
@@ -27,7 +28,7 @@ class LocalAgentRunner:
         state_store: LocalAgentStateStore,
         handlers: LocalAgentHandlers,
         jira_origins_provider: Callable[[], dict[str, Any]] | None = None,
-        cloud_jobs_provider: Callable[[], dict[str, Any]] | None = None,
+        cloud_jobs_provider: Callable[..., dict[str, Any]] | None = None,
         cloud_job_completer: Callable[[str, int, str, dict[str, Any], str | None], dict[str, Any]] | None = None,
         default_sync_interval_seconds: int = 3600,
         jira_interval_seconds: int = 1800,
@@ -62,6 +63,36 @@ class LocalAgentRunner:
         only_due: bool = False,
     ) -> dict[str, Any]:
         now = now or datetime.now(timezone.utc)
+        results: list[dict[str, Any]] = []
+        results.extend(self._run_scheduled_tasks(now=now, include_jira=include_jira, only_due=only_due))
+        results.extend(self._run_cloud_jobs(now=now, wait_seconds=0))
+        return _runner_report(results)
+
+    def run_cloud_jobs_once(
+        self,
+        *,
+        now: datetime | None = None,
+        wait_seconds: int = 0,
+    ) -> dict[str, Any]:
+        """Lease and execute only Cloud-triggered jobs.
+
+        This is the interactive control-plane path used by the foreground
+        daemon loop. It intentionally skips scheduled local profile/Jira tasks
+        so UI-triggered work is not tied to source sync cadence.
+        """
+        results = self._run_cloud_jobs(
+            now=now or datetime.now(timezone.utc),
+            wait_seconds=wait_seconds,
+        )
+        return _runner_report(results)
+
+    def _run_scheduled_tasks(
+        self,
+        *,
+        now: datetime,
+        include_jira: bool,
+        only_due: bool,
+    ) -> list[dict[str, Any]]:
         tasks = self.discover_tasks(include_jira=False)
         results: list[dict[str, Any]] = []
         if include_jira:
@@ -78,7 +109,16 @@ class LocalAgentRunner:
             result = self._run_task(task, now, _previous_state_result(state, task.task_id))
             self.state_store.record_result(task.task_id, result)
             results.append(result)
-        cloud_jobs, cloud_discovery_result = self._lease_cloud_jobs(now)
+        return results
+
+    def _run_cloud_jobs(
+        self,
+        *,
+        now: datetime,
+        wait_seconds: int,
+    ) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        cloud_jobs, cloud_discovery_result = self._lease_cloud_jobs(now, wait_seconds=wait_seconds)
         if cloud_discovery_result is not None:
             self.state_store.record_result(cloud_discovery_result["task_id"], cloud_discovery_result)
             results.append(cloud_discovery_result)
@@ -86,22 +126,14 @@ class LocalAgentRunner:
             result = self._run_cloud_job(job, now)
             self.state_store.record_result(result["task_id"], result)
             results.append(result)
-        return {
-            "status": "ok",
-            "counts": {
-                "total": len(results),
-                "success": sum(1 for item in results if item["status"] == "success"),
-                "failed": sum(1 for item in results if item["status"] == "failed"),
-                "skipped": sum(1 for item in results if item["status"] == "skipped"),
-            },
-            "results": results,
-        }
+        return results
 
     def run_forever(
         self,
         *,
         include_jira: bool = True,
         poll_interval_seconds: int = 60,
+        cloud_job_wait_seconds: int = 0,
         stop_after_iterations: int | None = None,
         sleep: Callable[[float], None] = time.sleep,
         log: Callable[[str], None] | None = None,
@@ -109,8 +141,18 @@ class LocalAgentRunner:
         iterations = 0
         while True:
             try:
-                self.run_once(include_jira=include_jira, only_due=True)
+                if int(cloud_job_wait_seconds) <= 0:
+                    self.run_once(include_jira=include_jira, only_due=True)
+                    cloud_results = []
+                else:
+                    now = datetime.now(timezone.utc)
+                    self._run_scheduled_tasks(now=now, include_jira=include_jira, only_due=True)
+                    cloud_results = self._run_cloud_jobs(
+                        now=datetime.now(timezone.utc),
+                        wait_seconds=max(int(cloud_job_wait_seconds), 0),
+                    )
             except Exception as exc:
+                cloud_results = []
                 if log is not None:
                     log(f"Local agent daemon iteration failed: {exc}")
                 try:
@@ -122,7 +164,12 @@ class LocalAgentRunner:
             iterations += 1
             if stop_after_iterations is not None and iterations >= stop_after_iterations:
                 return
-            sleep(max(int(poll_interval_seconds), 1))
+            if (
+                int(cloud_job_wait_seconds) <= 0
+                or self.cloud_jobs_provider is None
+                or _cloud_lease_failed(cloud_results)
+            ):
+                sleep(max(int(poll_interval_seconds), 1))
 
     def _run_task(
         self,
@@ -229,11 +276,16 @@ class LocalAgentRunner:
                 "error_type": type(exc).__name__,
             }
 
-    def _lease_cloud_jobs(self, now: datetime) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    def _lease_cloud_jobs(
+        self,
+        now: datetime,
+        *,
+        wait_seconds: int = 0,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         if self.cloud_jobs_provider is None:
             return [], None
         try:
-            response = self.cloud_jobs_provider()
+            response = _call_cloud_jobs_provider(self.cloud_jobs_provider, wait_seconds=wait_seconds)
         except Exception as exc:  # cloud polling must not block local profile work
             started_at = now.isoformat()
             return [], _cloud_job_failed_result(
@@ -317,6 +369,40 @@ def _payload_error(task: LocalAgentTask, payload: dict[str, Any]) -> str | None:
         if action and action not in {"uploaded", "unchanged"}:
             return f"Jira browser-session refresh returned {action}"
     return None
+
+
+def _runner_report(results: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "counts": {
+            "total": len(results),
+            "success": sum(1 for item in results if item["status"] == "success"),
+            "failed": sum(1 for item in results if item["status"] == "failed"),
+            "skipped": sum(1 for item in results if item["status"] == "skipped"),
+        },
+        "results": results,
+    }
+
+
+def _cloud_lease_failed(results: list[dict[str, Any]]) -> bool:
+    return any(
+        result.get("task_id") == "cloud-jobs:lease" and result.get("status") == "failed"
+        for result in results
+    )
+
+
+def _call_cloud_jobs_provider(
+    provider: Callable[..., dict[str, Any]],
+    *,
+    wait_seconds: int,
+) -> dict[str, Any]:
+    try:
+        signature = inspect.signature(provider)
+    except (TypeError, ValueError):
+        return provider()
+    if "wait_seconds" in signature.parameters:
+        return provider(wait_seconds=wait_seconds)
+    return provider()
 
 
 def _previous_state_result(state: dict[str, Any], task_id: str) -> dict[str, Any] | None:

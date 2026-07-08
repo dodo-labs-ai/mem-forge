@@ -1449,6 +1449,57 @@ def test_local_agent_cloud_local_markdown_preview_uses_job_payload(tmp_path: Pat
     assert [item["relative_path"] for item in payload["items"]] == ["Decision.md"]
 
 
+def test_local_agent_cloud_local_markdown_pick_root_uses_local_picker(monkeypatch, tmp_path: Path):
+    selected = tmp_path / "notes"
+    selected.mkdir()
+    calls: list[dict] = []
+
+    def fake_pick_folder(*, title: str | None = None, initial_directory: str | None = None) -> str:
+        calls.append({"title": title, "initial_directory": initial_directory})
+        return str(selected)
+
+    monkeypatch.setattr(main, "pick_folder", fake_pick_folder)
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-pick-root",
+            "operation": "local_markdown_pick_root",
+            "payload": {
+                "title": "Choose folder to sync",
+                "initial_directory": str(tmp_path),
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload == {
+        "operation": "local_markdown_pick_root",
+        "root": str(selected),
+    }
+    assert calls == [{"title": "Choose folder to sync", "initial_directory": str(tmp_path)}]
+
+
+def test_local_agent_cloud_local_markdown_pick_root_reports_cancellation(monkeypatch):
+    def fake_pick_folder(*, title: str | None = None, initial_directory: str | None = None) -> str:
+        raise main.FolderPickerCancelled("folder selection cancelled")
+
+    monkeypatch.setattr(main, "pick_folder", fake_pick_folder)
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-pick-root",
+            "operation": "local_markdown_pick_root",
+            "payload": {"title": "Choose folder to sync"},
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload == {
+        "operation": "local_markdown_pick_root",
+        "error": "folder selection cancelled",
+    }
+
+
 def test_local_agent_cloud_local_markdown_sync_pushes_workspace_source(monkeypatch, tmp_path: Path):
     root = tmp_path / "notes"
     root.mkdir()
