@@ -165,6 +165,51 @@ def test_push_jira_document_posts_jira_payload_without_file_path_field():
     ]
 
 
+def test_push_teams_document_posts_window_payload():
+    client = _RecordingClient({"doc_id": "teams-doc"})
+
+    result = client.push_teams_document(
+        source_id="src-teams",
+        conversation_id="19:channel@example.test",
+        window_id="teams-thread:src-teams:conv:root",
+        revision_hash="rev-1",
+        markdown_body="# Teams Window\n\nDecision captured.",
+        title="Teams decision",
+        root_message_id="root-1",
+        window_type="thread",
+        source_url="teams-window://src-teams/conv/window/rev-1",
+        raw_hash="raw-1",
+        source_semantics={"message_count": 3},
+        submitted_by="codex",
+        submitted_at="2026-07-08T08:00:00Z",
+        process_now=True,
+    )
+
+    assert result["doc_id"] == "teams-doc"
+    assert client.calls == [
+        (
+            "POST",
+            "/api/sources/src-teams/adapter/documents",
+            {
+                "conversation_id": "19:channel@example.test",
+                "window_id": "teams-thread:src-teams:conv:root",
+                "revision_hash": "rev-1",
+                "markdown_body": "# Teams Window\n\nDecision captured.",
+                "content_type": "text/markdown",
+                "process_now": True,
+                "title": "Teams decision",
+                "root_message_id": "root-1",
+                "window_type": "thread",
+                "source_url": "teams-window://src-teams/conv/window/rev-1",
+                "raw_hash": "raw-1",
+                "source_semantics": {"message_count": 3},
+                "submitted_by": "codex",
+                "submitted_at": "2026-07-08T08:00:00Z",
+            },
+        )
+    ]
+
+
 def test_start_source_sync_posts_source_sync_payload():
     client = _RecordingClient({"ok": True})
 
