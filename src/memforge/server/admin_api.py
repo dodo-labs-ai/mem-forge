@@ -1685,6 +1685,19 @@ def _ensure_local_markdown_vault_id(
     return cleaned
 
 
+def _ensure_jira_sync_mode(
+    config: dict[str, Any],
+    existing_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cleaned = dict(config)
+    existing_config = existing_config or {}
+    if not str(cleaned.get("sync_mode") or "").strip():
+        sync_mode = str(existing_config.get("sync_mode") or "").strip()
+        if sync_mode:
+            cleaned["sync_mode"] = sync_mode
+    return cleaned
+
+
 def _populate_jira_local_agent_inbox(
     config: dict[str, Any],
     source_id: str,
@@ -3840,6 +3853,8 @@ def create_admin_app(
                     if existing["type"] == "local_markdown"
                     else req.config
                 )
+                if existing["type"] == "jira":
+                    incoming_config = _ensure_jira_sync_mode(incoming_config, existing["config"])
                 _validate_source_config(existing["type"], incoming_config, existing_config=existing["config"])
                 src_config = prepare_source_config_for_storage(
                     incoming_config,

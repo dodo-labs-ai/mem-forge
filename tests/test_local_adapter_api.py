@@ -300,6 +300,41 @@ def test_jira_local_agent_mode_rejects_pat_auth(tmp_path):
         asyncio.run(database.close())
 
 
+def test_update_jira_local_agent_source_preserves_sync_mode_when_omitted(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            created = _create_jira_source(client)
+            source_id = created["id"]
+            before = asyncio.run(database.get_source(source_id))
+            assert before is not None
+            initial_documents_dir = before["config"]["local_agent_documents_dir"]
+            response = client.put(
+                f"/api/sources/{source_id}",
+                json={
+                    "config": {
+                        "base_url": "https://jira.example.test",
+                        "auth_mode": "browser_cookie",
+                        "projects": ["PAY", "ENG"],
+                        "issue_types": ["Task"],
+                        "include_comments": True,
+                    }
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        row = asyncio.run(database.get_source(source_id))
+        assert row is not None
+        assert row["config"]["sync_mode"] == "local_agent"
+        assert row["config"]["local_agent_documents_dir"] == initial_documents_dir
+    finally:
+        asyncio.run(database.close())
+
+
 def test_jira_local_agent_package_discovery_normalizes_naive_timestamps(tmp_path):
     from datetime import datetime, timezone
 
