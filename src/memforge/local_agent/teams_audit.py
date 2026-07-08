@@ -91,6 +91,7 @@ def validate_teams_audit_run(events: Iterable[Mapping[str, Any]]) -> list[str]:
             _validate_poll(run_id, poll, errors)
         _validate_projection_linkage(run_id, projections, patches, errors)
         if summaries:
+            _validate_window_totals(run_id, summaries[-1], projections, patches, errors)
             _validate_claim_totals(run_id, summaries[-1], patches, errors)
 
     return errors
@@ -179,6 +180,30 @@ def _validate_claim_totals(
         actual = sum(_int_value(patch.get(key)) for patch in patches)
         if expected != actual:
             errors.append(f"sync summary {key} does not match memory patches for run {run_id}")
+
+
+def _validate_window_totals(
+    run_id: str,
+    summary: Mapping[str, Any],
+    projections: list[Mapping[str, Any]],
+    patches: list[Mapping[str, Any]],
+    errors: list[str],
+) -> None:
+    if "selected_windows" in summary and _int_value(summary.get("selected_windows")) != len(projections):
+        errors.append(f"sync summary selected_windows does not match projections for run {run_id}")
+
+    pushed_patches = [
+        patch for patch in patches
+        if str(patch.get("patch_status") or "pushed") == "pushed"
+    ]
+    failed_patches = [
+        patch for patch in patches
+        if str(patch.get("patch_status") or "") == "failed"
+    ]
+    if "pushed_windows" in summary and _int_value(summary.get("pushed_windows")) != len(pushed_patches):
+        errors.append(f"sync summary pushed_windows does not match pushed patches for run {run_id}")
+    if "failed_windows" in summary and _int_value(summary.get("failed_windows")) != len(failed_patches):
+        errors.append(f"sync summary failed_windows does not match failed patches for run {run_id}")
 
 
 def _stable_hash(value: Any) -> str:

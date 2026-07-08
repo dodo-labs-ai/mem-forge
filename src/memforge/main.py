@@ -53,6 +53,7 @@ log_console = Console(stderr=True)
 DEFAULT_CLI_CONFIG_PATH = Path.home() / ".memforge" / "cli.toml"
 DEFAULT_ADAPTER_CONFIG_PATH = Path.home() / ".memforge" / "adapter.toml"
 DEFAULT_LOCAL_AGENT_STATE_PATH = Path.home() / ".memforge" / "local-agent-state.json"
+DEFAULT_TEAMS_AUDIT_LOG_PATH = Path.home() / ".memforge" / "teams-sync-audit.jsonl"
 DEFAULT_KB_INCLUDE = [
     "*.md", "**/*.md",
     "*.markdown", "**/*.markdown",
@@ -2117,6 +2118,7 @@ def _run_cloud_local_agent_job(
         "local_markdown_preview_tree": lambda: _run_cloud_local_markdown_preview_job(job),
         "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(job, client),
         "jira_sync": lambda: _run_cloud_jira_sync_job(job, client, browser=browser),
+        "teams_sync": lambda: _run_cloud_teams_sync_job(job, client),
     }
     handler = handlers.get(operation)
     if handler is None:
@@ -2271,6 +2273,172 @@ def _run_cloud_jira_sync_job(
     return result
 
 
+def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:
+    from memforge.local_agent.teams_audit import write_teams_audit_event
+
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    if error:
+        return error
+
+    run_id = str(job.get("job_id") or f"teams-sync-{int(time.time())}")
+    audit_path = Path(str(payload.get("audit_log_path") or DEFAULT_TEAMS_AUDIT_LOG_PATH))
+    limit = _cloud_job_limit(payload.get("limit"), default=0)
+    try:
+        documents = asyncio.run(_collect_teams_documents_from_cloud_job(job, source_id=source_id, limit=limit))
+    except Exception as exc:
+        write_teams_audit_event(
+            audit_path,
+            {
+                "event": "teams_sync_run",
+                "run_id": run_id,
+                "operation": operation,
+                "source_id": source_id,
+                "status": "collect_failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+        return {"operation": operation, "source_id": source_id, "error": str(exc), "error_type": type(exc).__name__}
+
+    pushed: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    scoped_client = _workspace_tool_client(client, workspace_id)
+    should_process = bool(payload.get("process_now", True))
+    submitted_by = str(payload.get("submitted_by") or "memforge-local-agent")
+    sync_result: dict[str, Any] | None = None
+
+    for doc in documents:
+        window_id = str(doc["window_id"])
+        revision_hash = str(doc["revision_hash"])
+        window_id_hash = hashlib.sha256(window_id.encode("utf-8")).hexdigest()
+        write_teams_audit_event(
+            audit_path,
+            {
+                "event": "teams_window_projection",
+                "run_id": run_id,
+                "source_id": source_id,
+                "raw_conversation_id": doc.get("conversation_id"),
+                "raw_root_message_id": doc.get("root_message_id"),
+                "window_id_hash": window_id_hash,
+                "window_type": doc.get("window_type"),
+                "revision_hash": revision_hash,
+                "receipt_status": "new",
+                "message_count": (doc.get("source_semantics") or {}).get("message_count"),
+            },
+        )
+        response = scoped_client.push_teams_document(
+            source_id=source_id,
+            conversation_id=str(doc["conversation_id"]),
+            root_message_id=str(doc.get("root_message_id") or ""),
+            window_id=window_id,
+            window_type=str(doc.get("window_type") or ""),
+            revision_hash=revision_hash,
+            markdown_body=str(doc["markdown_body"]),
+            title=str(doc["title"]),
+            source_url=str(doc.get("source_url") or ""),
+            last_modified=str(doc.get("last_modified") or ""),
+            raw_hash=str(doc["raw_hash"]),
+            source_semantics=doc.get("source_semantics") if isinstance(doc.get("source_semantics"), dict) else {},
+            submitted_by=submitted_by,
+            process_now=False,
+        )
+        if isinstance(response, dict) and response.get("error"):
+            failed.append({
+                "window_id": window_id,
+                "revision_hash": revision_hash,
+                "error": response.get("error"),
+                "detail": response.get("detail"),
+                "status_code": response.get("status_code"),
+            })
+            write_teams_audit_event(
+                audit_path,
+                {
+                    "event": "teams_memory_patch",
+                    "run_id": run_id,
+                    "source_id": source_id,
+                    "window_id_hash": window_id_hash,
+                    "revision_hash": revision_hash,
+                    "patch_status": "failed",
+                    "error": response.get("error"),
+                    "status_code": response.get("status_code"),
+                    "claim_add": 0,
+                    "claim_update": 0,
+                    "claim_supersede": 0,
+                    "claim_noop": 0,
+                    "claim_rejected_ambiguous": 0,
+                },
+            )
+            continue
+        pushed.append({
+            "window_id": window_id,
+            "revision_hash": revision_hash,
+            "doc_id": response.get("doc_id") if isinstance(response, dict) else None,
+            "document_hash": response.get("document_hash") if isinstance(response, dict) else None,
+        })
+        write_teams_audit_event(
+            audit_path,
+            {
+                "event": "teams_memory_patch",
+                "run_id": run_id,
+                "source_id": source_id,
+                "window_id_hash": window_id_hash,
+                "revision_hash": revision_hash,
+                "patch_status": "pushed",
+                "document_hash": response.get("document_hash") if isinstance(response, dict) else None,
+                "claim_add": 0,
+                "claim_update": 0,
+                "claim_supersede": 0,
+                "claim_noop": 0,
+                "claim_rejected_ambiguous": 0,
+            },
+        )
+
+    if should_process and pushed:
+        sync_result = scoped_client.start_source_sync(source_id=source_id, force_full_sync=False)
+
+    result = {
+        "operation": operation,
+        "source_id": source_id,
+        "counts": {"selected": len(documents), "pushed": len(pushed), "failed": len(failed)},
+        "pushed": pushed,
+        "failed": failed,
+        "sync_started": bool(sync_result and not sync_result.get("error")),
+        "audit_log_path": str(audit_path.expanduser()),
+    }
+    sync_failed = isinstance(sync_result, dict) and bool(sync_result.get("error"))
+    if sync_failed:
+        result["sync_error"] = sync_result
+    if failed and sync_failed:
+        result["error"] = "one or more Teams windows failed to push; source sync failed to start"
+    elif sync_failed:
+        result["error"] = "source sync failed to start"
+    elif failed:
+        result["error"] = "one or more Teams windows failed to push"
+
+    write_teams_audit_event(
+        audit_path,
+        {
+            "event": "teams_sync_run",
+            "run_id": run_id,
+            "operation": operation,
+            "source_id": source_id,
+            "status": "completed" if not result.get("error") else "completed_with_error",
+            "selected_windows": len(documents),
+            "pushed_windows": len(pushed),
+            "failed_windows": len(failed),
+            "sync_started": result["sync_started"],
+            "claim_add": 0,
+            "claim_update": 0,
+            "claim_supersede": 0,
+            "claim_noop": 0,
+            "claim_rejected_ambiguous": 0,
+        },
+    )
+    return result
+
+
 def _github_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     profile: dict[str, Any] = {
@@ -2372,6 +2540,79 @@ async def _collect_jira_documents_from_cloud_job(
         if client is not None:
             await client.aclose()
     return documents
+
+
+async def _collect_teams_documents_from_cloud_job(
+    job: dict[str, Any],
+    *,
+    source_id: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    from memforge.genes.teams_gene import TeamsGene
+
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    config = dict(payload)
+    config.pop("local_agent_documents_dir", None)
+    config.pop("audit_log_path", None)
+    gene = TeamsGene(config, source_id)
+    await gene.authenticate()
+    documents: list[dict[str, Any]] = []
+    try:
+        async for item in gene.discover(None):
+            if limit and len(documents) >= limit:
+                break
+            raw = await gene.fetch(item)
+            normalized = await gene.normalize(raw)
+            markdown = normalized.markdown_body
+            raw_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+            conversation_id = str(item.extra.get("conversation_id") or "")
+            root_message_id = str(item.extra.get("root_message_id") or item.item_id)
+            window_type = "thread" if item.extra.get("is_thread") else "time_block"
+            window_id = str(item.extra.get("window_id") or _teams_window_id(
+                source_id=source_id,
+                conversation_id=conversation_id,
+                root_message_id=root_message_id,
+                window_type=window_type,
+            ))
+            revision_hash = str(item.version or hashlib.sha256(
+                f"{window_id}\n{raw_hash}".encode("utf-8")
+            ).hexdigest())
+            source_semantics = normalized.source_semantics if isinstance(normalized.source_semantics, dict) else {}
+            documents.append(
+                {
+                    "conversation_id": conversation_id,
+                    "root_message_id": root_message_id,
+                    "window_id": window_id,
+                    "window_type": window_type,
+                    "revision_hash": revision_hash,
+                    "title": item.title,
+                    "source_url": item.source_url,
+                    "last_modified": item.last_modified.isoformat(),
+                    "markdown_body": markdown,
+                    "raw_hash": raw_hash,
+                    "source_semantics": {
+                        **source_semantics,
+                        "window_type": window_type,
+                        "message_count": item.extra.get("message_count") or source_semantics.get("message_count"),
+                    },
+                }
+            )
+    finally:
+        api_client = getattr(gene, "_client", None)
+        if api_client is not None:
+            await api_client.close()
+    return documents
+
+
+def _teams_window_id(
+    *,
+    source_id: str,
+    conversation_id: str,
+    root_message_id: str,
+    window_type: str,
+) -> str:
+    prefix = "teams-thread" if window_type == "thread" else "teams-block"
+    return f"{prefix}:{source_id}:{conversation_id}:{root_message_id}"
 
 
 def _cloud_job_limit(value: Any, *, default: int) -> int:
