@@ -111,6 +111,9 @@ def _validate_poll(run_id: str, poll: Mapping[str, Any], errors: list[str]) -> N
     if raw_messages != unique_messages + duplicate_messages:
         errors.append(f"poll raw/unique counts do not reconcile for run {run_id}")
 
+    selected_messages = _int_value(poll.get("selected_message_keys_seen"))
+    if not selected_messages and "selected_message_keys_seen" not in poll:
+        selected_messages = unique_messages
     terminal_actions = sum(
         _int_value(poll.get(key))
         for key in (
@@ -121,7 +124,7 @@ def _validate_poll(run_id: str, poll: Mapping[str, Any], errors: list[str]) -> N
             "missing_once_candidates",
         )
     )
-    if unique_messages != terminal_actions:
+    if selected_messages != terminal_actions:
         errors.append(f"poll ledger action counts do not reconcile for run {run_id}")
 
 
