@@ -1,4 +1,4 @@
-import { Bell, Circle, Menu, Sun } from "lucide-react";
+import { Bell, Menu, Sun } from "lucide-react";
 import { BRAND_INITIALS, BRAND_NAME } from "@/brand";
 import { Button } from "@/components/ui/button";
 import { getExtensionAccountSurface, getExtensionTopbarSlots } from "@/extension";
@@ -65,10 +65,6 @@ export function Topbar({ onOpenNavigation }: { onOpenNavigation: () => void }) {
         <Button type="button" variant="ghost" size="icon-sm" aria-label="Notifications">
           <Bell className="size-4" />
         </Button>
-        <div className="hidden items-center gap-2 rounded-md px-2 py-1 text-xs text-muted-foreground sm:flex">
-          <Circle className="size-2 fill-emerald-500 text-emerald-500" />
-          <span>API</span>
-        </div>
         <ExtensionSlots placement="before-account" />
         {accountSurface?.topbar ? accountSurface.topbar() : <DefaultAccountBadge />}
       </div>

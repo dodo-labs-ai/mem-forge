@@ -38,7 +38,7 @@ export function LocalAgentDaemonStatus({ className }: LocalAgentDaemonStatusProp
       <div className={containerClass} role="status" aria-live="polite">
         <span className="flex items-center gap-2 font-medium text-muted-foreground">
           <Loader2 className="size-3 animate-spin" />
-          Checking local daemon...
+          Checking local sync...
         </span>
       </div>
     );
@@ -49,7 +49,7 @@ export function LocalAgentDaemonStatus({ className }: LocalAgentDaemonStatusProp
       <div className={containerClass} role="status" aria-live="polite">
         <span className="flex items-center gap-2 font-medium text-muted-foreground">
           <Circle className="size-2 fill-muted-foreground/60 text-muted-foreground/60" />
-          Local daemon status unavailable
+          Local sync status unavailable
         </span>
       </div>
     );
@@ -59,10 +59,10 @@ export function LocalAgentDaemonStatus({ className }: LocalAgentDaemonStatusProp
   const dotClass = isOnline
     ? "size-2 fill-emerald-500 text-emerald-500"
     : "size-2 fill-amber-500 text-amber-500";
-  const label = isOnline ? "Local daemon online" : "Local daemon offline";
+  const label = isOnline ? "Local sync ready" : "Local sync unavailable";
   const detail = isOnline
     ? lastSeenText ? `Last seen ${lastSeenText}` : null
-    : "Start it on your machine to sync local sources.";
+    : "Start local sync on this device to push local sources.";
 
   return (
     <div className={containerClass} role="status" aria-live="polite">
