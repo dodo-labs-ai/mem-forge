@@ -40,6 +40,7 @@ from memforge.github_repo_utils import (
     github_path_in_scope,
     parse_github_repo_url,
 )
+from memforge.local_agent.folder_picker import FolderPickerCancelled, FolderPickerUnavailable, pick_folder
 from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
     SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES,
@@ -253,7 +254,7 @@ def _build_local_agent_runner(
             run_cloud_job=lambda job: _run_cloud_local_agent_job(job, client, browser=browser),
         ),
         jira_origins_provider=client.list_jira_origins,
-        cloud_jobs_provider=client.lease_local_agent_jobs,
+        cloud_jobs_provider=lambda wait_seconds=0: client.lease_local_agent_jobs(wait_seconds=wait_seconds),
         cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: client.complete_local_agent_job(
             job_id,
             attempt_count=attempt_count,
@@ -1716,6 +1717,8 @@ def adapter_daemon_once(
 @click.option("--browser", default=None, help="Browser to read Jira cookies from, for example chrome or edge.")
 @click.option("--interval-seconds", "poll_interval_seconds", default=10, show_default=True, type=int,
               help="Seconds between due-task checks.")
+@click.option("--cloud-job-wait-seconds", default=25, show_default=True, type=int,
+              help="Long-poll wait for Cloud-triggered local-agent jobs.")
 @click.option("--default-sync-interval-seconds", default=3600, show_default=True, type=int,
               help="Default local-folder and GitHub sync interval.")
 @click.option("--jira-interval-seconds", default=WATCH_DEFAULT_INTERVAL_SECONDS, show_default=True, type=int,
@@ -1726,6 +1729,7 @@ def adapter_daemon_run(
     include_jira: bool,
     browser: str | None,
     poll_interval_seconds: int,
+    cloud_job_wait_seconds: int,
     default_sync_interval_seconds: int,
     jira_interval_seconds: int,
 ):
@@ -1742,6 +1746,7 @@ def adapter_daemon_run(
                 "status": "running",
                 "state_path": str(_local_agent_state_path()),
                 "poll_interval_seconds": max(int(poll_interval_seconds), 1),
+                "cloud_job_wait_seconds": max(int(cloud_job_wait_seconds), 0),
             },
             ensure_ascii=False,
         )
@@ -1750,6 +1755,7 @@ def adapter_daemon_run(
         runner.run_forever(
             include_jira=include_jira,
             poll_interval_seconds=poll_interval_seconds,
+            cloud_job_wait_seconds=cloud_job_wait_seconds,
             log=lambda message: click.echo(message, err=True),
         )
     except KeyboardInterrupt:
@@ -2006,6 +2012,7 @@ def _run_cloud_local_agent_job(
     handlers = {
         "github_repo_preview_tree": lambda: _run_cloud_github_preview_job(job),
         "github_repo_sync": lambda: _run_cloud_github_sync_job(job, client),
+        "local_markdown_pick_root": lambda: _run_cloud_local_markdown_pick_root_job(job),
         "local_markdown_preview_tree": lambda: _run_cloud_local_markdown_preview_job(job),
         "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(job, client),
         "jira_sync": lambda: _run_cloud_jira_sync_job(job, client, browser=browser),
@@ -2056,6 +2063,19 @@ def _run_cloud_local_markdown_preview_job(job: dict[str, Any]) -> dict[str, Any]
     profile = _kb_profile_from_cloud_job(job)
     preview = _preview_kb_profile(profile_name, profile, limit=_cloud_job_limit(payload.get("limit"), default=200))
     return {"operation": operation, "source_id": source_id, **preview}
+
+
+def _run_cloud_local_markdown_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    try:
+        root = pick_folder(
+            title=str(payload.get("title") or "Choose folder to sync"),
+            initial_directory=str(payload.get("initial_directory") or "").strip() or None,
+        )
+    except (FolderPickerCancelled, FolderPickerUnavailable) as exc:
+        return {"operation": operation, "error": str(exc)}
+    return {"operation": operation, "root": root}
 
 
 def _run_cloud_local_markdown_sync_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:

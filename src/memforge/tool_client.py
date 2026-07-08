@@ -380,11 +380,12 @@ class ToolClient:
         *,
         limit: int = 5,
         lease_seconds: int = 3600,
+        wait_seconds: int = 0,
     ) -> dict[str, Any]:
         return self._http_json(
             "POST",
             "/api/cloud/local-agent/jobs/lease",
-            {"limit": limit, "lease_seconds": lease_seconds},
+            {"limit": limit, "lease_seconds": lease_seconds, "wait_seconds": wait_seconds},
         )
 
     def complete_local_agent_job(
