@@ -383,6 +383,13 @@ export interface LocalAgentJobStatusResponse {
   last_error?: string | null;
 }
 
+export interface LocalAgentDaemonStatusResponse {
+  status: "online" | "offline";
+  last_seen_at: string | null;
+  checked_at: string;
+  stale_after_seconds: number;
+}
+
 export interface LlmConfig {
   enrichment_model: string | null;
   enrichment_base_url: string | null;
