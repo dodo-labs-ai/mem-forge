@@ -54,6 +54,7 @@ DEFAULT_CLI_CONFIG_PATH = Path.home() / ".memforge" / "cli.toml"
 DEFAULT_ADAPTER_CONFIG_PATH = Path.home() / ".memforge" / "adapter.toml"
 DEFAULT_LOCAL_AGENT_STATE_PATH = Path.home() / ".memforge" / "local-agent-state.json"
 DEFAULT_TEAMS_AUDIT_LOG_PATH = Path.home() / ".memforge" / "teams-sync-audit.jsonl"
+DEFAULT_TEAMS_LEDGER_STATE_PATH = Path.home() / ".memforge" / "teams-ledger-state.json"
 DEFAULT_KB_INCLUDE = [
     "*.md", "**/*.md",
     "*.markdown", "**/*.markdown",
@@ -2554,6 +2555,7 @@ async def _collect_teams_documents_from_cloud_job(
     config = dict(payload)
     config.pop("local_agent_documents_dir", None)
     config.pop("audit_log_path", None)
+    config.setdefault("ledger_state_path", str(DEFAULT_TEAMS_LEDGER_STATE_PATH))
     gene = TeamsGene(config, source_id)
     await gene.authenticate()
     documents: list[dict[str, Any]] = []

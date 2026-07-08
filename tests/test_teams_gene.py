@@ -282,6 +282,46 @@ class TestDiscover:
         assert len(items) == 2  # two blocks split by 4-hour gap
         assert all(item.extra["is_thread"] is False for item in items)
 
+    @pytest.mark.asyncio
+    async def test_discovers_blocks_with_persisted_ledger_anchor_for_late_messages(self, tmp_path):
+        conv_id = "19:abc@thread.tacv2"
+        config = {
+            "group_chats": [conv_id],
+            "conversation_gap_minutes": 60,
+            "ledger_state_path": str(tmp_path / "teams-ledger.json"),
+        }
+        gene = TeamsGene(config=config, source_id="teams-test")
+        gene._client = MagicMock(spec=_TeamsAPIClient)
+        gene._client.list_conversations = AsyncMock(return_value=[{
+            "id": conv_id,
+            "topic": "architecture",
+            "lastActivity": NOW,
+            "type": "group_chat",
+        }])
+
+        first_messages = [
+            _msg("m2", "Alice", "Anchor", NOW),
+            _msg("m3", "Bob", "Follow-up", NOW + timedelta(minutes=30)),
+        ]
+        gene._fetch_with_context = AsyncMock(return_value=first_messages)
+        first_items = [item async for item in gene.discover(since=None)]
+        assert len(first_items) == 1
+        first_item = first_items[0]
+
+        second_messages = [
+            _msg("m1", "Carol", "Late earlier", NOW - timedelta(minutes=30)),
+            _msg("m2", "Alice", "Anchor", NOW),
+            _msg("m3", "Bob", "Follow-up", NOW + timedelta(minutes=30)),
+        ]
+        gene._fetch_with_context = AsyncMock(return_value=second_messages)
+        second_items = [item async for item in gene.discover(since=None)]
+
+        assert len(second_items) == 1
+        assert second_items[0].item_id == first_item.item_id
+        assert second_items[0].extra["window_id"] == first_item.extra["window_id"]
+        assert second_items[0].extra["root_message_id"] == "m2"
+        assert second_items[0].extra["block_start"] == (NOW - timedelta(minutes=30)).isoformat()
+
 
 # ---------------------------------------------------------------------------
 # Fetch

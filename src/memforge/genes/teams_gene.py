@@ -742,12 +742,8 @@ class TeamsGene(Gene):
             block_messages = [m for m in unthreaded if m["id"] not in thread_root_ids]
             block_messages.sort(key=lambda m: m["time"])
 
-            for block in _group_into_blocks(block_messages, self._gap_minutes, self._max_block):
-                if since and max(m["time"] for m in block) < since:
-                    continue
-                yield self._make_content_item(
-                    conv_meta, block[0]["id"], block, is_thread=False,
-                )
+            for item in self._project_unthreaded_content_items(conv_meta, block_messages, since=since):
+                yield item
 
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full thread/block content."""
@@ -1085,6 +1081,84 @@ class TeamsGene(Gene):
         configured = str(self.config.get("local_agent_documents_dir") or "").strip()
         return Path(configured).expanduser() if configured else None
 
+    def _teams_ledger_state_path(self) -> Path | None:
+        configured = str(self.config.get("ledger_state_path") or "").strip()
+        return Path(configured).expanduser() if configured else None
+
+    def _project_unthreaded_content_items(
+        self,
+        conv_meta: dict,
+        block_messages: list[dict],
+        *,
+        since: datetime | None,
+    ) -> list[ContentItem]:
+        ledger_state_path = self._teams_ledger_state_path()
+        if ledger_state_path is None:
+            items: list[ContentItem] = []
+            for block in _group_into_blocks(block_messages, self._gap_minutes, self._max_block):
+                if since and max(m["time"] for m in block) < since:
+                    continue
+                items.append(self._make_content_item(
+                    conv_meta, block[0]["id"], block, is_thread=False,
+                ))
+            return items
+
+        from memforge.local_agent.teams_ledger import (
+            TeamsLedgerMessage,
+            TeamsLedgerProjector,
+            TeamsLedgerStateStore,
+        )
+
+        conv_id = str(conv_meta["id"])
+        messages_by_id = {str(message["id"]): message for message in block_messages}
+        ledger_messages = [
+            TeamsLedgerMessage(
+                source_id=self.source_id,
+                conversation_id=conv_id,
+                conversation_type=str(conv_meta.get("type") or "group_chat"),
+                message_id=str(message["id"]),
+                created_at=message["time"],
+                body_normalized=str(message.get("content") or ""),
+                root_message_id=str(message.get("rootMessageId") or message["id"]),
+                parent_message_id=message.get("parentMessageId"),
+            )
+            for message in block_messages
+        ]
+        store = TeamsLedgerStateStore(ledger_state_path)
+        previous = store.load_projection(source_id=self.source_id, conversation_id=conv_id)
+        projection = TeamsLedgerProjector(gap_minutes=self._gap_minutes).project_unthreaded(
+            ledger_messages,
+            previous=previous,
+        )
+        store.save_projection(source_id=self.source_id, conversation_id=conv_id, projection=projection)
+
+        items = []
+        for block in projection.blocks:
+            messages = [
+                messages_by_id[message_id]
+                for message_id in block.member_message_ids
+                if message_id in messages_by_id
+            ]
+            if not messages:
+                continue
+            if since and block.member_max_created_at < since:
+                continue
+            items.append(self._make_content_item(
+                conv_meta,
+                block.frozen_anchor_message_id,
+                sorted(messages, key=lambda m: m["time"]),
+                is_thread=False,
+                window_id=block.window_id,
+                block_start=block.member_min_created_at,
+                block_end=block.member_max_created_at,
+                revision_hash=block.revision_hash,
+                block_membership_fingerprint=block.block_membership_fingerprint,
+                assignment_generation=block.assignment_generation,
+                rebuild_generation=block.rebuild_generation,
+                bridge_not_merged=block.bridge_not_merged,
+            ))
+        return items
+
     async def _discover_local_agent_packages(
         self,
         documents_dir: Path,
@@ -1128,6 +1202,15 @@ class TeamsGene(Gene):
         first_msg_id: str,
         messages: list[dict],
         is_thread: bool,
+        *,
+        window_id: str | None = None,
+        block_start: datetime | None = None,
+        block_end: datetime | None = None,
+        revision_hash: str | None = None,
+        block_membership_fingerprint: str | None = None,
+        assignment_generation: int | None = None,
+        rebuild_generation: int | None = None,
+        bridge_not_merged: bool | None = None,
     ) -> ContentItem:
         """Build a ContentItem from a thread or conversation block."""
         conv_id = conv_meta["id"]
@@ -1157,13 +1240,15 @@ class TeamsGene(Gene):
         # Build Teams deep link
         source_url = f"https://teams.microsoft.com/l/message/{conv_id}/{first_msg_id}"
 
+        item_id = window_id or f"teams-{conv_id}#{first_msg_id}"
         return ContentItem(
-            item_id=f"teams-{conv_id}#{first_msg_id}",
+            item_id=item_id,
             title=title[:200],
             source_url=source_url,
             last_modified=max_time,
             content_type="application/json",
             space_or_project=team_name or conv_meta.get("topic", ""),
+            version=revision_hash or "",
             author=first_msg.get("from"),
             labels=[conv_type, channel_name or person_name or conv_meta.get("topic", "")],
             extra={
@@ -1173,8 +1258,14 @@ class TeamsGene(Gene):
                 "channel_name": channel_name,
                 "message_count": len(messages),
                 "is_thread": is_thread,
-                "block_start": min_time.isoformat() if not is_thread else None,
-                "block_end": max_time.isoformat() if not is_thread else None,
+                "window_id": window_id,
+                "block_start": (block_start or min_time).isoformat() if not is_thread else None,
+                "block_end": (block_end or max_time).isoformat() if not is_thread else None,
+                "revision_hash": revision_hash,
+                "block_membership_fingerprint": block_membership_fingerprint,
+                "assignment_generation": assignment_generation,
+                "rebuild_generation": rebuild_generation,
+                "bridge_not_merged": bridge_not_merged,
             },
         )
 
