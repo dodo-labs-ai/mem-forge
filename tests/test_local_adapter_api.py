@@ -855,6 +855,11 @@ def test_teams_adapter_push_writes_window_package(tmp_path):
         row = asyncio.run(database.get_source(source_id))
         assert row is not None
         assert Path(row["config"]["local_agent_documents_dir"]).exists()
+        manifest = row["config"]["local_agent_package_manifest"]
+        assert len(manifest) == 1
+        assert manifest[0]["doc_id"] == body["doc_id"]
+        assert manifest[0]["package_uri"] == body["package_uri"]
+        assert manifest[0]["window_id"] == "teams-thread:src:conversation:root"
     finally:
         asyncio.run(database.close())
 

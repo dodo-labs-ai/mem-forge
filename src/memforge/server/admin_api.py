@@ -3798,6 +3798,7 @@ def create_admin_app(
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         sync_service: SyncService = Depends(get_sync_service),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         """Receive one local-source package pushed by the local daemon/adapter.
 
@@ -3878,6 +3879,7 @@ def create_admin_app(
                     raw_hash=req.raw_hash,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
+                    document_store=artifact_store,
                 )
             else:
                 result = await submit_local_markdown_document(

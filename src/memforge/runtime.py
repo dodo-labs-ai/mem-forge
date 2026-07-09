@@ -577,6 +577,7 @@ async def run_source_sync(
         config=source_config,
         source_id=source["id"],
     )
+    gene.bind_document_store(runtime.doc_store)
     return await runtime.orchestrator().sync_gene(
         gene=gene,
         source_name=source["name"],
