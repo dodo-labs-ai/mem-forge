@@ -820,6 +820,54 @@ class TestNormalize:
         assert sem["has_links"] is True
         assert sem["has_code_blocks"] is False
 
+    @pytest.mark.asyncio
+    async def test_normalize_tolerates_loose_teams_rest_shapes(self):
+        gene = TeamsGene(config={"channels": "T/C"}, source_id="test")
+        gene._client = MagicMock()
+
+        from memforge.genes.teams_gene import LOCAL_AGENT_TEAMS_PACKAGE_KIND
+        from memforge.models import ContentItem, RawContent
+
+        package = {
+            "package_kind": LOCAL_AGENT_TEAMS_PACKAGE_KIND,
+            "conversation_id": "19:conversation@thread.v2",
+            "root_message_id": "1783500000000",
+            "window_id": "teams-block:v1:test",
+            "window_type": "time_block",
+            "revision_hash": "sha256:revision",
+            "raw_hash": "sha256:raw",
+            "submitted_at": "2026-07-09T00:00:00+00:00",
+            "submitted_by": "tester",
+            "raw_payload": {
+                "conversation_type": "group_chat",
+                "team_name": "PCC Agent Dev",
+                "messages": [
+                    {
+                        "id": "1783500000000",
+                        "from": "Alice",
+                        "content": "Here is the file",
+                        "time": "2026-07-09T01:02:00+00:00",
+                        "is_root": True,
+                        "attachments": ["raw-attachment-name", {"fileName": "design.md"}],
+                    },
+                    "unexpected raw item",
+                ],
+                "participants": [{"displayName": "Alice"}, "Bob"],
+                "first_message_time": "2026-07-09T01:02:00+00:00",
+                "last_message_time": "2026-07-09T01:02:00+00:00",
+            },
+        }
+        item = ContentItem(item_id="test", title="Test", source_url="", last_modified=NOW)
+        raw = RawContent(item=item, body=json.dumps(package).encode(), content_type="application/json")
+
+        result = await gene.normalize(raw)
+
+        assert "**Participants**: Alice, Bob" in result.markdown_body
+        assert "- raw-attachment-name (shared by Alice)" in result.markdown_body
+        assert "- design.md (shared by Alice)" in result.markdown_body
+        assert result.source_semantics["participants"] == ["Alice", "Bob"]
+        assert result.source_semantics["message_count"] == 1
+
 
 # ---------------------------------------------------------------------------
 # Content hash (unchanged thread = same normalized markdown = same hash)
