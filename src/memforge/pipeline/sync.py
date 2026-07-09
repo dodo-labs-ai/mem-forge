@@ -533,7 +533,9 @@ class GeneSyncOrchestrator:
         """
         run_id = uuid.uuid4().hex[:12]
         started_at = datetime.now(timezone.utc)
-        gene.bind_document_store(self.doc_store)
+        bind_document_store = getattr(gene, "bind_document_store", None)
+        if callable(bind_document_store):
+            bind_document_store(self.doc_store)
 
         logger.info(
             "Sync started for %s (source_id=%s, run_id=%s)",

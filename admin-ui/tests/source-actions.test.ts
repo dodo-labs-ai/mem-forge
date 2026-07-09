@@ -7,6 +7,7 @@ import {
   getSourceMenuStyle,
   sourceActionLayout,
 } from "../src/views/sources/sourceActions.js";
+import { isLocalAgentBackedSource, localAgentSyncOperation } from "../src/views/sources/localAgentSources.js";
 
 assert.deepEqual(
   sourceActionLayout.primary.map((action) => action.id),
@@ -92,6 +93,7 @@ assert.deepEqual(
 
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
 const sourceRowSource = readFileSync("src/views/sources/SourceRow.tsx", "utf8");
+const localAgentSourcesSource = readFileSync("src/views/sources/localAgentSources.ts", "utf8");
 const syncStatusBarSource = readFileSync("src/components/admin/SyncStatusBar.tsx", "utf8");
 const localAgentJobsSource = readFileSync("src/api/localAgentJobs.ts", "utf8");
 
@@ -156,6 +158,16 @@ assert.match(
   "SourceRow should render local-agent job progress for the matching source row",
 );
 assert.match(
+  sourceRowSource,
+  /isLocalAgentBackedSource\(source\)/,
+  "SourceRow should use the same local-agent source predicate as sync job routing",
+);
+assert.match(
+  sourceRowSource,
+  /<LocalAgentDaemonBadge \/>/,
+  "Local-agent backed source rows should surface daemon readiness instead of source lifecycle as the title badge",
+);
+assert.match(
   sourcesPageSource,
   /function safeSourceErrorMessage/,
   "Source sync errors should pass through only explicitly safe user-facing messages",
@@ -212,19 +224,39 @@ assert.match(
   "enabled overflow menu actions should use a pointer cursor while disabled actions keep not-allowed",
 );
 assert.match(
-  sourcesPageSource,
+  localAgentSourcesSource,
   /github_repo_sync/,
   "Internal network GitHub source sync should enqueue a local-agent sync job",
 );
 assert.match(
-  sourcesPageSource,
+  localAgentSourcesSource,
   /local_markdown_sync/,
   "Local repository sync should enqueue a local-agent sync job",
 );
 assert.match(
-  sourcesPageSource,
+  localAgentSourcesSource,
   /jira_sync/,
   "Jira sources configured for local daemon sync should enqueue a local-agent sync job",
+);
+assert.match(
+  localAgentSourcesSource,
+  /teams_sync/,
+  "Teams source sync should enqueue a local-agent sync job",
+);
+assert.equal(
+  localAgentSyncOperation({ type: "teams", config: {} } as never),
+  "teams_sync",
+  "Teams sources should be local-agent backed",
+);
+assert.equal(
+  localAgentSyncOperation({ type: "jira", config: { sync_mode: "cloud" } } as never),
+  null,
+  "Cloud Jira sources should not be treated as local-agent backed",
+);
+assert.equal(
+  isLocalAgentBackedSource({ type: "jira", config: { sync_mode: "local_agent" } } as never),
+  true,
+  "Jira local-agent mode should share the daemon status badge path",
 );
 assert.match(
   sourcesPageSource,
