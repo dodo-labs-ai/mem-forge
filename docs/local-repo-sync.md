@@ -72,7 +72,7 @@ memforge adapter kb push my-notes --process-now   # push and trigger extraction
 ```
 
 `push` uploads each included file's raw text to
-`POST /api/sources/{id}/adapter/documents` with its `content_type`. With
+`POST /api/sources/{id}/adapter/packages` with its `content_type`. With
 `--process-now`, a source sync runs after the last file. Re-pushing a file
 overwrites its package; the pipeline skips documents whose content is unchanged.
 

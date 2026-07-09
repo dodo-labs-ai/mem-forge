@@ -45,6 +45,12 @@ async def db(tmp_path):
 
 
 class EmptyGene:
+    def __init__(self) -> None:
+        self.bound_document_store = None
+
+    def bind_document_store(self, document_store) -> None:
+        self.bound_document_store = document_store
+
     def requires_pdf_artifact(
         self,
         *,
@@ -445,6 +451,36 @@ class FailingPdfDocumentStore(StubDocumentStore):
             content_type=content_type,
             extension=extension,
         )
+
+
+@pytest.mark.asyncio
+async def test_sync_gene_binds_document_store_at_pipeline_boundary(db: Database):
+    source_id = "src-bind-doc-store"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Teams",
+        config_json="{}",
+    )
+    doc_store = StubDocumentStore()
+    gene = EmptyGene()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        enricher=InstantEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=gene,
+        source_name="Teams",
+        source_id=source_id,
+    )
+
+    assert gene.bound_document_store is doc_store
+    assert state.last_sync_status == "success"
 
 
 class NoopMemoryEngine:

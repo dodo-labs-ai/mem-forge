@@ -7,6 +7,7 @@ import {
   getSourceMenuStyle,
   sourceActionLayout,
 } from "../src/views/sources/sourceActions.js";
+import { isLocalAgentBackedSource, localAgentSyncOperation } from "../src/views/sources/localAgentSources.js";
 
 assert.deepEqual(
   sourceActionLayout.primary.map((action) => action.id),
@@ -92,7 +93,9 @@ assert.deepEqual(
 
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
 const sourceRowSource = readFileSync("src/views/sources/SourceRow.tsx", "utf8");
+const localAgentSourcesSource = readFileSync("src/views/sources/localAgentSources.ts", "utf8");
 const syncStatusBarSource = readFileSync("src/components/admin/SyncStatusBar.tsx", "utf8");
+const localAgentJobsSource = readFileSync("src/api/localAgentJobs.ts", "utf8");
 
 assert.match(
   sourcesPageSource,
@@ -131,8 +134,38 @@ assert.match(
 );
 assert.match(
   sourcesPageSource,
-  /current === LOCAL_AGENT_WAITING_MESSAGE \? null : current/,
-  "Successful local-agent sync should clear the optimistic waiting banner",
+  /localAgentProgressBySource/,
+  "Local-agent sync should track row-level progress instead of relying only on a global banner",
+);
+assert.match(
+  sourcesPageSource,
+  /LOCAL_AGENT_TERMINAL_PROGRESS_RETENTION_MS/,
+  "Successful local-agent sync should keep a short row-level terminal summary visible",
+);
+assert.match(
+  sourcesPageSource,
+  /function localAgentJobPayload/,
+  "Local-agent job payload shaping should be centralized before enqueueing daemon work",
+);
+assert.match(
+  sourcesPageSource,
+  /delete payload\.local_agent_documents_dir;[\s\S]*delete payload\.local_agent_package_manifest;/,
+  "Local-agent job payloads should not forward server-side package inbox metadata to the local daemon",
+);
+assert.match(
+  sourceRowSource,
+  /localAgentProgress/,
+  "SourceRow should render local-agent job progress for the matching source row",
+);
+assert.match(
+  sourceRowSource,
+  /isLocalAgentBackedSource\(source\)/,
+  "SourceRow should use the same local-agent source predicate as sync job routing",
+);
+assert.match(
+  sourceRowSource,
+  /<LocalAgentDaemonBadge \/>/,
+  "Local-agent backed source rows should surface daemon readiness instead of source lifecycle as the title badge",
 );
 assert.match(
   sourcesPageSource,
@@ -191,19 +224,39 @@ assert.match(
   "enabled overflow menu actions should use a pointer cursor while disabled actions keep not-allowed",
 );
 assert.match(
-  sourcesPageSource,
+  localAgentSourcesSource,
   /github_repo_sync/,
   "Internal network GitHub source sync should enqueue a local-agent sync job",
 );
 assert.match(
-  sourcesPageSource,
+  localAgentSourcesSource,
   /local_markdown_sync/,
   "Local repository sync should enqueue a local-agent sync job",
 );
 assert.match(
-  sourcesPageSource,
+  localAgentSourcesSource,
   /jira_sync/,
   "Jira sources configured for local daemon sync should enqueue a local-agent sync job",
+);
+assert.match(
+  localAgentSourcesSource,
+  /teams_sync/,
+  "Teams source sync should enqueue a local-agent sync job",
+);
+assert.equal(
+  localAgentSyncOperation({ type: "teams", config: {} } as never),
+  "teams_sync",
+  "Teams sources should be local-agent backed",
+);
+assert.equal(
+  localAgentSyncOperation({ type: "jira", config: { sync_mode: "cloud" } } as never),
+  null,
+  "Cloud Jira sources should not be treated as local-agent backed",
+);
+assert.equal(
+  isLocalAgentBackedSource({ type: "jira", config: { sync_mode: "local_agent" } } as never),
+  true,
+  "Jira local-agent mode should share the daemon status badge path",
 );
 assert.match(
   sourcesPageSource,
@@ -211,8 +264,18 @@ assert.match(
   "Internal network GitHub source sync should use the cloud local-agent queue",
 );
 assert.match(
+  localAgentJobsSource,
+  /workspace_id:\s*requireCurrentWorkspaceId\(\)/,
+  "Local-agent jobs should bind to the selected workspace instead of relying on a primary workspace",
+);
+assert.match(
+  localAgentJobsSource,
+  /client\.post<LocalAgentJobCreateResponse>\("\/api\/cloud\/local-agent\/jobs"/,
+  "Local-agent job creation should be centralized behind the API helper",
+);
+assert.match(
   sourcesPageSource,
-  /forceResyncSource[\s\S]*createLocalAgentSyncJob\(source\)/,
+  /forceResyncSource[\s\S]*createLocalAgentSyncJob\(source,\s*\{/,
   "Force refresh for local-agent sources should use the daemon job path instead of Cloud-side source sync",
 );
 assert.match(
@@ -227,10 +290,32 @@ assert.doesNotMatch(
 );
 
 const sourceConfigDialogSource = readFileSync("src/views/sources/SourceConfigDialog.tsx", "utf8");
+const teamsSourceWizardSource = readFileSync("src/views/sources/TeamsSourceWizard.tsx", "utf8");
+const githubRepoFolderPickerSource = readFileSync("src/views/sources/GitHubRepoFolderPicker.tsx", "utf8");
 assert.match(
   sourceConfigDialogSource,
   /const DISCOVERY_PREVIEW_LIMIT = 5;/,
   "source discovery preview should request a small bounded result set",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /createLocalAgentJob/,
+  "Local markdown local-agent preview jobs should bind to the selected workspace",
+);
+assert.match(
+  teamsSourceWizardSource,
+  /createLocalAgentJob/,
+  "Teams auth and browse jobs should bind to the selected workspace",
+);
+assert.match(
+  githubRepoFolderPickerSource,
+  /createLocalAgentJob/,
+  "GitHub local-agent browse jobs should bind to the selected workspace",
+);
+assert.doesNotMatch(
+  [sourcesPageSource, sourceConfigDialogSource, teamsSourceWizardSource, githubRepoFolderPickerSource].join("\n"),
+  /client\.post<[^>]+>\("\/api\/cloud\/local-agent\/jobs"/,
+  "Source UI components should not create local-agent job envelopes directly",
 );
 assert.match(
   sourceConfigDialogSource,

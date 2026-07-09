@@ -212,7 +212,7 @@ class ToolClient:
             body["submitted_at"] = submitted_at
         return self._http_json(
             "POST",
-            f"/api/sources/{quote(source_id, safe='')}/adapter/documents",
+            f"/api/sources/{quote(source_id, safe='')}/adapter/packages",
             body,
         )
 
@@ -256,50 +256,95 @@ class ToolClient:
             body["submitted_at"] = submitted_at
         return self._http_json(
             "POST",
-            f"/api/sources/{quote(source_id, safe='')}/adapter/documents",
+            f"/api/sources/{quote(source_id, safe='')}/adapter/packages",
             body,
         )
 
-    def push_jira_document(
+    def push_jira_package(
         self,
         *,
         source_id: str,
         base_url: str,
         issue_key: str,
-        source_url: str,
-        markdown_body: str,
+        raw_payload: dict[str, Any],
+        source_url: str | None = None,
         title: str | None = None,
         raw_hash: str | None = None,
-        source_semantics: dict[str, Any] | None = None,
         submitted_by: str | None = None,
         submitted_at: str | None = None,
         process_now: bool = False,
     ) -> dict[str, Any]:
-        """Push one locally fetched Jira issue into a configured Jira source."""
+        """Push one raw Jira issue package into a configured local-agent source."""
         source_id = source_id.strip()
         if not source_id:
             return {"error": "source_id is required"}
         body: dict[str, Any] = {
             "base_url": base_url,
             "issue_key": issue_key,
-            "source_url": source_url,
-            "markdown_body": markdown_body,
-            "content_type": "text/markdown",
+            "raw_payload": raw_payload,
             "process_now": process_now,
         }
+        if source_url is not None:
+            body["source_url"] = source_url
         if title is not None:
             body["title"] = title
         if raw_hash is not None:
             body["raw_hash"] = raw_hash
-        if source_semantics is not None:
-            body["source_semantics"] = source_semantics
         if submitted_by is not None:
             body["submitted_by"] = submitted_by
         if submitted_at is not None:
             body["submitted_at"] = submitted_at
         return self._http_json(
             "POST",
-            f"/api/sources/{quote(source_id, safe='')}/adapter/documents",
+            f"/api/sources/{quote(source_id, safe='')}/adapter/packages",
+            body,
+        )
+
+    def push_teams_window_package(
+        self,
+        *,
+        source_id: str,
+        conversation_id: str,
+        window_id: str,
+        revision_hash: str,
+        raw_payload: dict[str, Any],
+        title: str | None = None,
+        root_message_id: str | None = None,
+        window_type: str | None = None,
+        source_url: str | None = None,
+        raw_hash: str | None = None,
+        submitted_by: str | None = None,
+        submitted_at: str | None = None,
+        process_now: bool = False,
+    ) -> dict[str, Any]:
+        """Push one raw Teams conversation-window package into a configured Teams source."""
+        source_id = source_id.strip()
+        if not source_id:
+            return {"error": "source_id is required"}
+        body: dict[str, Any] = {
+            "conversation_id": conversation_id,
+            "window_id": window_id,
+            "revision_hash": revision_hash,
+            "raw_payload": raw_payload,
+            "process_now": process_now,
+        }
+        if title is not None:
+            body["title"] = title
+        if root_message_id is not None:
+            body["root_message_id"] = root_message_id
+        if window_type is not None:
+            body["window_type"] = window_type
+        if source_url is not None:
+            body["source_url"] = source_url
+        if raw_hash is not None:
+            body["raw_hash"] = raw_hash
+        if submitted_by is not None:
+            body["submitted_by"] = submitted_by
+        if submitted_at is not None:
+            body["submitted_at"] = submitted_at
+        return self._http_json(
+            "POST",
+            f"/api/sources/{quote(source_id, safe='')}/adapter/packages",
             body,
         )
 
@@ -379,13 +424,26 @@ class ToolClient:
         self,
         *,
         limit: int = 5,
-        lease_seconds: int = 3600,
+        lease_seconds: int = 60,
         wait_seconds: int = 0,
     ) -> dict[str, Any]:
         return self._http_json(
             "POST",
             "/api/cloud/local-agent/jobs/lease",
             {"limit": limit, "lease_seconds": lease_seconds, "wait_seconds": wait_seconds},
+        )
+
+    def heartbeat_local_agent_job(
+        self,
+        job_id: str,
+        *,
+        attempt_count: int,
+        lease_seconds: int = 60,
+    ) -> dict[str, Any]:
+        return self._http_json(
+            "POST",
+            f"/api/cloud/local-agent/jobs/{quote(job_id, safe='')}/heartbeat",
+            {"attempt_count": attempt_count, "lease_seconds": lease_seconds},
         )
 
     def complete_local_agent_job(

@@ -108,7 +108,7 @@ def test_push_github_repo_document_posts_adapter_payload():
     assert client.calls == [
         (
             "POST",
-            "/api/sources/src-github/adapter/documents",
+            "/api/sources/src-github/adapter/packages",
             {
                 "repo_url": "https://github.tools.sap/org/repo",
                 "repo_ref": "main",
@@ -126,18 +126,17 @@ def test_push_github_repo_document_posts_adapter_payload():
     ]
 
 
-def test_push_jira_document_posts_jira_payload_without_file_path_field():
+def test_push_jira_package_posts_raw_payload_without_markdown_body():
     client = _RecordingClient({"doc_id": "jira-doc"})
 
-    result = client.push_jira_document(
+    result = client.push_jira_package(
         source_id="src-jira",
         base_url="https://jira.example.test",
         issue_key="PAY-1",
         source_url="https://jira.example.test/browse/PAY-1",
-        markdown_body="# PAY-1",
+        raw_payload={"key": "PAY-1", "fields": {"summary": "Payroll task"}},
         title="Payroll task",
         raw_hash="raw-1",
-        source_semantics={"status": "Open"},
         submitted_by="codex",
         submitted_at="2026-07-07T08:00:00Z",
         process_now=False,
@@ -147,19 +146,59 @@ def test_push_jira_document_posts_jira_payload_without_file_path_field():
     assert client.calls == [
         (
             "POST",
-            "/api/sources/src-jira/adapter/documents",
+            "/api/sources/src-jira/adapter/packages",
             {
                 "base_url": "https://jira.example.test",
                 "issue_key": "PAY-1",
                 "source_url": "https://jira.example.test/browse/PAY-1",
-                "markdown_body": "# PAY-1",
-                "content_type": "text/markdown",
+                "raw_payload": {"key": "PAY-1", "fields": {"summary": "Payroll task"}},
                 "process_now": False,
                 "title": "Payroll task",
                 "raw_hash": "raw-1",
-                "source_semantics": {"status": "Open"},
                 "submitted_by": "codex",
                 "submitted_at": "2026-07-07T08:00:00Z",
+            },
+        )
+    ]
+
+
+def test_push_teams_window_package_posts_raw_payload_without_markdown_body():
+    client = _RecordingClient({"doc_id": "teams-doc"})
+
+    result = client.push_teams_window_package(
+        source_id="src-teams",
+        conversation_id="19:channel@example.test",
+        window_id="teams-thread:src-teams:conv:root",
+        revision_hash="rev-1",
+        raw_payload={"messages": [{"id": "root-1", "content": "Decision captured."}]},
+        title="Teams decision",
+        root_message_id="root-1",
+        window_type="thread",
+        source_url="teams-window://src-teams/conv/window/rev-1",
+        raw_hash="raw-1",
+        submitted_by="codex",
+        submitted_at="2026-07-08T08:00:00Z",
+        process_now=True,
+    )
+
+    assert result["doc_id"] == "teams-doc"
+    assert client.calls == [
+        (
+            "POST",
+            "/api/sources/src-teams/adapter/packages",
+            {
+                "conversation_id": "19:channel@example.test",
+                "window_id": "teams-thread:src-teams:conv:root",
+                "revision_hash": "rev-1",
+                "raw_payload": {"messages": [{"id": "root-1", "content": "Decision captured."}]},
+                "process_now": True,
+                "title": "Teams decision",
+                "root_message_id": "root-1",
+                "window_type": "thread",
+                "source_url": "teams-window://src-teams/conv/window/rev-1",
+                "raw_hash": "raw-1",
+                "submitted_by": "codex",
+                "submitted_at": "2026-07-08T08:00:00Z",
             },
         )
     ]
@@ -184,6 +223,7 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
     client = _RecordingClient({"jobs": []})
 
     lease = client.lease_local_agent_jobs(limit=3, lease_seconds=120, wait_seconds=25)
+    heartbeat = client.heartbeat_local_agent_job("laj-1", attempt_count=2, lease_seconds=120)
     complete = client.complete_local_agent_job(
         "laj-1",
         attempt_count=2,
@@ -192,12 +232,18 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
     )
 
     assert lease == {"jobs": []}
+    assert heartbeat == {"jobs": []}
     assert complete == {"jobs": []}
     assert client.calls == [
         (
             "POST",
             "/api/cloud/local-agent/jobs/lease",
             {"limit": 3, "lease_seconds": 120, "wait_seconds": 25},
+        ),
+        (
+            "POST",
+            "/api/cloud/local-agent/jobs/laj-1/heartbeat",
+            {"attempt_count": 2, "lease_seconds": 120},
         ),
         (
             "POST",
@@ -216,7 +262,7 @@ def test_local_agent_job_lease_default_matches_ui_sync_wait_window():
         (
             "POST",
             "/api/cloud/local-agent/jobs/lease",
-            {"limit": 5, "lease_seconds": 3600, "wait_seconds": 0},
+            {"limit": 5, "lease_seconds": 60, "wait_seconds": 0},
         )
     ]
 
@@ -246,8 +292,8 @@ def test_workspace_client_scopes_data_plane_push_routes():
     )
 
     assert (
-        client._request_url("/api/sources/src-github/adapter/documents")
-        == "https://memforge.example.test/api/workspaces/ws-a/api/sources/src-github/adapter/documents"
+        client._request_url("/api/sources/src-github/adapter/packages")
+        == "https://memforge.example.test/api/workspaces/ws-a/api/sources/src-github/adapter/packages"
     )
 
 

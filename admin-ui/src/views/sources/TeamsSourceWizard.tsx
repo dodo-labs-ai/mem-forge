@@ -10,12 +10,17 @@ import {
   Loader2,
   MessageSquare,
   Search,
-  Terminal,
   User,
   X,
 } from "lucide-react";
 import client from "@/api/client";
-import type { TeamsAuthStatus, TeamsBrowseData, TeamsChannel } from "@/api/types";
+import { createLocalAgentJob } from "@/api/localAgentJobs";
+import type {
+  LocalAgentJobStatusResponse,
+  TeamsAuthStatus,
+  TeamsBrowseData,
+  TeamsChannel,
+} from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -27,31 +32,16 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
+import {
+  buildDefaultTeamsSourceConfig,
+  buildTeamsSourcePayload,
+  teamsSelectionLabel,
+  type TeamsSelectionItem,
+  type TeamsSourceConfig,
+} from "./teamsSourceConfig";
 
-interface SelectionItem {
-  id: string;
-  displayName: string;
-  type: "channel" | "group_chat" | "individual_chat";
-  teamName?: string;
-}
-
-interface SourceConfig {
-  name: string;
-  region: string;
-  max_age_days: number;
-  conversation_gap_minutes: number;
-  max_block_messages: number;
-}
-
-function defaultSourceConfig(): SourceConfig {
-  return {
-    name: "",
-    region: "emea",
-    max_age_days: 90,
-    conversation_gap_minutes: 180,
-    max_block_messages: 100,
-  };
-}
+const TEAMS_AUTH_POLL_ATTEMPTS = 120;
+const TEAMS_AUTH_POLL_INTERVAL_MS = 1_000;
 
 export function TeamsSourceWizard({
   open,
@@ -84,12 +74,12 @@ function TeamsSourceWizardBody({
   onCreated: () => void;
 }) {
   const [step, setStep] = useState<0 | 1 | 2>(0);
-  const [selections, setSelections] = useState<Map<string, SelectionItem>>(new Map());
-  const [config, setConfig] = useState(defaultSourceConfig);
+  const [selections, setSelections] = useState<Map<string, TeamsSelectionItem>>(new Map());
+  const [config, setConfig] = useState(buildDefaultTeamsSourceConfig);
 
   return (
     <>
-      {step === 0 && <AuthCheckStep onAuthenticated={() => setStep(1)} />}
+      {step === 0 && <AuthCheckStep region={config.region} onAuthenticated={() => setStep(1)} />}
       {step === 1 && (
         <BrowseSelectStep
           region={config.region}
@@ -122,16 +112,39 @@ function TeamsSourceWizardBody({
   );
 }
 
-function AuthCheckStep({ onAuthenticated }: { onAuthenticated: () => void }) {
+function AuthCheckStep({ region, onAuthenticated }: { region: string; onAuthenticated: () => void }) {
+  const [message, setMessage] = useState<string | null>(null);
+  const queryClient = useQueryClient();
   const { data, isLoading, isFetching, refetch } = useQuery<TeamsAuthStatus>({
-    queryKey: ["teams-auth-check"],
-    queryFn: () => client.get("/api/genes/teams/auth-check").then((response) => response.data),
+    queryKey: ["teams-auth-check", region],
+    queryFn: () => runTeamsAuthCheck(region),
     retry: false,
+  });
+  const connectMutation = useMutation({
+    mutationFn: async () => {
+      setMessage(null);
+      const status = await runTeamsLocalAgentJob("teams_auth", { region });
+      if (status.status === "failed") {
+        throw new Error(teamsAuthJobMessage(status));
+      }
+      return status;
+    },
+    onSuccess: async () => {
+      setMessage("Connected. Loading conversations...");
+      await queryClient.invalidateQueries({ queryKey: ["teams-auth-check", region] });
+      onAuthenticated();
+    },
+    onError: (error) => {
+      setMessage(error instanceof Error ? error.message : "Could not connect Teams.");
+    },
   });
 
   useEffect(() => {
     if (data?.authenticated) onAuthenticated();
   }, [data?.authenticated, onAuthenticated]);
+
+  const busy = isFetching || connectMutation.isPending;
+  const statusMessage = message || cleanTeamsAuthMessage(data?.error) || "Teams session required.";
 
   return (
     <>
@@ -154,17 +167,7 @@ function AuthCheckStep({ onAuthenticated }: { onAuthenticated: () => void }) {
           <div className="space-y-4 pt-4">
             <div className="flex items-start gap-3 rounded-lg bg-muted p-3 text-sm">
               <AlertCircle className="mt-0.5 size-4 shrink-0 text-amber-600" />
-              <span>{data?.error || "Teams authentication required."}</span>
-            </div>
-            <div className="space-y-2">
-              <p className="text-sm text-muted-foreground">Run this from the project directory:</p>
-              <div className="flex items-center gap-2 rounded-lg bg-muted p-3 font-mono text-sm">
-                <Terminal className="size-4 shrink-0 text-muted-foreground" />
-                <code>.venv/bin/memforge auth teams</code>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Log into Teams in Chrome first, then run the command to extract your session.
-              </p>
+              <span>{statusMessage}</span>
             </div>
           </div>
         )}
@@ -172,14 +175,78 @@ function AuthCheckStep({ onAuthenticated }: { onAuthenticated: () => void }) {
 
       {!data?.authenticated && !isLoading && (
         <DialogFooter>
-          <Button type="button" onClick={() => refetch()} disabled={isFetching}>
-            {isFetching && <Loader2 className="size-4 animate-spin" />}
+          <Button type="button" variant="outline" onClick={() => refetch()} disabled={busy}>
+            {isFetching && !connectMutation.isPending && <Loader2 className="size-4 animate-spin" />}
             Check Again
+          </Button>
+          <Button type="button" onClick={() => connectMutation.mutate()} disabled={busy}>
+            {connectMutation.isPending && <Loader2 className="size-4 animate-spin" />}
+            Connect
           </Button>
         </DialogFooter>
       )}
     </>
   );
+}
+
+async function runTeamsAuthCheck(region: string): Promise<TeamsAuthStatus> {
+  const status = await runTeamsLocalAgentJob("teams_auth_check", { region });
+  return teamsAuthStatusFromJob(status);
+}
+
+async function runTeamsLocalAgentJob(operation: string, payload: Record<string, unknown>): Promise<LocalAgentJobStatusResponse> {
+  const created = await createLocalAgentJob({
+    sourceType: "teams",
+    operation,
+    payload,
+  });
+  return pollTeamsLocalAgentJob(created.job_id);
+}
+
+async function pollTeamsLocalAgentJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
+  for (let attempt = 0; attempt < TEAMS_AUTH_POLL_ATTEMPTS; attempt += 1) {
+    const response = await client.get<LocalAgentJobStatusResponse>(`/api/cloud/local-agent/jobs/${jobId}`);
+    if (response.data.status === "succeeded" || response.data.status === "failed") {
+      return response.data;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, TEAMS_AUTH_POLL_INTERVAL_MS));
+  }
+  throw new Error("Timed out waiting for the local daemon.");
+}
+
+function teamsAuthStatusFromJob(status: LocalAgentJobStatusResponse): TeamsAuthStatus {
+  const result = status.result as Partial<TeamsAuthStatus> | null;
+  return {
+    authenticated: result?.authenticated === true,
+    expires_in_minutes: typeof result?.expires_in_minutes === "number" ? result.expires_in_minutes : null,
+    error: typeof result?.error === "string" ? result.error : status.last_error ?? null,
+  };
+}
+
+function teamsAuthJobMessage(status: LocalAgentJobStatusResponse): string {
+  const result = status.result as { error?: unknown } | null;
+  if (typeof result?.error === "string" && result.error.trim()) {
+    return result.error.trim();
+  }
+  if (status.last_error?.trim()) {
+    return cleanTeamsAuthMessage(status.last_error) || "Could not connect Teams.";
+  }
+  return "Could not connect Teams.";
+}
+
+function cleanTeamsAuthMessage(value: string | null | undefined): string | null {
+  const text = value?.trim();
+  if (!text) return null;
+  const normalized = text.toLowerCase();
+  if (
+    normalized.includes("tokens")
+    || normalized.includes("run:")
+    || normalized.includes("no teams session")
+    || normalized.includes("session expired")
+  ) {
+    return "No Teams session found. Select Connect after signing in to Teams in Chrome.";
+  }
+  return text;
 }
 
 function BrowseSelectStep({
@@ -190,22 +257,21 @@ function BrowseSelectStep({
   onNext,
 }: {
   region: string;
-  selections: Map<string, SelectionItem>;
-  onSelectionsChange: (selections: Map<string, SelectionItem>) => void;
+  selections: Map<string, TeamsSelectionItem>;
+  onSelectionsChange: (selections: Map<string, TeamsSelectionItem>) => void;
   onBack: () => void;
   onNext: () => void;
 }) {
   const [search, setSearch] = useState("");
   const { data, isLoading, isError, refetch } = useQuery<TeamsBrowseData>({
     queryKey: ["teams-browse", region],
-    queryFn: () =>
-      client.get("/api/genes/teams/browse", { params: { region } }).then((response) => response.data),
-    retry: 1,
+    queryFn: () => runTeamsBrowse(region),
+    retry: false,
     staleTime: 60_000,
   });
 
   const toggleSelection = useCallback(
-    (item: SelectionItem) => {
+    (item: TeamsSelectionItem) => {
       const next = new Map(selections);
       if (next.has(item.id)) {
         next.delete(item.id);
@@ -230,7 +296,7 @@ function BrowseSelectStep({
     <>
       <div className="space-y-4 p-4">
         <DialogHeader>
-          <DialogTitle>Select conversations to sync</DialogTitle>
+          <DialogTitle>Select Teams conversations to sync</DialogTitle>
         </DialogHeader>
 
         {selections.size > 0 && (
@@ -238,7 +304,7 @@ function BrowseSelectStep({
             {[...selections.values()].map((item) => (
               <Badge key={item.id} variant="secondary" className="gap-1 pr-1">
                 <TypeIcon type={item.type} className="size-3" />
-                <span className="max-w-[160px] truncate text-xs">{item.displayName}</span>
+                <span className="max-w-[180px] truncate text-xs">{teamsSelectionLabel(item)}</span>
                 <button
                   type="button"
                   onClick={() => toggleSelection(item)}
@@ -318,9 +384,9 @@ function ConfirmStep({
   onBack,
   onCreated,
 }: {
-  selections: Map<string, SelectionItem>;
-  config: SourceConfig;
-  onConfigChange: (config: SourceConfig) => void;
+  selections: Map<string, TeamsSelectionItem>;
+  config: TeamsSourceConfig;
+  onConfigChange: (config: TeamsSourceConfig) => void;
   onBack: () => void;
   onCreated: () => void;
 }) {
@@ -335,28 +401,12 @@ function ConfirmStep({
   });
 
   const selectedItems = [...selections.values()];
-  const updateNumber = (field: keyof SourceConfig, fallback: number) => (value: string) => {
+  const updateNumber = (field: keyof TeamsSourceConfig, fallback: number) => (value: string) => {
     onConfigChange({ ...config, [field]: Number(value) || fallback });
   };
 
   const handleCreate = () => {
-    const channels = selectedItems.filter((item) => item.type === "channel").map((item) => item.id).join(", ");
-    const groupChats = selectedItems.filter((item) => item.type === "group_chat").map((item) => item.id).join(", ");
-    const individualChats = selectedItems.filter((item) => item.type === "individual_chat").map((item) => item.id).join(", ");
-
-    createSource.mutate({
-      type: "teams",
-      name: config.name,
-      config: {
-        region: config.region,
-        ...(channels && { channels }),
-        ...(groupChats && { group_chats: groupChats }),
-        ...(individualChats && { individual_chats: individualChats }),
-        max_age_days: config.max_age_days,
-        conversation_gap_minutes: config.conversation_gap_minutes,
-        max_block_messages: config.max_block_messages,
-      },
-    });
+    createSource.mutate(buildTeamsSourcePayload({ selections: selectedItems, config }));
   };
 
   return (
@@ -374,13 +424,12 @@ function ConfirmStep({
           />
         </Field>
 
-        <Field label={`Selected conversations (${selectedItems.length})`}>
+        <Field label={`Selected Teams conversations (${selectedItems.length})`}>
           <div className="flex flex-wrap gap-1.5">
             {selectedItems.map((item) => (
               <Badge key={item.id} variant="secondary" className="gap-1">
                 <TypeIcon type={item.type} className="size-3" />
-                {item.teamName && <span className="text-muted-foreground">{item.teamName}/</span>}
-                {item.displayName}
+                {teamsSelectionLabel(item)}
               </Badge>
             ))}
           </div>
@@ -390,10 +439,10 @@ function ConfirmStep({
 
         <div className="grid gap-3 sm:grid-cols-3">
           <Field label="History (days)">
-            <Input type="number" value={config.max_age_days} onChange={(event) => updateNumber("max_age_days", 90)(event.target.value)} />
+            <Input type="number" value={config.max_age_days} onChange={(event) => updateNumber("max_age_days", 14)(event.target.value)} />
           </Field>
           <Field label="Gap (minutes)">
-            <Input type="number" value={config.conversation_gap_minutes} onChange={(event) => updateNumber("conversation_gap_minutes", 180)(event.target.value)} />
+            <Input type="number" value={config.conversation_gap_minutes} onChange={(event) => updateNumber("conversation_gap_minutes", 60)(event.target.value)} />
           </Field>
           <Field label="Max messages/block">
             <Input type="number" value={config.max_block_messages} onChange={(event) => updateNumber("max_block_messages", 100)(event.target.value)} />
@@ -422,10 +471,28 @@ function ConfirmStep({
   );
 }
 
-function flattenTeamsData(data: TeamsBrowseData | undefined): SelectionItem[] {
+async function runTeamsBrowse(region: string): Promise<TeamsBrowseData> {
+  const status = await runTeamsLocalAgentJob("teams_browse", { region });
+  if (status.status === "failed") {
+    throw new Error(teamsAuthJobMessage(status));
+  }
+  return teamsBrowseDataFromJob(status);
+}
+
+function teamsBrowseDataFromJob(status: LocalAgentJobStatusResponse): TeamsBrowseData {
+  const result = status.result as Partial<TeamsBrowseData> | null;
+  return {
+    favorites: Array.isArray(result?.favorites) ? result.favorites : [],
+    teams: Array.isArray(result?.teams) ? result.teams : [],
+    group_chats: Array.isArray(result?.group_chats) ? result.group_chats : [],
+    individual_chats: Array.isArray(result?.individual_chats) ? result.individual_chats : [],
+  };
+}
+
+function flattenTeamsData(data: TeamsBrowseData | undefined): TeamsSelectionItem[] {
   if (!data) return [];
 
-  const channels: SelectionItem[] = data.teams.flatMap((team) =>
+  const channels: TeamsSelectionItem[] = data.teams.flatMap((team) =>
     team.channels.map((channel: TeamsChannel) => ({
       id: channel.id,
       displayName: channel.displayName,
@@ -433,12 +500,12 @@ function flattenTeamsData(data: TeamsBrowseData | undefined): SelectionItem[] {
       teamName: team.displayName,
     })),
   );
-  const groups: SelectionItem[] = data.group_chats.map((chat) => ({
+  const groups: TeamsSelectionItem[] = data.group_chats.map((chat) => ({
     id: chat.id,
     displayName: chat.topic,
     type: "group_chat",
   }));
-  const dms: SelectionItem[] = data.individual_chats.map((chat) => ({
+  const dms: TeamsSelectionItem[] = data.individual_chats.map((chat) => ({
     id: chat.id,
     displayName: chat.topic,
     type: "individual_chat",
@@ -460,7 +527,7 @@ function TypeIcon({
   type,
   className,
 }: {
-  type: SelectionItem["type"];
+  type: TeamsSelectionItem["type"];
   className?: string;
 }) {
   if (type === "channel") return <Hash className={className} />;

@@ -368,17 +368,36 @@ export interface LocalAgentJobCreateResponse {
   status: "queued";
 }
 
+export interface LocalAgentJobCounts {
+  selected?: number;
+  pushed?: number;
+  skipped_existing?: number;
+  failed?: number;
+  polls?: number;
+}
+
 export interface LocalAgentJobStatusResponse {
   job_id: string;
   status: "queued" | "leased" | "succeeded" | "failed";
+  attempt_count?: number;
+  leased_until?: string | null;
   result: {
+    authenticated?: boolean;
+    expires_in_minutes?: number | null;
+    error?: string | null;
     items?: Array<{
       path?: string;
       relative_path?: string;
       type?: "tree" | "blob";
       size?: number | null;
     }>;
+    favorites?: TeamsChat[];
+    teams?: TeamsTeam[];
+    group_chats?: TeamsChat[];
+    individual_chats?: TeamsChat[];
     truncated?: boolean;
+    counts?: LocalAgentJobCounts;
+    sync_started?: boolean;
   } | null;
   last_error?: string | null;
 }
