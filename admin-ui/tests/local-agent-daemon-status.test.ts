@@ -5,7 +5,9 @@ const componentSource = readFileSync(
   "src/views/sources/LocalAgentDaemonStatus.tsx",
   "utf8",
 );
+const querySource = readFileSync("src/views/sources/localAgentDaemonStatusQuery.ts", "utf8");
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
+const sourceRowSource = readFileSync("src/views/sources/SourceRow.tsx", "utf8");
 const sourceConfigDialogSource = readFileSync(
   "src/views/sources/SourceConfigDialog.tsx",
   "utf8",
@@ -16,13 +18,13 @@ const apiTypesSource = readFileSync("src/api/types.ts", "utf8");
 // --- Component contract --------------------------------------------------
 
 assert.match(
-  componentSource,
+  querySource,
   /"\/api\/cloud\/local-agent\/status"/,
   "LocalAgentDaemonStatus should read the cloud daemon status endpoint",
 );
 
 assert.match(
-  componentSource,
+  querySource,
   /useQuery<LocalAgentDaemonStatusResponse>/,
   "LocalAgentDaemonStatus should fetch the daemon status through TanStack Query",
 );
@@ -67,6 +69,16 @@ assert.match(
   componentSource,
   /timeAgo\(data\.last_seen_at\)/,
   "LocalAgentDaemonStatus should show last seen in the shared friendly format",
+);
+assert.match(
+  querySource,
+  /export function useLocalAgentDaemonStatus/,
+  "Local-agent daemon status should expose one shared query hook for compact and full status UI",
+);
+assert.match(
+  componentSource,
+  /export function LocalAgentDaemonBadge/,
+  "Local-agent daemon status should provide a compact badge for source rows",
 );
 
 // --- Types ---------------------------------------------------------------
@@ -118,6 +130,17 @@ assert.equal(
   localAgentStatusUsages.length,
   1,
   "SourcesPage should render the daemon status exactly once, inside the Add Source flow",
+);
+
+assert.match(
+  sourceRowSource,
+  /LocalAgentDaemonBadge/,
+  "Source rows should reuse the daemon status UI instead of hardcoding active for local-agent backed sources",
+);
+assert.match(
+  sourceRowSource,
+  /showLocalAgentStatus = !isPaused && isLocalAgentBackedSource\(source\)/,
+  "Paused source lifecycle should still take precedence over daemon readiness in the title badge",
 );
 
 // --- Configure dialog ----------------------------------------------------

@@ -16,6 +16,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from datetime import datetime
+from typing import Any
 
 from memforge.models import (
     ConfigField,
@@ -122,6 +123,10 @@ class Gene(ABC):
         self.config = config
         self.source_id = source_id
         self._log = logging.getLogger(f"{__name__}.{type(self).__name__}[{source_id}]")
+
+    def bind_document_store(self, document_store: Any) -> None:
+        """Bind the runtime document artifact store when a gene needs it."""
+        self._document_store = document_store
 
     # ------------------------------------------------------------------
     # Abstract instance methods

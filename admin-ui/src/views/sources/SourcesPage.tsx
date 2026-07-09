@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Files, Info, Loader2, MoreHorizontal, Pause, Play, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import client from "@/api/client";
+import { createLocalAgentJob } from "@/api/localAgentJobs";
 import type {
   AgentSessionCompleteness,
   GeneMetadata,
@@ -42,6 +43,11 @@ import {
 } from "./projectGrouping";
 import { SourceRow } from "./SourceRow";
 import { TeamsSourceWizard } from "./TeamsSourceWizard";
+import {
+  type LocalAgentSyncProgress,
+  localAgentProgressFromJob,
+} from "./localAgentSyncProgress";
+import { localAgentSyncOperation } from "./localAgentSources";
 
 const SOURCE_LABELS: Record<string, { name: string; subtitle: string; description: string }> = {
   // Per-client agent-session sources returned by the split backend.
@@ -77,17 +83,14 @@ function normalizeSources(payload: SourcesResponse | Source[] | undefined): Sour
   return [];
 }
 
-function isInternalGitHubSource(source: Source): boolean {
-  return source.type === "github_repo" && String(source.config.connection_mode ?? "cloud_pull") === "local_push";
-}
-
-function localAgentSyncOperation(source: Source): string | null {
-  if (isInternalGitHubSource(source)) return "github_repo_sync";
-  if (source.type === "local_markdown" && String(source.config.root ?? "").trim().length > 0) {
-    return "local_markdown_sync";
-  }
-  if (source.type === "jira" && String(source.config.sync_mode ?? "cloud") === "local_agent") return "jira_sync";
-  return null;
+function localAgentJobPayload(source: Source): Record<string, unknown> {
+  const payload = { ...source.config };
+  delete payload.local_agent_documents_dir;
+  delete payload.local_agent_package_manifest;
+  return {
+    ...payload,
+    process_now: true,
+  };
 }
 
 const LOCAL_AGENT_SYNC_POLL_ATTEMPTS = 1_800;
@@ -97,6 +100,7 @@ const LOCAL_AGENT_TIMEOUT_MESSAGE =
   "Local daemon did not pick up this job. Start it with `memforge adapter daemon run` and try again.";
 const LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE = "Configure a folder path before syncing this local source.";
 const LOCAL_AGENT_SYNC_FAILED_MESSAGE = "Local daemon could not sync this source.";
+const LOCAL_AGENT_TERMINAL_PROGRESS_RETENTION_MS = 30_000;
 
 function safeSourceErrorMessage(error: unknown): string | null {
   if (!(error instanceof Error)) return null;
@@ -105,13 +109,43 @@ function safeSourceErrorMessage(error: unknown): string | null {
     || error.message === LOCAL_AGENT_TIMEOUT_MESSAGE
     || error.message === LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE
     || error.message === LOCAL_AGENT_SYNC_FAILED_MESSAGE
+    || error.message.startsWith(`${LOCAL_AGENT_SYNC_FAILED_MESSAGE} `)
   ) {
     return error.message;
   }
   return null;
 }
 
-async function createLocalAgentSyncJob(source: Source): Promise<LocalAgentJobCreateResponse | null> {
+function localAgentJobErrorMessage(status: LocalAgentJobStatusResponse): string {
+  const result = status.result as { error?: unknown } | null;
+  const detail = typeof result?.error === "string" && result.error.trim()
+    ? result.error.trim()
+    : status.last_error?.trim();
+  if (!detail) return LOCAL_AGENT_SYNC_FAILED_MESSAGE;
+  return `${LOCAL_AGENT_SYNC_FAILED_MESSAGE} ${cleanLocalAgentJobError(detail)}`;
+}
+
+function cleanLocalAgentJobError(value: string): string {
+  const text = value.trim();
+  const normalized = text.toLowerCase();
+  if (normalized.includes("teams") && (
+    normalized.includes("session expired")
+    || normalized.includes("no teams session")
+    || normalized.includes("tokens")
+    || normalized.includes("sign in")
+  )) {
+    return "Sign in to Teams in Chrome, then retry sync.";
+  }
+  return text;
+}
+
+async function createLocalAgentSyncJob(
+  source: Source,
+  options: {
+    itemLabel: string;
+    onProgress?: (progress: LocalAgentSyncProgress) => void;
+  },
+): Promise<LocalAgentJobCreateResponse | null> {
   const operation = localAgentSyncOperation(source);
   if (!operation) {
     if (source.type === "local_markdown") {
@@ -119,34 +153,57 @@ async function createLocalAgentSyncJob(source: Source): Promise<LocalAgentJobCre
     }
     return null;
   }
-  const response = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
-    source_id: source.id,
-    source_type: source.type,
+  const created = await createLocalAgentJob({
+    sourceId: source.id,
+    sourceType: source.type,
     operation,
-    payload: {
-      ...source.config,
-      process_now: true,
-    },
+    payload: localAgentJobPayload(source),
   });
-  const status = await pollLocalAgentSyncJob(response.data.job_id);
+  options.onProgress?.(
+    localAgentProgressFromJob(
+      {
+        job_id: created.job_id,
+        status: "queued",
+        result: null,
+        last_error: null,
+      },
+      options.itemLabel,
+    ),
+  );
+  const status = await pollLocalAgentSyncJob(created.job_id, options);
   if (status.status === "failed") {
     if (status.last_error) {
       console.warn("Local daemon sync failed", status.last_error);
     }
-    throw new Error(LOCAL_AGENT_SYNC_FAILED_MESSAGE);
+    throw new Error(localAgentJobErrorMessage(status));
   }
-  return response.data;
+  return created;
 }
 
-async function pollLocalAgentSyncJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
+async function pollLocalAgentSyncJob(
+  jobId: string,
+  options: {
+    itemLabel: string;
+    onProgress?: (progress: LocalAgentSyncProgress) => void;
+  },
+): Promise<LocalAgentJobStatusResponse> {
   for (let attempt = 0; attempt < LOCAL_AGENT_SYNC_POLL_ATTEMPTS; attempt += 1) {
     const response = await client.get<LocalAgentJobStatusResponse>(`/api/cloud/local-agent/jobs/${jobId}`);
+    options.onProgress?.(localAgentProgressFromJob(response.data, options.itemLabel));
     if (response.data.status === "succeeded" || response.data.status === "failed") {
       return response.data;
     }
     await new Promise((resolve) => window.setTimeout(resolve, LOCAL_AGENT_SYNC_POLL_INTERVAL_MS));
   }
   throw new Error(LOCAL_AGENT_TIMEOUT_MESSAGE);
+}
+
+function sourceItemLabel(source: Source): string {
+  return SOURCE_ITEM_LABELS[source.id] ?? SOURCE_ITEM_LABELS[source.type] ?? "documents";
+}
+
+function isActiveLocalAgentProgress(progress: LocalAgentSyncProgress | undefined): boolean {
+  return progress?.state === "queued" || progress?.state === "leased";
 }
 
 export function SourcesPage() {
@@ -162,6 +219,9 @@ export function SourcesPage() {
   const [openMenuSourceId, setOpenMenuSourceId] = useState<string | null>(null);
   const [sourcePendingDelete, setSourcePendingDelete] = useState<Source | null>(null);
   const [pendingSyncIds, setPendingSyncIds] = useState<Set<string>>(new Set());
+  const [localAgentProgressBySource, setLocalAgentProgressBySource] = useState<
+    Record<string, LocalAgentSyncProgress | undefined>
+  >({});
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
   const [pendingSubscriptionIds, setPendingSubscriptionIds] = useState<Set<string>>(
     () => new Set(),
@@ -178,6 +238,19 @@ export function SourcesPage() {
     }
     setAuthorityMessage(safeSourceErrorMessage(error) ?? fallback);
     return false;
+  };
+
+  const setLocalAgentProgress = (sourceId: string, progress: LocalAgentSyncProgress) => {
+    setLocalAgentProgressBySource((current) => ({ ...current, [sourceId]: progress }));
+  };
+
+  const clearLocalAgentProgress = (sourceId: string) => {
+    setLocalAgentProgressBySource((current) => {
+      if (!current[sourceId]) return current;
+      const next = { ...current };
+      delete next[sourceId];
+      return next;
+    });
   };
 
   const genesQuery = useQuery<GeneMetadata[]>({
@@ -203,25 +276,39 @@ export function SourcesPage() {
     mutationFn: async ({ source, forceFullSync = false }: { source: Source; forceFullSync?: boolean }) => {
       const sourceId = source.id;
       setPendingSyncIds((current) => new Set(current).add(sourceId));
-      if (localAgentSyncOperation(source)) {
-        setAuthorityMessage(LOCAL_AGENT_WAITING_MESSAGE);
-      }
-      const localAgentJob = await createLocalAgentSyncJob(source);
+      const localAgentJob = await createLocalAgentSyncJob(source, {
+        itemLabel: sourceItemLabel(source),
+        onProgress: (progress) => setLocalAgentProgress(sourceId, progress),
+      });
       if (localAgentJob) {
         return { data: localAgentJob };
       }
       return client.post(`/api/sources/${sourceId}/sync`, { force_full_sync: forceFullSync });
     },
-    onError: (error) => handleAuthorityError(error, "Failed to start sync."),
-    onSettled: (_data, _error, variables) => {
-      if (!_error) {
-        setAuthorityMessage((current) => current === LOCAL_AGENT_WAITING_MESSAGE ? null : current);
+    onError: (error, variables) => {
+      if (localAgentSyncOperation(variables.source)) {
+        setLocalAgentProgress(variables.source.id, {
+          state: "failed",
+          message: "Action needed",
+          detail: safeSourceErrorMessage(error) ?? LOCAL_AGENT_SYNC_FAILED_MESSAGE,
+        });
       }
+      handleAuthorityError(error, "Failed to start sync.");
+    },
+    onSettled: (_data, _error, variables) => {
       setPendingSyncIds((current) => {
         const next = new Set(current);
         next.delete(variables.source.id);
         return next;
       });
+      if (!_error && localAgentSyncOperation(variables.source)) {
+        window.setTimeout(
+          () => clearLocalAgentProgress(variables.source.id),
+          LOCAL_AGENT_TERMINAL_PROGRESS_RETENTION_MS,
+        );
+      } else if (!localAgentSyncOperation(variables.source)) {
+        clearLocalAgentProgress(variables.source.id);
+      }
       queryClient.invalidateQueries({ queryKey: ["sources"] });
       queryClient.invalidateQueries({ queryKey: ["stats"] });
     },
@@ -241,25 +328,39 @@ export function SourcesPage() {
   const forceResyncSource = useMutation({
     mutationFn: async (source: Source) => {
       setPendingSyncIds((current) => new Set(current).add(source.id));
-      if (localAgentSyncOperation(source)) {
-        setAuthorityMessage(LOCAL_AGENT_WAITING_MESSAGE);
-      }
-      const localAgentJob = await createLocalAgentSyncJob(source);
+      const localAgentJob = await createLocalAgentSyncJob(source, {
+        itemLabel: sourceItemLabel(source),
+        onProgress: (progress) => setLocalAgentProgress(source.id, progress),
+      });
       if (localAgentJob) {
         return { data: localAgentJob };
       }
       return client.post(getSourceActionEndpoint(source.id, "force-resync"));
     },
-    onError: (error) => handleAuthorityError(error, "Failed to start refresh."),
-    onSettled: (_data, _error, source) => {
-      if (!_error) {
-        setAuthorityMessage((current) => current === LOCAL_AGENT_WAITING_MESSAGE ? null : current);
+    onError: (error, source) => {
+      if (localAgentSyncOperation(source)) {
+        setLocalAgentProgress(source.id, {
+          state: "failed",
+          message: "Action needed",
+          detail: safeSourceErrorMessage(error) ?? LOCAL_AGENT_SYNC_FAILED_MESSAGE,
+        });
       }
+      handleAuthorityError(error, "Failed to start refresh.");
+    },
+    onSettled: (_data, _error, source) => {
       setPendingSyncIds((current) => {
         const next = new Set(current);
         next.delete(source.id);
         return next;
       });
+      if (!_error && localAgentSyncOperation(source)) {
+        window.setTimeout(
+          () => clearLocalAgentProgress(source.id),
+          LOCAL_AGENT_TERMINAL_PROGRESS_RETENTION_MS,
+        );
+      } else if (!localAgentSyncOperation(source)) {
+        clearLocalAgentProgress(source.id);
+      }
       queryClient.invalidateQueries({ queryKey: ["sources"] });
       queryClient.invalidateQueries({ queryKey: ["stats"] });
     },
@@ -426,7 +527,11 @@ export function SourcesPage() {
                   onToggle={() => toggleGroup(group)}
                 >
                   {group.sources.map(({ source, memory_count }) => {
-                    const isSyncing = source.sync?.status === "running" || pendingSyncIds.has(source.id);
+                    const localAgentProgress = localAgentProgressBySource[source.id];
+                    const isSyncing =
+                      source.sync?.status === "running" ||
+                      pendingSyncIds.has(source.id) ||
+                      isActiveLocalAgentProgress(localAgentProgress);
                     const isDeleting = deleteSource.isPending && sourcePendingDelete?.id === source.id;
                     const isUpdatingStatus =
                       setSourceStatus.isPending &&
@@ -445,9 +550,7 @@ export function SourcesPage() {
                       subtitle: gene?.data_shape ?? "",
                     };
                     const itemLabel =
-                      SOURCE_ITEM_LABELS[source.id] ??
-                      SOURCE_ITEM_LABELS[source.type] ??
-                      "documents";
+                      sourceItemLabel(source);
                     const showActionsMenu =
                       capabilities.can_configure ||
                       capabilities.can_force_resync ||
@@ -460,6 +563,7 @@ export function SourcesPage() {
                         source={source}
                         perGroupMemoryCount={memory_count}
                         isSyncing={isSyncing}
+                        localAgentProgress={localAgentProgress}
                         isDeleting={isDeleting}
                         isUpdatingStatus={isUpdatingStatus}
                         isManaged={isManaged}
@@ -981,15 +1085,10 @@ function AddSourceDialog({
           <Button
             type="button"
             size="sm"
-            onClick={() => onConfigureSelected(gene.name)}
+            onClick={() => (isTeams ? onTeamsSelected() : onConfigureSelected(gene.name))}
           >
-            Configure
+            {isTeams ? "Browse Teams" : "Configure"}
           </Button>
-          {isTeams && (
-            <Button type="button" size="sm" variant="outline" onClick={onTeamsSelected}>
-              Browse Teams
-            </Button>
-          )}
         </div>
       </div>
     );

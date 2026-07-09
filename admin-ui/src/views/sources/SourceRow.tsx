@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
-import { Info, Loader2, Pause, Play, SlidersHorizontal } from "lucide-react";
+import { AlertCircle, Check, Info, Loader2, Pause, Play, SlidersHorizontal } from "lucide-react";
 import type { Source, SourceCapabilities, SourceOwnership } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
 import { SyncStatusBar } from "@/components/admin/SyncStatusBar";
@@ -11,6 +11,9 @@ import { SourceIcon } from "@/components/sources/SourceIcon";
 import { cn } from "@/lib/utils";
 import { formatDuration, timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
+import { LocalAgentDaemonBadge } from "./LocalAgentDaemonStatus";
+import { isLocalAgentBackedSource } from "./localAgentSources";
+import type { LocalAgentSyncProgress } from "./localAgentSyncProgress";
 
 /**
  * One row in the project-grouped sources view. Behaviour and DOM match the
@@ -43,6 +46,7 @@ export function SourceRow({
   source,
   perGroupMemoryCount,
   isSyncing,
+  localAgentProgress,
   isDeleting,
   isUpdatingStatus = false,
   isManaged,
@@ -61,6 +65,7 @@ export function SourceRow({
   source: Source;
   perGroupMemoryCount: number;
   isSyncing: boolean;
+  localAgentProgress?: LocalAgentSyncProgress;
   isDeleting: boolean;
   isUpdatingStatus?: boolean;
   isManaged: boolean;
@@ -77,6 +82,7 @@ export function SourceRow({
   actionsMenu: ReactNode;
 }) {
   const isPaused = source.status === "paused";
+  const showLocalAgentStatus = !isPaused && isLocalAgentBackedSource(source);
   const pausedSyncHint = "Source is paused. Resume the source to sync again.";
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
   const ownershipText = formatOwnership(source.ownership);
@@ -91,18 +97,11 @@ export function SourceRow({
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="truncate text-sm font-medium">{source.name}</h3>
-              <StatusDot
-                status={source.status}
-                className={isPaused ? "bg-amber-500" : undefined}
-              />
-              <Badge
-                variant={isPaused ? "outline" : source.status === "active" ? "secondary" : "outline"}
-                className={cn(
-                  isPaused && "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-900/30 dark:text-amber-200",
-                )}
-              >
-                {source.status}
-              </Badge>
+              {showLocalAgentStatus ? (
+                <LocalAgentDaemonBadge />
+              ) : (
+                <SourceLifecycleBadge status={source.status} />
+              )}
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
               {sourceLabel.name}
@@ -124,7 +123,7 @@ export function SourceRow({
                 <span className="font-medium text-foreground">{perGroupMemoryCount}</span> memories
               </span>
               <span>
-                {source.sync?.status === "running"
+                {source.sync?.status === "running" || isActiveLocalAgentProgress(localAgentProgress)
                   ? "Syncing now"
                   : <LastSyncDetails source={source} itemLabel={itemLabel} />}
               </span>
@@ -242,11 +241,74 @@ export function SourceRow({
         </div>
       )}
 
+      {localAgentProgress && (
+        <LocalAgentProgressBar progress={localAgentProgress} />
+      )}
+
       {hasManagementControl && (
         <SyncStatusBar sync={source.sync} itemLabel={itemLabel} onRetry={isPaused ? undefined : onSync} />
       )}
     </div>
   );
+}
+
+function SourceLifecycleBadge({ status }: { status: Source["status"] }) {
+  const isPaused = status === "paused";
+  return (
+    <>
+      <StatusDot
+        status={status}
+        className={isPaused ? "bg-amber-500" : undefined}
+      />
+      <Badge
+        variant={isPaused ? "outline" : status === "active" ? "secondary" : "outline"}
+        className={cn(
+          isPaused && "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-900/30 dark:text-amber-200",
+        )}
+      >
+        {status}
+      </Badge>
+    </>
+  );
+}
+
+function LocalAgentProgressBar({ progress }: { progress: LocalAgentSyncProgress }) {
+  const isActive = progress.state === "queued" || progress.state === "leased";
+  const isFailed = progress.state === "failed";
+  const Icon = isActive ? Loader2 : isFailed ? AlertCircle : Check;
+
+  return (
+    <div
+      role={isFailed ? "alert" : "status"}
+      aria-live="polite"
+      className={cn(
+        "flex items-center gap-2 rounded-md px-3 py-2 text-sm",
+        isFailed
+          ? "bg-destructive/10 text-destructive"
+          : progress.state === "succeeded"
+            ? "bg-emerald-50 text-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-100"
+            : "bg-muted text-muted-foreground",
+      )}
+    >
+      <Icon
+        className={cn(
+          "size-3.5 shrink-0",
+          isActive && "animate-spin text-foreground",
+          progress.state === "succeeded" && "text-emerald-600 dark:text-emerald-300",
+        )}
+      />
+      <span className={cn("font-medium", !isFailed && "text-foreground")}>
+        {progress.message}
+      </span>
+      {progress.detail && (
+        <span className="min-w-0 truncate text-xs opacity-80">{progress.detail}</span>
+      )}
+    </div>
+  );
+}
+
+function isActiveLocalAgentProgress(progress: LocalAgentSyncProgress | undefined): boolean {
+  return progress?.state === "queued" || progress?.state === "leased";
 }
 
 function LastSyncDetails({

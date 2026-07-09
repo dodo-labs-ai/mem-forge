@@ -12,6 +12,7 @@ import re
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -534,31 +535,33 @@ class JiraGene(Gene):
         issue links, subtasks, and comments so the enricher can extract memories
         from the issue payload.
         """
-        data = json.loads(raw.body)
-        if data.get("package_kind") == LOCAL_AGENT_JIRA_PACKAGE_KIND:
-            return NormalizedContent(
-                item=raw.item,
-                markdown_body=str(data.get("markdown") or ""),
-                source_semantics={
-                    "source_kind": "jira",
-                    "base_url": data.get("base_url"),
-                    "issue_key": data.get("issue_key"),
-                    **(data.get("source_semantics") if isinstance(data.get("source_semantics"), dict) else {}),
-                    "raw_hash": data.get("raw_hash"),
-                    "submitted_at": data.get("submitted_at"),
-                    "submitted_by": data.get("submitted_by"),
-                },
-            )
+        package = json.loads(raw.body)
+        data = package
+        package_semantics: dict[str, Any] = {}
+        if package.get("package_kind") == LOCAL_AGENT_JIRA_PACKAGE_KIND:
+            raw_payload = package.get("raw_payload")
+            if not isinstance(raw_payload, dict):
+                raise ValueError("Jira local-agent package is missing raw_payload")
+            data = raw_payload
+            package_semantics = {
+                "source_kind": "jira",
+                "base_url": package.get("base_url"),
+                "issue_key": package.get("issue_key"),
+                "raw_hash": package.get("raw_hash"),
+                "submitted_at": package.get("submitted_at"),
+                "submitted_by": package.get("submitted_by"),
+            }
         fields = data.get("fields", {})
-        key = raw.item.extra.get("issue_key", "")
+        key = str(package_semantics.get("issue_key") or raw.item.extra.get("issue_key") or data.get("key") or "")
 
         lines = []
 
         # Header
-        issue_type = raw.item.extra.get("issue_type", "Task")
-        status = raw.item.extra.get("status", "Unknown")
-        priority = raw.item.extra.get("priority", "")
-        assignee = raw.item.author or "Unassigned"
+        issue_type = raw.item.extra.get("issue_type") or (fields.get("issuetype") or {}).get("name") or "Task"
+        status = raw.item.extra.get("status") or (fields.get("status") or {}).get("name") or "Unknown"
+        priority = raw.item.extra.get("priority") or (fields.get("priority") or {}).get("name") or ""
+        assignee_field = fields.get("assignee") or {}
+        assignee = raw.item.author or assignee_field.get("displayName") or "Unassigned"
 
         lines.append(f"# [{issue_type}] {raw.item.title}")
         lines.append(f"**Status**: {status} | **Priority**: {priority} | **Assignee**: {assignee}")
@@ -641,6 +644,7 @@ class JiraGene(Gene):
 
         # Source semantics (structured data for filtering)
         source_semantics = {
+            **package_semantics,
             "issue_key": key,
             "status": status,
             "priority": priority,

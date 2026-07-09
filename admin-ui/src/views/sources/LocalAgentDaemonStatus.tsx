@@ -1,24 +1,9 @@
-import { useQuery } from "@tanstack/react-query";
 import { Circle, Loader2 } from "lucide-react";
-import client from "@/api/client";
-import type { LocalAgentDaemonStatusResponse } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { timeAgo } from "@/utils/date";
+import { useLocalAgentDaemonStatus } from "./localAgentDaemonStatusQuery";
 
-const LOCAL_AGENT_STATUS_ENDPOINT = "/api/cloud/local-agent/status";
-const LOCAL_AGENT_STATUS_QUERY_KEY = ["local-agent-daemon-status"] as const;
-const LOCAL_AGENT_STATUS_REFETCH_MS = 30_000;
 const LOCAL_AGENT_DAEMON_COMMAND = "memforge adapter daemon run";
-
-function useLocalAgentDaemonStatus() {
-  return useQuery<LocalAgentDaemonStatusResponse>({
-    queryKey: LOCAL_AGENT_STATUS_QUERY_KEY,
-    queryFn: () => client.get(LOCAL_AGENT_STATUS_ENDPOINT).then((response) => response.data),
-    refetchInterval: LOCAL_AGENT_STATUS_REFETCH_MS,
-    refetchOnWindowFocus: true,
-    staleTime: 15_000,
-  });
-}
 
 interface LocalAgentDaemonStatusProps {
   className?: string;
@@ -33,7 +18,7 @@ export function LocalAgentDaemonStatus({ className }: LocalAgentDaemonStatusProp
     className ?? "",
   ].filter(Boolean).join(" ");
 
-  if (query.isPending || !data) {
+  if (query.isPending) {
     return (
       <div className={containerClass} role="status" aria-live="polite">
         <span className="flex items-center gap-2 font-medium text-muted-foreground">
@@ -44,7 +29,7 @@ export function LocalAgentDaemonStatus({ className }: LocalAgentDaemonStatusProp
     );
   }
 
-  if (query.isError) {
+  if (query.isError || !data) {
     return (
       <div className={containerClass} role="status" aria-live="polite">
         <span className="flex items-center gap-2 font-medium text-muted-foreground">
@@ -87,6 +72,42 @@ export function LocalAgentDaemonStatus({ className }: LocalAgentDaemonStatusProp
         </span>
       )}
     </div>
+  );
+}
+
+export function LocalAgentDaemonBadge() {
+  const query = useLocalAgentDaemonStatus();
+  const data = query.data;
+
+  if (query.isPending) {
+    return (
+      <>
+        <Loader2 className="size-2.5 animate-spin text-muted-foreground" aria-hidden="true" />
+        <span className="rounded-full bg-muted px-2.5 py-0.5 text-xs font-medium text-muted-foreground">
+          Checking local sync
+        </span>
+      </>
+    );
+  }
+
+  if (query.isError || !data || data.status !== "online") {
+    return (
+      <>
+        <Circle className="size-2 fill-amber-500 text-amber-500" aria-hidden="true" />
+        <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-700 dark:border-amber-900 dark:bg-amber-900/30 dark:text-amber-200">
+          Local sync unavailable
+        </span>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <Circle className="size-2 fill-emerald-500 text-emerald-500" aria-hidden="true" />
+      <span className="rounded-full bg-secondary px-2.5 py-0.5 text-xs font-medium text-secondary-foreground">
+        Local sync ready
+      </span>
+    </>
   );
 }
 
