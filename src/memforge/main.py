@@ -2907,6 +2907,7 @@ async def _collect_teams_documents_from_cloud_job(
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     config = _teams_direct_rest_config_from_cloud_payload(payload)
     config.pop("local_agent_documents_dir", None)
+    config.pop("local_agent_package_manifest", None)
     config.pop("audit_log_path", None)
     config.setdefault("ledger_state_path", str(DEFAULT_TEAMS_LEDGER_STATE_PATH))
     gene = TeamsGene(config, source_id)

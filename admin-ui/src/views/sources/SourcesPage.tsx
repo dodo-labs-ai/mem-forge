@@ -95,6 +95,16 @@ function localAgentSyncOperation(source: Source): string | null {
   return null;
 }
 
+function localAgentJobPayload(source: Source): Record<string, unknown> {
+  const payload = { ...source.config };
+  delete payload.local_agent_documents_dir;
+  delete payload.local_agent_package_manifest;
+  return {
+    ...payload,
+    process_now: true,
+  };
+}
+
 const LOCAL_AGENT_SYNC_POLL_ATTEMPTS = 1_800;
 const LOCAL_AGENT_SYNC_POLL_INTERVAL_MS = 2_000;
 const LOCAL_AGENT_WAITING_MESSAGE = "Waiting for local daemon to sync this source.";
@@ -159,10 +169,7 @@ async function createLocalAgentSyncJob(
     source_id: source.id,
     source_type: source.type,
     operation,
-    payload: {
-      ...source.config,
-      process_now: true,
-    },
+    payload: localAgentJobPayload(source),
   });
   options.onProgress?.(
     localAgentProgressFromJob(

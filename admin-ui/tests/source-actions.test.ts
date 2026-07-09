@@ -140,6 +140,16 @@ assert.match(
   "Successful local-agent sync should keep a short row-level terminal summary visible",
 );
 assert.match(
+  sourcesPageSource,
+  /function localAgentJobPayload/,
+  "Local-agent job payload shaping should be centralized before enqueueing daemon work",
+);
+assert.match(
+  sourcesPageSource,
+  /delete payload\.local_agent_documents_dir;[\s\S]*delete payload\.local_agent_package_manifest;/,
+  "Local-agent job payloads should not forward server-side package inbox metadata to the local daemon",
+);
+assert.match(
   sourceRowSource,
   /localAgentProgress/,
   "SourceRow should render local-agent job progress for the matching source row",
