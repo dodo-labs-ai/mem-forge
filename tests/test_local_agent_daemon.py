@@ -43,7 +43,261 @@ def test_local_agent_state_quarantines_corrupt_json(tmp_path):
     state = LocalAgentStateStore(path).load()
 
     assert state == {"version": 1, "tasks": {}}
-    assert list(tmp_path.glob("state.json.corrupt-*"))
+    assert not path.exists()
+    corrupt_files = list(tmp_path.glob("state.json.corrupt-*"))
+    assert len(corrupt_files) == 1
+    assert corrupt_files[0].read_text(encoding="utf-8") == "not-json"
+
+
+def test_local_agent_state_quarantines_version_mismatch(tmp_path):
+    from memforge.local_agent.state import LocalAgentStateStore
+
+    state_path = tmp_path / "agent-state.json"
+    state_path.write_text(json.dumps({"version": 999, "tasks": {"old": {}}}), encoding="utf-8")
+
+    payload = LocalAgentStateStore(state_path).load()
+
+    assert payload == {"version": 1, "tasks": {}}
+    assert not state_path.exists()
+    assert len(list(tmp_path.glob("agent-state.json.corrupt-*"))) == 1
+
+
+def test_local_agent_state_compacts_large_payloads(tmp_path):
+    from memforge.local_agent.state import LocalAgentStateStore
+
+    store = LocalAgentStateStore(tmp_path / "agent-state.json")
+
+    payload = store.record_result(
+        "github:arch",
+        {
+            "status": "success",
+            "started_at": "2026-07-07T01:00:00+00:00",
+            "finished_at": "2026-07-07T01:00:02+00:00",
+            "payload": {
+                "profile": "arch",
+                "counts": {"pushed": 1000, "failed": 1},
+                "pushed": [{"relative_path": f"doc-{index}.md"} for index in range(1000)],
+                "failed": [{"relative_path": "bad.md", "error": "push failed"}],
+            },
+        },
+    )
+
+    stored = payload["tasks"]["github:arch"]["last_result"]["payload"]
+    assert "pushed" not in stored
+    assert "failed" not in stored
+    assert stored["pushed_count"] == 1000
+    assert stored["failed_count"] == 1
+    assert stored["first_failed"] == {"relative_path": "bad.md", "error": "push failed"}
+
+
+def test_local_agent_state_preserves_sync_audit_summary(tmp_path):
+    from memforge.local_agent.state import LocalAgentStateStore
+
+    store = LocalAgentStateStore(tmp_path / "agent-state.json")
+
+    payload = store.record_result(
+        "cloud-job:laj-teams",
+        {
+            "task_id": "cloud-job:laj-teams",
+            "kind": "cloud_job",
+            "status": "failed",
+            "started_at": "2026-07-09T00:00:00+00:00",
+            "finished_at": "2026-07-09T00:00:01+00:00",
+            "error": "source sync failed to start",
+            "payload": {
+                "source_id": "src-teams",
+                "counts": {"selected": 1, "pushed": 1, "failed": 0, "skipped_existing": 0, "polls": 1},
+                "pushed": [{"window_id": "teams-thread:v1:opaque", "document_hash": "hash"}],
+                "failed": [],
+                "skipped_existing": [],
+                "sync_started": False,
+                "sync_error": {"error": "MemForge API unavailable"},
+                "audit_log_path": "/Users/example/.memforge/teams-sync-audit.jsonl",
+            },
+        },
+    )
+
+    stored = payload["tasks"]["cloud-job:laj-teams"]["last_result"]["payload"]
+    assert stored["sync_started"] is False
+    assert stored["sync_error"] == {"error": "MemForge API unavailable"}
+    assert stored["audit_log_path"].endswith("teams-sync-audit.jsonl")
+    assert stored["pushed_count"] == 1
+    assert stored["failed_count"] == 0
+    assert stored["skipped_existing_count"] == 0
+
+
+def test_local_agent_state_records_running_without_incrementing_run_count(tmp_path):
+    from memforge.local_agent.state import LocalAgentStateStore
+
+    store = LocalAgentStateStore(tmp_path / "agent-state.json")
+    store.record_result(
+        "cloud-job:laj-teams",
+        {
+            "task_id": "cloud-job:laj-teams",
+            "kind": "cloud_job",
+            "status": "failed",
+            "started_at": "2026-07-09T00:00:00+00:00",
+            "finished_at": "2026-07-09T00:00:01+00:00",
+            "error": "old failure",
+        },
+    )
+
+    payload = store.record_running(
+        "cloud-job:laj-teams",
+        {
+            "task_id": "cloud-job:laj-teams",
+            "kind": "cloud_job",
+            "status": "running",
+            "started_at": "2026-07-09T01:00:00+00:00",
+            "payload": {"source_id": "src-teams", "operation": "teams_sync"},
+        },
+    )
+
+    task = payload["tasks"]["cloud-job:laj-teams"]
+    assert task["run_count"] == 1
+    assert task["last_status"] == "running"
+    assert task["last_started_at"] == "2026-07-09T01:00:00+00:00"
+    assert task["last_finished_at"] is None
+    assert task["last_error"] is None
+    assert task["last_result"]["payload"] == {
+        "source_id": "src-teams",
+        "operation": "teams_sync",
+    }
+
+
+def test_local_adapter_capability_commands_include_teams():
+    runner = CliRunner()
+
+    listed = runner.invoke(cli, ["adapter", "list"])
+    status = runner.invoke(cli, ["adapter", "status"])
+
+    assert listed.exit_code == 0
+    assert status.exit_code == 0
+    listed_payload = json.loads(listed.output)
+    status_payload = json.loads(status.output)
+    assert any(item["type"] == "teams" for item in listed_payload["data"])
+    assert "teams.auth" in status_payload["capabilities"]
+    assert "teams.browse" in status_payload["capabilities"]
+    assert "teams.sync" in status_payload["capabilities"]
+
+
+def test_teams_browse_job_reauths_when_no_local_session(monkeypatch):
+    calls = {"browse": 0}
+    auth_jobs: list[dict] = []
+
+    async def fake_browse_teams_conversations(*, region: str):
+        calls["browse"] += 1
+        if calls["browse"] == 1:
+            raise ValueError("No Teams session found.")
+        return {"favorites": [], "teams": [], "group_chats": [], "individual_chats": []}
+
+    monkeypatch.setattr(
+        "memforge.local_agent.teams_browse.browse_teams_conversations",
+        fake_browse_teams_conversations,
+    )
+    monkeypatch.setattr(main, "_current_teams_chat_token_hashes", lambda: {"old-token-hash"})
+
+    def fake_auth(job):
+        auth_jobs.append(job)
+        return {"operation": "teams_auth", "authenticated": True, "region": "emea", "token_count": 1}
+
+    monkeypatch.setattr(main, "_run_cloud_teams_auth_job", fake_auth)
+
+    result = main._run_cloud_teams_browse_job(
+        {
+            "job_id": "laj-browse",
+            "operation": "teams_browse",
+            "payload": {"region": "emea", "wait_seconds": 1},
+        }
+    )
+
+    assert result == {
+        "operation": "teams_browse",
+        "region": "emea",
+        "favorites": [],
+        "teams": [],
+        "group_chats": [],
+        "individual_chats": [],
+    }
+    assert calls["browse"] == 2
+    assert auth_jobs[0]["operation"] == "teams_auth"
+    assert auth_jobs[0]["payload"]["rejected_token_hashes"] == ["old-token-hash"]
+
+
+def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
+    calls = {"collect": 0}
+    auth_jobs: list[dict] = []
+
+    async def fake_collect(job, *, source_id: str, limit: int):
+        calls["collect"] += 1
+        if calls["collect"] == 1:
+            raise ValueError("No Teams session found.")
+        return {"documents": [], "poll_audits": []}
+
+    def fake_auth(job):
+        auth_jobs.append(job)
+        return {"operation": "teams_auth", "authenticated": True, "region": "emea", "token_count": 1}
+
+    class FakeClient:
+        pass
+
+    monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect)
+    monkeypatch.setattr(main, "_run_cloud_teams_auth_job", fake_auth)
+    monkeypatch.setattr(main, "_current_teams_chat_token_hashes", lambda: set())
+    monkeypatch.setattr(main, "_workspace_tool_client", lambda client, workspace_id: client)
+
+    result = main._run_cloud_teams_sync_job(
+        {
+            "job_id": "laj-sync",
+            "operation": "teams_sync",
+            "source_id": "src-teams",
+            "workspace_id": "workspace-a",
+            "payload": {
+                "source_id": "src-teams",
+                "workspace_id": "workspace-a",
+                "audit_log_path": str(tmp_path / "teams-audit.jsonl"),
+                "ledger_state_path": str(tmp_path / "teams-ledger.json"),
+                "wait_seconds": 1,
+            },
+        },
+        FakeClient(),
+    )
+
+    assert result["operation"] == "teams_sync"
+    assert result["source_id"] == "src-teams"
+    assert result["counts"] == {
+        "selected": 0,
+        "pushed": 0,
+        "failed": 0,
+        "skipped_existing": 0,
+        "polls": 0,
+    }
+    assert result["sync_started"] is False
+    assert calls["collect"] == 2
+    assert auth_jobs[0]["operation"] == "teams_auth"
+
+
+def test_local_agent_state_records_daemon_heartbeat(tmp_path):
+    from memforge.local_agent.state import LocalAgentStateStore
+
+    store = LocalAgentStateStore(tmp_path / "agent-state.json")
+
+    payload = store.record_daemon_heartbeat(
+        pid=12345,
+        started_at="2026-07-09T00:00:00+00:00",
+        command=["memforge", "adapter", "daemon", "run"],
+        target={
+            "api_url": "https://memforge.example.test",
+            "api_token_configured": True,
+        },
+    )
+
+    assert payload["daemon"]["pid"] == 12345
+    assert payload["daemon"]["started_at"] == "2026-07-09T00:00:00+00:00"
+    assert payload["daemon"]["command"] == ["memforge", "adapter", "daemon", "run"]
+    assert payload["daemon"]["target"]["api_token_configured"] is True
+    assert payload["daemon"]["updated_at"]
+    assert LocalAgentStateStore(tmp_path / "agent-state.json").load()["daemon"]["pid"] == 12345
 
 
 def test_local_agent_daemon_lock_prevents_duplicate_runners(tmp_path):
