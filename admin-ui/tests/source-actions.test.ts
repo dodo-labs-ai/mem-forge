@@ -93,6 +93,7 @@ assert.deepEqual(
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
 const sourceRowSource = readFileSync("src/views/sources/SourceRow.tsx", "utf8");
 const syncStatusBarSource = readFileSync("src/components/admin/SyncStatusBar.tsx", "utf8");
+const localAgentJobsSource = readFileSync("src/api/localAgentJobs.ts", "utf8");
 
 assert.match(
   sourcesPageSource,
@@ -231,6 +232,16 @@ assert.match(
   "Internal network GitHub source sync should use the cloud local-agent queue",
 );
 assert.match(
+  localAgentJobsSource,
+  /workspace_id:\s*currentWorkspaceId\(\)/,
+  "Local-agent jobs should bind to the selected workspace instead of relying on a primary workspace",
+);
+assert.match(
+  localAgentJobsSource,
+  /client\.post<LocalAgentJobCreateResponse>\("\/api\/cloud\/local-agent\/jobs"/,
+  "Local-agent job creation should be centralized behind the API helper",
+);
+assert.match(
   sourcesPageSource,
   /forceResyncSource[\s\S]*createLocalAgentSyncJob\(source,\s*\{/,
   "Force refresh for local-agent sources should use the daemon job path instead of Cloud-side source sync",
@@ -247,10 +258,32 @@ assert.doesNotMatch(
 );
 
 const sourceConfigDialogSource = readFileSync("src/views/sources/SourceConfigDialog.tsx", "utf8");
+const teamsSourceWizardSource = readFileSync("src/views/sources/TeamsSourceWizard.tsx", "utf8");
+const githubRepoFolderPickerSource = readFileSync("src/views/sources/GitHubRepoFolderPicker.tsx", "utf8");
 assert.match(
   sourceConfigDialogSource,
   /const DISCOVERY_PREVIEW_LIMIT = 5;/,
   "source discovery preview should request a small bounded result set",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /createLocalAgentJob/,
+  "Local markdown local-agent preview jobs should bind to the selected workspace",
+);
+assert.match(
+  teamsSourceWizardSource,
+  /createLocalAgentJob/,
+  "Teams auth and browse jobs should bind to the selected workspace",
+);
+assert.match(
+  githubRepoFolderPickerSource,
+  /createLocalAgentJob/,
+  "GitHub local-agent browse jobs should bind to the selected workspace",
+);
+assert.doesNotMatch(
+  [sourcesPageSource, sourceConfigDialogSource, teamsSourceWizardSource, githubRepoFolderPickerSource].join("\n"),
+  /client\.post<[^>]+>\("\/api\/cloud\/local-agent\/jobs"/,
+  "Source UI components should not create local-agent job envelopes directly",
 );
 assert.match(
   sourceConfigDialogSource,

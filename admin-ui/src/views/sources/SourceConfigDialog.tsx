@@ -3,12 +3,12 @@ import type { ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, Check, ChevronRight, FolderOpen, Loader2, RefreshCw } from "lucide-react";
 import client from "@/api/client";
+import { createLocalAgentJob } from "@/api/localAgentJobs";
 import type {
   ConfigField,
   DiscoveryPreviewResponse,
   GeneConfigSchema,
   JiraAuthSession,
-  LocalAgentJobCreateResponse,
   LocalAgentJobStatusResponse,
   ProjectBinding,
   Source,
@@ -223,16 +223,16 @@ function SourceConfigForm({
     mutationFn: async () => {
       const serializedConfig = serializeConfig(schema.fields, config);
       if (sourceType === "local_markdown") {
-        const created = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
-          source_id: source?.id ?? "",
-          source_type: "local_markdown",
+        const created = await createLocalAgentJob({
+          sourceId: source?.id ?? "",
+          sourceType: "local_markdown",
           operation: "local_markdown_preview_tree",
           payload: {
             ...localMarkdownPreviewJobConfig(serializedConfig, source),
             limit: DISCOVERY_PREVIEW_LIMIT,
           },
         });
-        const status = await pollLocalAgentPreviewJob(created.data.job_id);
+        const status = await pollLocalAgentPreviewJob(created.job_id);
         if (status.status === "failed") {
           throw new Error(status.last_error || "Local daemon could not preview this folder.");
         }
@@ -248,16 +248,16 @@ function SourceConfigForm({
   });
   const pickLocalMarkdownRoot = useMutation<string | null, unknown, void>({
     mutationFn: async () => {
-      const created = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
-        source_id: source?.id ?? "",
-        source_type: "local_markdown",
+      const created = await createLocalAgentJob({
+        sourceId: source?.id ?? "",
+        sourceType: "local_markdown",
         operation: "local_markdown_pick_root",
         payload: {
           title: "Choose folder to sync",
           initial_directory: stringValue(config.root).trim() || undefined,
         },
       });
-      const status = await pollLocalAgentPreviewJob(created.data.job_id);
+      const status = await pollLocalAgentPreviewJob(created.job_id);
       if (status.status === "failed") {
         throw new Error(status.last_error || "Local daemon could not open the folder picker.");
       }

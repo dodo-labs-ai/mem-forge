@@ -5,6 +5,7 @@ import {
   localAgentProgressMessage,
 } from "../src/views/sources/localAgentSyncProgress.js";
 import type { LocalAgentJobStatusResponse } from "../src/api/types.js";
+import { currentWorkspaceId } from "../src/lib/workspace.js";
 
 function job(
   status: LocalAgentJobStatusResponse["status"],
@@ -96,3 +97,15 @@ assert.equal(
   ),
   "Action needed · Sign in to Teams in Chrome, then retry sync.",
 );
+
+Object.defineProperty(globalThis, "window", {
+  configurable: true,
+  value: { location: { search: "?workspace=payroll_agent" } },
+});
+assert.equal(currentWorkspaceId(), "payroll_agent");
+
+Object.defineProperty(globalThis, "window", {
+  configurable: true,
+  value: { location: { search: "?workspace=%20" } },
+});
+assert.equal(currentWorkspaceId(), undefined);
