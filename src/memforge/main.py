@@ -2184,7 +2184,17 @@ def _teams_auth_exception(exc: Exception) -> bool:
     if isinstance(exc, AuthenticationError):
         return True
     text = str(exc).lower()
-    return "401" in text or "authentication failed" in text or "session expired" in text
+    return any(
+        marker in text
+        for marker in (
+            "401",
+            "authentication failed",
+            "session expired",
+            "no teams session found",
+            "missing chat api token",
+            "no active teams session",
+        )
+    )
 
 
 def _current_teams_chat_token_hashes() -> set[str]:

@@ -575,6 +575,24 @@ def test_memory_extraction_prompt_rejects_metadata_and_preserves_modality():
     assert "local paths" in prompt
 
 
+def test_memory_extraction_prompts_preserve_source_language():
+    from memforge.pipeline.memory_extractor import (
+        MEMORY_CHANGE_EXTRACTION_PROMPT,
+        MEMORY_EXTRACTION_PROMPT,
+        UNIT_MEMORY_EXTRACTION_PROMPT,
+    )
+
+    for prompt in (
+        MEMORY_EXTRACTION_PROMPT,
+        MEMORY_CHANGE_EXTRACTION_PROMPT,
+        UNIT_MEMORY_EXTRACTION_PROMPT,
+    ):
+        lowered = prompt.lower()
+        assert "preserve the source language" in lowered
+        assert "do not translate memories to english" in lowered
+        assert "primarily chinese" in lowered
+
+
 def test_memory_change_extraction_prompt_rejects_operational_metadata_changes():
     from memforge.pipeline.memory_extractor import MEMORY_CHANGE_EXTRACTION_PROMPT
 
