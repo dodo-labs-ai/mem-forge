@@ -2496,6 +2496,7 @@ def test_collect_teams_documents_from_cloud_job_uses_gene_window_shape(monkeypat
             assert self.config["conversation_gap_minutes"] == 60
             assert self.config["ledger_state_path"].endswith("teams-ledger-state.json")
             assert "local_agent_documents_dir" not in self.config
+            assert "local_agent_package_manifest" not in self.config
             assert "audit_log_path" not in self.config
 
         async def discover(self, since):
@@ -2567,6 +2568,12 @@ def test_collect_teams_documents_from_cloud_job_uses_gene_window_shape(monkeypat
                     "group_chats": ["19:conversation@thread.tacv2"],
                     "conversation_gap_minutes": 60,
                     "local_agent_documents_dir": "/srv/memforge/inbox/src-teams",
+                    "local_agent_package_manifest": [
+                        {
+                            "doc_id": "teams-src-teams-old",
+                            "package_path": "/srv/memforge/inbox/src-teams/teams-src-teams-old.json",
+                        }
+                    ],
                     "audit_log_path": "/tmp/teams-audit.jsonl",
                 },
             },
