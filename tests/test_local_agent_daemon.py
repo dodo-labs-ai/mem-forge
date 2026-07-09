@@ -192,7 +192,6 @@ def test_local_agent_state_records_daemon_heartbeat(tmp_path):
         target={
             "api_url": "https://memforge.example.test",
             "api_token_configured": True,
-            "workspace_id_configured": True,
         },
     )
 
@@ -256,7 +255,7 @@ def test_local_agent_status_reports_running_daemon_from_lock_and_heartbeat(tmp_p
     assert payload["daemon"]["lock_held"] is True
     assert payload["target"]["source"] == "running_daemon"
     assert payload["target"]["api_token_configured"] is True
-    assert payload["target"]["workspace_id_configured"] is True
+    assert "workspace_id_configured" not in payload["target"]
 
 
 def test_local_agent_discovers_linked_profiles_and_jira_origins():
@@ -561,15 +560,15 @@ def test_local_agent_cloud_job_loop_sleeps_after_lease_failure(tmp_path):
     assert sleeps == [7]
 
 
-def test_local_agent_cloud_job_loop_sleeps_after_scheduled_task_failure(tmp_path):
+def test_local_agent_cloud_job_loop_does_not_run_scheduled_tasks(tmp_path):
     from memforge.local_agent.runner import LocalAgentRunner
     from memforge.local_agent.state import LocalAgentStateStore
     from memforge.local_agent.tasks import LocalAgentHandlers
 
-    sleeps: list[float] = []
+    lease_calls = 0
 
     runner = LocalAgentRunner(
-        adapter_config={},
+        adapter_config={"github": {"arch": {"source_id": "src-arch"}}},
         state_store=LocalAgentStateStore(tmp_path / "state.json"),
         handlers=LocalAgentHandlers(
             run_kb_profile=lambda name: {},
@@ -584,15 +583,21 @@ def test_local_agent_cloud_job_loop_sleeps_after_scheduled_task_failure(tmp_path
 
     runner._run_scheduled_tasks = fail_scheduled_tasks  # type: ignore[method-assign]
 
+    def lease_cloud_jobs(*, wait_seconds: int = 0) -> dict:
+        nonlocal lease_calls
+        lease_calls += 1
+        return {"jobs": []}
+
+    runner.cloud_jobs_provider = lease_cloud_jobs
+
     runner.run_forever(
         include_jira=False,
         poll_interval_seconds=7,
         cloud_job_wait_seconds=25,
-        stop_after_iterations=2,
-        sleep=sleeps.append,
+        stop_after_iterations=1,
     )
 
-    assert sleeps == [7]
+    assert lease_calls == 1
 
 
 def test_local_agent_cloud_lease_failure_does_not_abort_profile_tasks(tmp_path):
@@ -1115,7 +1120,7 @@ def test_adapter_daemon_status_summarizes_state_by_default(monkeypatch, tmp_path
                     "cloud-jobs:lease": {
                         "run_count": 3,
                         "last_status": "failed",
-                        "last_error": "missing MEMFORGE_WORKSPACE_ID",
+                        "last_error": "cloud lease unavailable",
                         "updated_at": "2026-07-07T01:02:00+00:00",
                     }
                 },
@@ -1143,14 +1148,13 @@ def test_adapter_daemon_status_summarizes_state_by_default(monkeypatch, tmp_path
     assert "state" not in payload
     assert payload["target"]["api_url"] == "https://memforge.example.test"
     assert payload["target"]["api_token_configured"] is False
-    assert payload["target"]["workspace_id_configured"] is False
+    assert "workspace_id_configured" not in payload["target"]
     assert payload["recommendations"] == [
         "Set MEMFORGE_API_TOKEN before starting the daemon.",
-        "Set MEMFORGE_WORKSPACE_ID for hosted multi-workspace MemForge targets.",
     ]
     assert payload["summary"]["total_recorded_tasks"] == 2
     assert payload["summary"]["last_cloud_job_lease"]["status"] == "failed"
-    assert payload["summary"]["last_cloud_job_lease"]["error"] == "missing MEMFORGE_WORKSPACE_ID"
+    assert payload["summary"]["last_cloud_job_lease"]["error"] == "cloud lease unavailable"
     assert payload["recent_tasks"] == [
         {
             "task_id": "cloud-jobs:lease",
@@ -1158,7 +1162,7 @@ def test_adapter_daemon_status_summarizes_state_by_default(monkeypatch, tmp_path
             "last_finished_at": None,
             "updated_at": "2026-07-07T01:02:00+00:00",
             "run_count": 3,
-            "error": "missing MEMFORGE_WORKSPACE_ID",
+            "error": "cloud lease unavailable",
         },
         {
             "task_id": "github:arch",
