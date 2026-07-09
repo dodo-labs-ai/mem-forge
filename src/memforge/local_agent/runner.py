@@ -161,8 +161,6 @@ class LocalAgentRunner:
                     self.run_once(include_jira=include_jira, only_due=True)
                     cloud_results = []
                 else:
-                    now = datetime.now(timezone.utc)
-                    self._run_scheduled_tasks(now=now, include_jira=include_jira, only_due=True)
                     cloud_results = self._run_cloud_jobs(
                         now=datetime.now(timezone.utc),
                         wait_seconds=max(int(cloud_job_wait_seconds), 0),

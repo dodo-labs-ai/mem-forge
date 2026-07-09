@@ -1255,11 +1255,7 @@ function AgentSessionSetupDialog({
               <code className="rounded bg-muted px-1 font-mono text-[11px]">MEMFORGE_API_URL</code>{" "}
               and optionally{" "}
               <code className="rounded bg-muted px-1 font-mono text-[11px]">MEMFORGE_API_TOKEN</code>{" "}
-              when the plugin should reach a non-default MemForge instance. Hosted
-              multi-workspace deployments also need{" "}
-              <code className="rounded bg-muted px-1 font-mono text-[11px]">
-                MEMFORGE_WORKSPACE_ID
-              </code>. See{" "}
+              when the plugin should reach a non-default MemForge instance. See{" "}
               <span className="font-medium text-foreground">
                 docs/design/agent-session-saas-plugin-flow.md
               </span>{" "}
