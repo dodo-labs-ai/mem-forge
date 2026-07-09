@@ -131,8 +131,18 @@ assert.match(
 );
 assert.match(
   sourcesPageSource,
-  /current === LOCAL_AGENT_WAITING_MESSAGE \? null : current/,
-  "Successful local-agent sync should clear the optimistic waiting banner",
+  /localAgentProgressBySource/,
+  "Local-agent sync should track row-level progress instead of relying only on a global banner",
+);
+assert.match(
+  sourcesPageSource,
+  /LOCAL_AGENT_TERMINAL_PROGRESS_RETENTION_MS/,
+  "Successful local-agent sync should keep a short row-level terminal summary visible",
+);
+assert.match(
+  sourceRowSource,
+  /localAgentProgress/,
+  "SourceRow should render local-agent job progress for the matching source row",
 );
 assert.match(
   sourcesPageSource,
@@ -212,7 +222,7 @@ assert.match(
 );
 assert.match(
   sourcesPageSource,
-  /forceResyncSource[\s\S]*createLocalAgentSyncJob\(source\)/,
+  /forceResyncSource[\s\S]*createLocalAgentSyncJob\(source,\s*\{/,
   "Force refresh for local-agent sources should use the daemon job path instead of Cloud-side source sync",
 );
 assert.match(

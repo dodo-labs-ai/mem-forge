@@ -368,6 +368,14 @@ export interface LocalAgentJobCreateResponse {
   status: "queued";
 }
 
+export interface LocalAgentJobCounts {
+  selected?: number;
+  pushed?: number;
+  skipped_existing?: number;
+  failed?: number;
+  polls?: number;
+}
+
 export interface LocalAgentJobStatusResponse {
   job_id: string;
   status: "queued" | "leased" | "succeeded" | "failed";
@@ -388,6 +396,8 @@ export interface LocalAgentJobStatusResponse {
     group_chats?: TeamsChat[];
     individual_chats?: TeamsChat[];
     truncated?: boolean;
+    counts?: LocalAgentJobCounts;
+    sync_started?: boolean;
   } | null;
   last_error?: string | null;
 }

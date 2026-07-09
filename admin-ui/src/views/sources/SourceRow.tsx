@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
-import { Info, Loader2, Pause, Play, SlidersHorizontal } from "lucide-react";
+import { AlertCircle, Check, Info, Loader2, Pause, Play, SlidersHorizontal } from "lucide-react";
 import type { Source, SourceCapabilities, SourceOwnership } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
 import { SyncStatusBar } from "@/components/admin/SyncStatusBar";
@@ -11,6 +11,7 @@ import { SourceIcon } from "@/components/sources/SourceIcon";
 import { cn } from "@/lib/utils";
 import { formatDuration, timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
+import type { LocalAgentSyncProgress } from "./localAgentSyncProgress";
 
 /**
  * One row in the project-grouped sources view. Behaviour and DOM match the
@@ -43,6 +44,7 @@ export function SourceRow({
   source,
   perGroupMemoryCount,
   isSyncing,
+  localAgentProgress,
   isDeleting,
   isUpdatingStatus = false,
   isManaged,
@@ -61,6 +63,7 @@ export function SourceRow({
   source: Source;
   perGroupMemoryCount: number;
   isSyncing: boolean;
+  localAgentProgress?: LocalAgentSyncProgress;
   isDeleting: boolean;
   isUpdatingStatus?: boolean;
   isManaged: boolean;
@@ -124,7 +127,7 @@ export function SourceRow({
                 <span className="font-medium text-foreground">{perGroupMemoryCount}</span> memories
               </span>
               <span>
-                {source.sync?.status === "running"
+                {source.sync?.status === "running" || isActiveLocalAgentProgress(localAgentProgress)
                   ? "Syncing now"
                   : <LastSyncDetails source={source} itemLabel={itemLabel} />}
               </span>
@@ -242,11 +245,54 @@ export function SourceRow({
         </div>
       )}
 
+      {localAgentProgress && (
+        <LocalAgentProgressBar progress={localAgentProgress} />
+      )}
+
       {hasManagementControl && (
         <SyncStatusBar sync={source.sync} itemLabel={itemLabel} onRetry={isPaused ? undefined : onSync} />
       )}
     </div>
   );
+}
+
+function LocalAgentProgressBar({ progress }: { progress: LocalAgentSyncProgress }) {
+  const isActive = progress.state === "queued" || progress.state === "leased";
+  const isFailed = progress.state === "failed";
+  const Icon = isActive ? Loader2 : isFailed ? AlertCircle : Check;
+
+  return (
+    <div
+      role={isFailed ? "alert" : "status"}
+      aria-live="polite"
+      className={cn(
+        "flex items-center gap-2 rounded-md px-3 py-2 text-sm",
+        isFailed
+          ? "bg-destructive/10 text-destructive"
+          : progress.state === "succeeded"
+            ? "bg-emerald-50 text-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-100"
+            : "bg-muted text-muted-foreground",
+      )}
+    >
+      <Icon
+        className={cn(
+          "size-3.5 shrink-0",
+          isActive && "animate-spin text-foreground",
+          progress.state === "succeeded" && "text-emerald-600 dark:text-emerald-300",
+        )}
+      />
+      <span className={cn("font-medium", !isFailed && "text-foreground")}>
+        {progress.message}
+      </span>
+      {progress.detail && (
+        <span className="min-w-0 truncate text-xs opacity-80">{progress.detail}</span>
+      )}
+    </div>
+  );
+}
+
+function isActiveLocalAgentProgress(progress: LocalAgentSyncProgress | undefined): boolean {
+  return progress?.state === "queued" || progress?.state === "leased";
 }
 
 function LastSyncDetails({
