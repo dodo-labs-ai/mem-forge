@@ -1,7 +1,8 @@
 import { useMemo, useState } from "react";
 import { AlertCircle, FileText, FolderTree, Loader2, RefreshCw } from "lucide-react";
 import client from "@/api/client";
-import type { GitHubRepoTreeResponse, LocalAgentJobCreateResponse, LocalAgentJobStatusResponse } from "@/api/types";
+import { createLocalAgentJob } from "@/api/localAgentJobs";
+import type { GitHubRepoTreeResponse, LocalAgentJobStatusResponse } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -58,15 +59,15 @@ export function GitHubRepoFolderPicker({
     setLoading(true);
     setMessage(null);
     try {
-      const created = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
-        source_type: "github_repo",
+      const created = await createLocalAgentJob({
+        sourceType: "github_repo",
         operation: "github_repo_preview_tree",
         payload: {
           ...config,
           limit: LOCAL_SCAN_LIMIT,
         },
       });
-      const status = await pollLocalAgentJob(created.data.job_id);
+      const status = await pollLocalAgentJob(created.job_id);
       if (status.status === "failed") {
         setMessage(status.last_error || "Local daemon could not load repository folders.");
         return;

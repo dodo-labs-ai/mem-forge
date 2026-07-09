@@ -14,8 +14,8 @@ import {
   X,
 } from "lucide-react";
 import client from "@/api/client";
+import { createLocalAgentJob } from "@/api/localAgentJobs";
 import type {
-  LocalAgentJobCreateResponse,
   LocalAgentJobStatusResponse,
   TeamsAuthStatus,
   TeamsBrowseData,
@@ -195,12 +195,12 @@ async function runTeamsAuthCheck(region: string): Promise<TeamsAuthStatus> {
 }
 
 async function runTeamsLocalAgentJob(operation: string, payload: Record<string, unknown>): Promise<LocalAgentJobStatusResponse> {
-  const created = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
-    source_type: "teams",
+  const created = await createLocalAgentJob({
+    sourceType: "teams",
     operation,
     payload,
   });
-  return pollTeamsLocalAgentJob(created.data.job_id);
+  return pollTeamsLocalAgentJob(created.job_id);
 }
 
 async function pollTeamsLocalAgentJob(jobId: string): Promise<LocalAgentJobStatusResponse> {

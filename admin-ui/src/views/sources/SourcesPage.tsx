@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Files, Info, Loader2, MoreHorizontal, Pause, Play, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import client from "@/api/client";
+import { createLocalAgentJob } from "@/api/localAgentJobs";
 import type {
   AgentSessionCompleteness,
   GeneMetadata,
@@ -165,16 +166,16 @@ async function createLocalAgentSyncJob(
     }
     return null;
   }
-  const response = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
-    source_id: source.id,
-    source_type: source.type,
+  const created = await createLocalAgentJob({
+    sourceId: source.id,
+    sourceType: source.type,
     operation,
     payload: localAgentJobPayload(source),
   });
   options.onProgress?.(
     localAgentProgressFromJob(
       {
-        job_id: response.data.job_id,
+        job_id: created.job_id,
         status: "queued",
         result: null,
         last_error: null,
@@ -182,14 +183,14 @@ async function createLocalAgentSyncJob(
       options.itemLabel,
     ),
   );
-  const status = await pollLocalAgentSyncJob(response.data.job_id, options);
+  const status = await pollLocalAgentSyncJob(created.job_id, options);
   if (status.status === "failed") {
     if (status.last_error) {
       console.warn("Local daemon sync failed", status.last_error);
     }
     throw new Error(localAgentJobErrorMessage(status));
   }
-  return response.data;
+  return created;
 }
 
 async function pollLocalAgentSyncJob(
