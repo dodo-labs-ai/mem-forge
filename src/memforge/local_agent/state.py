@@ -49,13 +49,19 @@ class LocalAgentStateStore:
         tasks = payload.get("tasks")
         if not isinstance(tasks, dict):
             tasks = {}
-        return {"version": STATE_VERSION, "tasks": tasks}
+        daemon = payload.get("daemon")
+        cleaned: dict[str, Any] = {"version": STATE_VERSION, "tasks": tasks}
+        if isinstance(daemon, dict):
+            cleaned["daemon"] = daemon
+        return cleaned
 
     def save(self, payload: dict[str, Any]) -> dict[str, Any]:
         cleaned = {
             "version": STATE_VERSION,
             "tasks": payload.get("tasks") if isinstance(payload.get("tasks"), dict) else {},
         }
+        if isinstance(payload.get("daemon"), dict):
+            cleaned["daemon"] = payload["daemon"]
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(dir=str(self.path.parent), prefix=f".{self.path.name}.", suffix=".tmp")
         try:
@@ -87,7 +93,54 @@ class LocalAgentStateStore:
             "last_result": stored_result,
             "updated_at": utc_now_iso(),
         }
-        return self.save({"version": STATE_VERSION, "tasks": tasks})
+        next_payload: dict[str, Any] = {"version": STATE_VERSION, "tasks": tasks}
+        if isinstance(payload.get("daemon"), dict):
+            next_payload["daemon"] = payload["daemon"]
+        return self.save(next_payload)
+
+    def record_running(self, task_id: str, result: dict[str, Any]) -> dict[str, Any]:
+        payload = self.load()
+        tasks = dict(payload.get("tasks") or {})
+        previous = tasks.get(task_id) if isinstance(tasks.get(task_id), dict) else {}
+        stored_result = _compact_result(result)
+        tasks[task_id] = {
+            "run_count": int(previous.get("run_count") or 0),
+            "last_status": "running",
+            "last_started_at": stored_result.get("started_at"),
+            "last_finished_at": None,
+            "last_error": None,
+            "last_result": stored_result,
+            "updated_at": utc_now_iso(),
+        }
+        next_payload: dict[str, Any] = {"version": STATE_VERSION, "tasks": tasks}
+        if isinstance(payload.get("daemon"), dict):
+            next_payload["daemon"] = payload["daemon"]
+        return self.save(next_payload)
+
+    def record_daemon_heartbeat(
+        self,
+        *,
+        pid: int,
+        started_at: str,
+        command: list[str],
+        target: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = self.load()
+        daemon = {
+            "pid": int(pid),
+            "started_at": started_at,
+            "updated_at": utc_now_iso(),
+            "command": list(command),
+        }
+        if isinstance(target, dict):
+            daemon["target"] = deepcopy(target)
+        return self.save(
+            {
+                "version": STATE_VERSION,
+                "tasks": payload.get("tasks") if isinstance(payload.get("tasks"), dict) else {},
+                "daemon": daemon,
+            }
+        )
 
     def _quarantine_corrupt_state(self) -> None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -126,6 +179,11 @@ def _compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "error",
         "detail",
         "status_code",
+        "sync_started",
+        "sync_error",
+        "audit_log_path",
+        "operation",
+        "leased_count",
     }
     compact = {key: deepcopy(payload[key]) for key in preserved_keys if key in payload}
 
@@ -138,4 +196,8 @@ def _compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
         compact["failed_count"] = len(failed)
         if failed:
             compact["first_failed"] = deepcopy(failed[0])
+
+    skipped_existing = payload.get("skipped_existing")
+    if isinstance(skipped_existing, list):
+        compact["skipped_existing_count"] = len(skipped_existing)
     return compact

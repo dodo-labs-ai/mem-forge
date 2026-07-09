@@ -147,12 +147,14 @@ class _TeamsAPIClient:
         """Verify tokens are valid with a lightweight probe."""
         await self._ensure_clients()
         try:
-            resp = await self._chat_client.get("/conversations", params={"pageSize": 1})
-            if resp.status_code == 401:
-                raise AuthenticationError(
-                    "Teams session expired. Connect Teams from the source wizard."
-                )
-            resp.raise_for_status()
+            await self._request(
+                self._chat_client,
+                "GET",
+                "/conversations",
+                params={"pageSize": 1},
+            )
+        except AuthenticationError:
+            raise
         except httpx.HTTPError as e:
             raise AuthenticationError(f"Teams API probe failed: {e}") from e
 
@@ -171,6 +173,10 @@ class _TeamsAPIClient:
 
         async def _do_request() -> httpx.Response:
             resp = await client.request(method, url, **kwargs)
+            if resp.status_code == 401:
+                raise AuthenticationError(
+                    "Teams session expired. Connect Teams from the source wizard."
+                )
             if resp.status_code == 429:
                 raise httpx.HTTPStatusError(
                     "Rate limited", request=resp.request, response=resp,
@@ -181,7 +187,12 @@ class _TeamsAPIClient:
         return await retry_async(
             _do_request,
             max_retries=3,
-            retryable_exceptions=(httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadTimeout),
+            retryable_exceptions=(
+                httpx.HTTPStatusError,
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+                httpx.RemoteProtocolError,
+            ),
             description=f"Teams API {method} {url}",
         )
 
@@ -710,7 +721,7 @@ class TeamsGene(Gene):
                 ConfigField(
                     key="max_age_days", label="Max Age (days)",
                     field_type=ConfigFieldType.INTEGER, required=False,
-                    default="90",
+                    default="14",
                     help_text="How far back to fetch on initial sync",
                     group="sync", order=0,
                 ),
@@ -740,17 +751,22 @@ class TeamsGene(Gene):
         self._client: _TeamsAPIClient | None = None
         self._gap_minutes = int(config.get("conversation_gap_minutes", 60))
         self._max_block = int(config.get("max_block_messages", 100))
-        self._max_age_days = int(config.get("max_age_days", 90))
+        self._max_age_days = int(config.get("max_age_days", 14))
+        self._conversation_fetch_timeout_seconds = int(
+            config.get("conversation_fetch_timeout_seconds", 300)
+        )
         self._message_cache: dict[str, list[dict]] = {}  # conv_id → messages (per-sync)
 
-        # Validate scope
-        channels = config.get("channels", [])
-        group_chats = config.get("group_chats", [])
-        individual_chats = config.get("individual_chats", [])
-        if not any([channels, group_chats, individual_chats]):
-            raise ValueError(
-                "At least one of channels, group_chats, or individual_chats must be configured"
-            )
+        # Local-agent Teams sources read already-captured raw window packages
+        # from the server-side inbox. They do not need remote Teams selectors.
+        if self._local_agent_documents_dir() is None:
+            channels = config.get("channels", [])
+            group_chats = config.get("group_chats", [])
+            individual_chats = config.get("individual_chats", [])
+            if not any([channels, group_chats, individual_chats]):
+                raise ValueError(
+                    "At least one of channels, group_chats, or individual_chats must be configured"
+                )
 
     async def authenticate(self) -> None:
         """Authenticate using tokens from Chrome cookies."""
@@ -780,6 +796,8 @@ class TeamsGene(Gene):
         configured = await self._resolve_configured_conversations(conv_lookup)
         self._log.info("Resolved %d configured conversations", len(configured))
 
+        successful_polls = 0
+        conversation_failures: list[str] = []
         for conv_id, conv_meta in configured:
             # Skip if no activity since last sync
             if since and conv_meta["lastActivity"] < since:
@@ -788,8 +806,14 @@ class TeamsGene(Gene):
 
             # Fetch messages with full context
             self._log.info("Fetching messages for %s (topic=%s)", conv_id[:30], conv_meta.get("topic", "?"))
-            messages = await self._fetch_with_context(conv_id, since)
+            try:
+                messages = await self._fetch_with_timeout(conv_id, since)
+            except TimeoutError as exc:
+                self._log.warning("Skipping Teams conversation %s after timeout: %s", conv_id[:30], exc)
+                conversation_failures.append(str(exc))
+                continue
             self._log.info("Got %d messages for %s", len(messages), conv_id[:30])
+            successful_polls += 1
             self._record_message_ledger_actions(conv_id, conv_meta, messages)
             if not messages:
                 continue
@@ -831,6 +855,12 @@ class TeamsGene(Gene):
             for item in self._project_unthreaded_content_items(conv_meta, block_messages, since=since):
                 yield item
 
+        if conversation_failures and successful_polls == 0:
+            first_failure = conversation_failures[0]
+            remaining = len(conversation_failures) - 1
+            suffix = f" (+{remaining} more)" if remaining else ""
+            raise RuntimeError(f"Teams sync could not fetch any configured conversations: {first_failure}{suffix}")
+
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full thread/block content."""
         if item.extra.get("package_path"):
@@ -853,7 +883,7 @@ class TeamsGene(Gene):
             if cached:
                 messages = cached
             else:
-                messages = await self._fetch_with_context(conv_id, since=None)
+                messages = await self._fetch_with_timeout(conv_id, since=None)
 
             # Filter to this block's time range
             block_start = item.extra.get("block_start")
@@ -1165,6 +1195,24 @@ class TeamsGene(Gene):
                 break
 
         return all_messages
+
+    async def _fetch_with_timeout(
+        self, conv_id: str, since: datetime | None,
+    ) -> list[dict]:
+        timeout = self._conversation_fetch_timeout_seconds
+        if timeout <= 0:
+            return await self._fetch_with_context(conv_id, since)
+        try:
+            return await asyncio.wait_for(
+                self._fetch_with_context(conv_id, since),
+                timeout=timeout,
+            )
+        except TimeoutError as exc:
+            if self._client is not None:
+                self._client.mark_poll_complete(conv_id, stop_reason="fetch_timeout")
+            raise TimeoutError(
+                f"Teams message fetch timed out after {timeout}s for conversation {conv_id[:30]}"
+            ) from exc
 
     def _local_agent_documents_dir(self) -> Path | None:
         configured = str(self.config.get("local_agent_documents_dir") or "").strip()

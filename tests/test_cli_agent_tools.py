@@ -1793,10 +1793,19 @@ def test_local_agent_cloud_jira_sync_starts_source_sync_when_last_push_fails(mon
 
 def test_local_agent_cloud_teams_auth_captures_session(monkeypatch):
     captured_regions: list[str] = []
+    wait_options: list[tuple[int, float]] = []
 
     class FakeTeamsAuthenticator:
-        def authenticate(self, *, region: str = "emea") -> dict[str, object]:
+        def authenticate(
+            self,
+            *,
+            region: str = "emea",
+            wait_seconds: int = 0,
+            poll_interval_seconds: float = 2.0,
+            rejected_token_hashes: set[str] | None = None,
+        ) -> dict[str, object]:
             captured_regions.append(region)
+            wait_options.append((wait_seconds, poll_interval_seconds))
             return {
                 "region": region,
                 "tokens": {
@@ -1829,7 +1838,101 @@ def test_local_agent_cloud_teams_auth_captures_session(monkeypatch):
         "token_count": 1,
     }
     assert captured_regions == ["amer"]
+    assert wait_options == [(90, 2.0)]
     assert FakeToolClient.calls == []
+
+
+def test_teams_authenticator_opens_browser_and_waits_for_chrome_session(monkeypatch, tmp_path: Path):
+    from memforge.auth.teams_auth import TeamsAuthenticator
+
+    attempts: list[int] = []
+    sleeps: list[float] = []
+    opened_urls: list[str] = []
+    token_dir = tmp_path / "tokens"
+
+    def fake_extract(self):
+        attempts.append(1)
+        if len(attempts) < 3:
+            return None
+        return {
+            "https://ic3.teams.office.com": {
+                "token": "tok",
+                "expiresAt": 4_102_444_800,
+                "scopes": "Chat.Read",
+            }
+        }
+
+    monkeypatch.setattr(TeamsAuthenticator, "_extract_from_chrome", fake_extract)
+    monkeypatch.setattr("memforge.auth.teams_auth._open_teams_login", lambda: opened_urls.append("opened"))
+    monkeypatch.setattr("memforge.auth.teams_auth.time.sleep", sleeps.append)
+    monkeypatch.setattr("memforge.auth.teams_auth.TOKEN_DIR", token_dir)
+    monkeypatch.setattr("memforge.auth.teams_auth.TOKEN_FILE", token_dir / "teams.json")
+
+    token_data = TeamsAuthenticator().authenticate(
+        region="emea",
+        wait_seconds=5,
+        poll_interval_seconds=0.5,
+    )
+
+    assert opened_urls == ["opened"]
+    assert len(attempts) == 3
+    assert sleeps == [0.5, 0.5]
+    assert token_data["region"] == "emea"
+    assert token_data["tokens"]["https://ic3.teams.office.com"]["token"] == "tok"
+
+
+def test_teams_authenticator_waits_for_rejected_token_to_change(monkeypatch, tmp_path: Path):
+    import hashlib
+
+    from memforge.auth.teams_auth import CHAT_API_AUDIENCE, TeamsAuthenticator
+
+    sleeps: list[float] = []
+    opened_urls: list[str] = []
+    token_dir = tmp_path / "tokens"
+    extracted = [
+        {
+            CHAT_API_AUDIENCE: {
+                "token": "stale-token",
+                "expiresAt": 4_102_444_800,
+                "scopes": "Chat.Read",
+            }
+        },
+        {
+            CHAT_API_AUDIENCE: {
+                "token": "stale-token",
+                "expiresAt": 4_102_444_800,
+                "scopes": "Chat.Read",
+            }
+        },
+        {
+            CHAT_API_AUDIENCE: {
+                "token": "fresh-token",
+                "expiresAt": 4_102_444_800,
+                "scopes": "Chat.Read",
+            }
+        },
+    ]
+
+    def fake_extract(self):
+        return extracted.pop(0)
+
+    stale_hash = hashlib.sha256("stale-token".encode("utf-8")).hexdigest()
+    monkeypatch.setattr(TeamsAuthenticator, "_extract_from_chrome", fake_extract)
+    monkeypatch.setattr("memforge.auth.teams_auth._open_teams_login", lambda: opened_urls.append("opened"))
+    monkeypatch.setattr("memforge.auth.teams_auth.time.sleep", sleeps.append)
+    monkeypatch.setattr("memforge.auth.teams_auth.TOKEN_DIR", token_dir)
+    monkeypatch.setattr("memforge.auth.teams_auth.TOKEN_FILE", token_dir / "teams.json")
+
+    token_data = TeamsAuthenticator().authenticate(
+        region="emea",
+        wait_seconds=5,
+        poll_interval_seconds=0.5,
+        rejected_token_hashes={stale_hash},
+    )
+
+    assert opened_urls == ["opened"]
+    assert sleeps == [0.5, 0.5]
+    assert token_data["tokens"][CHAT_API_AUDIENCE]["token"] == "fresh-token"
 
 
 def test_local_agent_cloud_teams_auth_check_uses_daemon_token_status(monkeypatch):
@@ -1900,6 +2003,66 @@ def test_local_agent_cloud_teams_browse_returns_picker_data(monkeypatch):
     assert FakeToolClient.calls == []
 
 
+def test_local_agent_cloud_teams_browse_reauths_after_stale_cached_session(monkeypatch):
+    import memforge.local_agent.teams_browse as teams_browse
+    import memforge.auth.teams_auth as teams_auth
+    from memforge.genes.teams_gene import AuthenticationError
+
+    browse_calls: list[int] = []
+    auth_calls: list[tuple[int, float]] = []
+
+    async def fake_browse(*, region: str = "emea"):
+        assert region == "emea"
+        browse_calls.append(1)
+        if len(browse_calls) == 1:
+            raise AuthenticationError("Teams session expired. Connect Teams from the source wizard.")
+        return {
+            "favorites": [],
+            "teams": [],
+            "group_chats": [{"id": "19:group@thread.v2", "topic": "Planning", "lastActivity": None}],
+            "individual_chats": [],
+        }
+
+    class FakeTeamsAuthenticator:
+        def authenticate(
+            self,
+            *,
+            region: str = "emea",
+            wait_seconds: int = 0,
+            poll_interval_seconds: float = 2.0,
+            rejected_token_hashes: set[str] | None = None,
+        ) -> dict[str, object]:
+            auth_calls.append((wait_seconds, poll_interval_seconds))
+            return {
+                "region": region,
+                "tokens": {
+                    "https://ic3.teams.office.com": {
+                        "token": "fresh",
+                        "expiresAt": 4_102_444_800,
+                    }
+                },
+            }
+
+    monkeypatch.setattr(teams_browse, "browse_teams_conversations", fake_browse)
+    monkeypatch.setattr(teams_auth, "TeamsAuthenticator", FakeTeamsAuthenticator)
+    FakeToolClient.reset({})
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-teams-browse",
+            "operation": "teams_browse",
+            "source_type": "teams",
+            "payload": {"region": "emea"},
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload["operation"] == "teams_browse"
+    assert payload["group_chats"][0]["topic"] == "Planning"
+    assert len(browse_calls) == 2
+    assert auth_calls == [(90, 2.0)]
+
+
 def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_path: Path):
     from memforge.local_agent.teams_audit import validate_teams_audit_run
 
@@ -1944,7 +2107,20 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
 
     monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect, raising=False)
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
+
+    def fake_push_teams_window_package(self, **kwargs):
+        self.calls.append((
+            "push_teams_window_package",
+            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+        ))
+        return {
+            "doc_id": "teams-doc",
+            "document_hash": "hash",
+            "sync_started": bool(kwargs.get("process_now")),
+        }
+
+    monkeypatch.setattr(FakeToolClient, "push_teams_window_package", fake_push_teams_window_package)
+    FakeToolClient.reset({})
     audit_log_path = tmp_path / "teams-audit.jsonl"
     ledger_state_path = tmp_path / "teams-ledger.json"
 
@@ -1967,6 +2143,7 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
 
     assert payload["operation"] == "teams_sync"
     assert payload["counts"] == {"selected": 2, "pushed": 2, "failed": 0, "skipped_existing": 0, "polls": 0}
+    assert payload["sync_started"] is True
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
     assert len(push_calls) == 2
     first = push_calls[0][1]
@@ -1981,10 +2158,8 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     assert "markdown_body" not in first
     assert "last_modified" not in first
     assert first["process_now"] is False
-    sync_calls = [call for call in FakeToolClient.calls if call[0] == "start_source_sync"]
-    assert len(sync_calls) == 1
-    assert sync_calls[0][1]["workspace_id"] == "ws-from-cloud"
-    assert sync_calls[0][1]["source_id"] == "src-teams"
+    assert push_calls[1][1]["process_now"] is True
+    assert not [call for call in FakeToolClient.calls if call[0] == "start_source_sync"]
 
     audit_rows = [json.loads(line) for line in audit_log_path.read_text(encoding="utf-8").splitlines()]
     assert [row["event"] for row in audit_rows] == [
@@ -2000,6 +2175,150 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     assert {row["patch_status"] for row in audit_rows if row["event"] == "teams_memory_patch"} == {"pushed"}
     assert audit_rows[-1]["selected_windows"] == 2
     assert audit_rows[-1]["pushed_windows"] == 2
+    assert audit_rows[-1]["sync_started"] is True
+    assert audit_rows[-1]["sync_error"] is None
+
+
+def test_local_agent_cloud_teams_sync_reauths_after_stale_session(monkeypatch, tmp_path: Path):
+    import memforge.auth.teams_auth as teams_auth
+    from memforge.genes.teams_gene import AuthenticationError
+
+    collect_calls: list[int] = []
+    auth_calls: list[tuple[int, float]] = []
+
+    async def fake_collect(job, *, source_id, limit):
+        assert source_id == "src-teams"
+        collect_calls.append(1)
+        if len(collect_calls) == 1:
+            raise AuthenticationError("Teams session expired. Connect Teams from the source wizard.")
+        return {
+            "documents": [
+                {
+                    "conversation_id": "19:conversation@thread.tacv2",
+                    "root_message_id": "1783500000000",
+                    "window_id": "teams-thread:v1:opaque-window",
+                    "window_type": "thread",
+                    "revision_hash": "sha256:revision-1",
+                    "title": "Thread window",
+                    "source_url": "https://teams.microsoft.com/l/message/19:conversation@thread.tacv2/1783500000001",
+                    "last_modified": "2026-07-08T09:24:57.5870000Z",
+                    "raw_payload": {
+                        "conversation_type": "channel",
+                        "messages": [{"id": "1783500000000", "content": "Thread window", "from": "Alice"}],
+                    },
+                    "raw_hash": "sha256:raw-1",
+                    "message_count": 1,
+                }
+            ],
+            "poll_audits": [],
+        }
+
+    class FakeTeamsAuthenticator:
+        def authenticate(
+            self,
+            *,
+            region: str = "emea",
+            wait_seconds: int = 0,
+            poll_interval_seconds: float = 2.0,
+            rejected_token_hashes: set[str] | None = None,
+        ) -> dict[str, object]:
+            auth_calls.append((wait_seconds, poll_interval_seconds))
+            return {
+                "region": region,
+                "tokens": {
+                    "https://ic3.teams.office.com": {
+                        "token": "fresh",
+                        "expiresAt": 4_102_444_800,
+                    }
+                },
+            }
+
+    monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect, raising=False)
+    monkeypatch.setattr(teams_auth, "TeamsAuthenticator", FakeTeamsAuthenticator)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-teams-sync",
+            "workspace_id": "ws-from-cloud",
+            "operation": "teams_sync",
+            "source_id": "src-teams",
+            "payload": {
+                "conversation_ids": "19:conversation@thread.tacv2",
+                "audit_log_path": str(tmp_path / "teams-audit.jsonl"),
+                "ledger_state_path": str(tmp_path / "teams-ledger.json"),
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload["operation"] == "teams_sync"
+    assert payload["counts"]["pushed"] == 1
+    assert len(collect_calls) == 2
+    assert auth_calls == [(90, 2.0)]
+
+
+def test_local_agent_cloud_teams_sync_reports_push_failure_without_generic_source_sync(monkeypatch, tmp_path: Path):
+    async def fake_collect(job, *, source_id, limit):
+        return [
+            {
+                "conversation_id": "19:conversation@thread.tacv2",
+                "root_message_id": "1783500000000",
+                "window_id": "teams-thread:v1:opaque-window",
+                "window_type": "thread",
+                "revision_hash": "sha256:revision-1",
+                "title": "Thread window",
+                "source_url": "https://teams.microsoft.com/l/message/19:conversation@thread.tacv2/1783500000001",
+                "last_modified": "2026-07-08T09:24:57.5870000Z",
+                "raw_payload": {
+                    "conversation_type": "channel",
+                    "messages": [{"id": "1783500000000", "content": "Thread window", "from": "Alice"}],
+                },
+                "raw_hash": "sha256:raw-1",
+                "message_count": 1,
+            }
+        ]
+
+    def failing_push_teams_window_package(self, **kwargs):
+        self.calls.append((
+            "push_teams_window_package",
+            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+        ))
+        return {"error": "MemForge API unavailable", "detail": "Server disconnected without sending a response."}
+
+    monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect, raising=False)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    monkeypatch.setattr(FakeToolClient, "push_teams_window_package", failing_push_teams_window_package)
+    FakeToolClient.reset({})
+    audit_log_path = tmp_path / "teams-audit.jsonl"
+    ledger_state_path = tmp_path / "teams-ledger.json"
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-teams-sync",
+            "workspace_id": "ws-from-cloud",
+            "operation": "teams_sync",
+            "source_id": "src-teams",
+            "payload": {
+                "process_now": True,
+                "audit_log_path": str(audit_log_path),
+                "ledger_state_path": str(ledger_state_path),
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload["counts"] == {"selected": 1, "pushed": 0, "failed": 1, "skipped_existing": 0, "polls": 0}
+    assert payload["sync_started"] is False
+    assert payload["error"] == "one or more Teams windows failed to push"
+    assert not [call for call in FakeToolClient.calls if call[0] == "start_source_sync"]
+
+    audit_rows = [json.loads(line) for line in audit_log_path.read_text(encoding="utf-8").splitlines()]
+    assert audit_rows[-1]["event"] == "teams_sync_run"
+    assert audit_rows[-1]["status"] == "completed_with_error"
+    assert audit_rows[-1]["sync_started"] is False
+    assert audit_rows[-1]["failed_windows"] == 1
 
 
 def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypatch, tmp_path: Path):

@@ -424,13 +424,26 @@ class ToolClient:
         self,
         *,
         limit: int = 5,
-        lease_seconds: int = 3600,
+        lease_seconds: int = 60,
         wait_seconds: int = 0,
     ) -> dict[str, Any]:
         return self._http_json(
             "POST",
             "/api/cloud/local-agent/jobs/lease",
             {"limit": limit, "lease_seconds": lease_seconds, "wait_seconds": wait_seconds},
+        )
+
+    def heartbeat_local_agent_job(
+        self,
+        job_id: str,
+        *,
+        attempt_count: int,
+        lease_seconds: int = 60,
+    ) -> dict[str, Any]:
+        return self._http_json(
+            "POST",
+            f"/api/cloud/local-agent/jobs/{quote(job_id, safe='')}/heartbeat",
+            {"attempt_count": attempt_count, "lease_seconds": lease_seconds},
         )
 
     def complete_local_agent_job(

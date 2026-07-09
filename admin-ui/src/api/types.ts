@@ -371,6 +371,8 @@ export interface LocalAgentJobCreateResponse {
 export interface LocalAgentJobStatusResponse {
   job_id: string;
   status: "queued" | "leased" | "succeeded" | "failed";
+  attempt_count?: number;
+  leased_until?: string | null;
   result: {
     authenticated?: boolean;
     expires_in_minutes?: number | null;

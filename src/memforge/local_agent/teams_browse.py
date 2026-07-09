@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from memforge.auth.teams_auth import TeamsAuthenticator
-from memforge.genes.teams_gene import _TeamsAPIClient
+from memforge.genes.teams_gene import AuthenticationError, _TeamsAPIClient
 
 _CHAT_API_AUDIENCE = "https://ic3.teams.office.com"
 
@@ -75,6 +75,9 @@ async def browse_teams_conversations(*, region: str = "emea") -> dict[str, Any]:
             client.list_conversations(),
             return_exceptions=True,
         )
+        auth_error = _first_auth_error(raw_channel_teams, raw_convos)
+        if auth_error is not None:
+            raise auth_error
         if isinstance(raw_channel_teams, Exception):
             raw_channel_teams = []
         if isinstance(raw_convos, Exception):
@@ -147,6 +150,15 @@ def _jwt_oid(token: str) -> str:
         return str(jwt_data.get("oid") or "")
     except Exception:
         return ""
+
+
+def _first_auth_error(*results: Any) -> Exception | None:
+    for result in results:
+        if isinstance(result, AuthenticationError):
+            return result
+        if isinstance(result, httpx.HTTPStatusError) and result.response.status_code == 401:
+            return AuthenticationError("Teams session expired. Connect Teams from the source wizard.")
+    return None
 
 
 def _sender_guid_name_map(conversations: list[dict[str, Any]], my_oid: str) -> dict[str, str]:

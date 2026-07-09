@@ -53,6 +53,7 @@ log_console = Console(stderr=True)
 DEFAULT_CLI_CONFIG_PATH = Path.home() / ".memforge" / "cli.toml"
 DEFAULT_ADAPTER_CONFIG_PATH = Path.home() / ".memforge" / "adapter.toml"
 DEFAULT_LOCAL_AGENT_STATE_PATH = Path.home() / ".memforge" / "local-agent-state.json"
+DEFAULT_LOCAL_AGENT_LOCK_PATH = Path.home() / ".memforge" / "local-agent-daemon.lock"
 DEFAULT_TEAMS_AUDIT_LOG_PATH = Path.home() / ".memforge" / "teams-sync-audit.jsonl"
 DEFAULT_TEAMS_LEDGER_STATE_PATH = Path.home() / ".memforge" / "teams-ledger-state.json"
 DEFAULT_KB_INCLUDE = [
@@ -210,10 +211,88 @@ def _local_agent_state_path() -> Path:
     return Path(configured).expanduser() if configured else DEFAULT_LOCAL_AGENT_STATE_PATH
 
 
+def _local_agent_lock_path() -> Path:
+    configured = os.getenv("MEMFORGE_LOCAL_AGENT_LOCK", "").strip()
+    return Path(configured).expanduser() if configured else DEFAULT_LOCAL_AGENT_LOCK_PATH
+
+
 def _local_agent_state_store():
     from memforge.local_agent.state import LocalAgentStateStore
 
     return LocalAgentStateStore(_local_agent_state_path())
+
+
+class _LocalAgentDaemonLock:
+    def __init__(self, path: Path, fd: int) -> None:
+        self.path = path
+        self.fd = fd
+        self.closed = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            os.close(self.fd)
+        finally:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _pid_is_running(pid: Any) -> bool:
+    try:
+        normalized = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if normalized <= 0:
+        return False
+    try:
+        os.kill(normalized, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_local_agent_lock(lock_path: Path | None = None) -> dict[str, Any] | None:
+    path = (lock_path or _local_agent_lock_path()).expanduser()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _acquire_local_agent_daemon_lock(lock_path: Path | None = None) -> _LocalAgentDaemonLock | None:
+    path = (lock_path or _local_agent_lock_path()).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        existing = _read_local_agent_lock(path)
+        if existing is not None and _pid_is_running(existing.get("pid")):
+            return None
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            return None
+    payload = {
+        "pid": os.getpid(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "command": sys.argv,
+    }
+    with os.fdopen(os.dup(fd), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    return _LocalAgentDaemonLock(path, fd)
 
 
 def _build_local_agent_runner(
@@ -257,13 +336,21 @@ def _build_local_agent_runner(
             run_cloud_job=lambda job: _run_cloud_local_agent_job(job, client, browser=browser),
         ),
         jira_origins_provider=client.list_jira_origins,
-        cloud_jobs_provider=lambda wait_seconds=0: client.lease_local_agent_jobs(wait_seconds=wait_seconds),
+        cloud_jobs_provider=lambda wait_seconds=0, lease_seconds=60: client.lease_local_agent_jobs(
+            wait_seconds=wait_seconds,
+            lease_seconds=lease_seconds,
+        ),
         cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: client.complete_local_agent_job(
             job_id,
             attempt_count=attempt_count,
             status=status,
             result=result,
             error=error,
+        ),
+        cloud_job_heartbeat=lambda job_id, attempt_count, lease_seconds: client.heartbeat_local_agent_job(
+            job_id,
+            attempt_count=attempt_count,
+            lease_seconds=lease_seconds,
         ),
         default_sync_interval_seconds=default_sync_interval_seconds,
         jira_interval_seconds=jira_interval_seconds,
@@ -1621,6 +1708,7 @@ def adapter_list(ctx):
                 {"type": "jira", "auth": "browser_session"},
                 {"type": "kb", "kind": "markdown"},
                 {"type": "github", "kind": "repository"},
+                {"type": "teams", "auth": "browser_session", "kind": "conversation"},
             ]
         },
     )
@@ -1640,6 +1728,9 @@ def adapter_status(ctx):
                 "kb.markdown_push",
                 "github.repo_preview",
                 "github.repo_push",
+                "teams.auth",
+                "teams.browse",
+                "teams.sync",
             ],
         },
     )
@@ -1666,11 +1757,14 @@ def adapter_daemon_status(ctx, verbose: bool, default_sync_interval_seconds: int
         default_interval_seconds=default_sync_interval_seconds,
     )
     state_tasks = state.get("tasks") if isinstance(state.get("tasks"), dict) else {}
-    target_summary = _local_agent_target_summary(ctx)
+    daemon_status = _local_agent_daemon_status(state)
+    target_summary = _local_agent_status_target(state, _local_agent_target_summary(ctx))
     payload = {
-        "status": "stopped",
+        "status": daemon_status["status"],
         "state_path": str(_local_agent_state_path()),
+        "lock_path": str(_local_agent_lock_path()),
         "target": target_summary,
+        "daemon": daemon_status["daemon"],
         "configured_tasks": [
             {
                 "task_id": task.task_id,
@@ -1693,6 +1787,31 @@ def adapter_daemon_status(ctx, verbose: bool, default_sync_interval_seconds: int
         ctx,
         payload,
     )
+
+
+def _local_agent_daemon_status(state: dict[str, Any]) -> dict[str, Any]:
+    lock_payload = _read_local_agent_lock()
+    lock_pid = lock_payload.get("pid") if isinstance(lock_payload, dict) else None
+    lock_held = _pid_is_running(lock_pid)
+    daemon = state.get("daemon") if isinstance(state.get("daemon"), dict) else {}
+    daemon_pid = daemon.get("pid") if isinstance(daemon, dict) else None
+    heartbeat_alive = _pid_is_running(daemon_pid)
+    running = lock_held or heartbeat_alive
+    status_payload: dict[str, Any] = {
+        "lock_held": lock_held,
+        "lock_pid": lock_pid if lock_held else None,
+        "pid": daemon_pid,
+        "started_at": daemon.get("started_at") if isinstance(daemon, dict) else None,
+        "updated_at": daemon.get("updated_at") if isinstance(daemon, dict) else None,
+        "command": daemon.get("command") if isinstance(daemon, dict) else None,
+    }
+    return {"status": "running" if running else "stopped", "daemon": status_payload}
+
+
+def _daemon_recorded_target(state: dict[str, Any]) -> dict[str, Any] | None:
+    daemon = state.get("daemon") if isinstance(state.get("daemon"), dict) else {}
+    target = daemon.get("target") if isinstance(daemon, dict) else None
+    return target if isinstance(target, dict) else None
 
 
 def _local_agent_target_summary(ctx) -> dict[str, Any]:
@@ -1721,6 +1840,13 @@ def _local_agent_status_recommendations(target: dict[str, Any]) -> list[str]:
     if not target.get("workspace_id_configured"):
         recommendations.append("Set MEMFORGE_WORKSPACE_ID for hosted multi-workspace MemForge targets.")
     return recommendations
+
+
+def _local_agent_status_target(state: dict[str, Any], current_target: dict[str, Any]) -> dict[str, Any]:
+    recorded = _daemon_recorded_target(state)
+    if recorded is None:
+        return current_target
+    return {**recorded, "source": "running_daemon"}
 
 
 def _summarize_local_agent_state_tasks(tasks: dict[str, Any]) -> dict[str, Any]:
@@ -1774,7 +1900,7 @@ def _local_agent_task_timestamp(value: Any) -> datetime:
 
 def _compact_local_agent_task(task_id: str, task: dict[str, Any]) -> dict[str, Any]:
     error = task.get("last_error")
-    return {
+    compact = {
         "task_id": task_id,
         "status": task.get("last_status"),
         "last_finished_at": task.get("last_finished_at"),
@@ -1782,6 +1908,11 @@ def _compact_local_agent_task(task_id: str, task: dict[str, Any]) -> dict[str, A
         "run_count": task.get("run_count"),
         "error": str(error) if error else None,
     }
+    last_result = task.get("last_result")
+    payload = last_result.get("payload") if isinstance(last_result, dict) else None
+    if isinstance(payload, dict) and payload:
+        compact["payload"] = payload
+    return compact
 
 
 @adapter_daemon.command("once")
@@ -1837,24 +1968,42 @@ def adapter_daemon_run(
     jira_interval_seconds: int,
 ):
     """Run the local agent daemon until interrupted."""
-    runner = _build_local_agent_runner(
-        ctx,
-        browser=browser,
-        default_sync_interval_seconds=default_sync_interval_seconds,
-        jira_interval_seconds=jira_interval_seconds,
-    )
-    click.echo(
-        json.dumps(
+    daemon_lock = _acquire_local_agent_daemon_lock()
+    if daemon_lock is None:
+        _emit_tool_payload(
+            ctx,
             {
-                "status": "running",
-                "state_path": str(_local_agent_state_path()),
-                "poll_interval_seconds": max(int(poll_interval_seconds), 1),
-                "cloud_job_wait_seconds": max(int(cloud_job_wait_seconds), 0),
+                "status": "already_running",
+                "error": "local agent daemon is already running",
+                "lock_path": str(_local_agent_lock_path()),
             },
-            ensure_ascii=False,
         )
-    )
+        return
+    started_at = datetime.now(timezone.utc).isoformat()
     try:
+        _local_agent_state_store().record_daemon_heartbeat(
+            pid=os.getpid(),
+            started_at=started_at,
+            command=sys.argv,
+            target=_local_agent_target_summary(ctx),
+        )
+        runner = _build_local_agent_runner(
+            ctx,
+            browser=browser,
+            default_sync_interval_seconds=default_sync_interval_seconds,
+            jira_interval_seconds=jira_interval_seconds,
+        )
+        click.echo(
+            json.dumps(
+                {
+                    "status": "running",
+                    "state_path": str(_local_agent_state_path()),
+                    "poll_interval_seconds": max(int(poll_interval_seconds), 1),
+                    "cloud_job_wait_seconds": max(int(cloud_job_wait_seconds), 0),
+                },
+                ensure_ascii=False,
+            )
+        )
         runner.run_forever(
             include_jira=include_jira,
             poll_interval_seconds=poll_interval_seconds,
@@ -1863,6 +2012,8 @@ def adapter_daemon_run(
         )
     except KeyboardInterrupt:
         click.echo(json.dumps({"status": "stopped"}, ensure_ascii=False))
+    finally:
+        daemon_lock.close()
 
 
 @adapter.group("kb")
@@ -2283,13 +2434,18 @@ def _run_cloud_teams_auth_job(job: dict[str, Any]) -> dict[str, Any]:
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     region = _teams_region_from_payload(payload)
     try:
-        token_data = teams_auth.TeamsAuthenticator().authenticate(region=region)
+        token_data = teams_auth.TeamsAuthenticator().authenticate(
+            region=region,
+            wait_seconds=_cloud_job_limit(payload.get("wait_seconds"), default=90),
+            poll_interval_seconds=2.0,
+            rejected_token_hashes=_teams_rejected_token_hashes_from_payload(payload),
+        )
     except RuntimeError:
         return {
             "operation": operation,
             "authenticated": False,
             "region": region,
-            "error": "Sign in to Teams in Chrome, then select Connect again.",
+            "error": "Sign in to Teams in the browser window, then retry.",
         }
     except Exception as exc:
         return {
@@ -2330,8 +2486,66 @@ def _run_cloud_teams_browse_job(job: dict[str, Any]) -> dict[str, Any]:
     try:
         data = asyncio.run(browse_teams_conversations(region=region))
     except Exception as exc:
-        return {"operation": operation, "region": region, "error": str(exc), "error_type": type(exc).__name__}
+        if _teams_auth_exception(exc):
+            reauth = _run_cloud_teams_auth_job(
+                {
+                    **job,
+                    "operation": "teams_auth",
+                    "payload": {
+                        **payload,
+                        "wait_seconds": _cloud_job_limit(payload.get("wait_seconds"), default=90),
+                        "rejected_token_hashes": sorted(_current_teams_chat_token_hashes()),
+                    },
+                }
+            )
+            if not reauth.get("error"):
+                try:
+                    data = asyncio.run(browse_teams_conversations(region=region))
+                except Exception as retry_exc:
+                    return {
+                        "operation": operation,
+                        "region": region,
+                        "error": str(retry_exc),
+                        "error_type": type(retry_exc).__name__,
+                    }
+            else:
+                return {"operation": operation, "region": region, **reauth}
+        else:
+            return {"operation": operation, "region": region, "error": str(exc), "error_type": type(exc).__name__}
     return {"operation": operation, "region": region, **data}
+
+
+def _teams_auth_exception(exc: Exception) -> bool:
+    try:
+        from memforge.genes.teams_gene import AuthenticationError
+    except Exception:
+        AuthenticationError = ()  # type: ignore[assignment]
+    if isinstance(exc, AuthenticationError):
+        return True
+    text = str(exc).lower()
+    return "401" in text or "authentication failed" in text or "session expired" in text
+
+
+def _current_teams_chat_token_hashes() -> set[str]:
+    from memforge.auth.teams_auth import CHAT_API_AUDIENCE, TeamsAuthenticator
+
+    try:
+        tokens = TeamsAuthenticator.load_tokens()
+    except Exception:
+        return set()
+    if not isinstance(tokens, dict):
+        return set()
+    token = TeamsAuthenticator.get_token_for_audience(tokens, CHAT_API_AUDIENCE)
+    if not token:
+        return set()
+    return {hashlib.sha256(token.encode("utf-8")).hexdigest()}
+
+
+def _teams_rejected_token_hashes_from_payload(payload: dict[str, Any]) -> set[str]:
+    value = payload.get("rejected_token_hashes")
+    if not isinstance(value, (list, tuple, set)):
+        return set()
+    return {str(item) for item in value if str(item).strip()}
 
 
 def _teams_region_from_payload(payload: dict[str, Any]) -> str:
@@ -2357,19 +2571,48 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
     try:
         collection = asyncio.run(_collect_teams_documents_from_cloud_job(job, source_id=source_id, limit=limit))
     except Exception as exc:
-        write_teams_audit_event(
-            audit_path,
-            {
-                "event": "teams_sync_run",
-                "run_id": run_id,
+        collect_error: Exception | None = exc
+        if _teams_auth_exception(exc):
+            reauth = _run_cloud_teams_auth_job(
+                {
+                    **job,
+                    "operation": "teams_auth",
+                    "payload": {
+                        **payload,
+                        "wait_seconds": _cloud_job_limit(payload.get("wait_seconds"), default=90),
+                        "rejected_token_hashes": sorted(_current_teams_chat_token_hashes()),
+                    },
+                }
+            )
+            if not reauth.get("error"):
+                try:
+                    collection = asyncio.run(
+                        _collect_teams_documents_from_cloud_job(job, source_id=source_id, limit=limit)
+                    )
+                    collect_error = None
+                except Exception as retry_exc:
+                    collect_error = retry_exc
+            else:
+                collect_error = RuntimeError(str(reauth.get("error") or "Teams authentication failed."))
+        if collect_error is not None:
+            write_teams_audit_event(
+                audit_path,
+                {
+                    "event": "teams_sync_run",
+                    "run_id": run_id,
+                    "operation": operation,
+                    "source_id": source_id,
+                    "status": "collect_failed",
+                    "error_type": type(collect_error).__name__,
+                    "error": str(collect_error),
+                },
+            )
+            return {
                 "operation": operation,
                 "source_id": source_id,
-                "status": "collect_failed",
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            },
-        )
-        return {"operation": operation, "source_id": source_id, "error": str(exc), "error_type": type(exc).__name__}
+                "error": str(collect_error),
+                "error_type": type(collect_error).__name__,
+            }
 
     documents, poll_audits = _teams_collection_documents_and_polls(collection)
     for poll in poll_audits:
@@ -2382,9 +2625,9 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
     scoped_client = _workspace_tool_client(client, workspace_id)
     should_process = bool(payload.get("process_now", True))
     submitted_by = str(payload.get("submitted_by") or "memforge-local-agent")
-    sync_result: dict[str, Any] | None = None
+    sync_started = False
 
-    for doc in documents:
+    for index, doc in enumerate(documents):
         window_id = str(doc["window_id"])
         revision_hash = str(doc["revision_hash"])
         window_id_hash = hashlib.sha256(window_id.encode("utf-8")).hexdigest()
@@ -2434,7 +2677,7 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             source_url=str(doc.get("source_url") or ""),
             raw_hash=str(doc["raw_hash"]),
             submitted_by=submitted_by,
-            process_now=False,
+            process_now=should_process and index == len(documents) - 1,
         )
         if isinstance(response, dict) and response.get("error"):
             failed.append({
@@ -2469,6 +2712,8 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             "doc_id": response.get("doc_id") if isinstance(response, dict) else None,
             "document_hash": response.get("document_hash") if isinstance(response, dict) else None,
         })
+        if isinstance(response, dict) and response.get("sync_started"):
+            sync_started = True
         ledger_store.record_receipt(
             source_id=source_id,
             window_id=window_id,
@@ -2493,9 +2738,6 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             },
         )
 
-    if should_process and pushed:
-        sync_result = scoped_client.start_source_sync(source_id=source_id, force_full_sync=False)
-
     result = {
         "operation": operation,
         "source_id": source_id,
@@ -2509,17 +2751,10 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
         "pushed": pushed,
         "failed": failed,
         "skipped_existing": skipped_existing,
-        "sync_started": bool(sync_result and not sync_result.get("error")),
+        "sync_started": sync_started,
         "audit_log_path": str(audit_path.expanduser()),
     }
-    sync_failed = isinstance(sync_result, dict) and bool(sync_result.get("error"))
-    if sync_failed:
-        result["sync_error"] = sync_result
-    if failed and sync_failed:
-        result["error"] = "one or more Teams windows failed to push; source sync failed to start"
-    elif sync_failed:
-        result["error"] = "source sync failed to start"
-    elif failed:
+    if failed:
         result["error"] = "one or more Teams windows failed to push"
 
     write_teams_audit_event(
@@ -2536,6 +2771,7 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             "skipped_existing_windows": len(skipped_existing),
             "polls": len(poll_audits),
             "sync_started": result["sync_started"],
+            "sync_error": result.get("sync_error"),
             "claim_add": 0,
             "claim_update": 0,
             "claim_supersede": 0,

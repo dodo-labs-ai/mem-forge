@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from memforge.genes.teams_gene import (
+    AuthenticationError,
     TeamsGene,
     _TeamsAPIClient,
     _group_into_blocks,
@@ -75,6 +78,57 @@ class TestMetadata:
             source_id="test",
         )
         assert gene._gap_minutes == 60
+
+    def test_initial_history_defaults_to_two_weeks(self):
+        schema = TeamsGene.config_schema()
+        max_age = next(f for f in schema.fields if f.key == "max_age_days")
+        assert max_age.default == "14"
+
+        gene = TeamsGene(
+            config={"channels": "Team/Channel"},
+            source_id="test",
+        )
+        assert gene._max_age_days == 14
+
+    def test_local_agent_package_mode_does_not_require_remote_selectors(self, tmp_path):
+        gene = TeamsGene(
+            config={"local_agent_documents_dir": str(tmp_path)},
+            source_id="test",
+        )
+
+        assert gene._local_agent_documents_dir() == tmp_path
+
+    @pytest.mark.asyncio
+    async def test_discovers_local_agent_package_without_remote_selectors(self, tmp_path):
+        package = {
+            "package_kind": "teams_window_document",
+            "doc_id": "teams-doc-1",
+            "title": "PCC Agent Dev",
+            "source_url": "https://teams.microsoft.com/l/message/19:conversation/1",
+            "last_modified": NOW.isoformat(),
+            "space_or_project": "PCC Agent Dev",
+            "version": "sha256:revision-1",
+            "conversation_id": "19:conversation@thread.v2",
+            "root_message_id": "1",
+            "window_id": "teams-block:v1:opaque",
+            "window_type": "time_block",
+            "revision_hash": "sha256:revision-1",
+            "raw_payload": {
+                "conversation_type": "group_chat",
+                "messages": [{"id": "1", "from": "Ada", "content": "Ship it", "time": NOW.isoformat()}],
+            },
+        }
+        (tmp_path / "teams-doc-1.json").write_text(json.dumps(package), encoding="utf-8")
+        gene = TeamsGene(
+            config={"local_agent_documents_dir": str(tmp_path)},
+            source_id="test",
+        )
+
+        items = [item async for item in gene.discover(since=None)]
+
+        assert len(items) == 1
+        assert items[0].item_id == "teams-doc-1"
+        assert items[0].extra["window_id"] == "teams-block:v1:opaque"
 
     def test_numeric_fields_use_integer_type(self):
         schema = TeamsGene.config_schema()
@@ -167,6 +221,71 @@ class TestBlockGrouping:
 
 
 class TestMessageParsing:
+    @pytest.mark.asyncio
+    async def test_request_raises_auth_error_without_retry_on_401(self):
+        client = _TeamsAPIClient(region="emea")
+        calls = 0
+
+        class FakeClient:
+            async def request(self, method: str, url: str, **kwargs):
+                nonlocal calls
+                calls += 1
+                request = httpx.Request(method, f"https://teams.cloud.microsoft{url}")
+                return httpx.Response(
+                    401,
+                    json={"errorCode": 911, "message": "Authentication failed."},
+                    request=request,
+                )
+
+        with pytest.raises(AuthenticationError, match="Teams session expired"):
+            await client._request(FakeClient(), "GET", "/conversations")
+
+        assert calls == 1
+
+    @pytest.mark.asyncio
+    async def test_request_retries_remote_protocol_error(self, monkeypatch):
+        client = _TeamsAPIClient(region="emea")
+        calls = 0
+
+        async def no_sleep(_delay: float) -> None:
+            return None
+
+        monkeypatch.setattr("memforge.pipeline.retry.asyncio.sleep", no_sleep)
+
+        class FakeClient:
+            async def request(self, method: str, url: str, **kwargs):
+                nonlocal calls
+                calls += 1
+                request = httpx.Request(method, f"https://teams.cloud.microsoft{url}")
+                if calls == 1:
+                    raise httpx.RemoteProtocolError(
+                        "Server disconnected without sending a response.",
+                        request=request,
+                    )
+                return httpx.Response(200, json={"conversations": []}, request=request)
+
+        response = await client._request(FakeClient(), "GET", "/conversations")
+
+        assert response.status_code == 200
+        assert calls == 2
+
+    @pytest.mark.asyncio
+    async def test_validate_uses_retrying_request(self):
+        client = _TeamsAPIClient(region="emea")
+        client._ensure_clients = AsyncMock()
+        client._chat_client = object()
+        client._request = AsyncMock(
+            return_value=httpx.Response(
+                200,
+                json={"conversations": []},
+                request=httpx.Request("GET", "https://teams.cloud.microsoft/conversations"),
+            )
+        )
+
+        await client.validate()
+
+        client._request.assert_awaited_once()
+
     def test_parse_message_preserves_real_rest_root_message_id(self):
         client = _TeamsAPIClient(region="emea")
 
@@ -392,6 +511,75 @@ class TestDiscover:
 
         assert len(items) == 2  # two blocks split by 4-hour gap
         assert all(item.extra["is_thread"] is False for item in items)
+
+    @pytest.mark.asyncio
+    async def test_discover_times_out_stuck_conversation_fetch(self, gene):
+        conv_id = "19:abc@thread.tacv2"
+        gene.config = {"group_chats": [conv_id]}
+        gene._conversation_fetch_timeout_seconds = 1
+        gene._client.list_conversations = AsyncMock(return_value=[{
+            "id": conv_id,
+            "topic": "architecture",
+            "lastActivity": NOW,
+            "type": "group_chat",
+        }])
+        gene._client.mark_poll_complete = MagicMock()
+
+        async def never_returns(conv_id, since):
+            await asyncio.sleep(30)
+            return []
+
+        gene._fetch_with_context = never_returns
+
+        with pytest.raises(RuntimeError, match="Teams sync could not fetch any configured conversations"):
+            async for _ in gene.discover(since=None):
+                pass
+
+        gene._client.mark_poll_complete.assert_called_once_with(
+            conv_id,
+            stop_reason="fetch_timeout",
+        )
+
+    @pytest.mark.asyncio
+    async def test_discover_skips_one_timed_out_conversation_and_continues(self, gene):
+        stuck_id = "19:stuck@thread.v2"
+        ok_id = "19:ok@thread.v2"
+        gene.config = {"group_chats": [stuck_id, ok_id]}
+        gene._conversation_fetch_timeout_seconds = 1
+        gene._client.list_conversations = AsyncMock(return_value=[
+            {
+                "id": stuck_id,
+                "topic": "stuck",
+                "lastActivity": NOW,
+                "type": "group_chat",
+            },
+            {
+                "id": ok_id,
+                "topic": "ok",
+                "lastActivity": NOW,
+                "type": "group_chat",
+            },
+        ])
+        gene._client.mark_poll_complete = MagicMock()
+
+        async def fetch(conv_id, since):
+            if conv_id == stuck_id:
+                await asyncio.sleep(30)
+                return []
+            return [_msg("m1", "Alice", "Ship the change", NOW)]
+
+        gene._fetch_with_context = fetch
+
+        items = []
+        async for item in gene.discover(since=None):
+            items.append(item)
+
+        assert len(items) == 1
+        assert items[0].extra["conversation_id"] == ok_id
+        gene._client.mark_poll_complete.assert_called_once_with(
+            stuck_id,
+            stop_reason="fetch_timeout",
+        )
 
     @pytest.mark.asyncio
     async def test_discovers_blocks_with_persisted_ledger_anchor_for_late_messages(self, tmp_path):
