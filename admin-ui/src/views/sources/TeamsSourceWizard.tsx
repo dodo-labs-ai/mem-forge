@@ -237,7 +237,13 @@ function teamsAuthJobMessage(status: LocalAgentJobStatusResponse): string {
 function cleanTeamsAuthMessage(value: string | null | undefined): string | null {
   const text = value?.trim();
   if (!text) return null;
-  if (text.toLowerCase().includes("tokens") || text.toLowerCase().includes("run:")) {
+  const normalized = text.toLowerCase();
+  if (
+    normalized.includes("tokens")
+    || normalized.includes("run:")
+    || normalized.includes("no teams session")
+    || normalized.includes("session expired")
+  ) {
     return "No Teams session found. Select Connect after signing in to Teams in Chrome.";
   }
   return text;
@@ -433,7 +439,7 @@ function ConfirmStep({
 
         <div className="grid gap-3 sm:grid-cols-3">
           <Field label="History (days)">
-            <Input type="number" value={config.max_age_days} onChange={(event) => updateNumber("max_age_days", 90)(event.target.value)} />
+            <Input type="number" value={config.max_age_days} onChange={(event) => updateNumber("max_age_days", 14)(event.target.value)} />
           </Field>
           <Field label="Gap (minutes)">
             <Input type="number" value={config.conversation_gap_minutes} onChange={(event) => updateNumber("conversation_gap_minutes", 60)(event.target.value)} />

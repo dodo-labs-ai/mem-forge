@@ -78,6 +78,16 @@ assert.match(
   "Teams source sync should enqueue a local-agent teams_sync job instead of server-side sync",
 );
 assert.match(
+  sourcesPageSource,
+  /localAgentJobErrorMessage\(status\)/,
+  "Local-agent sync failures should surface the daemon job error instead of a generic no-op",
+);
+assert.match(
+  sourcesPageSource,
+  /Sign in to Teams in Chrome, then retry sync\./,
+  "Teams sync failures should give a direct browser-session recovery action",
+);
+assert.match(
   teamsWizardSource,
   /runTeamsLocalAgentJob\("teams_auth"/,
   "Teams auth should be triggered through the local daemon instead of CLI instructions",

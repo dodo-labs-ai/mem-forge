@@ -29,7 +29,7 @@ export function buildDefaultTeamsSourceConfig(): TeamsSourceConfig {
   return {
     name: "",
     region: "emea",
-    max_age_days: 90,
+    max_age_days: 14,
     conversation_gap_minutes: 60,
     max_block_messages: 100,
   };

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 import re
 
 from click.testing import CliRunner
@@ -86,6 +87,176 @@ def test_local_agent_state_compacts_large_payloads(tmp_path):
     assert stored["pushed_count"] == 1000
     assert stored["failed_count"] == 1
     assert stored["first_failed"] == {"relative_path": "bad.md", "error": "push failed"}
+
+
+def test_local_agent_state_preserves_sync_audit_summary(tmp_path):
+    from memforge.local_agent.state import LocalAgentStateStore
+
+    store = LocalAgentStateStore(tmp_path / "agent-state.json")
+
+    payload = store.record_result(
+        "cloud-job:laj-teams",
+        {
+            "task_id": "cloud-job:laj-teams",
+            "kind": "cloud_job",
+            "status": "failed",
+            "started_at": "2026-07-09T00:00:00+00:00",
+            "finished_at": "2026-07-09T00:00:01+00:00",
+            "error": "source sync failed to start",
+            "payload": {
+                "source_id": "src-teams",
+                "counts": {"selected": 1, "pushed": 1, "failed": 0, "skipped_existing": 0, "polls": 1},
+                "pushed": [{"window_id": "teams-thread:v1:opaque", "document_hash": "hash"}],
+                "failed": [],
+                "skipped_existing": [],
+                "sync_started": False,
+                "sync_error": {"error": "MemForge API unavailable"},
+                "audit_log_path": "/Users/example/.memforge/teams-sync-audit.jsonl",
+            },
+        },
+    )
+
+    stored = payload["tasks"]["cloud-job:laj-teams"]["last_result"]["payload"]
+    assert stored["sync_started"] is False
+    assert stored["sync_error"] == {"error": "MemForge API unavailable"}
+    assert stored["audit_log_path"].endswith("teams-sync-audit.jsonl")
+    assert stored["pushed_count"] == 1
+    assert stored["failed_count"] == 0
+    assert stored["skipped_existing_count"] == 0
+
+
+def test_local_agent_state_records_running_without_incrementing_run_count(tmp_path):
+    from memforge.local_agent.state import LocalAgentStateStore
+
+    store = LocalAgentStateStore(tmp_path / "agent-state.json")
+    store.record_result(
+        "cloud-job:laj-teams",
+        {
+            "task_id": "cloud-job:laj-teams",
+            "kind": "cloud_job",
+            "status": "failed",
+            "started_at": "2026-07-09T00:00:00+00:00",
+            "finished_at": "2026-07-09T00:00:01+00:00",
+            "error": "old failure",
+        },
+    )
+
+    payload = store.record_running(
+        "cloud-job:laj-teams",
+        {
+            "task_id": "cloud-job:laj-teams",
+            "kind": "cloud_job",
+            "status": "running",
+            "started_at": "2026-07-09T01:00:00+00:00",
+            "payload": {"source_id": "src-teams", "operation": "teams_sync"},
+        },
+    )
+
+    task = payload["tasks"]["cloud-job:laj-teams"]
+    assert task["run_count"] == 1
+    assert task["last_status"] == "running"
+    assert task["last_started_at"] == "2026-07-09T01:00:00+00:00"
+    assert task["last_finished_at"] is None
+    assert task["last_error"] is None
+    assert task["last_result"]["payload"] == {
+        "source_id": "src-teams",
+        "operation": "teams_sync",
+    }
+
+
+def test_local_adapter_capability_commands_include_teams():
+    runner = CliRunner()
+
+    listed = runner.invoke(cli, ["adapter", "list"])
+    status = runner.invoke(cli, ["adapter", "status"])
+
+    assert listed.exit_code == 0
+    assert status.exit_code == 0
+    listed_payload = json.loads(listed.output)
+    status_payload = json.loads(status.output)
+    assert any(item["type"] == "teams" for item in listed_payload["data"])
+    assert "teams.auth" in status_payload["capabilities"]
+    assert "teams.browse" in status_payload["capabilities"]
+    assert "teams.sync" in status_payload["capabilities"]
+
+
+def test_local_agent_state_records_daemon_heartbeat(tmp_path):
+    from memforge.local_agent.state import LocalAgentStateStore
+
+    store = LocalAgentStateStore(tmp_path / "agent-state.json")
+
+    payload = store.record_daemon_heartbeat(
+        pid=12345,
+        started_at="2026-07-09T00:00:00+00:00",
+        command=["memforge", "adapter", "daemon", "run"],
+        target={
+            "api_url": "https://memforge.example.test",
+            "api_token_configured": True,
+            "workspace_id_configured": True,
+        },
+    )
+
+    assert payload["daemon"]["pid"] == 12345
+    assert payload["daemon"]["started_at"] == "2026-07-09T00:00:00+00:00"
+    assert payload["daemon"]["command"] == ["memforge", "adapter", "daemon", "run"]
+    assert payload["daemon"]["target"]["api_token_configured"] is True
+    assert payload["daemon"]["updated_at"]
+    assert LocalAgentStateStore(tmp_path / "agent-state.json").load()["daemon"]["pid"] == 12345
+
+
+def test_local_agent_daemon_lock_prevents_duplicate_runners(tmp_path):
+    lock_path = tmp_path / "agent.lock"
+
+    first = main._acquire_local_agent_daemon_lock(lock_path)
+    assert first is not None
+    try:
+        second = main._acquire_local_agent_daemon_lock(lock_path)
+        assert second is None
+    finally:
+        first.close()
+
+    third = main._acquire_local_agent_daemon_lock(lock_path)
+    assert third is not None
+    third.close()
+
+
+def test_local_agent_status_reports_running_daemon_from_lock_and_heartbeat(tmp_path, monkeypatch):
+    state_path = tmp_path / "agent-state.json"
+    lock_path = tmp_path / "agent.lock"
+    monkeypatch.setattr(main, "_local_agent_state_path", lambda: state_path)
+    monkeypatch.setattr(main, "_local_agent_lock_path", lambda: lock_path)
+    monkeypatch.setattr(main, "_read_adapter_config", lambda: {})
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "ws-a")
+
+    from memforge.local_agent.state import LocalAgentStateStore
+
+    LocalAgentStateStore(state_path).record_daemon_heartbeat(
+        pid=os.getpid(),
+        started_at="2026-07-09T00:00:00+00:00",
+        command=["memforge", "adapter", "daemon", "run"],
+        target={
+            "api_url": "https://memforge.example.test",
+            "active_target": "dev",
+            "token_env": "MEMFORGE_API_TOKEN",
+            "api_token_configured": True,
+            "workspace_id_configured": True,
+        },
+    )
+    lock_handle = main._acquire_local_agent_daemon_lock(lock_path)
+    assert lock_handle is not None
+    try:
+        result = CliRunner().invoke(cli, ["adapter", "daemon", "status"])
+    finally:
+        lock_handle.close()
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "running"
+    assert payload["daemon"]["pid"] == os.getpid()
+    assert payload["daemon"]["lock_held"] is True
+    assert payload["target"]["source"] == "running_daemon"
+    assert payload["target"]["api_token_configured"] is True
+    assert payload["target"]["workspace_id_configured"] is True
 
 
 def test_local_agent_discovers_linked_profiles_and_jira_origins():
@@ -221,6 +392,7 @@ def test_local_agent_leases_runs_and_completes_cloud_jobs(tmp_path):
     from memforge.local_agent.tasks import LocalAgentHandlers
 
     completed: list[tuple[str, int, str, dict, str | None]] = []
+    heartbeats: list[tuple[str, int, int]] = []
     handled_jobs: list[dict] = []
 
     def run_cloud_job(job: dict) -> dict:
@@ -251,6 +423,10 @@ def test_local_agent_leases_runs_and_completes_cloud_jobs(tmp_path):
             (job_id, attempt_count, status, result, error)
         )
         or {"ok": True},
+        cloud_job_heartbeat=lambda job_id, attempt_count, lease_seconds: heartbeats.append(
+            (job_id, attempt_count, lease_seconds)
+        )
+        or {"ok": True},
     )
 
     report = runner.run_once(now=datetime(2026, 7, 7, tzinfo=timezone.utc), include_jira=False)
@@ -273,8 +449,10 @@ def test_local_agent_leases_runs_and_completes_cloud_jobs(tmp_path):
             None,
         )
     ]
-    assert report["counts"] == {"total": 1, "success": 1, "failed": 0, "skipped": 0}
-    assert report["results"][0]["task_id"] == "cloud-job:laj-1"
+    assert heartbeats == [("laj-1", 1, 60)]
+    assert report["counts"] == {"total": 2, "success": 2, "failed": 0, "skipped": 0}
+    assert report["results"][0]["task_id"] == "cloud-jobs:lease"
+    assert report["results"][1]["task_id"] == "cloud-job:laj-1"
 
 
 def test_local_agent_cloud_job_loop_uses_long_poll_without_profile_tasks(tmp_path):
@@ -307,9 +485,51 @@ def test_local_agent_cloud_job_loop_uses_long_poll_without_profile_tasks(tmp_pat
         wait_seconds=25,
     )
 
-    assert report["counts"] == {"total": 0, "success": 0, "failed": 0, "skipped": 0}
+    assert report["counts"] == {"total": 1, "success": 1, "failed": 0, "skipped": 0}
+    assert report["results"] == [
+        {
+            "task_id": "cloud-jobs:lease",
+            "kind": "cloud_job_lease",
+            "profile_name": None,
+            "origin": None,
+            "status": "success",
+            "started_at": "2026-07-07T00:00:00+00:00",
+            "finished_at": report["results"][0]["finished_at"],
+            "payload": {"leased_count": 0},
+        }
+    ]
     assert lease_requests == [{"wait_seconds": 25}]
     assert profile_calls == []
+
+
+def test_local_agent_cloud_job_lease_uses_short_renewable_lease(tmp_path):
+    from memforge.local_agent.runner import LocalAgentRunner
+    from memforge.local_agent.state import LocalAgentStateStore
+    from memforge.local_agent.tasks import LocalAgentHandlers
+
+    lease_requests: list[dict] = []
+
+    def lease_cloud_jobs(*, wait_seconds: int = 0, lease_seconds: int = 0) -> dict:
+        lease_requests.append({"wait_seconds": wait_seconds, "lease_seconds": lease_seconds})
+        return {"jobs": []}
+
+    runner = LocalAgentRunner(
+        adapter_config={},
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        handlers=LocalAgentHandlers(
+            run_kb_profile=lambda name: {},
+            run_github_profile=lambda name: {},
+            run_jira_auth=lambda origin, last_hash=None: {"action": "unchanged"},
+        ),
+        cloud_jobs_provider=lease_cloud_jobs,
+    )
+
+    runner.run_cloud_jobs_once(
+        now=datetime(2026, 7, 7, tzinfo=timezone.utc),
+        wait_seconds=25,
+    )
+
+    assert lease_requests == [{"wait_seconds": 25, "lease_seconds": 60}]
 
 
 def test_local_agent_cloud_job_loop_sleeps_after_lease_failure(tmp_path):
@@ -465,12 +685,13 @@ def test_local_agent_cloud_completion_failure_does_not_abort_following_jobs(tmp_
     report = runner.run_once(now=datetime(2026, 7, 7, tzinfo=timezone.utc), include_jira=False)
 
     assert completed == ["laj-2:2"]
-    assert report["counts"] == {"total": 2, "success": 1, "failed": 1, "skipped": 0}
-    assert report["results"][0]["task_id"] == "cloud-job:laj-1"
-    assert report["results"][0]["status"] == "failed"
-    assert report["results"][0]["error"] == "completion unavailable"
-    assert report["results"][1]["task_id"] == "cloud-job:laj-2"
-    assert report["results"][1]["status"] == "success"
+    assert report["counts"] == {"total": 3, "success": 2, "failed": 1, "skipped": 0}
+    assert report["results"][0]["task_id"] == "cloud-jobs:lease"
+    assert report["results"][1]["task_id"] == "cloud-job:laj-1"
+    assert report["results"][1]["status"] == "failed"
+    assert report["results"][1]["error"] == "completion unavailable"
+    assert report["results"][2]["task_id"] == "cloud-job:laj-2"
+    assert report["results"][2]["status"] == "success"
 
 
 def test_local_agent_cloud_completion_error_response_does_not_abort_following_jobs(tmp_path):
@@ -507,13 +728,14 @@ def test_local_agent_cloud_completion_error_response_does_not_abort_following_jo
 
     report = runner.run_once(now=datetime(2026, 7, 7, tzinfo=timezone.utc), include_jira=False)
 
-    assert report["counts"] == {"total": 2, "success": 1, "failed": 1, "skipped": 0}
-    assert report["results"][0]["task_id"] == "cloud-job:laj-1"
-    assert report["results"][0]["status"] == "failed"
-    assert report["results"][0]["error_type"] == "CloudJobCompletionError"
-    assert report["results"][0]["error"] == "MemForge API request failed: status_code=404: stale lease"
-    assert report["results"][1]["task_id"] == "cloud-job:laj-2"
-    assert report["results"][1]["status"] == "success"
+    assert report["counts"] == {"total": 3, "success": 2, "failed": 1, "skipped": 0}
+    assert report["results"][0]["task_id"] == "cloud-jobs:lease"
+    assert report["results"][1]["task_id"] == "cloud-job:laj-1"
+    assert report["results"][1]["status"] == "failed"
+    assert report["results"][1]["error_type"] == "CloudJobCompletionError"
+    assert report["results"][1]["error"] == "MemForge API request failed: status_code=404: stale lease"
+    assert report["results"][2]["task_id"] == "cloud-job:laj-2"
+    assert report["results"][2]["status"] == "success"
 
 
 def test_local_agent_cloud_job_without_attempt_count_is_rejected_locally(tmp_path):
@@ -536,9 +758,10 @@ def test_local_agent_cloud_job_without_attempt_count_is_rejected_locally(tmp_pat
 
     report = runner.run_once(now=datetime(2026, 7, 7, tzinfo=timezone.utc), include_jira=False)
 
-    assert report["counts"] == {"total": 1, "success": 0, "failed": 1, "skipped": 0}
-    assert report["results"][0]["task_id"] == "cloud-job:laj-1"
-    assert report["results"][0]["error"] == "cloud job is missing attempt_count"
+    assert report["counts"] == {"total": 2, "success": 1, "failed": 1, "skipped": 0}
+    assert report["results"][0]["task_id"] == "cloud-jobs:lease"
+    assert report["results"][1]["task_id"] == "cloud-job:laj-1"
+    assert report["results"][1]["error"] == "cloud job is missing attempt_count"
 
 
 def test_local_agent_failed_tasks_retry_after_short_backoff(tmp_path):
@@ -796,6 +1019,51 @@ def test_local_agent_run_forever_records_runner_errors(tmp_path):
     assert state["tasks"]["runner:error"]["last_error"] == "unexpected loop failure"
 
 
+def test_local_agent_cloud_job_records_running_before_handler(tmp_path):
+    from memforge.local_agent.runner import LocalAgentRunner
+    from memforge.local_agent.state import LocalAgentStateStore
+    from memforge.local_agent.tasks import LocalAgentHandlers
+
+    state_store = LocalAgentStateStore(tmp_path / "state.json")
+
+    def run_cloud_job(job):
+        state = state_store.load()
+        task = state["tasks"]["cloud-job:laj-running"]
+        assert task["last_status"] == "running"
+        assert task["last_result"]["payload"] == {
+            "source_id": "src-teams",
+            "operation": "teams_sync",
+        }
+        return {"ok": True}
+
+    completions = []
+    runner = LocalAgentRunner(
+        adapter_config={},
+        state_store=state_store,
+        handlers=LocalAgentHandlers(
+            run_kb_profile=lambda name: {},
+            run_github_profile=lambda name: {},
+            run_jira_auth=lambda origin, last_hash=None: {"action": "unchanged"},
+            run_cloud_job=run_cloud_job,
+        ),
+        cloud_job_completer=lambda *args: completions.append(args) or {},
+    )
+
+    result = runner._run_cloud_job(
+        {
+            "job_id": "laj-running",
+            "attempt_count": 1,
+            "operation": "teams_sync",
+            "source_id": "src-teams",
+        },
+        datetime(2026, 7, 9, tzinfo=timezone.utc),
+    )
+
+    assert result["status"] == "success"
+    assert state_store.load()["tasks"]["cloud-job:laj-running"]["last_status"] == "running"
+    assert completions
+
+
 def test_adapter_daemon_once_exits_nonzero_when_task_fails(monkeypatch):
     class FakeRunner:
         def run_once(self, *, include_jira: bool = True) -> dict:
@@ -856,6 +1124,7 @@ def test_adapter_daemon_status_summarizes_state_by_default(monkeypatch, tmp_path
         encoding="utf-8",
     )
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_STATE", str(state_path))
+    monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_LOCK", str(tmp_path / "daemon.lock"))
     monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "cli.toml"))
     monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
     monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
@@ -920,6 +1189,7 @@ def test_adapter_daemon_status_verbose_includes_raw_state(monkeypatch, tmp_path)
         encoding="utf-8",
     )
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_STATE", str(state_path))
+    monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_LOCK", str(tmp_path / "daemon.lock"))
     monkeypatch.setattr(main, "_read_adapter_config", lambda: {"kb": {}, "github": {}})
 
     result = CliRunner().invoke(cli, ["adapter", "daemon", "status", "--verbose"])

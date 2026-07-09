@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import inspect
+import threading
 import time
 from typing import Any, Callable
 
@@ -17,6 +18,8 @@ from memforge.local_agent.tasks import (
 )
 
 FAILED_TASK_RETRY_SECONDS = 300
+DEFAULT_CLOUD_JOB_LEASE_SECONDS = 60
+DEFAULT_CLOUD_JOB_HEARTBEAT_INTERVAL_SECONDS = 20
 
 
 class LocalAgentRunner:
@@ -30,6 +33,9 @@ class LocalAgentRunner:
         jira_origins_provider: Callable[[], dict[str, Any]] | None = None,
         cloud_jobs_provider: Callable[..., dict[str, Any]] | None = None,
         cloud_job_completer: Callable[[str, int, str, dict[str, Any], str | None], dict[str, Any]] | None = None,
+        cloud_job_heartbeat: Callable[[str, int, int], dict[str, Any]] | None = None,
+        cloud_job_lease_seconds: int = DEFAULT_CLOUD_JOB_LEASE_SECONDS,
+        cloud_job_heartbeat_interval_seconds: int = DEFAULT_CLOUD_JOB_HEARTBEAT_INTERVAL_SECONDS,
         default_sync_interval_seconds: int = 3600,
         jira_interval_seconds: int = 1800,
     ) -> None:
@@ -40,6 +46,15 @@ class LocalAgentRunner:
         self.jira_origins_provider = jira_origins_provider
         self.cloud_jobs_provider = cloud_jobs_provider
         self.cloud_job_completer = cloud_job_completer
+        self.cloud_job_heartbeat = cloud_job_heartbeat
+        self.cloud_job_lease_seconds = _positive_seconds(
+            cloud_job_lease_seconds,
+            default=DEFAULT_CLOUD_JOB_LEASE_SECONDS,
+        )
+        self.cloud_job_heartbeat_interval_seconds = _positive_seconds(
+            cloud_job_heartbeat_interval_seconds,
+            default=DEFAULT_CLOUD_JOB_HEARTBEAT_INTERVAL_SECONDS,
+        )
         self.default_sync_interval_seconds = _positive_seconds(default_sync_interval_seconds, default=3600)
         self.jira_interval_seconds = _positive_seconds(jira_interval_seconds, default=1800)
         self._cached_jira_tasks: list[LocalAgentTask] = []
@@ -231,7 +246,37 @@ class LocalAgentRunner:
         if self.handlers.run_cloud_job is None:
             return _cloud_job_failed_result(task_id, started_at, "cloud job handler is not configured")
         try:
-            payload = self.handlers.run_cloud_job(job)
+            self.state_store.record_running(
+                task_id,
+                {
+                    "task_id": task_id,
+                    "kind": "cloud_job",
+                    "profile_name": None,
+                    "origin": job.get("source_id"),
+                    "status": "running",
+                    "started_at": started_at,
+                    "payload": {
+                        "source_id": job.get("source_id"),
+                        "operation": job.get("operation"),
+                    },
+                },
+            )
+        except Exception:
+            # Running-state visibility is best-effort; completing the cloud job is the source of truth.
+            pass
+        try:
+            with _CloudJobLeaseHeartbeat(
+                heartbeat=self.cloud_job_heartbeat,
+                job_id=job_id,
+                attempt_count=attempt_count,
+                lease_seconds=self.cloud_job_lease_seconds,
+                interval_seconds=self.cloud_job_heartbeat_interval_seconds,
+            ) as heartbeat:
+                payload = self.handlers.run_cloud_job(job)
+            heartbeat_errors = heartbeat.errors
+            if heartbeat_errors:
+                payload = dict(payload)
+                payload["heartbeat_errors"] = heartbeat_errors
             error = str(payload.get("error") or "").strip()
             status = "failed" if error else "success"
             completion_status = "failed" if error else "succeeded"
@@ -288,7 +333,11 @@ class LocalAgentRunner:
         if self.cloud_jobs_provider is None:
             return [], None
         try:
-            response = _call_cloud_jobs_provider(self.cloud_jobs_provider, wait_seconds=wait_seconds)
+            response = _call_cloud_jobs_provider(
+                self.cloud_jobs_provider,
+                wait_seconds=wait_seconds,
+                lease_seconds=self.cloud_job_lease_seconds,
+            )
         except Exception as exc:  # cloud polling must not block local profile work
             started_at = now.isoformat()
             return [], _cloud_job_failed_result(
@@ -307,7 +356,18 @@ class LocalAgentRunner:
         jobs = response.get("jobs") if isinstance(response, dict) else None
         if not isinstance(jobs, list):
             return [], None
-        return [job for job in jobs if isinstance(job, dict)], None
+        valid_jobs = [job for job in jobs if isinstance(job, dict)]
+        finished_at = datetime.now(timezone.utc).isoformat()
+        return valid_jobs, {
+            "task_id": "cloud-jobs:lease",
+            "kind": "cloud_job_lease",
+            "profile_name": None,
+            "origin": None,
+            "status": "success",
+            "started_at": now.isoformat(),
+            "finished_at": finished_at,
+            "payload": {"leased_count": len(valid_jobs)},
+        }
 
     def _complete_cloud_job(
         self,
@@ -394,17 +454,79 @@ def _cloud_lease_failed(results: list[dict[str, Any]]) -> bool:
     )
 
 
+class _CloudJobLeaseHeartbeat:
+    def __init__(
+        self,
+        *,
+        heartbeat: Callable[[str, int, int], dict[str, Any]] | None,
+        job_id: str,
+        attempt_count: int,
+        lease_seconds: int,
+        interval_seconds: int,
+    ) -> None:
+        self._heartbeat = heartbeat
+        self._job_id = job_id
+        self._attempt_count = attempt_count
+        self._lease_seconds = lease_seconds
+        self._interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.errors: list[str] = []
+
+    def __enter__(self) -> _CloudJobLeaseHeartbeat:
+        if self._heartbeat is None:
+            return self
+        self._send_heartbeat()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"memforge-cloud-job-heartbeat-{self._job_id}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=1)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            self._send_heartbeat()
+
+    def _send_heartbeat(self) -> None:
+        if self._heartbeat is None:
+            return
+        try:
+            response = self._heartbeat(
+                self._job_id,
+                self._attempt_count,
+                self._lease_seconds,
+            )
+            if isinstance(response, dict) and response.get("error"):
+                self.errors.append(_api_error_message(response))
+        except Exception as exc:
+            self.errors.append(str(exc))
+
+
 def _call_cloud_jobs_provider(
     provider: Callable[..., dict[str, Any]],
     *,
     wait_seconds: int,
+    lease_seconds: int,
 ) -> dict[str, Any]:
     try:
         signature = inspect.signature(provider)
     except (TypeError, ValueError):
         return provider()
+    kwargs: dict[str, Any] = {}
     if "wait_seconds" in signature.parameters:
-        return provider(wait_seconds=wait_seconds)
+        kwargs["wait_seconds"] = wait_seconds
+    if "lease_seconds" in signature.parameters:
+        kwargs["lease_seconds"] = lease_seconds
+    if kwargs:
+        return provider(**kwargs)
     return provider()
 
 

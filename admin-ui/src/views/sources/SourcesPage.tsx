@@ -106,10 +106,34 @@ function safeSourceErrorMessage(error: unknown): string | null {
     || error.message === LOCAL_AGENT_TIMEOUT_MESSAGE
     || error.message === LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE
     || error.message === LOCAL_AGENT_SYNC_FAILED_MESSAGE
+    || error.message.startsWith(`${LOCAL_AGENT_SYNC_FAILED_MESSAGE} `)
   ) {
     return error.message;
   }
   return null;
+}
+
+function localAgentJobErrorMessage(status: LocalAgentJobStatusResponse): string {
+  const result = status.result as { error?: unknown } | null;
+  const detail = typeof result?.error === "string" && result.error.trim()
+    ? result.error.trim()
+    : status.last_error?.trim();
+  if (!detail) return LOCAL_AGENT_SYNC_FAILED_MESSAGE;
+  return `${LOCAL_AGENT_SYNC_FAILED_MESSAGE} ${cleanLocalAgentJobError(detail)}`;
+}
+
+function cleanLocalAgentJobError(value: string): string {
+  const text = value.trim();
+  const normalized = text.toLowerCase();
+  if (normalized.includes("teams") && (
+    normalized.includes("session expired")
+    || normalized.includes("no teams session")
+    || normalized.includes("tokens")
+    || normalized.includes("sign in")
+  )) {
+    return "Sign in to Teams in Chrome, then retry sync.";
+  }
+  return text;
 }
 
 async function createLocalAgentSyncJob(source: Source): Promise<LocalAgentJobCreateResponse | null> {
@@ -134,7 +158,7 @@ async function createLocalAgentSyncJob(source: Source): Promise<LocalAgentJobCre
     if (status.last_error) {
       console.warn("Local daemon sync failed", status.last_error);
     }
-    throw new Error(LOCAL_AGENT_SYNC_FAILED_MESSAGE);
+    throw new Error(localAgentJobErrorMessage(status));
   }
   return response.data;
 }

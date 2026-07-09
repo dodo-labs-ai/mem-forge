@@ -11,10 +11,12 @@ Token location: ~/.memforge/tokens/teams.json
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
@@ -30,31 +32,54 @@ CHAT_API_AUDIENCE = "https://ic3.teams.office.com"
 _TEAMS_LOGIN_URL = "https://teams.microsoft.com/v2/"
 
 
+def _open_teams_login() -> None:
+    if sys.platform == "darwin":
+        subprocess.run(["open", _TEAMS_LOGIN_URL], check=False)
+    else:
+        import webbrowser
+
+        webbrowser.open(_TEAMS_LOGIN_URL)
+
+
 class TeamsAuthenticator:
     """Extracts Teams OAuth tokens from Chrome cookies or cached files."""
 
-    def authenticate(self, region: str = "emea") -> dict:
+    def authenticate(
+        self,
+        region: str = "emea",
+        *,
+        wait_seconds: int = 0,
+        poll_interval_seconds: float = 2.0,
+        rejected_token_hashes: set[str] | None = None,
+    ) -> dict:
         """Extract tokens from Chrome cookies. Opens browser if no session found.
 
         Returns:
             Token data dict with version, captured_at, region, tokens.
         """
         # Try extracting from Chrome cookies first
+        rejected_token_hashes = rejected_token_hashes or set()
         tokens = self._extract_from_chrome()
+        if tokens and self._has_rejected_token(tokens, rejected_token_hashes):
+            tokens = None
 
         if not tokens:
             # No valid tokens — open browser for user to log in
             logger.info("No valid Teams session in Chrome. Opening browser...")
-            if sys.platform == "darwin":
-                subprocess.run(["open", _TEAMS_LOGIN_URL])
-            else:
-                import webbrowser
-                webbrowser.open(_TEAMS_LOGIN_URL)
-            raise RuntimeError(
-                "No active Teams session found in Chrome.\n"
-                "A browser window has been opened to Teams.\n"
-                "Log in, then run this command again."
-            )
+            _open_teams_login()
+            deadline = time.monotonic() + max(int(wait_seconds), 0)
+            while time.monotonic() < deadline:
+                time.sleep(max(float(poll_interval_seconds), 0.1))
+                tokens = self._extract_from_chrome()
+                if tokens and not self._has_rejected_token(tokens, rejected_token_hashes):
+                    break
+                tokens = None
+            if not tokens:
+                raise RuntimeError(
+                    "No active Teams session found in Chrome.\n"
+                    "A browser window has been opened to Teams.\n"
+                    "Log in, then try again."
+                )
 
         token_data = {
             "version": 1,
@@ -131,6 +156,16 @@ class TeamsAuthenticator:
             return decoded.get(field)
         except Exception:
             return None
+
+    @staticmethod
+    def _has_rejected_token(tokens: dict[str, dict], rejected_hashes: set[str]) -> bool:
+        if not rejected_hashes:
+            return False
+        for entry in tokens.values():
+            token = entry.get("token") if isinstance(entry, dict) else entry
+            if isinstance(token, str) and hashlib.sha256(token.encode("utf-8")).hexdigest() in rejected_hashes:
+                return True
+        return False
 
     @staticmethod
     def save_tokens(token_data: dict) -> None:
