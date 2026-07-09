@@ -233,7 +233,7 @@ assert.match(
 );
 assert.match(
   localAgentJobsSource,
-  /workspace_id:\s*currentWorkspaceId\(\)/,
+  /workspace_id:\s*requireCurrentWorkspaceId\(\)/,
   "Local-agent jobs should bind to the selected workspace instead of relying on a primary workspace",
 );
 assert.match(

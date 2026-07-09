@@ -4,3 +4,10 @@ export function currentWorkspaceId(): string | undefined {
   return workspaceId || undefined;
 }
 
+export function requireCurrentWorkspaceId(): string {
+  const workspaceId = currentWorkspaceId();
+  if (!workspaceId) {
+    throw new Error("Select a workspace before starting local sync.");
+  }
+  return workspaceId;
+}
