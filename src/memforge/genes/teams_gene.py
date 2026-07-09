@@ -973,8 +973,9 @@ class TeamsGene(Gene):
                 "submitted_by": package.get("submitted_by"),
             }
 
-        messages = data.get("messages", [])
-        participants = data.get("participants", [])
+        raw_messages = data.get("messages", [])
+        messages = [msg for msg in raw_messages if isinstance(msg, dict)] if isinstance(raw_messages, list) else []
+        participants = _teams_string_values(data.get("participants", []))
         conv_type = data.get("conversation_type", "")
         channel_name = data.get("channel_name", "")
         team_name = data.get("team_name", "")
@@ -1002,7 +1003,7 @@ class TeamsGene(Gene):
         has_links = False
 
         for i, msg in enumerate(messages):
-            content = msg.get("content", "").strip()
+            content = str(msg.get("content") or "").strip()
             if not content:
                 continue
 
@@ -1011,8 +1012,8 @@ class TeamsGene(Gene):
             if "http://" in content or "https://" in content:
                 has_links = True
 
-            author = msg.get("from", "Unknown")
-            time_str = msg.get("time", "")[:16]  # trim to minute precision
+            author = str(msg.get("from") or "Unknown")
+            time_str = str(msg.get("time") or "")[:16]  # trim to minute precision
             is_root = msg.get("is_root", i == 0)
 
             if is_root:
@@ -1029,9 +1030,8 @@ class TeamsGene(Gene):
         # Attachments
         all_attachments = []
         for msg in messages:
-            for att in msg.get("attachments", []):
-                name = att.get("fileName", att.get("name", "attachment"))
-                author = msg.get("from", "")
+            for name in _teams_attachment_names(msg.get("attachments", [])):
+                author = str(msg.get("from") or "")
                 all_attachments.append(f"- {name} (shared by {author})")
 
         if all_attachments:
@@ -1595,6 +1595,47 @@ def _int_or_zero(value: object) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _teams_string_values(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            text = str(item.get("displayName") or item.get("name") or item.get("id") or "").strip()
+        else:
+            text = str(item or "").strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def _teams_attachment_names(value: object) -> list[str]:
+    if isinstance(value, dict):
+        value = [value]
+    elif isinstance(value, str):
+        value = [value]
+    elif not isinstance(value, list):
+        return []
+
+    names: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            name = str(
+                item.get("fileName")
+                or item.get("name")
+                or item.get("title")
+                or item.get("contentUrl")
+                or "attachment"
+            ).strip()
+        else:
+            name = str(item or "").strip()
+        if name:
+            names.append(name)
+    return names
 
 
 # ============================================================================
