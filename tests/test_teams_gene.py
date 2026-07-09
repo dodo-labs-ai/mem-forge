@@ -39,6 +39,19 @@ def _msg(id: str, author: str, content: str, time: datetime, parent_id: str | No
 NOW = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
 
 
+class FakeDocumentStore:
+    def __init__(self):
+        self._objects: dict[str, bytes] = {}
+
+    def store_raw(self, source_name, title, content, content_type, extension=None):
+        uri = f"fake://{source_name}/{title}{extension or ''}"
+        self._objects[uri] = content
+        return uri
+
+    def read_artifact(self, uri):
+        return self._objects[uri]
+
+
 # ---------------------------------------------------------------------------
 # Gene metadata and config
 # ---------------------------------------------------------------------------
@@ -129,6 +142,66 @@ class TestMetadata:
         assert len(items) == 1
         assert items[0].item_id == "teams-doc-1"
         assert items[0].extra["window_id"] == "teams-block:v1:opaque"
+
+    @pytest.mark.asyncio
+    async def test_discovers_and_fetches_document_store_package_manifest(self):
+        package = {
+            "package_kind": "teams_window_document",
+            "doc_id": "teams-doc-1",
+            "title": "PCC Agent Dev",
+            "source_url": "https://teams.microsoft.com/l/message/19:conversation/1",
+            "last_modified": NOW.isoformat(),
+            "space_or_project": "PCC Agent Dev",
+            "version": "sha256:revision-1",
+            "conversation_id": "19:conversation@thread.v2",
+            "root_message_id": "1",
+            "window_id": "teams-block:v1:opaque",
+            "window_type": "time_block",
+            "revision_hash": "sha256:revision-1",
+            "raw_payload": {
+                "conversation_type": "group_chat",
+                "messages": [{"id": "1", "from": "Ada", "content": "Ship it", "time": NOW.isoformat()}],
+            },
+        }
+        store = FakeDocumentStore()
+        package_uri = store.store_raw(
+            "PCC Agent Dev",
+            "teams-doc-1-package",
+            json.dumps(package).encode("utf-8"),
+            "application/json",
+            extension=".teams-package.json",
+        )
+        gene = TeamsGene(
+            config={
+                "local_agent_package_manifest": [
+                    {
+                        "doc_id": "teams-doc-1",
+                        "title": "PCC Agent Dev",
+                        "source_url": package["source_url"],
+                        "last_modified": NOW.isoformat(),
+                        "space_or_project": "PCC Agent Dev",
+                        "version": "sha256:revision-1",
+                        "conversation_id": "19:conversation@thread.v2",
+                        "root_message_id": "1",
+                        "window_id": "teams-block:v1:opaque",
+                        "window_type": "time_block",
+                        "revision_hash": "sha256:revision-1",
+                        "package_uri": package_uri,
+                    }
+                ]
+            },
+            source_id="test",
+        )
+        gene.bind_document_store(store)
+
+        items = [item async for item in gene.discover(since=None)]
+        raw = await gene.fetch(items[0])
+        normalized = await gene.normalize(raw)
+
+        assert len(items) == 1
+        assert items[0].extra["package_uri"] == package_uri
+        assert b"teams_window_document" in raw.body
+        assert "Ship it" in normalized.markdown_body
 
     def test_numeric_fields_use_integer_type(self):
         schema = TeamsGene.config_schema()

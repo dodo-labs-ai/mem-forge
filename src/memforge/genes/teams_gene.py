@@ -759,7 +759,7 @@ class TeamsGene(Gene):
 
         # Local-agent Teams sources read already-captured raw window packages
         # from the server-side inbox. They do not need remote Teams selectors.
-        if self._local_agent_documents_dir() is None:
+        if self._local_agent_documents_dir() is None and not self._local_agent_package_manifest():
             channels = config.get("channels", [])
             group_chats = config.get("group_chats", [])
             individual_chats = config.get("individual_chats", [])
@@ -771,6 +771,8 @@ class TeamsGene(Gene):
     async def authenticate(self) -> None:
         """Authenticate using tokens from Chrome cookies."""
         local_documents_dir = self._local_agent_documents_dir()
+        if self._local_agent_package_manifest():
+            return
         if local_documents_dir is not None:
             local_documents_dir.mkdir(parents=True, exist_ok=True)
             return
@@ -782,6 +784,11 @@ class TeamsGene(Gene):
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         """Discover threads and conversation blocks from configured sources."""
         local_documents_dir = self._local_agent_documents_dir()
+        manifest = self._local_agent_package_manifest()
+        if manifest:
+            async for item in self._discover_local_agent_package_manifest(manifest, since):
+                yield item
+            return
         if local_documents_dir is not None:
             async for item in self._discover_local_agent_packages(local_documents_dir, since):
                 yield item
@@ -863,6 +870,22 @@ class TeamsGene(Gene):
 
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full thread/block content."""
+        if item.extra.get("package_uri"):
+            document_store = getattr(self, "_document_store", None)
+            if document_store is None and item.extra.get("package_path"):
+                package_path = Path(item.extra["package_path"])
+                return RawContent(
+                    item=item,
+                    body=package_path.read_bytes(),
+                    content_type="application/json",
+                )
+            if document_store is None:
+                raise FileNotFoundError(f"document store is required for Teams package {item.item_id}")
+            return RawContent(
+                item=item,
+                body=document_store.read_artifact(str(item.extra["package_uri"])),
+                content_type="application/json",
+            )
         if item.extra.get("package_path"):
             package_path = Path(item.extra["package_path"])
             return RawContent(
@@ -1218,6 +1241,12 @@ class TeamsGene(Gene):
         configured = str(self.config.get("local_agent_documents_dir") or "").strip()
         return Path(configured).expanduser() if configured else None
 
+    def _local_agent_package_manifest(self) -> list[dict]:
+        manifest = self.config.get("local_agent_package_manifest")
+        if not isinstance(manifest, list):
+            return []
+        return [entry for entry in manifest if isinstance(entry, dict)]
+
     def _teams_ledger_state_path(self) -> Path | None:
         configured = str(self.config.get("ledger_state_path") or "").strip()
         return Path(configured).expanduser() if configured else None
@@ -1361,7 +1390,7 @@ class TeamsGene(Gene):
                 title=str(package.get("title") or window_id),
                 source_url=str(package.get("source_url") or ""),
                 last_modified=last_modified,
-                content_type="text/markdown",
+                content_type="application/json",
                 space_or_project=str(package.get("space_or_project") or ""),
                 version=str(package.get("revision_hash") or package.get("version") or ""),
                 author=package.get("submitted_by"),
@@ -1373,6 +1402,43 @@ class TeamsGene(Gene):
                     "window_id": window_id,
                     "window_type": package.get("window_type"),
                     "revision_hash": package.get("revision_hash"),
+                },
+            )
+
+    async def _discover_local_agent_package_manifest(
+        self,
+        manifest: list[dict],
+        since: datetime | None,
+    ) -> AsyncIterator[ContentItem]:
+        for entry in sorted(
+            manifest,
+            key=lambda item: (str(item.get("last_modified") or ""), str(item.get("doc_id") or "")),
+        ):
+            package_uri = str(entry.get("package_uri") or "").strip()
+            if not package_uri:
+                continue
+            last_modified = _TeamsAPIClient._parse_timestamp(str(entry.get("last_modified") or ""))
+            if since and last_modified <= since:
+                continue
+            window_id = str(entry.get("window_id") or entry.get("doc_id") or "")
+            yield ContentItem(
+                item_id=str(entry.get("doc_id") or window_id),
+                title=str(entry.get("title") or window_id),
+                source_url=str(entry.get("source_url") or ""),
+                last_modified=last_modified,
+                content_type="application/json",
+                space_or_project=str(entry.get("space_or_project") or ""),
+                version=str(entry.get("revision_hash") or entry.get("version") or ""),
+                author=entry.get("submitted_by"),
+                labels=["teams", str(entry.get("window_type") or "")],
+                extra={
+                    "package_uri": package_uri,
+                    "package_path": entry.get("package_path"),
+                    "conversation_id": entry.get("conversation_id"),
+                    "root_message_id": entry.get("root_message_id"),
+                    "window_id": window_id,
+                    "window_type": entry.get("window_type"),
+                    "revision_hash": entry.get("revision_hash"),
                 },
             )
 

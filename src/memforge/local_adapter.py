@@ -37,6 +37,7 @@ from memforge.github_repo_utils import (
 )
 from memforge.models import content_hash, slugify
 from memforge.storage.database import Database
+from memforge.storage.document_store import DocumentStore
 
 LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
 GITHUB_REPO_SOURCE_TYPE = "github_repo"
@@ -529,6 +530,7 @@ async def submit_teams_window_package(
     raw_hash: str | None = None,
     submitted_by: str | None = None,
     submitted_at: str | None = None,
+    document_store: DocumentStore | None = None,
 ) -> dict[str, Any]:
     """Validate, package, and persist one raw Teams window captured by the local daemon."""
     if source.get("type") != TEAMS_SOURCE_TYPE:
@@ -582,6 +584,15 @@ async def submit_teams_window_package(
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
+    package_uri: str | None = None
+    if document_store is not None:
+        package_uri = document_store.store_raw(
+            source.get("name") or source_id,
+            f"{doc_id}-package",
+            payload_text.encode("utf-8"),
+            "application/json",
+            extension=".teams-package.json",
+        )
     tmp_fd, tmp_name = tempfile.mkstemp(dir=str(package_path.parent), suffix=".json.tmp")
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
@@ -596,6 +607,34 @@ async def submit_teams_window_package(
 
     refreshed_config = dict(source_config)
     refreshed_config["local_agent_documents_dir"] = str(inbox)
+    if package_uri:
+        manifest = [
+            entry for entry in refreshed_config.get("local_agent_package_manifest", [])
+            if isinstance(entry, dict) and entry.get("doc_id") != doc_id
+        ]
+        manifest.append(
+            {
+                "doc_id": doc_id,
+                "title": doc_title,
+                "source_url": package["source_url"],
+                "last_modified": submitted_at,
+                "space_or_project": package["space_or_project"],
+                "version": normalized_revision_hash,
+                "conversation_id": normalized_conversation_id,
+                "root_message_id": package["root_message_id"],
+                "window_id": normalized_window_id,
+                "window_type": package["window_type"],
+                "revision_hash": normalized_revision_hash,
+                "package_uri": package_uri,
+                "package_path": str(package_path),
+                "submitted_at": submitted_at,
+                "submitted_by": submitted_by,
+            }
+        )
+        refreshed_config["local_agent_package_manifest"] = sorted(
+            manifest,
+            key=lambda entry: (str(entry.get("last_modified") or ""), str(entry.get("doc_id") or "")),
+        )
     await db.upsert_source(
         id=source_id,
         type=TEAMS_SOURCE_TYPE,
@@ -612,6 +651,7 @@ async def submit_teams_window_package(
         "revision_hash": normalized_revision_hash,
         "document_hash": payload_hash,
         "package_path": str(package_path),
+        "package_uri": package_uri,
         "submitted_at": submitted_at,
     }
 
