@@ -1,6 +1,6 @@
 import client from "./client";
 import type { LocalAgentJobCreateResponse } from "./types";
-import { currentWorkspaceId } from "@/lib/workspace";
+import { requireCurrentWorkspaceId } from "@/lib/workspace";
 
 interface CreateLocalAgentJobInput {
   sourceId?: string;
@@ -16,7 +16,7 @@ export async function createLocalAgentJob({
   payload = {},
 }: CreateLocalAgentJobInput): Promise<LocalAgentJobCreateResponse> {
   const response = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
-    workspace_id: currentWorkspaceId(),
+    workspace_id: requireCurrentWorkspaceId(),
     source_id: sourceId,
     source_type: sourceType,
     operation,
@@ -24,4 +24,3 @@ export async function createLocalAgentJob({
   });
   return response.data;
 }
-

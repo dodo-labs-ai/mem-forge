@@ -5,7 +5,7 @@ import {
   localAgentProgressMessage,
 } from "../src/views/sources/localAgentSyncProgress.js";
 import type { LocalAgentJobStatusResponse } from "../src/api/types.js";
-import { currentWorkspaceId } from "../src/lib/workspace.js";
+import { currentWorkspaceId, requireCurrentWorkspaceId } from "../src/lib/workspace.js";
 
 function job(
   status: LocalAgentJobStatusResponse["status"],
@@ -103,9 +103,14 @@ Object.defineProperty(globalThis, "window", {
   value: { location: { search: "?workspace=payroll_agent" } },
 });
 assert.equal(currentWorkspaceId(), "payroll_agent");
+assert.equal(requireCurrentWorkspaceId(), "payroll_agent");
 
 Object.defineProperty(globalThis, "window", {
   configurable: true,
   value: { location: { search: "?workspace=%20" } },
 });
 assert.equal(currentWorkspaceId(), undefined);
+assert.throws(
+  () => requireCurrentWorkspaceId(),
+  /Select a workspace before starting local sync\./,
+);
