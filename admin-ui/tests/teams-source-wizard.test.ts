@@ -62,6 +62,7 @@ assert.equal(Object.hasOwn(payload.config, "individual_chats"), false);
 
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
 const teamsWizardSource = readFileSync("src/views/sources/TeamsSourceWizard.tsx", "utf8");
+const localAgentSourcesSource = readFileSync("src/views/sources/localAgentSources.ts", "utf8");
 assert.match(
   sourcesPageSource,
   /isTeams\s*\?\s*onTeamsSelected\(\)\s*:\s*onConfigureSelected\(gene\.name\)/,
@@ -73,7 +74,7 @@ assert.match(
   "Teams source card should not expose the generic hand-written config path as the primary action",
 );
 assert.match(
-  sourcesPageSource,
+  localAgentSourcesSource,
   /source\.type === "teams"[\s\S]*return "teams_sync"/,
   "Teams source sync should enqueue a local-agent teams_sync job instead of server-side sync",
 );

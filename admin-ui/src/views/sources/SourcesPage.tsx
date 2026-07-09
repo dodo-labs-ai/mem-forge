@@ -47,6 +47,7 @@ import {
   type LocalAgentSyncProgress,
   localAgentProgressFromJob,
 } from "./localAgentSyncProgress";
+import { localAgentSyncOperation } from "./localAgentSources";
 
 const SOURCE_LABELS: Record<string, { name: string; subtitle: string; description: string }> = {
   // Per-client agent-session sources returned by the split backend.
@@ -80,20 +81,6 @@ function normalizeSources(payload: SourcesResponse | Source[] | undefined): Sour
   if (Array.isArray(payload)) return payload;
   if (Array.isArray(payload?.data)) return payload.data;
   return [];
-}
-
-function isInternalGitHubSource(source: Source): boolean {
-  return source.type === "github_repo" && String(source.config.connection_mode ?? "cloud_pull") === "local_push";
-}
-
-function localAgentSyncOperation(source: Source): string | null {
-  if (isInternalGitHubSource(source)) return "github_repo_sync";
-  if (source.type === "local_markdown" && String(source.config.root ?? "").trim().length > 0) {
-    return "local_markdown_sync";
-  }
-  if (source.type === "jira" && String(source.config.sync_mode ?? "cloud") === "local_agent") return "jira_sync";
-  if (source.type === "teams") return "teams_sync";
-  return null;
 }
 
 function localAgentJobPayload(source: Source): Record<string, unknown> {

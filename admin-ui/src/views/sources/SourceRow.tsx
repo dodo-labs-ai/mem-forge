@@ -11,6 +11,8 @@ import { SourceIcon } from "@/components/sources/SourceIcon";
 import { cn } from "@/lib/utils";
 import { formatDuration, timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
+import { LocalAgentDaemonBadge } from "./LocalAgentDaemonStatus";
+import { isLocalAgentBackedSource } from "./localAgentSources";
 import type { LocalAgentSyncProgress } from "./localAgentSyncProgress";
 
 /**
@@ -80,6 +82,7 @@ export function SourceRow({
   actionsMenu: ReactNode;
 }) {
   const isPaused = source.status === "paused";
+  const showLocalAgentStatus = !isPaused && isLocalAgentBackedSource(source);
   const pausedSyncHint = "Source is paused. Resume the source to sync again.";
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
   const ownershipText = formatOwnership(source.ownership);
@@ -94,18 +97,11 @@ export function SourceRow({
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="truncate text-sm font-medium">{source.name}</h3>
-              <StatusDot
-                status={source.status}
-                className={isPaused ? "bg-amber-500" : undefined}
-              />
-              <Badge
-                variant={isPaused ? "outline" : source.status === "active" ? "secondary" : "outline"}
-                className={cn(
-                  isPaused && "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-900/30 dark:text-amber-200",
-                )}
-              >
-                {source.status}
-              </Badge>
+              {showLocalAgentStatus ? (
+                <LocalAgentDaemonBadge />
+              ) : (
+                <SourceLifecycleBadge status={source.status} />
+              )}
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
               {sourceLabel.name}
@@ -253,6 +249,26 @@ export function SourceRow({
         <SyncStatusBar sync={source.sync} itemLabel={itemLabel} onRetry={isPaused ? undefined : onSync} />
       )}
     </div>
+  );
+}
+
+function SourceLifecycleBadge({ status }: { status: Source["status"] }) {
+  const isPaused = status === "paused";
+  return (
+    <>
+      <StatusDot
+        status={status}
+        className={isPaused ? "bg-amber-500" : undefined}
+      />
+      <Badge
+        variant={isPaused ? "outline" : status === "active" ? "secondary" : "outline"}
+        className={cn(
+          isPaused && "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-900/30 dark:text-amber-200",
+        )}
+      >
+        {status}
+      </Badge>
+    </>
   );
 }
 
