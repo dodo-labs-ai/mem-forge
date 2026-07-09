@@ -1811,7 +1811,13 @@ def _local_agent_daemon_status(state: dict[str, Any]) -> dict[str, Any]:
 def _daemon_recorded_target(state: dict[str, Any]) -> dict[str, Any] | None:
     daemon = state.get("daemon") if isinstance(state.get("daemon"), dict) else {}
     target = daemon.get("target") if isinstance(daemon, dict) else None
-    return target if isinstance(target, dict) else None
+    if not isinstance(target, dict):
+        return None
+    return _local_agent_clean_target_summary(target)
+
+
+def _local_agent_clean_target_summary(target: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in target.items() if key != "workspace_id_configured"}
 
 
 def _local_agent_target_summary(ctx) -> dict[str, Any]:
@@ -1828,7 +1834,6 @@ def _local_agent_target_summary(ctx) -> dict[str, Any]:
         "active_target": active,
         "token_env": token_env,
         "api_token_configured": bool(api_token),
-        "workspace_id_configured": bool(os.getenv("MEMFORGE_WORKSPACE_ID", "").strip()),
     }
 
 
@@ -1837,8 +1842,6 @@ def _local_agent_status_recommendations(target: dict[str, Any]) -> list[str]:
     token_env = str(target.get("token_env") or "MEMFORGE_API_TOKEN")
     if not target.get("api_token_configured"):
         recommendations.append(f"Set {token_env} before starting the daemon.")
-    if not target.get("workspace_id_configured"):
-        recommendations.append("Set MEMFORGE_WORKSPACE_ID for hosted multi-workspace MemForge targets.")
     return recommendations
 
 
