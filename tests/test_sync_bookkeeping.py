@@ -157,6 +157,51 @@ async def test_lease_next_source_sync_run_recovers_expired_run_without_new_run(d
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_source_sync_run_extends_only_current_worker_lease(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-heartbeat-run",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-heartbeat-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert leased is not None
+
+    wrong_worker = await db.heartbeat_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-b",
+        lease_seconds=60,
+        now=now + timedelta(seconds=10),
+    )
+    after_wrong_worker = await db.get_source_sync_run(enqueued.run_id)
+    right_worker = await db.heartbeat_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=10),
+    )
+    after_right_worker = await db.get_source_sync_run(enqueued.run_id)
+
+    assert wrong_worker is False
+    assert after_wrong_worker is not None
+    assert after_wrong_worker.lease_expires_at == now + timedelta(seconds=60)
+    assert right_worker is True
+    assert after_right_worker is not None
+    assert after_right_worker.lease_expires_at == now + timedelta(seconds=70)
+
+
+@pytest.mark.asyncio
 async def test_complete_source_sync_run_releases_active_slot_for_next_run(db: Database):
     now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
     await db.upsert_source(
@@ -1999,7 +2044,71 @@ async def test_source_sync_schedule_round_trips_and_claims_due_sources(db: Datab
 
 
 @pytest.mark.asyncio
-async def test_scheduler_enqueues_due_source_and_advances_next_run(db: Database, monkeypatch):
+async def test_enqueue_due_source_sync_runs_advances_schedule_with_run_acceptance(db: Database):
+    claim_time = datetime(2026, 6, 16, tzinfo=timezone.utc)
+    source_id = "src-scheduled-due"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Scheduled Due Source",
+        config_json="{}",
+    )
+    await db.set_source_sync_schedule(
+        source_id,
+        enabled=True,
+        interval_minutes=30,
+        next_run_at=claim_time - timedelta(minutes=1),
+    )
+
+    runs = await db.enqueue_due_source_sync_runs(now=claim_time)
+
+    assert [run.source_id for run in runs] == [source_id]
+    assert runs[0].trigger == "schedule"
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["sync_schedule"]["next_run_at"] == "2026-06-16T00:30:00+00:00"
+    coalesced = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    assert coalesced.run_id == runs[0].run_id
+    assert coalesced.coalesced is True
+
+
+@pytest.mark.asyncio
+async def test_enqueue_due_source_sync_runs_rolls_back_schedule_when_run_enqueue_fails(
+    db: Database,
+    monkeypatch,
+):
+    claim_time = datetime(2026, 6, 16, tzinfo=timezone.utc)
+    due_at = claim_time - timedelta(minutes=1)
+    source_id = "src-scheduled-rollback"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Scheduled Rollback Source",
+        config_json="{}",
+    )
+    await db.set_source_sync_schedule(
+        source_id,
+        enabled=True,
+        interval_minutes=30,
+        next_run_at=due_at,
+    )
+
+    async def fail_enqueue_locked(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("enqueue failed after schedule claim")
+
+    monkeypatch.setattr(db, "_enqueue_source_sync_run_locked", fail_enqueue_locked)
+
+    with pytest.raises(RuntimeError, match="enqueue failed"):
+        await db.enqueue_due_source_sync_runs(now=claim_time)
+
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["sync_schedule"]["next_run_at"] == due_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_enqueues_due_source_and_advances_next_run(db: Database):
     source_id = "src-scheduled-due"
     await db.upsert_source(
         id=source_id,
@@ -2015,25 +2124,12 @@ async def test_scheduler_enqueues_due_source_and_advances_next_run(db: Database,
     )
     service = SyncService(db, AppConfig())
     scheduler = SyncScheduler(db, service)
-    started: list[str] = []
-
-    async def fake_enqueue_source(
-        started_source_id: str,
-        *,
-        trigger: str = "manual",
-        force_full_sync: bool = False,
-        workspace_id: str = "default",
-    ):
-        del force_full_sync, workspace_id
-        started.append(started_source_id)
-        assert trigger == "schedule"
-        return await db.enqueue_source_sync_run(source_id=started_source_id, trigger=trigger)
-
-    monkeypatch.setattr(service, "enqueue_source", fake_enqueue_source)
 
     await scheduler._sync_due_sources()
 
-    assert started == [source_id]
+    run = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    assert run.source_id == source_id
+    assert run.coalesced is True
     source = await db.get_source(source_id)
     assert source is not None
     assert source["sync_schedule"]["next_run_at"] is not None
@@ -2041,7 +2137,7 @@ async def test_scheduler_enqueues_due_source_and_advances_next_run(db: Database,
 
 
 @pytest.mark.asyncio
-async def test_scheduler_coalesces_active_due_source_and_advances_next_run(db: Database, monkeypatch):
+async def test_scheduler_coalesces_active_due_source_and_advances_next_run(db: Database):
     source_id = "src-scheduled-running"
     due_at = datetime.now(timezone.utc) - timedelta(minutes=1)
     await db.upsert_source(
@@ -2059,25 +2155,9 @@ async def test_scheduler_coalesces_active_due_source_and_advances_next_run(db: D
     service = SyncService(db, AppConfig())
     scheduler = SyncScheduler(db, service)
     active = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
-    started: list[str] = []
-
-    async def fake_enqueue_source(
-        started_source_id: str,
-        *,
-        trigger: str = "manual",
-        force_full_sync: bool = False,
-        workspace_id: str = "default",
-    ):
-        del force_full_sync, workspace_id
-        started.append(started_source_id)
-        assert trigger == "schedule"
-        return await db.enqueue_source_sync_run(source_id=started_source_id, trigger=trigger)
-
-    monkeypatch.setattr(service, "enqueue_source", fake_enqueue_source)
 
     await scheduler._sync_due_sources()
 
-    assert started == [source_id]
     scheduled = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
     assert scheduled.run_id == active.run_id
     assert scheduled.coalesced is True
@@ -2311,6 +2391,64 @@ async def test_source_sync_worker_retries_failed_final_state(db: Database):
     assert sync_state is not None
     assert sync_state.last_sync_status == "failed"
     assert sync_state.error_message == "temporary final-state failure"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_heartbeats_while_run_is_active(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-heartbeat"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker Heartbeat",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+
+    class WaitingRuntimeProvider:
+        async def build_sync_runtime(
+            self,
+            db: Database,
+            config: AppConfig,
+            *,
+            extraction_pool: ExtractionWorkPool | None = None,
+            document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
+        ):
+            del db, config, extraction_pool, document_lifecycle_admission
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            db = kwargs["db"]
+            initial = await db.get_source_sync_run(enqueued.run_id)
+            assert initial is not None
+            assert initial.lease_expires_at is not None
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                current = await db.get_source_sync_run(enqueued.run_id)
+                assert current is not None
+                if current.lease_expires_at and current.lease_expires_at > initial.lease_expires_at:
+                    return SyncState(
+                        source=source_id,
+                        last_sync_at=datetime.now(timezone.utc),
+                        last_sync_status="success",
+                    )
+            raise AssertionError("worker did not heartbeat the active source sync run")
+
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=WaitingRuntimeProvider(),
+        worker_id="worker-a",
+        lease_seconds=1,
+        heartbeat_seconds=0.01,
+    )
+
+    await worker.run_once()
+    completed = await db.get_source_sync_run(enqueued.run_id)
+
+    assert completed is not None
+    assert completed.status == "success"
 
 
 @pytest.mark.asyncio

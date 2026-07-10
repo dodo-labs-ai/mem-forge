@@ -131,14 +131,10 @@ class SyncScheduler:
         logger.error("Memory index health check found issues: %s", issue_counts)
 
     async def _sync_due_sources(self) -> None:
-        for source in await self.db.claim_due_scheduled_sources(
-            limit=50,
-        ):
-            source_id = str(source["id"])
-            try:
-                await self.sync_service.enqueue_source(source_id, trigger="schedule")
-            except Exception:
-                logger.exception("Scheduled source sync failed to start for %s", source_id)
+        try:
+            await self.db.enqueue_due_source_sync_runs(limit=50)
+        except Exception:
+            logger.exception("Scheduled source sync scan failed")
 
     async def shutdown(self) -> None:
         if self.scheduler.running:
