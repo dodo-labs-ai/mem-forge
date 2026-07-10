@@ -105,7 +105,7 @@ assert.match(
 );
 assert.doesNotMatch(
   teamsWizardSource,
-  /\/api\/genes\/teams\/(?:auth-check|browse)/,
+  /resourceClient[^\n]*\/genes\/teams\/(?:auth-check|browse)/,
   "Teams wizard should not call direct server-side Teams auth or browse endpoints",
 );
 assert.match(

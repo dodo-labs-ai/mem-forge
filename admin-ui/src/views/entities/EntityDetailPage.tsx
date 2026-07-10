@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { AlertCircle, ArrowLeft, Loader2, Plus, Trash2 } from "lucide-react";
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import type { EntityDetail as EntityDetailType } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -42,13 +42,13 @@ export function EntityDetailPage() {
   const entityQuery = useQuery<EntityDetailType>({
     queryKey: ["entity", id],
     queryFn: () =>
-      client.get(`/api/entities/${id}`).then((response) => response.data),
+      resourceClient.get(`/entities/${id}`).then((response) => response.data),
     enabled: Boolean(id),
   });
 
   const addAlias = useMutation({
     mutationFn: (alias: string) =>
-      client.post(`/api/entities/${id}/aliases`, { alias }),
+      resourceClient.post(`/entities/${id}/aliases`, { alias }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["entity", id] });
       setNewAlias("");
@@ -57,8 +57,8 @@ export function EntityDetailPage() {
 
   const deleteAlias = useMutation({
     mutationFn: (alias: string) =>
-      client.delete(
-        `/api/entities/${id}/aliases/${encodeURIComponent(alias)}`,
+      resourceClient.delete(
+        `/entities/${id}/aliases/${encodeURIComponent(alias)}`,
       ),
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: ["entity", id] }),
@@ -66,7 +66,7 @@ export function EntityDetailPage() {
 
   const mergeEntity = useMutation({
     mutationFn: (targetId: string) =>
-      client.post("/api/entities/merge", {
+      resourceClient.post("/entities/merge", {
         source_id: Number(id),
         target_id: Number(targetId),
       }),

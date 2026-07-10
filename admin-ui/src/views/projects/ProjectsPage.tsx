@@ -3,7 +3,7 @@ import type { FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, FolderKanban, Loader2, Lock, Plus, Trash2 } from "lucide-react";
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import { RESERVED_PROJECT_KEYS, isReservedProjectKey } from "@/api/projectKeys";
 import type { Project, ProjectKind } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
@@ -41,7 +41,7 @@ import {
 import type { ProjectCreateFormState } from "./projectCreateForm";
 
 /**
- * The DELETE /api/projects/{id} response reports how many memories were
+ * The DELETE /projects/{id} response reports how many memories were
  * moved into the Unsorted project. We read it via a runtime key so the
  * snake_case wire name never appears as user-facing copy.
  */
@@ -80,7 +80,7 @@ function CreateProjectDialog({
       };
       const submittedKey = payload.key.trim();
       if (submittedKey.length > 0) body.key = submittedKey;
-      const response = await client.post<Project>("/api/projects", body);
+      const response = await resourceClient.post<Project>("/projects", body);
       return response.data;
     },
     onSuccess: () => {
@@ -188,13 +188,13 @@ export function ProjectsPage() {
 
   const projectsQuery = useQuery<Project[]>({
     queryKey: ["projects"],
-    queryFn: () => client.get<Project[]>("/api/projects").then((response) => response.data),
+    queryFn: () => resourceClient.get<Project[]>("/projects").then((response) => response.data),
   });
 
   const deleteProject = useMutation({
     mutationFn: async (project: Project) => {
-      const response = await client.delete<DeleteProjectWireResponse>(
-        `/api/projects/${project.id}`,
+      const response = await resourceClient.delete<DeleteProjectWireResponse>(
+        `/projects/${project.id}`,
       );
       return { project, payload: response.data };
     },

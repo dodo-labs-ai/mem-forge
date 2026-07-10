@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { ChevronRight, Database, RefreshCw } from "lucide-react";
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import type { Entity, PaginatedResponse } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
@@ -37,8 +37,8 @@ export function EntitiesPage() {
   const entitiesQuery = useQuery<PaginatedResponse<Entity>>({
     queryKey: ["entities", search, tag, page],
     queryFn: () =>
-      client
-        .get("/api/entities", {
+      resourceClient
+        .get("/entities", {
           params: {
             search: search || undefined,
             tag: tag !== "all" ? tag : undefined,

@@ -13,8 +13,8 @@ import {
   User,
   X,
 } from "lucide-react";
-import client from "@/api/client";
-import { createLocalAgentJob } from "@/api/localAgentJobs";
+import { resourceClient } from "@/api/client";
+import { createLocalAgentJob, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
   LocalAgentJobStatusResponse,
   TeamsAuthStatus,
@@ -205,9 +205,9 @@ async function runTeamsLocalAgentJob(operation: string, payload: Record<string, 
 
 async function pollTeamsLocalAgentJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
   for (let attempt = 0; attempt < TEAMS_AUTH_POLL_ATTEMPTS; attempt += 1) {
-    const response = await client.get<LocalAgentJobStatusResponse>(`/api/cloud/local-agent/jobs/${jobId}`);
-    if (response.data.status === "succeeded" || response.data.status === "failed") {
-      return response.data;
+    const status = await getLocalAgentJob(jobId);
+    if (status.status === "succeeded" || status.status === "failed") {
+      return status;
     }
     await new Promise((resolve) => window.setTimeout(resolve, TEAMS_AUTH_POLL_INTERVAL_MS));
   }
@@ -393,7 +393,7 @@ function ConfirmStep({
   const queryClient = useQueryClient();
   const createSource = useMutation({
     mutationFn: (payload: { type: string; name: string; config: Record<string, unknown> }) =>
-      client.post("/api/sources", payload),
+      resourceClient.post("/sources", payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sources"] });
       onCreated();

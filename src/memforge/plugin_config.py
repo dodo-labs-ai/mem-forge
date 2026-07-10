@@ -13,20 +13,23 @@ import re
 from pathlib import Path
 from typing import Mapping
 
+if __package__:
+    from .api_target import MemForgeTarget, build_target
+else:  # pragma: no cover - direct file load used by packaged integrations
+    from memforge.api_target import MemForgeTarget, build_target
+
 
 _CONFIG_CACHE: dict[str, str] | None = None
 
 
-def configured_api_url(default: str) -> str:
-    return _configured_value("MEMFORGE_API_URL", default).rstrip("/")
+def configured_target() -> MemForgeTarget:
+    origin = _configured_value("MEMFORGE_API_URL", "").strip() or None
+    workspace = _configured_value("MEMFORGE_WORKSPACE_ID", "").strip() or None
+    return build_target(origin=origin, workspace_id=workspace)
 
 
 def configured_api_token() -> str:
     return _configured_value("MEMFORGE_API_TOKEN", "").strip()
-
-
-def configured_workspace_id() -> str:
-    return _configured_value("MEMFORGE_WORKSPACE_ID", "").strip()
 
 
 def _configured_value(name: str, default: str) -> str:

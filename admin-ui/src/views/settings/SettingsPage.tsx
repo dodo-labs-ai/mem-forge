@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Eye, EyeOff, Loader2, RotateCw, SlidersHorizontal, X } from "lucide-react";
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import type { LlmConfig, LlmConfigProbeResponse } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
@@ -68,7 +68,7 @@ export function SettingsPage() {
 
   const configQuery = useQuery<LlmConfig>({
     queryKey: ["llm-config"],
-    queryFn: () => client.get("/api/llm-config").then((response) => response.data),
+    queryFn: () => resourceClient.get("/llm-config").then((response) => response.data),
   });
 
   useEffect(() => {
@@ -87,7 +87,7 @@ export function SettingsPage() {
   }, [configQuery.data]);
 
   const updateConfig = useMutation({
-    mutationFn: (payload: Partial<LlmConfig>) => client.put("/api/llm-config", payload),
+    mutationFn: (payload: Partial<LlmConfig>) => resourceClient.put("/llm-config", payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["llm-config"] });
     },
@@ -144,7 +144,7 @@ export function SettingsPage() {
     }));
 
     try {
-      const response = await client.post<LlmConfigProbeResponse>("/api/llm-config/probe", {
+      const response = await resourceClient.post<LlmConfigProbeResponse>("/llm-config/probe", {
         kind,
         base_url: baseUrl,
         api_key: apiKey,

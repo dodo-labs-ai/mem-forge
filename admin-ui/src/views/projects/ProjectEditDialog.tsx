@@ -3,13 +3,13 @@
  *
  * The project key is immutable once created (it lives in URLs, tags, and
  * memory rows), so the form intentionally exposes only the fields the
- * PATCH /api/projects/{id} endpoint accepts: name and kind.
+ * PATCH /projects/{id} endpoint accepts: name and kind.
  */
 import { useState } from "react";
 import type { FormEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import type { Project, ProjectKind } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import {
@@ -79,8 +79,8 @@ function ProjectEditForm({
     mutationFn: async (payload: EditFormState) => {
       const kind: ProjectKind = payload.shared ? "shared" : "normal";
       const body = { name: payload.name.trim(), kind };
-      const response = await client.patch<Project>(
-        `/api/projects/${project.id}`,
+      const response = await resourceClient.patch<Project>(
+        `/projects/${project.id}`,
         body,
       );
       return response.data;

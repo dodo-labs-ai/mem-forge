@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, Check, ChevronRight, FolderOpen, Loader2, RefreshCw } from "lucide-react";
-import client from "@/api/client";
-import { createLocalAgentJob } from "@/api/localAgentJobs";
+import { resourceClient } from "@/api/client";
+import { createLocalAgentJob, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
   ConfigField,
   DiscoveryPreviewResponse,
@@ -74,7 +74,7 @@ export function SourceConfigDialog({
   const schemaQuery = useQuery<GeneConfigSchema>({
     queryKey: ["gene-config-schema", sourceType],
     queryFn: () =>
-      client.get(`/api/genes/${sourceType}/config-schema`).then((response) => response.data),
+      resourceClient.get(`/genes/${sourceType}/config-schema`).then((response) => response.data),
     enabled:
       open
       && Boolean(sourceType)
@@ -186,7 +186,7 @@ function SourceConfigForm({
   const jiraSessionQuery = useQuery<JiraAuthSession>({
     queryKey: ["jira-session", jiraBaseUrl],
     queryFn: () =>
-      client.get("/api/auth/jira-session", { params: { base_url: jiraBaseUrl } }).then((response) => response.data),
+      resourceClient.get("/auth/jira-session", { params: { base_url: jiraBaseUrl } }).then((response) => response.data),
     enabled: canConfigureConnection
       && sourceType === "jira"
       && authMode === "browser_cookie"
@@ -208,10 +208,10 @@ function SourceConfigForm({
         },
       };
       if (source) {
-        await client.put(`/api/sources/${source.id}`, payloadWithSchedule);
+        await resourceClient.put(`/sources/${source.id}`, payloadWithSchedule);
         return { id: source.id };
       }
-      const response = await client.post("/api/sources", {
+      const response = await resourceClient.post("/sources", {
         type: sourceType,
         ...payloadWithSchedule,
       });
@@ -245,8 +245,8 @@ function SourceConfigForm({
         }
         return localMarkdownPreviewFromJob(status);
       }
-      return client
-        .post(`/api/genes/${sourceType}/preview-discovery`, {
+      return resourceClient
+        .post(`/genes/${sourceType}/preview-discovery`, {
           config: serializedConfig,
           limit: DISCOVERY_PREVIEW_LIMIT,
         })
@@ -1276,9 +1276,9 @@ function scheduleIntervalLabel(value: string): string {
 
 async function pollLocalAgentPreviewJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
   for (let attempt = 0; attempt < LOCAL_AGENT_PREVIEW_POLL_ATTEMPTS; attempt += 1) {
-    const response = await client.get<LocalAgentJobStatusResponse>(`/api/cloud/local-agent/jobs/${jobId}`);
-    if (response.data.status === "succeeded" || response.data.status === "failed") {
-      return response.data;
+    const status = await getLocalAgentJob(jobId);
+    if (status.status === "succeeded" || status.status === "failed") {
+      return status;
     }
     await new Promise((resolve) => window.setTimeout(resolve, LOCAL_AGENT_PREVIEW_POLL_INTERVAL_MS));
   }
