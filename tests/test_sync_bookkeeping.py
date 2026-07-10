@@ -44,6 +44,240 @@ async def db(tmp_path):
     await database.close()
 
 
+@pytest.mark.asyncio
+async def test_enqueue_source_sync_run_coalesces_by_workspace_and_source(db: Database):
+    await db.upsert_source(
+        id="src-sync-run",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+
+    first = await db.enqueue_source_sync_run(
+        source_id="src-sync-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    second = await db.enqueue_source_sync_run(
+        source_id="src-sync-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    other_workspace = await db.enqueue_source_sync_run(
+        source_id="src-sync-run",
+        workspace_id="workspace-b",
+        trigger="manual",
+    )
+
+    assert second.run_id == first.run_id
+    assert second.coalesced is True
+    assert other_workspace.run_id != first.run_id
+    assert first.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_enqueue_source_sync_run_promotes_force_intent_on_active_run(db: Database):
+    await db.upsert_source(
+        id="src-force-run",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+
+    first = await db.enqueue_source_sync_run(
+        source_id="src-force-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    force = await db.enqueue_source_sync_run(
+        source_id="src-force-run",
+        workspace_id="workspace-a",
+        trigger="force",
+        force_full_sync=True,
+    )
+
+    assert force.run_id == first.run_id
+    assert force.coalesced is True
+    assert force.force_full_sync is True
+    assert force.rerun_requested is True
+
+
+@pytest.mark.asyncio
+async def test_lease_next_source_sync_run_recovers_expired_run_without_new_run(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-lease-run",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-lease-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+
+    first = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    before_expiry = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=30),
+    )
+    recovered = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=90),
+    )
+
+    assert first is not None
+    assert first.run_id == enqueued.run_id
+    assert first.status == "running"
+    assert first.lease_owner == "worker-a"
+    assert first.lease_attempt_count == 1
+    assert first.recovery_count == 0
+    assert before_expiry is None
+    assert recovered is not None
+    assert recovered.run_id == enqueued.run_id
+    assert recovered.lease_owner == "worker-b"
+    assert recovered.lease_attempt_count == 2
+    assert recovered.recovery_count == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_source_sync_run_releases_active_slot_for_next_run(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-complete-run",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-complete-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+
+    await db.complete_source_sync_run(
+        enqueued.run_id,
+        final_state=SyncState(
+            source="src-complete-run",
+            last_sync_at=now,
+            last_sync_status="success",
+            docs_processed=3,
+            docs_updated=2,
+            memories_extracted=4,
+        ),
+        completed_at=now + timedelta(seconds=10),
+    )
+    completed = await db.get_source_sync_run(enqueued.run_id)
+    next_run = await db.enqueue_source_sync_run(
+        source_id="src-complete-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+
+    assert completed is not None
+    assert completed.status == "success"
+    assert completed.lease_owner is None
+    assert completed.completed_at == now + timedelta(seconds=10)
+    assert next_run.run_id != enqueued.run_id
+    assert next_run.coalesced is False
+
+
+@pytest.mark.asyncio
+async def test_fail_source_sync_run_requeues_retryable_failure(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-fail-run",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-fail-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+
+    await db.fail_source_sync_run(
+        enqueued.run_id,
+        error_message="temporary outage",
+        retryable=True,
+        failed_at=now + timedelta(seconds=5),
+    )
+    failed = await db.get_source_sync_run(enqueued.run_id)
+    retried = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=6),
+    )
+
+    assert failed is not None
+    assert failed.status == "pending"
+    assert failed.error_message == "temporary outage"
+    assert failed.lease_owner is None
+    assert retried is not None
+    assert retried.run_id == enqueued.run_id
+    assert retried.lease_attempt_count == 2
+
+
+@pytest.mark.asyncio
+async def test_source_sync_inputs_are_immutable_generations_per_workspace_source(db: Database):
+    await db.upsert_source(
+        id="src-input-run",
+        type="teams",
+        name="Teams",
+        config_json="{}",
+    )
+
+    first = await db.create_source_sync_input(
+        source_id="src-input-run",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-run/inputs/one.json",
+        raw_sha256="sha-one",
+        raw_content_type="application/json",
+        metadata={"conversation_id": "chat-1"},
+    )
+    second = await db.create_source_sync_input(
+        source_id="src-input-run",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-run/inputs/two.json",
+        raw_sha256="sha-two",
+        raw_content_type="application/json",
+        metadata={"conversation_id": "chat-1"},
+    )
+    listed = await db.list_source_sync_inputs(
+        source_id="src-input-run",
+        workspace_id="workspace-a",
+    )
+
+    assert first.input_generation == 1
+    assert second.input_generation == 2
+    assert [item.input_id for item in listed] == [first.input_id, second.input_id]
+    assert listed[0].metadata == {"conversation_id": "chat-1"}
+
+
 class EmptyGene:
     def __init__(self) -> None:
         self.bound_document_store = None
