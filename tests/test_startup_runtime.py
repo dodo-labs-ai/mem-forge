@@ -1676,6 +1676,7 @@ async def test_non_secret_source_noop_update_preserves_sync_cursor(db, tmp_path)
     from memforge.local_adapter import default_local_adapter_inbox
     from memforge.models import SyncState
     from memforge.server.admin_api import create_admin_app
+    from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 
     source_id = "src-local-markdown"
     cfg = _config(tmp_path)
@@ -1689,6 +1690,8 @@ async def test_non_secret_source_noop_update_preserves_sync_cursor(db, tmp_path)
         type="local_markdown",
         name="Engineering Notes",
         config_json=json.dumps(source_config),
+        created_by_user_id=LOCAL_DEV_USER_ID,
+        execution_owner_user_id=LOCAL_DEV_USER_ID,
     )
     await db.upsert_sync_state(
         SyncState(
