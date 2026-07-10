@@ -225,6 +225,8 @@ def test_local_agent_status_reports_running_daemon_from_lock_and_heartbeat(tmp_p
     monkeypatch.setattr(main, "_local_agent_state_path", lambda: state_path)
     monkeypatch.setattr(main, "_local_agent_lock_path", lambda: lock_path)
     monkeypatch.setattr(main, "_read_adapter_config", lambda: {})
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example.test")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "ws-a")
 
     from memforge.local_agent.state import LocalAgentStateStore
@@ -1134,8 +1136,11 @@ def test_adapter_daemon_status_summarizes_state_by_default(monkeypatch, tmp_path
     monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
     monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
     monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
+    monkeypatch.delenv("MEMFORGE_EDITION", raising=False)
     (tmp_path / "cli.toml").write_text(
-        'active = "dev"\n\n[targets.dev]\napi_url = "https://memforge.example.test"\ntoken_env = "MEMFORGE_API_TOKEN"\n',
+        'active = "dev"\n\n[targets.dev]\nedition = "cloud"\n'
+        'api_url = "https://memforge.example.test"\nworkspace_id = "ws-a"\n'
+        'token_env = "MEMFORGE_API_TOKEN"\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(main, "_read_adapter_config", lambda: {"kb": {}, "github": {}})
@@ -1194,6 +1199,10 @@ def test_adapter_daemon_status_verbose_includes_raw_state(monkeypatch, tmp_path)
     )
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_STATE", str(state_path))
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_LOCK", str(tmp_path / "daemon.lock"))
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "cli.toml"))
+    monkeypatch.delenv("MEMFORGE_EDITION", raising=False)
+    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
+    monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
     monkeypatch.setattr(main, "_read_adapter_config", lambda: {"kb": {}, "github": {}})
 
     result = CliRunner().invoke(cli, ["adapter", "daemon", "status", "--verbose"])
