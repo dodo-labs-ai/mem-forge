@@ -3969,6 +3969,7 @@ def create_admin_app(
                     blob_sha=req.blob_sha,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
+                    document_store=artifact_store,
                 )
             elif source_type == JIRA_SOURCE_TYPE:
                 result = await submit_jira_package(
@@ -3983,6 +3984,7 @@ def create_admin_app(
                     raw_hash=req.raw_hash,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
+                    document_store=artifact_store,
                 )
             elif source_type == TEAMS_SOURCE_TYPE:
                 result = await submit_teams_window_package(
@@ -4015,9 +4017,25 @@ def create_admin_app(
                     raw_hash=req.raw_hash,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
+                    document_store=artifact_store,
                 )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if result.get("package_uri"):
+            await db.create_source_sync_input(
+                source_id=source_id,
+                raw_uri=str(result["package_uri"]),
+                raw_sha256=str(result.get("package_sha256") or result.get("document_hash") or ""),
+                raw_content_type="application/json",
+                metadata={
+                    "doc_id": result.get("doc_id"),
+                    "source_type": source_type,
+                    "package_path": result.get("package_path"),
+                    "submitted_at": result.get("submitted_at"),
+                    "submitted_by": req.submitted_by,
+                },
+            )
 
         sync_started = False
         if req.process_now:

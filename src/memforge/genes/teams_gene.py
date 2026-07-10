@@ -26,6 +26,7 @@ from pathlib import Path
 import httpx
 
 from memforge.genes.base import Gene
+from memforge.genes.local_adapter_packages import read_package_body
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -870,27 +871,10 @@ class TeamsGene(Gene):
 
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full thread/block content."""
-        if item.extra.get("package_uri"):
-            document_store = getattr(self, "_document_store", None)
-            if document_store is None and item.extra.get("package_path"):
-                package_path = Path(item.extra["package_path"])
-                return RawContent(
-                    item=item,
-                    body=package_path.read_bytes(),
-                    content_type="application/json",
-                )
-            if document_store is None:
-                raise FileNotFoundError(f"document store is required for Teams package {item.item_id}")
+        if item.extra.get("package_uri") or item.extra.get("package_path"):
             return RawContent(
                 item=item,
-                body=document_store.read_artifact(str(item.extra["package_uri"])),
-                content_type="application/json",
-            )
-        if item.extra.get("package_path"):
-            package_path = Path(item.extra["package_path"])
-            return RawContent(
-                item=item,
-                body=package_path.read_bytes(),
+                body=read_package_body(self, item, source_label="Teams"),
                 content_type="application/json",
             )
 

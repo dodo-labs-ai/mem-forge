@@ -15,6 +15,7 @@ from urllib.parse import quote
 import requests
 
 from memforge.genes.base import Gene
+from memforge.genes.local_adapter_packages import package_manifest, read_package_body
 from memforge.genes.local_markdown_gene import _parse_dt, _to_markdown
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSIONS,
@@ -179,6 +180,8 @@ class GitHubRepoGene(Gene):
         self._repo_ref = _parse_repo_url(str(self.config.get("repo_url") or ""))
         self._connection_mode = _connection_mode(self.config)
         if self._connection_mode == CONNECTION_MODE_LOCAL_PUSH:
+            if self._package_manifest():
+                return
             self._documents_dir().mkdir(parents=True, exist_ok=True)
             return
         if self._connection_mode != CONNECTION_MODE_CLOUD_PULL:
@@ -249,9 +252,12 @@ class GitHubRepoGene(Gene):
             )
 
     async def fetch(self, item: ContentItem) -> RawContent:
-        package_path = item.extra.get("package_path")
-        if package_path:
-            return RawContent(item=item, body=Path(str(package_path)).read_bytes(), content_type="application/json")
+        if item.extra.get("package_uri") or item.extra.get("package_path"):
+            return RawContent(
+                item=item,
+                body=read_package_body(self, item, source_label="GitHub repository"),
+                content_type="application/json",
+            )
 
         response = await self._client.get(str(item.extra["repo_contents_url"]))
         response.raise_for_status()
@@ -307,6 +313,11 @@ class GitHubRepoGene(Gene):
         return tree if isinstance(tree, list) else []
 
     async def _discover_local_push(self, since: datetime | None) -> AsyncIterator[ContentItem]:
+        manifest = self._package_manifest()
+        if manifest:
+            async for item in self._discover_local_push_manifest(manifest, since):
+                yield item
+            return
         documents_dir = self._documents_dir()
         selected: list[tuple[Path, dict]] = []
         for package_path in sorted(documents_dir.rglob("*.json")):
@@ -345,11 +356,53 @@ class GitHubRepoGene(Gene):
                 },
             )
 
+    async def _discover_local_push_manifest(
+        self,
+        manifest: list[dict],
+        since: datetime | None,
+    ) -> AsyncIterator[ContentItem]:
+        selected = [
+            entry for entry in manifest
+            if str(entry.get("package_uri") or "").strip() and _package_matches_config(entry, self.config)
+        ]
+        max_files = _int_config(self.config, "max_files", DEFAULT_MAX_FILES)
+        if len(selected) > max_files:
+            raise RuntimeError(
+                f"GitHub Repository Internal network / VPN sync matched {len(selected)} files, exceeding max_files={max_files}"
+            )
+        for entry in sorted(
+            selected,
+            key=lambda item: (str(item.get("last_modified") or ""), str(item.get("doc_id") or "")),
+        ):
+            last_modified = _parse_dt(str(entry.get("last_modified") or ""))
+            if since and last_modified <= since:
+                continue
+            doc_id = str(entry.get("doc_id") or "")
+            yield ContentItem(
+                item_id=doc_id,
+                title=str(entry.get("title") or doc_id),
+                source_url=str(entry.get("source_url") or ""),
+                last_modified=last_modified,
+                content_type=str(entry.get("content_type") or "text/markdown"),
+                space_or_project=str(entry.get("space_or_project") or ""),
+                version=str(entry.get("version") or ""),
+                author=entry.get("submitted_by"),
+                labels=["github_repo"],
+                extra={
+                    "package_uri": str(entry.get("package_uri")),
+                    "package_path": entry.get("package_path"),
+                    "relative_path": entry.get("relative_path"),
+                },
+            )
+
     def _documents_dir(self) -> Path:
         configured = str(self.config.get("documents_dir") or "").strip()
         if not configured:
             raise ValueError("GitHub Repository Internal network / VPN source is missing documents_dir")
         return Path(configured).expanduser()
+
+    def _package_manifest(self) -> list[dict]:
+        return package_manifest(self.config)
 
 
 class _RequestsAsyncClient:
