@@ -686,7 +686,7 @@ def test_github_repo_adapter_document_push_max_files_counts_current_scope_only(t
         asyncio.run(database.close())
 
 
-def test_local_adapter_document_push_requires_source_management(tmp_path):
+def test_local_adapter_document_push_requires_execution_owner(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)

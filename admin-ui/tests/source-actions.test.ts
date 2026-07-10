@@ -299,7 +299,7 @@ const teamsSourceWizardSource = readFileSync("src/views/sources/TeamsSourceWizar
 const githubRepoFolderPickerSource = readFileSync("src/views/sources/GitHubRepoFolderPicker.tsx", "utf8");
 assert.match(
   sourceConfigDialogSource,
-  /const canConfigureConnection = source \? source\.capabilities\?\.can_configure_connection !== false : true;/,
+  /const canConfigureConnection = source \? source\.capabilities\?\.can_configure_connection === true : true;/,
   "existing local sources should consume the backend connection capability",
 );
 assert.match(
@@ -312,6 +312,9 @@ assert.match(
   /disabled=\{source\s*\?\s*isImmutableExecutionModeField\(source, field\.key\)\s*:\s*false\}/,
   "existing sources should render execution-mode selectors as read-only",
 );
+assert.match(sourceConfigDialogSource, /type="checkbox"[\s\S]*disabled=\{disabled\}/);
+assert.match(sourceConfigDialogSource, /<textarea[\s\S]*disabled=\{disabled\}/);
+assert.match(sourceConfigDialogSource, /<Input[\s\S]*disabled=\{disabled\}/);
 assert.doesNotMatch(
   localAgentSourcesSource,
   /source\.type\s*===|sync_mode|connection_mode|local_markdown/,

@@ -311,6 +311,26 @@ def test_local_source_creator_becomes_execution_owner_and_client_cannot_override
         asyncio.run(database.close())
 
 
+def test_local_markdown_source_requires_root_before_execution_classification(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json={
+                    "type": "local_markdown",
+                    "name": "Incomplete local source",
+                    "config": {},
+                },
+            )
+
+        assert response.status_code == 400, response.text
+    finally:
+        asyncio.run(database.close())
+
+
 def test_non_owner_admin_can_manage_local_source_but_cannot_change_connection(tmp_path):
     database = _connect_database(tmp_path)
     try:
