@@ -1768,13 +1768,6 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                ON source_sync_inputs(workspace_id, source_id, input_generation)""",
         ],
     ),
-    (
-        37,
-        "Drop unused source sync run items",
-        [
-            "DROP TABLE IF EXISTS source_sync_run_items",
-        ],
-    ),
 ]
 
 
