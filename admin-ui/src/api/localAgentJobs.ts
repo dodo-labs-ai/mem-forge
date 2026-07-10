@@ -12,6 +12,8 @@ interface CreateLocalAgentJobInput {
   payload?: Record<string, unknown>;
 }
 
+const LOCAL_AGENT_JOB_CONTROL_BASE_URL = "/api/cloud/local-agent";
+
 export async function createLocalAgentJob({
   sourceId = "",
   sourceType,
@@ -29,7 +31,7 @@ export async function createLocalAgentJob({
 
 export async function getLocalAgentJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
   const response = await hostClient.get<LocalAgentJobStatusResponse>(
-    localAgentUrl(`/jobs/${encodeURIComponent(jobId)}`),
+    `${LOCAL_AGENT_JOB_CONTROL_BASE_URL}/jobs/${encodeURIComponent(jobId)}`,
   );
   return response.data;
 }
