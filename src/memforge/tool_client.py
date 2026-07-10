@@ -14,7 +14,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-DEFAULT_API_URL = "http://127.0.0.1:8765"
+from memforge.api_target import MemForgeTarget
+
+
 DEFAULT_TIMEOUT_SECONDS = 60.0
 
 
@@ -37,16 +39,21 @@ class ToolClient:
     def __init__(
         self,
         *,
-        api_url: str | None = None,
-        api_token: str | None = None,
-        workspace_id: str | None = None,
+        target: MemForgeTarget,
+        api_token: str | None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        self.api_url = (api_url or os.getenv("MEMFORGE_API_URL") or DEFAULT_API_URL).rstrip("/")
-        self.api_token = api_token if api_token is not None else os.getenv("MEMFORGE_API_TOKEN")
-        self.workspace_id = workspace_id if workspace_id is not None else os.getenv("MEMFORGE_WORKSPACE_ID")
-        self.workspace_id = (self.workspace_id or "").strip()
+        self.target = target
+        self.api_token = api_token
         self.timeout_seconds = timeout_seconds
+
+    def _resource_url(self, path: str) -> str:
+        return self.target.resource_url(path)
+
+    def _host_url(self, path: str) -> str:
+        if not path.startswith("/api/"):
+            raise ValueError("host_path_must_start_with_api")
+        return f"{self.target.origin}{path}"
 
     def search(
         self,
@@ -82,21 +89,21 @@ class ToolClient:
             body["active_repo_identifier"] = active_repo_identifier
         if status:
             body["status"] = status
-        return self._http_json("POST", "/api/memories/search", body)
+        return self._resource_json("POST", "/memories/search", body)
 
     def get_memory(self, memory_id: str) -> dict[str, Any]:
         memory_id = memory_id.strip()
         if not memory_id:
             return {"error": "memory_id is required"}
-        return self._http_json("GET", f"/api/memories/{quote(memory_id, safe='')}?include_private=true", None)
+        return self._resource_json("GET", f"/memories/{quote(memory_id, safe='')}?include_private=true", None)
 
     def start_source_sync(self, source_id: str, *, force_full_sync: bool = False) -> dict[str, Any]:
         source_id = source_id.strip()
         if not source_id:
             return {"error": "source_id is required"}
-        return self._http_json(
+        return self._resource_json(
             "POST",
-            f"/api/sources/{quote(source_id, safe='')}/sync",
+            f"/sources/{quote(source_id, safe='')}/sync",
             {"force_full_sync": force_full_sync},
         )
 
@@ -125,7 +132,7 @@ class ToolClient:
             body["repo_identifier"] = repo_identifier
         if idempotency_key:
             body["idempotency_key"] = idempotency_key
-        return self._http_json("POST", "/api/memories/create", body)
+        return self._resource_json("POST", "/memories/create", body)
 
     def retire_memory(
         self,
@@ -137,9 +144,9 @@ class ToolClient:
         memory_id = memory_id.strip()
         if not memory_id:
             return {"error": "memory_id is required"}
-        return self._http_json(
+        return self._resource_json(
             "POST",
-            f"/api/memories/{quote(memory_id, safe='')}/retire",
+            f"/memories/{quote(memory_id, safe='')}/retire",
             {
                 "reason": reason,
                 "expected_content_hash": expected_content_hash,
@@ -166,9 +173,9 @@ class ToolClient:
             "expected_content_hash": expected_content_hash,
             "replacement_kind": replacement_kind,
         }
-        return self._http_json(
+        return self._resource_json(
             "POST",
-            f"/api/memories/{quote(memory_id, safe='')}/replace",
+            f"/memories/{quote(memory_id, safe='')}/replace",
             body,
         )
 
@@ -210,9 +217,9 @@ class ToolClient:
             body["submitted_by"] = submitted_by
         if submitted_at is not None:
             body["submitted_at"] = submitted_at
-        return self._http_json(
+        return self._resource_json(
             "POST",
-            f"/api/sources/{quote(source_id, safe='')}/adapter/packages",
+            f"/sources/{quote(source_id, safe='')}/adapter/packages",
             body,
         )
 
@@ -254,9 +261,9 @@ class ToolClient:
             body["submitted_by"] = submitted_by
         if submitted_at is not None:
             body["submitted_at"] = submitted_at
-        return self._http_json(
+        return self._resource_json(
             "POST",
-            f"/api/sources/{quote(source_id, safe='')}/adapter/packages",
+            f"/sources/{quote(source_id, safe='')}/adapter/packages",
             body,
         )
 
@@ -294,9 +301,9 @@ class ToolClient:
             body["submitted_by"] = submitted_by
         if submitted_at is not None:
             body["submitted_at"] = submitted_at
-        return self._http_json(
+        return self._resource_json(
             "POST",
-            f"/api/sources/{quote(source_id, safe='')}/adapter/packages",
+            f"/sources/{quote(source_id, safe='')}/adapter/packages",
             body,
         )
 
@@ -342,19 +349,19 @@ class ToolClient:
             body["submitted_by"] = submitted_by
         if submitted_at is not None:
             body["submitted_at"] = submitted_at
-        return self._http_json(
+        return self._resource_json(
             "POST",
-            f"/api/sources/{quote(source_id, safe='')}/adapter/packages",
+            f"/sources/{quote(source_id, safe='')}/adapter/packages",
             body,
         )
 
     def list_sources(self) -> dict[str, Any]:
         """List configured sources. Returns the API ``{"data": [...]}`` envelope."""
-        return self._http_json("GET", "/api/sources", None)
+        return self._resource_json("GET", "/sources", None)
 
     def list_searchable_sources(self) -> dict[str, Any]:
         """List search-eligible sources for MCP/source-id discovery."""
-        return self._http_json("GET", "/api/sources/searchable", None)
+        return self._resource_json("GET", "/sources/searchable", None)
 
     def list_memory_reviews(
         self,
@@ -364,13 +371,13 @@ class ToolClient:
         offset: int = 0,
     ) -> dict[str, Any]:
         query = urlencode({"status": status, "limit": limit, "offset": offset})
-        return self._http_json("GET", f"/api/memory-reviews?{query}", None)
+        return self._resource_json("GET", f"/memory-reviews?{query}", None)
 
     def get_memory_review(self, review_id: str) -> dict[str, Any]:
         review_id = review_id.strip()
         if not review_id:
             return {"error": "review_id is required"}
-        return self._http_json("GET", f"/api/memory-reviews/{quote(review_id, safe='')}", None)
+        return self._resource_json("GET", f"/memory-reviews/{quote(review_id, safe='')}", None)
 
     def resolve_memory_review(
         self,
@@ -388,13 +395,13 @@ class ToolClient:
             body["note"] = note
         if reviewer is not None:
             body["reviewer"] = reviewer
-        return self._http_json("POST", f"/api/memory-reviews/{quote(review_id, safe='')}/{decision}", body)
+        return self._resource_json("POST", f"/memory-reviews/{quote(review_id, safe='')}/{decision}", body)
 
     def create_source(self, *, source_type: str, name: str, config: dict[str, Any]) -> dict[str, Any]:
         """Create a source (gene instance) of ``source_type`` with the given config."""
-        return self._http_json(
+        return self._resource_json(
             "POST",
-            "/api/sources",
+            "/sources",
             {"type": source_type, "name": name, "config": config},
         )
 
@@ -402,7 +409,7 @@ class ToolClient:
         source_id = source_id.strip()
         if not source_id:
             return {"error": "source_id is required"}
-        return self._http_json("GET", f"/api/sources/{quote(source_id, safe='')}/schedule", None)
+        return self._resource_json("GET", f"/sources/{quote(source_id, safe='')}/schedule", None)
 
     def update_source_schedule(
         self,
@@ -414,9 +421,9 @@ class ToolClient:
         source_id = source_id.strip()
         if not source_id:
             return {"error": "source_id is required"}
-        return self._http_json(
+        return self._resource_json(
             "PUT",
-            f"/api/sources/{quote(source_id, safe='')}/schedule",
+            f"/sources/{quote(source_id, safe='')}/schedule",
             {"enabled": enabled, "interval_minutes": interval_minutes},
         )
 
@@ -427,7 +434,7 @@ class ToolClient:
         lease_seconds: int = 60,
         wait_seconds: int = 0,
     ) -> dict[str, Any]:
-        return self._http_json(
+        return self._host_json(
             "POST",
             "/api/cloud/local-agent/jobs/lease",
             {"limit": limit, "lease_seconds": lease_seconds, "wait_seconds": wait_seconds},
@@ -440,7 +447,7 @@ class ToolClient:
         attempt_count: int,
         lease_seconds: int = 60,
     ) -> dict[str, Any]:
-        return self._http_json(
+        return self._host_json(
             "POST",
             f"/api/cloud/local-agent/jobs/{quote(job_id, safe='')}/heartbeat",
             {"attempt_count": attempt_count, "lease_seconds": lease_seconds},
@@ -458,25 +465,25 @@ class ToolClient:
         body: dict[str, Any] = {"status": status, "attempt_count": attempt_count, "result": result}
         if error is not None:
             body["error"] = error
-        return self._http_json(
+        return self._host_json(
             "POST",
             f"/api/cloud/local-agent/jobs/{quote(job_id, safe='')}/complete",
             body,
         )
 
     def get_jira_session(self, base_url: str) -> dict[str, Any]:
-        return self._http_json("GET", f"/api/auth/jira-session?base_url={quote(base_url, safe='')}", None)
+        return self._resource_json("GET", f"/auth/jira-session?base_url={quote(base_url, safe='')}", None)
 
     def list_jira_origins(self) -> dict[str, Any]:
-        return self._http_json("GET", "/api/auth/jira-origins", None)
+        return self._resource_json("GET", "/auth/jira-origins", None)
 
     def upload_jira_session(
         self, *, base_url: str, cookie_header: str, browser: str | None = None,
         confirm_principal_change: bool = False,
     ) -> dict[str, Any]:
-        return self._http_json(
+        return self._resource_json(
             "POST",
-            "/api/auth/jira-session",
+            "/auth/jira-session",
             {
                 "base_url": base_url,
                 "cookie_header": cookie_header,
@@ -486,13 +493,13 @@ class ToolClient:
         )
 
     def forget_jira_session(self, base_url: str) -> dict[str, Any]:
-        return self._http_json("DELETE", f"/api/auth/jira-session?base_url={quote(base_url, safe='')}", None)
+        return self._resource_json("DELETE", f"/auth/jira-session?base_url={quote(base_url, safe='')}", None)
 
     def mark_jira_session_expired(self, *, base_url: str, error: str) -> dict[str, Any]:
-        return self._http_json("POST", "/api/auth/jira-session/expire", {"base_url": base_url, "error": error})
+        return self._resource_json("POST", "/auth/jira-session/expire", {"base_url": base_url, "error": error})
 
     def health(self) -> dict[str, Any]:
-        return self._http_json("GET", "/api/health", None)
+        return self._resource_json("GET", "/health", None)
 
     def get_resource(
         self,
@@ -515,8 +522,8 @@ class ToolClient:
 
         target = _parse_resource_url(
             str(url or "").strip(),
-            self.api_url,
-            self._request_url,
+            self.target.origin,
+            self._resource_url,
         )
         if target is None:
             return {
@@ -555,10 +562,16 @@ class ToolClient:
             headers["Authorization"] = f"Bearer {self.api_token}"
         return headers
 
-    def _http_json(self, method: str, path: str, body: dict[str, Any] | None) -> dict[str, Any]:
+    def _resource_json(self, method: str, path: str, body: dict[str, Any] | None) -> dict[str, Any]:
+        return self._http_json(method, self._resource_url(path), body)
+
+    def _host_json(self, method: str, path: str, body: dict[str, Any] | None) -> dict[str, Any]:
+        return self._http_json(method, self._host_url(path), body)
+
+    def _http_json(self, method: str, url: str, body: dict[str, Any] | None) -> dict[str, Any]:
         data = None if body is None else json.dumps(body).encode("utf-8")
         request = Request(
-            self._request_url(path),
+            url,
             data=data,
             headers=self._headers(json_body=body is not None),
             method=method,
@@ -573,7 +586,11 @@ class ToolClient:
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
             return {"error": "MemForge API request failed", "status_code": exc.code, "detail": detail}
         except (OSError, URLError, json.JSONDecodeError) as exc:
-            return {"error": "MemForge API unavailable", "api_url": self.api_url, "detail": str(exc)}
+            return {
+                "error": "MemForge API unavailable",
+                "api_url": self.target.workspace_api_base,
+                "detail": str(exc),
+            }
 
     def _fetch_resource_inline(
         self,
@@ -650,19 +667,6 @@ class ToolClient:
                 tmp_path.unlink(missing_ok=True)
             raise
 
-    def _request_url(self, path: str) -> str:
-        if not self.workspace_id or not path.startswith("/api"):
-            return f"{self.api_url}{path}"
-        if path.startswith(("/api/cloud/", "/api/auth/")):
-            return f"{self.api_url}{path}"
-        quoted_workspace = quote(self.workspace_id, safe="")
-        if path == "/api":
-            return f"{self.api_url}/api/workspaces/{quoted_workspace}/api"
-        if path.startswith("/api/"):
-            return f"{self.api_url}/api/workspaces/{quoted_workspace}/api/{path[len('/api/'):]}"
-        return f"{self.api_url}{path}"
-
-
 def _parse_resource_url(
     url: str,
     api_base_url: str,
@@ -689,11 +693,11 @@ def _parse_resource_url(
     if any(part in {".", ".."} or "/" in part or "\\" in part for part in parts):
         return None
     if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "content":
-        return ResourceTarget(parts[2], "content", path, request_url_for_path(path))
+        return ResourceTarget(parts[2], "content", path, request_url_for_path(path[len("/api") :]))
     if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "pdf":
-        return ResourceTarget(parts[2], "pdf", path, request_url_for_path(path))
+        return ResourceTarget(parts[2], "pdf", path, request_url_for_path(path[len("/api") :]))
     if len(parts) == 5 and parts[:2] == ["api", "documents"] and parts[3] == "artifacts":
-        return ResourceTarget(parts[2], parts[4], path, request_url_for_path(path))
+        return ResourceTarget(parts[2], parts[4], path, request_url_for_path(path[len("/api") :]))
     return None
 
 
