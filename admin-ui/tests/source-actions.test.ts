@@ -7,7 +7,11 @@ import {
   getSourceMenuStyle,
   sourceActionLayout,
 } from "../src/views/sources/sourceActions.js";
-import { isLocalAgentBackedSource, localAgentSyncOperation } from "../src/views/sources/localAgentSources.js";
+import {
+  isImmutableExecutionModeField,
+  isLocalAgentBackedSource,
+  localAgentSyncOperation,
+} from "../src/views/sources/localAgentSources.js";
 
 assert.deepEqual(
   sourceActionLayout.primary.map((action) => action.id),
@@ -274,6 +278,9 @@ assert.equal(
   true,
   "Jira local-agent mode should share the daemon status badge path",
 );
+assert.equal(isImmutableExecutionModeField("jira", "sync_mode"), true);
+assert.equal(isImmutableExecutionModeField("github_repo", "connection_mode"), true);
+assert.equal(isImmutableExecutionModeField("jira", "auth_mode"), false);
 assert.match(
   sourcesPageSource,
   /\/api\/cloud\/local-agent\/jobs/,
@@ -317,6 +324,11 @@ assert.match(
   sourceConfigDialogSource,
   /canConfigureConnection\s*&&\s*fieldsByGroup\.map/,
   "non-owner admins should not render local connector fields or pickers",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /disabled=\{isEdit\s*&&\s*isImmutableExecutionModeField\(sourceType, field\.key\)\}/,
+  "existing sources should render execution-mode selectors as read-only",
 );
 assert.match(
   sourceConfigDialogSource,

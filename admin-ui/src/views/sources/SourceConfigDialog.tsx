@@ -38,6 +38,7 @@ import {
 } from "./confluenceConfig";
 import type { ParsedConfluenceWikiUrl } from "./confluenceConfig";
 import { GitHubRepoFolderPicker } from "./GitHubRepoFolderPicker";
+import { isImmutableExecutionModeField } from "./localAgentSources";
 import { canConfigureSourceType } from "./managedSources";
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
@@ -394,6 +395,7 @@ function SourceConfigForm({
                       hasExistingSecret={Boolean(config[`${field.key}_configured`])}
                       decryptFailed={Boolean(config[`${field.key}_decrypt_failed`])}
                       required={isFieldRequired(sourceType, field, config)}
+                      disabled={isEdit && isImmutableExecutionModeField(sourceType, field.key)}
                       onChange={(value) => updateField(field, value)}
                     />
                     {sourceType === "confluence" && field.key === "base_url" && confluenceUrlInfo && (
@@ -577,6 +579,7 @@ function ConfigFieldInput({
   hasExistingSecret,
   decryptFailed,
   required,
+  disabled,
   onChange,
 }: {
   field: ConfigField;
@@ -584,6 +587,7 @@ function ConfigFieldInput({
   hasExistingSecret?: boolean;
   decryptFailed?: boolean;
   required?: boolean;
+  disabled?: boolean;
   onChange: (value: ConfigValue) => void;
 }) {
   if (field.field_type === "boolean") {
@@ -612,6 +616,7 @@ function ConfigFieldInput({
       <Field label={field.label} required={required} helpText={field.help_text}>
         <Select<string>
           value={optionValue(field, selected)}
+          disabled={disabled}
           onValueChange={(next) => onChange(optionFromValue(field, stringValue(next)))}
         >
           <SelectTrigger>

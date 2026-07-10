@@ -3702,6 +3702,15 @@ def create_admin_app(
                     src_config = _populate_local_markdown_inbox(src_config, source_id, config)
             except (SecretConfigurationError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            existing_is_local = is_local_agent_backed_source(existing)
+            updated_is_local = is_local_agent_backed_source(
+                {"type": existing["type"], "config": src_config}
+            )
+            if existing_is_local != updated_is_local:
+                raise HTTPException(
+                    status_code=409,
+                    detail="source_execution_mode_immutable",
+                )
         else:
             src_config = existing["config"]
         scope_changed = req.config is not None and (
