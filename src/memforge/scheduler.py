@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from memforge.runtime import SyncAlreadyRunningError, SyncService
+from memforge.runtime import SyncService
 
 if TYPE_CHECKING:
     from memforge.storage.database import Database
@@ -131,16 +131,12 @@ class SyncScheduler:
         logger.error("Memory index health check found issues: %s", issue_counts)
 
     async def _sync_due_sources(self) -> None:
-        running_source_ids = self.sync_service.running_source_ids()
         for source in await self.db.claim_due_scheduled_sources(
             limit=50,
-            exclude_source_ids=running_source_ids,
         ):
             source_id = str(source["id"])
             try:
-                await self.sync_service.start_source(source_id)
-            except SyncAlreadyRunningError:
-                logger.info("Scheduled source sync skipped because %s is already running", source_id)
+                await self.sync_service.enqueue_source(source_id, trigger="schedule")
             except Exception:
                 logger.exception("Scheduled source sync failed to start for %s", source_id)
 

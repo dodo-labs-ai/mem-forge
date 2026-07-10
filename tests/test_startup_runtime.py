@@ -678,13 +678,12 @@ async def test_sync_service_does_not_queue_paused_source(db, tmp_path):
     sync_service = SyncService(db, _config(tmp_path))
 
     assert await sync_service.request_source_sync(source_id) is False
-    assert source_id not in sync_service.queued_tasks
 
 
 @pytest.mark.asyncio
 async def test_queued_sync_stops_quietly_if_source_is_paused_before_execution(db, tmp_path, monkeypatch):
     import memforge.runtime as runtime
-    from memforge.runtime import SyncService
+    from memforge.runtime import SourceSyncWorker, SyncService
 
     source_id = "src-paused-after-queue"
     await db.upsert_source(
@@ -704,6 +703,7 @@ async def test_queued_sync_stops_quietly_if_source_is_paused_before_execution(db
     sync_service = SyncService(db, _config(tmp_path))
 
     assert await sync_service.request_source_sync(source_id, delay_seconds=0) is True
+    queued_run = await db.enqueue_source_sync_run(source_id=source_id, trigger="request")
     await db.upsert_source(
         id=source_id,
         type="confluence",
@@ -711,11 +711,14 @@ async def test_queued_sync_stops_quietly_if_source_is_paused_before_execution(db
         config_json=json.dumps({"base_url": "https://wiki.example.test", "spaces": ["PAY"]}),
         status="paused",
     )
-    queued = sync_service.queued_tasks[source_id]
-    await queued
+    worker = SourceSyncWorker(db, _config(tmp_path), worker_id="test-worker")
+    await worker.run_once()
+    completed = await db.get_source_sync_run(queued_run.run_id)
 
     assert logged_errors == []
-    assert source_id not in sync_service.queued_tasks
+    assert completed is not None
+    assert completed.status == "failed"
+    assert completed.error_message == f"Source is paused: {source_id}"
     assert not sync_service.is_running(source_id)
 
 
@@ -2113,7 +2116,7 @@ async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_force_resync_resets_cursor_and_starts_source_sync(db, tmp_path):
+async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds(db, tmp_path):
     from datetime import datetime, timezone
 
     from memforge.models import SyncState
@@ -2150,13 +2153,28 @@ async def test_force_resync_resets_cursor_and_starts_source_sync(db, tmp_path):
 
     class FakeSyncService:
         def __init__(self):
-            self.started: list[tuple[str, bool]] = []
+            self.enqueued: list[tuple[str, str, bool]] = []
 
         def is_running(self, source_id: str):
             return False
 
-        async def start_source(self, started_source_id: str, *, force_full_sync: bool = False):
-            self.started.append((started_source_id, force_full_sync))
+        async def enqueue_source(
+            self,
+            enqueued_source_id: str,
+            *,
+            trigger: str = "manual",
+            force_full_sync: bool = False,
+            workspace_id: str = "default",
+        ):
+            del workspace_id
+            self.enqueued.append((enqueued_source_id, trigger, force_full_sync))
+
+            class Run:
+                run_id = "run-force-resync"
+                status = "pending"
+                coalesced = False
+
+            return Run()
 
         async def shutdown(self):
             return None
@@ -2168,12 +2186,19 @@ async def test_force_resync_resets_cursor_and_starts_source_sync(db, tmp_path):
         response = client.post(f"/api/sources/{source_id}/force-resync")
         sources_response = client.get("/api/sources")
 
-    assert response.status_code == 200
-    assert response.json() == {"ok": True, "message": "Force resync started", "source_id": source_id}
-    assert fake_sync_service.started == [(source_id, True)]
-    assert await db.get_sync_state(source_id) is None
+    assert response.status_code == 202
+    assert response.json() == {
+        "ok": True,
+        "message": "Sync enqueued",
+        "source_id": source_id,
+        "run_id": "run-force-resync",
+        "status": "pending",
+        "coalesced": False,
+    }
+    assert fake_sync_service.enqueued == [(source_id, "force", True)]
+    assert await db.get_sync_state(source_id) is not None
     source_payload = next(s for s in sources_response.json()["data"] if s["id"] == source_id)
-    assert source_payload["sync"] is None
+    assert source_payload["sync"]["status"] == "success"
 
 
 def test_schedule_trigger_uses_configured_daily_time():
