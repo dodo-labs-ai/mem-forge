@@ -77,15 +77,20 @@ export interface EntityAlias {
 }
 
 export interface SyncStatus {
-  status: "running" | "success" | "partial" | "failed";
+  status: "pending" | "running" | "recovering" | "success" | "partial" | "failed";
+  run_id?: string;
+  trigger?: string;
+  force_full_sync?: boolean;
+  next_attempt_at?: string | null;
+  recovery_count?: number;
   phase?: "discovering" | "processing" | "detecting_deletions" | "complete" | string | null;
   started_at: string | null;
   finished_at: string | null;
-  docs_processed: number;
+  docs_processed?: number;
   docs_total?: number | null;
-  docs_updated: number;
+  docs_updated?: number;
   docs_failed?: number;
-  memories_extracted: number;
+  memories_extracted?: number;
   docs_stored?: number;
   memories_stored?: number;
   current_title?: string | null;
@@ -114,6 +119,7 @@ export type SourceViewerRelationship = ViewerRole | "creator";
 
 export interface SourceOwnership {
   created_by_user_id: string | null;
+  execution_owner_user_id: string | null;
   viewer_role: ViewerRole;
   viewer_relationship: SourceViewerRelationship;
 }
@@ -126,6 +132,7 @@ export interface SourceOwnership {
 export interface SourceCapabilities {
   can_subscribe: boolean;
   can_configure: boolean;
+  can_configure_connection: boolean;
   can_sync: boolean;
   can_force_resync: boolean;
   can_delete: boolean;
@@ -144,6 +151,12 @@ export interface SourceSyncSchedule {
   interval_minutes: number;
   next_run_at: string | null;
   updated_at: string | null;
+}
+
+export interface SourceExecution {
+  kind: "server" | "local_agent";
+  operation: string | null;
+  immutable_config_fields: string[];
 }
 
 export interface Source {
@@ -173,6 +186,7 @@ export interface Source {
   project_binding?: ProjectBinding | null;
   ownership?: SourceOwnership;
   capabilities?: SourceCapabilities;
+  execution?: SourceExecution;
   subscription?: SourceSubscription;
   /** Convenience mirror of `subscription.enabled` for the current viewer. */
   enabled_for_me?: boolean;
