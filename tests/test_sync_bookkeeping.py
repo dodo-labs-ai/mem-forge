@@ -2073,6 +2073,41 @@ async def test_enqueue_due_source_sync_runs_advances_schedule_with_run_acceptanc
 
 
 @pytest.mark.asyncio
+async def test_advance_source_sync_schedule_uses_expected_due_timestamp(db: Database):
+    due_at = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    source_id = "src-local-schedule"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Scheduled Teams",
+        config_json="{}",
+    )
+    await db.set_source_sync_schedule(
+        source_id,
+        enabled=True,
+        interval_minutes=60,
+        next_run_at=due_at,
+    )
+
+    stale = await db.advance_source_sync_schedule(
+        source_id,
+        expected_next_run_at=(due_at - timedelta(minutes=1)).isoformat(),
+        now=due_at + timedelta(minutes=1),
+    )
+    advanced = await db.advance_source_sync_schedule(
+        source_id,
+        expected_next_run_at=due_at.isoformat(),
+        now=due_at + timedelta(minutes=1),
+    )
+
+    assert stale is False
+    assert advanced is True
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["sync_schedule"]["next_run_at"] == "2026-07-10T01:01:00+00:00"
+
+
+@pytest.mark.asyncio
 async def test_enqueue_due_source_sync_runs_rolls_back_schedule_when_run_enqueue_fails(
     db: Database,
     monkeypatch,

@@ -6061,6 +6061,46 @@ class Database:
                 raise
         return runs
 
+    async def advance_source_sync_schedule(
+        self,
+        source_id: str,
+        *,
+        expected_next_run_at: str,
+        now: datetime | None = None,
+    ) -> bool:
+        claim_time = now or datetime.now(timezone.utc)
+        async with self._write_lock:
+            async with self.db.execute(
+                "SELECT sync_schedule_interval_minutes FROM sources WHERE id = ?",
+                (source_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return False
+            interval_minutes = int(
+                row["sync_schedule_interval_minutes"]
+                or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+            )
+            next_at = claim_time + timedelta(minutes=interval_minutes)
+            updated_at = _now_iso()
+            cursor = await self.db.execute(
+                """UPDATE sources SET
+                   sync_schedule_next_at = ?,
+                   sync_schedule_updated_at = ?
+                   WHERE id = ?
+                     AND status = 'active'
+                     AND sync_schedule_enabled = 1
+                     AND sync_schedule_next_at = ?""",
+                (
+                    next_at.isoformat(),
+                    updated_at,
+                    source_id,
+                    expected_next_run_at,
+                ),
+            )
+            await self.db.commit()
+            return bool(cursor.rowcount)
+
     async def is_source_enabled_for_user(self, source_id: str, user_id: str) -> bool:
         async with self.db.execute(
             "SELECT enabled FROM source_subscriptions WHERE source_id = ? AND user_id = ?",
