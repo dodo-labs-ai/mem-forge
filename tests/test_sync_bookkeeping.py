@@ -1790,7 +1790,7 @@ async def test_auth_failure_records_failed_sync_state_without_secondary_error(db
 
 
 @pytest.mark.asyncio
-async def test_scheduled_sync_uses_tracked_source_tasks(db: Database, monkeypatch):
+async def test_run_all_active_sources_enqueues_durable_runs(db: Database):
     source_id = "src-scheduled-tracked"
     await db.upsert_source(
         id=source_id,
@@ -1799,29 +1799,14 @@ async def test_scheduled_sync_uses_tracked_source_tasks(db: Database, monkeypatc
         config_json="{}",
     )
     service = SyncService(db, AppConfig())
-    release = asyncio.Event()
-    running_observed = False
 
-    async def fake_run_source_task(running_source_id: str, *, force_full_sync: bool = False):
-        nonlocal running_observed
-        assert force_full_sync is False
-        running_observed = service.is_running(running_source_id)
-        await release.wait()
-        service.tasks.pop(running_source_id, None)
+    await service.run_all_active_sources()
+    run = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
 
-    monkeypatch.setattr(service, "_run_source_task", fake_run_source_task)
-
-    run_task = asyncio.create_task(service.run_all_active_sources())
-    for _ in range(20):
-        if running_observed:
-            break
-        await asyncio.sleep(0.01)
-
-    assert running_observed is True
-    assert source_id in service.tasks
-    release.set()
-    await run_task
-    assert source_id not in service.tasks
+    assert run.source_id == source_id
+    assert run.status == "pending"
+    assert run.coalesced is True
+    assert service.tasks == {}
 
 
 @pytest.mark.asyncio
@@ -1902,7 +1887,7 @@ async def test_source_sync_schedule_round_trips_and_claims_due_sources(db: Datab
 
 
 @pytest.mark.asyncio
-async def test_scheduler_starts_due_source_and_advances_next_run(db: Database, monkeypatch):
+async def test_scheduler_enqueues_due_source_and_advances_next_run(db: Database, monkeypatch):
     source_id = "src-scheduled-due"
     await db.upsert_source(
         id=source_id,
@@ -1920,11 +1905,19 @@ async def test_scheduler_starts_due_source_and_advances_next_run(db: Database, m
     scheduler = SyncScheduler(db, service)
     started: list[str] = []
 
-    async def fake_start_source(started_source_id: str, *, force_full_sync: bool = False):
+    async def fake_enqueue_source(
+        started_source_id: str,
+        *,
+        trigger: str = "manual",
+        force_full_sync: bool = False,
+        workspace_id: str = "default",
+    ):
+        del force_full_sync, workspace_id
         started.append(started_source_id)
-        return asyncio.create_task(asyncio.sleep(0))
+        assert trigger == "schedule"
+        return await db.enqueue_source_sync_run(source_id=started_source_id, trigger=trigger)
 
-    monkeypatch.setattr(service, "start_source", fake_start_source)
+    monkeypatch.setattr(service, "enqueue_source", fake_enqueue_source)
 
     await scheduler._sync_due_sources()
 
@@ -1936,7 +1929,7 @@ async def test_scheduler_starts_due_source_and_advances_next_run(db: Database, m
 
 
 @pytest.mark.asyncio
-async def test_scheduler_leaves_running_due_source_due(db: Database, monkeypatch):
+async def test_scheduler_coalesces_active_due_source_and_advances_next_run(db: Database, monkeypatch):
     source_id = "src-scheduled-running"
     due_at = datetime.now(timezone.utc) - timedelta(minutes=1)
     await db.upsert_source(
@@ -1953,19 +1946,175 @@ async def test_scheduler_leaves_running_due_source_due(db: Database, monkeypatch
     )
     service = SyncService(db, AppConfig())
     scheduler = SyncScheduler(db, service)
+    active = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    started: list[str] = []
 
-    monkeypatch.setattr(service, "running_source_ids", lambda: {source_id})
+    async def fake_enqueue_source(
+        started_source_id: str,
+        *,
+        trigger: str = "manual",
+        force_full_sync: bool = False,
+        workspace_id: str = "default",
+    ):
+        del force_full_sync, workspace_id
+        started.append(started_source_id)
+        assert trigger == "schedule"
+        return await db.enqueue_source_sync_run(source_id=started_source_id, trigger=trigger)
 
-    async def fail_start_source(started_source_id: str, *, force_full_sync: bool = False):
-        raise AssertionError("running scheduled source should not be started")
-
-    monkeypatch.setattr(service, "start_source", fail_start_source)
+    monkeypatch.setattr(service, "enqueue_source", fake_enqueue_source)
 
     await scheduler._sync_due_sources()
 
+    assert started == [source_id]
+    scheduled = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    assert scheduled.run_id == active.run_id
+    assert scheduled.coalesced is True
     source = await db.get_source(source_id)
     assert source is not None
-    assert source["sync_schedule"]["next_run_at"] == due_at.isoformat()
+    assert source["sync_schedule"]["next_run_at"] != due_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_sync_service_enqueue_source_creates_durable_run_without_local_task(db: Database):
+    source_id = "src-enqueue-service"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Enqueue Service",
+        config_json="{}",
+    )
+    service = SyncService(db, AppConfig())
+
+    run = await service.enqueue_source(
+        source_id,
+        trigger="manual",
+        force_full_sync=True,
+    )
+
+    assert run.source_id == source_id
+    assert run.force_full_sync is True
+    assert run.status == "pending"
+    assert service.tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-run"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker Run",
+        config_json="{}",
+    )
+
+    class CapturingRuntimeProvider:
+        def __init__(self) -> None:
+            self.force_full_sync_values: list[bool] = []
+            self.extraction_pools: list[ExtractionWorkPool | None] = []
+
+        async def build_sync_runtime(
+            self,
+            db: Database,
+            config: AppConfig,
+            *,
+            extraction_pool: ExtractionWorkPool | None = None,
+            document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
+        ):
+            del db, config, document_lifecycle_admission
+            self.extraction_pools.append(extraction_pool)
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            self.force_full_sync_values.append(bool(kwargs["force_full_sync"]))
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc),
+                last_sync_status="success",
+                docs_processed=1,
+                docs_updated=1,
+            )
+
+    provider = CapturingRuntimeProvider()
+    service = SyncService(
+        db,
+        AppConfig(sync=SyncConfig(max_extraction_workers=3)),
+        runtime_provider=provider,
+    )
+    enqueued = await service.enqueue_source(source_id, trigger="manual", force_full_sync=True)
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(sync=SyncConfig(max_extraction_workers=3)),
+        runtime_provider=provider,
+        worker_id="worker-a",
+    )
+
+    leased = await worker.run_once()
+    completed = await db.get_source_sync_run(enqueued.run_id)
+
+    assert leased is not None
+    assert leased.run_id == enqueued.run_id
+    assert completed is not None
+    assert completed.status == "success"
+    assert completed.lease_owner is None
+    assert provider.force_full_sync_values == [True]
+    assert provider.extraction_pools == [worker._extraction_pool]
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_run_forever_polls_until_cancelled(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-loop"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker Loop",
+        config_json="{}",
+    )
+
+    class InstantRuntimeProvider:
+        async def build_sync_runtime(
+            self,
+            db: Database,
+            config: AppConfig,
+            *,
+            extraction_pool: ExtractionWorkPool | None = None,
+            document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
+        ):
+            del db, config, extraction_pool, document_lifecycle_admission
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc),
+                last_sync_status="success",
+            )
+
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=InstantRuntimeProvider(),
+        worker_id="worker-loop",
+    )
+
+    task = asyncio.create_task(worker.run_forever(poll_seconds=0.01))
+    for _ in range(50):
+        completed = await db.get_source_sync_run(enqueued.run_id)
+        if completed and completed.status == "success":
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    completed = await db.get_source_sync_run(enqueued.run_id)
+    assert completed is not None
+    assert completed.status == "success"
 
 
 @pytest.mark.asyncio
@@ -2143,6 +2292,16 @@ def test_sync_max_document_lifecycles_can_be_set_from_env(monkeypatch):
     assert AppConfig().sync.max_document_lifecycles == 1
 
 
+def test_sync_worker_config_can_be_disabled_from_env(monkeypatch):
+    monkeypatch.setenv("MEMFORGE_SYNC_WORKER_ENABLED", "false")
+    monkeypatch.setenv("MEMFORGE_SYNC_WORKER_POLL_SECONDS", "0.25")
+
+    config = AppConfig()
+
+    assert config.sync.worker_enabled is False
+    assert config.sync.worker_poll_seconds == 0.25
+
+
 @pytest.mark.asyncio
 async def test_sync_service_passes_shared_extraction_pool_to_runtime_provider(db: Database):
     source_id = "src-shared-pool"
@@ -2251,16 +2410,12 @@ async def test_requested_sync_runs_after_active_source_sync_finishes(db: Databas
     )
     service = SyncService(db, AppConfig())
     first_release = asyncio.Event()
-    followup_started = asyncio.Event()
     calls: list[str] = []
 
     async def fake_run_source_task(running_source_id: str, *, force_full_sync: bool = False):
         calls.append(running_source_id)
         try:
-            if len(calls) == 1:
-                await first_release.wait()
-            else:
-                followup_started.set()
+            await first_release.wait()
         finally:
             service.tasks.pop(running_source_id, None)
 
@@ -2272,13 +2427,15 @@ async def test_requested_sync_runs_after_active_source_sync_finishes(db: Databas
     assert await service.request_source_sync(source_id, delay_seconds=0) is True
     await asyncio.sleep(0)
     assert calls == [source_id]
+    pending = await db.enqueue_source_sync_run(source_id=source_id, trigger="request")
+    assert pending.coalesced is True
+    assert pending.status == "pending"
 
     first_release.set()
-    await asyncio.wait_for(followup_started.wait(), timeout=1)
     await first_task
     await service.shutdown()
 
-    assert calls == [source_id, source_id]
+    assert calls == [source_id]
 
 
 @pytest.mark.asyncio

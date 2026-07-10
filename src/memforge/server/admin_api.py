@@ -6,6 +6,7 @@ sources/genes, schedule, LLM configuration, and system health/stats.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict, is_dataclass
 import json
 import logging
@@ -82,7 +83,7 @@ from memforge.runtime import (
     DefaultRuntimeProvider,
     RuntimeHealthComponent,
     RuntimeProvider,
-    SyncAlreadyRunningError,
+    SourceSyncWorker,
     SyncService,
     SourcePausedError,
 )
@@ -2307,10 +2308,29 @@ def create_admin_app(
         app.state.sync_service = SyncService(app.state.db, config, runtime_provider=runtime_provider)
         app.state.sync_scheduler = SyncScheduler(app.state.db, app.state.sync_service)
         await app.state.sync_scheduler.start()
+        app.state.sync_worker = None
+        app.state.sync_worker_task = None
+        if config.sync.worker_enabled:
+            app.state.sync_worker = SourceSyncWorker(
+                app.state.db,
+                config,
+                runtime_provider=runtime_provider,
+                worker_id="embedded-admin-worker",
+            )
+            app.state.sync_worker_task = asyncio.create_task(
+                app.state.sync_worker.run_forever(poll_seconds=config.sync.worker_poll_seconds)
+            )
 
         try:
             yield
         finally:
+            worker_task = getattr(app.state, "sync_worker_task", None)
+            if worker_task is not None:
+                worker_task.cancel()
+                try:
+                    await worker_task
+                except asyncio.CancelledError:
+                    pass
             await app.state.sync_scheduler.shutdown()
             await app.state.sync_service.shutdown()
             if owned_db is not None:
@@ -2326,6 +2346,8 @@ def create_admin_app(
         app.state.db = db
         app.state.sync_service = SyncService(db, config, runtime_provider=runtime_provider)
         app.state.sync_scheduler = SyncScheduler(db, app.state.sync_service)
+        app.state.sync_worker = None
+        app.state.sync_worker_task = None
     app.state.config = config
     app.state.document_store = document_store or LocalDocumentStore(config.storage.docs_path)
     app.state.runtime_provider = runtime_provider
@@ -3789,7 +3811,7 @@ def create_admin_app(
         await memory_store.delete_source_cascade(source_id)
         return {"ok": True, "deleted_source": source_id}
 
-    @source_router.post("/{source_id}/sync")
+    @source_router.post("/{source_id}/sync", status_code=202)
     async def trigger_sync(
         request: Request,
         source_id: str,
@@ -3804,40 +3826,51 @@ def create_admin_app(
         _require_source_sync_execution(request, source)
 
         try:
-            await sync_service.start_source(
+            run = await sync_service.enqueue_source(
                 source_id,
+                trigger="manual",
                 force_full_sync=bool(req and req.force_full_sync),
             )
-        except SyncAlreadyRunningError:
-            raise HTTPException(status_code=409, detail="Sync already running for this source")
         except SourcePausedError:
             raise _source_paused_http_error()
-        return {"ok": True, "message": "Sync started", "source_id": source_id}
+        return {
+            "ok": True,
+            "message": "Sync enqueued",
+            "source_id": source_id,
+            "run_id": run.run_id,
+            "status": run.status,
+            "coalesced": run.coalesced,
+        }
 
-    @source_router.post("/{source_id}/force-resync")
+    @source_router.post("/{source_id}/force-resync", status_code=202)
     async def trigger_force_resync(
         request: Request,
         source_id: str,
         db: Database = Depends(get_db),
         sync_service: SyncService = Depends(get_sync_service),
     ):
-        """Reset incremental sync state and trigger a full source sync."""
+        """Enqueue a full source sync without clearing the prior successful cursor."""
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         _require_source_sync_execution(request, source)
 
-        if sync_service.is_running(source_id):
-            raise HTTPException(status_code=409, detail="Sync already running for this source")
-
-        await db.reset_source_sync_cursor(source_id)
         try:
-            await sync_service.start_source(source_id, force_full_sync=True)
-        except SyncAlreadyRunningError:
-            raise HTTPException(status_code=409, detail="Sync already running for this source")
+            run = await sync_service.enqueue_source(
+                source_id,
+                trigger="force",
+                force_full_sync=True,
+            )
         except SourcePausedError:
             raise _source_paused_http_error()
-        return {"ok": True, "message": "Force resync started", "source_id": source_id}
+        return {
+            "ok": True,
+            "message": "Sync enqueued",
+            "source_id": source_id,
+            "run_id": run.run_id,
+            "status": run.status,
+            "coalesced": run.coalesced,
+        }
 
     @source_router.get("/{source_id}/schedule", response_model=SourceSyncScheduleResponse)
     async def get_source_sync_schedule(
@@ -3982,9 +4015,7 @@ def create_admin_app(
         sync_started = False
         if req.process_now:
             try:
-                await sync_service.start_source(source_id)
-                sync_started = True
-            except SyncAlreadyRunningError:
+                await sync_service.enqueue_source(source_id, trigger="document_intake")
                 sync_started = True
             except SourcePausedError:
                 raise _source_paused_http_error()

@@ -94,6 +94,8 @@ class SyncConfig:
     max_active_sources: int = 0
     max_extraction_workers: int = 0
     max_document_lifecycles: int = 0
+    worker_enabled: bool = True
+    worker_poll_seconds: float = 5.0
 
 
 @dataclass
@@ -184,6 +186,18 @@ class AppConfig:
             int(
                 os.environ.get("MEMFORGE_SYNC_MAX_DOCUMENT_LIFECYCLES")
                 or self.sync.max_document_lifecycles
+            ),
+        )
+        if os.environ.get("MEMFORGE_SYNC_WORKER_ENABLED") is not None:
+            self.sync.worker_enabled = (
+                os.environ["MEMFORGE_SYNC_WORKER_ENABLED"].strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+        self.sync.worker_poll_seconds = max(
+            0.1,
+            float(
+                os.environ.get("MEMFORGE_SYNC_WORKER_POLL_SECONDS")
+                or self.sync.worker_poll_seconds
             ),
         )
         self.server.jwt_secret = (
