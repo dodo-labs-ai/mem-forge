@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.26"
+SERVER_VERSION = "0.1.27"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 WORKSPACE_ROOT_ENV_VARS = ("CODEX_WORKSPACE_ROOT",)
