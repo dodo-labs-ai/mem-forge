@@ -624,6 +624,7 @@ CREATE TABLE IF NOT EXISTS sources (
     doc_count       INTEGER DEFAULT 0,
     project_binding TEXT,                    -- JSON: {"mode": "fixed", ...} or {"mode": "by_field", ...}
     created_by_user_id TEXT,
+    execution_owner_user_id TEXT,
     sync_schedule_enabled INTEGER NOT NULL DEFAULT 0,
     sync_schedule_interval_minutes INTEGER NOT NULL DEFAULT 1440,
     sync_schedule_next_at TEXT,
@@ -1625,6 +1626,17 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                    COALESCE(ea.alias, '') || ' ' || COALESCE(ea.alias_normalized, '')
                FROM entity_aliases ea
                JOIN entities e ON e.id = ea.canonical_id""",
+        ],
+    ),
+    (
+        35,
+        "Track local source execution owner",
+        [
+            "ALTER TABLE sources ADD COLUMN execution_owner_user_id TEXT",
+            """UPDATE sources
+               SET execution_owner_user_id = created_by_user_id
+               WHERE execution_owner_user_id IS NULL
+                 AND created_by_user_id IS NOT NULL""",
         ],
     ),
 ]
@@ -5597,6 +5609,7 @@ class Database:
         status: str | None = None,
         project_binding: Mapping[str, Any] | None = None,
         created_by_user_id: str | None = None,
+        execution_owner_user_id: str | None = None,
     ) -> None:
         """Insert or update a source row.
 
@@ -5607,8 +5620,11 @@ class Database:
         binding_json = json.dumps(dict(project_binding)) if project_binding else None
         async with self._write_lock:
             await self.db.execute(
-                """INSERT INTO sources (id, type, name, config, status, project_binding, created_by_user_id)
-                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?, ?)
+                """INSERT INTO sources (
+                       id, type, name, config, status, project_binding,
+                       created_by_user_id, execution_owner_user_id
+                   )
+                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                    type=excluded.type,
                    name=excluded.name,
@@ -5618,8 +5634,22 @@ class Database:
                        ELSE excluded.status
                    END,
                    project_binding=excluded.project_binding,
-                   created_by_user_id=COALESCE(sources.created_by_user_id, excluded.created_by_user_id)""",
-                (id, type, name, config_json, status, binding_json, created_by_user_id, status),
+                   created_by_user_id=COALESCE(sources.created_by_user_id, excluded.created_by_user_id),
+                   execution_owner_user_id=COALESCE(
+                       sources.execution_owner_user_id,
+                       excluded.execution_owner_user_id
+                   )""",
+                (
+                    id,
+                    type,
+                    name,
+                    config_json,
+                    status,
+                    binding_json,
+                    created_by_user_id,
+                    execution_owner_user_id,
+                    status,
+                ),
             )
             stale_metadata_rows = await self.db.execute_fetchall(
                 """SELECT 1
@@ -5650,10 +5680,10 @@ class Database:
             await self.db.execute(
                 """INSERT INTO sources
                    (id, type, name, config, status, last_sync, doc_count, project_binding,
-                    created_by_user_id, sync_schedule_enabled,
+                    created_by_user_id, execution_owner_user_id, sync_schedule_enabled,
                     sync_schedule_interval_minutes, sync_schedule_next_at,
                     sync_schedule_updated_at, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                    type=excluded.type,
                    name=excluded.name,
@@ -5663,6 +5693,7 @@ class Database:
                    doc_count=excluded.doc_count,
                    project_binding=excluded.project_binding,
                    created_by_user_id=excluded.created_by_user_id,
+                   execution_owner_user_id=excluded.execution_owner_user_id,
                    sync_schedule_enabled=excluded.sync_schedule_enabled,
                    sync_schedule_interval_minutes=excluded.sync_schedule_interval_minutes,
                    sync_schedule_next_at=excluded.sync_schedule_next_at,
@@ -5678,6 +5709,7 @@ class Database:
                     source["doc_count"],
                     (json.dumps(source["project_binding"]) if source.get("project_binding") else None),
                     source.get("created_by_user_id"),
+                    source.get("execution_owner_user_id"),
                     int((source.get("sync_schedule") or {}).get("enabled") or 0),
                     int((source.get("sync_schedule") or {}).get("interval_minutes") or 1440),
                     (source.get("sync_schedule") or {}).get("next_run_at"),
