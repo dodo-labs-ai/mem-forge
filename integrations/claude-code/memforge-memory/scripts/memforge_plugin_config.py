@@ -29,16 +29,8 @@ def configured_target() -> MemForgeTarget:
     return build_target(edition=edition, origin=origin, workspace_id=workspace)
 
 
-def configured_api_url(default: str) -> str:
-    return _configured_value("MEMFORGE_API_URL", default).rstrip("/")
-
-
 def configured_api_token() -> str:
     return _configured_value("MEMFORGE_API_TOKEN", "").strip()
-
-
-def configured_workspace_id() -> str:
-    return _configured_value("MEMFORGE_WORKSPACE_ID", "").strip()
 
 
 def _configured_value(name: str, default: str) -> str:
