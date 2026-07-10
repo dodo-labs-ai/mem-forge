@@ -5,11 +5,23 @@ import json
 import pytest
 
 from memforge.local_agent.source_contract import (
+    LOCAL_AGENT_SYNC_OPERATIONS,
     execution_owner_user_id,
     is_local_agent_backed_source,
     local_agent_sync_operation,
 )
 from memforge.server.source_admin_service import source_ownership_and_capabilities
+
+
+def test_local_agent_sync_operations_are_exported_from_the_domain_contract() -> None:
+    assert LOCAL_AGENT_SYNC_OPERATIONS == frozenset(
+        {
+            "github_repo_sync",
+            "jira_sync",
+            "local_markdown_sync",
+            "teams_sync",
+        }
+    )
 
 
 @pytest.mark.parametrize(

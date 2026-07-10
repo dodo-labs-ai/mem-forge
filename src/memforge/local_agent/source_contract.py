@@ -7,6 +7,16 @@ from collections.abc import Mapping
 from typing import Any
 
 
+LOCAL_AGENT_SYNC_OPERATIONS = frozenset(
+    {
+        "github_repo_sync",
+        "jira_sync",
+        "local_markdown_sync",
+        "teams_sync",
+    }
+)
+
+
 def _source_config(value: object) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
         return value
