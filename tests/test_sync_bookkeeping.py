@@ -2260,6 +2260,60 @@ async def test_source_sync_worker_delays_retryable_failure(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_source_sync_worker_retries_failed_final_state(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-final-state-failed"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker Final State Failed",
+        config_json="{}",
+    )
+
+    class FailedStateRuntimeProvider:
+        async def build_sync_runtime(
+            self,
+            db: Database,
+            config: AppConfig,
+            *,
+            extraction_pool: ExtractionWorkPool | None = None,
+            document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
+        ):
+            del db, config, extraction_pool, document_lifecycle_admission
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            return SyncState(
+                source=source_id,
+                last_sync_at=None,
+                last_sync_status="failed",
+                error_message="temporary final-state failure",
+            )
+
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(sync=SyncConfig(worker_retry_base_seconds=120, worker_retry_max_seconds=120)),
+        runtime_provider=FailedStateRuntimeProvider(),
+        worker_id="worker-a",
+    )
+
+    await worker.run_once()
+    failed = await db.get_source_sync_run(enqueued.run_id)
+    sync_state = await db.get_sync_state(source_id)
+
+    assert failed is not None
+    assert failed.status == "pending"
+    assert failed.next_attempt_at is not None
+    assert failed.error_message == "temporary final-state failure"
+    assert sync_state is not None
+    assert sync_state.last_sync_status == "failed"
+    assert sync_state.error_message == "temporary final-state failure"
+
+
+@pytest.mark.asyncio
 async def test_source_sync_worker_run_forever_polls_until_cancelled(db: Database):
     import memforge.runtime as runtime
 
