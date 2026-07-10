@@ -91,7 +91,12 @@ def _create_github_repo_source(
     return response.json()
 
 
-def _create_jira_source(client: TestClient, *, name: str = "Payroll Jira") -> dict:
+def _create_jira_source(
+    client: TestClient,
+    *,
+    name: str = "Payroll Jira",
+    sync_mode: str = "local_agent",
+) -> dict:
     response = client.post(
         "/api/sources",
         json={
@@ -100,7 +105,7 @@ def _create_jira_source(client: TestClient, *, name: str = "Payroll Jira") -> di
             "config": {
                 "base_url": "https://jira.example.test",
                 "auth_mode": "browser_cookie",
-                "sync_mode": "local_agent",
+                "sync_mode": sync_mode,
                 "projects": ["PAY"],
                 "issue_types": ["Task"],
                 "include_comments": True,
@@ -426,20 +431,8 @@ def test_jira_adapter_document_push_requires_local_agent_mode(tmp_path):
     try:
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
-            created = _create_jira_source(client)
+            created = _create_jira_source(client, sync_mode="cloud")
             source_id = created["id"]
-            update = client.put(
-                f"/api/sources/{source_id}",
-                json={
-                    "config": {
-                        "base_url": "https://jira.example.test",
-                        "auth_mode": "browser_cookie",
-                        "sync_mode": "cloud",
-                        "projects": ["PAY"],
-                    }
-                },
-            )
-            assert update.status_code == 200, update.text
             response = client.post(
                 f"/api/sources/{source_id}/adapter/packages",
                 json={

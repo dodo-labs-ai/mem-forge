@@ -243,44 +243,26 @@ assert.match(
   /className="[^"]*cursor-pointer[^"]*disabled:cursor-not-allowed[^"]*"/,
   "enabled overflow menu actions should use a pointer cursor while disabled actions keep not-allowed",
 );
-assert.match(
-  localAgentSourcesSource,
-  /github_repo_sync/,
-  "Internal network GitHub source sync should enqueue a local-agent sync job",
-);
-assert.match(
-  localAgentSourcesSource,
-  /local_markdown_sync/,
-  "Local repository sync should enqueue a local-agent sync job",
-);
-assert.match(
-  localAgentSourcesSource,
-  /jira_sync/,
-  "Jira sources configured for local daemon sync should enqueue a local-agent sync job",
-);
-assert.match(
-  localAgentSourcesSource,
-  /teams_sync/,
-  "Teams source sync should enqueue a local-agent sync job",
-);
 assert.equal(
-  localAgentSyncOperation({ type: "teams", config: {} } as never),
+  localAgentSyncOperation({ execution: { kind: "local_agent", operation: "teams_sync", immutable_config_fields: [] } } as never),
   "teams_sync",
   "Teams sources should be local-agent backed",
 );
 assert.equal(
-  localAgentSyncOperation({ type: "jira", config: { sync_mode: "cloud" } } as never),
+  localAgentSyncOperation({ execution: { kind: "server", operation: null, immutable_config_fields: ["sync_mode"] } } as never),
   null,
   "Cloud Jira sources should not be treated as local-agent backed",
 );
 assert.equal(
-  isLocalAgentBackedSource({ type: "jira", config: { sync_mode: "local_agent" } } as never),
+  isLocalAgentBackedSource({ execution: { kind: "local_agent", operation: "jira_sync", immutable_config_fields: ["sync_mode"] } } as never),
   true,
   "Jira local-agent mode should share the daemon status badge path",
 );
-assert.equal(isImmutableExecutionModeField("jira", "sync_mode"), true);
-assert.equal(isImmutableExecutionModeField("github_repo", "connection_mode"), true);
-assert.equal(isImmutableExecutionModeField("jira", "auth_mode"), false);
+const jiraExecutionSource = {
+  execution: { kind: "local_agent", operation: "jira_sync", immutable_config_fields: ["sync_mode"] },
+} as never;
+assert.equal(isImmutableExecutionModeField(jiraExecutionSource, "sync_mode"), true);
+assert.equal(isImmutableExecutionModeField(jiraExecutionSource, "auth_mode"), false);
 assert.match(
   sourcesPageSource,
   /\/api\/cloud\/local-agent\/jobs/,
@@ -327,8 +309,13 @@ assert.match(
 );
 assert.match(
   sourceConfigDialogSource,
-  /disabled=\{isEdit\s*&&\s*isImmutableExecutionModeField\(sourceType, field\.key\)\}/,
+  /disabled=\{source\s*\?\s*isImmutableExecutionModeField\(source, field\.key\)\s*:\s*false\}/,
   "existing sources should render execution-mode selectors as read-only",
+);
+assert.doesNotMatch(
+  localAgentSourcesSource,
+  /source\.type\s*===|sync_mode|connection_mode|local_markdown/,
+  "the UI should consume the server execution descriptor instead of reclassifying source types",
 );
 assert.match(
   sourceConfigDialogSource,

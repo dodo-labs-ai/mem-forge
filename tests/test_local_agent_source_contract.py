@@ -9,6 +9,7 @@ from memforge.local_agent.source_contract import (
     execution_owner_user_id,
     is_local_agent_backed_source,
     local_agent_sync_operation,
+    source_execution_descriptor,
 )
 from memforge.server.source_admin_service import source_ownership_and_capabilities
 
@@ -49,6 +50,46 @@ def test_local_agent_sync_operation_classifies_execution_mode(
     assert is_local_agent_backed_source({"type": source_type, "config": config}) is (
         expected_operation is not None
     )
+
+
+@pytest.mark.parametrize(
+    ("source_type", "config", "expected"),
+    [
+        (
+            "jira",
+            {"sync_mode": "local_agent"},
+            {
+                "kind": "local_agent",
+                "operation": "jira_sync",
+                "immutable_config_fields": ["sync_mode"],
+            },
+        ),
+        (
+            "github_repo",
+            {"connection_mode": "cloud_pull"},
+            {
+                "kind": "server",
+                "operation": None,
+                "immutable_config_fields": ["connection_mode"],
+            },
+        ),
+        (
+            "confluence",
+            {},
+            {
+                "kind": "server",
+                "operation": None,
+                "immutable_config_fields": [],
+            },
+        ),
+    ],
+)
+def test_source_execution_descriptor_is_canonical_ui_contract(
+    source_type: str,
+    config: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    assert source_execution_descriptor(source_type, config) == expected
 
 
 def test_local_agent_source_contract_accepts_serialized_config() -> None:
