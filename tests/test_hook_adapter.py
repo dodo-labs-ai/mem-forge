@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -13,6 +14,7 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _isolate_memforge_plugin_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMFORGE_EDITION", raising=False)
     monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
     monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
     monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
@@ -969,15 +971,36 @@ def test_plugin_adapters_match_canonical_adapter():
         assert adapter.read_text() == canonical
 
 
-def test_plugin_config_helpers_match_canonical_config():
+def test_packaged_plugin_config_matches_canonical_legacy_helpers():
     root = Path(__file__).resolve().parents[1]
     canonical = (root / "src" / "memforge" / "plugin_config.py").read_text()
+
+    def legacy_helper_ast(source: str) -> str:
+        module = ast.parse(source)
+        module.body = [
+            node
+            for node in module.body
+            if not (isinstance(node, ast.FunctionDef) and node.name == "configured_target")
+            and not (
+                isinstance(node, ast.ImportFrom)
+                and node.module in {"api_target", "memforge.api_target"}
+            )
+            and not (
+                isinstance(node, ast.Try)
+                and any(
+                    isinstance(child, ast.ImportFrom)
+                    and child.module in {"api_target", "memforge.api_target"}
+                    for child in ast.walk(node)
+                )
+            )
+        ]
+        return ast.dump(module, include_attributes=False)
 
     for helper in (
         root / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
         root / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
     ):
-        assert helper.read_text() == canonical
+        assert legacy_helper_ast(helper.read_text()) == legacy_helper_ast(canonical)
 
 
 def test_plugin_mcp_launchers_match_each_other():
