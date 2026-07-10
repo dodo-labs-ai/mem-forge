@@ -293,6 +293,17 @@ def test_admin_app_scheduler_registers_expiry_maintenance(tmp_path):
         assert app.state.sync_scheduler.scheduler.get_job(EXPIRY_JOB_ID) is not None
 
 
+def test_admin_app_can_disable_scheduler_for_external_worker_mode(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    config = _config(tmp_path)
+    config.sync.scheduler_enabled = False
+    app = create_admin_app(config=config)
+
+    with TestClient(app):
+        assert app.state.sync_scheduler is None
+
+
 def test_gene_config_schema_hides_runtime_transport_fields_from_ui(tmp_path):
     from memforge.server.admin_api import create_admin_app
 

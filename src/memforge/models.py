@@ -540,6 +540,7 @@ class SourceSyncRun:
     lease_attempt_count: int = 0
     recovery_count: int = 0
     rerun_requested: bool = False
+    next_attempt_at: datetime | None = None
     error_message: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
