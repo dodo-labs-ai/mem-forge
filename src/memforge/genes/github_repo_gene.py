@@ -15,7 +15,11 @@ from urllib.parse import quote
 import requests
 
 from memforge.genes.base import Gene
-from memforge.genes.local_adapter_packages import package_manifest, read_package_body
+from memforge.genes.local_adapter_packages import (
+    has_package_manifest,
+    package_manifest,
+    read_package_body,
+)
 from memforge.genes.local_markdown_gene import _parse_dt, _to_markdown
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSIONS,
@@ -66,7 +70,8 @@ class GitHubRepoGene(Gene):
 
     The same source type supports two delivery modes:
     - ``cloud_pull``: MemForge calls the GitHub REST API directly.
-    - ``local_push``: a local CLI pushes selected files into the per-source inbox.
+    - ``local_push``: the source config names a local clone and the user's
+      daemon uploads raw file packages for server-side processing.
     """
 
     @classmethod
@@ -117,6 +122,16 @@ class GitHubRepoGene(Gene):
                     help_text="Optional token for private repositories when using cloud pull. Leave blank for public repositories or local push.",
                     group="connection",
                     order=2,
+                ),
+                ConfigField(
+                    key="repo_path",
+                    label="Local Clone Path",
+                    field_type=ConfigFieldType.STRING,
+                    required=False,
+                    placeholder="/Users/me/work/repo",
+                    help_text="Local clone path on the machine running the MemForge daemon.",
+                    group="connection",
+                    order=3,
                 ),
                 ConfigField(
                     key="ref",
@@ -175,12 +190,14 @@ class GitHubRepoGene(Gene):
         config["connection_mode"] = _connection_mode(config)
         if not str(config.get("ref") or "").strip():
             config["ref"] = "main"
+        if "repo_path" in config:
+            config["repo_path"] = str(config.get("repo_path") or "").strip()
 
     async def authenticate(self) -> None:
         self._repo_ref = _parse_repo_url(str(self.config.get("repo_url") or ""))
         self._connection_mode = _connection_mode(self.config)
         if self._connection_mode == CONNECTION_MODE_LOCAL_PUSH:
-            if self._package_manifest():
+            if has_package_manifest(self.config):
                 return
             self._documents_dir().mkdir(parents=True, exist_ok=True)
             return
@@ -314,7 +331,7 @@ class GitHubRepoGene(Gene):
 
     async def _discover_local_push(self, since: datetime | None) -> AsyncIterator[ContentItem]:
         manifest = self._package_manifest()
-        if manifest:
+        if has_package_manifest(self.config):
             async for item in self._discover_local_push_manifest(manifest, since):
                 yield item
             return

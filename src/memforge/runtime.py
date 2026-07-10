@@ -657,13 +657,27 @@ class SourceSyncWorker:
         stop = asyncio.Event()
         lease_lost = asyncio.Event()
         heartbeat_task = asyncio.create_task(self._heartbeat_until_stopped(run, stop, lease_lost))
+        sync_task = asyncio.create_task(self.runtime_provider.run_source_sync(**kwargs))
         try:
-            result = await self.runtime_provider.run_source_sync(**kwargs)
+            done, _ = await asyncio.wait(
+                {sync_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done and lease_lost.is_set():
+                sync_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await sync_task
+                raise SourceSyncLeaseLost(f"source sync lease lost for run {run.run_id}")
+            result = await sync_task
             if lease_lost.is_set():
                 raise SourceSyncLeaseLost(f"source sync lease lost for run {run.run_id}")
             return result
         finally:
             stop.set()
+            if not sync_task.done():
+                sync_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await sync_task
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_task
@@ -720,8 +734,13 @@ class SourceSyncWorker:
             inputs = await self.db.list_source_sync_inputs(
                 source_id=run.source_id,
                 workspace_id=run.workspace_id,
+                input_snapshot_id=run.input_snapshot_id,
             )
-            source = source_with_sync_inputs(source, inputs)
+            source = source_with_sync_inputs(
+                source,
+                inputs,
+                authoritative_snapshot=run.input_snapshot_id is not None,
+            )
 
             runtime = await self.runtime_provider.build_sync_runtime(
                 self.db,
@@ -736,7 +755,9 @@ class SourceSyncWorker:
                 source=source,
                 runtime=runtime,
                 progress_callback=None,
-                force_full_sync=run.force_full_sync,
+                force_full_sync=(
+                    run.force_full_sync or run.input_snapshot_id is not None
+                ),
             )
             if final_state is None:
                 final_state = SyncState(
@@ -858,6 +879,7 @@ class SyncService:
         trigger: str = "manual",
         force_full_sync: bool = False,
         workspace_id: str = "default",
+        input_snapshot_id: str | None = None,
     ) -> SourceSyncRun:
         await self._ensure_source_can_sync(source_id)
         return await self.db.enqueue_source_sync_run(
@@ -865,6 +887,7 @@ class SyncService:
             workspace_id=workspace_id,
             trigger=trigger,
             force_full_sync=force_full_sync,
+            input_snapshot_id=input_snapshot_id,
         )
 
     async def start_source(self, source_id: str, *, force_full_sync: bool = False) -> asyncio.Task:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -32,6 +34,7 @@ from memforge.pipeline.sync import (
 from memforge.runtime import SyncService
 from memforge.config import AppConfig, SyncConfig
 from memforge.storage.database import Database
+from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.scheduler import SyncScheduler
 
@@ -42,6 +45,91 @@ async def db(tmp_path):
     await database.connect()
     yield database
     await database.close()
+
+
+def test_local_agent_broker_has_its_own_forward_migration() -> None:
+    version, description, statements = next(
+        migration for migration in MIGRATIONS if migration[0] == 37
+    )
+
+    assert version == 37
+    assert description == "Add local agent job broker"
+    assert any("CREATE TABLE IF NOT EXISTS local_agent_jobs" in sql for sql in statements)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_migration_upgrades_database_that_already_recorded_migration_36(
+    tmp_path,
+) -> None:
+    path = tmp_path / "pre-snapshot.db"
+    database = Database(str(path))
+    await database.connect()
+    await database.close()
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE source_sync_snapshot_items")
+        conn.execute("ALTER TABLE source_sync_runs DROP COLUMN input_snapshot_id")
+        conn.execute("ALTER TABLE source_sync_runs DROP COLUMN rerun_input_snapshot_id")
+        conn.execute("DELETE FROM schema_migrations WHERE version = 38")
+        conn.commit()
+
+    upgraded = Database(str(path))
+    await upgraded.connect()
+    try:
+        columns = {
+            row["name"]
+            for row in await (
+                await upgraded.db.execute("PRAGMA table_info(source_sync_runs)")
+            ).fetchall()
+        }
+        table = await (
+            await upgraded.db.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'source_sync_snapshot_items'"
+            )
+        ).fetchone()
+    finally:
+        await upgraded.close()
+
+    assert {"input_snapshot_id", "rerun_input_snapshot_id"} <= columns
+    assert table is not None
+
+
+@pytest.mark.asyncio
+async def test_latest_source_sync_run_is_scoped_to_source_and_workspace(db: Database):
+    await db.upsert_source(
+        id="src-latest-a",
+        type="jira",
+        name="Latest A",
+        config_json="{}",
+    )
+    await db.upsert_source(
+        id="src-latest-b",
+        type="jira",
+        name="Latest B",
+        config_json="{}",
+    )
+    first = await db.enqueue_source_sync_run(
+        source_id="src-latest-a",
+        workspace_id="ws-a",
+    )
+    await db.enqueue_source_sync_run(
+        source_id="src-latest-b",
+        workspace_id="ws-a",
+    )
+
+    latest = await db.get_latest_source_sync_run(
+        source_id="src-latest-a",
+        workspace_id="ws-a",
+    )
+    missing = await db.get_latest_source_sync_run(
+        source_id="src-latest-a",
+        workspace_id="ws-b",
+    )
+
+    assert latest is not None
+    assert latest.run_id == first.run_id
+    assert missing is None
 
 
 @pytest.mark.asyncio
@@ -109,6 +197,59 @@ async def test_enqueue_source_sync_run_promotes_force_intent_on_active_run(db: D
 
 
 @pytest.mark.asyncio
+async def test_duplicate_manual_trigger_does_not_schedule_successor_for_running_run(db: Database):
+    await db.upsert_source(
+        id="src-running-manual",
+        type="confluence",
+        name="Running manual",
+        config_json="{}",
+    )
+    first = await db.enqueue_source_sync_run(
+        source_id="src-running-manual",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc),
+    )
+    duplicate = await db.enqueue_source_sync_run(
+        source_id="src-running-manual",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+
+    assert leased is not None
+    assert duplicate.run_id == first.run_id
+    assert duplicate.coalesced is True
+    assert duplicate.rerun_requested is False
+
+
+@pytest.mark.asyncio
+async def test_duplicate_snapshot_does_not_schedule_running_successor(db: Database):
+    await db.upsert_source(id="src-same-snapshot", type="github_repo", name="Repo", config_json="{}")
+    first = await db.enqueue_source_sync_run(
+        source_id="src-same-snapshot",
+        input_snapshot_id="snapshot-a",
+    )
+    await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc),
+    )
+    duplicate = await db.enqueue_source_sync_run(
+        source_id="src-same-snapshot",
+        trigger="local_agent",
+        input_snapshot_id="snapshot-a",
+    )
+
+    assert duplicate.run_id == first.run_id
+    assert duplicate.rerun_requested is False
+
+
+@pytest.mark.asyncio
 async def test_lease_next_source_sync_run_recovers_expired_run_without_new_run(db: Database):
     now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
     await db.upsert_source(
@@ -154,6 +295,38 @@ async def test_lease_next_source_sync_run_recovers_expired_run_without_new_run(d
     assert recovered.lease_owner == "worker-b"
     assert recovered.lease_attempt_count == 2
     assert recovered.recovery_count == 1
+
+
+@pytest.mark.asyncio
+async def test_source_sync_run_lease_is_compare_and_swap_across_connections(tmp_path):
+    path = tmp_path / "shared-sync.db"
+    first_db = Database(str(path))
+    second_db = Database(str(path))
+    await first_db.connect()
+    await second_db.connect()
+    try:
+        await first_db.upsert_source(
+            id="src-cas-lease",
+            type="confluence",
+            name="CAS Lease",
+            config_json="{}",
+        )
+        await first_db.enqueue_source_sync_run(source_id="src-cas-lease")
+        now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+
+        leased = await asyncio.gather(
+            first_db.lease_next_source_sync_run(
+                worker_id="worker-a", lease_seconds=60, now=now
+            ),
+            second_db.lease_next_source_sync_run(
+                worker_id="worker-b", lease_seconds=60, now=now
+            ),
+        )
+
+        assert sum(run is not None for run in leased) == 1
+    finally:
+        await first_db.close()
+        await second_db.close()
 
 
 @pytest.mark.asyncio
@@ -489,6 +662,7 @@ async def test_complete_source_sync_run_creates_successor_for_coalesced_request(
         source_id="src-successor",
         workspace_id="workspace-a",
         trigger="manual",
+        input_snapshot_id="snapshot-old",
     )
     leased = await db.lease_next_source_sync_run(
         worker_id="worker-a",
@@ -502,6 +676,7 @@ async def test_complete_source_sync_run_creates_successor_for_coalesced_request(
         workspace_id="workspace-a",
         trigger="force",
         force_full_sync=True,
+        input_snapshot_id="snapshot-new",
     )
 
     completed_update = await db.complete_source_sync_run(
@@ -532,6 +707,7 @@ async def test_complete_source_sync_run_creates_successor_for_coalesced_request(
     assert successor.run_id != active.run_id
     assert successor.trigger == "rerun"
     assert successor.force_full_sync is True
+    assert successor.input_snapshot_id == "snapshot-new"
 
 
 @pytest.mark.asyncio
@@ -604,6 +780,103 @@ async def test_source_sync_inputs_are_idempotent_by_raw_hash(db: Database):
     assert duplicate.input_generation == first.input_generation
     assert duplicate.raw_uri == first.raw_uri
     assert [item.input_id for item in listed] == [first.input_id]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_input_uses_top_level_doc_id_and_rejects_missing_identity(db: Database):
+    await db.upsert_source(id="src-snapshot-doc", type="jira", name="Jira", config_json="{}")
+    created = await db.create_source_sync_input(
+        source_id="src-snapshot-doc",
+        raw_uri="object://input.json",
+        raw_sha256="sha-input",
+        raw_content_type="application/json",
+        metadata={"doc_id": "doc-top-level"},
+        sync_snapshot_id="snapshot-a",
+    )
+    listed = await db.list_source_sync_inputs(
+        source_id="src-snapshot-doc",
+        input_snapshot_id="snapshot-a",
+    )
+    assert [item.input_id for item in listed] == [created.input_id]
+    with pytest.raises(ValueError, match="requires doc_id"):
+        await db.create_source_sync_input(
+            source_id="src-snapshot-doc",
+            raw_uri="object://missing.json",
+            raw_sha256="sha-missing",
+            raw_content_type="application/json",
+            metadata={},
+            sync_snapshot_id="snapshot-b",
+        )
+
+
+@pytest.mark.asyncio
+async def test_source_sync_inputs_filter_by_current_snapshot_membership(db: Database):
+    await db.upsert_source(
+        id="src-input-snapshot",
+        type="local_markdown",
+        name="Local",
+        config_json="{}",
+    )
+
+    old = await db.create_source_sync_input(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-snapshot/inputs/old.json",
+        raw_sha256="sha-old",
+        raw_content_type="application/json",
+        sync_snapshot_id="snapshot-old",
+        metadata={
+            "manifest_entry": {"doc_id": "doc-old", "package_uri": "old"},
+        },
+    )
+    new = await db.create_source_sync_input(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-snapshot/inputs/new.json",
+        raw_sha256="sha-new",
+        raw_content_type="application/json",
+        sync_snapshot_id="snapshot-new",
+        metadata={
+            "manifest_entry": {"doc_id": "doc-new", "package_uri": "new"},
+        },
+    )
+    repeated = await db.create_source_sync_input(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-snapshot/inputs/new-copy.json",
+        raw_sha256="sha-new",
+        raw_content_type="application/json",
+        sync_snapshot_id="snapshot-repeat",
+        metadata={
+            "manifest_entry": {"doc_id": "doc-new", "package_uri": "new"},
+        },
+    )
+
+    all_inputs = await db.list_source_sync_inputs(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+    )
+    new_snapshot = await db.list_source_sync_inputs(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+        input_snapshot_id="snapshot-new",
+    )
+    repeat_snapshot = await db.list_source_sync_inputs(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+        input_snapshot_id="snapshot-repeat",
+    )
+    empty_snapshot = await db.list_source_sync_inputs(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+        input_snapshot_id="snapshot-empty",
+    )
+
+    assert [item.input_id for item in all_inputs] == [old.input_id, new.input_id]
+    assert [item.input_id for item in new_snapshot] == [new.input_id]
+    assert repeated.input_id == new.input_id
+    assert [item.input_id for item in repeat_snapshot] == [new.input_id]
+    assert empty_snapshot == []
 
 
 class EmptyGene:
@@ -2279,6 +2552,234 @@ async def test_advance_source_sync_schedule_uses_expected_due_timestamp(db: Data
 
 
 @pytest.mark.asyncio
+async def test_due_local_source_enqueues_owner_daemon_job_not_server_run(db: Database):
+    due_at = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    source_id = "src-local-owner-schedule"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Scheduled Teams",
+        config_json=json.dumps(
+            {
+                "region": "emea",
+                "conversation_ids": ["19:conversation-a@example.test"],
+                "access_token": "must-not-reach-daemon",
+            }
+        ),
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+    await db.set_source_sync_schedule(
+        source_id,
+        enabled=True,
+        interval_minutes=60,
+        next_run_at=due_at,
+    )
+
+    local_count = await db.enqueue_due_local_agent_jobs(now=due_at)
+    server_runs = await db.enqueue_due_source_sync_runs(now=due_at)
+    jobs = await db.lease_local_agent_jobs(
+        user_id="owner-a",
+        limit=5,
+        lease_seconds=60,
+        now=due_at,
+    )
+
+    assert local_count == 1
+    assert server_runs == []
+    assert len(jobs) == 1
+    assert jobs[0]["execution_owner_user_id"] == "owner-a"
+    assert jobs[0]["payload"]["region"] == "emea"
+    assert jobs[0]["payload"]["conversation_ids"] == ["19:conversation-a@example.test"]
+    assert "access_token" not in jobs[0]["payload"]
+    assert "config" not in jobs[0]["payload"]
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["sync_schedule"]["next_run_at"] == "2026-07-10T01:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_due_ownerless_local_source_advances_schedule_without_job(db: Database):
+    due_at = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    source_id = "src-ownerless-schedule"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Ownerless Scheduled Teams",
+        config_json='{"conversation_ids":["19:conversation@example.test"]}',
+    )
+    await db.set_source_sync_schedule(
+        source_id,
+        enabled=True,
+        interval_minutes=60,
+        next_run_at=due_at,
+    )
+
+    local_count = await db.enqueue_due_local_agent_jobs(now=due_at)
+
+    assert local_count == 0
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["sync_schedule"]["next_run_at"] == "2026-07-10T01:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
+    now = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    await db.insert_local_agent_job(
+        job_id="laj-retry",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_id": "src-local"},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+        now=now,
+    )
+    first = await db.lease_local_agent_jobs(
+        user_id="owner-a",
+        limit=1,
+        lease_seconds=60,
+        now=now,
+    )
+
+    completed = await db.complete_local_agent_job(
+        job_id="laj-retry",
+        user_id="owner-a",
+        attempt_count=first[0]["attempt_count"],
+        status="failed",
+        result={"retryable": True},
+        error="one package failed",
+        retryable=True,
+        now=now + timedelta(seconds=1),
+    )
+    second = await db.lease_local_agent_jobs(
+        user_id="owner-a",
+        limit=1,
+        lease_seconds=60,
+        now=now + timedelta(seconds=2),
+    )
+
+    assert completed is True
+    assert second[0]["job_id"] == "laj-retry"
+    assert second[0]["attempt_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_queued_force_request_promotes_existing_local_agent_job(db: Database):
+    first_id, first_created = await db.enqueue_local_agent_job(
+        job_id="laj-normal",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_config_revision": "rev-a", "force_full_sync": False},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+    promoted_id, promoted_created = await db.enqueue_local_agent_job(
+        job_id="laj-force",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_config_revision": "rev-a", "force_full_sync": True},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+    jobs = await db.lease_local_agent_jobs(
+        user_id="owner-a", limit=5, lease_seconds=60
+    )
+
+    assert first_created is True
+    assert promoted_created is False
+    assert promoted_id == first_id
+    assert len(jobs) == 1
+    assert jobs[0]["payload"]["force_full_sync"] is True
+
+
+@pytest.mark.asyncio
+async def test_leased_force_request_creates_serial_successor_job(db: Database):
+    first_id, _ = await db.enqueue_local_agent_job(
+        job_id="laj-leased-normal",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_config_revision": "rev-a", "force_full_sync": False},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+    leased = await db.lease_local_agent_jobs(
+        user_id="owner-a", limit=1, lease_seconds=60
+    )
+    promoted_id, created = await db.enqueue_local_agent_job(
+        job_id="laj-leased-force",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_config_revision": "rev-a", "force_full_sync": True},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+    blocked = await db.lease_local_agent_jobs(
+        user_id="owner-a", limit=5, lease_seconds=60
+    )
+    await db.complete_local_agent_job(
+        job_id=first_id,
+        user_id="owner-a",
+        attempt_count=leased[0]["attempt_count"],
+        status="succeeded",
+        result={},
+        error=None,
+        retryable=False,
+    )
+    successor = await db.lease_local_agent_jobs(
+        user_id="owner-a", limit=5, lease_seconds=60
+    )
+
+    assert leased[0]["job_id"] == first_id
+    assert promoted_id != first_id
+    assert created is True
+    assert blocked == []
+    assert successor[0]["job_id"] == promoted_id
+    assert successor[0]["payload"]["force_full_sync"] is True
+
+
+@pytest.mark.asyncio
+async def test_expired_original_and_successor_are_not_released_in_same_batch(db: Database):
+    now = datetime.now(timezone.utc)
+    first_id, _ = await db.enqueue_local_agent_job(
+        job_id="laj-expired-original",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_config_revision": "rev-a", "force_full_sync": False},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+    await db.lease_local_agent_jobs(
+        user_id="owner-a", limit=1, lease_seconds=60, now=now
+    )
+    successor_id, _ = await db.enqueue_local_agent_job(
+        job_id="laj-expired-successor",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_config_revision": "rev-a", "force_full_sync": True},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+
+    recovered = await db.lease_local_agent_jobs(
+        user_id="owner-a",
+        limit=5,
+        lease_seconds=60,
+        now=now + timedelta(seconds=61),
+    )
+
+    assert [job["job_id"] for job in recovered] == [first_id]
+    assert successor_id != first_id
+
+
+@pytest.mark.asyncio
 async def test_enqueue_due_source_sync_runs_rolls_back_schedule_when_run_enqueue_fails(
     db: Database,
     monkeypatch,
@@ -2373,6 +2874,26 @@ async def test_scheduler_coalesces_active_due_source_and_advances_next_run(db: D
 
 
 @pytest.mark.asyncio
+async def test_scheduler_still_scans_server_sources_when_local_job_scan_fails(db: Database, monkeypatch):
+    server_scan_calls: list[int] = []
+
+    async def fail_local_scan(*, limit):
+        raise RuntimeError("local broker unavailable")
+
+    async def record_server_scan(*, limit):
+        server_scan_calls.append(limit)
+        return []
+
+    monkeypatch.setattr(db, "enqueue_due_local_agent_jobs", fail_local_scan)
+    monkeypatch.setattr(db, "enqueue_due_source_sync_runs", record_server_scan)
+    scheduler = SyncScheduler(db, SyncService(db, AppConfig()))
+
+    await scheduler._sync_due_sources()
+
+    assert server_scan_calls == [50]
+
+
+@pytest.mark.asyncio
 async def test_sync_service_enqueue_source_creates_durable_run_without_local_task(db: Database):
     source_id = "src-enqueue-service"
     await db.upsert_source(
@@ -2458,6 +2979,57 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
     assert completed.lease_owner is None
     assert provider.force_full_sync_values == [True]
     assert provider.extraction_pools == [worker._extraction_pool]
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_treats_complete_input_snapshot_as_full_sync(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-snapshot-worker"
+    await db.upsert_source(
+        id=source_id,
+        type="local_markdown",
+        name="Snapshot Worker",
+        config_json='{"documents_dir":"/server/inbox"}',
+    )
+
+    class CapturingRuntimeProvider:
+        def __init__(self) -> None:
+            self.force_full_sync: bool | None = None
+            self.source: dict | None = None
+
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            self.force_full_sync = kwargs["force_full_sync"]
+            self.source = kwargs["source"]
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
+
+    provider = CapturingRuntimeProvider()
+    await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="local_agent",
+        force_full_sync=False,
+        input_snapshot_id="laj-empty",
+    )
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=provider,
+        worker_id="worker-snapshot",
+    )
+
+    await worker.run_once()
+
+    assert provider.force_full_sync is True
+    assert provider.source is not None
+    assert provider.source["config"]["local_agent_package_manifest"] == []
 
 
 @pytest.mark.asyncio

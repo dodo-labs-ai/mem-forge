@@ -409,6 +409,308 @@ def test_non_owner_admin_cannot_trigger_local_source_sync(tmp_path):
         asyncio.run(database.close())
 
 
+def test_local_source_sync_enqueues_canonical_owner_job(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        payload = _teams_payload()
+        payload["config"]["access_token"] = "must-not-reach-daemon"
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=payload,
+            )
+            assert created.status_code == 200, created.text
+
+            triggered = client.post(
+                f"/api/sources/{created.json()['id']}/sync",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json={"force_full_sync": True},
+            )
+            assert triggered.status_code == 202, triggered.text
+            repeated = client.post(
+                f"/api/sources/{created.json()['id']}/sync",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json={"force_full_sync": True},
+            )
+            assert repeated.status_code == 202, repeated.text
+            assert repeated.json()["job_id"] == triggered.json()["job_id"]
+            assert repeated.json()["coalesced"] is True
+
+            leased = client.post(
+                "/api/cloud/local-agent/jobs/lease",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json={"limit": 5, "lease_seconds": 60},
+            )
+
+        assert leased.status_code == 200, leased.text
+        jobs = leased.json()["jobs"]
+        assert len(jobs) == 1
+        assert jobs[0]["execution_owner_user_id"] == "owner-a"
+        job_payload = dict(jobs[0]["payload"])
+        assert job_payload.pop("source_config_revision")
+        assert job_payload == {
+            "region": "emea",
+            "conversation_ids": ["19:conversation-a@example.test"],
+            "conversation_gap_minutes": 60,
+            "source_id": created.json()["id"],
+            "source_type": "teams",
+            "force_full_sync": True,
+        }
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
+        with TestClient(app) as client:
+            created = client.post("/api/sources", headers=headers, json=_teams_payload())
+            source_id = created.json()["id"]
+            client.post(f"/api/sources/{source_id}/sync", headers=headers)
+            leased = client.post(
+                "/api/cloud/local-agent/jobs/lease",
+                headers=headers,
+                json={"limit": 1, "lease_seconds": 60},
+            ).json()["jobs"][0]
+            context = {
+                "local_agent_job_id": leased["job_id"],
+                "local_agent_attempt_count": leased["attempt_count"],
+            }
+            accepted = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                headers=headers,
+                json={
+                    **context,
+                    "conversation_id": "19:conversation-a@example.test",
+                    "window_id": "window-a",
+                    "revision_hash": "revision-a",
+                    "raw_payload": {"messages": [{"id": "m1", "content": "hello"}]},
+                },
+            )
+            stale = client.post(
+                f"/api/sources/{source_id}/process",
+                headers=headers,
+                json={**context, "local_agent_attempt_count": leased["attempt_count"] + 1},
+            )
+            completion_body = {
+                "attempt_count": leased["attempt_count"],
+                "status": "succeeded",
+                "result": {"ok": True},
+            }
+            first_complete = client.post(
+                f"/api/cloud/local-agent/jobs/{leased['job_id']}/complete",
+                headers=headers,
+                json=completion_body,
+            )
+            repeated_complete = client.post(
+                f"/api/cloud/local-agent/jobs/{leased['job_id']}/complete",
+                headers=headers,
+                json=completion_body,
+            )
+            forbidden_repeat = client.post(
+                f"/api/cloud/local-agent/jobs/{leased['job_id']}/complete",
+                headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
+                json=completion_body,
+            )
+
+        assert accepted.status_code == 200, accepted.text
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["detail"] == "local_agent_lease_not_current"
+        assert first_complete.status_code == 200, first_complete.text
+        assert repeated_complete.status_code == 200, repeated_complete.text
+        assert repeated_complete.json()["status"] == "succeeded"
+        assert forbidden_repeat.status_code == 404, forbidden_repeat.text
+    finally:
+        asyncio.run(database.close())
+
+
+def test_source_config_change_fences_leased_job_and_enqueues_successor(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/sources", headers=headers, json=_jira_payload(sync_mode="local_agent")
+            )
+            source_id = created.json()["id"]
+            first = client.post(f"/api/sources/{source_id}/sync", headers=headers)
+            leased = client.post(
+                "/api/cloud/local-agent/jobs/lease",
+                headers=headers,
+                json={"limit": 1, "lease_seconds": 60},
+            ).json()["jobs"][0]
+            updated_payload = _jira_payload(sync_mode="local_agent")
+            updated_payload["config"]["projects"] = ["PAY", "TIME"]
+            updated = client.put(
+                f"/api/sources/{source_id}", headers=headers, json=updated_payload
+            )
+            stale = client.post(
+                f"/api/sources/{source_id}/process",
+                headers=headers,
+                json={
+                    "local_agent_job_id": leased["job_id"],
+                    "local_agent_attempt_count": leased["attempt_count"],
+                },
+            )
+            successor = client.post(f"/api/sources/{source_id}/sync", headers=headers)
+
+        assert first.status_code == 202, first.text
+        assert updated.status_code == 200, updated.text
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["detail"] == "local_agent_lease_not_current"
+        assert successor.status_code == 202, successor.text
+        assert successor.json()["job_id"] != leased["job_id"]
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_agent_sync_job_can_only_be_created_and_leased_by_source_owner(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=_teams_payload(),
+            )
+            source_id = created.json()["id"]
+            request_body = {
+                "source_id": source_id,
+                "source_type": "teams",
+                "operation": "teams_sync",
+                "payload": {
+                    "execution_owner_user_id": "admin-b",
+                    "config": {"conversation_ids": ["attacker-value"]},
+                },
+            }
+
+            forbidden = client.post(
+                "/api/cloud/local-agent/jobs",
+                headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
+                json=request_body,
+            )
+            accepted = client.post(
+                "/api/cloud/local-agent/jobs",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=request_body,
+            )
+            other_jobs = client.post(
+                "/api/cloud/local-agent/jobs/lease",
+                headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
+                json={"limit": 5, "lease_seconds": 60},
+            )
+            owner_jobs = client.post(
+                "/api/cloud/local-agent/jobs/lease",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json={"limit": 5, "lease_seconds": 60},
+            )
+
+        assert forbidden.status_code == 403, forbidden.text
+        assert accepted.status_code == 201, accepted.text
+        assert other_jobs.json() == {"jobs": []}
+        assert [job["job_id"] for job in owner_jobs.json()["jobs"]] == [
+            accepted.json()["job_id"]
+        ]
+        assert owner_jobs.json()["jobs"][0]["payload"]["conversation_ids"] == [
+            "19:conversation-a@example.test"
+        ]
+        assert "config" not in owner_jobs.json()["jobs"][0]["payload"]
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_agent_setup_job_allows_member_but_forbids_viewer(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        body = {
+            "source_type": "local_markdown",
+            "operation": "local_markdown_pick_root",
+            "payload": {"title": "Choose folder"},
+        }
+        with TestClient(app) as client:
+            accepted = client.post(
+                "/api/cloud/local-agent/jobs",
+                headers={"x-test-user": "member-a", "x-test-workspace-role": "member"},
+                json=body,
+            )
+            forbidden = client.post(
+                "/api/cloud/local-agent/jobs",
+                headers={"x-test-user": "viewer-a", "x-test-workspace-role": "viewer"},
+                json=body,
+            )
+            leased = client.post(
+                "/api/cloud/local-agent/jobs/lease",
+                headers={"x-test-user": "member-a", "x-test-workspace-role": "member"},
+                json={"limit": 5, "lease_seconds": 60},
+            )
+
+        assert accepted.status_code == 201, accepted.text
+        assert forbidden.status_code == 403, forbidden.text
+        assert leased.json()["jobs"][0]["execution_owner_user_id"] == "member-a"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_source_sync_without_execution_owner_returns_contract_error(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        asyncio.run(
+            database.upsert_source(
+                id="src-ownerless-local",
+                type="local_markdown",
+                name="Ownerless Local",
+                config_json='{"vault_id":"notes"}',
+            )
+        )
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/sources/src-ownerless-local/sync",
+                headers={"x-test-user": "member-a", "x-test-workspace-role": "member"},
+            )
+
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == "local_agent_sync_execution_owner_required"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_source_force_resync_collects_fresh_raw_data_before_processing(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=_teams_payload(),
+            )
+            force = client.post(
+                f"/api/sources/{created.json()['id']}/force-resync",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+            )
+            leased = client.post(
+                "/api/cloud/local-agent/jobs/lease",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json={"limit": 5, "lease_seconds": 60},
+            )
+
+        assert force.status_code == 202, force.text
+        assert force.json()["status"] == "queued"
+        assert "run_id" not in force.json()
+        assert leased.json()["jobs"][0]["operation"] == "teams_sync"
+        assert leased.json()["jobs"][0]["payload"]["force_full_sync"] is True
+    finally:
+        asyncio.run(database.close())
+
+
 def test_local_source_owner_can_change_connection_without_transferring_ownership(tmp_path):
     database = _connect_database(tmp_path)
     try:

@@ -132,9 +132,13 @@ class SyncScheduler:
 
     async def _sync_due_sources(self) -> None:
         try:
+            await self.db.enqueue_due_local_agent_jobs(limit=50)
+        except Exception:
+            logger.exception("Scheduled local-agent job scan failed")
+        try:
             await self.db.enqueue_due_source_sync_runs(limit=50)
         except Exception:
-            logger.exception("Scheduled source sync scan failed")
+            logger.exception("Scheduled server source sync scan failed")
 
     async def shutdown(self) -> None:
         if self.scheduler.running:

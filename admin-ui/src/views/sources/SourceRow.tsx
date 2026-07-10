@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 import { AlertCircle, Check, Info, Loader2, Pause, Play, SlidersHorizontal } from "lucide-react";
-import type { Source, SourceCapabilities, SourceOwnership } from "@/api/types";
+import type { Source, SourceCapabilities, SourceOwnership, SyncStatus } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
 import { SyncStatusBar } from "@/components/admin/SyncStatusBar";
 import { Badge } from "@/components/ui/badge";
@@ -89,6 +89,7 @@ export function SourceRow({
   const ownershipText = formatOwnership(source.ownership);
   const hasManagementControl =
     capabilities.can_configure || capabilities.can_sync || isManaged;
+  const durableSyncLabel = activeSyncLabel(source.sync?.status);
 
   return (
     <div className="space-y-3 p-4">
@@ -124,9 +125,9 @@ export function SourceRow({
                 <span className="font-medium text-foreground">{perGroupMemoryCount}</span> memories
               </span>
               <span>
-                {source.sync?.status === "running" || isActiveLocalAgentProgress(localAgentProgress)
+                {isActiveLocalAgentProgress(localAgentProgress)
                   ? "Syncing now"
-                  : <LastSyncDetails source={source} itemLabel={itemLabel} />}
+                  : durableSyncLabel ?? <LastSyncDetails source={source} itemLabel={itemLabel} />}
               </span>
               {source.sync_schedule?.enabled && (
                 <span>
@@ -316,6 +317,13 @@ function isActiveLocalAgentProgress(progress: LocalAgentSyncProgress | undefined
   return progress?.state === "queued" || progress?.state === "leased";
 }
 
+function activeSyncLabel(status: SyncStatus["status"] | undefined): string | null {
+  if (status === "pending") return "Waiting to sync";
+  if (status === "recovering") return "Recovering sync";
+  if (status === "running") return "Syncing now";
+  return null;
+}
+
 function LastSyncDetails({
   source,
   itemLabel,
@@ -370,9 +378,9 @@ function LastSyncDetails({
                   {sync.status}
                 </dd>
                 <dt className="text-muted-foreground">{capitalize(itemLabel)} checked</dt>
-                <dd className="font-medium text-foreground">{sync.docs_processed}</dd>
+                <dd className="font-medium text-foreground">{sync.docs_processed ?? "-"}</dd>
                 <dt className="text-muted-foreground">Updated</dt>
-                <dd className="font-medium text-foreground">{sync.docs_updated}</dd>
+                <dd className="font-medium text-foreground">{sync.docs_updated ?? "-"}</dd>
                 {failedCount > 0 && (
                   <>
                     <dt className="text-muted-foreground">Failed</dt>

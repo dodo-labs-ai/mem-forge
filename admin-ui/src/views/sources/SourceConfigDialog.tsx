@@ -167,7 +167,6 @@ function SourceConfigForm({
     ? stringValue(config.connection_mode) || "cloud_pull"
     : "";
   const githubRepoUrl = sourceType === "github_repo" ? stringValue(config.repo_url).trim() : "";
-  const githubRef = sourceType === "github_repo" ? stringValue(config.ref).trim() || "main" : "";
   const githubPickerConfig = sourceType === "github_repo" ? serializeConfig(schema.fields, config) : {};
   const jiraBaseUrl = stringValue(config.base_url).trim();
   const confluenceUrlInfo = useMemo(
@@ -283,6 +282,37 @@ function SourceConfigForm({
       if (root === null) return;
       setValidationMessage(null);
       setConfig((current) => ({ ...current, root }));
+    },
+  });
+  const pickGitHubRepoPath = useMutation<string | null, unknown, void>({
+    mutationFn: async () => {
+      const created = await createLocalAgentJob({
+        sourceId: source?.id ?? "",
+        sourceType: "github_repo",
+        operation: "github_repo_pick_root",
+        payload: {
+          title: "Choose local repository clone",
+          initial_directory: stringValue(config.repo_path).trim() || undefined,
+        },
+      });
+      const status = await pollLocalAgentPreviewJob(created.job_id);
+      if (status.status === "failed") {
+        throw new Error(status.last_error || "Local daemon could not open the folder picker.");
+      }
+      const result = status.result as { cancelled?: unknown; root?: unknown } | null;
+      if (result?.cancelled === true) {
+        return null;
+      }
+      const root = typeof result?.root === "string" ? result.root.trim() : "";
+      if (!root) {
+        throw new Error("Local daemon did not return a folder path.");
+      }
+      return root;
+    },
+    onSuccess: (repoPath) => {
+      if (repoPath === null) return;
+      setValidationMessage(null);
+      setConfig((current) => ({ ...current, repo_path: repoPath }));
     },
   });
 
@@ -408,6 +438,13 @@ function SourceConfigForm({
                         onChoose={() => pickLocalMarkdownRoot.mutate()}
                       />
                     )}
+                    {sourceType === "github_repo" && field.key === "repo_path" && (
+                      <LocalMarkdownFolderPickerPanel
+                        isPending={pickGitHubRepoPath.isPending}
+                        error={pickGitHubRepoPath.isError ? pickGitHubRepoPath.error : null}
+                        onChoose={() => pickGitHubRepoPath.mutate()}
+                      />
+                    )}
                     {sourceType === "jira" && field.key === "jql" && (
                       <JiraEffectiveQueryPanel jql={stringValue(config.jql)} />
                     )}
@@ -434,16 +471,7 @@ function SourceConfigForm({
                       />
                     )}
                     {sourceType === "github_repo" && field.key === "repo_url" && (
-                      <>
-                        <GitHubRepoDetectedPanel repoUrl={githubRepoUrl} />
-                        {githubConnectionMode === "local_push" && (
-                          <GitHubRepoLocalPushPanel
-                            sourceId={source?.id ?? null}
-                            repoUrl={githubRepoUrl}
-                            repoRef={githubRef}
-                          />
-                        )}
-                      </>
+                      <GitHubRepoDetectedPanel repoUrl={githubRepoUrl} />
                     )}
                   </div>
                 ))}
@@ -886,52 +914,6 @@ function GitHubRepoDetectedPanel({ repoUrl }: { repoUrl: string }) {
   );
 }
 
-function GitHubRepoLocalPushPanel({
-  sourceId,
-  repoUrl,
-  repoRef,
-}: {
-  sourceId: string | null;
-  repoUrl: string;
-  repoRef: string;
-}) {
-  const profile = githubRepoProfileName(repoUrl);
-  const command = sourceId
-    ? `memforge adapter github add ${profile} --repo-url ${repoUrl || "<repo-url>"} --repo-path <local-clone-path> --ref ${repoRef || "main"} --source-id ${sourceId} && memforge adapter github preview ${profile} && memforge adapter github push ${profile} --process-now`
-    : `memforge adapter github add ${profile} --repo-url ${repoUrl || "<repo-url>"} --repo-path <local-clone-path> --ref ${repoRef || "main"}`;
-  const ready = Boolean(repoUrl);
-  const handleCopy = () => {
-    if (typeof navigator === "undefined" || !navigator.clipboard) return;
-    void navigator.clipboard.writeText(command);
-  };
-
-  return (
-    <div className="rounded-lg border bg-muted/30 p-3 text-xs">
-      <div className="text-sm font-medium text-foreground">Sync from this computer</div>
-      <p className="mt-1 text-muted-foreground">
-        Use this for VPN or internal repos that MemForge Cloud cannot open.
-      </p>
-      <div className="mt-3 flex items-center gap-2 rounded-md border bg-background p-2">
-        <code className="flex-1 break-all font-mono text-[11px] text-foreground">{command}</code>
-        <Button type="button" variant="outline" size="sm" onClick={handleCopy} disabled={!ready}>
-          Copy
-        </Button>
-      </div>
-      {!sourceId && (
-        <p className="mt-2 text-muted-foreground">
-          Save this source first to get a source id, then rerun setup with <code>--source-id</code>.
-        </p>
-      )}
-    </div>
-  );
-}
-
-function githubRepoProfileName(repoUrl: string): string {
-  const parsed = parseGitHubRepoUrl(repoUrl);
-  if (!parsed) return "github-repo";
-  return `${parsed.owner}-${parsed.repo}`.toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
-}
-
 function DiscoveryPreviewPanel({
   ready,
   isPending,
@@ -1159,6 +1141,7 @@ function isFieldVisible(sourceType: string, field: ConfigField, config: ConfigFo
   if (sourceType === "github_repo") {
     const connectionMode = stringValue(config.connection_mode) || "cloud_pull";
     if (field.key === "pat") return connectionMode === "cloud_pull";
+    if (field.key === "repo_path") return connectionMode === "local_push";
     if (field.key === "include_paths") return false;
     return true;
   }
@@ -1186,7 +1169,9 @@ function isFieldRequired(sourceType: string, field: ConfigField, config: ConfigF
     if (field.key === "pages") return syncMode === "explicit_list";
   }
   if (sourceType === "github_repo") {
+    const connectionMode = stringValue(config.connection_mode) || "cloud_pull";
     if (field.key === "pat") return false;
+    if (field.key === "repo_path") return connectionMode === "local_push";
     if (field.key === "include_paths") return false;
   }
   return field.required;

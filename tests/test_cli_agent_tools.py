@@ -78,6 +78,13 @@ class FakeToolClient:
         ))
         return self.response
 
+    def start_source_processing(self, **kwargs):
+        self.calls.append((
+            "start_source_processing",
+            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+        ))
+        return self.response
+
     def push_local_markdown_document(self, **kwargs):
         self.calls.append((
             "push_local_markdown_document",
@@ -633,488 +640,6 @@ def test_adapter_list_includes_markdown_kb_capability():
     assert {"type": "kb", "kind": "markdown"} in payload["data"]
 
 
-def test_adapter_kb_add_and_list_profiles(monkeypatch, tmp_path: Path):
-    adapter_config = tmp_path / "adapter.toml"
-    vault_root = tmp_path / "vault"
-    vault_root.mkdir()
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
-
-    add_result = CliRunner().invoke(
-        cli,
-        [
-            "adapter",
-            "kb",
-            "add",
-            "work.vault",
-            "--root",
-            str(vault_root),
-            "--vault-id",
-            "work-vault",
-            "--include",
-            "**/*.md",
-            "--exclude",
-            ".obsidian/**",
-        ],
-    )
-    list_result = CliRunner().invoke(cli, ["adapter", "kb", "list"])
-
-    assert add_result.exit_code == 0, add_result.output
-    assert list_result.exit_code == 0, list_result.output
-    payload = json.loads(list_result.output)
-    assert payload["profiles"]["work.vault"]["root"] == str(vault_root)
-    assert payload["profiles"]["work.vault"]["vault_id"] == "work-vault"
-
-
-def test_adapter_kb_scan_reports_counts_without_a_profile(monkeypatch, tmp_path: Path):
-    vault_root = tmp_path / "vault"
-    (vault_root / "notes").mkdir(parents=True)
-    (vault_root / ".obsidian").mkdir()
-    (vault_root / "notes" / "a.md").write_text("# A\n\nbody", encoding="utf-8")
-    (vault_root / "notes" / "b.md").write_text("# B\n\nbody", encoding="utf-8")
-    (vault_root / ".obsidian" / "workspace.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-
-    result = CliRunner().invoke(cli, ["adapter", "kb", "scan", "--root", str(vault_root), "--limit", "5"])
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["counts"]["included"] == 2
-    paths = sorted(item["relative_path"] for item in payload["items"])
-    assert paths == ["notes/a.md", "notes/b.md"]
-
-
-def test_adapter_kb_scan_rejects_missing_root(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    result = CliRunner().invoke(cli, ["adapter", "kb", "scan", "--root", str(tmp_path / "nope")])
-    assert result.exit_code != 0
-
-
-def test_adapter_kb_remove_deletes_profile(monkeypatch, tmp_path: Path):
-    vault_root = tmp_path / "vault"
-    vault_root.mkdir()
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-
-    CliRunner().invoke(cli, ["adapter", "kb", "add", "work", "--root", str(vault_root)])
-    remove_result = CliRunner().invoke(cli, ["adapter", "kb", "remove", "work"])
-    list_result = CliRunner().invoke(cli, ["adapter", "kb", "list"])
-
-    assert remove_result.exit_code == 0, remove_result.output
-    assert json.loads(remove_result.output) == {"ok": True, "removed": "work"}
-    assert json.loads(list_result.output)["profiles"] == {}
-
-
-def test_adapter_kb_remove_unknown_profile_errors(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    result = CliRunner().invoke(cli, ["adapter", "kb", "remove", "nope"])
-    assert result.exit_code != 0
-
-
-def test_adapter_kb_add_create_source_creates_and_stores_source_id(monkeypatch, tmp_path: Path):
-    vault_root = tmp_path / "vault"
-    vault_root.mkdir()
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({}, list_response={"data": []},
-                         create_response={"id": "src-new123", "type": "local_markdown"})
-
-    add_result = CliRunner().invoke(
-        cli,
-        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--vault-id", "engineering",
-         "--display-label", "Eng notes", "--create-source"],
-    )
-    list_result = CliRunner().invoke(cli, ["adapter", "kb", "list"])
-
-    assert add_result.exit_code == 0, add_result.output
-    payload = json.loads(add_result.output)
-    assert payload["source_id"] == "src-new123"
-    assert payload["source_reused"] is False
-    assert json.loads(list_result.output)["profiles"]["work"]["source_id"] == "src-new123"
-
-    create_calls = [c for c in FakeToolClient.calls if c[0] == "create_source"]
-    assert len(create_calls) == 1
-    assert create_calls[0][1]["source_type"] == "local_markdown"
-    assert create_calls[0][1]["config"]["vault_id"] == "engineering"
-    assert create_calls[0][1]["config"]["display_label"] == "Eng notes"
-
-
-def test_adapter_kb_add_create_source_reuses_existing_by_vault_id(monkeypatch, tmp_path: Path):
-    vault_root = tmp_path / "vault"
-    vault_root.mkdir()
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset(
-        {},
-        list_response={"data": [
-            {"id": "src-other", "type": "jira", "config": {"vault_id": "engineering"}},
-            {"id": "src-exist", "type": "local_markdown", "config": {"vault_id": "engineering"}},
-        ]},
-        create_response={"id": "should-not-be-used"},
-    )
-
-    add_result = CliRunner().invoke(
-        cli,
-        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--vault-id", "engineering", "--create-source"],
-    )
-
-    assert add_result.exit_code == 0, add_result.output
-    payload = json.loads(add_result.output)
-    assert payload["source_id"] == "src-exist"
-    assert payload["source_reused"] is True
-    assert not [c for c in FakeToolClient.calls if c[0] == "create_source"]
-
-
-def test_adapter_kb_add_create_source_reports_link_error_but_saves_profile(monkeypatch, tmp_path: Path):
-    vault_root = tmp_path / "vault"
-    vault_root.mkdir()
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({}, list_response={"error": "MemForge API unavailable", "detail": "connection refused"})
-
-    add_result = CliRunner().invoke(
-        cli,
-        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--vault-id", "engineering", "--create-source"],
-    )
-    list_result = CliRunner().invoke(cli, ["adapter", "kb", "list"])
-
-    assert add_result.exit_code == 0, add_result.output
-    payload = json.loads(add_result.output)
-    assert "source_id" not in payload
-    assert payload["source_link_error"] == "MemForge API unavailable"
-    assert json.loads(list_result.output)["profiles"]["work"]["root"] == str(vault_root)
-
-
-def test_adapter_kb_push_uses_profile_source_id_when_omitted(monkeypatch, tmp_path: Path):
-    vault_root = tmp_path / "vault"
-    (vault_root / "notes").mkdir(parents=True)
-    (vault_root / "notes" / "a.md").write_text("# A\n\nbody", encoding="utf-8")
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({"doc_id": "d1", "document_hash": "h1"},
-                         list_response={"data": []}, create_response={"id": "src-stored"})
-
-    CliRunner().invoke(cli, ["adapter", "kb", "add", "work", "--root", str(vault_root),
-                             "--vault-id", "engineering", "--create-source"])
-    push_result = CliRunner().invoke(cli, ["adapter", "kb", "push", "work"])
-
-    assert push_result.exit_code == 0, push_result.output
-    payload = json.loads(push_result.output)
-    assert payload["source_id"] == "src-stored"
-    push_calls = [c for c in FakeToolClient.calls if c[0] == "push_local_markdown_document"]
-    assert push_calls and push_calls[0][1]["source_id"] == "src-stored"
-
-
-def test_adapter_kb_push_explicit_source_id_overrides_profile(monkeypatch, tmp_path: Path):
-    vault_root = tmp_path / "vault"
-    (vault_root / "notes").mkdir(parents=True)
-    (vault_root / "notes" / "a.md").write_text("# A\n\nbody", encoding="utf-8")
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({"doc_id": "d1", "document_hash": "h1"},
-                         list_response={"data": []}, create_response={"id": "src-stored"})
-
-    CliRunner().invoke(cli, ["adapter", "kb", "add", "work", "--root", str(vault_root),
-                             "--vault-id", "engineering", "--create-source"])
-    push_result = CliRunner().invoke(cli, ["adapter", "kb", "push", "work", "--source-id", "src-explicit"])
-
-    assert push_result.exit_code == 0, push_result.output
-    assert json.loads(push_result.output)["source_id"] == "src-explicit"
-
-
-def test_adapter_kb_push_without_any_source_id_errors(monkeypatch, tmp_path: Path):
-    vault_root = tmp_path / "vault"
-    vault_root.mkdir()
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({})
-
-    CliRunner().invoke(cli, ["adapter", "kb", "add", "work", "--root", str(vault_root)])
-    push_result = CliRunner().invoke(cli, ["adapter", "kb", "push", "work"])
-
-    assert push_result.exit_code != 0
-
-
-def test_adapter_kb_add_without_create_source_makes_no_api_calls(monkeypatch, tmp_path: Path):
-    vault_root = tmp_path / "vault"
-    vault_root.mkdir()
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({})
-
-    add_result = CliRunner().invoke(
-        cli, ["adapter", "kb", "add", "work", "--root", str(vault_root)],
-    )
-
-    assert add_result.exit_code == 0, add_result.output
-    assert FakeToolClient.calls == []
-    assert "source_id" not in json.loads(add_result.output)
-
-
-def test_adapter_kb_preview_scans_markdown_profile(monkeypatch, tmp_path: Path):
-    adapter_config = tmp_path / "adapter.toml"
-    vault_root = tmp_path / "vault"
-    (vault_root / "notes").mkdir(parents=True)
-    (vault_root / ".obsidian").mkdir()
-    (vault_root / "notes" / "cutoff.md").write_text("# Cutoff\n\nA durable note.", encoding="utf-8")
-    (vault_root / ".obsidian" / "workspace.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
-
-    add_result = CliRunner().invoke(
-        cli,
-        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--exclude", ".obsidian/**"],
-    )
-    preview_result = CliRunner().invoke(cli, ["adapter", "kb", "preview", "work", "--limit", "5"])
-
-    assert add_result.exit_code == 0, add_result.output
-    assert preview_result.exit_code == 0, preview_result.output
-    payload = json.loads(preview_result.output)
-    assert payload["profile"] == "work"
-    assert payload["counts"]["included"] == 1
-    assert payload["items"][0]["relative_path"] == "notes/cutoff.md"
-    assert payload["items"][0]["content_type"] == "text/markdown"
-
-
-def test_adapter_kb_custom_excludes_keep_default_safety_excludes(monkeypatch, tmp_path: Path):
-    adapter_config = tmp_path / "adapter.toml"
-    vault_root = tmp_path / "vault"
-    (vault_root / ".obsidian").mkdir(parents=True)
-    (vault_root / "archive").mkdir()
-    (vault_root / "notes").mkdir()
-    (vault_root / ".obsidian" / "private.md").write_text("# Private\n", encoding="utf-8")
-    (vault_root / "archive" / "old.md").write_text("# Old\n", encoding="utf-8")
-    (vault_root / "notes" / "live.md").write_text("# Live\n", encoding="utf-8")
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
-
-    add_result = CliRunner().invoke(
-        cli,
-        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--exclude", "archive/**"],
-    )
-    preview_result = CliRunner().invoke(cli, ["adapter", "kb", "preview", "work", "--limit", "10"])
-
-    assert add_result.exit_code == 0, add_result.output
-    assert preview_result.exit_code == 0, preview_result.output
-    payload = json.loads(preview_result.output)
-    assert payload["counts"]["included"] == 1
-    assert [item["relative_path"] for item in payload["items"]] == ["notes/live.md"]
-
-
-def test_adapter_kb_preview_rejects_missing_root(monkeypatch, tmp_path: Path):
-    adapter_config = tmp_path / "adapter.toml"
-    adapter_config.write_text('[kb."bad"]\nvault_id = "bad"\ninclude = ["*.md"]\n', encoding="utf-8")
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
-
-    result = CliRunner().invoke(cli, ["adapter", "kb", "preview", "bad"])
-
-    assert result.exit_code != 0
-    assert "root is required" in result.output
-
-
-def test_adapter_kb_preview_does_not_follow_symlink_escape(monkeypatch, tmp_path: Path):
-    adapter_config = tmp_path / "adapter.toml"
-    vault_root = tmp_path / "vault"
-    vault_root.mkdir()
-    outside = tmp_path / "outside.md"
-    outside.write_text("# Outside\n", encoding="utf-8")
-    try:
-        (vault_root / "leak.md").symlink_to(outside)
-    except OSError as exc:
-        pytest.skip(f"symlink unavailable: {exc}")
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
-
-    add_result = CliRunner().invoke(cli, ["adapter", "kb", "add", "work", "--root", str(vault_root)])
-    preview_result = CliRunner().invoke(cli, ["adapter", "kb", "preview", "work", "--limit", "10"])
-
-    assert add_result.exit_code == 0, add_result.output
-    assert preview_result.exit_code == 0, preview_result.output
-    payload = json.loads(preview_result.output)
-    assert payload["counts"]["included"] == 0
-    assert payload["counts"]["ignored"] == 1
-
-
-def test_adapter_kb_push_forwards_documents_to_service(monkeypatch, tmp_path: Path):
-    adapter_config = tmp_path / "adapter.toml"
-    vault_root = tmp_path / "vault"
-    (vault_root / "decisions").mkdir(parents=True)
-    (vault_root / "decisions" / "cutoff.md").write_text("# Cutoff\n\nTuesday.", encoding="utf-8")
-    (vault_root / "decisions" / "release.md").write_text("# Release\n\nThursday.", encoding="utf-8")
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({"doc_id": "local-md-fake", "document_hash": "abc123"})
-
-    add_result = CliRunner().invoke(
-        cli,
-        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--vault-id", "engineering"],
-    )
-    push_result = CliRunner().invoke(
-        cli,
-        ["adapter", "kb", "push", "work", "--source-id", "src-abcd1234", "--submitted-by", "cli-test"],
-    )
-
-    assert add_result.exit_code == 0, add_result.output
-    assert push_result.exit_code == 0, push_result.output
-    payload = json.loads(push_result.output)
-    assert payload["counts"]["pushed"] == 2
-    assert payload["counts"]["failed"] == 0
-    assert payload["source_id"] == "src-abcd1234"
-    assert payload["vault_id"] == "engineering"
-    relative_paths = sorted(item["relative_path"] for item in payload["pushed"])
-    assert relative_paths == ["decisions/cutoff.md", "decisions/release.md"]
-
-    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_local_markdown_document"]
-    assert len(push_calls) == 2
-    first_kwargs = push_calls[0][1]
-    assert first_kwargs["source_id"] == "src-abcd1234"
-    assert first_kwargs["vault_id"] == "engineering"
-    assert first_kwargs["submitted_by"] == "cli-test"
-    assert first_kwargs["process_now"] is False
-    # The CLI now sends raw file text tagged with a content type; conversion is server-side.
-    assert first_kwargs["markdown_body"] == "# Cutoff\n\nTuesday."
-    assert first_kwargs["content_type"] == "text/markdown"
-
-
-def test_adapter_kb_push_process_now_triggers_on_last_document(monkeypatch, tmp_path: Path):
-    adapter_config = tmp_path / "adapter.toml"
-    vault_root = tmp_path / "vault"
-    (vault_root / "notes").mkdir(parents=True)
-    (vault_root / "notes" / "first.md").write_text("# First\n", encoding="utf-8")
-    (vault_root / "notes" / "second.md").write_text("# Second\n", encoding="utf-8")
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({"doc_id": "local-md-fake", "document_hash": "abc123"})
-
-    add_result = CliRunner().invoke(
-        cli,
-        ["adapter", "kb", "add", "work", "--root", str(vault_root), "--vault-id", "engineering"],
-    )
-    push_result = CliRunner().invoke(
-        cli,
-        ["adapter", "kb", "push", "work", "--source-id", "src-abcd1234", "--process-now"],
-    )
-
-    assert add_result.exit_code == 0, add_result.output
-    assert push_result.exit_code == 0, push_result.output
-    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_local_markdown_document"]
-    assert [call[1]["process_now"] for call in push_calls] == [False, True]
-
-
-def test_adapter_kb_push_reports_service_errors(monkeypatch, tmp_path: Path):
-    adapter_config = tmp_path / "adapter.toml"
-    vault_root = tmp_path / "vault"
-    vault_root.mkdir()
-    (vault_root / "doc.md").write_text("# Doc\n", encoding="utf-8")
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(adapter_config))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({"error": "MemForge API request failed", "status_code": 400, "detail": "vault mismatch"})
-
-    add_result = CliRunner().invoke(
-        cli, ["adapter", "kb", "add", "work", "--root", str(vault_root), "--vault-id", "engineering"]
-    )
-    push_result = CliRunner().invoke(
-        cli, ["adapter", "kb", "push", "work", "--source-id", "src-bad"]
-    )
-
-    assert add_result.exit_code == 0, add_result.output
-    assert push_result.exit_code != 0
-    payload = json.loads(push_result.output)
-    assert payload["counts"]["failed"] == 1
-    assert payload["failed"][0]["status_code"] == 400
-    assert "error" in payload
-
-
-def test_adapter_github_add_and_preview_uses_local_gh_tree(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-
-    def fake_run(cmd, *, capture_output, text, env=None, check=False):
-        assert cmd[:2] == ["gh", "api"]
-        assert env["GH_HOST"] == "github.wdf.sap.corp"
-        assert cmd[2] == "repos/nextgenpayroll-matterhorn/architecture/git/trees/main?recursive=1"
-
-        class Result:
-            returncode = 0
-            stdout = json.dumps(
-                {
-                    "tree": [
-                        {"path": "Payroll Processing/README.md", "type": "blob", "sha": "md-sha", "size": 10},
-                        {"path": "Payroll Processing/images/diagram.png", "type": "blob", "sha": "png-sha", "size": 20},
-                        {"path": "Flexible Payroll/README.md", "type": "blob", "sha": "other-sha", "size": 30},
-                    ]
-                }
-            )
-            stderr = ""
-
-        return Result()
-
-    monkeypatch.setattr(main.subprocess, "run", fake_run)
-
-    add_result = CliRunner().invoke(
-        cli,
-        [
-            "adapter",
-            "github",
-            "add",
-            "matterhorn",
-            "--repo-url",
-            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
-            "--ref",
-            "main",
-            "--include-path",
-            "Payroll Processing/",
-            "--include-extension",
-            "md",
-        ],
-    )
-    preview_result = CliRunner().invoke(cli, ["adapter", "github", "preview", "matterhorn", "--limit", "5"])
-
-    assert add_result.exit_code == 0, add_result.output
-    assert preview_result.exit_code == 0, preview_result.output
-    payload = json.loads(preview_result.output)
-    assert payload["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
-    assert payload["counts"]["included"] == 1
-    assert payload["counts"]["ignored"] == 2
-    assert payload["extension_counts"] == {"md": 1, "png": 1}
-    assert payload["items"][0]["relative_path"] == "Payroll Processing/README.md"
-
-
-def test_adapter_github_add_help_uses_access_copy_not_internal_mode():
-    result = CliRunner().invoke(cli, ["adapter", "github", "add", "--help"])
-    normalized_output = " ".join(result.output.split())
-
-    assert result.exit_code == 0, result.output
-    assert "Internal network / VPN repositories" in normalized_output
-    assert "local_push" not in result.output
-    assert "cloud_pull" not in result.output
-
-
-def test_adapter_github_remove_deletes_profile(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-
-    add_result = CliRunner().invoke(
-        cli,
-        [
-            "adapter",
-            "github",
-            "add",
-            "matterhorn",
-            "--repo-url",
-            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
-        ],
-    )
-    remove_result = CliRunner().invoke(cli, ["adapter", "github", "remove", "matterhorn"])
-    list_result = CliRunner().invoke(cli, ["adapter", "github", "list"])
-
-    assert add_result.exit_code == 0, add_result.output
-    assert remove_result.exit_code == 0, remove_result.output
-    assert json.loads(remove_result.output) == {"ok": True, "removed": "matterhorn"}
-    assert json.loads(list_result.output)["profiles"] == {}
-
-
-def test_adapter_github_remove_unknown_profile_errors(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-
-    result = CliRunner().invoke(cli, ["adapter", "github", "remove", "nope"])
-
-    assert result.exit_code != 0
-
-
 def _init_github_local_clone(
     tmp_path: Path,
     *,
@@ -1154,167 +679,6 @@ def _init_github_local_clone(
         text=True,
     )
     return repo
-
-
-def test_adapter_github_local_clone_accepts_credentialed_https_remote(monkeypatch, tmp_path: Path):
-    repo = _init_github_local_clone(
-        tmp_path,
-        remote_url="https://x-access-token:SECRET_TOKEN@github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture.git",
-    )
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-
-    result = CliRunner().invoke(
-        cli,
-        [
-            "adapter",
-            "github",
-            "add",
-            "matterhorn",
-            "--repo-url",
-            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
-            "--repo-path",
-            str(repo),
-            "--ref",
-            "main",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "SECRET_TOKEN" not in result.output
-
-
-def test_adapter_github_local_clone_mismatch_redacts_credentialed_remote(monkeypatch, tmp_path: Path):
-    repo = _init_github_local_clone(
-        tmp_path,
-        remote_url="https://x-access-token:SECRET_TOKEN@github.wdf.sap.corp/other-org/other-repo.git",
-    )
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-
-    result = CliRunner().invoke(
-        cli,
-        [
-            "adapter",
-            "github",
-            "add",
-            "matterhorn",
-            "--repo-url",
-            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
-            "--repo-path",
-            str(repo),
-            "--ref",
-            "main",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "does not match configured repo_url" in result.output
-    assert "SECRET_TOKEN" not in result.output
-    assert "x-access-token" not in result.output
-
-
-def test_adapter_github_preview_can_use_local_clone_without_gh_api(monkeypatch, tmp_path: Path):
-    repo = _init_github_local_clone(tmp_path)
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    original_run = main.subprocess.run
-
-    def fake_run(cmd, *args, **kwargs):
-        if cmd[:2] == ["gh", "api"]:
-            raise AssertionError("repo_path preview must not call gh api")
-        return original_run(cmd, *args, **kwargs)
-
-    monkeypatch.setattr(main.subprocess, "run", fake_run)
-
-    add_result = CliRunner().invoke(
-        cli,
-        [
-            "adapter",
-            "github",
-            "add",
-            "matterhorn",
-            "--repo-url",
-            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
-            "--repo-path",
-            str(repo),
-            "--ref",
-            "main",
-            "--include-path",
-            "Payroll Processing V2",
-            "--include-extension",
-            "md",
-            "--include-extension",
-            "puml",
-        ],
-    )
-    preview_result = CliRunner().invoke(cli, ["adapter", "github", "preview", "matterhorn", "--limit", "10"])
-
-    assert add_result.exit_code == 0, add_result.output
-    assert preview_result.exit_code == 0, preview_result.output
-    payload = json.loads(preview_result.output)
-    assert payload["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
-    assert payload["repo_path"] == str(repo.resolve())
-    assert payload["counts"] == {"included": 3, "ignored": 2}
-    assert payload["extension_counts"] == {"md": 2, "png": 1, "puml": 1}
-    assert [item["relative_path"] for item in payload["items"]] == [
-        "Payroll Processing V2/README.md",
-        "Payroll Processing V2/images/Flow.puml",
-        "Payroll Processing V2/Überblick.md",
-    ]
-
-
-def test_adapter_github_push_can_read_local_clone_without_gh_api(monkeypatch, tmp_path: Path):
-    repo = _init_github_local_clone(tmp_path)
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
-    original_run = main.subprocess.run
-
-    def fake_run(cmd, *args, **kwargs):
-        if cmd[:2] == ["gh", "api"]:
-            raise AssertionError("repo_path push must not call gh api")
-        return original_run(cmd, *args, **kwargs)
-
-    monkeypatch.setattr(main.subprocess, "run", fake_run)
-    expected_blob_sha = original_run(
-        ["git", "-C", str(repo), "rev-parse", "main:Payroll Processing V2/README.md"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-
-    add_result = CliRunner().invoke(
-        cli,
-        [
-            "adapter",
-            "github",
-            "add",
-            "matterhorn",
-            "--repo-url",
-            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
-            "--repo-path",
-            str(repo),
-            "--ref",
-            "main",
-            "--include-path",
-            "Payroll Processing V2",
-            "--include-extension",
-            "md",
-        ],
-    )
-    push_result = CliRunner().invoke(
-        cli, ["adapter", "github", "push", "matterhorn", "--source-id", "src-gh", "--limit", "1"]
-    )
-
-    assert add_result.exit_code == 0, add_result.output
-    assert push_result.exit_code == 0, push_result.output
-    payload = json.loads(push_result.output)
-    assert payload["counts"]["pushed"] == 1
-    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
-    assert len(push_calls) == 1
-    kwargs = push_calls[0][1]
-    assert kwargs["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
-    assert kwargs["relative_path"] == "Payroll Processing V2/README.md"
-    assert kwargs["blob_sha"] == expected_blob_sha
-    assert kwargs["markdown_body"] == "# Payroll Processing V2\n\nBody"
 
 
 def test_local_agent_cloud_github_preview_uses_job_payload_without_profile(monkeypatch, tmp_path: Path):
@@ -1370,6 +734,7 @@ def test_local_agent_cloud_github_sync_pushes_job_source_and_snapshot(monkeypatc
     payload = main._run_cloud_local_agent_job(
         {
             "job_id": "laj-sync",
+            "attempt_count": 1,
             "workspace_id": "ws-from-cloud",
             "operation": "github_repo_sync",
             "source_id": "src-from-cloud",
@@ -1380,7 +745,6 @@ def test_local_agent_cloud_github_sync_pushes_job_source_and_snapshot(monkeypatc
                 "include_paths": ["Payroll Processing V2"],
                 "include_extensions": ["md"],
                 "limit": 1,
-                "process_now": True,
             },
         },
         FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
@@ -1388,16 +752,21 @@ def test_local_agent_cloud_github_sync_pushes_job_source_and_snapshot(monkeypatc
 
     assert payload["operation"] == "github_repo_sync"
     assert payload["source_id"] == "src-from-cloud"
-    assert payload["counts"] == {"selected": 1, "pushed": 1, "failed": 0}
+    assert payload["counts"] == {"selected": 2, "pushed": 2, "failed": 0}
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
-    assert len(push_calls) == 1
+    assert len(push_calls) == 2
     kwargs = push_calls[0][1]
     assert kwargs["workspace_id"] == "ws-from-cloud"
     assert kwargs["source_id"] == "src-from-cloud"
     assert kwargs["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
     assert kwargs["relative_path"] == "Payroll Processing V2/README.md"
-    assert kwargs["process_now"] is True
+    assert "process_now" not in kwargs
     assert kwargs["submitted_by"] == "memforge-local-agent"
+    assert kwargs["sync_snapshot_id"] == "laj-sync:attempt:1"
+    process_calls = [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
+    assert len(process_calls) == 1
+    assert process_calls[0][1]["source_id"] == "src-from-cloud"
+    assert process_calls[0][1]["sync_snapshot_id"] == "laj-sync:attempt:1"
 
 
 def test_local_agent_cloud_github_sync_requires_job_workspace(monkeypatch, tmp_path: Path):
@@ -1487,6 +856,26 @@ def test_local_agent_cloud_local_markdown_pick_root_uses_local_picker(monkeypatc
     assert calls == [{"title": "Choose folder to sync", "initial_directory": str(tmp_path)}]
 
 
+def test_local_agent_cloud_github_pick_root_uses_local_picker(monkeypatch, tmp_path: Path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    monkeypatch.setattr(main, "pick_folder", lambda **kwargs: str(repository))
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-github-pick-root",
+            "operation": "github_repo_pick_root",
+            "payload": {"title": "Choose repository"},
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload == {
+        "operation": "github_repo_pick_root",
+        "root": str(repository),
+    }
+
+
 def test_local_agent_cloud_local_markdown_pick_root_reports_cancellation(monkeypatch):
     def fake_pick_folder(*, title: str | None = None, initial_directory: str | None = None) -> str:
         raise main.FolderPickerCancelled("folder selection cancelled")
@@ -1538,12 +927,14 @@ def test_local_agent_cloud_local_markdown_sync_pushes_workspace_source(monkeypat
     root = tmp_path / "notes"
     root.mkdir()
     (root / "Decision.md").write_text("# Decision\n\nUse the daemon.", encoding="utf-8")
+    (root / "Runbook.md").write_text("# Runbook\n\nRestart safely.", encoding="utf-8")
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
     FakeToolClient.reset({"doc_id": "local-doc", "document_hash": "hash"})
 
     payload = main._run_cloud_local_agent_job(
         {
             "job_id": "laj-local-sync",
+            "attempt_count": 2,
             "workspace_id": "ws-from-cloud",
             "operation": "local_markdown_sync",
             "source_id": "src-local",
@@ -1553,7 +944,6 @@ def test_local_agent_cloud_local_markdown_sync_pushes_workspace_source(monkeypat
                 "include": ["*.md", "**/*.md"],
                 "exclude": [],
                 "limit": 1,
-                "process_now": True,
             },
         },
         FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
@@ -1561,15 +951,59 @@ def test_local_agent_cloud_local_markdown_sync_pushes_workspace_source(monkeypat
 
     assert payload["operation"] == "local_markdown_sync"
     assert payload["source_id"] == "src-local"
-    assert payload["counts"]["pushed"] == 1
+    assert payload["counts"]["pushed"] == 2
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_local_markdown_document"]
-    assert len(push_calls) == 1
+    assert len(push_calls) == 2
     kwargs = push_calls[0][1]
     assert kwargs["workspace_id"] == "ws-from-cloud"
     assert kwargs["source_id"] == "src-local"
     assert kwargs["vault_id"] == "engineering"
     assert kwargs["relative_path"] == "Decision.md"
-    assert kwargs["process_now"] is True
+    assert kwargs["sync_snapshot_id"] == "laj-local-sync:attempt:2"
+    assert "process_now" not in kwargs
+    process_calls = [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
+    assert len(process_calls) == 1
+    assert process_calls[0][1]["source_id"] == "src-local"
+    assert process_calls[0][1]["sync_snapshot_id"] == "laj-local-sync:attempt:2"
+
+
+def test_local_agent_cloud_local_markdown_sync_publishes_empty_snapshot(monkeypatch, tmp_path: Path):
+    root = tmp_path / "empty-notes"
+    root.mkdir()
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"ok": True})
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-empty-snapshot",
+            "attempt_count": 1,
+            "workspace_id": "ws-from-cloud",
+            "operation": "local_markdown_sync",
+            "source_id": "src-local",
+            "payload": {
+                "root": str(root),
+                "vault_id": "engineering",
+                "include": ["*.md", "**/*.md"],
+                "exclude": [],
+            },
+        },
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert payload["counts"]["pushed"] == 0
+    process_calls = [call[1] for call in FakeToolClient.calls if call[0] == "start_source_processing"]
+    assert process_calls == [
+        {
+            "api_url": "https://memforge.example.test",
+            "api_token": "tok",
+            "workspace_id": "ws-from-cloud",
+            "source_id": "src-local",
+                "force_full_sync": False,
+                "sync_snapshot_id": "laj-empty-snapshot:attempt:1",
+                "local_agent_job_id": "laj-empty-snapshot",
+                "local_agent_attempt_count": 1,
+            }
+    ]
 
 
 def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
@@ -1637,6 +1071,7 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
     payload = main._run_cloud_local_agent_job(
         {
             "job_id": "laj-jira-sync",
+            "attempt_count": 3,
             "workspace_id": "ws-from-cloud",
             "operation": "jira_sync",
             "source_id": "src-jira",
@@ -1648,7 +1083,6 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
                 "pat": "must-not-enter-daemon-runtime-config",
                 "projects": ["PAY"],
                 "limit": 1,
-                "process_now": True,
             },
         },
         FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
@@ -1665,20 +1099,23 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
     assert kwargs["base_url"] == "https://jira.example.test"
     assert kwargs["issue_key"] == "PAY-1"
     assert kwargs["raw_payload"]["fields"]["summary"] == "Create daemon source support"
+    assert kwargs["sync_snapshot_id"] == "laj-jira-sync:attempt:3"
     assert "markdown_body" not in kwargs
-    assert kwargs["process_now"] is False
-    sync_calls = [call for call in FakeToolClient.calls if call[0] == "start_source_sync"]
-    assert len(sync_calls) == 1
-    assert sync_calls[0][1]["source_id"] == "src-jira"
+    assert "process_now" not in kwargs
+    process_calls = [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
+    assert len(process_calls) == 1
+    assert process_calls[0][1]["source_id"] == "src-jira"
+    assert process_calls[0][1]["sync_snapshot_id"] == "laj-jira-sync:attempt:3"
 
 
 def test_local_agent_cloud_jira_sync_rejects_pat_payload():
     FakeToolClient.reset({"doc_id": "jira-doc", "document_hash": "hash"})
 
     payload = main._run_cloud_local_agent_job(
-        {
-            "job_id": "laj-jira-sync",
-            "workspace_id": "ws-from-cloud",
+            {
+                "job_id": "laj-jira-sync",
+                "attempt_count": 1,
+                "workspace_id": "ws-from-cloud",
             "operation": "jira_sync",
             "source_id": "src-jira",
             "payload": {
@@ -1697,7 +1134,7 @@ def test_local_agent_cloud_jira_sync_rejects_pat_payload():
     assert not [call for call in FakeToolClient.calls if call[0] == "push_jira_package"]
 
 
-def test_local_agent_cloud_jira_sync_starts_source_sync_when_last_push_fails(monkeypatch):
+def test_local_agent_cloud_jira_sync_does_not_publish_partial_snapshot(monkeypatch):
     from datetime import datetime, timezone
 
     from memforge.auth import jira_capture
@@ -1764,6 +1201,7 @@ def test_local_agent_cloud_jira_sync_starts_source_sync_when_last_push_fails(mon
     payload = main._run_cloud_local_agent_job(
         {
             "job_id": "laj-jira-sync",
+            "attempt_count": 1,
             "workspace_id": "ws-from-cloud",
             "operation": "jira_sync",
             "source_id": "src-jira",
@@ -1773,7 +1211,6 @@ def test_local_agent_cloud_jira_sync_starts_source_sync_when_last_push_fails(mon
                 "sync_mode": "local_agent",
                 "local_agent_documents_dir": "/srv/memforge/inbox/src-jira",
                 "projects": ["PAY"],
-                "process_now": True,
             },
         },
         FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
@@ -1781,14 +1218,12 @@ def test_local_agent_cloud_jira_sync_starts_source_sync_when_last_push_fails(mon
     )
 
     assert payload["counts"] == {"selected": 2, "pushed": 1, "failed": 1}
+    assert payload["retryable"] is True
     push_calls = [call[1] for call in FakeToolClient.calls if call[0] == "push_jira_package"]
-    assert [(call["issue_key"], call["process_now"]) for call in push_calls] == [
-        ("PAY-1", False),
-        ("PAY-2", False),
-    ]
-    sync_calls = [call[1] for call in FakeToolClient.calls if call[0] == "start_source_sync"]
-    assert len(sync_calls) == 1
-    assert sync_calls[0]["source_id"] == "src-jira"
+    assert [call["issue_key"] for call in push_calls] == ["PAY-1", "PAY-2"]
+    assert all("process_now" not in call for call in push_calls)
+    process_calls = [call[1] for call in FakeToolClient.calls if call[0] == "start_source_processing"]
+    assert process_calls == []
 
 
 def test_local_agent_cloud_teams_auth_captures_session(monkeypatch):
@@ -2116,7 +1551,6 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
         return {
             "doc_id": "teams-doc",
             "document_hash": "hash",
-            "sync_started": bool(kwargs.get("process_now")),
         }
 
     monkeypatch.setattr(FakeToolClient, "push_teams_window_package", fake_push_teams_window_package)
@@ -2129,11 +1563,11 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
             "job_id": "laj-teams-sync",
             "workspace_id": "ws-from-cloud",
             "operation": "teams_sync",
+            "attempt_count": 1,
             "source_id": "src-teams",
             "payload": {
                 "conversation_gap_minutes": 60,
                 "limit": 2,
-                "process_now": True,
                 "audit_log_path": str(audit_log_path),
                 "ledger_state_path": str(ledger_state_path),
             },
@@ -2157,9 +1591,11 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     assert first["raw_payload"]["messages"][0]["content"] == "Thread window"
     assert "markdown_body" not in first
     assert "last_modified" not in first
-    assert first["process_now"] is False
-    assert push_calls[1][1]["process_now"] is True
-    assert not [call for call in FakeToolClient.calls if call[0] == "start_source_sync"]
+    assert "process_now" not in first
+    assert "process_now" not in push_calls[1][1]
+    process_calls = [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
+    assert len(process_calls) == 1
+    assert process_calls[0][1]["source_id"] == "src-teams"
 
     audit_rows = [json.loads(line) for line in audit_log_path.read_text(encoding="utf-8").splitlines()]
     assert [row["event"] for row in audit_rows] == [
@@ -2243,6 +1679,7 @@ def test_local_agent_cloud_teams_sync_reauths_after_stale_session(monkeypatch, t
             "job_id": "laj-teams-sync",
             "workspace_id": "ws-from-cloud",
             "operation": "teams_sync",
+            "attempt_count": 1,
             "source_id": "src-teams",
             "payload": {
                 "conversation_ids": "19:conversation@thread.tacv2",
@@ -2299,9 +1736,9 @@ def test_local_agent_cloud_teams_sync_reports_push_failure_without_generic_sourc
             "job_id": "laj-teams-sync",
             "workspace_id": "ws-from-cloud",
             "operation": "teams_sync",
+            "attempt_count": 1,
             "source_id": "src-teams",
             "payload": {
-                "process_now": True,
                 "audit_log_path": str(audit_log_path),
                 "ledger_state_path": str(ledger_state_path),
             },
@@ -2312,7 +1749,8 @@ def test_local_agent_cloud_teams_sync_reports_push_failure_without_generic_sourc
     assert payload["counts"] == {"selected": 1, "pushed": 0, "failed": 1, "skipped_existing": 0, "polls": 0}
     assert payload["sync_started"] is False
     assert payload["error"] == "one or more Teams windows failed to push"
-    assert not [call for call in FakeToolClient.calls if call[0] == "start_source_sync"]
+    assert payload["retryable"] is True
+    assert not [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
 
     audit_rows = [json.loads(line) for line in audit_log_path.read_text(encoding="utf-8").splitlines()]
     assert audit_rows[-1]["event"] == "teams_sync_run"
@@ -2352,9 +1790,9 @@ def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypat
         "job_id": "laj-teams-sync",
         "workspace_id": "ws-from-cloud",
         "operation": "teams_sync",
+        "attempt_count": 1,
         "source_id": "src-teams",
         "payload": {
-            "process_now": True,
             "audit_log_path": str(audit_log_path),
             "ledger_state_path": str(ledger_state_path),
         },
@@ -2376,7 +1814,7 @@ def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypat
 
     assert second["counts"] == {"selected": 1, "pushed": 0, "failed": 0, "skipped_existing": 1, "polls": 0}
     assert not [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
-    assert not [call for call in FakeToolClient.calls if call[0] == "start_source_sync"]
+    assert not [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
 
     audit_rows = [json.loads(line) for line in audit_log_path.read_text(encoding="utf-8").splitlines()]
     second_run = [row for row in audit_rows if row["run_id"] == "laj-teams-sync-retry"]
@@ -2385,6 +1823,72 @@ def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypat
     assert second_run[0]["receipt_status"] == "existing"
     assert second_run[0]["receipt_skip_reason"] == "receipt_exists"
     assert second_run[-1]["skipped_existing_windows"] == 1
+
+
+def test_local_agent_cloud_teams_sync_retries_window_when_processing_was_not_accepted(
+    monkeypatch,
+    tmp_path: Path,
+):
+    async def fake_collect(job, *, source_id, limit):
+        return [
+            {
+                "conversation_id": "19:conversation@thread.tacv2",
+                "root_message_id": "1783500000000",
+                "window_id": "teams-thread:v1:retry-window",
+                "window_type": "thread",
+                "revision_hash": "sha256:revision-retry",
+                "title": "Retry window",
+                "source_url": "https://teams.microsoft.com/l/message/retry",
+                "raw_payload": {"messages": [{"id": "1783500000000", "content": "Retry me"}]},
+                "raw_hash": "sha256:raw-retry",
+                "message_count": 1,
+            }
+        ]
+
+    processing_results = [
+        {"error": "service restarting"},
+        {"run_id": "run-accepted"},
+    ]
+
+    def start_source_processing(self, **kwargs):
+        self.calls.append(("start_source_processing", kwargs))
+        return processing_results.pop(0)
+
+    monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect, raising=False)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    monkeypatch.setattr(FakeToolClient, "start_source_processing", start_source_processing)
+    audit_log_path = tmp_path / "teams-audit.jsonl"
+    ledger_state_path = tmp_path / "teams-ledger.json"
+    job = {
+        "job_id": "laj-teams-retry",
+        "workspace_id": "ws-from-cloud",
+        "operation": "teams_sync",
+        "attempt_count": 1,
+        "source_id": "src-teams",
+        "payload": {
+            "audit_log_path": str(audit_log_path),
+            "ledger_state_path": str(ledger_state_path),
+        },
+    }
+
+    FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
+    first = main._run_cloud_local_agent_job(
+        job,
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+    assert first["error"] == "source processing failed to start"
+    assert first["retryable"] is True
+
+    FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
+    second = main._run_cloud_local_agent_job(
+        {**job, "job_id": "laj-teams-retry-2"},
+        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+    )
+
+    assert second["sync_started"] is True
+    assert second["counts"]["pushed"] == 1
+    assert second["counts"]["skipped_existing"] == 0
+    assert len([call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]) == 1
 
 
 def test_local_agent_cloud_teams_sync_writes_conversation_poll_audit(monkeypatch, tmp_path: Path):
@@ -2445,9 +1949,9 @@ def test_local_agent_cloud_teams_sync_writes_conversation_poll_audit(monkeypatch
             "job_id": "laj-teams-sync",
             "workspace_id": "ws-from-cloud",
             "operation": "teams_sync",
+            "attempt_count": 1,
             "source_id": "src-teams",
             "payload": {
-                "process_now": True,
                 "audit_log_path": str(audit_log_path),
                 "ledger_state_path": str(ledger_state_path),
             },
@@ -2672,300 +2176,6 @@ async def _capture_collect_teams_documents_error(job):
     except ValueError as exc:
         return str(exc)
     return None
-
-
-def test_adapter_github_preview_rejects_truncated_tree(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-
-    def fake_run(cmd, *, capture_output, text, env=None, check=False):
-        assert cmd[:2] == ["gh", "api"]
-
-        class Result:
-            returncode = 0
-            stdout = json.dumps({"tree": [], "truncated": True})
-            stderr = ""
-
-        return Result()
-
-    monkeypatch.setattr(main.subprocess, "run", fake_run)
-
-    add_result = CliRunner().invoke(
-        cli,
-        [
-            "adapter",
-            "github",
-            "add",
-            "matterhorn",
-            "--repo-url",
-            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
-            "--ref",
-            "main",
-            "--include-extension",
-            "md",
-        ],
-    )
-    preview_result = CliRunner().invoke(cli, ["adapter", "github", "preview", "matterhorn"])
-
-    assert add_result.exit_code == 0, add_result.output
-    assert preview_result.exit_code != 0
-    assert "truncated" in preview_result.output
-    assert "Internal network / VPN" in preview_result.output
-    assert "local_push" not in preview_result.output
-    assert "cloud_pull" not in preview_result.output
-
-
-def test_adapter_github_push_rejects_malformed_base64_content(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
-
-    def fake_run(cmd, *, capture_output, text, env=None, check=False):
-        assert cmd[:2] == ["gh", "api"]
-
-        class Result:
-            returncode = 0
-            stderr = ""
-
-        result = Result()
-        if cmd[2].endswith("/git/trees/main?recursive=1"):
-            result.stdout = json.dumps(
-                {"tree": [{"path": "docs/broken.md", "type": "blob", "sha": "broken-sha", "size": 10}]}
-            )
-            return result
-        if cmd[2].endswith("/contents/docs/broken.md?ref=main"):
-            result.stdout = json.dumps({"encoding": "base64", "content": "!!!!", "size": 10})
-            return result
-        raise AssertionError(f"unexpected gh api call: {cmd}")
-
-    monkeypatch.setattr(main.subprocess, "run", fake_run)
-
-    add_result = CliRunner().invoke(
-        cli,
-        [
-            "adapter",
-            "github",
-            "add",
-            "repo",
-            "--repo-url",
-            "https://github.com/example/repo",
-            "--ref",
-            "main",
-            "--include-path",
-            "docs/",
-            "--include-extension",
-            "md",
-        ],
-    )
-    push_result = CliRunner().invoke(cli, ["adapter", "github", "push", "repo", "--source-id", "src-gh"])
-
-    assert add_result.exit_code == 0, add_result.output
-    assert push_result.exit_code != 0
-    payload = json.loads(push_result.output)
-    assert payload["counts"] == {"selected": 1, "pushed": 0, "failed": 1}
-    assert "base64" in payload["failed"][0]["error"]
-
-
-def test_adapter_github_push_uses_profile_source_id_and_pushes_content(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
-
-    def fake_run(cmd, *, capture_output, text, env=None, check=False):
-        assert cmd[:2] == ["gh", "api"]
-
-        class Result:
-            returncode = 0
-            stderr = ""
-
-        result = Result()
-        if cmd[2].endswith("/git/trees/main?recursive=1"):
-            result.stdout = json.dumps(
-                {
-                    "tree": [
-                        {
-                            "path": "Payroll Processing/README.md",
-                            "type": "blob",
-                            "sha": "md-sha",
-                            "size": 10,
-                        }
-                    ]
-                }
-            )
-            return result
-        if cmd[2].endswith("/contents/Payroll%20Processing/README.md?ref=main"):
-            import base64
-
-            result.stdout = json.dumps({"content": base64.b64encode(b"# Payroll Processing\n\nBody").decode()})
-            return result
-        raise AssertionError(f"unexpected gh api call: {cmd}")
-
-    monkeypatch.setattr(main.subprocess, "run", fake_run)
-
-    CliRunner().invoke(
-        cli,
-        [
-            "adapter",
-            "github",
-            "add",
-            "matterhorn",
-            "--repo-url",
-            "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
-            "--ref",
-            "main",
-            "--include-path",
-            "Payroll Processing/",
-            "--include-extension",
-            "md",
-        ],
-    )
-    push_result = CliRunner().invoke(
-        cli,
-        ["adapter", "github", "push", "matterhorn", "--source-id", "src-gh", "--submitted-by", "cli-test"],
-    )
-
-    assert push_result.exit_code == 0, push_result.output
-    payload = json.loads(push_result.output)
-    assert payload["counts"]["pushed"] == 1
-    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
-    assert len(push_calls) == 1
-    kwargs = push_calls[0][1]
-    assert kwargs["source_id"] == "src-gh"
-    assert kwargs["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
-    assert kwargs["repo_ref"] == "main"
-    assert kwargs["relative_path"] == "Payroll Processing/README.md"
-    assert kwargs["blob_sha"] == "md-sha"
-    assert kwargs["markdown_body"] == "# Payroll Processing\n\nBody"
-    assert kwargs["submitted_by"] == "cli-test"
-
-
-def test_adapter_github_push_limit_selects_first_matching_files(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
-
-    def fake_run(cmd, *, capture_output, text, env=None, check=False):
-        assert cmd[:2] == ["gh", "api"]
-
-        class Result:
-            returncode = 0
-            stderr = ""
-
-        result = Result()
-        if cmd[2].endswith("/git/trees/main?recursive=1"):
-            result.stdout = json.dumps(
-                {
-                    "tree": [
-                        {"path": "docs/first.md", "type": "blob", "sha": "first-sha", "size": 10},
-                        {"path": "docs/second.md", "type": "blob", "sha": "second-sha", "size": 10},
-                    ]
-                }
-            )
-            return result
-        if cmd[2].endswith("/contents/docs/first.md?ref=main"):
-            import base64
-
-            result.stdout = json.dumps({"content": base64.b64encode(b"# First\n").decode()})
-            return result
-        raise AssertionError(f"unexpected gh api call: {cmd}")
-
-    monkeypatch.setattr(main.subprocess, "run", fake_run)
-
-    add_result = CliRunner().invoke(
-        cli,
-        [
-            "adapter",
-            "github",
-            "add",
-            "repo",
-            "--repo-url",
-            "https://github.com/example/repo",
-            "--ref",
-            "main",
-            "--include-path",
-            "docs/",
-            "--include-extension",
-            "md",
-        ],
-    )
-    push_result = CliRunner().invoke(
-        cli,
-        ["adapter", "github", "push", "repo", "--source-id", "src-gh", "--limit", "1"],
-    )
-
-    assert add_result.exit_code == 0, add_result.output
-    assert push_result.exit_code == 0, push_result.output
-    payload = json.loads(push_result.output)
-    assert payload["counts"]["pushed"] == 1
-    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
-    assert [call[1]["relative_path"] for call in push_calls] == ["docs/first.md"]
-
-
-def test_adapter_github_push_process_now_uses_last_successful_push(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("MEMFORGE_ADAPTER_CONFIG", str(tmp_path / "adapter.toml"))
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
-
-    def fake_run(cmd, *, capture_output, text, env=None, check=False):
-        assert cmd[:2] == ["gh", "api"]
-
-        class Result:
-            returncode = 0
-            stderr = ""
-
-        result = Result()
-        if cmd[2].endswith("/git/trees/main?recursive=1"):
-            result.stdout = json.dumps(
-                {
-                    "tree": [
-                        {"path": "docs/first.md", "type": "blob", "sha": "first-sha", "size": 10},
-                        {"path": "docs/second.md", "type": "blob", "sha": "second-sha", "size": 10},
-                    ]
-                }
-            )
-            return result
-        if cmd[2].endswith("/contents/docs/first.md?ref=main"):
-            import base64
-
-            result.stdout = json.dumps({"content": base64.b64encode(b"# First\n").decode()})
-            return result
-        if cmd[2].endswith("/contents/docs/second.md?ref=main"):
-            result.returncode = 1
-            result.stdout = ""
-            result.stderr = "not found"
-            return result
-        raise AssertionError(f"unexpected gh api call: {cmd}")
-
-    monkeypatch.setattr(main.subprocess, "run", fake_run)
-
-    add_result = CliRunner().invoke(
-        cli,
-        [
-            "adapter",
-            "github",
-            "add",
-            "repo",
-            "--repo-url",
-            "https://github.com/example/repo",
-            "--ref",
-            "main",
-            "--include-path",
-            "docs/",
-            "--include-extension",
-            "md",
-        ],
-    )
-    push_result = CliRunner().invoke(
-        cli,
-        ["adapter", "github", "push", "repo", "--source-id", "src-gh", "--process-now"],
-    )
-
-    assert add_result.exit_code == 0, add_result.output
-    assert push_result.exit_code != 0
-    payload = json.loads(push_result.output)
-    assert payload["counts"] == {"selected": 2, "pushed": 1, "failed": 1}
-    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
-    assert [call[1]["relative_path"] for call in push_calls] == ["docs/first.md"]
-    assert [call[1]["process_now"] for call in push_calls] == [True]
 
 
 def test_adapter_jira_watch_command_is_registered():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import logging
 
@@ -2110,7 +2111,14 @@ async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path
             return None
 
     fake_sync_service = FakeSyncService()
-    app = create_admin_app(db=db, config=_config(tmp_path))
+    async def allow_lease(*args, **kwargs):
+        return True
+
+    app = create_admin_app(
+        db=db,
+        config=_config(tmp_path),
+        local_agent_lease_validator=allow_lease,
+    )
     with TestClient(app) as client:
         app.state.sync_service = fake_sync_service
         response = client.put(
@@ -2179,8 +2187,9 @@ async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds
             trigger: str = "manual",
             force_full_sync: bool = False,
             workspace_id: str = "default",
+            input_snapshot_id: str | None = None,
         ):
-            del workspace_id
+            del workspace_id, input_snapshot_id
             self.enqueued.append((enqueued_source_id, trigger, force_full_sync))
 
             class Run:
@@ -2213,6 +2222,158 @@ async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds
     assert await db.get_sync_state(source_id) is not None
     source_payload = next(s for s in sources_response.json()["data"] if s["id"] == source_id)
     assert source_payload["sync"]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_path):
+    from memforge.server.admin_api import create_admin_app
+    from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
+
+    source_id = "src-local-process"
+    await db.upsert_source(
+        id=source_id,
+        type="local_markdown",
+        name="Local process source",
+        config_json=json.dumps({"root": "/repo", "vault_id": "notes"}),
+        created_by_user_id=LOCAL_DEV_USER_ID,
+        execution_owner_user_id=LOCAL_DEV_USER_ID,
+    )
+
+    class FakeSyncService:
+        def __init__(self):
+            self.enqueued: list[tuple[str, str, bool]] = []
+
+        def is_running(self, source_id: str):
+            return False
+
+        async def enqueue_source(
+            self,
+            enqueued_source_id: str,
+            *,
+            trigger: str = "manual",
+            force_full_sync: bool = False,
+            workspace_id: str = "default",
+            input_snapshot_id: str | None = None,
+        ):
+            del workspace_id, input_snapshot_id
+            self.enqueued.append((enqueued_source_id, trigger, force_full_sync))
+
+            class Run:
+                run_id = "run-local-process"
+                status = "pending"
+                coalesced = False
+
+            return Run()
+
+        async def shutdown(self):
+            return None
+
+    fake_sync_service = FakeSyncService()
+    async def allow_lease(*args, **kwargs):
+        return True
+
+    app = create_admin_app(
+        db=db,
+        config=_config(tmp_path),
+        local_agent_lease_validator=allow_lease,
+    )
+    with TestClient(app) as client:
+        app.state.sync_service = fake_sync_service
+        response = client.post(
+            f"/api/sources/{source_id}/process",
+            json={
+                "force_full_sync": True,
+                "local_agent_job_id": "test-job",
+                "local_agent_attempt_count": 1,
+            },
+        )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "ok": True,
+        "source_id": source_id,
+        "run_id": "run-local-process",
+        "status": "pending",
+        "coalesced": False,
+    }
+    assert fake_sync_service.enqueued == [(source_id, "local_agent", True)]
+
+
+@pytest.mark.asyncio
+async def test_local_agent_process_endpoint_rejects_server_owned_source(db, tmp_path):
+    from memforge.server.admin_api import create_admin_app
+    from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
+
+    source_id = "src-server-owned-process"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Server-owned source",
+        config_json=json.dumps({"base_url": "https://wiki.example", "spaces": ["PAY"]}),
+        created_by_user_id=LOCAL_DEV_USER_ID,
+    )
+
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        response = client.post(f"/api/sources/{source_id}/process")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "source_is_not_local_agent_backed"
+
+
+@pytest.mark.asyncio
+async def test_admin_source_sync_status_uses_durable_worker_run(db, tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    source_id = "src-durable-status"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Durable status",
+        config_json="{}",
+    )
+    await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+
+    config = _config(tmp_path)
+    config.sync.worker_enabled = False
+    app = create_admin_app(db=db, config=config)
+    with TestClient(app) as client:
+        response = client.get("/api/sources")
+
+    assert response.status_code == 200, response.text
+    source = next(row for row in response.json()["data"] if row["id"] == source_id)
+    assert source["sync"]["status"] == "pending"
+    assert source["sync"]["run_id"].startswith("ssr-")
+
+
+@pytest.mark.asyncio
+async def test_admin_source_sync_status_marks_expired_worker_lease_recovering(db, tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    source_id = "src-durable-recovering"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Durable recovering",
+        config_json="{}",
+    )
+    await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-old",
+        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        lease_seconds=60,
+    )
+    assert leased is not None
+
+    config = _config(tmp_path)
+    config.sync.worker_enabled = False
+    app = create_admin_app(db=db, config=config)
+    with TestClient(app) as client:
+        response = client.get("/api/sources")
+
+    source = next(row for row in response.json()["data"] if row["id"] == source_id)
+    assert source["sync"]["status"] == "recovering"
+    assert source["sync"]["recovery_count"] == 0
 
 
 def test_schedule_trigger_uses_configured_daily_time():

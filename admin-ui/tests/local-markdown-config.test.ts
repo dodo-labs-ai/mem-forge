@@ -82,6 +82,25 @@ assert.match(
 
 assert.doesNotMatch(
   localMarkdownGenePy,
-  /Vault ID|vault-id you set|memforge adapter kb add/,
+  /Vault ID|vault-id you set|memforge adapter kb/,
   "local_markdown config schema should not expose the internal vault id in the normal source form",
+);
+
+const githubRepoGenePy = readFileSync("../src/memforge/genes/github_repo_gene.py", "utf8");
+assert.match(
+  githubRepoGenePy,
+  /key="repo_path"/,
+  "github_repo local mode should persist the local clone path in source config",
+);
+
+assert.match(
+  sourceConfigDialogSource,
+  /github_repo_pick_root/,
+  "SourceConfigDialog should let github_repo choose a local clone through the local-agent queue",
+);
+
+assert.doesNotMatch(
+  sourceConfigDialogSource,
+  /memforge adapter github/,
+  "github_repo local mode should not expose legacy CLI profile commands",
 );

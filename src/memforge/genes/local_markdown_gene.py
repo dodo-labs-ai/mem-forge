@@ -1,10 +1,9 @@
-"""Local Markdown Gene — ingests user-pushed markdown from a local CLI adapter.
+"""Local Markdown Gene — ingests daemon-uploaded local files.
 
-The gene treats a per-source inbox directory as the unit of sync. The local
-``memforge adapter kb push`` command writes one JSON package per markdown file
-into this inbox via the admin API. The gene discovers, fetches, and normalizes
-those packages exactly the way the agent-session gene handles client-generated
-session summaries.
+The gene treats a durable per-source raw package manifest as the unit of sync.
+The local daemon uploads one JSON package per file through the admin API; the
+server-side pipeline discovers, fetches, and normalizes those packages exactly
+the way the agent-session gene handles client-generated session summaries.
 """
 
 from __future__ import annotations
@@ -16,7 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from memforge.genes.base import Gene
-from memforge.genes.local_adapter_packages import package_manifest, read_package_body
+from memforge.genes.local_adapter_packages import (
+    has_package_manifest,
+    package_manifest,
+    read_package_body,
+)
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -60,14 +63,14 @@ def _to_markdown(content_type: str, body: str) -> str:
 
 
 class LocalMarkdownGene(Gene):
-    """Local markdown knowledge-base source pushed from the CLI adapter."""
+    """Local markdown knowledge-base source uploaded by the local daemon."""
 
     @classmethod
     def metadata(cls) -> GeneMetadata:
         return GeneMetadata(
             name="local_markdown",
             display_name="Local Repository",
-            description="Files from a local folder or repo (Markdown, text, JSON, HTML) pushed via the CLI adapter",
+            description="Files from a UI-configured local folder or repo uploaded by the local daemon",
             default_sync_interval_minutes=0,
             auth_method="local_adapter",
             data_shape="document",
@@ -122,14 +125,14 @@ class LocalMarkdownGene(Gene):
         )
 
     async def authenticate(self) -> None:
-        if self._package_manifest():
+        if has_package_manifest(self.config):
             return
         documents_dir = self._documents_dir()
         documents_dir.mkdir(parents=True, exist_ok=True)
 
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         manifest = self._package_manifest()
-        if manifest:
+        if has_package_manifest(self.config):
             async for item in self._discover_package_manifest(manifest, since):
                 yield item
             return

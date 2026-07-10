@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from memforge.local_agent.source_contract import (
@@ -81,6 +82,30 @@ def _sync_is_running(sync_service: Any, source_id: str) -> bool:
     return bool(sync_service is not None and sync_service.is_running(source_id))
 
 
+def _durable_sync_payload(run: Any) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    status = str(run.status)
+    if status == "running" and (
+        run.lease_expires_at is None or run.lease_expires_at <= now
+    ):
+        status = "recovering"
+    elif status == "pending" and run.next_attempt_at is not None:
+        status = "recovering"
+    return {
+        "run_id": run.run_id,
+        "status": status,
+        "trigger": run.trigger,
+        "force_full_sync": run.force_full_sync,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "finished_at": run.completed_at.isoformat() if run.completed_at else None,
+        "next_attempt_at": (
+            run.next_attempt_at.isoformat() if run.next_attempt_at else None
+        ),
+        "recovery_count": run.recovery_count,
+        "error_message": run.error_message,
+    }
+
+
 async def list_source_admin_rows(
     reader: SourceAdminReader,
     *,
@@ -112,7 +137,10 @@ async def list_source_admin_rows(
         )
         row["doc_count"] = await reader.count_documents(source=source_id)
         row.setdefault("client", None)
-        if _sync_is_running(sync_service, source_id):
+        durable_run = await reader.get_latest_source_sync_run(source_id=source_id)
+        if durable_run is not None and durable_run.status in {"pending", "running"}:
+            row["sync"] = _durable_sync_payload(durable_run)
+        elif _sync_is_running(sync_service, source_id):
             progress = sync_service.progress.get(source_id, {})
             row["sync"] = {
                 "status": "running",
@@ -144,6 +172,8 @@ async def list_source_admin_rows(
                     "error_message": latest.get("error_message"),
                     "failed_docs": latest.get("failed_docs", []),
                 }
+            elif durable_run is not None:
+                row["sync"] = _durable_sync_payload(durable_run)
             else:
                 row["sync"] = None
         rows.append(row)

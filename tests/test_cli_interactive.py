@@ -68,16 +68,15 @@ def test_old_auth_jira_command_is_removed():
 
 
 def test_clack_package_is_wired_in_repository():
-    """The Node Clack package must exist and declare `@clack/prompts`."""
-    repo_root = Path(__file__).resolve().parents[1]
-    package_json = repo_root / "cli" / "package.json"
-    assert package_json.exists(), "cli/package.json must exist"
+    """The packaged Node UI must declare `@clack/prompts`."""
+    package_json = main._interactive_resource_dir() / "package.json"
+    assert package_json.exists()
     data = json.loads(package_json.read_text())
     assert data.get("type") == "module"
     assert data.get("dependencies", {}).get("@clack/prompts"), (
-        "cli/package.json must declare @clack/prompts"
+        "interactive package.json must declare @clack/prompts"
     )
-    assert (repo_root / "cli" / "index.mjs").exists(), "cli/index.mjs must exist"
+    assert (main._interactive_resource_dir() / "index.mjs").exists()
 
 
 def test_interactive_resources_are_packaged_with_python_distribution():
@@ -86,14 +85,6 @@ def test_interactive_resources_are_packaged_with_python_distribution():
     assert (resources / "index.mjs").is_file()
     assert (resources / "package.json").is_file()
     assert (resources / "package-lock.json").is_file()
-
-
-def test_node_cli_and_packaged_interactive_script_stay_in_sync():
-    repo_root = Path(__file__).resolve().parents[1]
-    node_entrypoint = repo_root / "cli" / "index.mjs"
-    packaged_entrypoint = main._interactive_resource_dir() / "index.mjs"
-
-    assert packaged_entrypoint.read_text() == node_entrypoint.read_text()
 
 
 def test_interactive_script_path_resolves_to_packaged_resource(monkeypatch):

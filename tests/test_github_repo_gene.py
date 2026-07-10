@@ -342,6 +342,28 @@ async def test_local_push_discovers_and_normalizes_pushed_package(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_local_push_explicit_empty_manifest_does_not_fall_back_to_inbox(tmp_path):
+    (tmp_path / "stale.json").write_text(
+        '{"package_kind":"github_repo_document","doc_id":"stale"}',
+        encoding="utf-8",
+    )
+    gene = GitHubRepoGene(
+        config={
+            "connection_mode": "local_push",
+            "repo_url": "https://github.example.test/payroll/architecture",
+            "documents_dir": str(tmp_path),
+            "local_agent_package_manifest": [],
+        },
+        source_id="src-github-repo",
+    )
+
+    await gene.authenticate()
+    items = [item async for item in gene.discover()]
+
+    assert items == []
+
+
+@pytest.mark.asyncio
 async def test_local_push_discovery_filters_packages_by_current_scope(tmp_path):
     encoded_time = datetime(2026, 7, 7, 9, 30, tzinfo=timezone.utc).isoformat()
     for name, relative_path, repo_ref in [

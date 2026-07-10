@@ -148,8 +148,8 @@ def test_create_local_markdown_source_populates_inbox_path(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             row = asyncio.run(database.get_source(source_id))
@@ -171,8 +171,8 @@ def test_create_local_markdown_source_generates_internal_vault_id(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             response = client.post(
                 "/api/sources",
                 json={
@@ -202,8 +202,8 @@ def test_update_local_markdown_source_preserves_internal_vault_id(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_local_markdown_source(client, vault_id="engineering")
             response = client.put(
                 f"/api/sources/{created['id']}",
@@ -230,8 +230,8 @@ def test_create_github_repo_source_populates_inbox_path_for_local_push(tmp_path)
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_github_repo_source(client)
             row = asyncio.run(database.get_source(created["id"]))
         assert row is not None
@@ -252,8 +252,8 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_jira_source(client)
             source_id = created["id"]
             initial_row = asyncio.run(database.get_source(source_id))
@@ -282,14 +282,53 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
                         },
                         "_comments": [],
                     },
-                    "process_now": False,
+                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
+                    "submitted_at": "2026-07-10T08:00:00+00:00",
+                },
+            )
+            repeated_response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "base_url": "https://jira.example.test",
+                    "issue_key": "PAY-1",
+                    "source_url": "https://jira.example.test/browse/PAY-1",
+                    "title": "Create daemon source support",
+                    "raw_payload": {
+                        "key": "PAY-1",
+                        "fields": {
+                            "summary": "Create daemon source support",
+                            "description": "Create daemon source support.",
+                            "status": {"name": "Open"},
+                            "issuetype": {"name": "Task"},
+                            "priority": {"name": "Medium"},
+                            "assignee": {"displayName": "Ada"},
+                            "labels": [],
+                            "issuelinks": [],
+                            "subtasks": [],
+                        },
+                        "_comments": [],
+                    },
+                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
+                    "submitted_at": "2026-07-10T08:05:00+00:00",
+                },
+            )
+            process_response = client.post(
+                f"/api/sources/{source_id}/process",
+                json={
+                    "force_full_sync": False,
+                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
                 },
             )
 
         assert response.status_code == 200, response.text
+        assert repeated_response.status_code == 200, repeated_response.text
         payload = response.json()
+        repeated_payload = repeated_response.json()
         assert payload["issue_key"] == "PAY-1"
         assert payload["package_uri"]
+        assert repeated_payload["package_uri"] != payload["package_uri"]
+        first_package = json.loads(Path(payload["package_uri"]).read_text(encoding="utf-8"))
+        assert first_package["submitted_at"] == "2026-07-10T08:00:00+00:00"
         row = asyncio.run(database.get_source(source_id))
         assert row is not None
         documents_dir = Path(row["config"]["local_agent_documents_dir"])
@@ -300,6 +339,26 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
         assert inputs[0].raw_uri == payload["package_uri"]
         assert inputs[0].metadata["doc_id"] == payload["doc_id"]
         assert inputs[0].metadata["manifest_entry"]["doc_id"] == payload["doc_id"]
+        snapshot_inputs = asyncio.run(
+            database.list_source_sync_inputs(
+                source_id=source_id,
+                input_snapshot_id="test-local-agent-job:attempt:1",
+            )
+        )
+        assert [item.input_id for item in snapshot_inputs] == [inputs[0].input_id]
+        repeated_snapshot_inputs = asyncio.run(
+            database.list_source_sync_inputs(
+                source_id=source_id,
+                input_snapshot_id="test-local-agent-job:attempt:1",
+            )
+        )
+        assert [item.input_id for item in repeated_snapshot_inputs] == [inputs[0].input_id]
+        assert process_response.status_code == 202, process_response.text
+        run = asyncio.run(
+            database.get_source_sync_run(process_response.json()["run_id"])
+        )
+        assert run is not None
+        assert run.input_snapshot_id == "test-local-agent-job:attempt:1"
 
         package_path.unlink()
 
@@ -329,8 +388,8 @@ def test_jira_local_agent_mode_rejects_pat_auth(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             response = client.post(
                 "/api/sources",
                 json={
@@ -359,8 +418,8 @@ def test_update_jira_local_agent_source_preserves_sync_mode_when_omitted(tmp_pat
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_jira_source(client)
             source_id = created["id"]
             before = asyncio.run(database.get_source(source_id))
@@ -446,8 +505,8 @@ def test_jira_adapter_document_push_requires_local_agent_mode(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_jira_source(client, sync_mode="cloud")
             source_id = created["id"]
             response = client.post(
@@ -472,8 +531,8 @@ def test_local_adapter_document_push_writes_package(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             response = client.post(
@@ -539,8 +598,8 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_github_repo_source(client)
             source_id = created["id"]
             response = client.post(
@@ -612,8 +671,8 @@ def test_github_repo_adapter_document_push_requires_local_push_mode(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             source_id = _create_github_repo_source(client, connection_mode="cloud_pull")["id"]
             response = client.post(
                 f"/api/sources/{source_id}/adapter/packages",
@@ -637,8 +696,8 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             source_id = _create_github_repo_source(client)["id"]
             wrong_ref = client.post(
                 f"/api/sources/{source_id}/adapter/packages",
@@ -686,8 +745,8 @@ def test_github_repo_adapter_document_push_enforces_max_files(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             source_id = _create_github_repo_source(client, max_files=1)["id"]
             first = client.post(
                 f"/api/sources/{source_id}/adapter/packages",
@@ -722,8 +781,8 @@ def test_github_repo_adapter_document_push_max_files_counts_current_scope_only(t
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             source_id = _create_github_repo_source(client, max_files=1)["id"]
             row = asyncio.run(database.get_source(source_id))
             inbox = Path(row["config"]["documents_dir"])
@@ -785,7 +844,7 @@ def test_local_adapter_document_push_requires_execution_owner(tmp_path):
             principal_resolver=lambda request: "bob",
             workspace_role_resolver=lambda request: "member",
         )
-        with TestClient(app) as client:
+        with LeaseAwareTestClient(app) as client:
             response = client.post(
                 "/api/sources/src-owned-local/adapter/packages",
                 json={
@@ -802,14 +861,48 @@ def test_local_adapter_document_push_requires_execution_owner(tmp_path):
         asyncio.run(database.close())
 
 
+def test_local_adapter_revalidates_lease_before_committing_snapshot_membership(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    database = _connect_database(tmp_path)
+    calls: list[tuple] = []
+
+    async def validate(*args):
+        calls.append(args)
+        return True
+
+    try:
+        app = create_admin_app(
+            db=database,
+            config=_config(tmp_path),
+            local_agent_lease_validator=validate,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_local_markdown_source(client)["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "vault_id": "engineering",
+                    "relative_path": "lease-check.md",
+                    "markdown_body": "# Lease check",
+                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        assert len(calls) == 2
+    finally:
+        asyncio.run(database.close())
+
+
 def test_local_adapter_document_push_allows_unmapped_source(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_unmapped_local_markdown_source(client)
             source_id = created["id"]
             response = client.post(
@@ -837,8 +930,8 @@ def test_local_adapter_push_is_idempotent_on_doc_id(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             payload = {
@@ -861,8 +954,8 @@ def test_teams_adapter_push_writes_window_package(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             source_id = _create_teams_source(client)["id"]
             response = client.post(
                 f"/api/sources/{source_id}/adapter/packages",
@@ -918,7 +1011,7 @@ def test_teams_adapter_push_writes_window_package(tmp_path):
 
         row = asyncio.run(database.get_source(source_id))
         assert row is not None
-        assert Path(row["config"]["local_agent_documents_dir"]).exists()
+        assert "local_agent_documents_dir" not in row["config"]
         inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
         assert len(inputs) == 1
         assert inputs[0].raw_uri == body["package_uri"]
@@ -936,8 +1029,8 @@ def test_local_adapter_push_rejects_vault_mismatch(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             response = client.post(
@@ -961,8 +1054,8 @@ def test_local_adapter_push_rejects_path_traversal(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             response = client.post(
@@ -987,8 +1080,8 @@ def test_teams_gene_discovers_local_agent_window_packages(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             source_id = _create_teams_source(client)["id"]
             response = client.post(
                 f"/api/sources/{source_id}/adapter/packages",
@@ -1022,7 +1115,8 @@ def test_teams_gene_discovers_local_agent_window_packages(tmp_path):
             assert response.status_code == 200, response.text
 
         row = asyncio.run(database.get_source(source_id))
-        gene = create_gene("teams", row["config"], source_id)
+        projected = _project_source_inputs(database, row)
+        gene = create_gene("teams", projected["config"], source_id)
         asyncio.run(gene.authenticate())
 
         async def _collect_normalized():
@@ -1052,8 +1146,8 @@ def test_local_adapter_push_rejects_paused_source(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             assert client.put(f"/api/sources/{source_id}", json={"status": "paused"}).status_code == 200
@@ -1090,8 +1184,8 @@ def test_local_adapter_push_requires_local_adapter_source(tmp_path):
 
     try:
         source_id = asyncio.run(_seed_other_source())
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             response = client.post(
                 f"/api/sources/{source_id}/adapter/packages",
                 json={
@@ -1115,8 +1209,8 @@ def test_local_markdown_gene_discovers_pushed_packages(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             client.post(
@@ -1174,8 +1268,8 @@ def test_local_markdown_gene_converts_by_content_type(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
             source_id = _create_local_markdown_source(client)["id"]
             docs = [
                 ("page.html", "text/html", "<h1>Decision</h1><p>Ship on <b>Tuesday</b>.</p>"),
@@ -1213,3 +1307,15 @@ def test_local_markdown_gene_converts_by_content_type(tmp_path):
         assert by_path["note.txt"].markdown_body == "plain reminder"
     finally:
         asyncio.run(database.close())
+async def _allow_local_agent_lease(*args, **kwargs) -> bool:
+    return True
+
+
+class LeaseAwareTestClient(TestClient):
+    def post(self, url, *args, **kwargs):
+        if "/adapter/packages" in url or url.endswith("/process"):
+            body = dict(kwargs.get("json") or {})
+            body.setdefault("local_agent_job_id", "test-local-agent-job")
+            body.setdefault("local_agent_attempt_count", 1)
+            kwargs["json"] = body
+        return super().post(url, *args, **kwargs)

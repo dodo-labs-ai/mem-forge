@@ -8,6 +8,11 @@ from typing import Any
 from memforge.models import ContentItem
 
 
+def has_package_manifest(config: dict[str, Any]) -> bool:
+    """Return whether the server supplied an authoritative package snapshot."""
+    return isinstance(config.get("local_agent_package_manifest"), list)
+
+
 def package_manifest(config: dict[str, Any]) -> list[dict[str, Any]]:
     manifest = config.get("local_agent_package_manifest")
     if not isinstance(manifest, list):

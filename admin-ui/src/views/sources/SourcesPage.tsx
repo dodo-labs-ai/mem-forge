@@ -83,13 +83,9 @@ function normalizeSources(payload: SourcesResponse | Source[] | undefined): Sour
   return [];
 }
 
-function localAgentJobPayload(source: Source): Record<string, unknown> {
-  const payload = { ...source.config };
-  delete payload.local_agent_documents_dir;
-  delete payload.local_agent_package_manifest;
+function localAgentJobPayload(forceFullSync = false): Record<string, unknown> {
   return {
-    ...payload,
-    process_now: true,
+    force_full_sync: forceFullSync,
   };
 }
 
@@ -144,6 +140,7 @@ async function createLocalAgentSyncJob(
   options: {
     itemLabel: string;
     onProgress?: (progress: LocalAgentSyncProgress) => void;
+    forceFullSync?: boolean;
   },
 ): Promise<LocalAgentJobCreateResponse | null> {
   const operation = localAgentSyncOperation(source);
@@ -157,7 +154,7 @@ async function createLocalAgentSyncJob(
     sourceId: source.id,
     sourceType: source.type,
     operation,
-    payload: localAgentJobPayload(source),
+    payload: localAgentJobPayload(options.forceFullSync),
   });
   options.onProgress?.(
     localAgentProgressFromJob(
@@ -263,7 +260,11 @@ export function SourcesPage() {
     queryFn: () => client.get("/api/sources").then((response) => response.data),
     refetchInterval: (query) => {
       const sources = normalizeSources(query.state.data);
-      return sources.some((source) => source.sync?.status === "running") ? 2000 : false;
+      const terminal = new Set(["success", "partial", "failed"]);
+      return sources.some((source) => {
+        const status = source.sync?.status;
+        return Boolean(status && !terminal.has(status));
+      }) ? 2000 : false;
     },
   });
 
@@ -279,6 +280,7 @@ export function SourcesPage() {
       const localAgentJob = await createLocalAgentSyncJob(source, {
         itemLabel: sourceItemLabel(source),
         onProgress: (progress) => setLocalAgentProgress(sourceId, progress),
+        forceFullSync,
       });
       if (localAgentJob) {
         return { data: localAgentJob };
@@ -331,6 +333,7 @@ export function SourcesPage() {
       const localAgentJob = await createLocalAgentSyncJob(source, {
         itemLabel: sourceItemLabel(source),
         onProgress: (progress) => setLocalAgentProgress(source.id, progress),
+        forceFullSync: true,
       });
       if (localAgentJob) {
         return { data: localAgentJob };
@@ -529,7 +532,7 @@ export function SourcesPage() {
                   {group.sources.map(({ source, memory_count }) => {
                     const localAgentProgress = localAgentProgressBySource[source.id];
                     const isSyncing =
-                      source.sync?.status === "running" ||
+                      ["pending", "running", "recovering"].includes(source.sync?.status ?? "") ||
                       pendingSyncIds.has(source.id) ||
                       isActiveLocalAgentProgress(localAgentProgress);
                     const isDeleting = deleteSource.isPending && sourcePendingDelete?.id === source.id;
