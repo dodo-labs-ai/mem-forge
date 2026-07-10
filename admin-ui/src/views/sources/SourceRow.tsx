@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 import { AlertCircle, Check, Info, Loader2, Pause, Play, SlidersHorizontal } from "lucide-react";
-import type { Source, SourceCapabilities, SourceOwnership } from "@/api/types";
+import type { Source, SourceCapabilities, SourceOwnership, SyncStatus } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
 import { SyncStatusBar } from "@/components/admin/SyncStatusBar";
 import { Badge } from "@/components/ui/badge";
@@ -37,6 +37,7 @@ export interface SourceRowLabels {
 const DEFAULT_CAPABILITIES: SourceCapabilities = {
   can_subscribe: false,
   can_configure: false,
+  can_configure_connection: false,
   can_sync: false,
   can_force_resync: false,
   can_delete: false,
@@ -82,12 +83,13 @@ export function SourceRow({
   actionsMenu: ReactNode;
 }) {
   const isPaused = source.status === "paused";
-  const showLocalAgentStatus = !isPaused && isLocalAgentBackedSource(source);
-  const pausedSyncHint = "Source is paused. Resume the source to sync again.";
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
+  const showLocalAgentStatus = !isPaused && isLocalAgentBackedSource(source) && capabilities.can_sync;
+  const pausedSyncHint = "Source is paused. Resume the source to sync again.";
   const ownershipText = formatOwnership(source.ownership);
   const hasManagementControl =
     capabilities.can_configure || capabilities.can_sync || isManaged;
+  const durableSyncLabel = activeSyncLabel(source.sync?.status);
 
   return (
     <div className="space-y-3 p-4">
@@ -123,9 +125,9 @@ export function SourceRow({
                 <span className="font-medium text-foreground">{perGroupMemoryCount}</span> memories
               </span>
               <span>
-                {source.sync?.status === "running" || isActiveLocalAgentProgress(localAgentProgress)
+                {isActiveLocalAgentProgress(localAgentProgress)
                   ? "Syncing now"
-                  : <LastSyncDetails source={source} itemLabel={itemLabel} />}
+                  : durableSyncLabel ?? <LastSyncDetails source={source} itemLabel={itemLabel} />}
               </span>
               {source.sync_schedule?.enabled && (
                 <span>
@@ -135,7 +137,7 @@ export function SourceRow({
                     : ""}
                 </span>
               )}
-              {source.type === "jira" && source.auth_session && hasManagementControl && (
+              {source.type === "jira" && source.auth_session && capabilities.can_configure_connection && (
                 <span
                   className={
                     source.auth_session.status === "active"
@@ -246,7 +248,11 @@ export function SourceRow({
       )}
 
       {hasManagementControl && (
-        <SyncStatusBar sync={source.sync} itemLabel={itemLabel} onRetry={isPaused ? undefined : onSync} />
+        <SyncStatusBar
+          sync={source.sync}
+          itemLabel={itemLabel}
+          onRetry={isPaused || !capabilities.can_sync ? undefined : onSync}
+        />
       )}
     </div>
   );
@@ -311,6 +317,13 @@ function isActiveLocalAgentProgress(progress: LocalAgentSyncProgress | undefined
   return progress?.state === "queued" || progress?.state === "leased";
 }
 
+function activeSyncLabel(status: SyncStatus["status"] | undefined): string | null {
+  if (status === "pending") return "Waiting to sync";
+  if (status === "recovering") return "Recovering sync";
+  if (status === "running") return "Syncing now";
+  return null;
+}
+
 function LastSyncDetails({
   source,
   itemLabel,
@@ -365,9 +378,9 @@ function LastSyncDetails({
                   {sync.status}
                 </dd>
                 <dt className="text-muted-foreground">{capitalize(itemLabel)} checked</dt>
-                <dd className="font-medium text-foreground">{sync.docs_processed}</dd>
+                <dd className="font-medium text-foreground">{sync.docs_processed ?? "-"}</dd>
                 <dt className="text-muted-foreground">Updated</dt>
-                <dd className="font-medium text-foreground">{sync.docs_updated}</dd>
+                <dd className="font-medium text-foreground">{sync.docs_updated ?? "-"}</dd>
                 {failedCount > 0 && (
                   <>
                     <dt className="text-muted-foreground">Failed</dt>

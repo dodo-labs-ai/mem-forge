@@ -1,117 +1,72 @@
 # Local repository sync
 
-Register any local folder or repo (an Obsidian vault, a docs directory, a
-project's notes) as a first-class MemForge source. The CLI is a thin bridge: it
-reads each file's raw text and pushes it to the service, which converts and
-extracts it exactly like any other gene. The source shows up in the admin UI,
-can be renamed there, and syncs on demand or on a schedule.
+Local folders and checked-out repositories are configured in the MemForge UI.
+The local daemon reads the selected files and uploads raw packages; the server
+owns conversion, normalization, memory extraction, deduplication, and document
+lifecycle reconciliation.
+
+## Setup
+
+1. Start the local daemon with `uv run memforge adapter daemon run`.
+2. In the Sources UI, add a Local Markdown or GitHub Repository source.
+3. Choose the local folder or repository through the source-specific browser.
+4. Configure include and exclude patterns, then save the source.
+
+The daemon authenticates with the user's MemForge API key. It does not require
+a workspace environment variable: each server-issued job carries the workspace
+and source selected in the UI.
 
 ## Supported file types
 
-The CLI tags each file with a `content_type` from its extension. The service
-converts to markdown during sync:
+The daemon assigns a content type from the file extension and uploads the raw
+text. Conversion happens on the server.
 
-| Extension | content_type | Conversion (server-side) |
+| Extension | Content type | Server processing |
 | --- | --- | --- |
 | `.md`, `.markdown` | `text/markdown` | passthrough |
 | `.txt` | `text/plain` | passthrough |
-| `.json` | `application/json` | wrapped in a fenced ` ```json ` block |
-| `.html`, `.htm` | `text/html` | converted with `html_to_markdown` (markdownify) |
+| `.json` | `application/json` | converted to fenced JSON markdown |
+| `.html`, `.htm` | `text/html` | converted with `html_to_markdown` |
 
-PDF is intentionally not supported (no PDF text extraction exists in the service
-today). See "Which files are picked up" below for what gets scanned and skipped.
+Files over 1 MB and non-UTF-8 files are skipped. PDF is not part of this local
+text-source contract.
 
-## Set up a repo
+## Sync ownership
 
-Interactive: run `memforge` and choose **Local repository → Set up a repository**.
+The UI's Sync action and the source schedule both create durable server-owned
+jobs. The daemon leases those jobs; it has no local profile scheduler or cron
+configuration.
 
-Scriptable:
+Every raw package upload and final processing request carries the leased job id
+and attempt count. The server rejects missing, expired, or superseded lease
+contexts before writing raw input, so an old daemon attempt cannot publish a
+partial snapshot after another daemon has reclaimed the job.
 
-```bash
-memforge adapter kb add my-notes \
-  --root /path/to/folder \
-  --vault-id my-notes \
-  --create-source
-```
+For each complete folder or repository scan, the daemon derives a snapshot id
+from the job id and lease attempt number. Every uploaded package and the final
+processing request use that same attempt-scoped id. The server processes only
+that snapshot, including an explicit empty snapshot, so deleted or newly
+excluded files are reconciled correctly.
 
-`--create-source` reuses or creates the matching `local_markdown` source and
-stores its id in the profile (`~/.memforge/adapter.toml`). The server URL and
-token come from the active target (`memforge target ...`) or
-`MEMFORGE_API_URL` / `MEMFORGE_API_TOKEN`; the default is
-`http://127.0.0.1:8765`.
+If any package upload fails, the daemon does not publish the partial snapshot.
+The same job is retried with a new attempt-scoped snapshot, so membership from a
+partial attempt cannot leak into the retry. Stable document/content identities
+reuse raw inputs and prevent duplicate input generations or memories.
 
-### Which files are picked up
+## Scheduling
 
-By default the **entire folder tree is scanned recursively**, and every `.md`,
-`.markdown`, `.txt`, `.json`, `.html`, and `.htm` file (including those in
-subfolders) is included. Narrow or widen that with globs:
+Configure the interval in the source's UI. The server owns the next-run time and
+creates a local-agent job when the source becomes due. The daemon only needs to
+remain running and authenticated; no user crontab or daemon-side schedule is
+created.
 
-```bash
-memforge adapter kb add my-notes --root /path \
-  --include "**/*.md" \
-  --exclude "drafts/**" --exclude "archive/**"
-```
+## Operations
 
-- `--include` / `--exclude` are repeatable; globs match the path **relative to
-  the root** (e.g. `analysis/**`, `**/*.md`).
-- **`--include` replaces** the default type set. If you pass any `--include`,
-  only those globs are used, so list every type you want (e.g.
-  `--include "**/*.md" --include "**/*.txt"`).
-- **`--exclude` is added to** the always-on safety excludes (`.obsidian/**`,
-  `.trash/**`, `.git/**`, `**/.git/**`) rather than replacing them.
-- **Exclude wins over include**: a file matched by both is skipped.
+Rename, pause, rescope, force-resync, schedule, and delete sources in the UI.
+Connection paths and execution ownership remain attached to the saved source,
+while project binding controls where extracted memories land.
 
-Files over 1 MB and non-UTF-8 files are always skipped.
-
-## Sync
-
-```bash
-memforge adapter kb scan --root /path      # dry scan, no profile
-memforge adapter kb preview my-notes       # what would sync, for a saved profile
-memforge adapter kb push my-notes --process-now   # push and trigger extraction
-```
-
-`push` uploads each included file's raw text to
-`POST /api/sources/{id}/adapter/packages` with its `content_type`. With
-`--process-now`, a source sync runs after the last file. Re-pushing a file
-overwrites its package; the pipeline skips documents whose content is unchanged.
-
-Deleting a file locally is not propagated automatically: the push model only
-adds and updates. To drop deleted files, remove the source (or run a forced full
-resync) so the pipeline reconciles the inbox.
-
-## Schedule
-
-Scheduling installs a job in your **user crontab** that runs
-`adapter kb push <name> --process-now` on a timer, logging to
-`~/.memforge/kb-<name>.log`.
-
-```bash
-memforge adapter kb schedule my-notes --every daily --at 07:30
-memforge adapter kb schedule-list
-memforge adapter kb unschedule my-notes
-```
-
-Presets for `--every`: `15m`, `30m`, `hourly`, `2h`, `4h`, `6h`, `12h`,
-`daily`, `weekly`. `--at HH:MM` sets the time for `daily`/`weekly` (default
-09:00). `--cron "<5-field expr>"` overrides the preset for full control.
-
-Notes:
-- The crontab block is marked (`# >>> memforge:kb:<name> >>>`) so re-running
-  `schedule` replaces it in place and `unschedule` removes only that block.
-- On macOS, `cron` may require Full Disk Access for the controlling terminal.
-- The scheduled command uses the target/credentials resolvable from cron's
-  environment; for non-default targets, export `MEMFORGE_API_URL` /
-  `MEMFORGE_API_TOKEN` in your crontab.
-
-## Rename a source
-
-A local repository source is renamable in the admin UI: open its **Configure**
-dialog and edit **Source name** (this is a `PUT /api/sources/{id}`). The
-`vault_id` the CLI uses to address the source is separate and stays stable.
-
-## TODO: background daemon
-
-A long-running `memforge` watcher (file-system events for near-real-time sync,
-no crontab) is planned as an alternative to the OS scheduler. Until then, use
-`adapter kb schedule` (cron) or manual `push`.
+The user who creates a local source is its execution owner because the source
+depends on that user's filesystem and browser credentials. Workspace admins can
+rename, bind, schedule, pause, or delete the source, but only the execution
+owner's daemon can configure its connection or run a sync.

@@ -139,8 +139,8 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
-  /showLocalAgentStatus = !isPaused && isLocalAgentBackedSource\(source\)/,
-  "Paused source lifecycle should still take precedence over daemon readiness in the title badge",
+  /showLocalAgentStatus = !isPaused && isLocalAgentBackedSource\(source\) && capabilities\.can_sync/,
+  "Paused lifecycle and execution ownership should gate daemon readiness in the title badge",
 );
 
 // --- Configure dialog ----------------------------------------------------

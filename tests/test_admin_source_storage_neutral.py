@@ -12,6 +12,7 @@ def _config(tmp_path) -> AppConfig:
     cfg = AppConfig(base_dir=tmp_path / "memforge")
     cfg.llm.enrichment_api_key = ""
     cfg.llm.embedding_api_key = ""
+    cfg.sync.worker_enabled = False
     return cfg
 
 
@@ -84,6 +85,16 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
                     "failed_docs": [{"doc_id": "doc-1", "error": "boom"}],
                     }
                 ]
+
+        async def get_latest_source_sync_run(
+            self,
+            *,
+            source_id: str,
+            workspace_id: str = "default",
+        ):
+            assert source_id == "src-neutral"
+            assert workspace_id == "default"
+            return None
 
         async def is_source_enabled_for_user(self, source_id: str, user_id: str) -> bool:
             assert source_id == "src-neutral"

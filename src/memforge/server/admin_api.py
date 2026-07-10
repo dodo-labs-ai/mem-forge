@@ -6,6 +6,7 @@ sources/genes, schedule, LLM configuration, and system health/stats.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict, is_dataclass
 import json
 import logging
@@ -13,10 +14,11 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -82,7 +84,7 @@ from memforge.runtime import (
     DefaultRuntimeProvider,
     RuntimeHealthComponent,
     RuntimeProvider,
-    SyncAlreadyRunningError,
+    SourceSyncWorker,
     SyncService,
     SourcePausedError,
 )
@@ -104,6 +106,17 @@ from memforge.server.source_admin_service import (
     list_source_admin_rows,
     normalize_workspace_role,
 )
+from memforge.local_agent.source_contract import (
+    LOCAL_AGENT_SYNC_OPERATIONS,
+    execution_owner_user_id,
+    is_local_agent_backed_source,
+    local_agent_authoritative_snapshot_id,
+    local_agent_input_sha256,
+    local_agent_completion_status,
+    local_agent_source_config_revision,
+    local_agent_sync_job_payload,
+    local_agent_sync_operation,
+)
 from memforge.storage.admin_memory import MemoryAdminListFilters
 from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES,
@@ -118,6 +131,16 @@ SEARCH_CLIENTS = ("claude-code", "codex")
 
 SOURCE_ACTIVE_STATUS = "active"
 SOURCE_PAUSED_STATUS = "paused"
+LOCAL_AGENT_STATUS_STALE_SECONDS = 90
+LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES = {
+    "github_repo_pick_root": "github_repo",
+    "github_repo_preview_tree": "github_repo",
+    "local_markdown_pick_root": "local_markdown",
+    "local_markdown_preview_tree": "local_markdown",
+    "teams_auth": "teams",
+    "teams_auth_check": "teams",
+    "teams_browse": "teams",
+}
 # Source lifecycle is deliberately closed for now. A paused source keeps its
 # configuration and existing memories but cannot accept new sync work.
 SOURCE_STATUSES = {SOURCE_ACTIVE_STATUS, SOURCE_PAUSED_STATUS}
@@ -181,6 +204,115 @@ def _require_source_management(request: Request, source: dict[str, Any]) -> None
         viewer_role=resolve_request_workspace_role(request),
     ):
         raise _source_management_forbidden()
+
+
+def _require_local_agent_connection_management(
+    request: Request,
+    source: dict[str, Any],
+) -> Mapping[str, Any]:
+    if not is_local_agent_backed_source(source):
+        return
+    requester_id = resolve_request_principal(request)
+    expected_owner_id = execution_owner_user_id(source)
+    if expected_owner_id == requester_id:
+        return
+    logger.warning(
+        "Rejected local source connection update from non-owner",
+        extra={
+            "source_id": str(source.get("id") or ""),
+            "requester_user_id": requester_id,
+            "execution_owner_user_id": expected_owner_id,
+        },
+    )
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "error": "local_agent_source_connection_owner_forbidden",
+            "message": "Only the local execution owner can change this source connection.",
+        },
+    )
+
+
+def _require_source_sync_execution(
+    request: Request,
+    source: dict[str, Any],
+) -> None:
+    if not is_local_agent_backed_source(source):
+        _require_source_management(request, source)
+        return
+    requester_id = resolve_request_principal(request)
+    expected_owner_id = execution_owner_user_id(source)
+    if expected_owner_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail="local_agent_sync_execution_owner_required",
+        )
+    if expected_owner_id == requester_id:
+        return
+    logger.warning(
+        "Rejected local source execution from non-owner",
+        extra={
+            "source_id": str(source.get("id") or ""),
+            "requester_user_id": requester_id,
+            "execution_owner_user_id": expected_owner_id,
+        },
+    )
+    raise HTTPException(
+        status_code=403,
+        detail="local_agent_sync_execution_owner_forbidden",
+    )
+
+
+async def _require_current_local_agent_lease(
+    request: Request,
+    db: Database,
+    *,
+    source: Mapping[str, Any],
+    job_id: str | None,
+    attempt_count: int | None,
+) -> None:
+    source_id = str(source.get("id") or "").strip()
+    expected_config_revision = local_agent_source_config_revision(source)
+    normalized_job_id = str(job_id or "").strip()
+    if not normalized_job_id or attempt_count is None:
+        raise HTTPException(status_code=409, detail="local_agent_lease_context_required")
+    validator = getattr(request.app.state, "local_agent_lease_validator", None)
+    job_payload: Mapping[str, Any] = {}
+    if validator is not None:
+        validation = await validator(
+            request,
+            source_id,
+            normalized_job_id,
+            int(attempt_count or 0),
+            expected_config_revision,
+        )
+        valid = bool(validation)
+        if isinstance(validation, Mapping):
+            job_payload = validation
+    else:
+        job = await db.get_local_agent_job(normalized_job_id)
+        if job:
+            job_payload = job.get("payload") or {}
+        leased_until = None
+        if job and job.get("leased_until"):
+            try:
+                leased_until = datetime.fromisoformat(str(job["leased_until"]).replace("Z", "+00:00"))
+            except ValueError:
+                leased_until = None
+        valid = bool(
+            job
+            and job.get("status") == "leased"
+            and job.get("source_id") == source_id
+            and job.get("lease_owner_user_id") == resolve_request_principal(request)
+            and int(job.get("attempt_count") or 0) == attempt_count
+            and (job.get("payload") or {}).get("source_config_revision")
+            == expected_config_revision
+            and leased_until is not None
+            and leased_until > datetime.now(timezone.utc)
+        )
+    if not valid:
+        raise HTTPException(status_code=409, detail="local_agent_lease_not_current")
+    return job_payload
 
 
 async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
@@ -735,6 +867,35 @@ class CreateSourceRequest(BaseModel):
 
 class SourceSyncRequest(BaseModel):
     force_full_sync: bool = False
+    sync_snapshot_id: str | None = None
+    local_agent_job_id: str | None = None
+    local_agent_attempt_count: int | None = Field(default=None, ge=1)
+
+
+class LocalAgentJobCreateRequest(BaseModel):
+    workspace_id: str | None = None
+    source_id: str = ""
+    source_type: str
+    operation: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class LocalAgentJobLeaseRequest(BaseModel):
+    limit: int = Field(default=5, ge=1, le=20)
+    lease_seconds: int = Field(default=60, ge=1, le=3600)
+    wait_seconds: int = Field(default=0, ge=0, le=25)
+
+
+class LocalAgentJobHeartbeatRequest(BaseModel):
+    attempt_count: int = Field(ge=1)
+    lease_seconds: int = Field(default=60, ge=1, le=3600)
+
+
+class LocalAgentJobCompleteRequest(BaseModel):
+    status: Literal["succeeded", "failed"]
+    attempt_count: int = Field(ge=1)
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = Field(default=None, max_length=2000)
 
 
 class SourceSubscriptionRequest(BaseModel):
@@ -839,9 +1000,11 @@ class LocalSourcePackageRequest(BaseModel):
     source_url: str | None = None
     title: str | None = None
     raw_hash: str | None = None
+    sync_snapshot_id: str | None = None
+    local_agent_job_id: str | None = None
+    local_agent_attempt_count: int | None = Field(default=None, ge=1)
     submitted_by: str | None = None
     submitted_at: str | None = None
-    process_now: bool = True
 
 
 class AgentSessionWindowRequest(BaseModel):
@@ -2206,6 +2369,8 @@ def create_admin_app(
     principal_resolver: Callable[[Request], str] | None = None,
     workspace_role_resolver: Callable[[Request], str] | None = None,
     document_store: DocumentArtifactStore | None = None,
+    local_agent_lease_validator: Callable[[Request, str, str, int, str], Awaitable[bool]] | None = None,
+    local_agent_job_enqueuer: Callable[..., Awaitable[tuple[str, bool]]] | None = None,
 ) -> FastAPI:
     """Create and configure the MemForge Admin API FastAPI application.
 
@@ -2243,14 +2408,38 @@ def create_admin_app(
         app.state.runtime_provider = runtime_provider
         app.state.principal_resolver = principal_resolver
         app.state.workspace_role_resolver = workspace_role_resolver
+        app.state.local_agent_lease_validator = local_agent_lease_validator
+        app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
         app.state.sync_service = SyncService(app.state.db, config, runtime_provider=runtime_provider)
-        app.state.sync_scheduler = SyncScheduler(app.state.db, app.state.sync_service)
-        await app.state.sync_scheduler.start()
+        app.state.sync_scheduler = None
+        if config.sync.scheduler_enabled:
+            app.state.sync_scheduler = SyncScheduler(app.state.db, app.state.sync_service)
+            await app.state.sync_scheduler.start()
+        app.state.sync_worker = None
+        app.state.sync_worker_task = None
+        if config.sync.worker_enabled:
+            app.state.sync_worker = SourceSyncWorker(
+                app.state.db,
+                config,
+                runtime_provider=runtime_provider,
+                worker_id="embedded-admin-worker",
+            )
+            app.state.sync_worker_task = asyncio.create_task(
+                app.state.sync_worker.run_forever(poll_seconds=config.sync.worker_poll_seconds)
+            )
 
         try:
             yield
         finally:
-            await app.state.sync_scheduler.shutdown()
+            worker_task = getattr(app.state, "sync_worker_task", None)
+            if worker_task is not None:
+                worker_task.cancel()
+                try:
+                    await worker_task
+                except asyncio.CancelledError:
+                    pass
+            if app.state.sync_scheduler is not None:
+                await app.state.sync_scheduler.shutdown()
             await app.state.sync_service.shutdown()
             if owned_db is not None:
                 await owned_db.close()
@@ -2264,12 +2453,20 @@ def create_admin_app(
     if db is not None:
         app.state.db = db
         app.state.sync_service = SyncService(db, config, runtime_provider=runtime_provider)
-        app.state.sync_scheduler = SyncScheduler(db, app.state.sync_service)
+        app.state.sync_scheduler = (
+            SyncScheduler(db, app.state.sync_service)
+            if config.sync.scheduler_enabled
+            else None
+        )
+        app.state.sync_worker = None
+        app.state.sync_worker_task = None
     app.state.config = config
     app.state.document_store = document_store or LocalDocumentStore(config.storage.docs_path)
     app.state.runtime_provider = runtime_provider
     app.state.principal_resolver = principal_resolver
     app.state.workspace_role_resolver = workspace_role_resolver
+    app.state.local_agent_lease_validator = local_agent_lease_validator
+    app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
 
     # -- CORS --
     cors_origins = config.server.cors_origins.split(",") if config.server.cors_origins != "*" else ["*"]
@@ -2431,6 +2628,10 @@ def create_admin_app(
     schedule_router = APIRouter(prefix="/api/schedule", tags=["schedule"])
     llm_router = APIRouter(prefix="/api/llm-config", tags=["llm-config"])
     projects_router = APIRouter(prefix="/api/projects", tags=["projects"])
+    local_agent_router = APIRouter(
+        prefix="/api/cloud/local-agent",
+        tags=["local-agent"],
+    )
 
     async def get_search_engine(request: Request, db: Database, config: AppConfig):
         from memforge.memory.audit import AuditContext, MemoryAuditLogger
@@ -3313,7 +3514,11 @@ def create_admin_app(
                 s["client"] = agent_session_client_for_source_id(s["id"])
             else:
                 s["client"] = None
-            if s["type"] == "jira" and jira_auth_mode == "browser_cookie":
+            if (
+                s["type"] == "jira"
+                and jira_auth_mode == "browser_cookie"
+                and s.get("capabilities", {}).get("can_configure_connection")
+            ):
                 try:
                     s["auth_session"] = await jira_auth_service.get_status(
                         str(s.get("config", {}).get("base_url") or "")
@@ -3572,13 +3777,18 @@ def create_admin_app(
                 source_config = _populate_local_markdown_inbox(source_config, source_id, config)
         except (SecretConfigurationError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        creator_user_id = resolve_request_principal(request)
+        source_for_classification = {"type": req.type, "config": source_config}
         await db.upsert_source(
             id=source_id,
             type=req.type,
             name=req.name,
             config_json=json.dumps(source_config),
             project_binding=req.project_binding,
-            created_by_user_id=resolve_request_principal(request),
+            created_by_user_id=creator_user_id,
+            execution_owner_user_id=(
+                creator_user_id if is_local_agent_backed_source(source_for_classification) else None
+            ),
         )
         if req.sync_schedule is not None:
             await db.set_source_sync_schedule(
@@ -3602,6 +3812,8 @@ def create_admin_app(
         if not existing:
             raise HTTPException(status_code=404, detail="Source not found")
         _require_source_management(request, existing)
+        if req.config is not None:
+            _require_local_agent_connection_management(request, existing)
 
         _validate_source_status(req.status)
         name = req.name or existing["name"]
@@ -3630,6 +3842,15 @@ def create_admin_app(
                     src_config = _populate_local_markdown_inbox(src_config, source_id, config)
             except (SecretConfigurationError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            existing_is_local = is_local_agent_backed_source(existing)
+            updated_is_local = is_local_agent_backed_source(
+                {"type": existing["type"], "config": src_config}
+            )
+            if existing_is_local != updated_is_local:
+                raise HTTPException(
+                    status_code=409,
+                    detail="source_execution_mode_immutable",
+                )
         else:
             src_config = existing["config"]
         scope_changed = req.config is not None and (
@@ -3708,7 +3929,57 @@ def create_admin_app(
         await memory_store.delete_source_cascade(source_id)
         return {"ok": True, "deleted_source": source_id}
 
-    @source_router.post("/{source_id}/sync")
+    async def _enqueue_sync_local_agent_job(
+        request: Request,
+        db: Database,
+        **job: Any,
+    ) -> tuple[str, bool]:
+        enqueuer = getattr(request.app.state, "local_agent_job_enqueuer", None)
+        if enqueuer is not None:
+            return await enqueuer(**job)
+        return await db.enqueue_local_agent_job(**job)
+
+    async def _enqueue_local_source_collection_job(
+        request: Request,
+        db: Database,
+        source: dict[str, Any],
+        *,
+        force_full_sync: bool,
+    ) -> dict[str, Any] | None:
+        operation = local_agent_sync_operation(source["type"], source.get("config"))
+        if operation is None:
+            return None
+        owner = execution_owner_user_id(source)
+        if owner is None:
+            raise HTTPException(
+                status_code=409,
+                detail="local_agent_sync_execution_owner_required",
+            )
+        job_id = f"laj-{uuid.uuid4().hex}"
+        job_id, created = await _enqueue_sync_local_agent_job(
+            request,
+            db,
+            job_id=job_id,
+            source_id=source["id"],
+            source_type=source["type"],
+            operation=operation,
+            payload=local_agent_sync_job_payload(
+                source,
+                {"force_full_sync": force_full_sync},
+            ),
+            created_by_user_id=resolve_request_principal(request),
+            execution_owner_user_id=owner,
+        )
+        return {
+            "ok": True,
+            "message": "Local collection enqueued",
+            "source_id": source["id"],
+            "job_id": job_id,
+            "status": "queued",
+            "coalesced": not created,
+        }
+
+    @source_router.post("/{source_id}/sync", status_code=202)
     async def trigger_sync(
         request: Request,
         source_id: str,
@@ -3720,43 +3991,130 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_management(request, source)
+        _require_source_sync_execution(request, source)
+
+        local_job = await _enqueue_local_source_collection_job(
+            request,
+            db,
+            source,
+            force_full_sync=bool(req and req.force_full_sync),
+        )
+        if local_job is not None:
+            return local_job
 
         try:
-            await sync_service.start_source(
+            run = await sync_service.enqueue_source(
                 source_id,
+                trigger="manual",
                 force_full_sync=bool(req and req.force_full_sync),
             )
-        except SyncAlreadyRunningError:
-            raise HTTPException(status_code=409, detail="Sync already running for this source")
         except SourcePausedError:
             raise _source_paused_http_error()
-        return {"ok": True, "message": "Sync started", "source_id": source_id}
+        return {
+            "ok": True,
+            "message": "Sync enqueued",
+            "source_id": source_id,
+            "run_id": run.run_id,
+            "status": run.status,
+            "coalesced": run.coalesced,
+        }
 
-    @source_router.post("/{source_id}/force-resync")
+    @source_router.post("/{source_id}/process", status_code=202)
+    async def process_collected_local_source(
+        request: Request,
+        source_id: str,
+        req: SourceSyncRequest | None = Body(default=None),
+        db: Database = Depends(get_db),
+        sync_service: SyncService = Depends(get_sync_service),
+    ):
+        """Enqueue server processing after the owner daemon persisted raw input."""
+        source = await db.get_source(source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Source not found")
+        if local_agent_sync_operation(source["type"], source.get("config")) is None:
+            raise HTTPException(status_code=400, detail="source_is_not_local_agent_backed")
+        _require_source_sync_execution(request, source)
+        current_source = await db.get_source(source_id)
+        if current_source is None:
+            raise HTTPException(status_code=404, detail="Source not found")
+        try:
+            snapshot_id = local_agent_authoritative_snapshot_id(
+                current_source["type"],
+                req.local_agent_job_id if req else None,
+                req.local_agent_attempt_count if req else None,
+                req.sync_snapshot_id if req else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        current_source = await db.get_source(source_id)
+        if current_source is None:
+            raise HTTPException(status_code=404, detail="Source not found")
+        lease_payload = await _require_current_local_agent_lease(
+            request,
+            db,
+            source=current_source,
+            job_id=req.local_agent_job_id if req else None,
+            attempt_count=req.local_agent_attempt_count if req else None,
+        )
+        try:
+            run = await sync_service.enqueue_source(
+                source_id,
+                trigger="local_agent",
+                force_full_sync=bool(
+                    lease_payload.get("force_full_sync")
+                    if "force_full_sync" in lease_payload
+                    else req and req.force_full_sync
+                ),
+                input_snapshot_id=snapshot_id,
+            )
+        except SourcePausedError:
+            raise _source_paused_http_error()
+        return {
+            "ok": True,
+            "source_id": source_id,
+            "run_id": run.run_id,
+            "status": run.status,
+            "coalesced": run.coalesced,
+        }
+
+    @source_router.post("/{source_id}/force-resync", status_code=202)
     async def trigger_force_resync(
         request: Request,
         source_id: str,
         db: Database = Depends(get_db),
         sync_service: SyncService = Depends(get_sync_service),
     ):
-        """Reset incremental sync state and trigger a full source sync."""
+        """Enqueue a full source sync without clearing the prior successful cursor."""
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_management(request, source)
+        _require_source_sync_execution(request, source)
 
-        if sync_service.is_running(source_id):
-            raise HTTPException(status_code=409, detail="Sync already running for this source")
+        local_job = await _enqueue_local_source_collection_job(
+            request,
+            db,
+            source,
+            force_full_sync=True,
+        )
+        if local_job is not None:
+            return local_job
 
-        await db.reset_source_sync_cursor(source_id)
         try:
-            await sync_service.start_source(source_id, force_full_sync=True)
-        except SyncAlreadyRunningError:
-            raise HTTPException(status_code=409, detail="Sync already running for this source")
+            run = await sync_service.enqueue_source(
+                source_id,
+                trigger="force",
+                force_full_sync=True,
+            )
         except SourcePausedError:
             raise _source_paused_http_error()
-        return {"ok": True, "message": "Force resync started", "source_id": source_id}
+        return {
+            "ok": True,
+            "message": "Sync enqueued",
+            "source_id": source_id,
+            "run_id": run.run_id,
+            "status": run.status,
+            "coalesced": run.coalesced,
+        }
 
     @source_router.get("/{source_id}/schedule", response_model=SourceSyncScheduleResponse)
     async def get_source_sync_schedule(
@@ -3797,7 +4155,6 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
-        sync_service: SyncService = Depends(get_sync_service),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         """Receive one local-source package pushed by the local daemon/adapter.
@@ -3828,7 +4185,14 @@ def create_admin_app(
                     f"source {source_id} is type {source_type!r}, not a local adapter source"
                 ),
             )
-        _require_source_management(request, source)
+        _require_source_sync_execution(request, source)
+        await _require_current_local_agent_lease(
+            request,
+            db,
+            source=source,
+            job_id=req.local_agent_job_id,
+            attempt_count=req.local_agent_attempt_count,
+        )
         if source.get("status") == SOURCE_PAUSED_STATUS:
             raise HTTPException(status_code=400, detail="Source is paused")
 
@@ -3848,6 +4212,7 @@ def create_admin_app(
                     blob_sha=req.blob_sha,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
+                    document_store=artifact_store,
                 )
             elif source_type == JIRA_SOURCE_TYPE:
                 result = await submit_jira_package(
@@ -3862,6 +4227,7 @@ def create_admin_app(
                     raw_hash=req.raw_hash,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
+                    document_store=artifact_store,
                 )
             elif source_type == TEAMS_SOURCE_TYPE:
                 result = await submit_teams_window_package(
@@ -3894,21 +4260,62 @@ def create_admin_app(
                     raw_hash=req.raw_hash,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
+                    document_store=artifact_store,
                 )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        sync_started = False
-        if req.process_now:
+        if result.get("package_uri"):
             try:
-                await sync_service.start_source(source_id)
-                sync_started = True
-            except SyncAlreadyRunningError:
-                sync_started = True
-            except SourcePausedError:
-                raise _source_paused_http_error()
+                snapshot_id = local_agent_authoritative_snapshot_id(
+                    source_type,
+                    req.local_agent_job_id,
+                    req.local_agent_attempt_count,
+                    req.sync_snapshot_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            current_source = await db.get_source(source_id)
+            if current_source is None:
+                raise HTTPException(status_code=404, detail="Source not found")
+            await _require_current_local_agent_lease(
+                request,
+                db,
+                source=current_source,
+                job_id=req.local_agent_job_id,
+                attempt_count=req.local_agent_attempt_count,
+            )
+            raw_sha256 = local_agent_input_sha256(
+                result.get("doc_id"),
+                result.get("document_hash"),
+            )
+            if not raw_sha256:
+                raise HTTPException(
+                    status_code=500,
+                    detail="local_agent_package_hash_missing",
+                )
+            manifest_entry = result.get("package_manifest_entry")
+            await db.create_source_sync_input(
+                source_id=source_id,
+                raw_uri=str(result["package_uri"]),
+                raw_sha256=raw_sha256,
+                raw_content_type="application/json",
+                metadata={
+                    "doc_id": result.get("doc_id"),
+                    "source_type": source_type,
+                    "package_path": result.get("package_path"),
+                    "submitted_at": result.get("submitted_at"),
+                    "submitted_by": req.submitted_by,
+                    "manifest_entry": (
+                        manifest_entry if isinstance(manifest_entry, dict) else {}
+                    ),
+                },
+                sync_snapshot_id=snapshot_id,
+            )
 
-        return {**result, "sync_started": sync_started}
+        public_result = dict(result)
+        public_result.pop("package_manifest_entry", None)
+        return {**public_result, "sync_started": False}
 
     # ===================================================================
     # 4b. Agent Session Document Intake
@@ -4491,6 +4898,196 @@ def create_admin_app(
 
     # -- Include all routers --
     # Local tool — no auth required. All routers accessible directly.
+    def _shape_local_agent_job(job: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "job_id": job["job_id"],
+            "workspace_id": job["workspace_id"],
+            "source_id": job["source_id"],
+            "source_type": job["source_type"],
+            "operation": job["operation"],
+            "status": job["status"],
+            "payload": job.get("payload") or {},
+            "execution_owner_user_id": job["execution_owner_user_id"],
+            "result": job.get("result") or {},
+            "last_error": job.get("last_error"),
+            "leased_until": job.get("leased_until"),
+            "attempt_count": int(job.get("attempt_count") or 0),
+            "created_at": job.get("created_at"),
+            "updated_at": job.get("updated_at"),
+            "finished_at": job.get("finished_at"),
+        }
+
+    @local_agent_router.post("/jobs", status_code=201)
+    async def create_local_agent_job(
+        req: LocalAgentJobCreateRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        requester = resolve_request_principal(request)
+        source_id = req.source_id.strip()
+        payload = dict(req.payload)
+        if req.operation in LOCAL_AGENT_SYNC_OPERATIONS:
+            if not source_id:
+                raise HTTPException(status_code=400, detail="local_agent_sync_requires_source_id")
+            source = await db.get_source(source_id)
+            if source is None:
+                raise HTTPException(status_code=404, detail="local_agent_source_not_found")
+            operation = local_agent_sync_operation(source["type"], source.get("config"))
+            if operation != req.operation or source["type"] != req.source_type:
+                raise HTTPException(status_code=400, detail="local_agent_operation_source_mismatch")
+            owner = execution_owner_user_id(source)
+            if owner is None:
+                raise HTTPException(status_code=409, detail="local_agent_sync_execution_owner_required")
+            if requester != owner:
+                raise HTTPException(status_code=403, detail="local_agent_sync_execution_owner_forbidden")
+            payload = local_agent_sync_job_payload(source, payload)
+        else:
+            expected_type = LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES.get(req.operation)
+            if expected_type is None:
+                raise HTTPException(status_code=400, detail="unsupported_local_agent_operation")
+            if expected_type != req.source_type:
+                raise HTTPException(status_code=400, detail="local_agent_operation_source_type_mismatch")
+            if resolve_request_workspace_role(request) not in {"workspace_admin", "member"}:
+                raise HTTPException(status_code=403, detail="local_agent_job_forbidden")
+            owner = requester
+        payload.pop("created_by_user_id", None)
+        payload.pop("execution_owner_user_id", None)
+        job_id = f"laj-{uuid.uuid4().hex}"
+        workspace_id = (req.workspace_id or "default").strip() or "default"
+        if req.operation in LOCAL_AGENT_SYNC_OPERATIONS:
+            job_id, created = await _enqueue_sync_local_agent_job(
+                request,
+                db,
+                job_id=job_id,
+                workspace_id=workspace_id,
+                source_id=source_id,
+                source_type=req.source_type,
+                operation=req.operation,
+                payload=payload,
+                created_by_user_id=requester,
+                execution_owner_user_id=owner,
+            )
+            return {
+                "job_id": job_id,
+                "status": "queued",
+                "coalesced": not created,
+            }
+        await db.insert_local_agent_job(
+            job_id=job_id,
+            workspace_id=workspace_id,
+            source_id=source_id,
+            source_type=req.source_type,
+            operation=req.operation,
+            payload=payload,
+            created_by_user_id=requester,
+            execution_owner_user_id=owner,
+        )
+        return {"job_id": job_id, "status": "queued", "coalesced": False}
+
+    @local_agent_router.post("/jobs/lease")
+    async def lease_local_agent_jobs(
+        req: LocalAgentJobLeaseRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        requester = resolve_request_principal(request)
+        deadline = time.monotonic() + req.wait_seconds
+        while True:
+            jobs = await db.lease_local_agent_jobs(
+                user_id=requester,
+                limit=req.limit,
+                lease_seconds=req.lease_seconds,
+            )
+            if jobs or req.wait_seconds <= 0 or time.monotonic() >= deadline:
+                return {"jobs": [_shape_local_agent_job(job) for job in jobs]}
+            if await request.is_disconnected():
+                return {"jobs": []}
+            await asyncio.sleep(min(0.5, max(deadline - time.monotonic(), 0)))
+
+    @local_agent_router.post("/jobs/{job_id}/heartbeat")
+    async def heartbeat_local_agent_job(
+        job_id: str,
+        req: LocalAgentJobHeartbeatRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        wrote = await db.heartbeat_local_agent_job(
+            job_id=job_id,
+            user_id=resolve_request_principal(request),
+            attempt_count=req.attempt_count,
+            lease_seconds=req.lease_seconds,
+        )
+        if not wrote:
+            raise HTTPException(status_code=404, detail="local_agent_job_not_found")
+        return {"ok": True, "job_id": job_id, "status": "leased"}
+
+    @local_agent_router.post("/jobs/{job_id}/complete")
+    async def complete_local_agent_job(
+        job_id: str,
+        req: LocalAgentJobCompleteRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        wrote = await db.complete_local_agent_job(
+            job_id=job_id,
+            user_id=resolve_request_principal(request),
+            attempt_count=req.attempt_count,
+            status=req.status,
+            result=req.result,
+            error=req.error,
+            retryable=bool(req.result.get("retryable")),
+        )
+        if not wrote:
+            current = await db.get_local_agent_job(job_id)
+            if (
+                not current
+                or int(current.get("attempt_count") or 0) != req.attempt_count
+                or current.get("execution_owner_user_id") != resolve_request_principal(request)
+            ):
+                raise HTTPException(status_code=404, detail="local_agent_job_not_found")
+            status = str(current.get("status") or "")
+            if status not in {"queued", "succeeded", "failed"}:
+                raise HTTPException(status_code=404, detail="local_agent_job_not_found")
+        else:
+            status = local_agent_completion_status(
+                req.status,
+                retryable=bool(req.result.get("retryable")),
+                attempt_count=req.attempt_count,
+            )
+        return {"ok": True, "job_id": job_id, "status": status}
+
+    @local_agent_router.get("/jobs/{job_id}")
+    async def read_local_agent_job(
+        job_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        job = await db.get_local_agent_job(job_id)
+        requester = resolve_request_principal(request)
+        if job is None or requester not in {
+            job["created_by_user_id"], job["execution_owner_user_id"]
+        }:
+            raise HTTPException(status_code=404, detail="local_agent_job_not_found")
+        return _shape_local_agent_job(job)
+
+    @local_agent_router.get("/status")
+    async def read_local_agent_status(
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        now = datetime.now(timezone.utc)
+        last_seen_at = await db.get_local_agent_heartbeat(resolve_request_principal(request))
+        last_seen = datetime.fromisoformat(last_seen_at) if last_seen_at else None
+        online = bool(
+            last_seen and (now - last_seen).total_seconds() <= LOCAL_AGENT_STATUS_STALE_SECONDS
+        )
+        return {
+            "status": "online" if online else "offline",
+            "last_seen_at": last_seen_at,
+            "checked_at": now.isoformat(),
+            "stale_after_seconds": LOCAL_AGENT_STATUS_STALE_SECONDS,
+        }
+
     app.include_router(auth_router)
     app.include_router(health_router)
     app.include_router(document_router)
@@ -4505,6 +5102,7 @@ def create_admin_app(
     app.include_router(schedule_router)
     app.include_router(llm_router)
     app.include_router(projects_router)
+    app.include_router(local_agent_router)
 
     # -- Detailed stats endpoint (observability) --
 

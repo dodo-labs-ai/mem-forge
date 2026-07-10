@@ -19,6 +19,11 @@ from typing import Any, Mapping, Sequence
 
 import aiosqlite
 
+from memforge.local_agent.source_contract import (
+    local_agent_completion_status,
+    local_agent_sync_job_payload,
+    local_agent_sync_operation,
+)
 from memforge.models import (
     AgentHookReceipt,
     AgentSessionReceipt,
@@ -35,6 +40,8 @@ from memforge.models import (
     Project,
     ReplacementKind,
     SHARED_PROJECT_KEY,
+    SourceSyncInput,
+    SourceSyncRun,
     SyncState,
     UNSORTED_PROJECT_KEY,
     Visibility,
@@ -202,6 +209,17 @@ def _utc_iso(dt: datetime | None) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
+def _non_empty_string(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _manifest_doc_id(metadata: Mapping[str, object]) -> str | None:
+    entry = metadata.get("manifest_entry")
+    nested = _non_empty_string(entry.get("doc_id")) if isinstance(entry, Mapping) else None
+    return nested or _non_empty_string(metadata.get("doc_id"))
+
+
 def _validate_replacement_kind(value: str) -> ReplacementKind:
     if value not in {"revision", "supersession"}:
         raise ValueError(f"Unsupported memory replacement kind: {value}")
@@ -229,6 +247,64 @@ def _source_schedule_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "next_run_at": row.get("sync_schedule_next_at"),
         "updated_at": row.get("sync_schedule_updated_at"),
     }
+
+
+def _source_sync_run_from_row(row: Mapping[str, Any], *, coalesced: bool = False) -> SourceSyncRun:
+    data = dict(row)
+    return SourceSyncRun(
+        run_id=str(data["run_id"]),
+        workspace_id=str(data["workspace_id"]),
+        source_id=str(data["source_id"]),
+        trigger=str(data["trigger"]),
+        status=str(data["status"]),
+        force_full_sync=bool(data["force_full_sync"]),
+        input_snapshot_id=data.get("input_snapshot_id"),
+        rerun_input_snapshot_id=data.get("rerun_input_snapshot_id"),
+        coalesced=coalesced,
+        lease_owner=data.get("lease_owner"),
+        lease_expires_at=_parse_dt(data.get("lease_expires_at")),
+        lease_attempt_count=int(data.get("lease_attempt_count") or 0),
+        recovery_count=int(data.get("recovery_count") or 0),
+        rerun_requested=bool(data.get("rerun_requested")),
+        next_attempt_at=_parse_dt(data.get("next_attempt_at")),
+        error_message=data.get("error_message"),
+        created_at=_parse_dt(data.get("created_at")),
+        updated_at=_parse_dt(data.get("updated_at")),
+        started_at=_parse_dt(data.get("started_at")),
+        completed_at=_parse_dt(data.get("completed_at")),
+    )
+
+
+def _source_sync_input_from_row(row: Mapping[str, Any]) -> SourceSyncInput:
+    data = dict(row)
+    try:
+        metadata = json.loads(data.get("metadata_json") or "{}")
+    except json.JSONDecodeError:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return SourceSyncInput(
+        input_id=str(data["input_id"]),
+        workspace_id=str(data["workspace_id"]),
+        source_id=str(data["source_id"]),
+        input_generation=int(data["input_generation"]),
+        raw_uri=str(data["raw_uri"]),
+        raw_sha256=str(data["raw_sha256"]),
+        raw_content_type=str(data["raw_content_type"]),
+        metadata=metadata,
+        created_at=_parse_dt(data.get("created_at")),
+    )
+
+
+def _local_agent_job_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    data = dict(row)
+    for field in ("payload_json", "result_json"):
+        try:
+            parsed = json.loads(data.get(field) or "{}")
+        except json.JSONDecodeError:
+            parsed = {}
+        data[field.removesuffix("_json")] = parsed if isinstance(parsed, dict) else {}
+    return data
 
 
 _VALID_VISIBILITIES = frozenset({Visibility.WORKSPACE.value, Visibility.PRIVATE.value})
@@ -624,6 +700,7 @@ CREATE TABLE IF NOT EXISTS sources (
     doc_count       INTEGER DEFAULT 0,
     project_binding TEXT,                    -- JSON: {"mode": "fixed", ...} or {"mode": "by_field", ...}
     created_by_user_id TEXT,
+    execution_owner_user_id TEXT,
     sync_schedule_enabled INTEGER NOT NULL DEFAULT 0,
     sync_schedule_interval_minutes INTEGER NOT NULL DEFAULT 1440,
     sync_schedule_next_at TEXT,
@@ -756,6 +833,90 @@ CREATE TABLE IF NOT EXISTS sync_history (
     started_at          TEXT NOT NULL,
     finished_at         TEXT NOT NULL,
     run_id              TEXT
+);
+
+CREATE TABLE IF NOT EXISTS source_sync_runs (
+    run_id                  TEXT PRIMARY KEY,
+    workspace_id            TEXT NOT NULL,
+    source_id               TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    trigger                 TEXT NOT NULL,
+    status                  TEXT NOT NULL,
+    force_full_sync         INTEGER NOT NULL DEFAULT 0,
+    input_snapshot_id       TEXT,
+    rerun_input_snapshot_id TEXT,
+    lease_owner             TEXT,
+    lease_expires_at        TEXT,
+    lease_attempt_count     INTEGER NOT NULL DEFAULT 0,
+    recovery_count          INTEGER NOT NULL DEFAULT 0,
+    rerun_requested         INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at         TEXT,
+    error_message           TEXT,
+    created_at              TEXT NOT NULL,
+    updated_at              TEXT NOT NULL,
+    started_at              TEXT,
+    completed_at            TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_source_sync_runs_active
+    ON source_sync_runs(workspace_id, source_id)
+    WHERE status IN ('pending', 'running');
+
+CREATE TABLE IF NOT EXISTS source_sync_inputs (
+    input_id            TEXT PRIMARY KEY,
+    workspace_id        TEXT NOT NULL,
+    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    input_generation    INTEGER NOT NULL,
+    raw_uri             TEXT NOT NULL,
+    raw_sha256          TEXT NOT NULL,
+    raw_content_type    TEXT NOT NULL,
+    metadata_json       TEXT NOT NULL DEFAULT '{}',
+    created_at          TEXT NOT NULL,
+    UNIQUE(workspace_id, source_id, input_generation)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_sync_inputs_source
+    ON source_sync_inputs(workspace_id, source_id, input_generation);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_source_sync_inputs_raw_hash
+    ON source_sync_inputs(workspace_id, source_id, raw_sha256);
+
+CREATE TABLE IF NOT EXISTS source_sync_snapshot_items (
+    workspace_id        TEXT NOT NULL,
+    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    snapshot_id         TEXT NOT NULL,
+    doc_id              TEXT NOT NULL,
+    input_id            TEXT NOT NULL REFERENCES source_sync_inputs(input_id) ON DELETE CASCADE,
+    created_at          TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, source_id, snapshot_id, doc_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_sync_snapshot_items_input
+    ON source_sync_snapshot_items(input_id);
+
+CREATE TABLE IF NOT EXISTS local_agent_jobs (
+    job_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    source_id TEXT NOT NULL DEFAULT '',
+    source_type TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_by_user_id TEXT NOT NULL,
+    execution_owner_user_id TEXT NOT NULL,
+    lease_owner_user_id TEXT,
+    leased_until TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    result_json TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_local_agent_jobs_owner_status
+    ON local_agent_jobs(execution_owner_user_id, status, leased_until);
+CREATE TABLE IF NOT EXISTS local_agent_heartbeats (
+    user_id TEXT PRIMARY KEY,
+    last_seen_at TEXT NOT NULL
 );
 
 -- ---------------------------------------------------------------
@@ -1627,12 +1788,137 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                JOIN entities e ON e.id = ea.canonical_id""",
         ],
     ),
+    (
+        35,
+        "Track local source execution owner",
+        [
+            "ALTER TABLE sources ADD COLUMN execution_owner_user_id TEXT",
+            """UPDATE sources
+               SET execution_owner_user_id = created_by_user_id
+               WHERE execution_owner_user_id IS NULL
+                 AND created_by_user_id IS NOT NULL""",
+        ],
+    ),
+    (
+        36,
+        "Add durable source sync runs",
+        [
+            """CREATE TABLE IF NOT EXISTS source_sync_runs (
+                run_id                  TEXT PRIMARY KEY,
+                workspace_id            TEXT NOT NULL,
+                source_id               TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                trigger                 TEXT NOT NULL,
+                status                  TEXT NOT NULL,
+                force_full_sync         INTEGER NOT NULL DEFAULT 0,
+                input_snapshot_id       TEXT,
+                rerun_input_snapshot_id TEXT,
+                lease_owner             TEXT,
+                lease_expires_at        TEXT,
+                lease_attempt_count     INTEGER NOT NULL DEFAULT 0,
+                recovery_count          INTEGER NOT NULL DEFAULT 0,
+                rerun_requested         INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at         TEXT,
+                error_message           TEXT,
+                created_at              TEXT NOT NULL,
+                updated_at              TEXT NOT NULL,
+                started_at              TEXT,
+                completed_at            TEXT
+            )""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_source_sync_runs_active
+               ON source_sync_runs(workspace_id, source_id)
+               WHERE status IN ('pending', 'running')""",
+            """CREATE TABLE IF NOT EXISTS source_sync_inputs (
+                input_id            TEXT PRIMARY KEY,
+                workspace_id        TEXT NOT NULL,
+                source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                input_generation    INTEGER NOT NULL,
+                raw_uri             TEXT NOT NULL,
+                raw_sha256          TEXT NOT NULL,
+                raw_content_type    TEXT NOT NULL,
+                metadata_json       TEXT NOT NULL DEFAULT '{}',
+                created_at          TEXT NOT NULL,
+                UNIQUE(workspace_id, source_id, input_generation)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_source_sync_inputs_source
+               ON source_sync_inputs(workspace_id, source_id, input_generation)""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_source_sync_inputs_raw_hash
+               ON source_sync_inputs(workspace_id, source_id, raw_sha256)""",
+            """CREATE TABLE IF NOT EXISTS source_sync_snapshot_items (
+                workspace_id        TEXT NOT NULL,
+                source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                snapshot_id         TEXT NOT NULL,
+                doc_id              TEXT NOT NULL,
+                input_id            TEXT NOT NULL REFERENCES source_sync_inputs(input_id) ON DELETE CASCADE,
+                created_at          TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, source_id, snapshot_id, doc_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_source_sync_snapshot_items_input
+               ON source_sync_snapshot_items(input_id)""",
+        ],
+    ),
+    (
+        37,
+        "Add local agent job broker",
+        [
+            """CREATE TABLE IF NOT EXISTS local_agent_jobs (
+                job_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL DEFAULT 'default',
+                source_id TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_by_user_id TEXT NOT NULL,
+                execution_owner_user_id TEXT NOT NULL,
+                lease_owner_user_id TEXT,
+                leased_until TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                result_json TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                finished_at TEXT
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_local_agent_jobs_owner_status
+               ON local_agent_jobs(execution_owner_user_id, status, leased_until)""",
+            """CREATE TABLE IF NOT EXISTS local_agent_heartbeats (
+                user_id TEXT PRIMARY KEY,
+                last_seen_at TEXT NOT NULL
+            )""",
+        ],
+    ),
+    # Migration 36 is expanded in fresh installs, while 38 upgrades databases
+    # that already recorded the earlier 36. Duplicate columns are intentionally
+    # handled by the migration runner's additive-schema compatibility path.
+    (
+        38,
+        "Track local source input snapshots",
+        [
+            "ALTER TABLE source_sync_runs ADD COLUMN input_snapshot_id TEXT",
+            "ALTER TABLE source_sync_runs ADD COLUMN rerun_input_snapshot_id TEXT",
+            """CREATE TABLE IF NOT EXISTS source_sync_snapshot_items (
+                workspace_id        TEXT NOT NULL,
+                source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                snapshot_id         TEXT NOT NULL,
+                doc_id              TEXT NOT NULL,
+                input_id            TEXT NOT NULL REFERENCES source_sync_inputs(input_id) ON DELETE CASCADE,
+                created_at          TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, source_id, snapshot_id, doc_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_source_sync_snapshot_items_input
+               ON source_sync_snapshot_items(input_id)""",
+        ],
+    ),
 ]
 
 
 # ---------------------------------------------------------------------------
 # Database class
 # ---------------------------------------------------------------------------
+
+
+class _ActiveSourceSyncRunChanged(RuntimeError):
+    pass
 
 
 class Database:
@@ -1976,6 +2262,324 @@ class Database:
             async for row in cursor:
                 results.append(self._row_to_document(row))
         return results
+
+    async def insert_local_agent_job(
+        self,
+        *,
+        job_id: str,
+        source_id: str,
+        source_type: str,
+        operation: str,
+        payload: Mapping[str, Any],
+        created_by_user_id: str,
+        execution_owner_user_id: str,
+        workspace_id: str = "default",
+        now: datetime | None = None,
+    ) -> bool:
+        now_iso = _utc_iso(now)
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """INSERT OR IGNORE INTO local_agent_jobs (
+                    job_id, workspace_id, source_id, source_type, operation,
+                    payload_json, created_by_user_id, execution_owner_user_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job_id, workspace_id, source_id, source_type, operation,
+                    json.dumps(dict(payload), sort_keys=True),
+                    created_by_user_id, execution_owner_user_id, now_iso, now_iso,
+                ),
+            )
+            await self.db.commit()
+        return bool(cursor.rowcount)
+
+    async def enqueue_local_agent_job(
+        self,
+        *,
+        job_id: str,
+        source_id: str,
+        source_type: str,
+        operation: str,
+        payload: Mapping[str, Any],
+        created_by_user_id: str,
+        execution_owner_user_id: str,
+        workspace_id: str = "default",
+    ) -> tuple[str, bool]:
+        now_iso = _utc_iso(None)
+        requested_force = bool(payload.get("force_full_sync"))
+        async with self._write_lock:
+            async with self.db.execute(
+                """SELECT * FROM local_agent_jobs
+                   WHERE workspace_id = ? AND source_id = ? AND operation = ?
+                     AND execution_owner_user_id = ? AND status IN ('queued', 'leased')
+                   ORDER BY created_at LIMIT 1""",
+                (workspace_id, source_id, operation, execution_owner_user_id),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            if existing is not None:
+                existing_payload = json.loads(existing["payload_json"] or "{}")
+                if existing["status"] == "queued":
+                    replacement = dict(payload)
+                    if bool(existing_payload.get("force_full_sync")):
+                        replacement["force_full_sync"] = True
+                    if replacement != existing_payload:
+                        await self.db.execute(
+                            """UPDATE local_agent_jobs SET payload_json = ?, updated_at = ?
+                               WHERE job_id = ? AND status IN ('queued', 'leased')""",
+                            (
+                                json.dumps(replacement, sort_keys=True),
+                                now_iso,
+                                existing["job_id"],
+                            ),
+                        )
+                        await self.db.commit()
+                    return str(existing["job_id"]), False
+                same_revision = existing_payload.get(
+                    "source_config_revision"
+                ) == payload.get("source_config_revision")
+                if same_revision and (
+                    not requested_force
+                    or bool(existing_payload.get("force_full_sync"))
+                ):
+                    return str(existing["job_id"]), False
+            await self.db.execute(
+                """INSERT INTO local_agent_jobs (
+                    job_id, workspace_id, source_id, source_type, operation,
+                    payload_json, created_by_user_id, execution_owner_user_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job_id, workspace_id, source_id, source_type, operation,
+                    json.dumps(dict(payload), sort_keys=True), created_by_user_id,
+                    execution_owner_user_id, now_iso, now_iso,
+                ),
+            )
+            await self.db.commit()
+        return job_id, True
+
+    async def get_local_agent_job(self, job_id: str) -> dict[str, Any] | None:
+        async with self.db.execute(
+            "SELECT * FROM local_agent_jobs WHERE job_id = ?", (job_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return _local_agent_job_from_row(row) if row else None
+
+    async def lease_local_agent_jobs(
+        self,
+        *,
+        user_id: str,
+        limit: int,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        lease_time = now or datetime.now(timezone.utc)
+        now_iso = _utc_iso(lease_time)
+        leased_until = _utc_iso(lease_time + timedelta(seconds=lease_seconds))
+        leased_ids: list[str] = []
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT INTO local_agent_heartbeats (user_id, last_seen_at)
+                   VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET
+                   last_seen_at = excluded.last_seen_at""",
+                (user_id, now_iso),
+            )
+            async with self.db.execute(
+                """SELECT j.job_id FROM local_agent_jobs j
+                   WHERE j.execution_owner_user_id = ?
+                     AND (j.status = 'queued' OR
+                          (j.status = 'leased' AND j.leased_until <= ?))
+                     AND NOT EXISTS (
+                         SELECT 1 FROM local_agent_jobs active
+                         WHERE active.workspace_id = j.workspace_id
+                           AND active.source_id = j.source_id
+                           AND active.operation = j.operation
+                           AND active.execution_owner_user_id = j.execution_owner_user_id
+                           AND active.status = 'leased'
+                           AND active.leased_until > ?
+                           AND active.job_id <> j.job_id
+                     )
+                   ORDER BY j.created_at, j.job_id LIMIT ?""",
+                (user_id, now_iso, now_iso, limit),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            for row in rows:
+                cursor = await self.db.execute(
+                    """UPDATE local_agent_jobs SET status = 'leased',
+                       lease_owner_user_id = ?, leased_until = ?,
+                       attempt_count = attempt_count + 1, updated_at = ?
+                       WHERE job_id = ? AND execution_owner_user_id = ?
+                         AND (status = 'queued' OR
+                              (status = 'leased' AND leased_until <= ?))
+                         AND NOT EXISTS (
+                             SELECT 1 FROM local_agent_jobs active
+                             WHERE active.workspace_id = local_agent_jobs.workspace_id
+                               AND active.source_id = local_agent_jobs.source_id
+                               AND active.operation = local_agent_jobs.operation
+                               AND active.execution_owner_user_id = local_agent_jobs.execution_owner_user_id
+                               AND active.status = 'leased'
+                               AND active.leased_until > ?
+                               AND active.job_id <> local_agent_jobs.job_id
+                         )""",
+                    (
+                        user_id, leased_until, now_iso, row["job_id"], user_id,
+                        now_iso, now_iso,
+                    ),
+                )
+                if cursor.rowcount:
+                    leased_ids.append(str(row["job_id"]))
+            await self.db.commit()
+        jobs = [await self.get_local_agent_job(job_id) for job_id in leased_ids]
+        return [job for job in jobs if job is not None]
+
+    async def heartbeat_local_agent_job(
+        self,
+        *,
+        job_id: str,
+        user_id: str,
+        attempt_count: int,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> bool:
+        heartbeat_at = now or datetime.now(timezone.utc)
+        now_iso = _utc_iso(heartbeat_at)
+        leased_until = _utc_iso(heartbeat_at + timedelta(seconds=lease_seconds))
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT INTO local_agent_heartbeats (user_id, last_seen_at)
+                   VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET
+                   last_seen_at = excluded.last_seen_at""",
+                (user_id, now_iso),
+            )
+            cursor = await self.db.execute(
+                """UPDATE local_agent_jobs SET leased_until = ?, updated_at = ?
+                   WHERE job_id = ? AND status = 'leased'
+                     AND lease_owner_user_id = ? AND attempt_count = ?""",
+                (leased_until, now_iso, job_id, user_id, attempt_count),
+            )
+            await self.db.commit()
+        return bool(cursor.rowcount)
+
+    async def complete_local_agent_job(
+        self,
+        *,
+        job_id: str,
+        user_id: str,
+        attempt_count: int,
+        status: str,
+        result: Mapping[str, Any],
+        error: str | None,
+        retryable: bool = False,
+        now: datetime | None = None,
+    ) -> bool:
+        now_iso = _utc_iso(now)
+        stored_status = local_agent_completion_status(
+            status,
+            retryable=retryable,
+            attempt_count=attempt_count,
+        )
+        should_retry = stored_status == "queued"
+        finished_at = None if should_retry else now_iso
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE local_agent_jobs SET status = ?, result_json = ?,
+                   last_error = ?, lease_owner_user_id = NULL,
+                   leased_until = NULL, finished_at = ?, updated_at = ?
+                   WHERE job_id = ? AND status = 'leased'
+                     AND lease_owner_user_id = ? AND attempt_count = ?""",
+                (
+                    stored_status, json.dumps(dict(result), sort_keys=True), error,
+                    finished_at, now_iso, job_id, user_id, attempt_count,
+                ),
+            )
+            await self.db.commit()
+        return bool(cursor.rowcount)
+
+    async def get_local_agent_heartbeat(self, user_id: str) -> str | None:
+        async with self.db.execute(
+            "SELECT last_seen_at FROM local_agent_heartbeats WHERE user_id = ?",
+            (user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return str(row["last_seen_at"]) if row else None
+
+    async def enqueue_due_local_agent_jobs(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 50,
+        workspace_id: str = "default",
+    ) -> int:
+        claim_time = now or datetime.now(timezone.utc)
+        due_at = _utc_iso(claim_time)
+        enqueued = 0
+        async with self._write_lock:
+            async with self.db.execute(
+                """SELECT * FROM sources WHERE status = 'active'
+                   AND sync_schedule_enabled = 1
+                   AND sync_schedule_next_at IS NOT NULL
+                   AND sync_schedule_next_at <= ?
+                   ORDER BY sync_schedule_next_at, created_at LIMIT ?""",
+                (due_at, limit),
+            ) as cursor:
+                rows = [dict(row) async for row in cursor]
+            for row in rows:
+                operation = local_agent_sync_operation(row["type"], row["config"])
+                if operation is None:
+                    continue
+                owner = str(row.get("execution_owner_user_id") or "").strip()
+                expected_due = str(row["sync_schedule_next_at"])
+                interval = int(
+                    row.get("sync_schedule_interval_minutes")
+                    or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+                )
+                if not owner:
+                    await self.db.execute(
+                        """UPDATE sources SET sync_schedule_next_at = ?,
+                           sync_schedule_updated_at = ?
+                           WHERE id = ? AND status = 'active'
+                             AND sync_schedule_enabled = 1
+                             AND sync_schedule_next_at = ?""",
+                        (
+                            _utc_iso(claim_time + timedelta(minutes=interval)),
+                            due_at,
+                            row["id"],
+                            expected_due,
+                        ),
+                    )
+                    continue
+                job_id = "laj-schedule-" + uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"memforge:{workspace_id}:{row['id']}:{expected_due}",
+                ).hex
+                cursor = await self.db.execute(
+                    """UPDATE sources SET sync_schedule_next_at = ?,
+                       sync_schedule_updated_at = ?
+                       WHERE id = ? AND status = 'active'
+                         AND sync_schedule_enabled = 1
+                         AND sync_schedule_next_at = ?""",
+                    (
+                        _utc_iso(claim_time + timedelta(minutes=interval)),
+                        due_at,
+                        row["id"],
+                        expected_due,
+                    ),
+                )
+                if cursor.rowcount:
+                    await self.db.execute(
+                        """INSERT OR IGNORE INTO local_agent_jobs (
+                            job_id, workspace_id, source_id, source_type, operation,
+                            payload_json, created_by_user_id, execution_owner_user_id,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            job_id, workspace_id, row["id"], row["type"], operation,
+                            json.dumps(local_agent_sync_job_payload(row), sort_keys=True),
+                            owner, owner, due_at, due_at,
+                        ),
+                    )
+                    enqueued += 1
+            await self.db.commit()
+        return enqueued
 
     async def count_documents(self, source: str | None = None) -> int:
         """Return the number of indexed documents, optionally scoped to a source."""
@@ -5597,6 +6201,7 @@ class Database:
         status: str | None = None,
         project_binding: Mapping[str, Any] | None = None,
         created_by_user_id: str | None = None,
+        execution_owner_user_id: str | None = None,
     ) -> None:
         """Insert or update a source row.
 
@@ -5607,8 +6212,11 @@ class Database:
         binding_json = json.dumps(dict(project_binding)) if project_binding else None
         async with self._write_lock:
             await self.db.execute(
-                """INSERT INTO sources (id, type, name, config, status, project_binding, created_by_user_id)
-                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?, ?)
+                """INSERT INTO sources (
+                       id, type, name, config, status, project_binding,
+                       created_by_user_id, execution_owner_user_id
+                   )
+                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                    type=excluded.type,
                    name=excluded.name,
@@ -5618,8 +6226,22 @@ class Database:
                        ELSE excluded.status
                    END,
                    project_binding=excluded.project_binding,
-                   created_by_user_id=COALESCE(sources.created_by_user_id, excluded.created_by_user_id)""",
-                (id, type, name, config_json, status, binding_json, created_by_user_id, status),
+                   created_by_user_id=COALESCE(sources.created_by_user_id, excluded.created_by_user_id),
+                   execution_owner_user_id=COALESCE(
+                       sources.execution_owner_user_id,
+                       excluded.execution_owner_user_id
+                   )""",
+                (
+                    id,
+                    type,
+                    name,
+                    config_json,
+                    status,
+                    binding_json,
+                    created_by_user_id,
+                    execution_owner_user_id,
+                    status,
+                ),
             )
             stale_metadata_rows = await self.db.execute_fetchall(
                 """SELECT 1
@@ -5650,10 +6272,10 @@ class Database:
             await self.db.execute(
                 """INSERT INTO sources
                    (id, type, name, config, status, last_sync, doc_count, project_binding,
-                    created_by_user_id, sync_schedule_enabled,
+                    created_by_user_id, execution_owner_user_id, sync_schedule_enabled,
                     sync_schedule_interval_minutes, sync_schedule_next_at,
                     sync_schedule_updated_at, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                    type=excluded.type,
                    name=excluded.name,
@@ -5663,6 +6285,7 @@ class Database:
                    doc_count=excluded.doc_count,
                    project_binding=excluded.project_binding,
                    created_by_user_id=excluded.created_by_user_id,
+                   execution_owner_user_id=excluded.execution_owner_user_id,
                    sync_schedule_enabled=excluded.sync_schedule_enabled,
                    sync_schedule_interval_minutes=excluded.sync_schedule_interval_minutes,
                    sync_schedule_next_at=excluded.sync_schedule_next_at,
@@ -5678,6 +6301,7 @@ class Database:
                     source["doc_count"],
                     (json.dumps(source["project_binding"]) if source.get("project_binding") else None),
                     source.get("created_by_user_id"),
+                    source.get("execution_owner_user_id"),
                     int((source.get("sync_schedule") or {}).get("enabled") or 0),
                     int((source.get("sync_schedule") or {}).get("interval_minutes") or 1440),
                     (source.get("sync_schedule") or {}).get("next_run_at"),
@@ -5833,6 +6457,114 @@ class Database:
                     results.append(d)
             await self.db.commit()
         return results
+
+    async def enqueue_due_source_sync_runs(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 50,
+        workspace_id: str = "default",
+        exclude_source_ids: set[str] | None = None,
+    ) -> list[SourceSyncRun]:
+        claim_time = now or datetime.now(timezone.utc)
+        due_at = claim_time.isoformat()
+        exclude_ids = tuple(sorted(exclude_source_ids or ()))
+        exclude_sql = ""
+        if exclude_ids:
+            exclude_sql = " AND id NOT IN (" + ", ".join("?" for _ in exclude_ids) + ")"
+        runs: list[SourceSyncRun] = []
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    f"""SELECT * FROM sources
+                       WHERE status = 'active'
+                         AND sync_schedule_enabled = 1
+                         AND sync_schedule_next_at IS NOT NULL
+                         AND sync_schedule_next_at <= ?
+                         {exclude_sql}
+                       ORDER BY sync_schedule_next_at, created_at
+                       LIMIT ?""",
+                    (due_at, *exclude_ids, limit),
+                ) as cursor:
+                    rows = [dict(row) async for row in cursor]
+                for row in rows:
+                    if local_agent_sync_operation(row["type"], row["config"]) is not None:
+                        continue
+                    interval_minutes = int(
+                        row.get("sync_schedule_interval_minutes") or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+                    )
+                    next_at = claim_time + timedelta(minutes=interval_minutes)
+                    updated_at = _now_iso()
+                    update_cursor = await self.db.execute(
+                        """UPDATE sources SET
+                           sync_schedule_next_at = ?,
+                           sync_schedule_updated_at = ?
+                           WHERE id = ?
+                             AND status = 'active'
+                             AND sync_schedule_enabled = 1
+                             AND sync_schedule_next_at = ?""",
+                        (
+                            next_at.isoformat(),
+                            updated_at,
+                            row["id"],
+                            row["sync_schedule_next_at"],
+                        ),
+                    )
+                    if not update_cursor.rowcount:
+                        continue
+                    runs.append(
+                        await self._enqueue_source_sync_run_locked(
+                            source_id=str(row["id"]),
+                            workspace_id=workspace_id,
+                            trigger="schedule",
+                            now=updated_at,
+                        )
+                    )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return runs
+
+    async def advance_source_sync_schedule(
+        self,
+        source_id: str,
+        *,
+        expected_next_run_at: str,
+        now: datetime | None = None,
+    ) -> bool:
+        claim_time = now or datetime.now(timezone.utc)
+        async with self._write_lock:
+            async with self.db.execute(
+                "SELECT sync_schedule_interval_minutes FROM sources WHERE id = ?",
+                (source_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return False
+            interval_minutes = int(
+                row["sync_schedule_interval_minutes"]
+                or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+            )
+            next_at = claim_time + timedelta(minutes=interval_minutes)
+            updated_at = _now_iso()
+            cursor = await self.db.execute(
+                """UPDATE sources SET
+                   sync_schedule_next_at = ?,
+                   sync_schedule_updated_at = ?
+                   WHERE id = ?
+                     AND status = 'active'
+                     AND sync_schedule_enabled = 1
+                     AND sync_schedule_next_at = ?""",
+                (
+                    next_at.isoformat(),
+                    updated_at,
+                    source_id,
+                    expected_next_run_at,
+                ),
+            )
+            await self.db.commit()
+            return bool(cursor.rowcount)
 
     async def is_source_enabled_for_user(self, source_id: str, user_id: str) -> bool:
         async with self.db.execute(
@@ -6558,6 +7290,560 @@ class Database:
     # ==================================================================
     # Sync
     # ==================================================================
+
+    async def enqueue_source_sync_run(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str = "default",
+        trigger: str = "manual",
+        force_full_sync: bool = False,
+        input_snapshot_id: str | None = None,
+    ) -> SourceSyncRun:
+        for _attempt in range(3):
+            async with self._write_lock:
+                try:
+                    run = await self._enqueue_source_sync_run_locked(
+                        source_id=source_id,
+                        workspace_id=workspace_id,
+                        trigger=trigger,
+                        force_full_sync=force_full_sync,
+                        input_snapshot_id=input_snapshot_id,
+                    )
+                    await self.db.commit()
+                    return run
+                except (_ActiveSourceSyncRunChanged, aiosqlite.IntegrityError):
+                    await self.db.rollback()
+                    continue
+                except Exception:
+                    await self.db.rollback()
+                    raise
+        raise RuntimeError("source sync run changed repeatedly during enqueue")
+
+    async def _enqueue_source_sync_run_locked(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str = "default",
+        trigger: str = "manual",
+        force_full_sync: bool = False,
+        input_snapshot_id: str | None = None,
+        now: str | None = None,
+    ) -> SourceSyncRun:
+        now_iso = now or _now_iso()
+        normalized_snapshot_id = _non_empty_string(input_snapshot_id)
+        force_full_sync = force_full_sync or normalized_snapshot_id is not None
+        async with self.db.execute(
+            """SELECT * FROM source_sync_runs
+               WHERE workspace_id = ?
+                 AND source_id = ?
+                 AND status IN ('pending', 'running')
+               ORDER BY created_at
+               LIMIT 1""",
+            (workspace_id, source_id),
+        ) as cursor:
+            existing = await cursor.fetchone()
+        if existing:
+            existing_snapshot_id = _non_empty_string(existing["input_snapshot_id"])
+            pending_snapshot_id = _non_empty_string(existing["rerun_input_snapshot_id"])
+            has_new_snapshot = normalized_snapshot_id is not None and normalized_snapshot_id not in {
+                existing_snapshot_id,
+                pending_snapshot_id,
+            }
+            force_requires_rerun = force_full_sync and not bool(existing["force_full_sync"])
+            mark_rerun = existing["status"] == "running" and (
+                has_new_snapshot
+                or (trigger == "local_agent" and normalized_snapshot_id is None)
+                or force_requires_rerun
+            )
+            cursor = await self.db.execute(
+                """UPDATE source_sync_runs
+                   SET force_full_sync = CASE WHEN ? THEN 1 ELSE force_full_sync END,
+                       rerun_requested = CASE WHEN ? THEN 1 ELSE rerun_requested END,
+                       input_snapshot_id = CASE
+                           WHEN status = 'pending' AND ? IS NOT NULL THEN ?
+                           ELSE input_snapshot_id
+                       END,
+                       rerun_input_snapshot_id = CASE
+                           WHEN status = 'running' AND ? IS NOT NULL THEN ?
+                           ELSE rerun_input_snapshot_id
+                       END,
+                       updated_at = ?
+                   WHERE run_id = ? AND status IN ('pending', 'running')""",
+                (
+                    int(force_full_sync),
+                    int(mark_rerun),
+                    normalized_snapshot_id,
+                    normalized_snapshot_id,
+                    normalized_snapshot_id,
+                    normalized_snapshot_id,
+                    now_iso,
+                    existing["run_id"],
+                ),
+            )
+            if not cursor.rowcount:
+                raise _ActiveSourceSyncRunChanged
+            async with self.db.execute(
+                "SELECT * FROM source_sync_runs WHERE run_id = ?",
+                (existing["run_id"],),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            return _source_sync_run_from_row(existing, coalesced=True)
+
+        run_id = f"ssr-{uuid.uuid4().hex}"
+        await self.db.execute(
+            """INSERT INTO source_sync_runs (
+                run_id, workspace_id, source_id, trigger, status,
+                force_full_sync, input_snapshot_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+            (
+                run_id,
+                workspace_id,
+                source_id,
+                trigger,
+                int(force_full_sync),
+                normalized_snapshot_id,
+                now_iso,
+                now_iso,
+            ),
+        )
+        async with self.db.execute(
+            "SELECT * FROM source_sync_runs WHERE run_id = ?",
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        return _source_sync_run_from_row(row)
+
+    async def get_source_sync_run(self, run_id: str) -> SourceSyncRun | None:
+        async with self.db.execute(
+            "SELECT * FROM source_sync_runs WHERE run_id = ?",
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return _source_sync_run_from_row(row) if row else None
+
+    async def get_latest_source_sync_run(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str = "default",
+    ) -> SourceSyncRun | None:
+        async with self.db.execute(
+            """SELECT * FROM source_sync_runs
+               WHERE workspace_id = ? AND source_id = ?
+               ORDER BY created_at DESC, run_id DESC
+               LIMIT 1""",
+            (workspace_id, source_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return _source_sync_run_from_row(row) if row else None
+
+    async def lease_next_source_sync_run(
+        self,
+        *,
+        worker_id: str,
+        workspace_id: str | None = None,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> SourceSyncRun | None:
+        lease_started_at = now or datetime.now(timezone.utc)
+        lease_started_iso = _utc_iso(lease_started_at)
+        lease_expires_at = _utc_iso(lease_started_at + timedelta(seconds=lease_seconds))
+        conditions = [
+            "((status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) "
+            "OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))"
+        ]
+        params: list[Any] = [lease_started_iso, lease_started_iso]
+        if workspace_id is not None:
+            conditions.append("workspace_id = ?")
+            params.append(workspace_id)
+
+        async with self._write_lock:
+            async with self.db.execute(
+                "SELECT * FROM source_sync_runs WHERE "
+                + " AND ".join(conditions)
+                + " ORDER BY created_at LIMIT 1",
+                params,
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                return None
+
+            recovery_increment = 1 if row["status"] == "running" else 0
+            cursor = await self.db.execute(
+                """UPDATE source_sync_runs
+                   SET status = 'running',
+                       lease_owner = ?,
+                       lease_expires_at = ?,
+                       lease_attempt_count = lease_attempt_count + 1,
+                       recovery_count = recovery_count + ?,
+                       next_attempt_at = NULL,
+                       started_at = COALESCE(started_at, ?),
+                       updated_at = ?
+                   WHERE run_id = ?
+                     AND (
+                       (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                       OR
+                       (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+                     )""",
+                (
+                    worker_id,
+                    lease_expires_at,
+                    recovery_increment,
+                    lease_started_iso,
+                    lease_started_iso,
+                    row["run_id"],
+                    lease_started_iso,
+                    lease_started_iso,
+                ),
+            )
+            if not cursor.rowcount:
+                await self.db.rollback()
+                return None
+            await self.db.commit()
+            async with self.db.execute(
+                "SELECT * FROM source_sync_runs WHERE run_id = ?",
+                (row["run_id"],),
+            ) as cursor:
+                leased = await cursor.fetchone()
+        return _source_sync_run_from_row(leased) if leased else None
+
+    async def heartbeat_source_sync_run(
+        self,
+        run_id: str,
+        *,
+        worker_id: str,
+        lease_attempt_count: int,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> bool:
+        heartbeat_at = now or datetime.now(timezone.utc)
+        heartbeat_iso = _utc_iso(heartbeat_at)
+        lease_expires_at = _utc_iso(heartbeat_at + timedelta(seconds=lease_seconds))
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE source_sync_runs
+                   SET lease_expires_at = ?,
+                       updated_at = ?
+                   WHERE run_id = ?
+                     AND status = 'running'
+                     AND lease_owner = ?
+                     AND lease_attempt_count = ?""",
+                (
+                    lease_expires_at,
+                    heartbeat_iso,
+                    run_id,
+                    worker_id,
+                    lease_attempt_count,
+                ),
+            )
+            await self.db.commit()
+        return bool(cursor.rowcount)
+
+    async def complete_source_sync_run(
+        self,
+        run_id: str,
+        *,
+        worker_id: str,
+        lease_attempt_count: int,
+        final_state: SyncState | None = None,
+        completed_at: datetime | None = None,
+    ) -> bool:
+        completed_iso = _utc_iso(completed_at)
+        if final_state is not None and final_state.last_sync_status != "success":
+            raise ValueError("complete_source_sync_run requires a successful final state")
+        status = "success"
+        async with self._write_lock:
+            async with self.db.execute(
+                """SELECT * FROM source_sync_runs
+                   WHERE run_id = ? AND status = 'running'
+                     AND lease_owner = ? AND lease_attempt_count = ?
+                     AND lease_expires_at > ?""",
+                (run_id, worker_id, lease_attempt_count, completed_iso),
+            ) as cursor:
+                leased_run = await cursor.fetchone()
+            if leased_run is None:
+                return False
+            if final_state is not None:
+                await self.db.execute(
+                    """INSERT INTO sync_state (
+                        source, last_sync_at, last_sync_status,
+                        docs_processed, docs_updated, error_message
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source) DO UPDATE SET
+                        last_sync_at=excluded.last_sync_at,
+                        last_sync_status=excluded.last_sync_status,
+                        docs_processed=excluded.docs_processed,
+                        docs_updated=excluded.docs_updated,
+                        error_message=excluded.error_message""",
+                    (
+                        final_state.source,
+                        final_state.last_sync_at.isoformat() if final_state.last_sync_at else None,
+                        final_state.last_sync_status,
+                        final_state.docs_processed,
+                        final_state.docs_updated,
+                        final_state.error_message,
+                    ),
+                )
+                if final_state.last_sync_at and final_state.last_sync_status == "success":
+                    await self.db.execute(
+                        "UPDATE sources SET last_sync = ? WHERE id = ?",
+                        (final_state.last_sync_at.isoformat(), final_state.source),
+                    )
+            cursor = await self.db.execute(
+                """UPDATE source_sync_runs
+                   SET status = ?,
+                       lease_owner = NULL,
+                       lease_expires_at = NULL,
+                       next_attempt_at = NULL,
+                       error_message = ?,
+                       completed_at = ?,
+                       updated_at = ?
+                   WHERE run_id = ? AND status = 'running'
+                     AND lease_owner = ? AND lease_attempt_count = ?
+                     AND lease_expires_at > ?""",
+                (
+                    status,
+                    final_state.error_message if final_state else None,
+                    completed_iso,
+                    completed_iso,
+                    run_id,
+                    worker_id,
+                    lease_attempt_count,
+                    completed_iso,
+                ),
+            )
+            if not cursor.rowcount:
+                await self.db.rollback()
+                return False
+            if status == "success":
+                await self._enqueue_successor_for_completed_run(run_id, completed_iso)
+            await self.db.commit()
+        return True
+
+    async def fail_source_sync_run(
+        self,
+        run_id: str,
+        *,
+        worker_id: str,
+        lease_attempt_count: int,
+        error_message: str,
+        final_state: SyncState | None = None,
+        retryable: bool = True,
+        failed_at: datetime | None = None,
+        next_attempt_at: datetime | None = None,
+    ) -> bool:
+        if retryable and next_attempt_at is None:
+            raise ValueError("retryable source sync failure requires next_attempt_at")
+        failed_iso = _utc_iso(failed_at)
+        status = "pending" if retryable else "failed"
+        completed_at = None if retryable else failed_iso
+        next_attempt_iso = _utc_iso(next_attempt_at) if retryable and next_attempt_at else None
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE source_sync_runs
+                   SET status = ?,
+                       lease_owner = NULL,
+                       lease_expires_at = NULL,
+                       next_attempt_at = ?,
+                       error_message = ?,
+                       completed_at = ?,
+                       updated_at = ?
+                   WHERE run_id = ? AND status = 'running'
+                     AND lease_owner = ? AND lease_attempt_count = ?
+                     AND lease_expires_at > ?""",
+                (
+                    status,
+                    next_attempt_iso,
+                    error_message,
+                    completed_at,
+                    failed_iso,
+                    run_id,
+                    worker_id,
+                    lease_attempt_count,
+                    failed_iso,
+                ),
+            )
+            if not cursor.rowcount:
+                await self.db.rollback()
+                return False
+            if final_state is not None:
+                await self.db.execute(
+                    """INSERT INTO sync_state (
+                        source, last_sync_at, last_sync_status,
+                        docs_processed, docs_updated, error_message
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source) DO UPDATE SET
+                        last_sync_at=excluded.last_sync_at,
+                        last_sync_status=excluded.last_sync_status,
+                        docs_processed=excluded.docs_processed,
+                        docs_updated=excluded.docs_updated,
+                        error_message=excluded.error_message""",
+                    (
+                        final_state.source,
+                        final_state.last_sync_at.isoformat() if final_state.last_sync_at else None,
+                        final_state.last_sync_status,
+                        final_state.docs_processed,
+                        final_state.docs_updated,
+                        final_state.error_message,
+                    ),
+                )
+            if not retryable:
+                await self._enqueue_successor_for_completed_run(run_id, failed_iso)
+            await self.db.commit()
+        return True
+
+    async def _enqueue_successor_for_completed_run(self, run_id: str, now: str) -> None:
+        async with self.db.execute(
+            "SELECT * FROM source_sync_runs WHERE run_id = ?",
+            (run_id,),
+        ) as cursor:
+            completed = await cursor.fetchone()
+        if not completed or not bool(completed["rerun_requested"]):
+            return
+        successor_id = f"ssr-{uuid.uuid4().hex}"
+        await self.db.execute(
+            """INSERT INTO source_sync_runs (
+                run_id, workspace_id, source_id, trigger, status,
+                force_full_sync, input_snapshot_id, created_at, updated_at
+            ) VALUES (?, ?, ?, 'rerun', 'pending', ?, ?, ?, ?)""",
+            (
+                successor_id,
+                completed["workspace_id"],
+                completed["source_id"],
+                int(completed["force_full_sync"]),
+                completed["rerun_input_snapshot_id"],
+                now,
+                now,
+            ),
+        )
+
+    async def create_source_sync_input(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str = "default",
+        raw_uri: str,
+        raw_sha256: str,
+        raw_content_type: str,
+        metadata: dict[str, object] | None = None,
+        sync_snapshot_id: str | None = None,
+    ) -> SourceSyncInput:
+        now = _now_iso()
+        metadata_payload = dict(metadata or {})
+        snapshot_id = _non_empty_string(sync_snapshot_id)
+        snapshot_doc_id = _manifest_doc_id(metadata_payload)
+        if snapshot_id and not snapshot_doc_id:
+            raise ValueError("snapshot input requires doc_id")
+        async with self._write_lock:
+            async with self.db.execute(
+                """SELECT * FROM source_sync_inputs
+                   WHERE workspace_id = ? AND source_id = ? AND raw_sha256 = ?""",
+                (workspace_id, source_id, raw_sha256),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            if existing is not None:
+                if snapshot_id and snapshot_doc_id:
+                    await self._record_source_sync_snapshot_item_unlocked(
+                        workspace_id=workspace_id,
+                        source_id=source_id,
+                        snapshot_id=snapshot_id,
+                        doc_id=snapshot_doc_id,
+                        input_id=str(existing["input_id"]),
+                        now=now,
+                    )
+                    await self.db.commit()
+                return _source_sync_input_from_row(existing)
+            async with self.db.execute(
+                """SELECT COALESCE(MAX(input_generation), 0) + 1 AS next_generation
+                   FROM source_sync_inputs
+                   WHERE workspace_id = ? AND source_id = ?""",
+                (workspace_id, source_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            generation = int(row["next_generation"] if row else 1)
+            input_id = f"ssi-{uuid.uuid4().hex}"
+            await self.db.execute(
+                """INSERT INTO source_sync_inputs (
+                    input_id, workspace_id, source_id, input_generation,
+                    raw_uri, raw_sha256, raw_content_type, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    input_id,
+                    workspace_id,
+                    source_id,
+                    generation,
+                    raw_uri,
+                    raw_sha256,
+                    raw_content_type,
+                    json.dumps(metadata_payload, sort_keys=True),
+                    now,
+                ),
+            )
+            if snapshot_id and snapshot_doc_id:
+                await self._record_source_sync_snapshot_item_unlocked(
+                    workspace_id=workspace_id,
+                    source_id=source_id,
+                    snapshot_id=snapshot_id,
+                    doc_id=snapshot_doc_id,
+                    input_id=input_id,
+                    now=now,
+                )
+            await self.db.commit()
+            async with self.db.execute(
+                "SELECT * FROM source_sync_inputs WHERE input_id = ?",
+                (input_id,),
+            ) as cursor:
+                inserted = await cursor.fetchone()
+        assert inserted is not None
+        return _source_sync_input_from_row(inserted)
+
+    async def list_source_sync_inputs(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str = "default",
+        input_snapshot_id: str | None = None,
+    ) -> list[SourceSyncInput]:
+        results: list[SourceSyncInput] = []
+        snapshot_id = _non_empty_string(input_snapshot_id)
+        if snapshot_id:
+            query = """SELECT i.* FROM source_sync_snapshot_items si
+                       JOIN source_sync_inputs i ON i.input_id = si.input_id
+                       WHERE si.workspace_id = ? AND si.source_id = ?
+                         AND si.snapshot_id = ?
+                       ORDER BY i.input_generation"""
+            params: tuple[Any, ...] = (workspace_id, source_id, snapshot_id)
+        else:
+            query = """SELECT * FROM source_sync_inputs
+                       WHERE workspace_id = ? AND source_id = ?
+                       ORDER BY input_generation"""
+            params = (workspace_id, source_id)
+        async with self.db.execute(query, params) as cursor:
+            async for row in cursor:
+                results.append(_source_sync_input_from_row(row))
+        return results
+
+    async def _record_source_sync_snapshot_item_unlocked(
+        self,
+        *,
+        workspace_id: str,
+        source_id: str,
+        snapshot_id: str,
+        doc_id: str,
+        input_id: str,
+        now: str,
+    ) -> None:
+        await self.db.execute(
+            """INSERT INTO source_sync_snapshot_items (
+                workspace_id, source_id, snapshot_id, doc_id, input_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(workspace_id, source_id, snapshot_id, doc_id)
+            DO UPDATE SET input_id = excluded.input_id,
+                          created_at = excluded.created_at""",
+            (workspace_id, source_id, snapshot_id, doc_id, input_id, now),
+        )
 
     async def upsert_sync_state(self, state: SyncState) -> None:
         async with self._write_lock:
