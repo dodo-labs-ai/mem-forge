@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ChevronDown } from "lucide-react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import { isReservedProjectKey } from "@/api/projectKeys";
 import type { Project } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -67,7 +67,7 @@ export function ActiveProjectChip() {
 
   const projectsQuery = useQuery<Project[]>({
     queryKey: ["projects"],
-    queryFn: () => client.get<Project[]>("/api/projects").then((r) => r.data),
+    queryFn: () => resourceClient.get<Project[]>("/projects").then((r) => r.data),
   });
 
   const userProjects = useMemo(() => {

@@ -36,12 +36,12 @@ assert.equal(
   forceResync?.description,
   "Look for new, changed, or removed documents. Existing memories are not rebuilt unless source content changed.",
 );
-assert.equal(getSourceActionEndpoint("src-1", "force-resync"), "/api/sources/src-1/force-resync");
+assert.equal(getSourceActionEndpoint("src-1", "force-resync"), "/sources/src-1/force-resync");
 
 const deleteSource = sourceActionLayout.menu.find((action) => action.id === "delete");
 assert.equal(deleteSource?.tone, "destructive");
 assert.equal(deleteSource?.requiresConfirmation, true);
-assert.equal(getSourceActionEndpoint("src-1", "delete"), "/api/sources/src-1");
+assert.equal(getSourceActionEndpoint("src-1", "delete"), "/sources/src-1");
 
 assert.deepEqual(
   getSourceMenuPlacement({
@@ -104,8 +104,8 @@ assert.match(
 );
 assert.match(
   sourcesPageSource,
-  /client\.put\(`\/api\/sources\/\$\{sourceId\}`,\s*\{\s*status\s*\}\)/,
-  "Pause and resume should use PUT /api/sources/{id} with a status body",
+  /resourceClient\.put\(`\/sources\/\$\{sourceId\}`,\s*\{\s*status\s*\}\)/,
+  "Pause and resume should use the relative PUT /sources/{id} resource path",
 );
 assert.match(
   sourcesPageSource,
@@ -114,8 +114,8 @@ assert.match(
 );
 assert.match(
   sourcesPageSource,
-  /\/api\/cloud\/local-agent\/jobs\/\$\{jobId\}/,
-  "Internal network GitHub sync should poll the local-agent job status endpoint",
+  /getLocalAgentJob\(jobId\)/,
+  "Internal network GitHub sync should poll through the target-aware local-agent helper",
 );
 assert.match(
   sourcesPageSource,
@@ -260,18 +260,18 @@ assert.equal(
 );
 assert.match(
   sourcesPageSource,
-  /\/api\/cloud\/local-agent\/jobs/,
-  "Internal network GitHub source sync should use the cloud local-agent queue",
+  /getLocalAgentJob/,
+  "Internal network GitHub source sync should use the centralized local-agent queue helper",
+);
+assert.doesNotMatch(
+  localAgentJobsSource,
+  /workspace_id|requireCurrentWorkspaceId/,
+  "Local-agent jobs should select Cloud workspaces only through the configured host path",
 );
 assert.match(
   localAgentJobsSource,
-  /workspace_id:\s*requireCurrentWorkspaceId\(\)/,
-  "Local-agent jobs should bind to the selected workspace instead of relying on a primary workspace",
-);
-assert.match(
-  localAgentJobsSource,
-  /client\.post<LocalAgentJobCreateResponse>\("\/api\/cloud\/local-agent\/jobs"/,
-  "Local-agent job creation should be centralized behind the API helper",
+  /hostClient\.post<LocalAgentJobCreateResponse>\(localAgentUrl\("\/jobs"\)/,
+  "Local-agent job creation should use the controller-derived host client URL",
 );
 assert.match(
   sourcesPageSource,
@@ -300,21 +300,21 @@ assert.match(
 assert.match(
   sourceConfigDialogSource,
   /createLocalAgentJob/,
-  "Local markdown local-agent preview jobs should bind to the selected workspace",
+  "Local markdown local-agent preview jobs should use the centralized target-aware helper",
 );
 assert.match(
   teamsSourceWizardSource,
   /createLocalAgentJob/,
-  "Teams auth and browse jobs should bind to the selected workspace",
+  "Teams auth and browse jobs should use the centralized target-aware helper",
 );
 assert.match(
   githubRepoFolderPickerSource,
   /createLocalAgentJob/,
-  "GitHub local-agent browse jobs should bind to the selected workspace",
+  "GitHub local-agent browse jobs should use the centralized target-aware helper",
 );
 assert.doesNotMatch(
   [sourcesPageSource, sourceConfigDialogSource, teamsSourceWizardSource, githubRepoFolderPickerSource].join("\n"),
-  /client\.post<[^>]+>\("\/api\/cloud\/local-agent\/jobs"/,
+  /(?:resourceClient|hostClient)\.post<[^>]+>\([^)]*\/local-agent\/jobs/,
   "Source UI components should not create local-agent job envelopes directly",
 );
 assert.match(
@@ -369,7 +369,7 @@ assert.match(
 );
 assert.doesNotMatch(
   sourceConfigDialogSource,
-  /\/api\/sources\/[^`]+\/schedule/,
+  /resourceClient[^\n]*\/sources\/[^`]+\/schedule/,
   "SourceConfigDialog should not split config and schedule persistence into two requests",
 );
 assert.match(

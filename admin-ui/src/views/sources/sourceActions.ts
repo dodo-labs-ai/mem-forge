@@ -43,8 +43,8 @@ export const sourceActionLayout = {
 };
 
 export function getSourceActionEndpoint(sourceId: string, actionId: "force-resync" | "delete"): string {
-  if (actionId === "force-resync") return `/api/sources/${sourceId}/force-resync`;
-  return `/api/sources/${sourceId}`;
+  if (actionId === "force-resync") return `/sources/${sourceId}/force-resync`;
+  return `/sources/${sourceId}`;
 }
 
 export function getSourceMenuPlacement({

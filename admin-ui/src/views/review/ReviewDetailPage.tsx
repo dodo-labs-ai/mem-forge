@@ -12,7 +12,7 @@ import {
   Sparkles,
   XCircle,
 } from "lucide-react";
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import type {
   MemorySource,
   MemoryReviewDetail,
@@ -445,7 +445,7 @@ export function ReviewDetailPage() {
 
   const detailQuery = useQuery<MemoryReviewDetail>({
     queryKey: ["memory-review", id],
-    queryFn: () => client.get(`/api/memory-reviews/${id}`).then((response) => response.data),
+    queryFn: () => resourceClient.get(`/memory-reviews/${id}`).then((response) => response.data),
     enabled: Boolean(id),
   });
 
@@ -459,7 +459,7 @@ export function ReviewDetailPage() {
 
   const approveMutation = useMutation({
     mutationFn: () =>
-      client.post(`/api/memory-reviews/${id}/approve`, {
+      resourceClient.post(`/memory-reviews/${id}/approve`, {
         note: note.trim() || null,
       }).then((response) => response.data),
     onSuccess: (data: MemoryReviewDetail) => {
@@ -470,7 +470,7 @@ export function ReviewDetailPage() {
 
   const rejectMutation = useMutation({
     mutationFn: () =>
-      client.post(`/api/memory-reviews/${id}/reject`, {
+      resourceClient.post(`/memory-reviews/${id}/reject`, {
         note: note.trim(),
       }).then((response) => response.data),
     onSuccess: (data: MemoryReviewDetail) => {
@@ -480,7 +480,7 @@ export function ReviewDetailPage() {
   });
 
   const refreshMutation = useMutation({
-    mutationFn: () => client.post(`/api/memory-reviews/${id}/refresh`),
+    mutationFn: () => resourceClient.post(`/memory-reviews/${id}/refresh`),
     onSuccess: invalidate,
   });
 

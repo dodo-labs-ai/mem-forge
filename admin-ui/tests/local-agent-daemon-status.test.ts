@@ -19,8 +19,8 @@ const apiTypesSource = readFileSync("src/api/types.ts", "utf8");
 
 assert.match(
   querySource,
-  /"\/api\/cloud\/local-agent\/status"/,
-  "LocalAgentDaemonStatus should read the cloud daemon status endpoint",
+  /getLocalAgentDaemonStatus/,
+  "LocalAgentDaemonStatus should read the controller-derived local-agent host endpoint",
 );
 
 assert.match(

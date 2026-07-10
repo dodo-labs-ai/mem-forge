@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { CalendarClock, ExternalLink, RefreshCw } from "lucide-react";
 import { Link } from "react-router-dom";
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import type { Source, SourceSyncSchedule } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
@@ -162,7 +162,7 @@ export function SchedulesPage() {
 
   const sourcesQuery = useQuery<SourcesResponse | Source[]>({
     queryKey: ["sources"],
-    queryFn: () => client.get("/api/sources").then((r) => r.data),
+    queryFn: () => resourceClient.get("/sources").then((r) => r.data),
     refetchInterval: (query) => {
       const sources = normalizeSources(query.state.data);
       return sources.some((s) => s.sync?.status === "running") ? 2000 : false;

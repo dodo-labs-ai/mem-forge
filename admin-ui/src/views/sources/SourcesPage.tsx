@@ -2,8 +2,8 @@ import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from
 import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Files, Info, Loader2, MoreHorizontal, Pause, Play, Plus, RefreshCw, Trash2, X } from "lucide-react";
-import client from "@/api/client";
-import { createLocalAgentJob } from "@/api/localAgentJobs";
+import { resourceClient } from "@/api/client";
+import { createLocalAgentJob, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
   AgentSessionCompleteness,
   GeneMetadata,
@@ -188,10 +188,10 @@ async function pollLocalAgentSyncJob(
   },
 ): Promise<LocalAgentJobStatusResponse> {
   for (let attempt = 0; attempt < LOCAL_AGENT_SYNC_POLL_ATTEMPTS; attempt += 1) {
-    const response = await client.get<LocalAgentJobStatusResponse>(`/api/cloud/local-agent/jobs/${jobId}`);
-    options.onProgress?.(localAgentProgressFromJob(response.data, options.itemLabel));
-    if (response.data.status === "succeeded" || response.data.status === "failed") {
-      return response.data;
+    const status = await getLocalAgentJob(jobId);
+    options.onProgress?.(localAgentProgressFromJob(status, options.itemLabel));
+    if (status.status === "succeeded" || status.status === "failed") {
+      return status;
     }
     await new Promise((resolve) => window.setTimeout(resolve, LOCAL_AGENT_SYNC_POLL_INTERVAL_MS));
   }
@@ -255,12 +255,12 @@ export function SourcesPage() {
 
   const genesQuery = useQuery<GeneMetadata[]>({
     queryKey: ["genes"],
-    queryFn: () => client.get("/api/genes").then((response) => response.data),
+    queryFn: () => resourceClient.get("/genes").then((response) => response.data),
   });
 
   const sourcesQuery = useQuery<SourcesResponse | Source[]>({
     queryKey: ["sources"],
-    queryFn: () => client.get("/api/sources").then((response) => response.data),
+    queryFn: () => resourceClient.get("/sources").then((response) => response.data),
     refetchInterval: (query) => {
       const sources = normalizeSources(query.state.data);
       return sources.some((source) => source.sync?.status === "running") ? 2000 : false;
@@ -269,7 +269,7 @@ export function SourcesPage() {
 
   const projectsQuery = useQuery<Project[]>({
     queryKey: ["projects"],
-    queryFn: () => client.get("/api/projects").then((response) => response.data),
+    queryFn: () => resourceClient.get("/projects").then((response) => response.data),
   });
 
   const syncSource = useMutation({
@@ -283,7 +283,7 @@ export function SourcesPage() {
       if (localAgentJob) {
         return { data: localAgentJob };
       }
-      return client.post(`/api/sources/${sourceId}/sync`, { force_full_sync: forceFullSync });
+      return resourceClient.post(`/sources/${sourceId}/sync`, { force_full_sync: forceFullSync });
     },
     onError: (error, variables) => {
       if (localAgentSyncOperation(variables.source)) {
@@ -315,7 +315,7 @@ export function SourcesPage() {
   });
 
   const deleteSource = useMutation({
-    mutationFn: (sourceId: string) => client.delete(getSourceActionEndpoint(sourceId, "delete")),
+    mutationFn: (sourceId: string) => resourceClient.delete(getSourceActionEndpoint(sourceId, "delete")),
     onError: (error) => handleAuthorityError(error, "Failed to delete source."),
     onSuccess: () => {
       setSourcePendingDelete(null);
@@ -335,7 +335,7 @@ export function SourcesPage() {
       if (localAgentJob) {
         return { data: localAgentJob };
       }
-      return client.post(getSourceActionEndpoint(source.id, "force-resync"));
+      return resourceClient.post(getSourceActionEndpoint(source.id, "force-resync"));
     },
     onError: (error, source) => {
       if (localAgentSyncOperation(source)) {
@@ -368,7 +368,7 @@ export function SourcesPage() {
 
   const setSourceStatus = useMutation({
     mutationFn: ({ sourceId, status }: { sourceId: string; status: Source["status"] }) =>
-      client.put(`/api/sources/${sourceId}`, { status }),
+      resourceClient.put(`/sources/${sourceId}`, { status }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sources"] });
       queryClient.invalidateQueries({ queryKey: ["stats"] });
@@ -378,7 +378,7 @@ export function SourcesPage() {
   const setSubscription = useMutation({
     mutationFn: ({ sourceId, enabled }: { sourceId: string; enabled: boolean }) => {
       setPendingSubscriptionIds((current) => new Set(current).add(sourceId));
-      return client.put(`/api/sources/${sourceId}/subscription`, { enabled });
+      return resourceClient.put(`/sources/${sourceId}/subscription`, { enabled });
     },
     onError: (error) => handleAuthorityError(error, "Failed to update subscription."),
     onSettled: (_data, _error, variables) => {
@@ -413,8 +413,7 @@ export function SourcesPage() {
     queries: sourcesNeedingResolve.map((source) => ({
       queryKey: ["resolvedProjects", source.id],
       queryFn: () =>
-        client
-          .get<ResolvedProjectsResponse>(`/api/sources/${source.id}/projects/resolved`)
+        resourceClient.get<ResolvedProjectsResponse>(`/sources/${source.id}/projects/resolved`)
           .then((response) => response.data),
     })),
   });
@@ -873,7 +872,7 @@ function AgentSessionDetailsDialog({
     queryKey: ["source-projects", source?.id],
     queryFn: () => {
       if (!source) throw new Error("source is required");
-      return client.get(`/api/sources/${source.id}/projects`).then((response) => response.data);
+      return resourceClient.get(`/sources/${source.id}/projects`).then((response) => response.data);
     },
     enabled: open && (source?.type === "agent_session" || (source ? isManagedSourceId(source.id) : false)),
   });
@@ -881,8 +880,8 @@ function AgentSessionDetailsDialog({
     queryKey: ["agent-session-completeness", source?.id],
     queryFn: () => {
       if (!source) throw new Error("source is required");
-      return client
-        .get("/api/agent-sessions/completeness", { params: { source_id: source.id } })
+      return resourceClient
+        .get("/agent-sessions/completeness", { params: { source_id: source.id } })
         .then((response) => response.data);
     },
     enabled: open && (source?.type === "agent_session" || (source ? isManagedSourceId(source.id) : false)),

@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { CheckCircle2, RefreshCw, ShieldCheck, Sparkles } from "lucide-react";
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import type {
   MemoryReviewListResponse,
   MemoryReviewMemorySummary,
@@ -34,8 +34,8 @@ function useReviewQueue() {
   return useQuery<MemoryReviewListResponse>({
     queryKey: ["memory-reviews", "open", "queue"],
     queryFn: () =>
-      client
-        .get("/api/memory-reviews", {
+      resourceClient
+        .get("/memory-reviews", {
           params: { status: "open", limit: REVIEW_QUEUE_LIMIT },
         })
         .then((response) => response.data),
