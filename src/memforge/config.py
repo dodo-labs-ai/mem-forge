@@ -94,8 +94,12 @@ class SyncConfig:
     max_active_sources: int = 0
     max_extraction_workers: int = 0
     max_document_lifecycles: int = 0
+    scheduler_enabled: bool = True
     worker_enabled: bool = True
     worker_poll_seconds: float = 5.0
+    worker_retry_base_seconds: float = 60.0
+    worker_retry_max_seconds: float = 900.0
+    worker_max_attempts: int = 5
 
 
 @dataclass
@@ -188,6 +192,11 @@ class AppConfig:
                 or self.sync.max_document_lifecycles
             ),
         )
+        if os.environ.get("MEMFORGE_SYNC_SCHEDULER_ENABLED") is not None:
+            self.sync.scheduler_enabled = (
+                os.environ["MEMFORGE_SYNC_SCHEDULER_ENABLED"].strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
         if os.environ.get("MEMFORGE_SYNC_WORKER_ENABLED") is not None:
             self.sync.worker_enabled = (
                 os.environ["MEMFORGE_SYNC_WORKER_ENABLED"].strip().lower()
@@ -198,6 +207,27 @@ class AppConfig:
             float(
                 os.environ.get("MEMFORGE_SYNC_WORKER_POLL_SECONDS")
                 or self.sync.worker_poll_seconds
+            ),
+        )
+        self.sync.worker_retry_base_seconds = max(
+            0.1,
+            float(
+                os.environ.get("MEMFORGE_SYNC_WORKER_RETRY_BASE_SECONDS")
+                or self.sync.worker_retry_base_seconds
+            ),
+        )
+        self.sync.worker_retry_max_seconds = max(
+            self.sync.worker_retry_base_seconds,
+            float(
+                os.environ.get("MEMFORGE_SYNC_WORKER_RETRY_MAX_SECONDS")
+                or self.sync.worker_retry_max_seconds
+            ),
+        )
+        self.sync.worker_max_attempts = max(
+            1,
+            int(
+                os.environ.get("MEMFORGE_SYNC_WORKER_MAX_ATTEMPTS")
+                or self.sync.worker_max_attempts
             ),
         )
         self.server.jwt_secret = (

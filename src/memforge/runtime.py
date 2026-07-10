@@ -614,6 +614,16 @@ class SourceSyncWorker:
         max_document_lifecycles = max(0, int(config.sync.max_document_lifecycles))
         self._document_lifecycle_admission = get_process_document_lifecycle_admission(max_document_lifecycles)
 
+    def _next_retry_at(self, run: SourceSyncRun, failed_at: datetime) -> datetime | None:
+        if run.lease_attempt_count >= self.config.sync.worker_max_attempts:
+            return None
+        exponent = max(0, run.lease_attempt_count - 1)
+        delay = min(
+            self.config.sync.worker_retry_max_seconds,
+            self.config.sync.worker_retry_base_seconds * (2 ** exponent),
+        )
+        return failed_at + timedelta(seconds=delay)
+
     async def run_once(self) -> SourceSyncRun | None:
         run = await self.db.lease_next_source_sync_run(
             worker_id=self.worker_id,
@@ -627,7 +637,12 @@ class SourceSyncWorker:
         try:
             source = await self.db.get_source(run.source_id)
             if source is None:
-                raise ValueError(f"Source not found: {run.source_id}")
+                await self.db.fail_source_sync_run(
+                    run.run_id,
+                    error_message=f"Source not found: {run.source_id}",
+                    retryable=False,
+                )
+                return run
             if source.get("status") == "paused":
                 await self.db.fail_source_sync_run(
                     run.run_id,
@@ -670,10 +685,15 @@ class SourceSyncWorker:
                     str(source.get("config", {}).get("base_url") or ""),
                     str(exc),
                 )
+            failed_at = datetime.now(timezone.utc)
+            next_attempt_at = self._next_retry_at(run, failed_at)
+            retryable = not isinstance(exc, SourcePausedError) and next_attempt_at is not None
             await self.db.fail_source_sync_run(
                 run.run_id,
                 error_message=str(exc),
-                retryable=not isinstance(exc, SourcePausedError),
+                retryable=retryable,
+                failed_at=failed_at,
+                next_attempt_at=next_attempt_at,
             )
             return run
 

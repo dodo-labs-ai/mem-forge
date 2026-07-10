@@ -2306,8 +2306,10 @@ def create_admin_app(
         app.state.principal_resolver = principal_resolver
         app.state.workspace_role_resolver = workspace_role_resolver
         app.state.sync_service = SyncService(app.state.db, config, runtime_provider=runtime_provider)
-        app.state.sync_scheduler = SyncScheduler(app.state.db, app.state.sync_service)
-        await app.state.sync_scheduler.start()
+        app.state.sync_scheduler = None
+        if config.sync.scheduler_enabled:
+            app.state.sync_scheduler = SyncScheduler(app.state.db, app.state.sync_service)
+            await app.state.sync_scheduler.start()
         app.state.sync_worker = None
         app.state.sync_worker_task = None
         if config.sync.worker_enabled:
@@ -2331,7 +2333,8 @@ def create_admin_app(
                     await worker_task
                 except asyncio.CancelledError:
                     pass
-            await app.state.sync_scheduler.shutdown()
+            if app.state.sync_scheduler is not None:
+                await app.state.sync_scheduler.shutdown()
             await app.state.sync_service.shutdown()
             if owned_db is not None:
                 await owned_db.close()
@@ -2345,7 +2348,11 @@ def create_admin_app(
     if db is not None:
         app.state.db = db
         app.state.sync_service = SyncService(db, config, runtime_provider=runtime_provider)
-        app.state.sync_scheduler = SyncScheduler(db, app.state.sync_service)
+        app.state.sync_scheduler = (
+            SyncScheduler(db, app.state.sync_service)
+            if config.sync.scheduler_enabled
+            else None
+        )
         app.state.sync_worker = None
         app.state.sync_worker_task = None
     app.state.config = config

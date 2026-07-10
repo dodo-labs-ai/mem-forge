@@ -248,6 +248,7 @@ def _source_sync_run_from_row(row: Mapping[str, Any], *, coalesced: bool = False
         lease_attempt_count=int(data.get("lease_attempt_count") or 0),
         recovery_count=int(data.get("recovery_count") or 0),
         rerun_requested=bool(data.get("rerun_requested")),
+        next_attempt_at=_parse_dt(data.get("next_attempt_at")),
         error_message=data.get("error_message"),
         created_at=_parse_dt(data.get("created_at")),
         updated_at=_parse_dt(data.get("updated_at")),
@@ -817,6 +818,7 @@ CREATE TABLE IF NOT EXISTS source_sync_runs (
     lease_attempt_count     INTEGER NOT NULL DEFAULT 0,
     recovery_count          INTEGER NOT NULL DEFAULT 0,
     rerun_requested         INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at         TEXT,
     error_message           TEXT,
     created_at              TEXT NOT NULL,
     updated_at              TEXT NOT NULL,
@@ -1751,6 +1753,7 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                 lease_attempt_count     INTEGER NOT NULL DEFAULT 0,
                 recovery_count          INTEGER NOT NULL DEFAULT 0,
                 rerun_requested         INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at         TEXT,
                 error_message           TEXT,
                 created_at              TEXT NOT NULL,
                 updated_at              TEXT NOT NULL,
@@ -6759,21 +6762,26 @@ class Database:
             ) as cursor:
                 existing = await cursor.fetchone()
             if existing:
-                if force_full_sync and not bool(existing["force_full_sync"]):
-                    await self.db.execute(
-                        """UPDATE source_sync_runs
-                           SET force_full_sync = 1,
-                               rerun_requested = 1,
-                               updated_at = ?
-                           WHERE run_id = ?""",
-                        (now, existing["run_id"]),
-                    )
-                    await self.db.commit()
-                    async with self.db.execute(
-                        "SELECT * FROM source_sync_runs WHERE run_id = ?",
-                        (existing["run_id"],),
-                    ) as cursor:
-                        existing = await cursor.fetchone()
+                mark_rerun = existing["status"] == "running"
+                await self.db.execute(
+                    """UPDATE source_sync_runs
+                       SET force_full_sync = CASE WHEN ? THEN 1 ELSE force_full_sync END,
+                           rerun_requested = CASE WHEN ? THEN 1 ELSE rerun_requested END,
+                           updated_at = ?
+                       WHERE run_id = ?""",
+                    (
+                        int(force_full_sync),
+                        int(mark_rerun),
+                        now,
+                        existing["run_id"],
+                    ),
+                )
+                await self.db.commit()
+                async with self.db.execute(
+                    "SELECT * FROM source_sync_runs WHERE run_id = ?",
+                    (existing["run_id"],),
+                ) as cursor:
+                    existing = await cursor.fetchone()
                 return _source_sync_run_from_row(existing, coalesced=True)
 
             run_id = f"ssr-{uuid.uuid4().hex}"
@@ -6821,9 +6829,10 @@ class Database:
         lease_started_iso = _utc_iso(lease_started_at)
         lease_expires_at = _utc_iso(lease_started_at + timedelta(seconds=lease_seconds))
         conditions = [
-            "(status = 'pending' OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))"
+            "((status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) "
+            "OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))"
         ]
-        params: list[Any] = [lease_started_iso]
+        params: list[Any] = [lease_started_iso, lease_started_iso]
         if workspace_id is not None:
             conditions.append("workspace_id = ?")
             params.append(workspace_id)
@@ -6847,6 +6856,7 @@ class Database:
                        lease_expires_at = ?,
                        lease_attempt_count = lease_attempt_count + 1,
                        recovery_count = recovery_count + ?,
+                       next_attempt_at = NULL,
                        started_at = COALESCE(started_at, ?),
                        updated_at = ?
                    WHERE run_id = ?""",
@@ -6910,6 +6920,7 @@ class Database:
                    SET status = ?,
                        lease_owner = NULL,
                        lease_expires_at = NULL,
+                       next_attempt_at = NULL,
                        error_message = ?,
                        completed_at = ?,
                        updated_at = ?
@@ -6922,6 +6933,8 @@ class Database:
                     run_id,
                 ),
             )
+            if status == "success":
+                await self._enqueue_successor_for_completed_run(run_id, completed_iso)
             await self.db.commit()
 
     async def fail_source_sync_run(
@@ -6931,23 +6944,50 @@ class Database:
         error_message: str,
         retryable: bool = True,
         failed_at: datetime | None = None,
+        next_attempt_at: datetime | None = None,
     ) -> None:
         failed_iso = _utc_iso(failed_at)
         status = "pending" if retryable else "failed"
         completed_at = None if retryable else failed_iso
+        next_attempt_iso = _utc_iso(next_attempt_at) if retryable and next_attempt_at else None
         async with self._write_lock:
             await self.db.execute(
                 """UPDATE source_sync_runs
                    SET status = ?,
                        lease_owner = NULL,
                        lease_expires_at = NULL,
+                       next_attempt_at = ?,
                        error_message = ?,
                        completed_at = ?,
                        updated_at = ?
                    WHERE run_id = ?""",
-                (status, error_message, completed_at, failed_iso, run_id),
+                (status, next_attempt_iso, error_message, completed_at, failed_iso, run_id),
             )
             await self.db.commit()
+
+    async def _enqueue_successor_for_completed_run(self, run_id: str, now: str) -> None:
+        async with self.db.execute(
+            "SELECT * FROM source_sync_runs WHERE run_id = ?",
+            (run_id,),
+        ) as cursor:
+            completed = await cursor.fetchone()
+        if not completed or not bool(completed["rerun_requested"]):
+            return
+        successor_id = f"ssr-{uuid.uuid4().hex}"
+        await self.db.execute(
+            """INSERT INTO source_sync_runs (
+                run_id, workspace_id, source_id, trigger, status,
+                force_full_sync, created_at, updated_at
+            ) VALUES (?, ?, ?, 'rerun', 'pending', ?, ?, ?)""",
+            (
+                successor_id,
+                completed["workspace_id"],
+                completed["source_id"],
+                int(completed["force_full_sync"]),
+                now,
+                now,
+            ),
+        )
 
     async def create_source_sync_input(
         self,
