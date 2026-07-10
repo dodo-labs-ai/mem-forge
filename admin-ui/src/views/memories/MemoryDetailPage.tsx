@@ -1,7 +1,7 @@
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, ArrowLeft, ExternalLink, Loader2 } from "lucide-react";
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import type { Memory, MemorySource } from "@/api/types";
 import { ConfidenceBadge, MemoryTypeBadge, StatusDot } from "@/components/admin/StatusBadge";
 import { MemoryTypeIcon } from "@/components/memories/MemoryTypeIcon";
@@ -29,14 +29,14 @@ export function MemoryDetailPage() {
   const memoryQuery = useQuery<Memory>({
     queryKey: ["memory", id],
     queryFn: () =>
-      client
-        .get(`/api/memories/${id}`, { params: { include_private: "true" } })
+      resourceClient
+        .get(`/memories/${id}`, { params: { include_private: "true" } })
         .then((response) => response.data),
     enabled: Boolean(id),
   });
 
   const updateStatus = useMutation({
-    mutationFn: (status: string) => client.put(`/api/memories/${id}`, { status }),
+    mutationFn: (status: string) => resourceClient.put(`/memories/${id}`, { status }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["memory", id] });
       queryClient.invalidateQueries({ queryKey: ["memories"] });

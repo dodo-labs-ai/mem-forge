@@ -40,8 +40,13 @@ assert.deepEqual(updateRepoPathSelection(["Payroll Processing"], "Payroll Proces
 const pickerSource = readFileSync("src/views/sources/GitHubRepoFolderPicker.tsx", "utf8");
 assert.match(
   pickerSource,
-  /\/api\/cloud\/local-agent\/jobs/,
-  "Internal network GitHub folder browsing should enqueue a cloud local-agent job for the local daemon",
+  /createLocalAgentJob/,
+  "Internal network GitHub folder browsing should enqueue through the target-aware local-agent helper",
+);
+assert.match(
+  pickerSource,
+  /getLocalAgentJob\(jobId\)/,
+  "Internal network GitHub folder browsing should poll through the target-aware local-agent helper",
 );
 assert.match(
   pickerSource,

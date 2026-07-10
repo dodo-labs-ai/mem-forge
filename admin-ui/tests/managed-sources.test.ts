@@ -53,7 +53,7 @@ assert.match(
 
 assert.match(
   sourcesPageSource,
-  /\/api\/sources\/\$\{[^}]+\}\/subscription/,
+  /resourceClient\.put\(`\/sources\/\$\{[^}]+\}\/subscription/,
   "the page should call the per-source subscription endpoint when a viewer toggles their subscription",
 );
 
@@ -65,7 +65,7 @@ assert.match(
 
 assert.match(
   sourcesPageSource,
-  /\/api\/sources\/\$\{source\.id\}\/projects/,
+  /resourceClient\.get\(`\/sources\/\$\{source\.id\}\/projects/,
   "agent-session details should show project buckets from the generic source projects endpoint",
 );
 

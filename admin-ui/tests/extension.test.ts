@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import type { ReactNode } from "react";
+
+import type { WorkspaceApiController } from "../src/api/client.js";
 
 import {
   __resetCloudExtensionForTests,
@@ -32,6 +35,17 @@ assert.deepEqual(
 
 // First mount succeeds and exposes the additive contributions.
 const placeholderElement = null;
+const extensionWrapper = ({
+  children,
+  workspaceApi,
+}: {
+  children: ReactNode;
+  workspaceApi: WorkspaceApiController;
+}) => {
+  assert.equal(typeof workspaceApi.current, "function");
+  assert.equal(typeof workspaceApi.setTarget, "function");
+  return children;
+};
 const registered = mountCloudExtension({
   id: "ext-addon",
   routes: [
@@ -57,7 +71,7 @@ const registered = mountCloudExtension({
     topbar: () => "topbar-account",
     sidebarFooter: () => "sidebar-account",
   },
-  shell: { Wrapper: ({ children }) => children },
+  shell: { Wrapper: extensionWrapper },
 });
 assert.equal(registered, true);
 assert.equal(getExtensionRoutes().length, 2);

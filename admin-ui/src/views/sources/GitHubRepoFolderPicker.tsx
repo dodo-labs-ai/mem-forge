@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { AlertCircle, FileText, FolderTree, Loader2, RefreshCw } from "lucide-react";
-import client from "@/api/client";
-import { createLocalAgentJob } from "@/api/localAgentJobs";
+import { resourceClient } from "@/api/client";
+import { createLocalAgentJob, getLocalAgentJob } from "@/api/localAgentJobs";
 import type { GitHubRepoTreeResponse, LocalAgentJobStatusResponse } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -40,7 +40,7 @@ export function GitHubRepoFolderPicker({
     setLoading(true);
     setMessage(null);
     try {
-      const response = await client.post<GitHubRepoTreeResponse>("/api/genes/github_repo/browse-tree", {
+      const response = await resourceClient.post<GitHubRepoTreeResponse>("/genes/github_repo/browse-tree", {
         config,
         limit: LOCAL_SCAN_LIMIT,
       });
@@ -194,9 +194,9 @@ function SelectedPaths({ paths, onRemove }: { paths: string[]; onRemove: (path: 
 
 async function pollLocalAgentJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
   for (let attempt = 0; attempt < LOCAL_AGENT_POLL_ATTEMPTS; attempt += 1) {
-    const response = await client.get<LocalAgentJobStatusResponse>(`/api/cloud/local-agent/jobs/${jobId}`);
-    if (response.data.status === "succeeded" || response.data.status === "failed") {
-      return response.data;
+    const status = await getLocalAgentJob(jobId);
+    if (status.status === "succeeded" || status.status === "failed") {
+      return status;
     }
     await wait(LOCAL_AGENT_POLL_INTERVAL_MS);
   }

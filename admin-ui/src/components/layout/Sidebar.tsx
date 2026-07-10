@@ -12,7 +12,7 @@ import {
   ShieldCheck,
   X,
 } from "lucide-react";
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import type { MemoryReviewListResponse } from "@/api/types";
 import { BRAND_NAME, BRAND_SUBTITLE } from "@/brand";
 import { TaiSealLogo } from "@/components/brand/TaiSealLogo";
@@ -75,8 +75,8 @@ function usePendingReviewCount() {
   return useQuery<MemoryReviewListResponse>({
     queryKey: ["pending-reviews"],
     queryFn: () =>
-      client
-        .get("/api/memory-reviews", { params: { status: "open", limit: 1 } })
+      resourceClient
+        .get("/memory-reviews", { params: { status: "open", limit: 1 } })
         .then((res) => res.data),
     refetchInterval: PENDING_REVIEW_POLL_MS,
     staleTime: PENDING_REVIEW_POLL_MS,

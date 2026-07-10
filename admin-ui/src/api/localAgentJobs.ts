@@ -1,6 +1,9 @@
-import client from "./client";
-import type { LocalAgentJobCreateResponse } from "./types";
-import { requireCurrentWorkspaceId } from "@/lib/workspace";
+import { currentLocalAgentBaseUrl, hostClient } from "./client";
+import type {
+  LocalAgentDaemonStatusResponse,
+  LocalAgentJobCreateResponse,
+  LocalAgentJobStatusResponse,
+} from "./types";
 
 interface CreateLocalAgentJobInput {
   sourceId?: string;
@@ -15,12 +18,27 @@ export async function createLocalAgentJob({
   operation,
   payload = {},
 }: CreateLocalAgentJobInput): Promise<LocalAgentJobCreateResponse> {
-  const response = await client.post<LocalAgentJobCreateResponse>("/api/cloud/local-agent/jobs", {
-    workspace_id: requireCurrentWorkspaceId(),
+  const response = await hostClient.post<LocalAgentJobCreateResponse>(localAgentUrl("/jobs"), {
     source_id: sourceId,
     source_type: sourceType,
     operation,
     payload,
   });
   return response.data;
+}
+
+export async function getLocalAgentJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
+  const response = await hostClient.get<LocalAgentJobStatusResponse>(
+    localAgentUrl(`/jobs/${encodeURIComponent(jobId)}`),
+  );
+  return response.data;
+}
+
+export async function getLocalAgentDaemonStatus(): Promise<LocalAgentDaemonStatusResponse> {
+  const response = await hostClient.get<LocalAgentDaemonStatusResponse>(localAgentUrl("/status"));
+  return response.data;
+}
+
+function localAgentUrl(path: `/${string}`): string {
+  return `${currentLocalAgentBaseUrl()}${path}`;
 }
