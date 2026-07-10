@@ -672,6 +672,19 @@ class SourceSyncWorker:
                     last_sync_status="failed",
                     error_message="sync completed without final state",
                 )
+            if final_state.last_sync_status == "failed":
+                error_message = final_state.error_message or "source sync failed"
+                await self.db.upsert_sync_state(final_state)
+                failed_at = datetime.now(timezone.utc)
+                next_attempt_at = self._next_retry_at(run, failed_at)
+                await self.db.fail_source_sync_run(
+                    run.run_id,
+                    error_message=error_message,
+                    retryable=next_attempt_at is not None,
+                    failed_at=failed_at,
+                    next_attempt_at=next_attempt_at,
+                )
+                return run
             await self.db.complete_source_sync_run(run.run_id, final_state=final_state)
             return run
         except asyncio.CancelledError:
