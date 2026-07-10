@@ -114,6 +114,7 @@ export type SourceViewerRelationship = ViewerRole | "creator";
 
 export interface SourceOwnership {
   created_by_user_id: string | null;
+  execution_owner_user_id: string | null;
   viewer_role: ViewerRole;
   viewer_relationship: SourceViewerRelationship;
 }
@@ -126,6 +127,7 @@ export interface SourceOwnership {
 export interface SourceCapabilities {
   can_subscribe: boolean;
   can_configure: boolean;
+  can_configure_connection: boolean;
   can_sync: boolean;
   can_force_resync: boolean;
   can_delete: boolean;

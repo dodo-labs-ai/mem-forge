@@ -539,6 +539,7 @@ export function SourcesPage() {
                     const capabilities: SourceCapabilities = source.capabilities ?? {
                       can_subscribe: false,
                       can_configure: false,
+                      can_configure_connection: false,
                       can_sync: false,
                       can_force_resync: false,
                       can_delete: false,

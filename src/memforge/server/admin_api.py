@@ -3374,7 +3374,11 @@ def create_admin_app(
                 s["client"] = agent_session_client_for_source_id(s["id"])
             else:
                 s["client"] = None
-            if s["type"] == "jira" and jira_auth_mode == "browser_cookie":
+            if (
+                s["type"] == "jira"
+                and jira_auth_mode == "browser_cookie"
+                and s.get("capabilities", {}).get("can_configure_connection")
+            ):
                 try:
                     s["auth_session"] = await jira_auth_service.get_status(
                         str(s.get("config", {}).get("base_url") or "")
