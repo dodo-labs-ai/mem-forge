@@ -24,7 +24,11 @@ from memforge.genes.atlassian_auth import (
     tls_verify,
 )
 from memforge.genes.base import Gene
-from memforge.genes.local_adapter_packages import package_manifest, read_package_body
+from memforge.genes.local_adapter_packages import (
+    has_package_manifest,
+    package_manifest,
+    read_package_body,
+)
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -359,7 +363,7 @@ class JiraGene(Gene):
         self._auth_mode = mode
         sync_mode = str(self.config.get("sync_mode") or "cloud").strip().lower()
         if sync_mode == "local_agent":
-            if self._local_agent_package_manifest():
+            if has_package_manifest(self.config):
                 self._client = None
                 self._request_limiter = None
                 self._hydrated_issues = {}
@@ -394,7 +398,7 @@ class JiraGene(Gene):
         """Discover issues via JQL search."""
         if str(self.config.get("sync_mode") or "cloud").strip().lower() == "local_agent":
             manifest = self._local_agent_package_manifest()
-            if manifest:
+            if has_package_manifest(self.config):
                 async for item in self._discover_local_agent_package_manifest(manifest, since):
                     yield item
                 return

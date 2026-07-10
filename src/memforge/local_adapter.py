@@ -157,7 +157,7 @@ def _store_package_artifact(
         return None, package_sha256
     package_uri = document_store.store_raw(
         source.get("name") or source_id,
-        f"{doc_id}-package",
+        f"{doc_id}-{package_sha256}-package",
         payload_bytes,
         "application/json",
         extension=extension,
@@ -324,12 +324,6 @@ async def submit_local_markdown_document(
                 pass
         raise
 
-    # The DB upsert refreshes documents_dir so a freshly created source picks
-    # up its inbox even if the gene has not authenticated yet. Any
-    # admin-attached project_binding rides through unchanged so this
-    # idempotent refresh never erases admin configuration.
-    refreshed_config = dict(source.get("config") or {})
-    refreshed_config["documents_dir"] = str(inbox)
     manifest_entry = None
     if package_uri:
         manifest_entry = _package_manifest_entry(
@@ -350,14 +344,6 @@ async def submit_local_markdown_document(
                 "raw_hash": raw_hash,
             },
         )
-    await db.upsert_source(
-        id=source_id,
-        type=LOCAL_MARKDOWN_SOURCE_TYPE,
-        name=source.get("name") or source_id,
-        config_json=json.dumps(refreshed_config),
-        project_binding=source.get("project_binding"),
-    )
-
     return {
         "source_id": source_id,
         "doc_id": doc_id,
@@ -494,8 +480,6 @@ async def submit_github_repo_document(
                 pass
         raise
 
-    refreshed_config = dict(source_config)
-    refreshed_config["documents_dir"] = str(inbox)
     manifest_entry = None
     if package_uri:
         manifest_entry = _package_manifest_entry(
@@ -521,14 +505,6 @@ async def submit_github_repo_document(
                 "raw_hash": raw_hash,
             },
         )
-    await db.upsert_source(
-        id=source_id,
-        type=GITHUB_REPO_SOURCE_TYPE,
-        name=source.get("name") or source_id,
-        config_json=json.dumps(refreshed_config),
-        project_binding=source.get("project_binding"),
-    )
-
     return {
         "source_id": source_id,
         "doc_id": doc_id,
@@ -629,8 +605,6 @@ async def submit_jira_package(
             pass
         raise
 
-    refreshed_config = dict(source_config)
-    refreshed_config["local_agent_documents_dir"] = str(inbox)
     manifest_entry = None
     if package_uri:
         manifest_entry = _package_manifest_entry(
@@ -651,14 +625,6 @@ async def submit_jira_package(
                 "raw_hash": payload_hash,
             },
         )
-    await db.upsert_source(
-        id=source_id,
-        type=JIRA_SOURCE_TYPE,
-        name=source.get("name") or source_id,
-        config_json=json.dumps(refreshed_config),
-        project_binding=source.get("project_binding"),
-    )
-
     return {
         "source_id": source_id,
         "doc_id": doc_id,
@@ -709,7 +675,6 @@ async def submit_teams_window_package(
 
     submitted_at = submitted_at or _now_iso()
     source_id = str(source["id"])
-    source_config = dict(source.get("config") or {})
     inbox = default_local_adapter_inbox(config, source_id)
     inbox.mkdir(parents=True, exist_ok=True)
 
@@ -763,8 +728,6 @@ async def submit_teams_window_package(
             pass
         raise
 
-    refreshed_config = dict(source_config)
-    refreshed_config["local_agent_documents_dir"] = str(inbox)
     manifest_entry = None
     if package_uri:
         manifest_entry = _package_manifest_entry(
@@ -786,14 +749,6 @@ async def submit_teams_window_package(
                 "revision_hash": normalized_revision_hash,
             },
         )
-    await db.upsert_source(
-        id=source_id,
-        type=TEAMS_SOURCE_TYPE,
-        name=source.get("name") or source_id,
-        config_json=json.dumps(refreshed_config),
-        project_binding=source.get("project_binding"),
-    )
-
     return {
         "source_id": source_id,
         "doc_id": doc_id,

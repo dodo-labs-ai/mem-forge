@@ -534,6 +534,8 @@ class SourceSyncRun:
     trigger: str
     status: str
     force_full_sync: bool = False
+    input_snapshot_id: str | None = None
+    rerun_input_snapshot_id: str | None = None
     coalesced: bool = False
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None

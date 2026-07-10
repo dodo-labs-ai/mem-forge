@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from typing import Any
@@ -15,11 +16,127 @@ LOCAL_AGENT_SYNC_OPERATIONS = frozenset(
         "teams_sync",
     }
 )
+AUTHORITATIVE_COLLECTION_SOURCE_TYPES = frozenset(
+    {"github_repo", "jira", "local_markdown"}
+)
 
 _IMMUTABLE_EXECUTION_MODE_FIELDS = {
     "github_repo": ("connection_mode",),
     "jira": ("sync_mode",),
 }
+
+_LOCAL_AGENT_JOB_CONFIG_FIELDS_BY_SOURCE_TYPE = {
+    "github_repo": frozenset(
+        {
+            "repo_url",
+            "ref",
+            "repo_path",
+            "include_paths",
+            "include_extensions",
+        }
+    ),
+    "jira": frozenset(
+        {
+            "base_url",
+            "auth_mode",
+            "sync_mode",
+            "projects",
+            "issue_types",
+            "include_comments",
+            "query_mode",
+            "jql",
+            "jql_filter",
+        }
+    ),
+    "local_markdown": frozenset(
+        {
+            "root",
+            "vault_id",
+            "include",
+            "exclude",
+        }
+    ),
+    "teams": frozenset(
+        {
+            "region",
+            "conversation_ids",
+            "channels",
+            "group_chats",
+            "individual_chats",
+            "conversation_gap_minutes",
+            "max_age_days",
+            "max_block_messages",
+            "incremental_overlap_hours",
+            "page_size",
+        }
+    ),
+}
+LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS = frozenset(
+    {
+        "force_full_sync",
+    }
+)
+LOCAL_AGENT_JOB_MAX_ATTEMPTS = 5
+
+
+def local_agent_completion_status(
+    status: str,
+    *,
+    retryable: bool,
+    attempt_count: int,
+) -> str:
+    """Return the durable broker status for a daemon completion."""
+    if status == "failed" and retryable and attempt_count < LOCAL_AGENT_JOB_MAX_ATTEMPTS:
+        return "queued"
+    return "succeeded" if status == "succeeded" else "failed"
+
+
+def local_agent_sync_snapshot_id(job_id: object, attempt_count: object) -> str:
+    """Identify one complete collection attempt without sharing partial membership."""
+    normalized_job_id = str(job_id or "").strip()
+    try:
+        normalized_attempt = int(attempt_count)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cloud sync job is missing attempt_count") from exc
+    if not normalized_job_id:
+        raise ValueError("cloud sync job is missing job_id")
+    if normalized_attempt < 1:
+        raise ValueError("cloud sync job is missing attempt_count")
+    return f"{normalized_job_id}:attempt:{normalized_attempt}"
+
+
+def local_agent_authoritative_snapshot_id(
+    source_type: object,
+    job_id: object,
+    attempt_count: object,
+    requested_snapshot_id: object = None,
+) -> str | None:
+    """Return the server-owned snapshot identity for complete collections."""
+    normalized_source_type = str(source_type or "").strip().lower()
+    requested = str(requested_snapshot_id or "").strip()
+    if normalized_source_type not in AUTHORITATIVE_COLLECTION_SOURCE_TYPES:
+        if requested:
+            raise ValueError("source type does not accept collection snapshots")
+        return None
+    canonical = local_agent_sync_snapshot_id(job_id, attempt_count)
+    if requested and requested != canonical:
+        raise ValueError("local agent snapshot does not match the leased job attempt")
+    return canonical
+
+
+def local_agent_input_sha256(doc_id: object, document_hash: object) -> str:
+    """Hash stable document identity and semantic content version."""
+    normalized_doc_id = str(doc_id or "").strip()
+    normalized_hash = str(document_hash or "").strip()
+    if not normalized_doc_id or not normalized_hash:
+        return ""
+    identity = json.dumps(
+        {"doc_id": normalized_doc_id, "document_hash": normalized_hash},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def _source_config(value: object) -> Mapping[str, Any]:
@@ -88,9 +205,63 @@ def execution_owner_user_id(source: Mapping[str, Any]) -> str | None:
     return value or None
 
 
+def local_agent_job_config(
+    source_type: str,
+    config: Mapping[str, Any] | str | None,
+) -> dict[str, Any]:
+    """Return connector config safe and useful for the owner's daemon."""
+    allowed = _LOCAL_AGENT_JOB_CONFIG_FIELDS_BY_SOURCE_TYPE.get(
+        str(source_type or "").strip().lower(),
+        frozenset(),
+    )
+    return {
+        key: value
+        for key, value in _source_config(config).items()
+        if key in allowed
+    }
+
+
+def local_agent_sync_job_payload(
+    source: Mapping[str, Any],
+    request_payload: Mapping[str, Any] | str | None = None,
+) -> dict[str, Any]:
+    """Return the canonical daemon sync-job payload for a saved source."""
+    source_type = str(source.get("type") or "").strip()
+    payload = local_agent_job_config(source_type, source.get("config"))
+    payload.update(
+        {
+            key: value
+            for key, value in _source_config(request_payload).items()
+            if key in LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS
+        }
+    )
+    payload["source_id"] = str(source.get("id") or "").strip()
+    payload["source_type"] = source_type
+    payload["source_config_revision"] = local_agent_source_config_revision(source)
+    return payload
+
+
+def local_agent_source_config_revision(source: Mapping[str, Any]) -> str:
+    """Fingerprint the saved collection scope used by one daemon job."""
+    source_type = str(source.get("type") or "").strip()
+    canonical = {
+        "source_type": source_type,
+        "config": local_agent_job_config(source_type, source.get("config")),
+    }
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def source_with_sync_inputs(
     source: Mapping[str, Any],
     inputs: list[Any],
+    *,
+    authoritative_snapshot: bool = False,
 ) -> dict[str, Any]:
     """Project immutable raw inputs into the connector's runtime manifest."""
     latest_entries: dict[str, dict[str, Any]] = {}
@@ -108,7 +279,7 @@ def source_with_sync_inputs(
             continue
         latest_entries[doc_id] = {**entry, "package_uri": raw_uri}
     projected = dict(source)
-    if latest_entries:
+    if latest_entries or authoritative_snapshot:
         config = dict(_source_config(source.get("config")))
         config["local_agent_package_manifest"] = list(latest_entries.values())
         projected["config"] = config

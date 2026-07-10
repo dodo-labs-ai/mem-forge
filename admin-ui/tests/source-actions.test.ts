@@ -154,8 +154,13 @@ assert.match(
 );
 assert.match(
   sourcesPageSource,
-  /delete payload\.local_agent_documents_dir;[\s\S]*delete payload\.local_agent_package_manifest;/,
-  "Local-agent job payloads should not forward server-side package inbox metadata to the local daemon",
+  /function localAgentJobPayload\(\s*forceFullSync = false,?[\s\S]*force_full_sync: forceFullSync/,
+  "Local-agent job creation should send only execution controls; the server supplies canonical source config",
+);
+assert.doesNotMatch(
+  sourcesPageSource,
+  /localAgentJobPayload[\s\S]{0,180}process_now/,
+  "Local-agent sync jobs should not expose the old raw-upload process_now switch",
 );
 assert.match(
   sourceRowSource,
@@ -171,6 +176,16 @@ assert.match(
   sourceRowSource,
   /showLocalAgentStatus\s*=\s*!isPaused\s*&&\s*isLocalAgentBackedSource\(source\)\s*&&\s*capabilities\.can_sync/,
   "Only the execution owner should query and display local daemon readiness",
+);
+assert.match(
+  sourcesPageSource,
+  /\["pending", "running", "recovering"\]\.includes\(source\.sync\?\.status/,
+  "Durable queued and recovering runs should keep source status polling active",
+);
+assert.match(
+  sourceRowSource,
+  /Waiting to sync[\s\S]*Recovering sync/,
+  "Source rows should distinguish queued work from worker recovery",
 );
 assert.match(
   apiTypesSource,
