@@ -588,7 +588,7 @@ class ToolClient:
         except (OSError, URLError, json.JSONDecodeError) as exc:
             return {
                 "error": "MemForge API unavailable",
-                "api_url": self.target.workspace_api_base,
+                "api_url": url,
                 "detail": str(exc),
             }
 
