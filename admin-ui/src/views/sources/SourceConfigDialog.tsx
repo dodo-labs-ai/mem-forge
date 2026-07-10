@@ -68,6 +68,7 @@ export function SourceConfigDialog({
   // blocked. New-source flows have no source row yet, so the type check is
   // the only gate there.
   const canConfigureExisting = source ? source.capabilities?.can_configure !== false : true;
+  const canConfigureConnection = source ? source.capabilities?.can_configure_connection !== false : true;
 
   const schemaQuery = useQuery<GeneConfigSchema>({
     queryKey: ["gene-config-schema", sourceType],
@@ -114,6 +115,7 @@ export function SourceConfigDialog({
             onOpenChange={onOpenChange}
             onSaved={onSaved}
             initialFocus={initialFocus}
+            canConfigureConnection={canConfigureConnection}
           />
         )}
       </DialogContent>
@@ -128,6 +130,7 @@ function SourceConfigForm({
   onOpenChange,
   onSaved,
   initialFocus,
+  canConfigureConnection,
 }: {
   sourceType: string;
   source?: Source | null;
@@ -135,6 +138,7 @@ function SourceConfigForm({
   onOpenChange: (open: boolean) => void;
   onSaved?: () => void;
   initialFocus?: { step: "project" };
+  canConfigureConnection: boolean;
 }) {
   const queryClient = useQueryClient();
   const isEdit = Boolean(source);
@@ -183,13 +187,16 @@ function SourceConfigForm({
     queryKey: ["jira-session", jiraBaseUrl],
     queryFn: () =>
       client.get("/api/auth/jira-session", { params: { base_url: jiraBaseUrl } }).then((response) => response.data),
-    enabled: sourceType === "jira" && authMode === "browser_cookie" && jiraBaseUrl.startsWith("https://"),
+    enabled: canConfigureConnection
+      && sourceType === "jira"
+      && authMode === "browser_cookie"
+      && jiraBaseUrl.startsWith("https://"),
   });
 
   const saveSource = useMutation({
     mutationFn: async (payload: {
       name: string;
-      config: ConfigForm;
+      config?: ConfigForm;
       project_binding: ProjectBinding | null;
     }) => {
       const intervalMinutes = parseScheduleInterval(scheduleInterval);
@@ -330,7 +337,7 @@ function SourceConfigForm({
       sourceNameRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
       return;
     }
-    if (firstMissingField) {
+    if (canConfigureConnection && firstMissingField) {
       setValidationMessage(`Complete ${firstMissingField.label} before saving.`);
       configFieldsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
       return;
@@ -347,7 +354,7 @@ function SourceConfigForm({
     }
     saveSource.mutate({
       name: name.trim(),
-      config: serializeConfig(schema.fields, config),
+      ...(canConfigureConnection ? { config: serializeConfig(schema.fields, config) } : {}),
       project_binding: binding,
     });
   };
@@ -375,7 +382,7 @@ function SourceConfigForm({
         </div>
 
         <div ref={configFieldsRef} className="min-h-0 flex-1 space-y-5 overflow-y-auto pr-1">
-          {fieldsByGroup.map((group) => (
+          {canConfigureConnection && fieldsByGroup.map((group) => (
             <section key={group.key} className="space-y-3">
               <h3 className="text-sm font-semibold">{group.label}</h3>
               <div className="space-y-3">
@@ -450,7 +457,7 @@ function SourceConfigForm({
               )}
             </section>
           ))}
-          {advancedFields.length > 0 && (
+          {canConfigureConnection && advancedFields.length > 0 && (
             <details className="group space-y-3">
               <summary className="inline-flex cursor-pointer select-none items-center gap-1 rounded-md px-1 py-0.5 text-sm font-semibold hover:bg-muted focus:outline-none focus-visible:ring-1 focus-visible:ring-ring/40">
                 <ChevronRight className="size-4 transition-transform group-open:rotate-90" />

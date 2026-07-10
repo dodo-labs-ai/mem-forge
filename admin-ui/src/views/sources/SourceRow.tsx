@@ -37,6 +37,7 @@ export interface SourceRowLabels {
 const DEFAULT_CAPABILITIES: SourceCapabilities = {
   can_subscribe: false,
   can_configure: false,
+  can_configure_connection: false,
   can_sync: false,
   can_force_resync: false,
   can_delete: false,
@@ -82,9 +83,9 @@ export function SourceRow({
   actionsMenu: ReactNode;
 }) {
   const isPaused = source.status === "paused";
-  const showLocalAgentStatus = !isPaused && isLocalAgentBackedSource(source);
-  const pausedSyncHint = "Source is paused. Resume the source to sync again.";
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
+  const showLocalAgentStatus = !isPaused && isLocalAgentBackedSource(source) && capabilities.can_sync;
+  const pausedSyncHint = "Source is paused. Resume the source to sync again.";
   const ownershipText = formatOwnership(source.ownership);
   const hasManagementControl =
     capabilities.can_configure || capabilities.can_sync || isManaged;
@@ -135,7 +136,7 @@ export function SourceRow({
                     : ""}
                 </span>
               )}
-              {source.type === "jira" && source.auth_session && hasManagementControl && (
+              {source.type === "jira" && source.auth_session && capabilities.can_configure_connection && (
                 <span
                   className={
                     source.auth_session.status === "active"
@@ -246,7 +247,11 @@ export function SourceRow({
       )}
 
       {hasManagementControl && (
-        <SyncStatusBar sync={source.sync} itemLabel={itemLabel} onRetry={isPaused ? undefined : onSync} />
+        <SyncStatusBar
+          sync={source.sync}
+          itemLabel={itemLabel}
+          onRetry={isPaused || !capabilities.can_sync ? undefined : onSync}
+        />
       )}
     </div>
   );

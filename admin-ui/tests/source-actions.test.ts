@@ -96,6 +96,7 @@ const sourceRowSource = readFileSync("src/views/sources/SourceRow.tsx", "utf8");
 const localAgentSourcesSource = readFileSync("src/views/sources/localAgentSources.ts", "utf8");
 const syncStatusBarSource = readFileSync("src/components/admin/SyncStatusBar.tsx", "utf8");
 const localAgentJobsSource = readFileSync("src/api/localAgentJobs.ts", "utf8");
+const apiTypesSource = readFileSync("src/api/types.ts", "utf8");
 
 assert.match(
   sourcesPageSource,
@@ -164,8 +165,18 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
-  /<LocalAgentDaemonBadge \/>/,
-  "Local-agent backed source rows should surface daemon readiness instead of source lifecycle as the title badge",
+  /showLocalAgentStatus\s*=\s*!isPaused\s*&&\s*isLocalAgentBackedSource\(source\)\s*&&\s*capabilities\.can_sync/,
+  "Only the execution owner should query and display local daemon readiness",
+);
+assert.match(
+  apiTypesSource,
+  /execution_owner_user_id:\s*string \| null;/,
+  "source ownership types should expose the persisted local execution owner",
+);
+assert.match(
+  apiTypesSource,
+  /can_configure_connection:\s*boolean;/,
+  "source capabilities should distinguish connector configuration from workspace management",
 );
 assert.match(
   sourcesPageSource,
@@ -194,8 +205,13 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
-  /onRetry=\{isPaused \? undefined : onSync\}/,
-  "Paused sources should not expose retry sync from the status bar",
+  /onRetry=\{isPaused \|\| !capabilities\.can_sync \? undefined : onSync\}/,
+  "Paused sources and non-owners should not expose retry sync from the status bar",
+);
+assert.match(
+  sourceRowSource,
+  /source\.auth_session\s*&&\s*capabilities\.can_configure_connection/,
+  "local Jira auth status should be visible only to the execution owner",
 );
 assert.match(
   sourceRowSource,
@@ -292,6 +308,21 @@ assert.doesNotMatch(
 const sourceConfigDialogSource = readFileSync("src/views/sources/SourceConfigDialog.tsx", "utf8");
 const teamsSourceWizardSource = readFileSync("src/views/sources/TeamsSourceWizard.tsx", "utf8");
 const githubRepoFolderPickerSource = readFileSync("src/views/sources/GitHubRepoFolderPicker.tsx", "utf8");
+assert.match(
+  sourceConfigDialogSource,
+  /const canConfigureConnection = source \? source\.capabilities\?\.can_configure_connection !== false : true;/,
+  "existing local sources should consume the backend connection capability",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /canConfigureConnection\s*&&\s*fieldsByGroup\.map/,
+  "non-owner admins should not render local connector fields or pickers",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /\.\.\.\(canConfigureConnection\s*\?\s*\{\s*config:\s*serializeConfig\(schema\.fields, config\)\s*\}\s*:\s*\{\}\)/,
+  "management-only saves must omit connector config from the API payload",
+);
 assert.match(
   sourceConfigDialogSource,
   /const DISCOVERY_PREVIEW_LIMIT = 5;/,
