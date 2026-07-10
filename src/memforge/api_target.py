@@ -84,11 +84,15 @@ def _normalized_optional(value: str | None) -> str | None:
 def _canonical_origin(origin: str) -> str:
     try:
         parsed = urlsplit(origin)
+        parsed.port
     except ValueError as exc:
         raise TargetConfigurationError("memforge_origin_required") from exc
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
         or parsed.path not in {"", "/"}
         or parsed.query
         or parsed.fragment

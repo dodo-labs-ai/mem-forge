@@ -27,6 +27,36 @@ def _isolate_memforge_plugin_config(monkeypatch, tmp_path):
         pass
 
 
+def _legacy_plugin_config_ast(source: str) -> str:
+    module = ast.parse(source)
+    expected_import_switch = ast.parse(
+        """
+if __package__:
+    from .api_target import MemForgeTarget, build_target
+else:
+    from memforge.api_target import MemForgeTarget, build_target
+"""
+    ).body[0]
+    expected_import_switch_ast = ast.dump(expected_import_switch, include_attributes=False)
+    legacy_body: list[ast.stmt] = []
+    for node in module.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "configured_target":
+            continue
+        contains_target_import = any(
+            isinstance(child, ast.ImportFrom)
+            and child.module in {"api_target", "memforge.api_target"}
+            for child in ast.walk(node)
+        )
+        if contains_target_import:
+            assert (
+                ast.dump(node, include_attributes=False) == expected_import_switch_ast
+            ), "target import compatibility block must be exact"
+            continue
+        legacy_body.append(node)
+    module.body = legacy_body
+    return ast.dump(module, include_attributes=False)
+
+
 def _init_git_repo_with_origin(path: Path, origin_url: str) -> None:
     subprocess.run(["git", "init"], cwd=path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     subprocess.run(
@@ -975,32 +1005,24 @@ def test_packaged_plugin_config_matches_canonical_legacy_helpers():
     root = Path(__file__).resolve().parents[1]
     canonical = (root / "src" / "memforge" / "plugin_config.py").read_text()
 
-    def legacy_helper_ast(source: str) -> str:
-        module = ast.parse(source)
-        module.body = [
-            node
-            for node in module.body
-            if not (isinstance(node, ast.FunctionDef) and node.name == "configured_target")
-            and not (
-                isinstance(node, ast.ImportFrom)
-                and node.module in {"api_target", "memforge.api_target"}
-            )
-            and not (
-                isinstance(node, ast.Try)
-                and any(
-                    isinstance(child, ast.ImportFrom)
-                    and child.module in {"api_target", "memforge.api_target"}
-                    for child in ast.walk(node)
-                )
-            )
-        ]
-        return ast.dump(module, include_attributes=False)
-
     for helper in (
         root / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
         root / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
     ):
-        assert legacy_helper_ast(helper.read_text()) == legacy_helper_ast(canonical)
+        assert _legacy_plugin_config_ast(helper.read_text()) == _legacy_plugin_config_ast(canonical)
+
+
+def test_plugin_config_parity_normalizer_rejects_mixed_target_import_block():
+    source = """
+if __package__:
+    from .api_target import MemForgeTarget, build_target
+    unrelated_statement = True
+else:
+    from memforge.api_target import MemForgeTarget, build_target
+"""
+
+    with pytest.raises(AssertionError, match="target import compatibility block must be exact"):
+        _legacy_plugin_config_ast(source)
 
 
 def test_plugin_mcp_launchers_match_each_other():
