@@ -181,6 +181,7 @@ async def test_heartbeat_source_sync_run_extends_only_current_worker_lease(db: D
     wrong_worker = await db.heartbeat_source_sync_run(
         enqueued.run_id,
         worker_id="worker-b",
+        lease_attempt_count=leased.lease_attempt_count,
         lease_seconds=60,
         now=now + timedelta(seconds=10),
     )
@@ -188,6 +189,7 @@ async def test_heartbeat_source_sync_run_extends_only_current_worker_lease(db: D
     right_worker = await db.heartbeat_source_sync_run(
         enqueued.run_id,
         worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
         lease_seconds=60,
         now=now + timedelta(seconds=10),
     )
@@ -215,15 +217,18 @@ async def test_complete_source_sync_run_releases_active_slot_for_next_run(db: Da
         workspace_id="workspace-a",
         trigger="manual",
     )
-    await db.lease_next_source_sync_run(
+    leased = await db.lease_next_source_sync_run(
         worker_id="worker-a",
         workspace_id="workspace-a",
         lease_seconds=60,
         now=now,
     )
+    assert leased is not None
 
-    await db.complete_source_sync_run(
+    completed_update = await db.complete_source_sync_run(
         enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
         final_state=SyncState(
             source="src-complete-run",
             last_sync_at=now,
@@ -241,12 +246,87 @@ async def test_complete_source_sync_run_releases_active_slot_for_next_run(db: Da
         trigger="manual",
     )
 
+    assert completed_update is True
     assert completed is not None
     assert completed.status == "success"
     assert completed.lease_owner is None
     assert completed.completed_at == now + timedelta(seconds=10)
     assert next_run.run_id != enqueued.run_id
     assert next_run.coalesced is False
+
+
+@pytest.mark.asyncio
+async def test_terminal_source_sync_writes_require_current_lease(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-stale-terminal",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-stale-terminal",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    first = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    recovered = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=90),
+    )
+    assert first is not None
+    assert recovered is not None
+
+    stale_complete = await db.complete_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=first.lease_attempt_count,
+        final_state=SyncState(
+            source="src-stale-terminal",
+            last_sync_at=now + timedelta(seconds=95),
+            last_sync_status="success",
+            docs_processed=99,
+        ),
+        completed_at=now + timedelta(seconds=95),
+    )
+    after_stale_complete = await db.get_source_sync_run(enqueued.run_id)
+    sync_state_after_stale = await db.get_sync_state("src-stale-terminal")
+
+    stale_fail = await db.fail_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=first.lease_attempt_count,
+        error_message="stale failure",
+        final_state=SyncState(
+            source="src-stale-terminal",
+            last_sync_at=now + timedelta(seconds=96),
+            last_sync_status="failed",
+            error_message="stale failure",
+        ),
+        retryable=False,
+        failed_at=now + timedelta(seconds=96),
+    )
+    after_stale_fail = await db.get_source_sync_run(enqueued.run_id)
+    sync_state_after_stale_fail = await db.get_sync_state("src-stale-terminal")
+
+    assert stale_complete is False
+    assert stale_fail is False
+    assert after_stale_complete is not None
+    assert after_stale_complete.lease_owner == "worker-b"
+    assert after_stale_complete.lease_attempt_count == recovered.lease_attempt_count
+    assert after_stale_complete.status == "running"
+    assert after_stale_fail is not None
+    assert after_stale_fail.status == "running"
+    assert after_stale_fail.lease_owner == "worker-b"
+    assert sync_state_after_stale is None
+    assert sync_state_after_stale_fail is None
 
 
 @pytest.mark.asyncio
@@ -263,15 +343,18 @@ async def test_fail_source_sync_run_requeues_retryable_failure_after_backoff(db:
         workspace_id="workspace-a",
         trigger="manual",
     )
-    await db.lease_next_source_sync_run(
+    leased = await db.lease_next_source_sync_run(
         worker_id="worker-a",
         workspace_id="workspace-a",
         lease_seconds=60,
         now=now,
     )
+    assert leased is not None
 
-    await db.fail_source_sync_run(
+    failed_update = await db.fail_source_sync_run(
         enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
         error_message="temporary outage",
         retryable=True,
         failed_at=now + timedelta(seconds=5),
@@ -292,6 +375,7 @@ async def test_fail_source_sync_run_requeues_retryable_failure_after_backoff(db:
     )
 
     assert failed is not None
+    assert failed_update is True
     assert failed.status == "pending"
     assert failed.next_attempt_at == now + timedelta(seconds=65)
     assert failed.error_message == "temporary outage"
@@ -316,15 +400,18 @@ async def test_fail_source_sync_run_marks_terminal_after_retry_budget(db: Databa
         workspace_id="workspace-a",
         trigger="manual",
     )
-    await db.lease_next_source_sync_run(
+    leased = await db.lease_next_source_sync_run(
         worker_id="worker-a",
         workspace_id="workspace-a",
         lease_seconds=60,
         now=now,
     )
+    assert leased is not None
 
-    await db.fail_source_sync_run(
+    failed_update = await db.fail_source_sync_run(
         enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
         error_message="permanent outage",
         retryable=False,
         failed_at=now + timedelta(seconds=5),
@@ -339,10 +426,54 @@ async def test_fail_source_sync_run_marks_terminal_after_retry_budget(db: Databa
     )
 
     assert failed is not None
+    assert failed_update is True
     assert failed.status == "failed"
     assert failed.next_attempt_at is None
     assert failed.completed_at == now + timedelta(seconds=5)
     assert retried is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_failure_preserves_coalesced_rerun(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-terminal-rerun",
+        type="teams",
+        name="Teams",
+        config_json="{}",
+    )
+    active = await db.enqueue_source_sync_run(
+        source_id="src-terminal-rerun",
+        trigger="local_agent",
+    )
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert leased is not None
+    await db.enqueue_source_sync_run(
+        source_id="src-terminal-rerun",
+        trigger="local_agent",
+    )
+
+    failed = await db.fail_source_sync_run(
+        active.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        error_message="retry budget exhausted",
+        retryable=False,
+        failed_at=now + timedelta(seconds=10),
+    )
+    successor = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        now=now + timedelta(seconds=11),
+    )
+
+    assert failed is True
+    assert successor is not None
+    assert successor.run_id != active.run_id
+    assert successor.trigger == "rerun"
 
 
 @pytest.mark.asyncio
@@ -359,12 +490,13 @@ async def test_complete_source_sync_run_creates_successor_for_coalesced_request(
         workspace_id="workspace-a",
         trigger="manual",
     )
-    await db.lease_next_source_sync_run(
+    leased = await db.lease_next_source_sync_run(
         worker_id="worker-a",
         workspace_id="workspace-a",
         lease_seconds=60,
         now=now,
     )
+    assert leased is not None
     coalesced = await db.enqueue_source_sync_run(
         source_id="src-successor",
         workspace_id="workspace-a",
@@ -372,8 +504,10 @@ async def test_complete_source_sync_run_creates_successor_for_coalesced_request(
         force_full_sync=True,
     )
 
-    await db.complete_source_sync_run(
+    completed_update = await db.complete_source_sync_run(
         active.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
         final_state=SyncState(
             source="src-successor",
             last_sync_at=now + timedelta(seconds=10),
@@ -391,6 +525,7 @@ async def test_complete_source_sync_run_creates_successor_for_coalesced_request(
 
     assert coalesced.run_id == active.run_id
     assert coalesced.coalesced is True
+    assert completed_update is True
     assert completed is not None
     assert completed.status == "success"
     assert successor is not None
@@ -433,6 +568,42 @@ async def test_source_sync_inputs_are_immutable_generations_per_workspace_source
     assert second.input_generation == 2
     assert [item.input_id for item in listed] == [first.input_id, second.input_id]
     assert listed[0].metadata == {"conversation_id": "chat-1"}
+
+
+@pytest.mark.asyncio
+async def test_source_sync_inputs_are_idempotent_by_raw_hash(db: Database):
+    await db.upsert_source(
+        id="src-input-idempotent",
+        type="teams",
+        name="Teams",
+        config_json="{}",
+    )
+
+    first = await db.create_source_sync_input(
+        source_id="src-input-idempotent",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-idempotent/inputs/one.json",
+        raw_sha256="sha-same",
+        raw_content_type="application/json",
+        metadata={"conversation_id": "chat-1"},
+    )
+    duplicate = await db.create_source_sync_input(
+        source_id="src-input-idempotent",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-idempotent/inputs/one-copy.json",
+        raw_sha256="sha-same",
+        raw_content_type="application/json",
+        metadata={"conversation_id": "chat-1", "submitted_at": "later"},
+    )
+    listed = await db.list_source_sync_inputs(
+        source_id="src-input-idempotent",
+        workspace_id="workspace-a",
+    )
+
+    assert duplicate.input_id == first.input_id
+    assert duplicate.input_generation == first.input_generation
+    assert duplicate.raw_uri == first.raw_uri
+    assert [item.input_id for item in listed] == [first.input_id]
 
 
 class EmptyGene:
@@ -2426,6 +2597,52 @@ async def test_source_sync_worker_retries_failed_final_state(db: Database):
     assert sync_state is not None
     assert sync_state.last_sync_status == "failed"
     assert sync_state.error_message == "temporary final-state failure"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_retries_partial_final_state(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-final-state-partial"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker Partial State",
+        config_json="{}",
+    )
+
+    class PartialStateRuntimeProvider:
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="partial",
+                docs_processed=2,
+                docs_failed=1,
+                error_message="one document failed",
+            )
+
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(sync=SyncConfig(worker_retry_base_seconds=120)),
+        runtime_provider=PartialStateRuntimeProvider(),
+        worker_id="worker-a",
+    )
+
+    await worker.run_once()
+    failed = await db.get_source_sync_run(enqueued.run_id)
+    sync_state = await db.get_sync_state(source_id)
+
+    assert failed is not None
+    assert failed.status == "pending"
+    assert sync_state is not None
+    assert sync_state.last_sync_status == "partial"
 
 
 @pytest.mark.asyncio

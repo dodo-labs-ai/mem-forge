@@ -165,8 +165,7 @@ def _store_package_artifact(
     return package_uri, package_sha256
 
 
-def _upsert_package_manifest_entry(
-    config: dict[str, Any],
+def _package_manifest_entry(
     *,
     doc_id: str,
     title: str,
@@ -179,14 +178,7 @@ def _upsert_package_manifest_entry(
     submitted_at: str,
     submitted_by: str | None,
     extra: dict[str, Any] | None = None,
-) -> None:
-    existing_manifest = config.get("local_agent_package_manifest")
-    if not isinstance(existing_manifest, list):
-        existing_manifest = []
-    manifest = [
-        entry for entry in existing_manifest
-        if isinstance(entry, dict) and entry.get("doc_id") != doc_id
-    ]
+) -> dict[str, Any]:
     entry = {
         "doc_id": doc_id,
         "title": title,
@@ -201,11 +193,7 @@ def _upsert_package_manifest_entry(
     }
     if extra:
         entry.update(extra)
-    manifest.append(entry)
-    config["local_agent_package_manifest"] = sorted(
-        manifest,
-        key=lambda item: (str(item.get("last_modified") or ""), str(item.get("doc_id") or "")),
-    )
+    return entry
 
 
 def _jira_title_from_payload(payload: dict[str, Any], fallback: str) -> str:
@@ -342,9 +330,9 @@ async def submit_local_markdown_document(
     # idempotent refresh never erases admin configuration.
     refreshed_config = dict(source.get("config") or {})
     refreshed_config["documents_dir"] = str(inbox)
+    manifest_entry = None
     if package_uri:
-        _upsert_package_manifest_entry(
-            refreshed_config,
+        manifest_entry = _package_manifest_entry(
             doc_id=doc_id,
             title=doc_title,
             source_url=source_url,
@@ -379,6 +367,7 @@ async def submit_local_markdown_document(
         "package_path": str(package_path),
         "package_uri": package_uri,
         "package_sha256": package_sha256,
+        "package_manifest_entry": manifest_entry,
         "submitted_at": submitted_at,
     }
 
@@ -507,9 +496,9 @@ async def submit_github_repo_document(
 
     refreshed_config = dict(source_config)
     refreshed_config["documents_dir"] = str(inbox)
+    manifest_entry = None
     if package_uri:
-        _upsert_package_manifest_entry(
-            refreshed_config,
+        manifest_entry = _package_manifest_entry(
             doc_id=doc_id,
             title=doc_title,
             source_url=source_url,
@@ -550,6 +539,7 @@ async def submit_github_repo_document(
         "package_path": str(package_path),
         "package_uri": package_uri,
         "package_sha256": package_sha256,
+        "package_manifest_entry": manifest_entry,
         "submitted_at": submitted_at,
     }
 
@@ -641,9 +631,9 @@ async def submit_jira_package(
 
     refreshed_config = dict(source_config)
     refreshed_config["local_agent_documents_dir"] = str(inbox)
+    manifest_entry = None
     if package_uri:
-        _upsert_package_manifest_entry(
-            refreshed_config,
+        manifest_entry = _package_manifest_entry(
             doc_id=doc_id,
             title=doc_title,
             source_url=issue_url,
@@ -678,6 +668,7 @@ async def submit_jira_package(
         "package_path": str(package_path),
         "package_uri": package_uri,
         "package_sha256": package_sha256,
+        "package_manifest_entry": manifest_entry,
         "submitted_at": submitted_at,
     }
 
@@ -774,9 +765,9 @@ async def submit_teams_window_package(
 
     refreshed_config = dict(source_config)
     refreshed_config["local_agent_documents_dir"] = str(inbox)
+    manifest_entry = None
     if package_uri:
-        _upsert_package_manifest_entry(
-            refreshed_config,
+        manifest_entry = _package_manifest_entry(
             doc_id=doc_id,
             title=doc_title,
             source_url=package["source_url"],
@@ -813,6 +804,7 @@ async def submit_teams_window_package(
         "package_path": str(package_path),
         "package_uri": package_uri,
         "package_sha256": package_sha256,
+        "package_manifest_entry": manifest_entry,
         "submitted_at": submitted_at,
     }
 

@@ -86,3 +86,30 @@ def source_execution_descriptor(
 def execution_owner_user_id(source: Mapping[str, Any]) -> str | None:
     value = str(source.get("execution_owner_user_id") or "").strip()
     return value or None
+
+
+def source_with_sync_inputs(
+    source: Mapping[str, Any],
+    inputs: list[Any],
+) -> dict[str, Any]:
+    """Project immutable raw inputs into the connector's runtime manifest."""
+    latest_entries: dict[str, dict[str, Any]] = {}
+    for source_input in sorted(
+        inputs,
+        key=lambda item: int(getattr(item, "input_generation", 0)),
+    ):
+        metadata = getattr(source_input, "metadata", {})
+        entry = metadata.get("manifest_entry") if isinstance(metadata, Mapping) else None
+        if not isinstance(entry, Mapping):
+            continue
+        doc_id = str(entry.get("doc_id") or "").strip()
+        raw_uri = str(getattr(source_input, "raw_uri", "") or "").strip()
+        if not doc_id or not raw_uri:
+            continue
+        latest_entries[doc_id] = {**entry, "package_uri": raw_uri}
+    projected = dict(source)
+    if latest_entries:
+        config = dict(_source_config(source.get("config")))
+        config["local_agent_package_manifest"] = list(latest_entries.values())
+        projected["config"] = config
+    return projected

@@ -4023,6 +4023,7 @@ def create_admin_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         if result.get("package_uri"):
+            manifest_entry = result.get("package_manifest_entry")
             await db.create_source_sync_input(
                 source_id=source_id,
                 raw_uri=str(result["package_uri"]),
@@ -4034,6 +4035,9 @@ def create_admin_app(
                     "package_path": result.get("package_path"),
                     "submitted_at": result.get("submitted_at"),
                     "submitted_by": req.submitted_by,
+                    "manifest_entry": (
+                        manifest_entry if isinstance(manifest_entry, dict) else {}
+                    ),
                 },
             )
 
@@ -4045,7 +4049,9 @@ def create_admin_app(
             except SourcePausedError:
                 raise _source_paused_http_error()
 
-        return {**result, "sync_started": sync_started}
+        public_result = dict(result)
+        public_result.pop("package_manifest_entry", None)
+        return {**public_result, "sync_started": sync_started}
 
     # ===================================================================
     # 4b. Agent Session Document Intake

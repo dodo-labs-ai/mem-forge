@@ -846,6 +846,9 @@ CREATE TABLE IF NOT EXISTS source_sync_inputs (
 CREATE INDEX IF NOT EXISTS idx_source_sync_inputs_source
     ON source_sync_inputs(workspace_id, source_id, input_generation);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_source_sync_inputs_raw_hash
+    ON source_sync_inputs(workspace_id, source_id, raw_sha256);
+
 -- ---------------------------------------------------------------
 -- Config singletons
 -- ---------------------------------------------------------------
@@ -1766,6 +1769,8 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             )""",
             """CREATE INDEX IF NOT EXISTS idx_source_sync_inputs_source
                ON source_sync_inputs(workspace_id, source_id, input_generation)""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_source_sync_inputs_raw_hash
+               ON source_sync_inputs(workspace_id, source_id, raw_sha256)""",
         ],
     ),
 ]
@@ -6987,6 +6992,7 @@ class Database:
         run_id: str,
         *,
         worker_id: str,
+        lease_attempt_count: int,
         lease_seconds: int = 300,
         now: datetime | None = None,
     ) -> bool:
@@ -7000,12 +7006,14 @@ class Database:
                        updated_at = ?
                    WHERE run_id = ?
                      AND status = 'running'
-                     AND lease_owner = ?""",
+                     AND lease_owner = ?
+                     AND lease_attempt_count = ?""",
                 (
                     lease_expires_at,
                     heartbeat_iso,
                     run_id,
                     worker_id,
+                    lease_attempt_count,
                 ),
             )
             await self.db.commit()
@@ -7015,14 +7023,26 @@ class Database:
         self,
         run_id: str,
         *,
+        worker_id: str,
+        lease_attempt_count: int,
         final_state: SyncState | None = None,
         completed_at: datetime | None = None,
-    ) -> None:
+    ) -> bool:
         completed_iso = _utc_iso(completed_at)
         status = final_state.last_sync_status if final_state and final_state.last_sync_status else "success"
         if status not in {"success", "failed"}:
             status = "success"
         async with self._write_lock:
+            async with self.db.execute(
+                """SELECT * FROM source_sync_runs
+                   WHERE run_id = ? AND status = 'running'
+                     AND lease_owner = ? AND lease_attempt_count = ?
+                     AND lease_expires_at > ?""",
+                (run_id, worker_id, lease_attempt_count, completed_iso),
+            ) as cursor:
+                leased_run = await cursor.fetchone()
+            if leased_run is None:
+                return False
             if final_state is not None:
                 await self.db.execute(
                     """INSERT INTO sync_state (
@@ -7049,7 +7069,7 @@ class Database:
                         "UPDATE sources SET last_sync = ? WHERE id = ?",
                         (final_state.last_sync_at.isoformat(), final_state.source),
                     )
-            await self.db.execute(
+            cursor = await self.db.execute(
                 """UPDATE source_sync_runs
                    SET status = ?,
                        lease_owner = NULL,
@@ -7058,34 +7078,46 @@ class Database:
                        error_message = ?,
                        completed_at = ?,
                        updated_at = ?
-                   WHERE run_id = ?""",
+                   WHERE run_id = ? AND status = 'running'
+                     AND lease_owner = ? AND lease_attempt_count = ?
+                     AND lease_expires_at > ?""",
                 (
                     status,
                     final_state.error_message if final_state else None,
                     completed_iso,
                     completed_iso,
                     run_id,
+                    worker_id,
+                    lease_attempt_count,
+                    completed_iso,
                 ),
             )
+            if not cursor.rowcount:
+                await self.db.rollback()
+                return False
             if status == "success":
                 await self._enqueue_successor_for_completed_run(run_id, completed_iso)
             await self.db.commit()
+        return True
 
     async def fail_source_sync_run(
         self,
         run_id: str,
         *,
+        worker_id: str,
+        lease_attempt_count: int,
         error_message: str,
+        final_state: SyncState | None = None,
         retryable: bool = True,
         failed_at: datetime | None = None,
         next_attempt_at: datetime | None = None,
-    ) -> None:
+    ) -> bool:
         failed_iso = _utc_iso(failed_at)
         status = "pending" if retryable else "failed"
         completed_at = None if retryable else failed_iso
         next_attempt_iso = _utc_iso(next_attempt_at) if retryable and next_attempt_at else None
         async with self._write_lock:
-            await self.db.execute(
+            cursor = await self.db.execute(
                 """UPDATE source_sync_runs
                    SET status = ?,
                        lease_owner = NULL,
@@ -7094,10 +7126,49 @@ class Database:
                        error_message = ?,
                        completed_at = ?,
                        updated_at = ?
-                   WHERE run_id = ?""",
-                (status, next_attempt_iso, error_message, completed_at, failed_iso, run_id),
+                   WHERE run_id = ? AND status = 'running'
+                     AND lease_owner = ? AND lease_attempt_count = ?
+                     AND lease_expires_at > ?""",
+                (
+                    status,
+                    next_attempt_iso,
+                    error_message,
+                    completed_at,
+                    failed_iso,
+                    run_id,
+                    worker_id,
+                    lease_attempt_count,
+                    failed_iso,
+                ),
             )
+            if not cursor.rowcount:
+                await self.db.rollback()
+                return False
+            if final_state is not None:
+                await self.db.execute(
+                    """INSERT INTO sync_state (
+                        source, last_sync_at, last_sync_status,
+                        docs_processed, docs_updated, error_message
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source) DO UPDATE SET
+                        last_sync_at=excluded.last_sync_at,
+                        last_sync_status=excluded.last_sync_status,
+                        docs_processed=excluded.docs_processed,
+                        docs_updated=excluded.docs_updated,
+                        error_message=excluded.error_message""",
+                    (
+                        final_state.source,
+                        final_state.last_sync_at.isoformat() if final_state.last_sync_at else None,
+                        final_state.last_sync_status,
+                        final_state.docs_processed,
+                        final_state.docs_updated,
+                        final_state.error_message,
+                    ),
+                )
+            if not retryable:
+                await self._enqueue_successor_for_completed_run(run_id, failed_iso)
             await self.db.commit()
+        return True
 
     async def _enqueue_successor_for_completed_run(self, run_id: str, now: str) -> None:
         async with self.db.execute(
@@ -7135,6 +7206,14 @@ class Database:
     ) -> SourceSyncInput:
         now = _now_iso()
         async with self._write_lock:
+            async with self.db.execute(
+                """SELECT * FROM source_sync_inputs
+                   WHERE workspace_id = ? AND source_id = ? AND raw_sha256 = ?""",
+                (workspace_id, source_id, raw_sha256),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            if existing is not None:
+                return _source_sync_input_from_row(existing)
             async with self.db.execute(
                 """SELECT COALESCE(MAX(input_generation), 0) + 1 AS next_generation
                    FROM source_sync_inputs
