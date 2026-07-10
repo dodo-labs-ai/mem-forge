@@ -140,7 +140,6 @@ def _write_cli_config(data: dict[str, Any]) -> None:
         if not isinstance(target, dict):
             continue
         lines.append(f"[targets.{_toml_key(str(name))}]")
-        lines.append(f"edition = {_toml_string(str(target.get('edition') or ''))}")
         lines.append(f"api_url = {_toml_string(str(target.get('api_url') or ''))}")
         if target.get("workspace_id"):
             lines.append(f"workspace_id = {_toml_string(str(target['workspace_id']))}")
@@ -160,10 +159,9 @@ def _toml_key(value: str) -> str:
 
 
 def _resolve_api_target(_config: AppConfig) -> _ResolvedCliTarget:
-    target_env_names = ("MEMFORGE_EDITION", "MEMFORGE_API_URL", "MEMFORGE_WORKSPACE_ID")
+    target_env_names = ("MEMFORGE_API_URL", "MEMFORGE_WORKSPACE_ID")
     if any(os.getenv(name, "").strip() for name in target_env_names):
         target = _build_cli_target(
-            edition=os.getenv("MEMFORGE_EDITION"),
             api_url=os.getenv("MEMFORGE_API_URL"),
             workspace_id=os.getenv("MEMFORGE_WORKSPACE_ID"),
         )
@@ -180,7 +178,6 @@ def _resolve_api_target(_config: AppConfig) -> _ResolvedCliTarget:
     profile = profiles.get(active)
     if isinstance(profile, dict):
         target = _build_cli_target(
-            edition=profile.get("edition"),
             api_url=profile.get("api_url"),
             workspace_id=profile.get("workspace_id"),
         )
@@ -193,17 +190,16 @@ def _resolve_api_target(_config: AppConfig) -> _ResolvedCliTarget:
         )
 
     return _ResolvedCliTarget(
-        target=build_target(edition=None, origin=None, workspace_id=None),
+        target=build_target(origin=None, workspace_id=None),
         api_token=os.getenv("MEMFORGE_API_TOKEN"),
         active_target="",
         token_env="",
     )
 
 
-def _build_cli_target(*, edition: object, api_url: object, workspace_id: object) -> MemForgeTarget:
+def _build_cli_target(*, api_url: object, workspace_id: object) -> MemForgeTarget:
     try:
         return build_target(
-            edition=str(edition) if edition is not None else None,
             origin=str(api_url) if api_url is not None else None,
             workspace_id=str(workspace_id) if workspace_id is not None else None,
         )
@@ -935,21 +931,19 @@ def target_list(ctx):
 
 @target.command("add")
 @click.argument("name")
-@click.option("--edition", required=True, help="MemForge edition: oss or cloud.")
 @click.option("--api-url", required=True, help="MemForge API URL for this target.")
 @click.option("--workspace-id", default=None, help="Required workspace ID for Cloud targets.")
 @click.option("--token-env", default="MEMFORGE_API_TOKEN", show_default=True, help="Environment variable for the token.")
 @click.pass_context
-def target_add(ctx, name: str, edition: str, api_url: str, workspace_id: str | None, token_env: str):
+def target_add(ctx, name: str, api_url: str, workspace_id: str | None, token_env: str):
     """Add or update an API target and make it active."""
     name = name.strip()
     if not name:
         raise click.ClickException("Target name is required.")
-    resolved = _build_cli_target(edition=edition, api_url=api_url, workspace_id=workspace_id)
+    resolved = _build_cli_target(api_url=api_url, workspace_id=workspace_id)
     data = _read_cli_config()
     targets = data.setdefault("targets", {})
     targets[name] = {
-        "edition": resolved.edition.value,
         "api_url": resolved.origin,
         "workspace_id": resolved.workspace_id,
         "token_env": token_env.strip(),

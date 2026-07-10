@@ -14,7 +14,6 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _isolate_memforge_plugin_config(monkeypatch, tmp_path):
-    monkeypatch.delenv("MEMFORGE_EDITION", raising=False)
     monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
     monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
     monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
@@ -1020,24 +1019,20 @@ def test_packaged_plugin_config_matches_canonical_target_and_helpers():
 
 def test_mcp_and_hook_share_cloud_resource_url(monkeypatch):
     from memforge import hook_adapter, plugin_mcp_proxy
-
-    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example.hana.ondemand.com")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
 
     assert plugin_mcp_proxy._resource_url("/sources") == (
-        "https://cloud.example/api/workspaces/mount_tai/api/sources"
+        "https://cloud.example.hana.ondemand.com/api/workspaces/mount_tai/api/sources"
     )
     assert hook_adapter._resource_url("/hooks/receipts") == (
-        "https://cloud.example/api/workspaces/mount_tai/api/hooks/receipts"
+        "https://cloud.example.hana.ondemand.com/api/workspaces/mount_tai/api/hooks/receipts"
     )
 
 
 def test_invalid_hook_target_fails_before_urlopen(monkeypatch):
     from memforge import hook_adapter
-
-    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example.hana.ondemand.com")
     monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
     monkeypatch.setattr(
         hook_adapter.urllib.request,
@@ -1237,8 +1232,7 @@ def test_mcp_proxy_forwards_search_to_service_with_token(monkeypatch):
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
-    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://self.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
@@ -1246,7 +1240,7 @@ def test_mcp_proxy_forwards_search_to_service_with_token(monkeypatch):
     result = proxy._call_tool("search", {"query": "artifact cache"})
 
     assert result == {"results": []}
-    assert captured["url"] == "https://memforge.example/api/memories/search"
+    assert captured["url"] == "https://self.example/api/memories/search"
     assert captured["authorization"] == "Bearer token-123"
     assert captured["content_type"] == "application/json"
     assert json.loads(captured["body"].decode()) == {
@@ -1277,8 +1271,7 @@ def test_mcp_proxy_forwards_explicit_search_entities(monkeypatch):
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
-    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://self.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
@@ -1321,8 +1314,7 @@ def test_mcp_proxy_trims_and_dedupes_explicit_search_entities(monkeypatch):
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
-    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://self.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
@@ -1363,8 +1355,7 @@ def test_mcp_proxy_omits_empty_explicit_search_entities(monkeypatch):
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
-    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://self.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
@@ -1425,16 +1416,15 @@ def test_mcp_proxy_forwards_list_sources_to_searchable_sources(monkeypatch):
             captured["authorization"] = request.get_header("Authorization")
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example.hana.ondemand.com")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
-    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
     result = proxy._call_tool("list_sources", {})
 
     assert result["data"][0]["source_id"] == "src-mounttai"
-    assert captured["url"] == "https://memforge.example/api/workspaces/mount_tai/api/sources/searchable"
+    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/sources/searchable"
     assert captured["authorization"] == "Bearer token-123"
 
 
@@ -1865,17 +1855,16 @@ def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example.hana.ondemand.com")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
-    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
 
     result = proxy._call_tool("search", {"query": "artifact cache"})
 
     assert result == {"results": []}
-    assert captured["url"] == "https://memforge.example/api/workspaces/mount_tai/api/memories/search"
+    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/memories/search"
     assert captured["authorization"] == "Bearer token-123"
     assert json.loads(captured["body"].decode()) == {
         "query": "artifact cache",
@@ -1907,10 +1896,9 @@ def test_mcp_proxy_forwards_retire_memory_to_lifecycle_endpoint(monkeypatch):
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example.hana.ondemand.com")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
-    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
     result = proxy._call_tool(
@@ -1924,7 +1912,7 @@ def test_mcp_proxy_forwards_retire_memory_to_lifecycle_endpoint(monkeypatch):
 
     assert result == {"status": "retired", "memory_id": "mem-123"}
     assert captured["method"] == "POST"
-    assert captured["url"] == "https://memforge.example/api/workspaces/mount_tai/api/memories/mem-123/retire"
+    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/memories/mem-123/retire"
     assert json.loads(captured["body"].decode()) == {
         "reason": "User confirmed this memory is obsolete.",
         "expected_content_hash": "hash-old",
@@ -1954,9 +1942,8 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example.hana.ondemand.com")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
-    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setenv("MEMFORGE_MCP_CLIENT", "claude-code")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: "github.com/shno-labs/mem-forge")
@@ -1974,7 +1961,7 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
 
     assert result == {"status": "inserted", "memory_id": "mem-new"}
     assert captured["method"] == "POST"
-    assert captured["url"] == "https://memforge.example/api/workspaces/mount_tai/api/memories/create"
+    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/memories/create"
     assert json.loads(captured["body"].decode()) == {
         "content": "Use readable confirmation previews before memory mutations.",
         "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
@@ -2162,8 +2149,7 @@ def test_mcp_proxy_forwards_replace_memory_to_lifecycle_endpoint(monkeypatch):
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
-    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://self.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
@@ -2181,7 +2167,7 @@ def test_mcp_proxy_forwards_replace_memory_to_lifecycle_endpoint(monkeypatch):
 
     assert result["replacement_memory_id"] == "mem-new"
     assert captured["method"] == "POST"
-    assert captured["url"] == "https://memforge.example/api/memories/mem-old/replace"
+    assert captured["url"] == "https://self.example/api/memories/mem-old/replace"
     assert json.loads(captured["body"].decode()) == {
         "replacement_content": "Use the new deployment route.",
         "provenance": "User corrected this while reviewing the deployment guide.",
@@ -2244,8 +2230,7 @@ def test_mcp_proxy_forwards_memory_review_tools(monkeypatch):
             )
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
-    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://self.example")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
     assert proxy._call_tool("list_memory_reviews", {"status": "open", "limit": 5}) == {"ok": True}
@@ -2256,11 +2241,11 @@ def test_mcp_proxy_forwards_memory_review_tools(monkeypatch):
     ) == {"ok": True}
 
     assert calls[0]["method"] == "GET"
-    assert calls[0]["url"] == "https://memforge.example/api/memory-reviews?status=open&limit=5&offset=0"
+    assert calls[0]["url"] == "https://self.example/api/memory-reviews?status=open&limit=5&offset=0"
     assert calls[1]["method"] == "GET"
-    assert calls[1]["url"] == "https://memforge.example/api/memory-reviews/rev-1"
+    assert calls[1]["url"] == "https://self.example/api/memory-reviews/rev-1"
     assert calls[2]["method"] == "POST"
-    assert calls[2]["url"] == "https://memforge.example/api/memory-reviews/rev-1/reject"
+    assert calls[2]["url"] == "https://self.example/api/memory-reviews/rev-1/reject"
     assert json.loads(calls[2]["body"].decode()) == {"note": "Not durable enough."}
 
 
@@ -2271,8 +2256,7 @@ def test_mcp_proxy_requires_note_before_rejecting_memory_review(monkeypatch):
         def open(self, request, timeout):
             raise AssertionError("reject without note should fail before HTTP")
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
-    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://self.example")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
     assert proxy._call_tool(
@@ -2309,10 +2293,9 @@ def test_mcp_proxy_forwards_queryless_source_id_time_range(monkeypatch):
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example.hana.ondemand.com")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
-    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
 
@@ -2365,10 +2348,9 @@ def test_mcp_proxy_forwards_search_offset_for_deterministic_listing(monkeypatch)
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example.hana.ondemand.com")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
-    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
 
@@ -2413,8 +2395,7 @@ def test_mcp_proxy_does_not_guess_has_more_for_windowed_legacy_response(monkeypa
         def open(self, request, timeout):
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
-    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://self.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
@@ -2482,8 +2463,7 @@ def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
         def open(self, request, timeout):
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
-    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://self.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
@@ -2565,8 +2545,7 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
         def open(self, request, timeout):
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
-    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://self.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
@@ -2660,10 +2639,9 @@ def test_mcp_proxy_forwards_explicit_optional_date_bounds(monkeypatch):
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example.hana.ondemand.com")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
-    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
 
@@ -2789,10 +2767,9 @@ def test_mcp_proxy_fetches_resource_through_hosted_workspace(monkeypatch):
             captured["authorization"] = request.get_header("Authorization")
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example.hana.ondemand.com")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
-    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
     result = proxy._call_tool(
@@ -2802,7 +2779,7 @@ def test_mcp_proxy_fetches_resource_through_hosted_workspace(monkeypatch):
 
     assert result["text"] == "# Source"
     assert result["url"] == "/api/documents/doc-1/content"
-    assert captured["url"] == "https://memforge.example/api/workspaces/mount_tai/api/documents/doc-1/content"
+    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/documents/doc-1/content"
     assert captured["authorization"] == "Bearer token-123"
 
 
@@ -2841,7 +2818,6 @@ def test_mcp_proxy_downloads_resource_to_local_cache(monkeypatch, tmp_path):
             return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_API_URL", "http://memforge.test")
-    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
     monkeypatch.setenv("MEMFORGE_ARTIFACT_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
@@ -2863,8 +2839,7 @@ def test_mcp_proxy_downloads_resource_to_local_cache(monkeypatch, tmp_path):
 
 def test_mcp_proxy_rejects_foreign_and_ambiguous_resource_urls(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
-    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://self.example")
 
     foreign = proxy._handle_get_resource(
         {
@@ -3009,16 +2984,15 @@ def test_post_json_targets_hosted_workspace_when_configured(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
-    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example.hana.ondemand.com")
     monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
 
     hook_adapter._post_json("/hooks/context", {}, timeout=1)
     hook_adapter._post_json("/agent-sessions/windows", {}, timeout=1)
 
     assert urls == [
-        "https://memforge.example/api/workspaces/mount_tai/api/hooks/context",
-        "https://memforge.example/api/workspaces/mount_tai/api/agent-sessions/windows",
+        "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/hooks/context",
+        "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/agent-sessions/windows",
     ]
 
 
@@ -3058,8 +3032,7 @@ def test_hook_adapter_uses_codex_plugin_config_when_hook_env_is_absent(monkeypat
     (codex_home / "config.toml").write_text(
         """
 [memforge]
-MEMFORGE_EDITION = "cloud"
-MEMFORGE_API_URL = "https://memforge.example"
+MEMFORGE_API_URL = "https://memforge.example.hana.ondemand.com"
 MEMFORGE_API_TOKEN = "config-token"
 MEMFORGE_WORKSPACE_ID = "mount_tai"
 """,
@@ -3106,8 +3079,7 @@ def test_post_json_uses_codex_plugin_config_for_workspace_and_token(monkeypatch,
     (codex_home / "config.toml").write_text(
         """
 [memforge]
-MEMFORGE_EDITION = "cloud"
-MEMFORGE_API_URL = "https://memforge.example"
+MEMFORGE_API_URL = "https://memforge.example.hana.ondemand.com"
 MEMFORGE_API_TOKEN = "config-token"
 MEMFORGE_WORKSPACE_ID = "mount_tai"
 """,
@@ -3139,7 +3111,7 @@ MEMFORGE_WORKSPACE_ID = "mount_tai"
     hook_adapter._post_json("/hooks/receipts", {}, timeout=1)
 
     assert observed == {
-        "url": "https://memforge.example/api/workspaces/mount_tai/api/hooks/receipts",
+        "url": "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/hooks/receipts",
         "authorization": "Bearer config-token",
     }
 

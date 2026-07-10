@@ -8,6 +8,7 @@ from urllib.parse import quote, urlsplit
 
 
 _LOCAL_OSS_ORIGIN = "http://127.0.0.1:8765"
+_CLOUD_HOST_SUFFIX = "hana.ondemand.com"
 
 
 class Edition(str, Enum):
@@ -42,37 +43,22 @@ class MemForgeTarget:
 
 def build_target(
     *,
-    edition: str | Edition | None,
     origin: str | None,
     workspace_id: str | None,
 ) -> MemForgeTarget:
-    """Build one canonical target from the explicit edition-tagged configuration."""
-    edition_value = _normalized_optional(edition)
+    """Build one canonical target, deriving Cloud only from the origin hostname."""
     origin_value = _normalized_optional(origin)
     workspace_value = _normalized_optional(workspace_id)
 
-    if edition_value is None and origin_value is None and workspace_value is None:
+    if origin_value is None and workspace_value is None:
         return MemForgeTarget(Edition.OSS, _LOCAL_OSS_ORIGIN, None)
-    if edition_value is None:
-        raise TargetConfigurationError("memforge_edition_required")
-
-    try:
-        target_edition = Edition(edition_value)
-    except ValueError as exc:
-        raise TargetConfigurationError("invalid_memforge_edition") from exc
-
-    if target_edition is Edition.OSS:
-        if workspace_value is not None:
-            raise TargetConfigurationError("workspace_not_supported_for_oss")
-        if origin_value is None:
-            raise TargetConfigurationError("memforge_origin_required")
-    else:
-        if origin_value is None:
-            raise TargetConfigurationError("cloud_api_url_required")
-        if workspace_value is None:
-            raise TargetConfigurationError("cloud_workspace_required")
 
     canonical_origin = _canonical_origin(origin_value)
+    target_edition = Edition.CLOUD if _is_cloud_origin(canonical_origin) else Edition.OSS
+    if target_edition is Edition.CLOUD and workspace_value is None:
+        raise TargetConfigurationError("cloud_workspace_required")
+    if target_edition is Edition.OSS and workspace_value is not None:
+        raise TargetConfigurationError("workspace_not_supported_for_oss")
     return MemForgeTarget(target_edition, canonical_origin, workspace_value)
 
 
@@ -81,7 +67,9 @@ def _normalized_optional(value: str | None) -> str | None:
     return normalized or None
 
 
-def _canonical_origin(origin: str) -> str:
+def _canonical_origin(origin: str | None) -> str:
+    if origin is None:
+        raise TargetConfigurationError("memforge_origin_required")
     try:
         parsed = urlsplit(origin)
         parsed.port
@@ -99,3 +87,8 @@ def _canonical_origin(origin: str) -> str:
     ):
         raise TargetConfigurationError("memforge_origin_required")
     return origin.rstrip("/")
+
+
+def _is_cloud_origin(origin: str) -> bool:
+    hostname = (urlsplit(origin).hostname or "").lower().rstrip(".")
+    return hostname == _CLOUD_HOST_SUFFIX or hostname.endswith(f".{_CLOUD_HOST_SUFFIX}")

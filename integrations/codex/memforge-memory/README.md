@@ -2,25 +2,25 @@
 
 This plugin connects Codex lifecycle hooks to a MemForge API.
 It also registers a thin local MCP proxy for explicit memory tools.
-The packaged runtime and plugin version is `0.1.26`.
+The packaged runtime and plugin version is `0.1.27`.
 
 With no routing variables, the plugin targets local OSS at
-`http://127.0.0.1:8765/api`. Otherwise set the complete edition-tagged target in
-`~/.codex/config.toml`. `MEMFORGE_API_URL` must be an HTTP(S) origin without
-`/api`; Cloud also requires `MEMFORGE_WORKSPACE_ID`. Set `MEMFORGE_API_TOKEN`
-separately when the service requires bearer authentication.
+`http://127.0.0.1:8765/api`. Otherwise set the target in `~/.codex/config.toml`.
+`MEMFORGE_API_URL` must be an HTTP(S) origin without `/api`. Origins whose
+hostname is `hana.ondemand.com` or one of its subdomains are Cloud targets and
+require `MEMFORGE_WORKSPACE_ID`; every other origin is OSS and forbids a
+workspace. Set `MEMFORGE_API_TOKEN` separately when bearer authentication is
+required.
 
 ```toml
 [memforge]
-MEMFORGE_EDITION = "cloud"
-MEMFORGE_API_URL = "https://memforge.example"
+MEMFORGE_API_URL = "https://memforge-dev.cfapps.eu12.hana.ondemand.com"
 MEMFORGE_API_TOKEN = "..."
 MEMFORGE_WORKSPACE_ID = "mount_tai"
 ```
 
-Use `MEMFORGE_EDITION = "oss"` with an explicit origin for remote OSS and omit
-`MEMFORGE_WORKSPACE_ID`. Invalid or partial targets fail locally before any MCP
-or hook network request.
+For remote OSS, use its origin and omit `MEMFORGE_WORKSPACE_ID`. Invalid or
+partial targets fail locally before any MCP or hook network request.
 
 Do not add a manual `[mcp_servers.memforge]` block. The plugin's `.mcp.json`
 registers the MCP server; duplicating it in `config.toml` can pin Codex to a

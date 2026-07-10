@@ -2,27 +2,28 @@
 
 This plugin connects Claude Code lifecycle hooks to a MemForge API.
 It also registers a thin local MCP proxy for explicit memory tools.
-The packaged runtime and plugin version is `0.1.26`.
+The packaged runtime and plugin version is `0.1.27`.
 
 With no routing variables, the plugin targets local OSS at
-`http://127.0.0.1:8765/api`. Otherwise put the complete edition-tagged target in
-the top-level `env` object in `~/.claude/settings.json`. Lifecycle hooks do not
+`http://127.0.0.1:8765/api`. Otherwise put the target in the top-level `env`
+object in `~/.claude/settings.json`. Lifecycle hooks do not
 inherit MCP-server-only environment, so do not put these routing values only in
 an MCP server entry. `MEMFORGE_API_URL` must be an HTTP(S) origin without
-`/api`; Cloud also requires `MEMFORGE_WORKSPACE_ID`.
+`/api`. Origins whose hostname is `hana.ondemand.com` or one of its subdomains
+are Cloud targets and require `MEMFORGE_WORKSPACE_ID`; every other origin is OSS
+and forbids a workspace.
 
 ```json
 {
   "env": {
-    "MEMFORGE_EDITION": "cloud",
-    "MEMFORGE_API_URL": "https://memforge.example",
+    "MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
     "MEMFORGE_WORKSPACE_ID": "mount_tai"
   }
 }
 ```
 
-Set `MEMFORGE_EDITION` to `oss` with an explicit origin for remote OSS and omit
-`MEMFORGE_WORKSPACE_ID`. Set `MEMFORGE_API_TOKEN` separately in the process or
+For remote OSS, use its origin and omit `MEMFORGE_WORKSPACE_ID`. Set
+`MEMFORGE_API_TOKEN` separately in the process or
 top-level agent environment when bearer authentication is required; the token
 is an identity credential, not a workspace selector. Invalid or partial targets
 fail locally before any MCP or hook network request.

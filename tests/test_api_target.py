@@ -13,44 +13,42 @@ from memforge.plugin_config import configured_target
 
 
 @pytest.mark.parametrize(
-    ("edition", "origin", "workspace_id", "resource_base"),
+    ("origin", "workspace_id", "edition", "resource_base"),
     [
-        ("oss", "https://self.example", None, "https://self.example/api"),
+        ("https://self.example", None, Edition.OSS, "https://self.example/api"),
         (
-            "cloud",
-            "https://cloud.example",
+            "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
             "mount_tai",
-            "https://cloud.example/api/workspaces/mount_tai/api",
+            Edition.CLOUD,
+            "https://memforge-dev.cfapps.eu12.hana.ondemand.com/api/workspaces/mount_tai/api",
         ),
     ],
 )
-def test_build_target_returns_one_resource_base(edition, origin, workspace_id, resource_base):
-    target = build_target(edition=edition, origin=origin, workspace_id=workspace_id)
+def test_build_target_derives_edition_and_returns_one_resource_base(origin, workspace_id, edition, resource_base):
+    target = build_target(origin=origin, workspace_id=workspace_id)
 
+    assert target.edition is edition
     assert target.workspace_api_base == resource_base
 
 
 @pytest.mark.parametrize(
-    ("edition", "origin", "workspace_id", "code"),
+    ("origin", "workspace_id", "code"),
     [
-        (None, "https://self.example", None, "memforge_edition_required"),
-        ("cloud", None, "mount_tai", "cloud_api_url_required"),
-        ("cloud", "https://cloud.example", None, "cloud_workspace_required"),
-        ("oss", "https://self.example", "mount_tai", "workspace_not_supported_for_oss"),
-        ("oss", "https://self.example/api", None, "memforge_origin_required"),
-        ("invalid", "https://self.example", None, "invalid_memforge_edition"),
-        ("oss", None, None, "memforge_origin_required"),
+        (None, "mount_tai", "memforge_origin_required"),
+        ("https://memforge-dev.cfapps.eu12.hana.ondemand.com", None, "cloud_workspace_required"),
+        ("https://self.example", "mount_tai", "workspace_not_supported_for_oss"),
+        ("https://self.example/api", None, "memforge_origin_required"),
     ],
 )
-def test_build_target_rejects_invalid_tagged_union(edition, origin, workspace_id, code):
+def test_build_target_rejects_invalid_derived_target(origin, workspace_id, code):
     with pytest.raises(TargetConfigurationError, match=code) as exc_info:
-        build_target(edition=edition, origin=origin, workspace_id=workspace_id)
+        build_target(origin=origin, workspace_id=workspace_id)
 
     assert exc_info.value.code == code
 
 
 def test_build_target_defaults_only_when_all_configuration_is_absent():
-    target = build_target(edition=None, origin=None, workspace_id=None)
+    target = build_target(origin=None, workspace_id=None)
 
     assert target == MemForgeTarget(
         edition=Edition.OSS,
@@ -62,15 +60,15 @@ def test_build_target_defaults_only_when_all_configuration_is_absent():
 
 def test_build_target_normalizes_origin_and_quotes_workspace():
     target = build_target(
-        edition=" cloud ",
-        origin=" https://cloud.example/ ",
+        origin=" https://MEMFORGE-DEV.CFAPPS.EU12.HANA.ONDEMAND.COM/ ",
         workspace_id=" mount tai/blue ",
     )
 
-    assert target.origin == "https://cloud.example"
+    assert target.edition is Edition.CLOUD
+    assert target.origin == "https://MEMFORGE-DEV.CFAPPS.EU12.HANA.ONDEMAND.COM"
     assert target.workspace_id == "mount tai/blue"
     assert target.workspace_api_base == (
-        "https://cloud.example/api/workspaces/mount%20tai%2Fblue/api"
+        "https://MEMFORGE-DEV.CFAPPS.EU12.HANA.ONDEMAND.COM/api/workspaces/mount%20tai%2Fblue/api"
     )
 
 
@@ -88,18 +86,46 @@ def test_build_target_normalizes_origin_and_quotes_workspace():
 )
 def test_build_target_rejects_non_origin_api_urls(origin):
     with pytest.raises(TargetConfigurationError, match="memforge_origin_required"):
-        build_target(edition="oss", origin=origin, workspace_id=None)
+        build_target(origin=origin, workspace_id=None)
 
 
 @pytest.mark.parametrize("origin", ["https://self.example:8443", "https://[::1]:8443"])
 def test_build_target_accepts_normal_host_and_ipv6_origins(origin):
-    target = build_target(edition="oss", origin=origin, workspace_id=None)
+    target = build_target(origin=origin, workspace_id=None)
 
     assert target.origin == origin
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://hana.ondemand.com",
+        "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+        "https://MEMFORGE-DEV.CFAPPS.EU12.HANA.ONDEMAND.COM.",
+    ],
+)
+def test_build_target_classifies_only_hana_ondemand_hosts_as_cloud(origin):
+    target = build_target(origin=origin, workspace_id="mount_tai")
+
+    assert target.edition is Edition.CLOUD
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://hana.ondemand.com.evil.example",
+        "https://hana-ondemand.com",
+        "https://self.example",
+    ],
+)
+def test_build_target_does_not_use_substring_cloud_detection(origin):
+    target = build_target(origin=origin, workspace_id=None)
+
+    assert target.edition is Edition.OSS
+
+
 def test_memforge_target_is_immutable():
-    target = build_target(edition="oss", origin="https://self.example", workspace_id=None)
+    target = build_target(origin="https://self.example", workspace_id=None)
 
     with pytest.raises(FrozenInstanceError):
         target.origin = "https://other.example"
@@ -107,19 +133,18 @@ def test_memforge_target_is_immutable():
 
 def test_resource_url_resolves_relative_resource_path():
     target = build_target(
-        edition="cloud",
-        origin="https://cloud.example",
+        origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com",
         workspace_id="mount_tai",
     )
 
     assert target.resource_url("/sources") == (
-        "https://cloud.example/api/workspaces/mount_tai/api/sources"
+        "https://memforge-dev.cfapps.eu12.hana.ondemand.com/api/workspaces/mount_tai/api/sources"
     )
 
 
 @pytest.mark.parametrize("relative_path", ["sources", "/api/sources"])
 def test_resource_url_rejects_paths_outside_api_base(relative_path):
-    target = build_target(edition="oss", origin="https://self.example", workspace_id=None)
+    target = build_target(origin="https://self.example", workspace_id=None)
 
     with pytest.raises(ValueError, match="resource_path_must_be_relative_to_api_base"):
         target.resource_url(relative_path)
@@ -128,15 +153,14 @@ def test_resource_url_rejects_paths_outside_api_base(relative_path):
 def test_configured_target_reads_explicit_cloud_target(monkeypatch, tmp_path):
     from memforge import plugin_config
 
-    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example/")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge-dev.cfapps.eu12.hana.ondemand.com/")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
     monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(tmp_path / "missing-config.toml"))
     monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
 
     assert configured_target() == MemForgeTarget(
         edition=Edition.CLOUD,
-        origin="https://cloud.example",
+        origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com",
         workspace_id="mount_tai",
     )
 
@@ -144,7 +168,7 @@ def test_configured_target_reads_explicit_cloud_target(monkeypatch, tmp_path):
 def test_configured_target_preserves_zero_configuration_default(monkeypatch, tmp_path):
     from memforge import plugin_config
 
-    for name in ("MEMFORGE_EDITION", "MEMFORGE_API_URL", "MEMFORGE_WORKSPACE_ID"):
+    for name in ("MEMFORGE_API_URL", "MEMFORGE_WORKSPACE_ID"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(tmp_path / "missing-config.toml"))
     monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)

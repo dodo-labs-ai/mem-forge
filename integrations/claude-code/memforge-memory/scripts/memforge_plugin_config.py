@@ -23,10 +23,9 @@ _CONFIG_CACHE: dict[str, str] | None = None
 
 
 def configured_target() -> MemForgeTarget:
-    edition = _configured_value("MEMFORGE_EDITION", "").strip() or None
     origin = _configured_value("MEMFORGE_API_URL", "").strip() or None
     workspace = _configured_value("MEMFORGE_WORKSPACE_ID", "").strip() or None
-    return build_target(edition=edition, origin=origin, workspace_id=workspace)
+    return build_target(origin=origin, workspace_id=workspace)
 
 
 def configured_api_token() -> str:

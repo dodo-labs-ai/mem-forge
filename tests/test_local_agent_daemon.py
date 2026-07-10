@@ -499,14 +499,13 @@ def test_adapter_daemon_status_uses_environment_target_provenance(monkeypatch, t
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_STATE", str(tmp_path / "state.json"))
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_LOCK", str(tmp_path / "daemon.lock"))
     monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "cli.toml"))
-    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://environment.example.test")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://environment.hana.ondemand.com")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "ws-environment")
     monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
     monkeypatch.setenv("SAP_TOKEN", "inactive-profile-token")
     (tmp_path / "cli.toml").write_text(
-        'active = "sap"\n\n[targets.sap]\nedition = "cloud"\n'
-        'api_url = "https://profile.example.test"\nworkspace_id = "ws-profile"\n'
+        'active = "sap"\n\n[targets.sap]\n'
+        'api_url = "https://profile.hana.ondemand.com"\nworkspace_id = "ws-profile"\n'
         'token_env = "SAP_TOKEN"\n',
         encoding="utf-8",
     )
@@ -517,7 +516,7 @@ def test_adapter_daemon_status_uses_environment_target_provenance(monkeypatch, t
     payload = json.loads(result.output)
     assert payload["target"] == {
         "edition": "cloud",
-        "api_url": "https://environment.example.test",
+        "api_url": "https://environment.hana.ondemand.com",
         "workspace_id": "ws-environment",
         "active_target": "",
         "token_env": "MEMFORGE_API_TOKEN",
@@ -547,7 +546,6 @@ def test_adapter_daemon_status_verbose_includes_raw_state(monkeypatch, tmp_path)
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_STATE", str(state_path))
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_LOCK", str(tmp_path / "daemon.lock"))
     monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "cli.toml"))
-    monkeypatch.delenv("MEMFORGE_EDITION", raising=False)
     monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
     monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
 
