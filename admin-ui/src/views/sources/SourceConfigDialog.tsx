@@ -68,8 +68,8 @@ export function SourceConfigDialog({
   // not open the form. Type-level managed sources (agent_session) are also
   // blocked. New-source flows have no source row yet, so the type check is
   // the only gate there.
-  const canConfigureExisting = source ? source.capabilities?.can_configure !== false : true;
-  const canConfigureConnection = source ? source.capabilities?.can_configure_connection !== false : true;
+  const canConfigureExisting = source ? source.capabilities?.can_configure === true : true;
+  const canConfigureConnection = source ? source.capabilities?.can_configure_connection === true : true;
 
   const schemaQuery = useQuery<GeneConfigSchema>({
     queryKey: ["gene-config-schema", sourceType],
@@ -597,6 +597,7 @@ function ConfigFieldInput({
           type="checkbox"
           className="mt-0.5 size-4"
           checked={toBoolean(value)}
+          disabled={disabled}
           onChange={(event) => onChange(event.target.checked)}
         />
         <span>
@@ -644,6 +645,7 @@ function ConfigFieldInput({
               <input
                 type="checkbox"
                 checked={selected.has(option)}
+                disabled={disabled}
                 onChange={(event) => {
                   const next = new Set(selected);
                   if (event.target.checked) next.add(option);
@@ -666,6 +668,7 @@ function ConfigFieldInput({
           className="min-h-20 w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs shadow-xs outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           rows={4}
           value={stringValue(value)}
+          disabled={disabled}
           placeholder={field.placeholder}
           onChange={(event) => onChange(event.target.value)}
         />
@@ -682,6 +685,7 @@ function ConfigFieldInput({
       <Input
         type={isInteger ? "number" : isSecret ? "password" : "text"}
         value={isList ? listValue(value).join(", ") : stringValue(value)}
+        disabled={disabled}
         onChange={(event) => {
           if (isInteger) {
             onChange(event.target.value === "" ? "" : Number(event.target.value));
