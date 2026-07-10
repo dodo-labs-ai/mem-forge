@@ -4037,13 +4037,6 @@ def create_admin_app(
         current_source = await db.get_source(source_id)
         if current_source is None:
             raise HTTPException(status_code=404, detail="Source not found")
-        await _require_current_local_agent_lease(
-            request,
-            db,
-            source=current_source,
-            job_id=req.local_agent_job_id if req else None,
-            attempt_count=req.local_agent_attempt_count if req else None,
-        )
         try:
             snapshot_id = local_agent_authoritative_snapshot_id(
                 current_source["type"],
