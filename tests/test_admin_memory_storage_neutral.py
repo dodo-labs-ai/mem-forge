@@ -33,6 +33,7 @@ def _config(tmp_path) -> AppConfig:
     cfg = AppConfig(base_dir=tmp_path / "memforge")
     cfg.llm.enrichment_api_key = ""
     cfg.llm.embedding_api_key = ""
+    cfg.sync.worker_enabled = False
     return cfg
 
 
