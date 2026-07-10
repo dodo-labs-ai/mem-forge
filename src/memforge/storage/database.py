@@ -1769,7 +1769,7 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         ],
     ),
     (
-        36,
+        37,
         "Drop unused source sync run items",
         [
             "DROP TABLE IF EXISTS source_sync_run_items",
