@@ -244,11 +244,11 @@ def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect)
     monkeypatch.setattr(main, "_run_cloud_teams_auth_job", fake_auth)
     monkeypatch.setattr(main, "_current_teams_chat_token_hashes", lambda: set())
-    monkeypatch.setattr(main, "_workspace_tool_client", lambda client, workspace_id: client)
 
     result = main._run_cloud_teams_sync_job(
         {
             "job_id": "laj-sync",
+            "attempt_count": 1,
             "operation": "teams_sync",
             "source_id": "src-teams",
             "workspace_id": "workspace-a",
@@ -495,6 +495,36 @@ def test_adapter_daemon_once_exits_nonzero_when_job_fails(monkeypatch):
     assert json.loads(result.output)["counts"]["failed"] == 1
 
 
+def test_adapter_daemon_status_uses_environment_target_provenance(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_LOCK", str(tmp_path / "daemon.lock"))
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "cli.toml"))
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://environment.hana.ondemand.com")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "ws-environment")
+    monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
+    monkeypatch.setenv("SAP_TOKEN", "inactive-profile-token")
+    (tmp_path / "cli.toml").write_text(
+        'active = "sap"\n\n[targets.sap]\n'
+        'api_url = "https://profile.hana.ondemand.com"\nworkspace_id = "ws-profile"\n'
+        'token_env = "SAP_TOKEN"\n',
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(cli, ["adapter", "daemon", "status"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["target"] == {
+        "edition": "cloud",
+        "api_url": "https://environment.hana.ondemand.com",
+        "workspace_id": "ws-environment",
+        "active_target": "",
+        "token_env": "MEMFORGE_API_TOKEN",
+        "api_token_configured": False,
+    }
+    assert payload["recommendations"] == ["Set MEMFORGE_API_TOKEN before starting the daemon."]
+
+
 def test_adapter_daemon_status_verbose_includes_raw_state(monkeypatch, tmp_path):
     state_path = tmp_path / "state.json"
     state_path.write_text(
@@ -515,6 +545,9 @@ def test_adapter_daemon_status_verbose_includes_raw_state(monkeypatch, tmp_path)
     )
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_STATE", str(state_path))
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_LOCK", str(tmp_path / "daemon.lock"))
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "cli.toml"))
+    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
+    monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
 
     result = CliRunner().invoke(cli, ["adapter", "daemon", "status", "--verbose"])
 

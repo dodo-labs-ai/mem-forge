@@ -20,6 +20,7 @@
  */
 import type { ComponentType, ReactNode } from "react";
 import type { RouteObject } from "react-router-dom";
+import type { WorkspaceApiController } from "./api/client.js";
 
 /**
  * Routes that the OSS admin UI owns. Extensions cannot register routes whose
@@ -65,7 +66,7 @@ export interface ExtensionTopbarSlot {
 
 export interface ExtensionShellWrapper {
   /** Wraps the entire admin shell; useful for context providers (e.g. auth, capability flags). */
-  Wrapper: ComponentType<{ children: ReactNode }>;
+  Wrapper: ComponentType<{ children: ReactNode; workspaceApi: WorkspaceApiController }>;
 }
 
 export interface ExtensionReservedRouteRedirect {

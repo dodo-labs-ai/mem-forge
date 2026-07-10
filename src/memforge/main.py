@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import metadata
 from itertools import islice
@@ -29,6 +30,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
+from memforge.api_target import MemForgeTarget, TargetConfigurationError, build_target
 from memforge.auth import browser_session
 from memforge.config import AppConfig, load_config
 from memforge.github_repo_utils import (
@@ -85,6 +87,14 @@ INTERACTIVE_INSTALL_LOCK_STALE_SECONDS = 600
 INTERACTIVE_DEPENDENCY_SENTINEL = Path("node_modules") / "@clack" / "prompts"
 
 
+@dataclass(frozen=True)
+class _ResolvedCliTarget:
+    target: MemForgeTarget
+    api_token: str | None
+    active_target: str
+    token_env: str
+
+
 def setup_logging(verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -131,6 +141,8 @@ def _write_cli_config(data: dict[str, Any]) -> None:
             continue
         lines.append(f"[targets.{_toml_key(str(name))}]")
         lines.append(f"api_url = {_toml_string(str(target.get('api_url') or ''))}")
+        if target.get("workspace_id"):
+            lines.append(f"workspace_id = {_toml_string(str(target['workspace_id']))}")
         if target.get("token_env"):
             lines.append(f"token_env = {_toml_string(str(target['token_env']))}")
         lines.append("")
@@ -146,45 +158,58 @@ def _toml_key(value: str) -> str:
     return json.dumps(value)
 
 
-def _active_target() -> dict[str, Any] | None:
-    data = _read_cli_config()
-    active = str(data.get("active") or "")
-    targets = data.get("targets") if isinstance(data.get("targets"), dict) else {}
-    target = targets.get(active)
-    return target if isinstance(target, dict) else None
+def _resolve_api_target(_config: AppConfig) -> _ResolvedCliTarget:
+    target_env_names = ("MEMFORGE_API_URL", "MEMFORGE_WORKSPACE_ID")
+    if any(os.getenv(name, "").strip() for name in target_env_names):
+        target = _build_cli_target(
+            api_url=os.getenv("MEMFORGE_API_URL"),
+            workspace_id=os.getenv("MEMFORGE_WORKSPACE_ID"),
+        )
+        return _ResolvedCliTarget(
+            target=target,
+            api_token=os.getenv("MEMFORGE_API_TOKEN"),
+            active_target="",
+            token_env="MEMFORGE_API_TOKEN",
+        )
 
+    cli_config = _read_cli_config()
+    active = str(cli_config.get("active") or "")
+    profiles = cli_config.get("targets") if isinstance(cli_config.get("targets"), dict) else {}
+    profile = profiles.get(active)
+    if isinstance(profile, dict):
+        target = _build_cli_target(
+            api_url=profile.get("api_url"),
+            workspace_id=profile.get("workspace_id"),
+        )
+        token_env = str(profile.get("token_env") or "")
+        return _ResolvedCliTarget(
+            target=target,
+            api_token=os.getenv(token_env) if token_env else None,
+            active_target=active,
+            token_env=token_env,
+        )
 
-def _resolve_api_endpoint(config: AppConfig) -> tuple[str, str | None]:
-    env_url = os.getenv("MEMFORGE_API_URL")
-    if env_url:
-        return env_url, os.getenv("MEMFORGE_API_TOKEN")
-    target = _active_target()
-    if target and target.get("api_url"):
-        token_env = str(target.get("token_env") or "")
-        return str(target["api_url"]), os.getenv(token_env) if token_env else None
-    return f"http://127.0.0.1:{config.server.admin_api_port}", os.getenv("MEMFORGE_API_TOKEN")
-
-
-def _tool_client(ctx, *, workspace_id: str | None = None) -> ToolClient:
-    config: AppConfig = ctx.obj["config"]
-    api_url, api_token = _resolve_api_endpoint(config)
-    return ToolClient(
-        api_url=api_url,
-        api_token=api_token,
-        workspace_id=workspace_id,
+    return _ResolvedCliTarget(
+        target=build_target(origin=None, workspace_id=None),
+        api_token=os.getenv("MEMFORGE_API_TOKEN"),
+        active_target="",
+        token_env="",
     )
 
 
-def _workspace_tool_client(client: ToolClient, workspace_id: str) -> ToolClient:
-    workspace_id = workspace_id.strip()
-    if not workspace_id:
-        return client
-    return ToolClient(
-        api_url=client.api_url,
-        api_token=client.api_token,
-        workspace_id=workspace_id,
-        timeout_seconds=client.timeout_seconds,
-    )
+def _build_cli_target(*, api_url: object, workspace_id: object) -> MemForgeTarget:
+    try:
+        return build_target(
+            origin=str(api_url) if api_url is not None else None,
+            workspace_id=str(workspace_id) if workspace_id is not None else None,
+        )
+    except TargetConfigurationError as exc:
+        raise click.ClickException(exc.code) from exc
+
+
+def _tool_client(ctx) -> ToolClient:
+    resolved = _resolve_api_target(ctx.obj["config"])
+    return ToolClient(target=resolved.target, api_token=resolved.api_token)
 
 
 def _emit_tool_payload(ctx, payload: dict) -> None:
@@ -289,7 +314,7 @@ def _build_local_agent_runner(
 ):
     from memforge.local_agent.runner import LocalAgentRunner
 
-    client = _tool_client(ctx, workspace_id="")
+    client = _tool_client(ctx)
     return LocalAgentRunner(
         state_store=_local_agent_state_store(),
         cloud_job_handler=lambda job: _run_cloud_local_agent_job(
@@ -907,19 +932,34 @@ def target_list(ctx):
 @target.command("add")
 @click.argument("name")
 @click.option("--api-url", required=True, help="MemForge API URL for this target.")
+@click.option("--workspace-id", default=None, help="Required workspace ID for Cloud targets.")
 @click.option("--token-env", default="MEMFORGE_API_TOKEN", show_default=True, help="Environment variable for the token.")
 @click.pass_context
-def target_add(ctx, name: str, api_url: str, token_env: str):
+def target_add(ctx, name: str, api_url: str, workspace_id: str | None, token_env: str):
     """Add or update an API target and make it active."""
     name = name.strip()
     if not name:
         raise click.ClickException("Target name is required.")
+    resolved = _build_cli_target(api_url=api_url, workspace_id=workspace_id)
     data = _read_cli_config()
     targets = data.setdefault("targets", {})
-    targets[name] = {"api_url": api_url.rstrip("/"), "token_env": token_env.strip()}
+    targets[name] = {
+        "api_url": resolved.origin,
+        "workspace_id": resolved.workspace_id,
+        "token_env": token_env.strip(),
+    }
     data["active"] = name
     _write_cli_config(data)
-    _emit_tool_payload(ctx, {"ok": True, "active": name, "api_url": targets[name]["api_url"]})
+    _emit_tool_payload(
+        ctx,
+        {
+            "ok": True,
+            "active": name,
+            "edition": resolved.edition.value,
+            "api_url": resolved.origin,
+            "workspace_id": resolved.workspace_id,
+        },
+    )
 
 
 @target.command("use")
@@ -1613,18 +1653,14 @@ def _local_agent_clean_target_summary(target: dict[str, Any]) -> dict[str, Any]:
 
 def _local_agent_target_summary(ctx) -> dict[str, Any]:
     config: AppConfig = ctx.obj["config"]
-    api_url, api_token = _resolve_api_endpoint(config)
-    cli_config = _read_cli_config()
-    active = str(cli_config.get("active") or "")
-    active_target = _active_target()
-    token_env = ""
-    if active_target is not None:
-        token_env = str(active_target.get("token_env") or "")
+    resolved = _resolve_api_target(config)
     return {
-        "api_url": api_url,
-        "active_target": active,
-        "token_env": token_env,
-        "api_token_configured": bool(api_token),
+        "edition": resolved.target.edition.value,
+        "api_url": resolved.target.origin,
+        "workspace_id": resolved.target.workspace_id,
+        "active_target": resolved.active_target,
+        "token_env": resolved.token_env,
+        "api_token_configured": bool(resolved.api_token),
     }
 
 
@@ -1936,7 +1972,7 @@ def _run_cloud_github_sync_job(job: dict[str, Any], client: ToolClient) -> dict[
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     profile = _github_profile_from_cloud_job(job)
-    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    source_id, _workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
     if error:
         return error
     profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
@@ -1947,7 +1983,7 @@ def _run_cloud_github_sync_job(job: dict[str, Any], client: ToolClient) -> dict[
         limit=0,
         force_full_sync=bool(payload.get("force_full_sync", False)),
         submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
-        client=_workspace_tool_client(client, workspace_id),
+        client=client,
         sync_snapshot_id=local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count")),
         local_agent_job_id=str(job["job_id"]),
         local_agent_attempt_count=int(job["attempt_count"]),
@@ -1983,7 +2019,7 @@ def _run_cloud_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
 def _run_cloud_local_markdown_sync_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    source_id, _workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
     if error:
         return error
     profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
@@ -1994,7 +2030,7 @@ def _run_cloud_local_markdown_sync_job(job: dict[str, Any], client: ToolClient) 
         limit=0,
         force_full_sync=bool(payload.get("force_full_sync", False)),
         submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
-        client=_workspace_tool_client(client, workspace_id),
+        client=client,
         sync_snapshot_id=local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count")),
         local_agent_job_id=str(job["job_id"]),
         local_agent_attempt_count=int(job["attempt_count"]),
@@ -2010,7 +2046,7 @@ def _run_cloud_jira_sync_job(
 ) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    source_id, _workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
     if error:
         return error
     try:
@@ -2033,7 +2069,7 @@ def _run_cloud_jira_sync_job(
 
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
-    scoped_client = _workspace_tool_client(client, workspace_id)
+    scoped_client = client
     sync_snapshot_id = local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count"))
     sync_result: dict[str, Any] | None = None
     for doc in documents:
@@ -2230,7 +2266,7 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    source_id, _workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
     if error:
         return error
 
@@ -2295,7 +2331,7 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
     failed: list[dict[str, Any]] = []
     skipped_existing: list[dict[str, Any]] = []
     pending_receipts: list[dict[str, str | None]] = []
-    scoped_client = _workspace_tool_client(client, workspace_id)
+    scoped_client = client
     submitted_by = str(payload.get("submitted_by") or "memforge-local-agent")
     sync_started = False
 

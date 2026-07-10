@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from urllib.error import URLError
+
+import pytest
 
 import memforge.tool_client as tool_client
+from memforge.api_target import build_target
 from memforge.tool_client import ToolClient
 
 
@@ -18,12 +22,18 @@ class _RecordingClient(ToolClient):
     """ToolClient that captures the _http_json call instead of making a request."""
 
     def __init__(self, response: dict[str, Any]) -> None:
-        super().__init__(api_url="https://memforge.example.test", api_token="tok")
+        super().__init__(
+            target=build_target(
+                origin="https://self.example.test",
+                workspace_id=None,
+            ),
+            api_token="tok",
+        )
         self._response = response
         self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
 
-    def _http_json(self, method, path, body):  # type: ignore[override]
-        self.calls.append((method, path, body))
+    def _http_json(self, method, url, body):  # type: ignore[override]
+        self.calls.append((method, url.removeprefix(self.target.origin), body))
         return self._response
 
 
@@ -291,34 +301,58 @@ def test_local_agent_job_lease_default_matches_ui_sync_wait_window():
     ]
 
 
-def test_control_plane_routes_bypass_env_workspace(monkeypatch):
-    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "ws-env")
+def test_tool_client_uses_target_for_workspace_resource_calls():
     client = ToolClient(
-        api_url="https://memforge.example.test",
+        target=build_target(
+            origin="https://memforge.example.hana.ondemand.com",
+            workspace_id="ws-a",
+        ),
         api_token="tok",
     )
 
     assert (
-        client._request_url("/api/cloud/local-agent/jobs/lease")
-        == "https://memforge.example.test/api/cloud/local-agent/jobs/lease"
-    )
-    assert (
-        client._request_url("/api/auth/api-keys")
-        == "https://memforge.example.test/api/auth/api-keys"
+        client._resource_url("/sources/src-github/adapter/packages")
+        == "https://memforge.example.hana.ondemand.com/api/workspaces/ws-a/api/sources/src-github/adapter/packages"
     )
 
 
-def test_workspace_client_scopes_data_plane_push_routes():
+def test_control_plane_daemon_jobs_use_host_origin_not_workspace_resource():
     client = ToolClient(
-        api_url="https://memforge.example.test",
+        target=build_target(
+            origin="https://memforge.example.hana.ondemand.com",
+            workspace_id="ws-a",
+        ),
         api_token="tok",
-        workspace_id="ws-a",
     )
 
     assert (
-        client._request_url("/api/sources/src-github/adapter/packages")
-        == "https://memforge.example.test/api/workspaces/ws-a/api/sources/src-github/adapter/packages"
+        client._host_url("/api/cloud/local-agent/jobs/lease")
+        == "https://memforge.example.hana.ondemand.com/api/cloud/local-agent/jobs/lease"
     )
+    with pytest.raises(ValueError, match="host_path_must_start_with_api"):
+        client._host_url("/cloud/local-agent/jobs/lease")
+    with pytest.raises(ValueError, match="resource_path_must_be_relative_to_api_base"):
+        client._resource_url("/api/cloud/local-agent/jobs/lease")
+
+
+def test_control_plane_lease_unavailable_reports_attempted_host_url(monkeypatch):
+    class UnavailableOpener:
+        def open(self, request, timeout):
+            raise URLError("host unavailable")
+
+    monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: UnavailableOpener())
+    client = ToolClient(
+        target=build_target(
+            origin="https://memforge.example.hana.ondemand.com",
+            workspace_id="ws-a",
+        ),
+        api_token="tok",
+    )
+
+    result = client.lease_local_agent_jobs()
+
+    assert result["error"] == "MemForge API unavailable"
+    assert result["api_url"] == "https://memforge.example.hana.ondemand.com/api/cloud/local-agent/jobs/lease"
 
 
 def test_tool_client_forwards_search_to_hosted_workspace(monkeypatch):
@@ -343,14 +377,19 @@ def test_tool_client_forwards_search_to_hosted_workspace(monkeypatch):
             captured["body"] = request.data
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
     monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: FakeOpener())
-    client = ToolClient(api_url="https://memforge.example.test", api_token="tok")
+    client = ToolClient(
+        target=build_target(
+            origin="https://memforge.example.hana.ondemand.com",
+            workspace_id="mount_tai",
+        ),
+        api_token="tok",
+    )
 
     result = client.search(query="artifact cache")
 
     assert result == {"results": []}
-    assert captured["url"] == "https://memforge.example.test/api/workspaces/mount_tai/api/memories/search"
+    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/memories/search"
     assert captured["authorization"] == "Bearer tok"
     assert json.loads(captured["body"].decode())["query"] == "artifact cache"
 
@@ -513,12 +552,17 @@ def test_tool_client_fetches_resource_through_hosted_workspace(monkeypatch):
             captured["authorization"] = request.get_header("Authorization")
             return FakeResponse()
 
-    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
     monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: FakeOpener())
-    client = ToolClient(api_url="https://memforge.example.test", api_token="tok")
+    client = ToolClient(
+        target=build_target(
+            origin="https://memforge.example.hana.ondemand.com",
+            workspace_id="mount_tai",
+        ),
+        api_token="tok",
+    )
 
     result = client.get_resource(url="/api/documents/doc-1/content")
 
     assert result["text"] == "# Source"
-    assert captured["url"] == "https://memforge.example.test/api/workspaces/mount_tai/api/documents/doc-1/content"
+    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/documents/doc-1/content"
     assert captured["authorization"] == "Bearer tok"

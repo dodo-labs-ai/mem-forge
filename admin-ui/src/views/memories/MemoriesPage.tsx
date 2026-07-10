@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { Brain, Database, Files, FolderTree, Lock, RefreshCw, ShieldCheck } from "lucide-react";
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import type {
   Memory,
   MemoryReviewListResponse,
@@ -70,7 +70,7 @@ interface SourcesResponse {
   data?: Source[];
 }
 
-// Shape returned by POST /api/memories/search. Mirrors `SearchResult`
+// Shape returned by POST /memories/search. Mirrors `SearchResult`
 // (memforge.models). Only the fields the list view actually renders are
 // declared here; provenance is fetched from memory detail when needed.
 interface SearchHit {
@@ -94,10 +94,10 @@ interface SearchResponse {
 /**
  * The list view runs against two backend routes with very different shapes:
  *
- * - `GET /api/memories` -> `PaginatedResponse<Memory>` (admin/cross-project)
- * - `POST /api/memories/search` -> ranking-aware `{ results: SearchHit[] }`
+ * - `GET /memories` -> `PaginatedResponse<Memory>` (admin/cross-project)
+ * - `POST /memories/search` -> ranking-aware `{ results: SearchHit[] }`
  *
- * The renderer only needs a `Memory`-shaped row, so we normalize on the client.
+ * The renderer only needs a `Memory`-shaped row, so we normalize on the resourceClient.
  * That keeps the search route ranking-pure (no row hydration roundtrip) and
  * leaves the keyword GET route unchanged for the cross-project admin path.
  *
@@ -224,23 +224,23 @@ export function MemoriesPage() {
 
   const sourcesQuery = useQuery<SourcesResponse | Source[]>({
     queryKey: ["sources"],
-    queryFn: () => client.get("/api/sources").then((response) => response.data),
+    queryFn: () => resourceClient.get("/sources").then((response) => response.data),
   });
 
   const projectsQuery = useQuery<Project[]>({
     queryKey: ["projects"],
-    queryFn: () => client.get<Project[]>("/api/projects").then((response) => response.data),
+    queryFn: () => resourceClient.get<Project[]>("/projects").then((response) => response.data),
   });
 
   const statsQuery = useQuery<Stats>({
     queryKey: ["stats"],
-    queryFn: () => client.get("/api/stats").then((response) => response.data),
+    queryFn: () => resourceClient.get("/stats").then((response) => response.data),
   });
 
   // The list view is an all-project browse by default. The page-level project
   // filter is the only project selector for this surface: "All projects" sends
   // no project parameter, while a specific project (including UNSORTED) narrows
-  // the result set. `POST /api/memories/search` runs only for query text plus a
+  // the result set. `POST /memories/search` runs only for query text plus a
   // selected project, where the ranker can apply project affinity.
   const pageProjectOverride = pageProject !== PAGE_PROJECT_ALL ? pageProject : null;
   const effectiveProjectKey = pageProjectOverride;
@@ -265,7 +265,7 @@ export function MemoriesPage() {
         // The UI only ever asks for a project-bound view: the narrow toggle
         // hard-restricts results to the selected project plus the shared bucket,
         // while the default leaves cross-project hits visible but down-weighted
-        // by the ranker. All-project browsing flows through GET /api/memories.
+        // by the ranker. All-project browsing flows through GET /memories.
         const body = {
           query: search || "",
           memory_types: type !== "all" ? [type] : undefined,
@@ -276,7 +276,7 @@ export function MemoriesPage() {
           include_private: true,
           top_k: LIST_PAGE_SIZE,
         };
-        const response = await client.post<SearchResponse>("/api/memories/search", body);
+        const response = await resourceClient.post<SearchResponse>("/memories/search", body);
         const rows = response.data.results.map(searchHitToMemoryRow);
         return {
           data: rows,
@@ -285,7 +285,7 @@ export function MemoriesPage() {
           offset: 0,
         };
       }
-      const response = await client.get<PaginatedResponse<Memory>>("/api/memories", {
+      const response = await resourceClient.get<PaginatedResponse<Memory>>("/memories", {
         params: {
           search: search || undefined,
           type: type !== "all" ? type : undefined,
@@ -304,8 +304,8 @@ export function MemoriesPage() {
   const reviewsQuery = useQuery<MemoryReviewListResponse>({
     queryKey: ["memory-reviews", "open"],
     queryFn: () =>
-      client
-        .get("/api/memory-reviews", { params: { status: "open", limit: 200 } })
+      resourceClient
+        .get("/memory-reviews", { params: { status: "open", limit: 200 } })
         .then((response) => response.data),
   });
 

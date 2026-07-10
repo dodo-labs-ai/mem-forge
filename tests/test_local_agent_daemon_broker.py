@@ -60,6 +60,9 @@ def test_daemon_status_reports_job_loop_not_profile_tasks(monkeypatch, tmp_path)
     state_path.write_text(json.dumps({"version": 1, "tasks": {}}), encoding="utf-8")
     monkeypatch.setattr(main, "_local_agent_state_path", lambda: state_path)
     monkeypatch.setattr(main, "_local_agent_lock_path", lambda: tmp_path / "daemon.lock")
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "cli.toml"))
+    for name in ("MEMFORGE_API_URL", "MEMFORGE_WORKSPACE_ID"):
+        monkeypatch.delenv(name, raising=False)
 
     result = CliRunner().invoke(cli, ["adapter", "daemon", "status"])
 

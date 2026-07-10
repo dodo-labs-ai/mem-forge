@@ -91,8 +91,8 @@ assert.match(
 
 assert.match(
   pageSource,
-  /\/api\/sources/,
-  "SchedulesPage should fetch from /api/sources",
+  /resourceClient\.get\("\/sources"\)/,
+  "SchedulesPage should fetch the relative /sources resource path",
 );
 
 assert.match(

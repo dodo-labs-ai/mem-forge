@@ -18,10 +18,10 @@ from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 try:
-    from .plugin_config import configured_api_token, configured_api_url, configured_workspace_id
+    from .plugin_config import configured_api_token, configured_target
 except ImportError:  # pragma: no cover - copied plugin package or direct file load
     try:
-        from memforge_plugin_config import configured_api_token, configured_api_url, configured_workspace_id
+        from memforge_plugin_config import configured_api_token, configured_target
     except ImportError:
         import importlib.util
 
@@ -34,13 +34,11 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
         _config_module = importlib.util.module_from_spec(_config_spec)
         _config_spec.loader.exec_module(_config_module)
         configured_api_token = _config_module.configured_api_token
-        configured_api_url = _config_module.configured_api_url
-        configured_workspace_id = _config_module.configured_workspace_id
+        configured_target = _config_module.configured_target
 
-DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.24"
+SERVER_VERSION = "0.1.27"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 WORKSPACE_ROOT_ENV_VARS = ("CODEX_WORKSPACE_ROOT",)
@@ -525,17 +523,17 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             body = _search_args_with_context(args)
         except ValueError as exc:
             return {"error": str(exc)}
-        return _compact_search_response(_http_json("POST", "/api/memories/search", body))
+        return _compact_search_response(_http_json("POST", "/memories/search", body))
     if name == "list_sources":
         if args:
             return {"error": "list_sources does not accept parameters"}
-        return _http_json("GET", "/api/sources/searchable", None)
+        return _http_json("GET", "/sources/searchable", None)
     if name == "get_memory":
         memory_id = str(args.get("memory_id") or "").strip()
         if not memory_id:
             return {"error": "memory_id is required"}
         return _compact_memory_response(
-            _http_json("GET", f"/api/memories/{quote(memory_id, safe='')}?include_private=true", None)
+            _http_json("GET", f"/memories/{quote(memory_id, safe='')}?include_private=true", None)
         )
     if name == "get_resource":
         return _handle_get_resource(args)
@@ -568,7 +566,7 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 body["idempotency_key"] = idempotency_key
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("POST", "/api/memories/create", body)
+        return _http_json("POST", "/memories/create", body)
     if name == "retire_memory":
         try:
             memory_id = _required_string_arg(args, "memory_id")
@@ -578,7 +576,7 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             }
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("POST", f"/api/memories/{quote(memory_id, safe='')}/retire", body)
+        return _http_json("POST", f"/memories/{quote(memory_id, safe='')}/retire", body)
     if name == "replace_memory":
         try:
             memory_id = _required_string_arg(args, "memory_id")
@@ -594,7 +592,7 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             }
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("POST", f"/api/memories/{quote(memory_id, safe='')}/replace", body)
+        return _http_json("POST", f"/memories/{quote(memory_id, safe='')}/replace", body)
     if name == "list_memory_reviews":
         allowed = {"status", "limit", "offset"}
         unknown = sorted(set(args) - allowed)
@@ -608,13 +606,13 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             }
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("GET", "/api/memory-reviews?" + urlencode(query), None)
+        return _http_json("GET", "/memory-reviews?" + urlencode(query), None)
     if name == "get_memory_review":
         try:
             review_id = _required_string_arg(args, "review_id")
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("GET", f"/api/memory-reviews/{quote(review_id, safe='')}", None)
+        return _http_json("GET", f"/memory-reviews/{quote(review_id, safe='')}", None)
     if name == "resolve_memory_review":
         try:
             review_id = _required_string_arg(args, "review_id")
@@ -632,7 +630,7 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 body["reviewer"] = reviewer
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("POST", f"/api/memory-reviews/{quote(review_id, safe='')}/{decision}", body)
+        return _http_json("POST", f"/memory-reviews/{quote(review_id, safe='')}/{decision}", body)
     return {"error": f"Unknown tool: {name}"}
 
 
@@ -1042,25 +1040,8 @@ def _compact_memory_source(source: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
-def _api_base_url() -> str:
-    return configured_api_url(DEFAULT_API_URL)
-
-
-def _workspace_id() -> str:
-    return configured_workspace_id()
-
-
-def _api_request_url(path: str) -> str:
-    base_url = _api_base_url()
-    workspace_id = _workspace_id()
-    if not workspace_id or not path.startswith("/api"):
-        return f"{base_url}{path}"
-    quoted_workspace = quote(workspace_id, safe="")
-    if path == "/api":
-        return f"{base_url}/api/workspaces/{quoted_workspace}/api"
-    if path.startswith("/api/"):
-        return f"{base_url}/api/workspaces/{quoted_workspace}/api/{path[len('/api/') :]}"
-    return f"{base_url}{path}"
+def _resource_url(path: str) -> str:
+    return configured_target().resource_url(path)
 
 
 def _api_headers(*, json_body: bool = False) -> dict[str, str]:
@@ -1076,7 +1057,7 @@ def _api_headers(*, json_body: bool = False) -> dict[str, str]:
 def _http_json(method: str, path: str, body: dict[str, Any] | None) -> dict[str, Any]:
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = Request(
-        _api_request_url(path),
+        _resource_url(path),
         data=data,
         headers=_api_headers(json_body=body is not None),
         method=method,
@@ -1091,7 +1072,11 @@ def _http_json(method: str, path: str, body: dict[str, Any] | None) -> dict[str,
         detail = exc.read().decode("utf-8", errors="replace")[:1000]
         return {"error": "MemForge API request failed", "status_code": exc.code, "detail": detail}
     except (OSError, URLError, json.JSONDecodeError) as exc:
-        return {"error": "MemForge API unavailable", "api_url": _api_base_url(), "detail": str(exc)}
+        return {
+            "error": "MemForge API unavailable",
+            "api_url": configured_target().workspace_api_base,
+            "detail": str(exc),
+        }
 
 
 def _handle_get_resource(args: dict[str, Any]) -> dict[str, Any]:
@@ -1106,7 +1091,7 @@ def _handle_get_resource(args: dict[str, Any]) -> dict[str, Any]:
     if isinstance(max_chars, dict):
         return max_chars
 
-    target = _parse_resource_url(str(args.get("url") or "").strip(), _api_base_url())
+    target = _parse_resource_url(str(args.get("url") or "").strip(), configured_target().origin)
     if target is None:
         return {
             "error": "unsupported resource URL",
@@ -1225,9 +1210,9 @@ def _resource_metadata(
     }
 
 
-def _parse_resource_url(url: str, api_base_url: str) -> ResourceTarget | None:
+def _parse_resource_url(url: str, origin: str) -> ResourceTarget | None:
     parsed = urlparse(url)
-    base = urlparse(api_base_url)
+    base = urlparse(origin)
     if parsed.query or parsed.fragment:
         return None
 
@@ -1247,11 +1232,11 @@ def _parse_resource_url(url: str, api_base_url: str) -> ResourceTarget | None:
     if any(part in {".", ".."} or "/" in part or "\\" in part for part in parts):
         return None
     if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "content":
-        return ResourceTarget(parts[2], "content", path, _api_request_url(path))
+        return ResourceTarget(parts[2], "content", path, _resource_url(path[len("/api") :]))
     if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "pdf":
-        return ResourceTarget(parts[2], "pdf", path, _api_request_url(path))
+        return ResourceTarget(parts[2], "pdf", path, _resource_url(path[len("/api") :]))
     if len(parts) == 5 and parts[:2] == ["api", "documents"] and parts[3] == "artifacts":
-        return ResourceTarget(parts[2], parts[4], path, _api_request_url(path))
+        return ResourceTarget(parts[2], parts[4], path, _resource_url(path[len("/api") :]))
     return None
 
 

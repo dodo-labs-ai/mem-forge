@@ -16,7 +16,6 @@ import sqlite3
 import subprocess
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -24,10 +23,10 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .plugin_config import configured_api_token, configured_api_url, configured_workspace_id
+    from .plugin_config import configured_api_token, configured_target
 except ImportError:  # pragma: no cover - copied plugin package or direct file load
     try:
-        from memforge_plugin_config import configured_api_token, configured_api_url, configured_workspace_id
+        from memforge_plugin_config import configured_api_token, configured_target
     except ImportError:
         import importlib.util
 
@@ -40,15 +39,13 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
         _config_module = importlib.util.module_from_spec(_config_spec)
         _config_spec.loader.exec_module(_config_module)
         configured_api_token = _config_module.configured_api_token
-        configured_api_url = _config_module.configured_api_url
-        configured_workspace_id = _config_module.configured_workspace_id
+        configured_target = _config_module.configured_target
 
 try:
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
-DEFAULT_API_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 5.0
 DEFAULT_AGENT_WORKER_TIMEOUT_SECONDS = 180.0
 DEFAULT_AGENT_QUEUE_DB = Path.home() / ".memforge-agent" / "queue.sqlite"
@@ -57,7 +54,7 @@ MAX_EVENTS = 40
 WORKER_LEASE_BUFFER_SECONDS = 60.0
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.24"
+PLUGIN_VERSION = "0.1.27"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -173,20 +170,32 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="MemForge agent hook adapter")
     parser.add_argument("mode", choices=("context", "submit-session", "worker-run-once"))
     parser.add_argument("--client", default=os.getenv("MEMFORGE_HOOK_CLIENT", "codex"))
-    parser.add_argument("--api-url", default=configured_api_url(DEFAULT_API_URL))
     parser.add_argument(
         "--timeout", type=float, default=_env_float("MEMFORGE_HOOK_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
     )
     args = parser.parse_args(argv)
 
     try:
+        configured_target()
+    except ValueError as exc:
+        print(
+            json.dumps(
+                {
+                    "continue": True,
+                    "systemMessage": f"MemForge hook skipped: {_safe_exception_message(exc)}",
+                }
+            ),
+        )
+        return 1
+
+    try:
         if args.mode == "worker-run-once":
-            run_agent_window_worker_once(api_url=args.api_url, timeout=args.timeout)
+            run_agent_window_worker_once(timeout=args.timeout)
             return 0
         payload = _read_hook_payload()
         if args.mode == "context":
-            return _run_context(payload, client=args.client, api_url=args.api_url, timeout=args.timeout)
-        return _run_submit_session(payload, client=args.client, api_url=args.api_url, timeout=args.timeout)
+            return _run_context(payload, client=args.client, timeout=args.timeout)
+        return _run_submit_session(payload, client=args.client, timeout=args.timeout)
     except Exception as exc:  # Hooks must not crash the coding session.
         print(
             json.dumps(
@@ -199,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
 
-def _run_context(payload: dict[str, Any], *, client: str, api_url: str, timeout: float) -> int:
+def _run_context(payload: dict[str, Any], *, client: str, timeout: float) -> int:
     event_name = _event_name(payload)
     if event_name == "SessionStart":
         _emit_additional_context(event_name, SESSION_START_USAGE_GUIDANCE)
@@ -211,7 +220,7 @@ def _run_context(payload: dict[str, Any], *, client: str, api_url: str, timeout:
                 )
             except Exception:
                 pass
-        _drain_pending_agent_windows_if_present(api_url=api_url, timeout=timeout)
+        _drain_pending_agent_windows_if_present()
         return 0
 
     request = {
@@ -224,7 +233,7 @@ def _run_context(payload: dict[str, Any], *, client: str, api_url: str, timeout:
         "touched_files": _touched_files(payload),
         "max_memories": _env_int("MEMFORGE_HOOK_MAX_MEMORIES", 5),
     }
-    response = _post_json("/api/hooks/context", request, api_url=api_url, timeout=timeout)
+    response = _post_json("/hooks/context", request, timeout=timeout)
     if not response.get("should_inject"):
         context = None
     else:
@@ -240,7 +249,7 @@ def _run_context(payload: dict[str, Any], *, client: str, api_url: str, timeout:
             )
         except Exception:
             pass
-    _drain_pending_agent_windows_if_present(api_url=api_url, timeout=timeout)
+    _drain_pending_agent_windows_if_present()
     return 0
 
 
@@ -258,7 +267,7 @@ def _emit_additional_context(event_name: str, context: str) -> None:
     )
 
 
-def _run_submit_session(payload: dict[str, Any], *, client: str, api_url: str, timeout: float) -> int:
+def _run_submit_session(payload: dict[str, Any], *, client: str, timeout: float) -> int:
     event_name = _event_name(payload)
     transcript_path = _transcript_path(payload)
     trigger = _capture_trigger(event_name)
@@ -272,7 +281,7 @@ def _run_submit_session(payload: dict[str, Any], *, client: str, api_url: str, t
                     workspace=_workspace(payload),
                     trigger=trigger,
                 )
-                _spawn_agent_window_worker(api_url=api_url, timeout=_agent_worker_timeout())
+                _spawn_agent_window_worker(timeout=_agent_worker_timeout())
         except Exception:
             pass
 
@@ -287,7 +296,7 @@ def _run_submit_session(payload: dict[str, Any], *, client: str, api_url: str, t
         "commit_sha": _git_value(payload, ["git", "rev-parse", "HEAD"]),
         "metadata": _session_metadata(payload),
     }
-    _post_json("/api/hooks/receipts", request, api_url=api_url, timeout=timeout)
+    _post_json("/hooks/receipts", request, timeout=timeout)
     return 0
 
 
@@ -535,7 +544,6 @@ def _new_lease_token() -> str:
 
 def run_agent_window_worker_once(
     *,
-    api_url: str,
     timeout: float,
     queue_db_path: str | Path | None = None,
     max_sessions: int = 5,
@@ -549,7 +557,7 @@ def run_agent_window_worker_once(
         # than double-process the same pending sessions.
         return 0
     try:
-        return _process_session_captures(db_path, api_url=api_url, timeout=timeout, max_sessions=max_sessions)
+        return _process_session_captures(db_path, timeout=timeout, max_sessions=max_sessions)
     finally:
         _release_worker_lock(lock)
 
@@ -594,7 +602,7 @@ def _claim_pending_sessions(
     return claimed, now
 
 
-def _process_session_captures(db_path: Path, *, api_url: str, timeout: float, max_sessions: int) -> int:
+def _process_session_captures(db_path: Path, *, timeout: float, max_sessions: int) -> int:
     connection = sqlite3.connect(db_path)
     connection.isolation_level = None  # manage the lease claim transaction explicitly
     try:
@@ -653,7 +661,7 @@ def _process_session_captures(db_path: Path, *, api_url: str, timeout: float, ma
                     to_line=count,
                     trigger=trigger,
                 )
-                _post_json("/api/agent-sessions/windows", window_payload, api_url=api_url, timeout=timeout)
+                _post_json("/agent-sessions/windows", window_payload, timeout=timeout)
             except Exception as exc:
                 # Keep capture_pending set so the next pass retries; release the lease.
                 connection.execute(
@@ -722,16 +730,16 @@ def _has_pending_session_captures(db_path: Path) -> bool:
         return False
 
 
-def _drain_pending_agent_windows_if_present(*, api_url: str, timeout: float) -> None:
+def _drain_pending_agent_windows_if_present() -> None:
     try:
         if _has_pending_session_captures(_agent_queue_db_path()):
-            _spawn_agent_window_worker(api_url=api_url, timeout=_agent_worker_timeout())
+            _spawn_agent_window_worker(timeout=_agent_worker_timeout())
     except Exception:
         return
 
 
-def _spawn_agent_window_worker(*, api_url: str, timeout: float) -> None:
-    command = _agent_window_worker_command(api_url=api_url, timeout=timeout)
+def _spawn_agent_window_worker(*, timeout: float) -> None:
+    command = _agent_window_worker_command(timeout=timeout)
     subprocess.Popen(  # noqa: S603 - plugin-local worker command is constructed without shell.
         command,
         stdin=subprocess.DEVNULL,
@@ -742,7 +750,7 @@ def _spawn_agent_window_worker(*, api_url: str, timeout: float) -> None:
     )
 
 
-def _agent_window_worker_command(*, api_url: str, timeout: float) -> list[str]:
+def _agent_window_worker_command(*, timeout: float) -> list[str]:
     script_path = Path(sys.argv[0]).expanduser()
     if script_path.exists() and script_path.name.startswith("memforge_hook"):
         command = [sys.executable, str(script_path)]
@@ -751,8 +759,6 @@ def _agent_window_worker_command(*, api_url: str, timeout: float) -> list[str]:
     return [
         *command,
         "worker-run-once",
-        "--api-url",
-        api_url,
         "--timeout",
         str(timeout),
     ]
@@ -762,8 +768,8 @@ def _agent_worker_timeout() -> float:
     return _env_float("MEMFORGE_AGENT_WORKER_TIMEOUT_SECONDS", DEFAULT_AGENT_WORKER_TIMEOUT_SECONDS)
 
 
-def _post_json(path: str, payload: dict[str, Any], *, api_url: str, timeout: float) -> dict[str, Any]:
-    url = _admin_api_request_url(path, api_url=api_url)
+def _post_json(path: str, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+    url = _resource_url(path)
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     api_token = configured_api_token()
@@ -789,28 +795,8 @@ def _post_json(path: str, payload: dict[str, Any], *, api_url: str, timeout: flo
     return data
 
 
-def _admin_api_base_url(api_url: str) -> str:
-    base_url = api_url.rstrip("/")
-    if base_url.endswith("/api"):
-        return base_url[:-4]
-    return base_url
-
-
-def _workspace_id() -> str:
-    return configured_workspace_id()
-
-
-def _admin_api_request_url(path: str, *, api_url: str) -> str:
-    base_url = _admin_api_base_url(api_url)
-    workspace_id = _workspace_id()
-    if not workspace_id or not path.startswith("/api"):
-        return f"{base_url}{path}"
-    quoted_workspace = urllib.parse.quote(workspace_id, safe="")
-    if path == "/api":
-        return f"{base_url}/api/workspaces/{quoted_workspace}/api"
-    if path.startswith("/api/"):
-        return f"{base_url}/api/workspaces/{quoted_workspace}/api/{path[len('/api/') :]}"
-    return f"{base_url}{path}"
+def _resource_url(path: str) -> str:
+    return configured_target().resource_url(path)
 
 
 def _event_name(payload: dict[str, Any]) -> str:

@@ -6,8 +6,16 @@ import pytest
 from click.testing import CliRunner
 
 import memforge.main as main
+from memforge.api_target import MemForgeTarget, build_target
 from memforge.local_agent import folder_picker
 from memforge.main import cli
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cli_target_configuration(monkeypatch, tmp_path: Path):
+    for name in ("MEMFORGE_API_URL", "MEMFORGE_WORKSPACE_ID", "MEMFORGE_API_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "isolated-cli.toml"))
 
 
 class FakeToolClient:
@@ -19,14 +27,14 @@ class FakeToolClient:
     def __init__(
         self,
         *,
-        api_url: str,
+        target: MemForgeTarget,
         api_token: str | None = None,
-        workspace_id: str | None = None,
         timeout_seconds: float = 60.0,
     ):
-        self.api_url = api_url
+        self.target = target
+        self.api_url = target.origin
         self.api_token = api_token
-        self.workspace_id = (workspace_id or "").strip()
+        self.workspace_id = target.workspace_id or ""
         self.timeout_seconds = timeout_seconds
 
     @classmethod
@@ -118,6 +126,16 @@ class FakeToolClient:
         return self.response
 
 
+def _cloud_test_client() -> FakeToolClient:
+    return FakeToolClient(
+        target=build_target(
+            origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+            workspace_id="ws-from-cloud",
+        ),
+        api_token="tok",
+    )
+
+
 def test_search_cli_forwards_mcp_shape(monkeypatch):
     FakeToolClient.reset(
         {
@@ -142,7 +160,7 @@ def test_search_cli_forwards_mcp_shape(monkeypatch):
             "fact",
             "--include-superseded",
         ],
-        env={"MEMFORGE_API_URL": "https://memforge.example.test", "MEMFORGE_API_TOKEN": "token-1"},
+        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_WORKSPACE_ID": "ws-from-cloud", "MEMFORGE_API_TOKEN": "token-1"},
     )
 
     assert result.exit_code == 0, result.output
@@ -151,7 +169,7 @@ def test_search_cli_forwards_mcp_shape(monkeypatch):
         (
             "search",
             {
-                "api_url": "https://memforge.example.test",
+                "api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
                 "api_token": "token-1",
                 "query": "docker artifact provenance",
                 "top_k": 3,
@@ -177,7 +195,7 @@ def test_search_cli_forwards_exact_source_ids(monkeypatch):
             "--end-date",
             "2026-06-26",
         ],
-        env={"MEMFORGE_API_URL": "https://memforge.example.test", "MEMFORGE_API_TOKEN": "token-1"},
+        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_WORKSPACE_ID": "ws-from-cloud", "MEMFORGE_API_TOKEN": "token-1"},
     )
 
     assert result.exit_code == 0, result.output
@@ -185,7 +203,7 @@ def test_search_cli_forwards_exact_source_ids(monkeypatch):
         (
             "search",
             {
-                "api_url": "https://memforge.example.test",
+                "api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
                 "api_token": "token-1",
                 "query": "",
                 "top_k": 10,
@@ -208,7 +226,7 @@ def test_search_cli_rejects_legacy_source_name_filter(monkeypatch):
     result = CliRunner().invoke(
         cli,
         ["search", "jira defects", "--source", "Matterhorn Defects"],
-        env={"MEMFORGE_API_URL": "https://memforge.example.test"},
+        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com"},
     )
 
     assert result.exit_code != 0
@@ -308,7 +326,7 @@ def test_sources_list_cli_reads_configured_sources_from_active_api_target(monkey
     result = CliRunner().invoke(
         cli,
         ["sources", "list"],
-        env={"MEMFORGE_API_URL": "https://memforge.example.test", "MEMFORGE_API_TOKEN": "token-1"},
+        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_WORKSPACE_ID": "ws-from-cloud", "MEMFORGE_API_TOKEN": "token-1"},
     )
 
     assert result.exit_code == 0, result.output
@@ -318,7 +336,7 @@ def test_sources_list_cli_reads_configured_sources_from_active_api_target(monkey
     assert FakeToolClient.calls == [
         (
             "list_sources",
-            {"api_url": "https://memforge.example.test", "api_token": "token-1"},
+            {"api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "api_token": "token-1"},
         )
     ]
 
@@ -345,7 +363,7 @@ def test_sources_searchable_cli_reads_searchable_sources_from_active_api_target(
     result = CliRunner().invoke(
         cli,
         ["sources", "searchable"],
-        env={"MEMFORGE_API_URL": "https://memforge.example.test", "MEMFORGE_API_TOKEN": "token-1"},
+        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_WORKSPACE_ID": "ws-from-cloud", "MEMFORGE_API_TOKEN": "token-1"},
     )
 
     assert result.exit_code == 0, result.output
@@ -354,7 +372,7 @@ def test_sources_searchable_cli_reads_searchable_sources_from_active_api_target(
     assert FakeToolClient.calls == [
         (
             "list_searchable_sources",
-            {"api_url": "https://memforge.example.test", "api_token": "token-1"},
+            {"api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "api_token": "token-1"},
         )
     ]
 
@@ -366,7 +384,7 @@ def test_sources_schedule_cli_updates_active_api_target(monkeypatch):
     result = CliRunner().invoke(
         cli,
         ["sources", "schedule", "src-1", "--every-minutes", "60"],
-        env={"MEMFORGE_API_URL": "https://memforge.example.test", "MEMFORGE_API_TOKEN": "token-1"},
+        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_WORKSPACE_ID": "ws-from-cloud", "MEMFORGE_API_TOKEN": "token-1"},
     )
 
     assert result.exit_code == 0, result.output
@@ -375,7 +393,7 @@ def test_sources_schedule_cli_updates_active_api_target(monkeypatch):
         (
             "update_source_schedule",
             {
-                "api_url": "https://memforge.example.test",
+                "api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
                 "api_token": "token-1",
                 "source_id": "src-1",
                 "enabled": True,
@@ -392,7 +410,7 @@ def test_sources_schedule_show_cli_reads_active_api_target(monkeypatch):
     result = CliRunner().invoke(
         cli,
         ["sources", "schedule-show", "src-1"],
-        env={"MEMFORGE_API_URL": "https://memforge.example.test", "MEMFORGE_API_TOKEN": "token-1"},
+        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_WORKSPACE_ID": "ws-from-cloud", "MEMFORGE_API_TOKEN": "token-1"},
     )
 
     assert result.exit_code == 0, result.output
@@ -401,7 +419,7 @@ def test_sources_schedule_show_cli_reads_active_api_target(monkeypatch):
         (
             "get_source_schedule",
             {
-                "api_url": "https://memforge.example.test",
+                "api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
                 "api_token": "token-1",
                 "source_id": "src-1",
             },
@@ -417,15 +435,27 @@ def test_target_profile_sets_default_api_url(monkeypatch, tmp_path: Path):
 
     add_result = CliRunner().invoke(
         cli,
-        ["target", "add", "sap.prod", "--api-url", "https://memforge.example.test", "--token-env", "SAP_TOKEN"],
+        [
+            "target",
+            "add",
+            "sap.prod",
+            "--api-url",
+            "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+            "--workspace-id",
+            "mount_tai",
+            "--token-env",
+            "SAP_TOKEN",
+        ],
     )
     check_result = CliRunner().invoke(cli, ["target", "check"], env={"SAP_TOKEN": "secret-token"})
 
     assert add_result.exit_code == 0, add_result.output
     assert check_result.exit_code == 0, check_result.output
     assert FakeToolClient.calls == [
-        ("health", {"api_url": "https://memforge.example.test", "api_token": "secret-token"})
+        ("health", {"api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "api_token": "secret-token"})
     ]
+    assert 'edition = ' not in cli_config.read_text(encoding="utf-8")
+    assert 'workspace_id = "mount_tai"' in cli_config.read_text(encoding="utf-8")
 
 
 def test_target_profile_does_not_mix_global_token(monkeypatch, tmp_path: Path):
@@ -436,7 +466,17 @@ def test_target_profile_does_not_mix_global_token(monkeypatch, tmp_path: Path):
 
     add_result = CliRunner().invoke(
         cli,
-        ["target", "add", "sap", "--api-url", "https://memforge.example.test", "--token-env", "SAP_TOKEN"],
+        [
+            "target",
+            "add",
+            "sap",
+            "--api-url",
+            "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+            "--workspace-id",
+            "mount_tai",
+            "--token-env",
+            "SAP_TOKEN",
+        ],
     )
     check_result = CliRunner().invoke(
         cli,
@@ -447,7 +487,7 @@ def test_target_profile_does_not_mix_global_token(monkeypatch, tmp_path: Path):
     assert add_result.exit_code == 0, add_result.output
     assert check_result.exit_code == 0, check_result.output
     assert FakeToolClient.calls == [
-        ("health", {"api_url": "https://memforge.example.test", "api_token": "target-token"})
+        ("health", {"api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "api_token": "target-token"})
     ]
 
 
@@ -459,12 +499,25 @@ def test_env_api_url_does_not_use_active_target_token(monkeypatch, tmp_path: Pat
 
     add_result = CliRunner().invoke(
         cli,
-        ["target", "add", "sap", "--api-url", "https://memforge.example.test", "--token-env", "SAP_TOKEN"],
+        [
+            "target",
+            "add",
+            "sap",
+            "--api-url",
+            "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+            "--workspace-id",
+            "mount_tai",
+            "--token-env",
+            "SAP_TOKEN",
+        ],
     )
     check_result = CliRunner().invoke(
         cli,
         ["target", "check"],
-        env={"MEMFORGE_API_URL": "https://override.example.test", "SAP_TOKEN": "target-token"},
+        env={
+            "MEMFORGE_API_URL": "https://override.example.test",
+            "SAP_TOKEN": "target-token",
+        },
     )
 
     assert add_result.exit_code == 0, add_result.output
@@ -472,6 +525,20 @@ def test_env_api_url_does_not_use_active_target_token(monkeypatch, tmp_path: Pat
     assert FakeToolClient.calls == [
         ("health", {"api_url": "https://override.example.test", "api_token": None})
     ]
+
+
+def test_target_add_rejects_invalid_tagged_union_before_writing(monkeypatch, tmp_path: Path):
+    cli_config = tmp_path / "cli.toml"
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(cli_config))
+
+    result = CliRunner().invoke(
+        cli,
+        ["target", "add", "invalid", "--api-url", "https://memforge-dev.cfapps.eu12.hana.ondemand.com"],
+    )
+
+    assert result.exit_code != 0
+    assert "cloud_workspace_required" in result.output
+    assert not cli_config.exists()
 
 
 class _StubClient:
@@ -706,7 +773,7 @@ def test_local_agent_cloud_github_preview_uses_job_payload_without_profile(monke
                 "limit": 10,
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload["operation"] == "github_repo_preview_tree"
@@ -735,7 +802,7 @@ def test_local_agent_cloud_github_sync_pushes_job_source_and_snapshot(monkeypatc
         {
             "job_id": "laj-sync",
             "attempt_count": 1,
-            "workspace_id": "ws-from-cloud",
+            "workspace_id": "ws-from-job-payload",
             "operation": "github_repo_sync",
             "source_id": "src-from-cloud",
             "payload": {
@@ -747,7 +814,7 @@ def test_local_agent_cloud_github_sync_pushes_job_source_and_snapshot(monkeypatc
                 "limit": 1,
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload["operation"] == "github_repo_sync"
@@ -788,7 +855,7 @@ def test_local_agent_cloud_github_sync_requires_job_workspace(monkeypatch, tmp_p
                 "limit": 1,
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload == {
@@ -817,7 +884,7 @@ def test_local_agent_cloud_local_markdown_preview_uses_job_payload(tmp_path: Pat
                 "limit": 20,
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload["operation"] == "local_markdown_preview_tree"
@@ -846,7 +913,7 @@ def test_local_agent_cloud_local_markdown_pick_root_uses_local_picker(monkeypatc
                 "initial_directory": str(tmp_path),
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload == {
@@ -867,7 +934,7 @@ def test_local_agent_cloud_github_pick_root_uses_local_picker(monkeypatch, tmp_p
             "operation": "github_repo_pick_root",
             "payload": {"title": "Choose repository"},
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload == {
@@ -888,7 +955,7 @@ def test_local_agent_cloud_local_markdown_pick_root_reports_cancellation(monkeyp
             "operation": "local_markdown_pick_root",
             "payload": {"title": "Choose folder to sync"},
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload == {
@@ -946,7 +1013,7 @@ def test_local_agent_cloud_local_markdown_sync_pushes_workspace_source(monkeypat
                 "limit": 1,
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload["operation"] == "local_markdown_sync"
@@ -987,14 +1054,14 @@ def test_local_agent_cloud_local_markdown_sync_publishes_empty_snapshot(monkeypa
                 "exclude": [],
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload["counts"]["pushed"] == 0
     process_calls = [call[1] for call in FakeToolClient.calls if call[0] == "start_source_processing"]
     assert process_calls == [
         {
-            "api_url": "https://memforge.example.test",
+            "api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
             "api_token": "tok",
             "workspace_id": "ws-from-cloud",
             "source_id": "src-local",
@@ -1085,7 +1152,7 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
                 "limit": 1,
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
         browser="chrome",
     )
 
@@ -1125,7 +1192,7 @@ def test_local_agent_cloud_jira_sync_rejects_pat_payload():
                 "projects": ["PAY"],
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload["operation"] == "jira_sync"
@@ -1213,7 +1280,7 @@ def test_local_agent_cloud_jira_sync_does_not_publish_partial_snapshot(monkeypat
                 "projects": ["PAY"],
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
         browser="chrome",
     )
 
@@ -1263,7 +1330,7 @@ def test_local_agent_cloud_teams_auth_captures_session(monkeypatch):
             "source_type": "teams",
             "payload": {"region": "amer"},
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload == {
@@ -1387,7 +1454,7 @@ def test_local_agent_cloud_teams_auth_check_uses_daemon_token_status(monkeypatch
             "source_type": "teams",
             "payload": {"region": "apac"},
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload == {
@@ -1428,7 +1495,7 @@ def test_local_agent_cloud_teams_browse_returns_picker_data(monkeypatch):
             "source_type": "teams",
             "payload": {"region": "amer"},
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload["operation"] == "teams_browse"
@@ -1489,7 +1556,7 @@ def test_local_agent_cloud_teams_browse_reauths_after_stale_cached_session(monke
             "source_type": "teams",
             "payload": {"region": "emea"},
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload["operation"] == "teams_browse"
@@ -1572,7 +1639,7 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
                 "ledger_state_path": str(ledger_state_path),
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload["operation"] == "teams_sync"
@@ -1687,7 +1754,7 @@ def test_local_agent_cloud_teams_sync_reauths_after_stale_session(monkeypatch, t
                 "ledger_state_path": str(tmp_path / "teams-ledger.json"),
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload["operation"] == "teams_sync"
@@ -1743,7 +1810,7 @@ def test_local_agent_cloud_teams_sync_reports_push_failure_without_generic_sourc
                 "ledger_state_path": str(ledger_state_path),
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload["counts"] == {"selected": 1, "pushed": 0, "failed": 1, "skipped_existing": 0, "polls": 0}
@@ -1801,7 +1868,7 @@ def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypat
     FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
     first = main._run_cloud_local_agent_job(
         job,
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
     assert first["counts"] == {"selected": 1, "pushed": 1, "failed": 0, "skipped_existing": 0, "polls": 0}
     assert len([call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]) == 1
@@ -1809,7 +1876,7 @@ def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypat
     FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
     second = main._run_cloud_local_agent_job(
         {**job, "job_id": "laj-teams-sync-retry"},
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert second["counts"] == {"selected": 1, "pushed": 0, "failed": 0, "skipped_existing": 1, "polls": 0}
@@ -1874,7 +1941,7 @@ def test_local_agent_cloud_teams_sync_retries_window_when_processing_was_not_acc
     FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
     first = main._run_cloud_local_agent_job(
         job,
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
     assert first["error"] == "source processing failed to start"
     assert first["retryable"] is True
@@ -1882,7 +1949,7 @@ def test_local_agent_cloud_teams_sync_retries_window_when_processing_was_not_acc
     FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
     second = main._run_cloud_local_agent_job(
         {**job, "job_id": "laj-teams-retry-2"},
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert second["sync_started"] is True
@@ -1956,7 +2023,7 @@ def test_local_agent_cloud_teams_sync_writes_conversation_poll_audit(monkeypatch
                 "ledger_state_path": str(ledger_state_path),
             },
         },
-        FakeToolClient(api_url="https://memforge.example.test", api_token="tok"),
+        _cloud_test_client(),
     )
 
     assert payload["counts"]["polls"] == 1

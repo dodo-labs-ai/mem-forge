@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
+from memforge.api_target import build_target
 from memforge.tool_client import ToolClient
 
 
@@ -55,7 +56,10 @@ def server():
 
 
 def test_tool_client_jira_session_round_trip(server):
-    client = ToolClient(api_url=server, api_token=None)
+    client = ToolClient(
+        target=build_target(origin=server, workspace_id=None),
+        api_token=None,
+    )
     assert client.get_jira_session("https://jira.example.test")["status"] == "active"
     assert client.list_jira_origins()["origins"][0]["origin"] == "https://jira.example.test"
     up = client.upload_jira_session(base_url="https://jira.example.test", cookie_header="SESSION=x", browser="Chrome")

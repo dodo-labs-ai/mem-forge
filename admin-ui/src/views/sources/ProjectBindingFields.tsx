@@ -5,7 +5,7 @@ import { useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Loader2, Plus, Trash2 } from "lucide-react";
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import {
   UNSORTED_PROJECT_KEY,
   isReservedProjectKey,
@@ -114,7 +114,7 @@ export function ProjectBindingFields({
   const projectsQuery = useQuery<Project[]>({
     queryKey: ["projects"],
     queryFn: () =>
-      client.get<Project[]>("/api/projects").then((response) => response.data),
+      resourceClient.get<Project[]>("/projects").then((response) => response.data),
   });
   const projects = useMemo(() => projectsQuery.data ?? [], [projectsQuery.data]);
   const userProjects = useMemo(
@@ -126,8 +126,8 @@ export function ProjectBindingFields({
     queryKey: ["source-projects", sourceId],
     queryFn: () => {
       if (!sourceId) throw new Error("sourceId required");
-      return client
-        .get(`/api/sources/${sourceId}/projects`)
+      return resourceClient
+        .get(`/sources/${sourceId}/projects`)
         .then((response) => response.data);
     },
     enabled: Boolean(sourceId) && byFieldEnabled,
@@ -548,7 +548,7 @@ function InlineCreateProjectDialog({
       };
       const submittedKey = payload.key.trim();
       if (submittedKey.length > 0) body.key = submittedKey;
-      const response = await client.post<Project>("/api/projects", body);
+      const response = await resourceClient.post<Project>("/projects", body);
       return response.data;
     },
     onSuccess: (project) => {

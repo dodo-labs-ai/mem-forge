@@ -27,7 +27,7 @@ import {
   Pencil,
   Trash2,
 } from "lucide-react";
-import client from "@/api/client";
+import { resourceClient } from "@/api/client";
 import type {
   Project,
   ResolvedProjectsResponse,
@@ -83,13 +83,13 @@ export function ProjectDetailPage() {
   const projectsQuery = useQuery<Project[]>({
     queryKey: ["projects"],
     queryFn: () =>
-      client.get<Project[]>("/api/projects").then((response) => response.data),
+      resourceClient.get<Project[]>("/projects").then((response) => response.data),
   });
 
   const sourcesQuery = useQuery<SourcesResponse | Source[]>({
     queryKey: ["sources"],
     queryFn: () =>
-      client.get("/api/sources").then((response) => response.data),
+      resourceClient.get("/sources").then((response) => response.data),
   });
 
   const project = useMemo(() => {
@@ -120,9 +120,9 @@ export function ProjectDetailPage() {
     queries: sourcesNeedingResolve.map((source) => ({
       queryKey: ["resolvedProjects", source.id],
       queryFn: () =>
-        client
+        resourceClient
           .get<ResolvedProjectsResponse>(
-            `/api/sources/${source.id}/projects/resolved`,
+            `/sources/${source.id}/projects/resolved`,
           )
           .then((response) => response.data),
     })),
@@ -191,8 +191,8 @@ export function ProjectDetailPage() {
 
   const deleteProject = useMutation({
     mutationFn: async (target: Project) => {
-      const response = await client.delete<DeleteProjectWireResponse>(
-        `/api/projects/${target.id}`,
+      const response = await resourceClient.delete<DeleteProjectWireResponse>(
+        `/projects/${target.id}`,
       );
       return { project: target, payload: response.data };
     },
