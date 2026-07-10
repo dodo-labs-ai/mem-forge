@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 from urllib.parse import quote, urlsplit
 
 
 _LOCAL_OSS_ORIGIN = "http://127.0.0.1:8765"
 
 
-class Edition(StrEnum):
+class Edition(str, Enum):
     OSS = "oss"
     CLOUD = "cloud"
 
