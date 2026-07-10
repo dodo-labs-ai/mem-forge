@@ -51,6 +51,10 @@ class SourcePausedError(RuntimeError):
     """Raised when sync is requested for a paused source."""
 
 
+class SourceSyncLeaseLost(RuntimeError):
+    """Raised when a worker no longer owns the leased source-sync run."""
+
+
 @dataclass
 class RuntimeHealthComponent:
     status: str
@@ -608,7 +612,7 @@ class SourceSyncWorker:
         self.workspace_id = workspace_id
         self.lease_seconds = lease_seconds
         self.heartbeat_seconds = (
-            max(0.1, float(heartbeat_seconds))
+            max(0.001, float(heartbeat_seconds))
             if heartbeat_seconds is not None
             else max(1.0, min(30.0, lease_seconds / 3))
         )
@@ -738,6 +742,9 @@ class SourceSyncWorker:
             return run
         except asyncio.CancelledError:
             raise
+        except SourceSyncLeaseLost:
+            logger.warning("Source sync worker stopped terminal update after losing lease for run %s", run.run_id)
+            return run
         except Exception as exc:
             logger.exception("Source sync worker failed run %s", run.run_id)
             if source and "browser session" in str(exc).lower():
