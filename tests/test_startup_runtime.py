@@ -2376,6 +2376,23 @@ async def test_admin_source_sync_status_marks_expired_worker_lease_recovering(db
     assert source["sync"]["recovery_count"] == 0
 
 
+@pytest.mark.asyncio
+async def test_admin_app_starts_embedded_source_sync_worker_by_default(db, tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    config = _config(tmp_path)
+    config.sync.worker_poll_seconds = 60
+    app = create_admin_app(db=db, config=config)
+
+    with TestClient(app):
+        worker_task = app.state.sync_worker_task
+        assert app.state.sync_worker is not None
+        assert worker_task is not None
+        assert not worker_task.done()
+
+    assert worker_task.cancelled()
+
+
 def test_schedule_trigger_uses_configured_daily_time():
     from memforge.scheduler import build_schedule_trigger
 
