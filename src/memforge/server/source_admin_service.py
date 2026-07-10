@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from memforge.local_agent.source_contract import (
+    execution_owner_user_id,
+    is_local_agent_backed_source,
+)
 from memforge.storage.admin_source import SourceAdminReader
 
 WORKSPACE_ADMIN_ROLE = "workspace_admin"
@@ -52,16 +56,21 @@ def source_ownership_and_capabilities(
         source, viewer_id=viewer_id, viewer_role=viewer_role
     )
     can_manage = can_manage_source(source, viewer_id=viewer_id, viewer_role=viewer_role)
+    local_agent_backed = is_local_agent_backed_source(source)
+    execution_owner = execution_owner_user_id(source)
+    can_execute_locally = execution_owner is not None and execution_owner == viewer_id
     ownership = {
         "created_by_user_id": source.get("created_by_user_id"),
+        "execution_owner_user_id": execution_owner,
         "viewer_role": viewer_role,
         "viewer_relationship": relationship,
     }
     capabilities = {
         "can_subscribe": True,
         "can_configure": can_manage,
-        "can_sync": can_manage,
-        "can_force_resync": can_manage,
+        "can_configure_connection": can_execute_locally if local_agent_backed else can_manage,
+        "can_sync": can_execute_locally if local_agent_backed else can_manage,
+        "can_force_resync": can_execute_locally if local_agent_backed else can_manage,
         "can_delete": can_manage,
     }
     return ownership, capabilities

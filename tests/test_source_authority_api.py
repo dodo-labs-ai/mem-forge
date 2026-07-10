@@ -121,12 +121,14 @@ def test_source_list_exposes_capabilities_and_redacts_config_for_non_owner_membe
         source = response.json()["data"][0]
         assert source["ownership"] == {
             "created_by_user_id": "owner-user",
+            "execution_owner_user_id": None,
             "viewer_role": "member",
             "viewer_relationship": "member",
         }
         assert source["capabilities"] == {
             "can_subscribe": True,
             "can_configure": False,
+            "can_configure_connection": False,
             "can_sync": False,
             "can_force_resync": False,
             "can_delete": False,
