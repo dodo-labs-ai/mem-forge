@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
@@ -73,6 +77,9 @@ def test_build_target_normalizes_origin_and_quotes_workspace():
 @pytest.mark.parametrize(
     "origin",
     [
+        "https://user:pass@self.example",
+        "https://:443",
+        "https://self.example:notaport",
         "https://self.example/custom",
         "https://self.example/api/workspaces/mount_tai/api",
         "https://self.example?api=v1",
@@ -82,6 +89,13 @@ def test_build_target_normalizes_origin_and_quotes_workspace():
 def test_build_target_rejects_non_origin_api_urls(origin):
     with pytest.raises(TargetConfigurationError, match="memforge_origin_required"):
         build_target(edition="oss", origin=origin, workspace_id=None)
+
+
+@pytest.mark.parametrize("origin", ["https://self.example:8443", "https://[::1]:8443"])
+def test_build_target_accepts_normal_host_and_ipv6_origins(origin):
+    target = build_target(edition="oss", origin=origin, workspace_id=None)
+
+    assert target.origin == origin
 
 
 def test_memforge_target_is_immutable():
@@ -140,3 +154,30 @@ def test_configured_target_preserves_zero_configuration_default(monkeypatch, tmp
         origin="http://127.0.0.1:8765",
         workspace_id=None,
     )
+
+
+def test_plugin_config_package_import_does_not_hide_api_target_import_error(tmp_path):
+    package = tmp_path / "broken_plugin"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "api_target.py").write_text(
+        'raise ImportError("internal_api_target_defect")\n',
+        encoding="utf-8",
+    )
+    source = Path(__file__).parents[1] / "src" / "memforge" / "plugin_config.py"
+    (package / "plugin_config.py").write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(tmp_path), env.get("PYTHONPATH"))))
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import broken_plugin.plugin_config"],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "internal_api_target_defect" in result.stderr

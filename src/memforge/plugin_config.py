@@ -13,9 +13,9 @@ import re
 from pathlib import Path
 from typing import Mapping
 
-try:
+if __package__:
     from .api_target import MemForgeTarget, build_target
-except ImportError:  # pragma: no cover - direct file load used by packaged integrations
+else:  # pragma: no cover - direct file load used by packaged integrations
     from memforge.api_target import MemForgeTarget, build_target
 
 
