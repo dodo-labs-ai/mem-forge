@@ -711,6 +711,7 @@ def test_local_adapter_document_push_requires_source_management(tmp_path):
                 }
             ),
             created_by_user_id="alice",
+            execution_owner_user_id="alice",
         )
 
     asyncio.run(_seed_source())
@@ -733,7 +734,7 @@ def test_local_adapter_document_push_requires_source_management(tmp_path):
             )
 
         assert response.status_code == 403
-        assert response.json()["detail"]["error"] == "source_management_forbidden"
+        assert response.json()["detail"] == "local_agent_sync_execution_owner_forbidden"
     finally:
         asyncio.run(database.close())
 

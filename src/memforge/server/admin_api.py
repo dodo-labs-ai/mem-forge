@@ -104,6 +104,10 @@ from memforge.server.source_admin_service import (
     list_source_admin_rows,
     normalize_workspace_role,
 )
+from memforge.local_agent.source_contract import (
+    execution_owner_user_id,
+    is_local_agent_backed_source,
+)
 from memforge.storage.admin_memory import MemoryAdminListFilters
 from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES,
@@ -181,6 +185,63 @@ def _require_source_management(request: Request, source: dict[str, Any]) -> None
         viewer_role=resolve_request_workspace_role(request),
     ):
         raise _source_management_forbidden()
+
+
+def _require_local_agent_connection_management(
+    request: Request,
+    source: dict[str, Any],
+) -> None:
+    if not is_local_agent_backed_source(source):
+        return
+    requester_id = resolve_request_principal(request)
+    expected_owner_id = execution_owner_user_id(source)
+    if expected_owner_id == requester_id:
+        return
+    logger.warning(
+        "Rejected local source connection update from non-owner",
+        extra={
+            "source_id": str(source.get("id") or ""),
+            "requester_user_id": requester_id,
+            "execution_owner_user_id": expected_owner_id,
+        },
+    )
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "error": "local_agent_source_connection_owner_forbidden",
+            "message": "Only the local execution owner can change this source connection.",
+        },
+    )
+
+
+def _require_source_sync_execution(
+    request: Request,
+    source: dict[str, Any],
+) -> None:
+    if not is_local_agent_backed_source(source):
+        _require_source_management(request, source)
+        return
+    requester_id = resolve_request_principal(request)
+    expected_owner_id = execution_owner_user_id(source)
+    if expected_owner_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail="local_agent_sync_execution_owner_required",
+        )
+    if expected_owner_id == requester_id:
+        return
+    logger.warning(
+        "Rejected local source execution from non-owner",
+        extra={
+            "source_id": str(source.get("id") or ""),
+            "requester_user_id": requester_id,
+            "execution_owner_user_id": expected_owner_id,
+        },
+    )
+    raise HTTPException(
+        status_code=403,
+        detail="local_agent_sync_execution_owner_forbidden",
+    )
 
 
 async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
@@ -3572,13 +3633,18 @@ def create_admin_app(
                 source_config = _populate_local_markdown_inbox(source_config, source_id, config)
         except (SecretConfigurationError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        creator_user_id = resolve_request_principal(request)
+        source_for_classification = {"type": req.type, "config": source_config}
         await db.upsert_source(
             id=source_id,
             type=req.type,
             name=req.name,
             config_json=json.dumps(source_config),
             project_binding=req.project_binding,
-            created_by_user_id=resolve_request_principal(request),
+            created_by_user_id=creator_user_id,
+            execution_owner_user_id=(
+                creator_user_id if is_local_agent_backed_source(source_for_classification) else None
+            ),
         )
         if req.sync_schedule is not None:
             await db.set_source_sync_schedule(
@@ -3602,6 +3668,8 @@ def create_admin_app(
         if not existing:
             raise HTTPException(status_code=404, detail="Source not found")
         _require_source_management(request, existing)
+        if req.config is not None:
+            _require_local_agent_connection_management(request, existing)
 
         _validate_source_status(req.status)
         name = req.name or existing["name"]
@@ -3720,7 +3788,7 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_management(request, source)
+        _require_source_sync_execution(request, source)
 
         try:
             await sync_service.start_source(
@@ -3744,7 +3812,7 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_management(request, source)
+        _require_source_sync_execution(request, source)
 
         if sync_service.is_running(source_id):
             raise HTTPException(status_code=409, detail="Sync already running for this source")
@@ -3828,7 +3896,7 @@ def create_admin_app(
                     f"source {source_id} is type {source_type!r}, not a local adapter source"
                 ),
             )
-        _require_source_management(request, source)
+        _require_source_sync_execution(request, source)
         if source.get("status") == SOURCE_PAUSED_STATUS:
             raise HTTPException(status_code=400, detail="Source is paused")
 

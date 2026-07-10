@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -55,6 +56,18 @@ def _confluence_payload(name: str = "Architecture Wiki") -> dict:
             "sync_mode": "page_tree",
             "page_tree_root": "12345",
             "include_children": True,
+        },
+    }
+
+
+def _teams_payload(name: str = "PCC Agent Dev") -> dict:
+    return {
+        "type": "teams",
+        "name": name,
+        "config": {
+            "region": "emea",
+            "conversation_ids": ["19:conversation-a@example.test"],
+            "conversation_gap_minutes": 60,
         },
     }
 
@@ -236,6 +249,187 @@ def test_workspace_admin_can_manage_source_they_do_not_own(tmp_path):
         assert source["name"] == "Admin Updated"
         assert source["ownership"]["viewer_relationship"] == "workspace_admin"
         assert source["capabilities"]["can_delete"] is True
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_source_creator_becomes_execution_owner_and_client_cannot_override(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        payload = _teams_payload()
+        payload["execution_owner_user_id"] = "admin-b"
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=payload,
+            )
+
+        assert created.status_code == 200, created.text
+        source = asyncio.run(database.get_source(created.json()["id"]))
+        assert source is not None
+        assert source["created_by_user_id"] == "owner-a"
+        assert source["execution_owner_user_id"] == "owner-a"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_non_owner_admin_can_manage_local_source_but_cannot_change_connection(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=_teams_payload(),
+            )
+            assert created.status_code == 200, created.text
+            source_id = created.json()["id"]
+
+            managed = client.put(
+                f"/api/sources/{source_id}",
+                headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
+                json={
+                    "name": "Admin Renamed",
+                    "project_binding": {"mode": "fixed", "project_key": "PAY"},
+                    "sync_schedule": {"enabled": True, "interval_minutes": 60},
+                },
+            )
+            connection_update = client.put(
+                f"/api/sources/{source_id}",
+                headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
+                json={
+                    "config": {
+                        "region": "emea",
+                        "conversation_ids": ["19:conversation-b@example.test"],
+                        "conversation_gap_minutes": 60,
+                    }
+                },
+            )
+
+        assert managed.status_code == 200, managed.text
+        assert connection_update.status_code == 403, connection_update.text
+        assert connection_update.json()["detail"]["error"] == (
+            "local_agent_source_connection_owner_forbidden"
+        )
+        source = asyncio.run(database.get_source(source_id))
+        assert source is not None
+        assert source["name"] == "Admin Renamed"
+        assert source["project_binding"] == {"mode": "fixed", "project_key": "PAY"}
+        assert source["execution_owner_user_id"] == "owner-a"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_non_owner_admin_cannot_trigger_local_source_sync(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=_teams_payload(),
+            )
+            assert created.status_code == 200, created.text
+            source_id = created.json()["id"]
+
+            synced = client.post(
+                f"/api/sources/{source_id}/sync",
+                headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
+            )
+            force_synced = client.post(
+                f"/api/sources/{source_id}/force-resync",
+                headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
+            )
+
+        assert synced.status_code == 403, synced.text
+        assert synced.json()["detail"] == "local_agent_sync_execution_owner_forbidden"
+        assert force_synced.status_code == 403, force_synced.text
+        assert force_synced.json()["detail"] == "local_agent_sync_execution_owner_forbidden"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_source_owner_can_change_connection_without_transferring_ownership(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=_teams_payload(),
+            )
+            assert created.status_code == 200, created.text
+            source_id = created.json()["id"]
+            updated = client.put(
+                f"/api/sources/{source_id}",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json={
+                    "config": {
+                        "region": "emea",
+                        "conversation_ids": ["19:conversation-b@example.test"],
+                        "conversation_gap_minutes": 60,
+                    },
+                    "execution_owner_user_id": "admin-b",
+                },
+            )
+
+        assert updated.status_code == 200, updated.text
+        source = asyncio.run(database.get_source(source_id))
+        assert source is not None
+        assert source["config"]["conversation_ids"] == ["19:conversation-b@example.test"]
+        assert source["execution_owner_user_id"] == "owner-a"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_source_execution_owner_migration_backfills_creator(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE sources (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            config TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            last_sync TEXT,
+            doc_count INTEGER DEFAULT 0,
+            project_binding TEXT,
+            created_by_user_id TEXT,
+            sync_schedule_enabled INTEGER NOT NULL DEFAULT 0,
+            sync_schedule_interval_minutes INTEGER NOT NULL DEFAULT 1440,
+            sync_schedule_next_at TEXT,
+            sync_schedule_updated_at TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            description TEXT NOT NULL,
+            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO sources (id, type, name, config, created_by_user_id)
+        VALUES ('src-legacy-teams', 'teams', 'Legacy Teams', '{}', 'owner-a');
+        """
+    )
+    connection.executemany(
+        "INSERT INTO schema_migrations (version, description) VALUES (?, ?)",
+        [(version, "already applied") for version in range(1, 35)],
+    )
+    connection.commit()
+    connection.close()
+
+    database = Database(str(db_path))
+    asyncio.run(database.connect())
+    try:
+        source = asyncio.run(database.get_source("src-legacy-teams"))
+        assert source is not None
+        assert source["execution_owner_user_id"] == "owner-a"
     finally:
         asyncio.run(database.close())
 
