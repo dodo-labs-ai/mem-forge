@@ -24,6 +24,7 @@ from memforge.genes.atlassian_auth import (
     tls_verify,
 )
 from memforge.genes.base import Gene
+from memforge.genes.local_adapter_packages import package_manifest, read_package_body
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -358,6 +359,12 @@ class JiraGene(Gene):
         self._auth_mode = mode
         sync_mode = str(self.config.get("sync_mode") or "cloud").strip().lower()
         if sync_mode == "local_agent":
+            if self._local_agent_package_manifest():
+                self._client = None
+                self._request_limiter = None
+                self._hydrated_issues = {}
+                logger.info("Jira client using local-agent package manifest")
+                return
             local_documents_dir = self._local_agent_documents_dir()
             if local_documents_dir is None:
                 raise ValueError("Jira local-agent sync requires a local package inbox")
@@ -386,6 +393,11 @@ class JiraGene(Gene):
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         """Discover issues via JQL search."""
         if str(self.config.get("sync_mode") or "cloud").strip().lower() == "local_agent":
+            manifest = self._local_agent_package_manifest()
+            if manifest:
+                async for item in self._discover_local_agent_package_manifest(manifest, since):
+                    yield item
+                return
             local_documents_dir = self._local_agent_documents_dir()
             if local_documents_dir is None:
                 raise ValueError("Jira local-agent sync requires a local package inbox")
@@ -460,11 +472,10 @@ class JiraGene(Gene):
 
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full issue data with comments and links."""
-        package_path = item.extra.get("package_path")
-        if package_path:
+        if item.extra.get("package_uri") or item.extra.get("package_path"):
             return RawContent(
                 item=item,
-                body=Path(str(package_path)).read_bytes(),
+                body=read_package_body(self, item, source_label="Jira"),
                 content_type="application/json",
             )
 
@@ -670,6 +681,42 @@ class JiraGene(Gene):
     def _local_agent_documents_dir(self) -> Path | None:
         configured = str(self.config.get("local_agent_documents_dir") or "").strip()
         return Path(configured).expanduser() if configured else None
+
+    def _local_agent_package_manifest(self) -> list[dict]:
+        return package_manifest(self.config)
+
+    async def _discover_local_agent_package_manifest(
+        self,
+        manifest: list[dict],
+        since: datetime | None,
+    ) -> AsyncIterator[ContentItem]:
+        for entry in sorted(
+            manifest,
+            key=lambda item: (str(item.get("last_modified") or ""), str(item.get("doc_id") or "")),
+        ):
+            package_uri = str(entry.get("package_uri") or "").strip()
+            if not package_uri:
+                continue
+            last_modified = _parse_local_package_dt(str(entry.get("last_modified") or ""))
+            if since and last_modified <= since:
+                continue
+            issue_key = str(entry.get("issue_key") or "").strip()
+            yield ContentItem(
+                item_id=str(entry.get("doc_id") or issue_key),
+                title=str(entry.get("title") or issue_key),
+                source_url=str(entry.get("source_url") or ""),
+                last_modified=last_modified,
+                content_type="application/json",
+                space_or_project=str(entry.get("space_or_project") or issue_key.split("-", 1)[0]),
+                version=str(entry.get("version") or ""),
+                author=entry.get("submitted_by"),
+                labels=["jira"],
+                extra={
+                    "package_uri": package_uri,
+                    "package_path": entry.get("package_path"),
+                    "issue_key": issue_key,
+                },
+            )
 
     async def _discover_local_agent_packages(
         self,

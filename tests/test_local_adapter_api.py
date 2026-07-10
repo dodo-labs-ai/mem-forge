@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from memforge.config import AppConfig
 from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.storage.database import Database
+from memforge.storage.document_store import LocalDocumentStore
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -282,13 +283,25 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
         assert response.status_code == 200, response.text
         payload = response.json()
         assert payload["issue_key"] == "PAY-1"
+        assert payload["package_uri"]
         row = asyncio.run(database.get_source(source_id))
         assert row is not None
         documents_dir = Path(row["config"]["local_agent_documents_dir"])
         package_path = documents_dir / f"{payload['doc_id']}.json"
         assert package_path.exists()
+        manifest = row["config"]["local_agent_package_manifest"]
+        assert len(manifest) == 1
+        assert manifest[0]["doc_id"] == payload["doc_id"]
+        assert manifest[0]["package_uri"] == payload["package_uri"]
+        inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
+        assert len(inputs) == 1
+        assert inputs[0].raw_uri == payload["package_uri"]
+        assert inputs[0].metadata["doc_id"] == payload["doc_id"]
+
+        package_path.unlink()
 
         gene = JiraGene(row["config"], source_id)
+        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
 
         async def _read_package():
             await gene.authenticate()
@@ -449,6 +462,7 @@ def test_jira_adapter_document_push_requires_local_agent_mode(tmp_path):
 
 
 def test_local_adapter_document_push_writes_package(tmp_path):
+    from memforge.genes.local_markdown_gene import LocalMarkdownGene
     from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
@@ -474,6 +488,7 @@ def test_local_adapter_document_push_writes_package(tmp_path):
         body = response.json()
         assert body["source_id"] == source_id
         assert body["doc_id"].startswith("local-md-")
+        assert body["package_uri"]
         assert body["sync_started"] is False
         assert body["relative_path"] == "decisions/cutoff.md"
 
@@ -485,11 +500,38 @@ def test_local_adapter_document_push_writes_package(tmp_path):
         assert package["relative_path"] == "decisions/cutoff.md"
         assert package["title"] == "Cutoff Decision"
         assert package["markdown"].startswith("# Cutoff")
+
+        row = asyncio.run(database.get_source(source_id))
+        assert row is not None
+        manifest = row["config"]["local_agent_package_manifest"]
+        assert len(manifest) == 1
+        assert manifest[0]["doc_id"] == body["doc_id"]
+        assert manifest[0]["package_uri"] == body["package_uri"]
+        inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
+        assert len(inputs) == 1
+        assert inputs[0].raw_uri == body["package_uri"]
+        assert inputs[0].metadata["doc_id"] == body["doc_id"]
+
+        package_path.unlink()
+        gene = LocalMarkdownGene(row["config"], source_id)
+        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
+
+        async def _read_package():
+            await gene.authenticate()
+            items = [item async for item in gene.discover(None)]
+            raw = await gene.fetch(items[0])
+            normalized = await gene.normalize(raw)
+            return items, normalized
+
+        items, normalized = asyncio.run(_read_package())
+        assert items[0].extra["package_uri"] == body["package_uri"]
+        assert normalized.markdown_body.startswith("# Cutoff")
     finally:
         asyncio.run(database.close())
 
 
 def test_github_repo_adapter_document_push_writes_package(tmp_path):
+    from memforge.genes.github_repo_gene import GitHubRepoGene
     from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
@@ -523,15 +565,43 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
             repo_ref="main",
             relative_path="Payroll Processing/README.md",
         )
+        assert body["package_uri"]
         assert body["relative_path"] == "Payroll Processing/README.md"
 
-        package = json.loads(Path(body["package_path"]).read_text())
+        package_path = Path(body["package_path"])
+        package = json.loads(package_path.read_text())
         assert package["package_kind"] == "github_repo_document"
         assert package["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
         assert package["repo_ref"] == "main"
         assert package["relative_path"] == "Payroll Processing/README.md"
         assert package["blob_sha"] == "blob-sha-1"
         assert package["markdown"].startswith("# Payroll Processing")
+
+        row = asyncio.run(database.get_source(source_id))
+        assert row is not None
+        manifest = row["config"]["local_agent_package_manifest"]
+        assert len(manifest) == 1
+        assert manifest[0]["doc_id"] == body["doc_id"]
+        assert manifest[0]["package_uri"] == body["package_uri"]
+        inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
+        assert len(inputs) == 1
+        assert inputs[0].raw_uri == body["package_uri"]
+        assert inputs[0].metadata["doc_id"] == body["doc_id"]
+
+        package_path.unlink()
+        gene = GitHubRepoGene(row["config"], source_id)
+        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
+
+        async def _read_package():
+            await gene.authenticate()
+            items = [item async for item in gene.discover(None)]
+            raw = await gene.fetch(items[0])
+            normalized = await gene.normalize(raw)
+            return items, normalized
+
+        items, normalized = asyncio.run(_read_package())
+        assert items[0].extra["package_uri"] == body["package_uri"]
+        assert normalized.markdown_body.startswith("# Payroll Processing")
     finally:
         asyncio.run(database.close())
 
@@ -854,6 +924,10 @@ def test_teams_adapter_push_writes_window_package(tmp_path):
         assert manifest[0]["doc_id"] == body["doc_id"]
         assert manifest[0]["package_uri"] == body["package_uri"]
         assert manifest[0]["window_id"] == "teams-thread:src:conversation:root"
+        inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
+        assert len(inputs) == 1
+        assert inputs[0].raw_uri == body["package_uri"]
+        assert inputs[0].metadata["doc_id"] == body["doc_id"]
     finally:
         asyncio.run(database.close())
 
