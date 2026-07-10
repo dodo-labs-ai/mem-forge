@@ -27,33 +27,48 @@ def _isolate_memforge_plugin_config(monkeypatch, tmp_path):
         pass
 
 
-def _legacy_plugin_config_ast(source: str) -> str:
+def _normalized_plugin_config_ast(source: str) -> str:
     module = ast.parse(source)
-    expected_import_switch = ast.parse(
-        """
+    expected_import_switches = [
+        ast.parse(
+            """
 if __package__:
     from .api_target import MemForgeTarget, build_target
 else:
     from memforge.api_target import MemForgeTarget, build_target
 """
-    ).body[0]
-    expected_import_switch_ast = ast.dump(expected_import_switch, include_attributes=False)
-    legacy_body: list[ast.stmt] = []
+        ).body[0],
+        ast.parse(
+            """
+if __package__:
+    from .memforge_api_target import MemForgeTarget, build_target
+else:
+    from memforge_api_target import MemForgeTarget, build_target
+"""
+        ).body[0],
+    ]
+    expected_import_switch_asts = {
+        ast.dump(node, include_attributes=False) for node in expected_import_switches
+    }
+    normalized_body: list[ast.stmt] = []
     for node in module.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "configured_target":
-            continue
         contains_target_import = any(
             isinstance(child, ast.ImportFrom)
-            and child.module in {"api_target", "memforge.api_target"}
+            and child.module
+            in {
+                "api_target",
+                "memforge.api_target",
+                "memforge_api_target",
+            }
             for child in ast.walk(node)
         )
         if contains_target_import:
             assert (
-                ast.dump(node, include_attributes=False) == expected_import_switch_ast
+                ast.dump(node, include_attributes=False) in expected_import_switch_asts
             ), "target import compatibility block must be exact"
             continue
-        legacy_body.append(node)
-    module.body = legacy_body
+        normalized_body.append(node)
+    module.body = normalized_body
     return ast.dump(module, include_attributes=False)
 
 
@@ -73,7 +88,7 @@ def test_hook_adapter_returns_additional_context_for_prompt_hook(monkeypatch, ca
 
     requests: list[tuple[str, dict]] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {
             "should_inject": True,
@@ -100,7 +115,7 @@ def test_hook_adapter_returns_additional_context_for_prompt_hook(monkeypatch, ca
     exit_code = hook_adapter.main(["context"])
 
     assert exit_code == 0
-    assert requests[0][0] == "/api/hooks/context"
+    assert requests[0][0] == "/hooks/context"
     assert requests[0][1]["client"] == "codex"
     assert requests[0][1]["hook"] == "UserPromptSubmit"
     output = json.loads(capsys.readouterr().out)
@@ -114,7 +129,7 @@ def test_hook_adapter_context_sends_canonical_remote_repo_for_claude(monkeypatch
     _init_git_repo_with_origin(tmp_path, "git@github.tools.sap:HCM/memforge-cloud.git")
     requests: list[tuple[str, dict]] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {"should_inject": False}
 
@@ -135,7 +150,7 @@ def test_hook_adapter_context_sends_canonical_remote_repo_for_claude(monkeypatch
     exit_code = hook_adapter.main(["context", "--client", "claude-code"])
 
     assert exit_code == 0
-    assert requests[0][0] == "/api/hooks/context"
+    assert requests[0][0] == "/hooks/context"
     assert requests[0][1]["client"] == "claude-code"
     assert requests[0][1]["repo"] == "github.tools.sap/hcm/memforge-cloud"
     assert capsys.readouterr().out == ""
@@ -146,7 +161,7 @@ def test_hook_adapter_injects_session_start_memforge_usage_guidance_without_api(
 
     requests: list[tuple[str, dict]] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         raise AssertionError("SessionStart guidance should not call the API")
 
@@ -187,7 +202,7 @@ def test_hook_adapter_submits_lifecycle_receipt_when_transcript_is_missing(monke
 
     requests: list[tuple[str, dict]] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {"receipt_id": "agent-hook-receipt"}
 
@@ -207,7 +222,7 @@ def test_hook_adapter_submits_lifecycle_receipt_when_transcript_is_missing(monke
     exit_code = hook_adapter.main(["submit-session"])
 
     assert exit_code == 0
-    assert requests[0][0] == "/api/hooks/receipts"
+    assert requests[0][0] == "/hooks/receipts"
     payload = requests[0][1]
     assert payload["client"] == "codex"
     assert payload["hook"] == "Stop"
@@ -228,14 +243,14 @@ def test_hook_adapter_precompact_posts_window_when_transcript_exists(monkeypatch
     )
     queue_db = tmp_path / "queue.sqlite"
     requests: list[tuple[str, dict]] = []
-    spawned_workers: list[tuple[str, float]] = []
+    spawned_workers: list[float] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {"receipt_id": "receipt-precompact"}
 
-    def fake_spawn_worker(*, api_url: str, timeout: float):
-        spawned_workers.append((api_url, timeout))
+    def fake_spawn_worker(*, timeout: float):
+        spawned_workers.append(timeout)
 
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(queue_db))
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
@@ -256,8 +271,8 @@ def test_hook_adapter_precompact_posts_window_when_transcript_exists(monkeypatch
     exit_code = hook_adapter.main(["submit-session"])
 
     assert exit_code == 0
-    assert [request[0] for request in requests] == ["/api/hooks/receipts"]
-    assert spawned_workers == [("http://127.0.0.1:8765", 180.0)]
+    assert [request[0] for request in requests] == ["/hooks/receipts"]
+    assert spawned_workers == [180.0]
     with sqlite3.connect(queue_db) as connection:
         rows = connection.execute(
             "SELECT capture_pending, captured_through, pending_trigger, transcript_path, session_id FROM session_cursor"
@@ -280,14 +295,14 @@ def test_hook_adapter_reprocesses_appended_transcript_window(monkeypatch, tmp_pa
     transcript.write_text('{"type":"tool","name":"apply_patch","input":"first edit"}\n', encoding="utf-8")
     queue_db = tmp_path / "queue.sqlite"
     requests: list[tuple[str, dict]] = []
-    spawned_workers: list[tuple[str, float]] = []
+    spawned_workers: list[float] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {"ok": True}
 
-    def fake_spawn_worker(*, api_url: str, timeout: float):
-        spawned_workers.append((api_url, timeout))
+    def fake_spawn_worker(*, timeout: float):
+        spawned_workers.append(timeout)
 
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(queue_db))
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
@@ -311,13 +326,10 @@ def test_hook_adapter_reprocesses_appended_transcript_window(monkeypatch, tmp_pa
     assert hook_adapter.main(["submit-session"]) == 0
 
     assert [request[0] for request in requests] == [
-        "/api/hooks/receipts",
-        "/api/hooks/receipts",
+        "/hooks/receipts",
+        "/hooks/receipts",
     ]
-    assert spawned_workers == [
-        ("http://127.0.0.1:8765", 180.0),
-        ("http://127.0.0.1:8765", 180.0),
-    ]
+    assert spawned_workers == [180.0, 180.0]
     with sqlite3.connect(queue_db) as connection:
         rows = connection.execute(
             "SELECT capture_pending, captured_through, transcript_path, session_id FROM session_cursor"
@@ -338,7 +350,7 @@ def test_hook_adapter_posts_receipt_when_window_queue_fails(monkeypatch, tmp_pat
     transcript.write_text('{"type":"tool","name":"apply_patch","input":"edit"}\n', encoding="utf-8")
     requests: list[tuple[str, dict]] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {"ok": True}
 
@@ -363,7 +375,7 @@ def test_hook_adapter_posts_receipt_when_window_queue_fails(monkeypatch, tmp_pat
     exit_code = hook_adapter.main(["submit-session"])
 
     assert exit_code == 0
-    assert [request[0] for request in requests] == ["/api/hooks/receipts"]
+    assert [request[0] for request in requests] == ["/hooks/receipts"]
     assert requests[0][1]["metadata"]["has_transcript_path"] is True
     assert capsys.readouterr().out == ""
 
@@ -375,7 +387,7 @@ def test_hook_adapter_trivial_stop_does_not_post_window(monkeypatch, tmp_path, c
     transcript.write_text('{"type":"assistant","message":"ok"}\n', encoding="utf-8")
     requests: list[tuple[str, dict]] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {"ok": True}
 
@@ -397,7 +409,7 @@ def test_hook_adapter_trivial_stop_does_not_post_window(monkeypatch, tmp_path, c
     exit_code = hook_adapter.main(["submit-session"])
 
     assert exit_code == 0
-    assert [request[0] for request in requests] == ["/api/hooks/receipts"]
+    assert [request[0] for request in requests] == ["/hooks/receipts"]
     assert requests[0][1]["hook"] == "Stop"
     assert capsys.readouterr().out == ""
 
@@ -413,14 +425,14 @@ def test_hook_adapter_stop_with_edit_and_test_signal_enqueues_window_worker(monk
         encoding="utf-8",
     )
     requests: list[tuple[str, dict]] = []
-    spawned_workers: list[tuple[str, float]] = []
+    spawned_workers: list[float] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {"receipt_id": "receipt-stop"}
 
-    def fake_spawn_worker(*, api_url: str, timeout: float):
-        spawned_workers.append((api_url, timeout))
+    def fake_spawn_worker(*, timeout: float):
+        spawned_workers.append(timeout)
 
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(tmp_path / "queue.sqlite"))
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
@@ -441,8 +453,8 @@ def test_hook_adapter_stop_with_edit_and_test_signal_enqueues_window_worker(monk
     exit_code = hook_adapter.main(["submit-session"])
 
     assert exit_code == 0
-    assert [request[0] for request in requests] == ["/api/hooks/receipts"]
-    assert spawned_workers == [("http://127.0.0.1:8765", 180.0)]
+    assert [request[0] for request in requests] == ["/hooks/receipts"]
+    assert spawned_workers == [180.0]
     with sqlite3.connect(tmp_path / "queue.sqlite") as connection:
         rows = connection.execute("SELECT capture_pending, pending_trigger, session_id FROM session_cursor").fetchall()
     assert len(rows) == 1
@@ -500,17 +512,17 @@ def test_hook_adapter_context_wakes_pending_queue_without_changing_output(monkey
         queue_db_path=queue_db,
     )
     requests: list[tuple[str, dict]] = []
-    spawned_workers: list[tuple[str, float]] = []
+    spawned_workers: list[float] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {
             "should_inject": True,
             "context_markdown": "## MemForge Memory Context\n- Keep queue output quiet.",
         }
 
-    def fake_spawn_worker(*, api_url: str, timeout: float):
-        spawned_workers.append((api_url, timeout))
+    def fake_spawn_worker(*, timeout: float):
+        spawned_workers.append(timeout)
 
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(queue_db))
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
@@ -531,8 +543,8 @@ def test_hook_adapter_context_wakes_pending_queue_without_changing_output(monkey
     exit_code = hook_adapter.main(["context"])
 
     assert exit_code == 0
-    assert [request[0] for request in requests] == ["/api/hooks/context"]
-    assert spawned_workers == [("http://127.0.0.1:8765", 180.0)]
+    assert [request[0] for request in requests] == ["/hooks/context"]
+    assert spawned_workers == [180.0]
     output = json.loads(capsys.readouterr().out)
     assert output["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
     assert "Keep queue output quiet." in output["hookSpecificOutput"]["additionalContext"]
@@ -557,7 +569,7 @@ def test_hook_adapter_worker_run_once_drains_pending_queue(monkeypatch, tmp_path
     )
     requests: list[tuple[str, dict, float]] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload, timeout))
         return {"window_id": "queued-window"}
 
@@ -567,8 +579,6 @@ def test_hook_adapter_worker_run_once_drains_pending_queue(monkeypatch, tmp_path
     exit_code = hook_adapter.main(
         [
             "worker-run-once",
-            "--api-url",
-            "http://127.0.0.1:8765",
             "--timeout",
             "77",
         ]
@@ -577,7 +587,7 @@ def test_hook_adapter_worker_run_once_drains_pending_queue(monkeypatch, tmp_path
     assert exit_code == 0
     assert len(requests) == 1
     path, payload, timeout = requests[0]
-    assert path == "/api/agent-sessions/windows"
+    assert path == "/agent-sessions/windows"
     assert payload["trigger"] == "GATED_CAPTURE"
     assert payload["events"][0]["name"] == "apply_patch"
     assert payload["process_now"] is False
@@ -608,14 +618,14 @@ def test_worker_normalizes_legacy_capture_trigger_names(monkeypatch, tmp_path):
         connection.execute("UPDATE session_cursor SET pending_trigger = 'BOUNDARY' WHERE session_id = 'legacy-session'")
     requests: list[tuple[str, dict]] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {"ok": True}
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
     submitted = hook_adapter.run_agent_window_worker_once(
-        api_url="http://127.0.0.1:8765", timeout=5, queue_db_path=queue_db
+        timeout=5, queue_db_path=queue_db
     )
 
     assert submitted == 1
@@ -642,7 +652,7 @@ def test_hook_adapter_worker_leaves_source_sync_to_service(monkeypatch, tmp_path
         )
     requests: list[tuple[str, dict]] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {"ok": True}
 
@@ -650,14 +660,13 @@ def test_hook_adapter_worker_leaves_source_sync_to_service(monkeypatch, tmp_path
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
     submitted = hook_adapter.run_agent_window_worker_once(
-        api_url="http://127.0.0.1:8765",
         timeout=77,
     )
 
     assert submitted == 2
     assert [request[0] for request in requests] == [
-        "/api/agent-sessions/windows",
-        "/api/agent-sessions/windows",
+        "/agent-sessions/windows",
+        "/agent-sessions/windows",
     ]
     assert requests[0][1]["process_now"] is False
     assert requests[1][1]["process_now"] is False
@@ -681,7 +690,7 @@ def test_hook_adapter_worker_splits_large_window_without_advancing_past_upload(m
     )
     requests: list[tuple[str, dict]] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {"ok": True}
 
@@ -690,7 +699,6 @@ def test_hook_adapter_worker_splits_large_window_without_advancing_past_upload(m
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
     submitted = hook_adapter.run_agent_window_worker_once(
-        api_url="http://127.0.0.1:8765",
         timeout=77,
     )
 
@@ -725,14 +733,13 @@ def test_hook_adapter_worker_records_window_submission_error(monkeypatch, tmp_pa
         queue_db_path=queue_db,
     )
 
-    def fail_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fail_post_json(path: str, payload: dict, *, timeout: float):
         raise TimeoutError("timed out after 77 seconds")
 
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(queue_db))
     monkeypatch.setattr(hook_adapter, "_post_json", fail_post_json)
 
     submitted = hook_adapter.run_agent_window_worker_once(
-        api_url="http://127.0.0.1:8765",
         timeout=77,
     )
 
@@ -768,7 +775,7 @@ def test_hook_adapter_worker_keeps_pending_when_transcript_disappears(monkeypatc
     transcript.unlink()
     requests: list[tuple[str, dict]] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {"ok": True}
 
@@ -776,7 +783,6 @@ def test_hook_adapter_worker_keeps_pending_when_transcript_disappears(monkeypatc
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
     submitted = hook_adapter.run_agent_window_worker_once(
-        api_url="http://127.0.0.1:8765",
         timeout=77,
     )
 
@@ -947,7 +953,7 @@ def test_plugin_wrapper_runs_from_repo_checkout_without_pythonpath():
     wrapper = root / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_hook.py"
 
     result = subprocess.run(
-        [sys.executable, str(wrapper), "context", "--api-url", ""],
+        [sys.executable, str(wrapper), "context"],
         input="{}",
         text=True,
         stdout=subprocess.PIPE,
@@ -974,7 +980,7 @@ def test_plugin_wrapper_runs_from_copied_package_without_pythonpath(tmp_path):
         wrapper = copied_plugin / "scripts" / "memforge_hook.py"
 
         result = subprocess.run(
-            [sys.executable, str(wrapper), "context", "--api-url", ""],
+            [sys.executable, str(wrapper), "context"],
             input="{}",
             text=True,
             stdout=subprocess.PIPE,
@@ -1001,7 +1007,7 @@ def test_plugin_adapters_match_canonical_adapter():
         assert adapter.read_text() == canonical
 
 
-def test_packaged_plugin_config_matches_canonical_legacy_helpers():
+def test_packaged_plugin_config_matches_canonical_target_and_helpers():
     root = Path(__file__).resolve().parents[1]
     canonical = (root / "src" / "memforge" / "plugin_config.py").read_text()
 
@@ -1009,7 +1015,37 @@ def test_packaged_plugin_config_matches_canonical_legacy_helpers():
         root / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
         root / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
     ):
-        assert _legacy_plugin_config_ast(helper.read_text()) == _legacy_plugin_config_ast(canonical)
+        assert _normalized_plugin_config_ast(helper.read_text()) == _normalized_plugin_config_ast(canonical)
+
+
+def test_mcp_and_hook_share_cloud_resource_url(monkeypatch):
+    from memforge import hook_adapter, plugin_mcp_proxy
+
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+
+    assert plugin_mcp_proxy._resource_url("/sources") == (
+        "https://cloud.example/api/workspaces/mount_tai/api/sources"
+    )
+    assert hook_adapter._resource_url("/hooks/receipts") == (
+        "https://cloud.example/api/workspaces/mount_tai/api/hooks/receipts"
+    )
+
+
+def test_invalid_hook_target_fails_before_urlopen(monkeypatch):
+    from memforge import hook_adapter
+
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example")
+    monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
+    monkeypatch.setattr(
+        hook_adapter.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: pytest.fail("network"),
+    )
+
+    assert hook_adapter.main(["submit-session"]) == 1
 
 
 def test_plugin_config_parity_normalizer_rejects_mixed_target_import_block():
@@ -1022,7 +1058,7 @@ else:
 """
 
     with pytest.raises(AssertionError, match="target import compatibility block must be exact"):
-        _legacy_plugin_config_ast(source)
+        _normalized_plugin_config_ast(source)
 
 
 def test_plugin_mcp_launchers_match_each_other():
@@ -1202,6 +1238,7 @@ def test_mcp_proxy_forwards_search_to_service_with_token(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
@@ -1241,6 +1278,7 @@ def test_mcp_proxy_forwards_explicit_search_entities(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
@@ -1284,6 +1322,7 @@ def test_mcp_proxy_trims_and_dedupes_explicit_search_entities(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
@@ -1325,6 +1364,7 @@ def test_mcp_proxy_omits_empty_explicit_search_entities(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
@@ -1388,6 +1428,7 @@ def test_mcp_proxy_forwards_list_sources_to_searchable_sources(monkeypatch):
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
     result = proxy._call_tool("list_sources", {})
@@ -1827,6 +1868,7 @@ def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
 
@@ -1868,6 +1910,7 @@ def test_mcp_proxy_forwards_retire_memory_to_lifecycle_endpoint(monkeypatch):
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
     result = proxy._call_tool(
@@ -1913,6 +1956,7 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
 
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setenv("MEMFORGE_MCP_CLIENT", "claude-code")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: "github.com/shno-labs/mem-forge")
@@ -2119,6 +2163,7 @@ def test_mcp_proxy_forwards_replace_memory_to_lifecycle_endpoint(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
@@ -2200,6 +2245,7 @@ def test_mcp_proxy_forwards_memory_review_tools(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
     assert proxy._call_tool("list_memory_reviews", {"status": "open", "limit": 5}) == {"ok": True}
@@ -2226,6 +2272,7 @@ def test_mcp_proxy_requires_note_before_rejecting_memory_review(monkeypatch):
             raise AssertionError("reject without note should fail before HTTP")
 
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
     assert proxy._call_tool(
@@ -2265,6 +2312,7 @@ def test_mcp_proxy_forwards_queryless_source_id_time_range(monkeypatch):
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
 
@@ -2320,6 +2368,7 @@ def test_mcp_proxy_forwards_search_offset_for_deterministic_listing(monkeypatch)
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
 
@@ -2365,6 +2414,7 @@ def test_mcp_proxy_does_not_guess_has_more_for_windowed_legacy_response(monkeypa
             return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
@@ -2433,6 +2483,7 @@ def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
@@ -2515,6 +2566,7 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
@@ -2611,6 +2663,7 @@ def test_mcp_proxy_forwards_explicit_optional_date_bounds(monkeypatch):
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
 
@@ -2739,6 +2792,7 @@ def test_mcp_proxy_fetches_resource_through_hosted_workspace(monkeypatch):
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
     result = proxy._call_tool(
@@ -2787,6 +2841,7 @@ def test_mcp_proxy_downloads_resource_to_local_cache(monkeypatch, tmp_path):
             return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_API_URL", "http://memforge.test")
+    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
     monkeypatch.setenv("MEMFORGE_ARTIFACT_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
@@ -2809,6 +2864,7 @@ def test_mcp_proxy_downloads_resource_to_local_cache(monkeypatch, tmp_path):
 def test_mcp_proxy_rejects_foreign_and_ambiguous_resource_urls(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
     monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
+    monkeypatch.setenv("MEMFORGE_EDITION", "oss")
 
     foreign = proxy._handle_get_resource(
         {
@@ -2877,7 +2933,7 @@ def test_malformed_timeout_env_fails_open(monkeypatch, capsys):
     monkeypatch.setenv("MEMFORGE_HOOK_TIMEOUT_SECONDS", "not-a-number")
     monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({}))
 
-    exit_code = hook_adapter.main(["context", "--api-url", ""])
+    exit_code = hook_adapter.main(["context"])
 
     assert exit_code == 0
     output = json.loads(capsys.readouterr().out)
@@ -2888,8 +2944,8 @@ def test_malformed_timeout_env_fails_open(monkeypatch, capsys):
 def test_http_error_body_is_not_echoed_into_hook_output(monkeypatch, capsys):
     from memforge import hook_adapter
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
-        raise RuntimeError("/api/hooks/context returned HTTP 500: secret stack trace")
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
+        raise RuntimeError("/hooks/context returned HTTP 500: secret stack trace")
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
     monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({"hook_event_name": "UserPromptSubmit"}))
@@ -2903,7 +2959,7 @@ def test_http_error_body_is_not_echoed_into_hook_output(monkeypatch, capsys):
     assert "MemForge hook skipped" in output["systemMessage"]
 
 
-def test_post_json_accepts_admin_api_url_with_or_without_api_suffix(monkeypatch):
+def test_post_json_targets_zero_configuration_local_oss(monkeypatch):
     from memforge import hook_adapter
 
     urls: list[str] = []
@@ -2924,12 +2980,12 @@ def test_post_json_accepts_admin_api_url_with_or_without_api_suffix(monkeypatch)
 
     monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
 
-    hook_adapter._post_json("/api/hooks/context", {}, api_url="http://127.0.0.1:8766", timeout=1)
-    hook_adapter._post_json("/api/hooks/context", {}, api_url="http://127.0.0.1:8766/api", timeout=1)
+    hook_adapter._post_json("/hooks/context", {}, timeout=1)
+    hook_adapter._post_json("/hooks/context", {}, timeout=1)
 
     assert urls == [
-        "http://127.0.0.1:8766/api/hooks/context",
-        "http://127.0.0.1:8766/api/hooks/context",
+        "http://127.0.0.1:8765/api/hooks/context",
+        "http://127.0.0.1:8765/api/hooks/context",
     ]
 
 
@@ -2953,10 +3009,12 @@ def test_post_json_targets_hosted_workspace_when_configured(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example")
     monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
 
-    hook_adapter._post_json("/api/hooks/context", {}, api_url="https://memforge.example", timeout=1)
-    hook_adapter._post_json("/api/agent-sessions/windows", {}, api_url="https://memforge.example/api", timeout=1)
+    hook_adapter._post_json("/hooks/context", {}, timeout=1)
+    hook_adapter._post_json("/agent-sessions/windows", {}, timeout=1)
 
     assert urls == [
         "https://memforge.example/api/workspaces/mount_tai/api/hooks/context",
@@ -2986,7 +3044,7 @@ def test_post_json_includes_configured_bearer_token(monkeypatch):
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "secret-token")
     monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
 
-    hook_adapter._post_json("/api/hooks/context", {}, api_url="http://127.0.0.1:8766", timeout=1)
+    hook_adapter._post_json("/hooks/context", {}, timeout=1)
 
     assert auth_headers == ["Bearer secret-token"]
 
@@ -3000,6 +3058,7 @@ def test_hook_adapter_uses_codex_plugin_config_when_hook_env_is_absent(monkeypat
     (codex_home / "config.toml").write_text(
         """
 [memforge]
+MEMFORGE_EDITION = "cloud"
 MEMFORGE_API_URL = "https://memforge.example"
 MEMFORGE_API_TOKEN = "config-token"
 MEMFORGE_WORKSPACE_ID = "mount_tai"
@@ -3012,10 +3071,10 @@ MEMFORGE_WORKSPACE_ID = "mount_tai"
     monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(codex_home / "config.toml"))
     monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
 
-    requests: list[tuple[str, str | None, float]] = []
+    requests: list[tuple[str, float]] = []
 
-    def fake_post_json(path: str, payload: dict, *, api_url: str, timeout: float):
-        requests.append((path, api_url, timeout))
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
+        requests.append((path, timeout))
         return {}
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
@@ -3034,7 +3093,7 @@ MEMFORGE_WORKSPACE_ID = "mount_tai"
     exit_code = hook_adapter.main(["submit-session"])
 
     assert exit_code == 0
-    assert requests == [("/api/hooks/receipts", "https://memforge.example", 5.0)]
+    assert requests == [("/hooks/receipts", 5.0)]
     assert capsys.readouterr().out == ""
 
 
@@ -3047,6 +3106,7 @@ def test_post_json_uses_codex_plugin_config_for_workspace_and_token(monkeypatch,
     (codex_home / "config.toml").write_text(
         """
 [memforge]
+MEMFORGE_EDITION = "cloud"
 MEMFORGE_API_URL = "https://memforge.example"
 MEMFORGE_API_TOKEN = "config-token"
 MEMFORGE_WORKSPACE_ID = "mount_tai"
@@ -3076,7 +3136,7 @@ MEMFORGE_WORKSPACE_ID = "mount_tai"
 
     monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
 
-    hook_adapter._post_json("/api/hooks/receipts", {}, api_url="https://memforge.example", timeout=1)
+    hook_adapter._post_json("/hooks/receipts", {}, timeout=1)
 
     assert observed == {
         "url": "https://memforge.example/api/workspaces/mount_tai/api/hooks/receipts",
@@ -3099,7 +3159,7 @@ def test_session_start_guidance_explains_agentic_memforge_usage(monkeypatch, cap
         ),
     )
 
-    exit_code = hook_adapter.main(["context", "--api-url", "http://127.0.0.1:8765"])
+    exit_code = hook_adapter.main(["context"])
 
     assert exit_code == 0
     output = json.loads(capsys.readouterr().out)
@@ -3663,7 +3723,7 @@ def test_worker_single_flight_skips_when_locked(monkeypatch, tmp_path):
 
     posts: list[str] = []
 
-    def fake_post_json(path, payload, *, api_url, timeout):
+    def fake_post_json(path, payload, *, timeout):
         posts.append(path)
         return {"ok": True}
 
@@ -3673,7 +3733,7 @@ def test_worker_single_flight_skips_when_locked(monkeypatch, tmp_path):
     assert held is not None and held is not hook_adapter._NULL_WORKER_LOCK
     try:
         skipped = hook_adapter.run_agent_window_worker_once(
-            api_url="http://127.0.0.1:8765", timeout=5, queue_db_path=queue_db
+            timeout=5, queue_db_path=queue_db
         )
     finally:
         hook_adapter._release_worker_lock(held)
@@ -3682,10 +3742,10 @@ def test_worker_single_flight_skips_when_locked(monkeypatch, tmp_path):
     assert posts == []  # nothing processed while another worker holds the lock
 
     processed = hook_adapter.run_agent_window_worker_once(
-        api_url="http://127.0.0.1:8765", timeout=5, queue_db_path=queue_db
+        timeout=5, queue_db_path=queue_db
     )
     assert processed == 1
-    assert posts and posts[0] == "/api/agent-sessions/windows"
+    assert posts and posts[0] == "/agent-sessions/windows"
 
 
 def test_drain_does_not_spawn_when_no_pending(monkeypatch, tmp_path):
@@ -3697,11 +3757,11 @@ def test_drain_does_not_spawn_when_no_pending(monkeypatch, tmp_path):
     monkeypatch.setattr(
         hook_adapter,
         "_spawn_agent_window_worker",
-        lambda *, api_url, timeout: spawned.append((api_url, timeout)),
+        lambda *, timeout: spawned.append(timeout),
     )
 
     # No queue file yet: nothing pending, so no worker is spawned.
-    hook_adapter._drain_pending_agent_windows_if_present(api_url="http://127.0.0.1:8765", timeout=5)
+    hook_adapter._drain_pending_agent_windows_if_present()
     assert spawned == []
 
     # A session_cursor with capture_pending=0 also has nothing pending.
@@ -3711,7 +3771,7 @@ def test_drain_does_not_spawn_when_no_pending(monkeypatch, tmp_path):
             "INSERT INTO session_cursor (client, session_id, captured_through, capture_pending, created_at, updated_at) "
             "VALUES ('codex', 's', 3, 0, 'now', 'now')"
         )
-    hook_adapter._drain_pending_agent_windows_if_present(api_url="http://127.0.0.1:8765", timeout=5)
+    hook_adapter._drain_pending_agent_windows_if_present()
     assert spawned == []
 
 
@@ -3730,8 +3790,8 @@ def test_worker_keeps_pending_when_capture_requested_during_upload(monkeypatch, 
         queue_db_path=queue_db,
     )
 
-    def fake_post_json(path, payload, *, api_url, timeout):
-        if path == "/api/agent-sessions/windows":
+    def fake_post_json(path, payload, *, timeout):
+        if path == "/agent-sessions/windows":
             # A hook fires during the in-flight upload, requesting another capture.
             hook_adapter.request_session_capture(
                 client="codex",
@@ -3746,7 +3806,7 @@ def test_worker_keeps_pending_when_capture_requested_during_upload(monkeypatch, 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
     submitted = hook_adapter.run_agent_window_worker_once(
-        api_url="http://127.0.0.1:8765", timeout=5, queue_db_path=queue_db
+        timeout=5, queue_db_path=queue_db
     )
 
     assert submitted == 1
@@ -3774,8 +3834,8 @@ def test_worker_keeps_pending_when_request_timestamp_collides(monkeypatch, tmp_p
         queue_db_path=queue_db,
     )
 
-    def fake_post_json(path, payload, *, api_url, timeout):
-        if path == "/api/agent-sessions/windows":
+    def fake_post_json(path, payload, *, timeout):
+        if path == "/agent-sessions/windows":
             transcript.write_text(
                 '{"type":"tool","name":"apply_patch","input":"edit"}\n'
                 '{"type":"tool","name":"pytest","input":"tests"}\n',
@@ -3794,7 +3854,7 @@ def test_worker_keeps_pending_when_request_timestamp_collides(monkeypatch, tmp_p
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
     submitted = hook_adapter.run_agent_window_worker_once(
-        api_url="http://127.0.0.1:8765", timeout=5, queue_db_path=queue_db
+        timeout=5, queue_db_path=queue_db
     )
 
     assert submitted == 1
@@ -3820,8 +3880,8 @@ def test_stale_worker_cannot_rewind_bookmark_after_lease_reclaim(monkeypatch, tm
     )
     calls = {"window_uploads": 0}
 
-    def fake_post_json(path, payload, *, api_url, timeout):
-        if path == "/api/agent-sessions/windows":
+    def fake_post_json(path, payload, *, timeout):
+        if path == "/agent-sessions/windows":
             calls["window_uploads"] += 1
             if calls["window_uploads"] == 1:
                 _write_transcript_lines(transcript, 20)
@@ -3831,13 +3891,13 @@ def test_stale_worker_cannot_rewind_bookmark_after_lease_reclaim(monkeypatch, tm
                         ("1970-01-01T00:00:00+00:00", "codex", "sess"),
                     )
                 hook_adapter._process_session_captures(
-                    queue_db, api_url="http://127.0.0.1:8765", timeout=5, max_sessions=5
+                    queue_db, timeout=5, max_sessions=5
                 )
         return {"ok": True}
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
-    hook_adapter._process_session_captures(queue_db, api_url="http://127.0.0.1:8765", timeout=5, max_sessions=5)
+    hook_adapter._process_session_captures(queue_db, timeout=5, max_sessions=5)
 
     with sqlite3.connect(queue_db) as connection:
         row = connection.execute("SELECT captured_through, capture_pending FROM session_cursor").fetchone()

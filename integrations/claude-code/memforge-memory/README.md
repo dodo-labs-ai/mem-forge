@@ -2,28 +2,39 @@
 
 This plugin connects Claude Code lifecycle hooks to a MemForge API.
 It also registers a thin local MCP proxy for explicit memory tools.
+The packaged runtime and plugin version is `0.1.25`.
 
-Set MemForge connection values in the agent config if the API is not running at
-`http://127.0.0.1:8765`. The URL can point at a local instance or a hosted
-service. Set `MEMFORGE_API_TOKEN` when the service requires bearer auth.
-For hosted multi-workspace deployments, also set `MEMFORGE_WORKSPACE_ID` so the
-proxy targets `/api/workspaces/<workspace>/api/...` while the token remains a
-user identity credential.
+With no routing variables, the plugin targets local OSS at
+`http://127.0.0.1:8765/api`. Otherwise put the complete edition-tagged target in
+the top-level `env` object in `~/.claude/settings.json`. Lifecycle hooks do not
+inherit MCP-server-only environment, so do not put these routing values only in
+an MCP server entry. `MEMFORGE_API_URL` must be an HTTP(S) origin without
+`/api`; Cloud also requires `MEMFORGE_WORKSPACE_ID`.
 
-```toml
-[memforge]
-MEMFORGE_API_URL = "https://memforge.example"
-MEMFORGE_API_TOKEN = "..."
-MEMFORGE_WORKSPACE_ID = "mount_tai"
+```json
+{
+  "env": {
+    "MEMFORGE_EDITION": "cloud",
+    "MEMFORGE_API_URL": "https://memforge.example",
+    "MEMFORGE_WORKSPACE_ID": "mount_tai"
+  }
+}
 ```
+
+Set `MEMFORGE_EDITION` to `oss` with an explicit origin for remote OSS and omit
+`MEMFORGE_WORKSPACE_ID`. Set `MEMFORGE_API_TOKEN` separately in the process or
+top-level agent environment when bearer authentication is required; the token
+is an identity credential, not a workspace selector. Invalid or partial targets
+fail locally before any MCP or hook network request.
 
 Do not add a manual MCP server block for MemForge. The plugin's `.mcp.json`
 registers the MCP server; duplicating it in config can pin the agent to a stale
 plugin cache path after upgrades.
 
 The bundled MCP proxy does not need a local MemForge CLI or local-DB MCP
-process. It forwards search, memory detail, recent-change, and session
-document calls to `MEMFORGE_API_URL`. `get_resource(mode="file")` is handled
+process. It forwards search, memory detail, recent-change, and session document
+calls through the configured immutable target. MCP and lifecycle hooks read the
+same top-level agent routing values. `get_resource(mode="file")` is handled
 locally so returned `local_path` values point to the agent machine.
 
 ```text
