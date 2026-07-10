@@ -72,6 +72,31 @@ def _teams_payload(name: str = "PCC Agent Dev") -> dict:
     }
 
 
+def _github_repo_payload(*, connection_mode: str) -> dict:
+    return {
+        "type": "github_repo",
+        "name": "Internal Cookbook",
+        "config": {
+            "repo_url": "https://github.example.test/platform/cookbook",
+            "ref": "main",
+            "connection_mode": connection_mode,
+        },
+    }
+
+
+def _jira_payload(*, sync_mode: str) -> dict:
+    return {
+        "type": "jira",
+        "name": "Payroll Jira",
+        "config": {
+            "base_url": "https://jira.example.test",
+            "auth_mode": "browser_cookie",
+            "sync_mode": sync_mode,
+            "projects": ["PAY"],
+        },
+    }
+
+
 async def _insert_source_backed_memory(
     database: Database,
     *,
@@ -383,6 +408,80 @@ def test_local_source_owner_can_change_connection_without_transferring_ownership
         assert source is not None
         assert source["config"]["conversation_ids"] == ["19:conversation-b@example.test"]
         assert source["execution_owner_user_id"] == "owner-a"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_existing_source_cannot_change_between_server_and_local_execution(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            cloud_source = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=_github_repo_payload(connection_mode="cloud_pull"),
+            )
+            local_source = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=_github_repo_payload(connection_mode="local_push"),
+            )
+            assert cloud_source.status_code == 200, cloud_source.text
+            assert local_source.status_code == 200, local_source.text
+
+            to_local = client.put(
+                f"/api/sources/{cloud_source.json()['id']}",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json={"config": _github_repo_payload(connection_mode="local_push")["config"]},
+            )
+            to_cloud = client.put(
+                f"/api/sources/{local_source.json()['id']}",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json={"config": _github_repo_payload(connection_mode="cloud_pull")["config"]},
+            )
+
+        assert to_local.status_code == 409, to_local.text
+        assert to_cloud.status_code == 409, to_cloud.text
+        assert to_local.json()["detail"] == "source_execution_mode_immutable"
+        assert to_cloud.json()["detail"] == "source_execution_mode_immutable"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_existing_jira_source_cannot_change_between_cloud_and_local_agent(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            cloud_source = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=_jira_payload(sync_mode="cloud"),
+            )
+            local_source = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=_jira_payload(sync_mode="local_agent"),
+            )
+            assert cloud_source.status_code == 200, cloud_source.text
+            assert local_source.status_code == 200, local_source.text
+
+            to_local = client.put(
+                f"/api/sources/{cloud_source.json()['id']}",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json={"config": _jira_payload(sync_mode="local_agent")["config"]},
+            )
+            to_cloud = client.put(
+                f"/api/sources/{local_source.json()['id']}",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json={"config": _jira_payload(sync_mode="cloud")["config"]},
+            )
+
+        assert to_local.status_code == 409, to_local.text
+        assert to_cloud.status_code == 409, to_cloud.text
+        assert to_local.json()["detail"] == "source_execution_mode_immutable"
+        assert to_cloud.json()["detail"] == "source_execution_mode_immutable"
     finally:
         asyncio.run(database.close())
 

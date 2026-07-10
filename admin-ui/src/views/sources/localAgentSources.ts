@@ -17,3 +17,8 @@ export function localAgentSyncOperation(source: Source): string | null {
 export function isLocalAgentBackedSource(source: Source): boolean {
   return localAgentSyncOperation(source) !== null;
 }
+
+export function isImmutableExecutionModeField(sourceType: string, fieldKey: string): boolean {
+  return (sourceType === "jira" && fieldKey === "sync_mode")
+    || (sourceType === "github_repo" && fieldKey === "connection_mode");
+}
