@@ -2452,6 +2452,62 @@ async def test_source_sync_worker_heartbeats_while_run_is_active(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_source_sync_worker_does_not_complete_after_losing_lease(db: Database, monkeypatch):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-lost-lease"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker Lost Lease",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+
+    class SlowSuccessRuntimeProvider:
+        async def build_sync_runtime(
+            self,
+            db: Database,
+            config: AppConfig,
+            *,
+            extraction_pool: ExtractionWorkPool | None = None,
+            document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
+        ):
+            del db, config, extraction_pool, document_lifecycle_admission
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            await asyncio.sleep(0.03)
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
+
+    async def lost_lease(*args, **kwargs):
+        del args, kwargs
+        return False
+
+    monkeypatch.setattr(db, "heartbeat_source_sync_run", lost_lease)
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=SlowSuccessRuntimeProvider(),
+        worker_id="worker-a",
+        lease_seconds=1,
+        heartbeat_seconds=0.01,
+    )
+
+    await worker.run_once()
+    run = await db.get_source_sync_run(enqueued.run_id)
+
+    assert run is not None
+    assert run.status == "running"
+    assert run.lease_owner == "worker-a"
+
+
+@pytest.mark.asyncio
 async def test_source_sync_worker_run_forever_polls_until_cancelled(db: Database):
     import memforge.runtime as runtime
 
