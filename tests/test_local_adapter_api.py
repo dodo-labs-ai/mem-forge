@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
 from memforge.github_repo_utils import build_github_repo_doc_id
+from memforge.local_agent.source_contract import source_with_sync_inputs
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
 
@@ -26,6 +27,11 @@ def _connect_database(tmp_path: Path) -> Database:
     database = Database(str(tmp_path / "api.db"))
     asyncio.run(database.connect())
     return database
+
+
+def _project_source_inputs(database: Database, source: dict) -> dict:
+    inputs = asyncio.run(database.list_source_sync_inputs(source_id=source["id"]))
+    return source_with_sync_inputs(source, inputs)
 
 
 def _create_local_markdown_source(client: TestClient, *, name: str = "Engineering notes",
@@ -289,18 +295,16 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
         documents_dir = Path(row["config"]["local_agent_documents_dir"])
         package_path = documents_dir / f"{payload['doc_id']}.json"
         assert package_path.exists()
-        manifest = row["config"]["local_agent_package_manifest"]
-        assert len(manifest) == 1
-        assert manifest[0]["doc_id"] == payload["doc_id"]
-        assert manifest[0]["package_uri"] == payload["package_uri"]
         inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
         assert len(inputs) == 1
         assert inputs[0].raw_uri == payload["package_uri"]
         assert inputs[0].metadata["doc_id"] == payload["doc_id"]
+        assert inputs[0].metadata["manifest_entry"]["doc_id"] == payload["doc_id"]
 
         package_path.unlink()
 
-        gene = JiraGene(row["config"], source_id)
+        projected = _project_source_inputs(database, row)
+        gene = JiraGene(projected["config"], source_id)
         gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
 
         async def _read_package():
@@ -503,17 +507,15 @@ def test_local_adapter_document_push_writes_package(tmp_path):
 
         row = asyncio.run(database.get_source(source_id))
         assert row is not None
-        manifest = row["config"]["local_agent_package_manifest"]
-        assert len(manifest) == 1
-        assert manifest[0]["doc_id"] == body["doc_id"]
-        assert manifest[0]["package_uri"] == body["package_uri"]
         inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
         assert len(inputs) == 1
         assert inputs[0].raw_uri == body["package_uri"]
         assert inputs[0].metadata["doc_id"] == body["doc_id"]
+        assert inputs[0].metadata["manifest_entry"]["doc_id"] == body["doc_id"]
 
         package_path.unlink()
-        gene = LocalMarkdownGene(row["config"], source_id)
+        projected = _project_source_inputs(database, row)
+        gene = LocalMarkdownGene(projected["config"], source_id)
         gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
 
         async def _read_package():
@@ -579,17 +581,15 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
 
         row = asyncio.run(database.get_source(source_id))
         assert row is not None
-        manifest = row["config"]["local_agent_package_manifest"]
-        assert len(manifest) == 1
-        assert manifest[0]["doc_id"] == body["doc_id"]
-        assert manifest[0]["package_uri"] == body["package_uri"]
         inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
         assert len(inputs) == 1
         assert inputs[0].raw_uri == body["package_uri"]
         assert inputs[0].metadata["doc_id"] == body["doc_id"]
+        assert inputs[0].metadata["manifest_entry"]["doc_id"] == body["doc_id"]
 
         package_path.unlink()
-        gene = GitHubRepoGene(row["config"], source_id)
+        projected = _project_source_inputs(database, row)
+        gene = GitHubRepoGene(projected["config"], source_id)
         gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
 
         async def _read_package():
@@ -919,15 +919,13 @@ def test_teams_adapter_push_writes_window_package(tmp_path):
         row = asyncio.run(database.get_source(source_id))
         assert row is not None
         assert Path(row["config"]["local_agent_documents_dir"]).exists()
-        manifest = row["config"]["local_agent_package_manifest"]
-        assert len(manifest) == 1
-        assert manifest[0]["doc_id"] == body["doc_id"]
-        assert manifest[0]["package_uri"] == body["package_uri"]
-        assert manifest[0]["window_id"] == "teams-thread:src:conversation:root"
         inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
         assert len(inputs) == 1
         assert inputs[0].raw_uri == body["package_uri"]
         assert inputs[0].metadata["doc_id"] == body["doc_id"]
+        manifest_entry = inputs[0].metadata["manifest_entry"]
+        assert manifest_entry["doc_id"] == body["doc_id"]
+        assert manifest_entry["window_id"] == "teams-thread:src:conversation:root"
     finally:
         asyncio.run(database.close())
 

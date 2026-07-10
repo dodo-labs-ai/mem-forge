@@ -16,6 +16,7 @@ from memforge.auth import browser_session
 from memforge.genes import GENE_REGISTRY, create_gene
 from memforge.llm.providers import is_litellm_provider_model
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
+from memforge.local_agent.source_contract import source_with_sync_inputs
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.health import MemoryIndexHealthChecker, MemoryIndexHealthReport
@@ -640,6 +641,7 @@ class SourceSyncWorker:
                     renewed = await self.db.heartbeat_source_sync_run(
                         run.run_id,
                         worker_id=self.worker_id,
+                        lease_attempt_count=run.lease_attempt_count,
                         lease_seconds=self.lease_seconds,
                     )
                 except Exception:
@@ -689,19 +691,37 @@ class SourceSyncWorker:
         try:
             source = await self.db.get_source(run.source_id)
             if source is None:
-                await self.db.fail_source_sync_run(
+                failed = await self.db.fail_source_sync_run(
                     run.run_id,
+                    worker_id=self.worker_id,
+                    lease_attempt_count=run.lease_attempt_count,
                     error_message=f"Source not found: {run.source_id}",
                     retryable=False,
                 )
+                if not failed:
+                    raise SourceSyncLeaseLost(
+                        f"source sync lease lost before missing-source update for run {run.run_id}"
+                    )
                 return run
             if source.get("status") == "paused":
-                await self.db.fail_source_sync_run(
+                failed = await self.db.fail_source_sync_run(
                     run.run_id,
+                    worker_id=self.worker_id,
+                    lease_attempt_count=run.lease_attempt_count,
                     error_message=f"Source is paused: {run.source_id}",
                     retryable=False,
                 )
+                if not failed:
+                    raise SourceSyncLeaseLost(
+                        f"source sync lease lost before paused-source update for run {run.run_id}"
+                    )
                 return run
+
+            inputs = await self.db.list_source_sync_inputs(
+                source_id=run.source_id,
+                workspace_id=run.workspace_id,
+            )
+            source = source_with_sync_inputs(source, inputs)
 
             runtime = await self.runtime_provider.build_sync_runtime(
                 self.db,
@@ -725,20 +745,35 @@ class SourceSyncWorker:
                     last_sync_status="failed",
                     error_message="sync completed without final state",
                 )
-            if final_state.last_sync_status == "failed":
+            if final_state.last_sync_status in {"failed", "partial"}:
                 error_message = final_state.error_message or "source sync failed"
-                await self.db.upsert_sync_state(final_state)
                 failed_at = datetime.now(timezone.utc)
                 next_attempt_at = self._next_retry_at(run, failed_at)
-                await self.db.fail_source_sync_run(
+                failed = await self.db.fail_source_sync_run(
                     run.run_id,
+                    worker_id=self.worker_id,
+                    lease_attempt_count=run.lease_attempt_count,
                     error_message=error_message,
+                    final_state=final_state,
                     retryable=next_attempt_at is not None,
                     failed_at=failed_at,
                     next_attempt_at=next_attempt_at,
                 )
+                if not failed:
+                    raise SourceSyncLeaseLost(
+                        f"source sync lease lost before failure update for run {run.run_id}"
+                    )
                 return run
-            await self.db.complete_source_sync_run(run.run_id, final_state=final_state)
+            completed = await self.db.complete_source_sync_run(
+                run.run_id,
+                worker_id=self.worker_id,
+                lease_attempt_count=run.lease_attempt_count,
+                final_state=final_state,
+            )
+            if not completed:
+                raise SourceSyncLeaseLost(
+                    f"source sync lease lost before completion for run {run.run_id}"
+                )
             return run
         except asyncio.CancelledError:
             raise
@@ -757,13 +792,17 @@ class SourceSyncWorker:
             failed_at = datetime.now(timezone.utc)
             next_attempt_at = self._next_retry_at(run, failed_at)
             retryable = not isinstance(exc, SourcePausedError) and next_attempt_at is not None
-            await self.db.fail_source_sync_run(
+            failed = await self.db.fail_source_sync_run(
                 run.run_id,
+                worker_id=self.worker_id,
+                lease_attempt_count=run.lease_attempt_count,
                 error_message=str(exc),
                 retryable=retryable,
                 failed_at=failed_at,
                 next_attempt_at=next_attempt_at,
             )
+            if not failed:
+                logger.warning("Source sync worker stopped failure update after losing lease for run %s", run.run_id)
             return run
 
     async def run_forever(self, *, poll_seconds: float | None = None) -> None:
