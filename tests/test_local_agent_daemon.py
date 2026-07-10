@@ -1180,6 +1180,38 @@ def test_adapter_daemon_status_summarizes_state_by_default(monkeypatch, tmp_path
     ]
 
 
+def test_adapter_daemon_status_uses_environment_target_provenance(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_LOCK", str(tmp_path / "daemon.lock"))
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "cli.toml"))
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://environment.example.test")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "ws-environment")
+    monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
+    monkeypatch.setenv("SAP_TOKEN", "inactive-profile-token")
+    (tmp_path / "cli.toml").write_text(
+        'active = "sap"\n\n[targets.sap]\nedition = "cloud"\n'
+        'api_url = "https://profile.example.test"\nworkspace_id = "ws-profile"\n'
+        'token_env = "SAP_TOKEN"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "_read_adapter_config", lambda: {"kb": {}, "github": {}})
+
+    result = CliRunner().invoke(cli, ["adapter", "daemon", "status"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["target"] == {
+        "edition": "cloud",
+        "api_url": "https://environment.example.test",
+        "workspace_id": "ws-environment",
+        "active_target": "",
+        "token_env": "MEMFORGE_API_TOKEN",
+        "api_token_configured": False,
+    }
+    assert payload["recommendations"] == ["Set MEMFORGE_API_TOKEN before starting the daemon."]
+
+
 def test_adapter_daemon_status_verbose_includes_raw_state(monkeypatch, tmp_path):
     state_path = tmp_path / "state.json"
     state_path.write_text(

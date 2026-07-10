@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import metadata
 from itertools import islice
@@ -99,6 +100,14 @@ INTERACTIVE_INSTALL_LOCK_STALE_SECONDS = 600
 INTERACTIVE_DEPENDENCY_SENTINEL = Path("node_modules") / "@clack" / "prompts"
 
 
+@dataclass(frozen=True)
+class _ResolvedCliTarget:
+    target: MemForgeTarget
+    api_token: str | None
+    active_target: str
+    token_env: str
+
+
 def setup_logging(verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -163,15 +172,7 @@ def _toml_key(value: str) -> str:
     return json.dumps(value)
 
 
-def _active_target() -> dict[str, Any] | None:
-    data = _read_cli_config()
-    active = str(data.get("active") or "")
-    targets = data.get("targets") if isinstance(data.get("targets"), dict) else {}
-    target = targets.get(active)
-    return target if isinstance(target, dict) else None
-
-
-def _resolve_api_target(_config: AppConfig) -> tuple[MemForgeTarget, str | None]:
+def _resolve_api_target(_config: AppConfig) -> _ResolvedCliTarget:
     target_env_names = ("MEMFORGE_EDITION", "MEMFORGE_API_URL", "MEMFORGE_WORKSPACE_ID")
     if any(os.getenv(name, "").strip() for name in target_env_names):
         target = _build_cli_target(
@@ -179,19 +180,37 @@ def _resolve_api_target(_config: AppConfig) -> tuple[MemForgeTarget, str | None]
             api_url=os.getenv("MEMFORGE_API_URL"),
             workspace_id=os.getenv("MEMFORGE_WORKSPACE_ID"),
         )
-        return target, os.getenv("MEMFORGE_API_TOKEN")
+        return _ResolvedCliTarget(
+            target=target,
+            api_token=os.getenv("MEMFORGE_API_TOKEN"),
+            active_target="",
+            token_env="MEMFORGE_API_TOKEN",
+        )
 
-    profile = _active_target()
-    if profile is not None:
+    cli_config = _read_cli_config()
+    active = str(cli_config.get("active") or "")
+    profiles = cli_config.get("targets") if isinstance(cli_config.get("targets"), dict) else {}
+    profile = profiles.get(active)
+    if isinstance(profile, dict):
         target = _build_cli_target(
             edition=profile.get("edition"),
             api_url=profile.get("api_url"),
             workspace_id=profile.get("workspace_id"),
         )
         token_env = str(profile.get("token_env") or "")
-        return target, os.getenv(token_env) if token_env else None
+        return _ResolvedCliTarget(
+            target=target,
+            api_token=os.getenv(token_env) if token_env else None,
+            active_target=active,
+            token_env=token_env,
+        )
 
-    return build_target(edition=None, origin=None, workspace_id=None), os.getenv("MEMFORGE_API_TOKEN")
+    return _ResolvedCliTarget(
+        target=build_target(edition=None, origin=None, workspace_id=None),
+        api_token=os.getenv("MEMFORGE_API_TOKEN"),
+        active_target="",
+        token_env="",
+    )
 
 
 def _build_cli_target(*, edition: object, api_url: object, workspace_id: object) -> MemForgeTarget:
@@ -206,8 +225,8 @@ def _build_cli_target(*, edition: object, api_url: object, workspace_id: object)
 
 
 def _tool_client(ctx) -> ToolClient:
-    target, api_token = _resolve_api_target(ctx.obj["config"])
-    return ToolClient(target=target, api_token=api_token)
+    resolved = _resolve_api_target(ctx.obj["config"])
+    return ToolClient(target=resolved.target, api_token=resolved.api_token)
 
 
 def _emit_tool_payload(ctx, payload: dict) -> None:
@@ -1849,20 +1868,14 @@ def _local_agent_clean_target_summary(target: dict[str, Any]) -> dict[str, Any]:
 
 def _local_agent_target_summary(ctx) -> dict[str, Any]:
     config: AppConfig = ctx.obj["config"]
-    target, api_token = _resolve_api_target(config)
-    cli_config = _read_cli_config()
-    active = str(cli_config.get("active") or "")
-    active_target = _active_target()
-    token_env = ""
-    if active_target is not None:
-        token_env = str(active_target.get("token_env") or "")
+    resolved = _resolve_api_target(config)
     return {
-        "edition": target.edition.value,
-        "api_url": target.origin,
-        "workspace_id": target.workspace_id,
-        "active_target": active,
-        "token_env": token_env,
-        "api_token_configured": bool(api_token),
+        "edition": resolved.target.edition.value,
+        "api_url": resolved.target.origin,
+        "workspace_id": resolved.target.workspace_id,
+        "active_target": resolved.active_target,
+        "token_env": resolved.token_env,
+        "api_token_configured": bool(resolved.api_token),
     }
 
 

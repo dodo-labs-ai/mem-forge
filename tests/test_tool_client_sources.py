@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from urllib.error import URLError
 
 import pytest
 
@@ -311,6 +312,27 @@ def test_control_plane_daemon_jobs_use_host_origin_not_workspace_resource():
         client._host_url("/cloud/local-agent/jobs/lease")
     with pytest.raises(ValueError, match="resource_path_must_be_relative_to_api_base"):
         client._resource_url("/api/cloud/local-agent/jobs/lease")
+
+
+def test_control_plane_lease_unavailable_reports_attempted_host_url(monkeypatch):
+    class UnavailableOpener:
+        def open(self, request, timeout):
+            raise URLError("host unavailable")
+
+    monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: UnavailableOpener())
+    client = ToolClient(
+        target=build_target(
+            edition="cloud",
+            origin="https://memforge.example.test",
+            workspace_id="ws-a",
+        ),
+        api_token="tok",
+    )
+
+    result = client.lease_local_agent_jobs()
+
+    assert result["error"] == "MemForge API unavailable"
+    assert result["api_url"] == "https://memforge.example.test/api/cloud/local-agent/jobs/lease"
 
 
 def test_tool_client_forwards_search_to_hosted_workspace(monkeypatch):
