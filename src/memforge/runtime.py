@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -598,6 +599,7 @@ class SourceSyncWorker:
         worker_id: str = "source-sync-worker",
         workspace_id: str | None = None,
         lease_seconds: int = 300,
+        heartbeat_seconds: float | None = None,
     ) -> None:
         self.db = db
         self.config = config
@@ -605,6 +607,11 @@ class SourceSyncWorker:
         self.worker_id = worker_id
         self.workspace_id = workspace_id
         self.lease_seconds = lease_seconds
+        self.heartbeat_seconds = (
+            max(0.1, float(heartbeat_seconds))
+            if heartbeat_seconds is not None
+            else max(1.0, min(30.0, lease_seconds / 3))
+        )
         max_extraction_workers = max(0, int(config.sync.max_extraction_workers))
         self._extraction_pool = (
             ExtractionWorkPool(max_extraction_workers)
@@ -613,6 +620,47 @@ class SourceSyncWorker:
         )
         max_document_lifecycles = max(0, int(config.sync.max_document_lifecycles))
         self._document_lifecycle_admission = get_process_document_lifecycle_admission(max_document_lifecycles)
+
+    async def _heartbeat_until_stopped(
+        self,
+        run: SourceSyncRun,
+        stop: asyncio.Event,
+        lease_lost: asyncio.Event,
+    ) -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self.heartbeat_seconds)
+                return
+            except asyncio.TimeoutError:
+                try:
+                    renewed = await self.db.heartbeat_source_sync_run(
+                        run.run_id,
+                        worker_id=self.worker_id,
+                        lease_seconds=self.lease_seconds,
+                    )
+                except Exception:
+                    logger.exception("Source sync worker heartbeat failed for run %s", run.run_id)
+                    lease_lost.set()
+                    return
+                if not renewed:
+                    logger.warning("Source sync worker lost lease for run %s", run.run_id)
+                    lease_lost.set()
+                    return
+
+    async def _run_source_sync_with_heartbeat(self, run: SourceSyncRun, **kwargs: Any) -> SyncState | None:
+        stop = asyncio.Event()
+        lease_lost = asyncio.Event()
+        heartbeat_task = asyncio.create_task(self._heartbeat_until_stopped(run, stop, lease_lost))
+        try:
+            result = await self.runtime_provider.run_source_sync(**kwargs)
+            if lease_lost.is_set():
+                raise SourceSyncLeaseLost(f"source sync lease lost for run {run.run_id}")
+            return result
+        finally:
+            stop.set()
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
 
     def _next_retry_at(self, run: SourceSyncRun, failed_at: datetime) -> datetime | None:
         if run.lease_attempt_count >= self.config.sync.worker_max_attempts:
@@ -657,7 +705,8 @@ class SourceSyncWorker:
                 extraction_pool=self._extraction_pool,
                 document_lifecycle_admission=self._document_lifecycle_admission,
             )
-            final_state = await self.runtime_provider.run_source_sync(
+            final_state = await self._run_source_sync_with_heartbeat(
+                run,
                 db=self.db,
                 config=self.config,
                 source=source,

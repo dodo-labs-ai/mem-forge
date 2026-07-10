@@ -846,17 +846,6 @@ CREATE TABLE IF NOT EXISTS source_sync_inputs (
 CREATE INDEX IF NOT EXISTS idx_source_sync_inputs_source
     ON source_sync_inputs(workspace_id, source_id, input_generation);
 
-CREATE TABLE IF NOT EXISTS source_sync_run_items (
-    run_id          TEXT NOT NULL REFERENCES source_sync_runs(run_id) ON DELETE CASCADE,
-    doc_id          TEXT NOT NULL,
-    item_id         TEXT,
-    status          TEXT NOT NULL,
-    error_message   TEXT,
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL,
-    PRIMARY KEY (run_id, doc_id)
-);
-
 -- ---------------------------------------------------------------
 -- Config singletons
 -- ---------------------------------------------------------------
@@ -1777,16 +1766,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             )""",
             """CREATE INDEX IF NOT EXISTS idx_source_sync_inputs_source
                ON source_sync_inputs(workspace_id, source_id, input_generation)""",
-            """CREATE TABLE IF NOT EXISTS source_sync_run_items (
-                run_id          TEXT NOT NULL REFERENCES source_sync_runs(run_id) ON DELETE CASCADE,
-                doc_id          TEXT NOT NULL,
-                item_id         TEXT,
-                status          TEXT NOT NULL,
-                error_message   TEXT,
-                created_at      TEXT NOT NULL,
-                updated_at      TEXT NOT NULL,
-                PRIMARY KEY (run_id, doc_id)
-            )""",
+        ],
+    ),
+    (
+        36,
+        "Drop unused source sync run items",
+        [
+            "DROP TABLE IF EXISTS source_sync_run_items",
         ],
     ),
 ]
@@ -6016,6 +6002,72 @@ class Database:
             await self.db.commit()
         return results
 
+    async def enqueue_due_source_sync_runs(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 50,
+        workspace_id: str = "default",
+        exclude_source_ids: set[str] | None = None,
+    ) -> list[SourceSyncRun]:
+        claim_time = now or datetime.now(timezone.utc)
+        due_at = claim_time.isoformat()
+        exclude_ids = tuple(sorted(exclude_source_ids or ()))
+        exclude_sql = ""
+        if exclude_ids:
+            exclude_sql = " AND id NOT IN (" + ", ".join("?" for _ in exclude_ids) + ")"
+        runs: list[SourceSyncRun] = []
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    f"""SELECT * FROM sources
+                       WHERE status = 'active'
+                         AND sync_schedule_enabled = 1
+                         AND sync_schedule_next_at IS NOT NULL
+                         AND sync_schedule_next_at <= ?
+                         {exclude_sql}
+                       ORDER BY sync_schedule_next_at, created_at
+                       LIMIT ?""",
+                    (due_at, *exclude_ids, limit),
+                ) as cursor:
+                    rows = [dict(row) async for row in cursor]
+                for row in rows:
+                    interval_minutes = int(
+                        row.get("sync_schedule_interval_minutes") or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+                    )
+                    next_at = claim_time + timedelta(minutes=interval_minutes)
+                    updated_at = _now_iso()
+                    update_cursor = await self.db.execute(
+                        """UPDATE sources SET
+                           sync_schedule_next_at = ?,
+                           sync_schedule_updated_at = ?
+                           WHERE id = ?
+                             AND status = 'active'
+                             AND sync_schedule_enabled = 1
+                             AND sync_schedule_next_at = ?""",
+                        (
+                            next_at.isoformat(),
+                            updated_at,
+                            row["id"],
+                            row["sync_schedule_next_at"],
+                        ),
+                    )
+                    if not update_cursor.rowcount:
+                        continue
+                    runs.append(
+                        await self._enqueue_source_sync_run_locked(
+                            source_id=str(row["id"]),
+                            workspace_id=workspace_id,
+                            trigger="schedule",
+                            now=updated_at,
+                        )
+                    )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return runs
+
     async def is_source_enabled_for_user(self, source_id: str, user_id: str) -> bool:
         async with self.db.execute(
             "SELECT enabled FROM source_subscriptions WHERE source_id = ? AND user_id = ?",
@@ -6749,65 +6801,85 @@ class Database:
         trigger: str = "manual",
         force_full_sync: bool = False,
     ) -> SourceSyncRun:
-        now = _now_iso()
         async with self._write_lock:
-            async with self.db.execute(
-                """SELECT * FROM source_sync_runs
-                   WHERE workspace_id = ?
-                     AND source_id = ?
-                     AND status IN ('pending', 'running')
-                   ORDER BY created_at
-                   LIMIT 1""",
-                (workspace_id, source_id),
-            ) as cursor:
-                existing = await cursor.fetchone()
-            if existing:
-                mark_rerun = existing["status"] == "running"
-                await self.db.execute(
-                    """UPDATE source_sync_runs
-                       SET force_full_sync = CASE WHEN ? THEN 1 ELSE force_full_sync END,
-                           rerun_requested = CASE WHEN ? THEN 1 ELSE rerun_requested END,
-                           updated_at = ?
-                       WHERE run_id = ?""",
-                    (
-                        int(force_full_sync),
-                        int(mark_rerun),
-                        now,
-                        existing["run_id"],
-                    ),
+            try:
+                run = await self._enqueue_source_sync_run_locked(
+                    source_id=source_id,
+                    workspace_id=workspace_id,
+                    trigger=trigger,
+                    force_full_sync=force_full_sync,
                 )
                 await self.db.commit()
-                async with self.db.execute(
-                    "SELECT * FROM source_sync_runs WHERE run_id = ?",
-                    (existing["run_id"],),
-                ) as cursor:
-                    existing = await cursor.fetchone()
-                return _source_sync_run_from_row(existing, coalesced=True)
+            except Exception:
+                await self.db.rollback()
+                raise
+        return run
 
-            run_id = f"ssr-{uuid.uuid4().hex}"
+    async def _enqueue_source_sync_run_locked(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str = "default",
+        trigger: str = "manual",
+        force_full_sync: bool = False,
+        now: str | None = None,
+    ) -> SourceSyncRun:
+        now_iso = now or _now_iso()
+        async with self.db.execute(
+            """SELECT * FROM source_sync_runs
+               WHERE workspace_id = ?
+                 AND source_id = ?
+                 AND status IN ('pending', 'running')
+               ORDER BY created_at
+               LIMIT 1""",
+            (workspace_id, source_id),
+        ) as cursor:
+            existing = await cursor.fetchone()
+        if existing:
+            mark_rerun = existing["status"] == "running"
             await self.db.execute(
-                """INSERT INTO source_sync_runs (
-                    run_id, workspace_id, source_id, trigger, status,
-                    force_full_sync, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)""",
+                """UPDATE source_sync_runs
+                   SET force_full_sync = CASE WHEN ? THEN 1 ELSE force_full_sync END,
+                       rerun_requested = CASE WHEN ? THEN 1 ELSE rerun_requested END,
+                       updated_at = ?
+                   WHERE run_id = ?""",
                 (
-                    run_id,
-                    workspace_id,
-                    source_id,
-                    trigger,
                     int(force_full_sync),
-                    now,
-                    now,
+                    int(mark_rerun),
+                    now_iso,
+                    existing["run_id"],
                 ),
             )
-            await self.db.commit()
             async with self.db.execute(
                 "SELECT * FROM source_sync_runs WHERE run_id = ?",
-                (run_id,),
+                (existing["run_id"],),
             ) as cursor:
-                row = await cursor.fetchone()
-            assert row is not None
-            return _source_sync_run_from_row(row)
+                existing = await cursor.fetchone()
+            return _source_sync_run_from_row(existing, coalesced=True)
+
+        run_id = f"ssr-{uuid.uuid4().hex}"
+        await self.db.execute(
+            """INSERT INTO source_sync_runs (
+                run_id, workspace_id, source_id, trigger, status,
+                force_full_sync, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)""",
+            (
+                run_id,
+                workspace_id,
+                source_id,
+                trigger,
+                int(force_full_sync),
+                now_iso,
+                now_iso,
+            ),
+        )
+        async with self.db.execute(
+            "SELECT * FROM source_sync_runs WHERE run_id = ?",
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        return _source_sync_run_from_row(row)
 
     async def get_source_sync_run(self, run_id: str) -> SourceSyncRun | None:
         async with self.db.execute(
@@ -6876,6 +6948,35 @@ class Database:
             ) as cursor:
                 leased = await cursor.fetchone()
         return _source_sync_run_from_row(leased) if leased else None
+
+    async def heartbeat_source_sync_run(
+        self,
+        run_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> bool:
+        heartbeat_at = now or datetime.now(timezone.utc)
+        heartbeat_iso = _utc_iso(heartbeat_at)
+        lease_expires_at = _utc_iso(heartbeat_at + timedelta(seconds=lease_seconds))
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE source_sync_runs
+                   SET lease_expires_at = ?,
+                       updated_at = ?
+                   WHERE run_id = ?
+                     AND status = 'running'
+                     AND lease_owner = ?""",
+                (
+                    lease_expires_at,
+                    heartbeat_iso,
+                    run_id,
+                    worker_id,
+                ),
+            )
+            await self.db.commit()
+        return bool(cursor.rowcount)
 
     async def complete_source_sync_run(
         self,
