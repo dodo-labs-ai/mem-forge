@@ -44,6 +44,7 @@ from memforge.github_repo_utils import (
     parse_github_repo_url,
 )
 from memforge.local_agent.folder_picker import FolderPickerCancelled, FolderPickerUnavailable, pick_folder
+from memforge.local_agent.source_contract import local_agent_sync_snapshot_id
 from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
     SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES,
@@ -53,7 +54,6 @@ from memforge.tool_client import ToolClient
 console = Console()
 log_console = Console(stderr=True)
 DEFAULT_CLI_CONFIG_PATH = Path.home() / ".memforge" / "cli.toml"
-DEFAULT_ADAPTER_CONFIG_PATH = Path.home() / ".memforge" / "adapter.toml"
 DEFAULT_LOCAL_AGENT_STATE_PATH = Path.home() / ".memforge" / "local-agent-state.json"
 DEFAULT_LOCAL_AGENT_LOCK_PATH = Path.home() / ".memforge" / "local-agent-daemon.lock"
 DEFAULT_TEAMS_AUDIT_LOG_PATH = Path.home() / ".memforge" / "teams-sync-audit.jsonl"
@@ -67,19 +67,6 @@ DEFAULT_KB_INCLUDE = [
     "*.htm", "**/*.htm",
 ]
 DEFAULT_KB_EXCLUDE = [".obsidian/**", ".trash/**", ".git/**", "**/.git/**"]
-KB_SCHEDULE_PRESETS = {
-    "15m": "*/15 * * * *",
-    "30m": "*/30 * * * *",
-    "hourly": "0 * * * *",
-    "2h": "0 */2 * * *",
-    "4h": "0 */4 * * *",
-    "6h": "0 */6 * * *",
-    "12h": "0 */12 * * *",
-    "daily": "0 9 * * *",
-    "weekly": "0 9 * * 1",
-}
-KB_CRON_MARK_START = "# >>> memforge:kb:{name} >>>"
-KB_CRON_MARK_END = "# <<< memforge:kb:{name} <<<"
 LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
 GITHUB_REPO_SOURCE_TYPE = "github_repo"
 JIRA_SOURCE_TYPE = "jira"
@@ -328,43 +315,15 @@ def _build_local_agent_runner(
     ctx,
     *,
     browser: str | None,
-    default_sync_interval_seconds: int,
-    jira_interval_seconds: int,
 ):
     from memforge.local_agent.runner import LocalAgentRunner
-    from memforge.local_agent.tasks import LocalAgentHandlers
 
     client = _tool_client(ctx)
     return LocalAgentRunner(
-        adapter_config=_read_adapter_config(),
-        adapter_config_provider=_read_adapter_config,
         state_store=_local_agent_state_store(),
-        handlers=LocalAgentHandlers(
-            run_kb_profile=lambda name: _push_kb_profile_payload(
-                ctx,
-                name,
-                source_id=None,
-                limit=0,
-                process_now=True,
-                submitted_by="memforge-local-agent",
-            ),
-            run_github_profile=lambda name: _push_github_profile_payload(
-                ctx,
-                name,
-                source_id=None,
-                limit=0,
-                process_now=True,
-                submitted_by="memforge-local-agent",
-            ),
-            run_jira_auth=lambda origin, last_hash=None: _run_jira_auth_once(
-                client=client,
-                origin=origin,
-                browser=browser,
-                last_hash=last_hash,
-            ),
-            run_cloud_job=lambda job: _run_cloud_local_agent_job(job, client, browser=browser),
+        cloud_job_handler=lambda job: _run_cloud_local_agent_job(
+            job, client, browser=browser
         ),
-        jira_origins_provider=client.list_jira_origins,
         cloud_jobs_provider=lambda wait_seconds=0, lease_seconds=60: client.lease_local_agent_jobs(
             wait_seconds=wait_seconds,
             lease_seconds=lease_seconds,
@@ -381,127 +340,7 @@ def _build_local_agent_runner(
             attempt_count=attempt_count,
             lease_seconds=lease_seconds,
         ),
-        default_sync_interval_seconds=default_sync_interval_seconds,
-        jira_interval_seconds=jira_interval_seconds,
     )
-
-
-def _run_jira_auth_once(
-    *,
-    client,
-    origin: str,
-    browser: str | None,
-    last_hash: str | None = None,
-) -> dict[str, Any]:
-    from memforge.auth import jira_capture
-
-    async def _capture(url, *, browser=None):
-        return await jira_capture.capture_and_prevalidate(url, browser=browser)
-
-    action, new_hash = asyncio.run(
-        run_watch_tick(
-            base_url=origin,
-            browser=browser,
-            client=client,
-            last_hash=last_hash,
-            capture=_capture,
-            log=lambda message: log_console.print(message),
-        )
-    )
-    return {"action": action, "cookie_hash": new_hash or last_hash, "ok": action in {"uploaded", "unchanged"}}
-
-
-def _adapter_config_path() -> Path:
-    configured = os.getenv("MEMFORGE_ADAPTER_CONFIG", "").strip()
-    return Path(configured).expanduser() if configured else DEFAULT_ADAPTER_CONFIG_PATH
-
-
-def _read_adapter_config() -> dict[str, Any]:
-    path = _adapter_config_path()
-    if not path.exists():
-        return {"kb": {}, "github": {}}
-    with path.open("rb") as handle:
-        data = tomllib.load(handle)
-    kb = data.get("kb")
-    if not isinstance(kb, dict):
-        kb = {}
-    github = data.get("github")
-    if not isinstance(github, dict):
-        github = {}
-    return {"kb": kb, "github": github}
-
-
-def _write_adapter_config(data: dict[str, Any]) -> None:
-    path = _adapter_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    kb = data.get("kb") if isinstance(data.get("kb"), dict) else {}
-    github = data.get("github") if isinstance(data.get("github"), dict) else {}
-    lines: list[str] = []
-    for name, profile in sorted(kb.items()):
-        if not isinstance(profile, dict):
-            continue
-        lines.append(f"[kb.{_toml_key(str(name))}]")
-        lines.append(f"root = {_toml_string(str(profile.get('root') or ''))}")
-        lines.append(f"vault_id = {_toml_string(str(profile.get('vault_id') or name))}")
-        lines.append(f"include = {_toml_string_list(_string_list(profile.get('include')) or DEFAULT_KB_INCLUDE)}")
-        lines.append(f"exclude = {_toml_string_list(_string_list(profile.get('exclude')) or DEFAULT_KB_EXCLUDE)}")
-        source_id = str(profile.get("source_id") or "").strip()
-        if source_id:
-            lines.append(f"source_id = {_toml_string(source_id)}")
-        schedule = str(profile.get("schedule") or "").strip()
-        if schedule:
-            lines.append(f"schedule = {_toml_string(schedule)}")
-        lines.append("")
-    for name, profile in sorted(github.items()):
-        if not isinstance(profile, dict):
-            continue
-        lines.append(f"[github.{_toml_key(str(name))}]")
-        lines.append(f"repo_url = {_toml_string(str(profile.get('repo_url') or ''))}")
-        repo_path = str(profile.get("repo_path") or "").strip()
-        if repo_path:
-            lines.append(f"repo_path = {_toml_string(repo_path)}")
-        lines.append(f"ref = {_toml_string(str(profile.get('ref') or 'main'))}")
-        lines.append(f"include_paths = {_toml_string_list(_string_list(profile.get('include_paths')))}")
-        lines.append(
-            f"include_extensions = {_toml_string_list(_string_list(profile.get('include_extensions')) or DEFAULT_GITHUB_INCLUDE_EXTENSIONS)}"
-        )
-        source_id = str(profile.get("source_id") or "").strip()
-        if source_id:
-            lines.append(f"source_id = {_toml_string(source_id)}")
-        schedule = str(profile.get("schedule") or "").strip()
-        if schedule:
-            lines.append(f"schedule = {_toml_string(schedule)}")
-        lines.append("")
-    path.write_text("\n".join(lines), encoding="utf-8")
-    path.chmod(0o600)
-
-
-# A profile name becomes part of the source id, a TOML table key, and a line in
-# the user crontab, so it is restricted to an identifier-safe character set.
-_KB_PROFILE_NAME_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
-)
-
-
-def _validate_kb_profile_name(name: str) -> str:
-    """Return a safe profile name or raise.
-
-    Restricting the character set blocks crontab injection (an embedded newline
-    would otherwise add a live cron line) and multi-word names that cron would
-    split into separate arguments.
-    """
-    cleaned = (name or "").strip()
-    if not cleaned:
-        raise click.ClickException("Profile name is required.")
-    if any(ch not in _KB_PROFILE_NAME_CHARS for ch in cleaned):
-        raise click.ClickException(
-            "Profile name may contain only letters, digits, '.', '_', and '-' (no spaces or newlines)."
-        )
-    return cleaned
-
-
-def _toml_string_list(values: list[str]) -> str:
-    return "[" + ", ".join(_toml_string(value) for value in values) + "]"
 
 
 def _string_list(value: Any) -> list[str]:
@@ -522,40 +361,6 @@ def _merge_default_excludes(excludes: tuple[str, ...] | list[str]) -> list[str]:
         if pattern and pattern not in merged:
             merged.append(pattern)
     return merged
-
-
-def _link_local_markdown_source(
-    ctx,
-    *,
-    vault_id: str,
-    display_label: str | None,
-    name: str,
-) -> dict[str, Any]:
-    """Reuse or create a ``local_markdown`` source for ``vault_id`` on the server.
-
-    A list failure means we cannot tell whether a matching source already exists,
-    so we stop rather than risk creating a duplicate. The caller keeps the local
-    profile either way and surfaces ``error`` to the user.
-    """
-    client = _tool_client(ctx)
-    listed = client.list_sources()
-    if isinstance(listed, dict) and listed.get("error"):
-        return {"error": str(listed.get("error")), "detail": listed.get("detail")}
-    for source in listed.get("data") or []:
-        config = source.get("config") or {}
-        if source.get("type") == LOCAL_MARKDOWN_SOURCE_TYPE and str(config.get("vault_id") or "") == vault_id:
-            return {"source_id": str(source["id"]), "reused": True}
-    source_config: dict[str, Any] = {"vault_id": vault_id}
-    if display_label:
-        source_config["display_label"] = display_label
-    created = client.create_source(
-        source_type=LOCAL_MARKDOWN_SOURCE_TYPE,
-        name=name,
-        config=source_config,
-    )
-    if isinstance(created, dict) and created.get("error"):
-        return {"error": str(created.get("error")), "detail": created.get("detail")}
-    return {"source_id": str(created["id"]), "reused": False}
 
 
 def _parse_github_repo_url(repo_url: str) -> dict[str, str]:
@@ -915,7 +720,7 @@ def _run_interactive_script() -> int:
     if node_bin is None:
         log_console.print(
             "[yellow]Interactive UI requires Node.js (>=18) on PATH.[/]\n"
-            "Install Node, then run [bold]cd cli && npm install[/], then re-run [bold]memforge[/]."
+            "Install Node, then re-run [bold]memforge[/]."
         )
         return 2
 
@@ -1790,37 +1595,23 @@ def adapter_daemon():
 
 @adapter_daemon.command("status")
 @click.option("--verbose", is_flag=True, help="Include the raw local daemon state file.")
-@click.option("--default-sync-interval-seconds", default=3600, show_default=True, type=int,
-              help="Default interval used when displaying local-folder and GitHub profile tasks.")
 @click.pass_context
-def adapter_daemon_status(ctx, verbose: bool, default_sync_interval_seconds: int):
+def adapter_daemon_status(ctx, verbose: bool):
     """Show local agent daemon state."""
-    from memforge.local_agent.tasks import discover_profile_tasks
-
     state = _local_agent_state_store().load()
-    configured = discover_profile_tasks(
-        _read_adapter_config(),
-        default_interval_seconds=default_sync_interval_seconds,
-    )
     state_tasks = state.get("tasks") if isinstance(state.get("tasks"), dict) else {}
     daemon_status = _local_agent_daemon_status(state)
-    target_summary = _local_agent_status_target(state, _local_agent_target_summary(ctx))
+    target_summary = _local_agent_status_target(
+        state,
+        _local_agent_target_summary(ctx),
+        daemon_running=daemon_status["status"] == "running",
+    )
     payload = {
         "status": daemon_status["status"],
         "state_path": str(_local_agent_state_path()),
         "lock_path": str(_local_agent_lock_path()),
         "target": target_summary,
         "daemon": daemon_status["daemon"],
-        "configured_tasks": [
-            {
-                "task_id": task.task_id,
-                "kind": task.kind,
-                "profile_name": task.profile_name,
-                "origin": task.origin,
-                "interval_seconds": task.interval_seconds,
-            }
-            for task in configured
-        ],
         "summary": _summarize_local_agent_state_tasks(state_tasks),
         "recent_tasks": _recent_local_agent_tasks(state_tasks, limit=5),
     }
@@ -1887,9 +1678,14 @@ def _local_agent_status_recommendations(target: dict[str, Any]) -> list[str]:
     return recommendations
 
 
-def _local_agent_status_target(state: dict[str, Any], current_target: dict[str, Any]) -> dict[str, Any]:
+def _local_agent_status_target(
+    state: dict[str, Any],
+    current_target: dict[str, Any],
+    *,
+    daemon_running: bool,
+) -> dict[str, Any]:
     recorded = _daemon_recorded_target(state)
-    if recorded is None:
+    if recorded is None or not daemon_running:
         return current_target
     return {**recorded, "source": "running_daemon"}
 
@@ -1961,29 +1757,18 @@ def _compact_local_agent_task(task_id: str, task: dict[str, Any]) -> dict[str, A
 
 
 @adapter_daemon.command("once")
-@click.option("--include-jira/--no-include-jira", default=True, show_default=True,
-              help="Also refresh known Jira browser-session origins.")
 @click.option("--browser", default=None, help="Browser to read Jira cookies from, for example chrome or edge.")
-@click.option("--default-sync-interval-seconds", default=3600, show_default=True, type=int,
-              help="Default interval recorded for local-folder and GitHub profile tasks.")
-@click.option("--jira-interval-seconds", default=WATCH_DEFAULT_INTERVAL_SECONDS, show_default=True, type=int,
-              help="Default Jira browser-session refresh interval.")
 @click.pass_context
 def adapter_daemon_once(
     ctx,
-    include_jira: bool,
     browser: str | None,
-    default_sync_interval_seconds: int,
-    jira_interval_seconds: int,
 ):
-    """Run one local agent daemon pass and exit."""
+    """Lease and execute one batch of server-owned jobs, then exit."""
     runner = _build_local_agent_runner(
         ctx,
         browser=browser,
-        default_sync_interval_seconds=default_sync_interval_seconds,
-        jira_interval_seconds=jira_interval_seconds,
     )
-    report = runner.run_once(include_jira=include_jira)
+    report = runner.run_once()
     if int(report.get("counts", {}).get("failed") or 0) > 0:
         report = dict(report)
         report["error"] = "one or more local agent tasks failed"
@@ -1991,26 +1776,17 @@ def adapter_daemon_once(
 
 
 @adapter_daemon.command("run")
-@click.option("--include-jira/--no-include-jira", default=True, show_default=True,
-              help="Also refresh known Jira browser-session origins.")
 @click.option("--browser", default=None, help="Browser to read Jira cookies from, for example chrome or edge.")
 @click.option("--interval-seconds", "poll_interval_seconds", default=10, show_default=True, type=int,
-              help="Seconds between due-task checks.")
+              help="Seconds between server-job lease polls.")
 @click.option("--cloud-job-wait-seconds", default=25, show_default=True, type=int,
               help="Long-poll wait for Cloud-triggered local-agent jobs.")
-@click.option("--default-sync-interval-seconds", default=3600, show_default=True, type=int,
-              help="Default local-folder and GitHub sync interval.")
-@click.option("--jira-interval-seconds", default=WATCH_DEFAULT_INTERVAL_SECONDS, show_default=True, type=int,
-              help="Default Jira browser-session refresh interval.")
 @click.pass_context
 def adapter_daemon_run(
     ctx,
-    include_jira: bool,
     browser: str | None,
     poll_interval_seconds: int,
     cloud_job_wait_seconds: int,
-    default_sync_interval_seconds: int,
-    jira_interval_seconds: int,
 ):
     """Run the local agent daemon until interrupted."""
     daemon_lock = _acquire_local_agent_daemon_lock()
@@ -2035,8 +1811,6 @@ def adapter_daemon_run(
         runner = _build_local_agent_runner(
             ctx,
             browser=browser,
-            default_sync_interval_seconds=default_sync_interval_seconds,
-            jira_interval_seconds=jira_interval_seconds,
         )
         click.echo(
             json.dumps(
@@ -2050,7 +1824,6 @@ def adapter_daemon_run(
             )
         )
         runner.run_forever(
-            include_jira=include_jira,
             poll_interval_seconds=poll_interval_seconds,
             cloud_job_wait_seconds=cloud_job_wait_seconds,
             log=lambda message: click.echo(message, err=True),
@@ -2061,172 +1834,18 @@ def adapter_daemon_run(
         daemon_lock.close()
 
 
-@adapter.group("kb")
-def adapter_kb():
-    """Manage local repository adapter profiles (Markdown, text, JSON, HTML)."""
-    pass
-
-
-@adapter.group("github")
-def adapter_github():
-    """Manage local GitHub repository adapter profiles."""
-    pass
-
-
-@adapter_github.command("add")
-@click.argument("name")
-@click.option("--repo-url", required=True, help="GitHub or GitHub Enterprise repository URL.")
-@click.option("--repo-path", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path),
-              help="Local clone path for Internal network / VPN repositories.")
-@click.option("--ref", "repo_ref", default="main", show_default=True, help="Branch, tag, or commit to sync.")
-@click.option("--include-path", "include_paths", multiple=True,
-              help="Repo-relative folder or file to include. Repeatable. Empty means all paths.")
-@click.option("--include-extension", "include_extensions", multiple=True,
-              help="File extension to include. Repeatable. Defaults to markdown/text-like files.")
-@click.option("--source-id", default=None, help="Existing github_repo source id to link to this profile.")
-@click.pass_context
-def adapter_github_add(
-    ctx,
-    name: str,
-    repo_url: str,
-    repo_path: Path | None,
-    repo_ref: str,
-    include_paths: tuple[str, ...],
-    include_extensions: tuple[str, ...],
-    source_id: str | None,
-):
-    """Add or update a local GitHub repository profile."""
-    name = _validate_kb_profile_name(name)
-    repo = _parse_github_repo_url(repo_url)
-    try:
-        normalized_include_paths = github_include_paths({"include_paths": list(include_paths)})
-    except ValueError as exc:
-        raise click.ClickException(str(exc).replace("relative_path", "GitHub include path")) from exc
-    profile = {
-        "repo_url": repo["repo_url"],
-        "ref": repo_ref.strip() or "main",
-        "include_paths": normalized_include_paths,
-        "include_extensions": [
-            ext.lower().lstrip(".")
-            for ext in (list(include_extensions) or DEFAULT_GITHUB_INCLUDE_EXTENSIONS)
-            if ext.strip()
-        ],
-    }
-    if repo_path is not None:
-        profile["repo_path"] = str(_repo_path_from_profile({"repo_path": str(repo_path)}, repo))
-    if source_id:
-        profile["source_id"] = source_id.strip()
-    data = _read_adapter_config()
-    data.setdefault("github", {})[name] = profile
-    _write_adapter_config(data)
-    _emit_tool_payload(ctx, {"ok": True, "profile": name, "config": profile})
-
-
-@adapter_github.command("list")
-@click.pass_context
-def adapter_github_list(ctx):
-    """List local GitHub repository profiles."""
-    _emit_tool_payload(ctx, {"profiles": _read_adapter_config().get("github", {})})
-
-
-@adapter_github.command("remove")
-@click.argument("name")
-@click.pass_context
-def adapter_github_remove(ctx, name: str):
-    """Remove a local GitHub repository profile."""
-    name = name.strip()
-    data = _read_adapter_config()
-    github = data.get("github", {})
-    if name not in github:
-        raise click.ClickException(f"Unknown GitHub repository profile: {name}")
-    github.pop(name)
-    _write_adapter_config(data)
-    _emit_tool_payload(ctx, {"ok": True, "removed": name})
-
-
-@adapter_github.command("preview")
-@click.argument("name")
-@click.option("--limit", default=20, show_default=True, type=int, help="Maximum included files to return.")
-@click.pass_context
-def adapter_github_preview(ctx, name: str, limit: int):
-    """Preview the files selected by a GitHub repository profile."""
-    profiles = _read_adapter_config().get("github", {})
-    profile = profiles.get(name)
-    if not isinstance(profile, dict):
-        raise click.ClickException(f"Unknown GitHub repository profile: {name}")
-    _emit_tool_payload(ctx, _preview_github_profile(name, profile, limit=limit))
-
-
-@adapter_github.command("push")
-@click.argument("name")
-@click.option("--source-id", default=None,
-              help="MemForge github_repo source id (defaults to the profile's linked source).")
-@click.option("--limit", default=0, show_default=True, type=int,
-              help="Maximum files to push. 0 means push every included file.")
-@click.option("--process-now/--no-process-now", default=False, show_default=True,
-              help="Trigger source sync after the push completes.")
-@click.option("--submitted-by", default=None, help="Optional label recorded with each push.")
-@click.pass_context
-def adapter_github_push(
-    ctx,
-    name: str,
-    source_id: str | None,
-    limit: int,
-    process_now: bool,
-    submitted_by: str | None,
-):
-    """Push selected GitHub repository files into a configured github_repo source."""
-    _emit_tool_payload(
-        ctx,
-        _push_github_profile_payload(
-            ctx,
-            name,
-            source_id=source_id,
-            limit=limit,
-            process_now=process_now,
-            submitted_by=submitted_by,
-        ),
-    )
-
-
-def _push_github_profile_payload(
-    ctx,
-    name: str,
-    *,
-    source_id: str | None,
-    limit: int,
-    process_now: bool,
-    submitted_by: str | None,
-) -> dict[str, Any]:
-    profiles = _read_adapter_config().get("github", {})
-    profile = profiles.get(name)
-    if not isinstance(profile, dict):
-        raise click.ClickException(f"Unknown GitHub repository profile: {name}")
-    source_id = (source_id or "").strip() or str(profile.get("source_id") or "").strip()
-    if not source_id:
-        raise click.ClickException(
-            "No source id for this profile. Re-run with --source-id, or link one with `adapter github add ... --source-id`."
-        )
-    return _push_github_profile_to_source(
-        name,
-        profile,
-        source_id=source_id,
-        limit=limit,
-        process_now=process_now,
-        submitted_by=submitted_by,
-        client=_tool_client(ctx),
-    )
-
-
 def _push_github_profile_to_source(
     name: str,
     profile: dict[str, Any],
     *,
     source_id: str,
     limit: int,
-    process_now: bool,
+    force_full_sync: bool,
     submitted_by: str | None,
     client: ToolClient,
+    sync_snapshot_id: str | None = None,
+    local_agent_job_id: str | None = None,
+    local_agent_attempt_count: int | None = None,
 ) -> dict[str, Any]:
     source_id = source_id.strip()
     if not source_id:
@@ -2265,7 +1884,7 @@ def _push_github_profile_to_source(
             }
         )
 
-    for index, doc in enumerate(prepared):
+    for doc in prepared:
         response = client.push_github_repo_document(
             source_id=source_id,
             repo_url=repo["repo_url"],
@@ -2276,8 +1895,10 @@ def _push_github_profile_to_source(
             title=str(doc["title"]),
             raw_hash=str(doc["raw_hash"]),
             blob_sha=str(doc["blob_sha"]),
+            sync_snapshot_id=sync_snapshot_id,
+            local_agent_job_id=local_agent_job_id,
+            local_agent_attempt_count=local_agent_attempt_count,
             submitted_by=submitted_by,
-            process_now=process_now and index == len(prepared) - 1,
         )
         if isinstance(response, dict) and response.get("error"):
             failed.append({"relative_path": doc["relative_path"], "error": response.get("error"),
@@ -2298,6 +1919,20 @@ def _push_github_profile_to_source(
     }
     if failed:
         payload["error"] = "one or more documents failed to push"
+    if not failed:
+        sync_result = client.start_source_processing(
+            source_id=source_id,
+            force_full_sync=force_full_sync,
+            sync_snapshot_id=sync_snapshot_id,
+            local_agent_job_id=local_agent_job_id,
+            local_agent_attempt_count=local_agent_attempt_count,
+        )
+        payload["sync_started"] = not bool(sync_result.get("error"))
+        if sync_result.get("error"):
+            payload["error"] = "source processing failed to start"
+            payload["sync_error"] = sync_result
+    if payload.get("error"):
+        payload["retryable"] = True
     return payload
 
 
@@ -2309,9 +1944,10 @@ def _run_cloud_local_agent_job(
 ) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     handlers = {
+        "github_repo_pick_root": lambda: _run_cloud_pick_root_job(job),
         "github_repo_preview_tree": lambda: _run_cloud_github_preview_job(job),
         "github_repo_sync": lambda: _run_cloud_github_sync_job(job, client),
-        "local_markdown_pick_root": lambda: _run_cloud_local_markdown_pick_root_job(job),
+        "local_markdown_pick_root": lambda: _run_cloud_pick_root_job(job),
         "local_markdown_preview_tree": lambda: _run_cloud_local_markdown_preview_job(job),
         "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(job, client),
         "jira_sync": lambda: _run_cloud_jira_sync_job(job, client, browser=browser),
@@ -2350,10 +1986,13 @@ def _run_cloud_github_sync_job(job: dict[str, Any], client: ToolClient) -> dict[
         profile_name,
         profile,
         source_id=source_id,
-        limit=_cloud_job_limit(payload.get("limit"), default=0),
-        process_now=bool(payload.get("process_now", True)),
+        limit=0,
+        force_full_sync=bool(payload.get("force_full_sync", False)),
         submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
         client=client,
+        sync_snapshot_id=local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count")),
+        local_agent_job_id=str(job["job_id"]),
+        local_agent_attempt_count=int(job["attempt_count"]),
     )
     return {"operation": operation, **result}
 
@@ -2368,7 +2007,7 @@ def _run_cloud_local_markdown_preview_job(job: dict[str, Any]) -> dict[str, Any]
     return {"operation": operation, "source_id": source_id, **preview}
 
 
-def _run_cloud_local_markdown_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
+def _run_cloud_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     try:
@@ -2394,10 +2033,13 @@ def _run_cloud_local_markdown_sync_job(job: dict[str, Any], client: ToolClient) 
         profile_name,
         _kb_profile_from_cloud_job(job),
         source_id=source_id,
-        limit=_cloud_job_limit(payload.get("limit"), default=0),
-        process_now=bool(payload.get("process_now", True)),
+        limit=0,
+        force_full_sync=bool(payload.get("force_full_sync", False)),
         submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
         client=client,
+        sync_snapshot_id=local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count")),
+        local_agent_job_id=str(job["job_id"]),
+        local_agent_attempt_count=int(job["attempt_count"]),
     )
     return {"operation": operation, **result}
 
@@ -2419,16 +2061,22 @@ def _run_cloud_jira_sync_job(
                 job,
                 source_id=source_id,
                 browser=browser,
-                limit=_cloud_job_limit(payload.get("limit"), default=0),
+                limit=0,
             )
         )
     except Exception as exc:
-        return {"operation": operation, "source_id": source_id, "error": str(exc), "error_type": type(exc).__name__}
+        return {
+            "operation": operation,
+            "source_id": source_id,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "retryable": True,
+        }
 
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     scoped_client = client
-    should_process = bool(payload.get("process_now", True))
+    sync_snapshot_id = local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count"))
     sync_result: dict[str, Any] | None = None
     for doc in documents:
         response = scoped_client.push_jira_package(
@@ -2440,7 +2088,9 @@ def _run_cloud_jira_sync_job(
             title=str(doc["title"]),
             raw_hash=str(doc["raw_hash"]),
             submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
-            process_now=False,
+            sync_snapshot_id=sync_snapshot_id,
+            local_agent_job_id=str(job["job_id"]),
+            local_agent_attempt_count=int(job["attempt_count"]),
         )
         if isinstance(response, dict) and response.get("error"):
             failed.append({"issue_key": doc["issue_key"], "error": response.get("error"),
@@ -2449,8 +2099,14 @@ def _run_cloud_jira_sync_job(
             pushed.append({"issue_key": doc["issue_key"],
                            "doc_id": response.get("doc_id"),
                            "document_hash": response.get("document_hash")})
-    if should_process and pushed:
-        sync_result = scoped_client.start_source_sync(source_id=source_id, force_full_sync=False)
+    if not failed:
+        sync_result = scoped_client.start_source_processing(
+            source_id=source_id,
+            force_full_sync=bool(payload.get("force_full_sync", False)),
+            sync_snapshot_id=sync_snapshot_id,
+            local_agent_job_id=str(job["job_id"]),
+            local_agent_attempt_count=int(job["attempt_count"]),
+        )
     result = {
         "operation": operation,
         "source_id": source_id,
@@ -2469,6 +2125,8 @@ def _run_cloud_jira_sync_job(
         result["error"] = "source sync failed to start"
     elif failed:
         result["error"] = "one or more documents failed to push"
+    if result.get("error"):
+        result["retryable"] = True
     return result
 
 
@@ -2568,7 +2226,17 @@ def _teams_auth_exception(exc: Exception) -> bool:
     if isinstance(exc, AuthenticationError):
         return True
     text = str(exc).lower()
-    return "401" in text or "authentication failed" in text or "session expired" in text
+    return any(
+        marker in text
+        for marker in (
+            "401",
+            "authentication failed",
+            "session expired",
+            "no teams session found",
+            "missing chat api token",
+            "no active teams session",
+        )
+    )
 
 
 def _current_teams_chat_token_hashes() -> set[str]:
@@ -2657,6 +2325,7 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
                 "source_id": source_id,
                 "error": str(collect_error),
                 "error_type": type(collect_error).__name__,
+                "retryable": True,
             }
 
     documents, poll_audits = _teams_collection_documents_and_polls(collection)
@@ -2667,12 +2336,12 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     skipped_existing: list[dict[str, Any]] = []
+    pending_receipts: list[dict[str, str | None]] = []
     scoped_client = client
-    should_process = bool(payload.get("process_now", True))
     submitted_by = str(payload.get("submitted_by") or "memforge-local-agent")
     sync_started = False
 
-    for index, doc in enumerate(documents):
+    for doc in documents:
         window_id = str(doc["window_id"])
         revision_hash = str(doc["revision_hash"])
         window_id_hash = hashlib.sha256(window_id.encode("utf-8")).hexdigest()
@@ -2722,7 +2391,8 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             source_url=str(doc.get("source_url") or ""),
             raw_hash=str(doc["raw_hash"]),
             submitted_by=submitted_by,
-            process_now=should_process and index == len(documents) - 1,
+            local_agent_job_id=str(job["job_id"]),
+            local_agent_attempt_count=int(job["attempt_count"]),
         )
         if isinstance(response, dict) and response.get("error"):
             failed.append({
@@ -2757,14 +2427,11 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             "doc_id": response.get("doc_id") if isinstance(response, dict) else None,
             "document_hash": response.get("document_hash") if isinstance(response, dict) else None,
         })
-        if isinstance(response, dict) and response.get("sync_started"):
-            sync_started = True
-        ledger_store.record_receipt(
-            source_id=source_id,
-            window_id=window_id,
-            revision_hash=revision_hash,
-            document_hash=response.get("document_hash") if isinstance(response, dict) else None,
-        )
+        pending_receipts.append({
+            "window_id": window_id,
+            "revision_hash": revision_hash,
+            "document_hash": response.get("document_hash") if isinstance(response, dict) else None,
+        })
         write_teams_audit_event(
             audit_path,
             {
@@ -2782,6 +2449,27 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
                 "claim_rejected_ambiguous": 0,
             },
         )
+
+    sync_result = None
+    if pushed:
+        # Teams is incremental by stable window id and revision. Processing the
+        # historical input set lets the server collapse each window to its
+        # latest revision; document-style authoritative snapshots do not apply.
+        sync_result = scoped_client.start_source_processing(
+            source_id=source_id,
+            force_full_sync=bool(payload.get("force_full_sync", False)),
+            local_agent_job_id=str(job["job_id"]),
+            local_agent_attempt_count=int(job["attempt_count"]),
+        )
+        sync_started = not bool(sync_result.get("error"))
+        if sync_started:
+            for receipt in pending_receipts:
+                ledger_store.record_receipt(
+                    source_id=source_id,
+                    window_id=str(receipt["window_id"]),
+                    revision_hash=str(receipt["revision_hash"]),
+                    document_hash=receipt["document_hash"],
+                )
 
     result = {
         "operation": operation,
@@ -2801,6 +2489,15 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
     }
     if failed:
         result["error"] = "one or more Teams windows failed to push"
+    if sync_result and sync_result.get("error"):
+        result["error"] = (
+            "one or more Teams windows failed to push; source processing failed to start"
+            if failed
+            else "source processing failed to start"
+        )
+        result["sync_error"] = sync_result
+    if result.get("error"):
+        result["retryable"] = True
 
     write_teams_audit_event(
         audit_path,
@@ -3117,202 +2814,18 @@ def _cloud_job_limit(value: Any, *, default: int) -> int:
     return max(parsed, 0)
 
 
-@adapter_kb.command("add")
-@click.argument("name")
-@click.option("--root", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--vault-id", default=None, help="Stable vault identifier used in local metadata.")
-@click.option("--include", "includes", multiple=True,
-              help="Glob to include, relative to root. Repeatable. Replaces the default md/txt/json/html set.")
-@click.option("--exclude", "excludes", multiple=True,
-              help="Glob to exclude, relative to root. Repeatable. Added to the .obsidian/.trash/.git safety excludes.")
-@click.option("--display-label", default=None, help="Human-readable label for the linked source.")
-@click.option("--create-source/--no-create-source", default=False, show_default=True,
-              help="Reuse or create the matching local_markdown source and store its id in the profile.")
-@click.pass_context
-def adapter_kb_add(
-    ctx,
-    name: str,
-    root: Path,
-    vault_id: str | None,
-    includes: tuple[str, ...],
-    excludes: tuple[str, ...],
-    display_label: str | None,
-    create_source: bool,
-):
-    """Add or update a local repository profile.
-
-    With ``--create-source`` the profile is also linked to its MemForge source:
-    an existing ``local_markdown`` source with the same vault id is reused, or a
-    new one is created, and its id is stored so ``push`` needs no source id.
-    """
-    name = _validate_kb_profile_name(name)
-    resolved_vault = vault_id or name
-    data = _read_adapter_config()
-    kb = data.setdefault("kb", {})
-    kb[name] = {
-        "root": str(root.expanduser().resolve()),
-        "vault_id": resolved_vault,
-        "include": list(includes) or DEFAULT_KB_INCLUDE,
-        "exclude": _merge_default_excludes(list(excludes)),
-    }
-
-    payload: dict[str, Any] = {"ok": True, "profile": name}
-    if create_source:
-        link = _link_local_markdown_source(
-            ctx,
-            vault_id=resolved_vault,
-            display_label=display_label,
-            name=display_label or name,
-        )
-        if link.get("error"):
-            payload["source_link_error"] = link["error"]
-            if link.get("detail"):
-                payload["detail"] = link["detail"]
-        else:
-            kb[name]["source_id"] = link["source_id"]
-            payload["source_id"] = link["source_id"]
-            payload["source_reused"] = link["reused"]
-
-    _write_adapter_config(data)
-    payload["config"] = kb[name]
-    _emit_tool_payload(ctx, payload)
-
-
-@adapter_kb.command("list")
-@click.pass_context
-def adapter_kb_list(ctx):
-    """List local repository profiles."""
-    _emit_tool_payload(ctx, {"profiles": _read_adapter_config().get("kb", {})})
-
-
-@adapter_kb.command("scan")
-@click.option("--root", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--include", "includes", multiple=True,
-              help="Glob to include, relative to root. Repeatable. Replaces the default md/txt/json/html set.")
-@click.option("--exclude", "excludes", multiple=True,
-              help="Glob to exclude, relative to root. Repeatable. Added to the .obsidian/.trash/.git safety excludes.")
-@click.option("--limit", default=20, show_default=True, type=int, help="Maximum included files to return.")
-@click.pass_context
-def adapter_kb_scan(ctx, root: Path, includes: tuple[str, ...], excludes: tuple[str, ...], limit: int):
-    """Dry-scan a folder for markdown files without saving a profile.
-
-    Backs the setup wizard's instant-feedback step: it reports what would be
-    included before a profile (and its vault id) exist.
-    """
-    profile = {
-        "root": str(root.expanduser().resolve()),
-        "vault_id": "scan",
-        "include": list(includes) or DEFAULT_KB_INCLUDE,
-        "exclude": _merge_default_excludes(list(excludes)),
-    }
-    _emit_tool_payload(ctx, _preview_kb_profile("scan", profile, limit=limit))
-
-
-@adapter_kb.command("remove")
-@click.argument("name")
-@click.pass_context
-def adapter_kb_remove(ctx, name: str):
-    """Remove a local repository profile."""
-    name = name.strip()
-    data = _read_adapter_config()
-    kb = data.get("kb", {})
-    if name not in kb:
-        raise click.ClickException(f"Unknown knowledge-base profile: {name}")
-    kb.pop(name)
-    _write_adapter_config(data)
-    _emit_tool_payload(ctx, {"ok": True, "removed": name})
-
-
-@adapter_kb.command("preview")
-@click.argument("name")
-@click.option("--limit", default=20, show_default=True, type=int, help="Maximum included files to return.")
-@click.pass_context
-def adapter_kb_preview(ctx, name: str, limit: int):
-    """Preview local markdown files for a knowledge-base profile."""
-    profiles = _read_adapter_config().get("kb", {})
-    profile = profiles.get(name)
-    if not isinstance(profile, dict):
-        raise click.ClickException(f"Unknown knowledge-base profile: {name}")
-    payload = _preview_kb_profile(name, profile, limit=limit)
-    _emit_tool_payload(ctx, payload)
-
-
-@adapter_kb.command("push")
-@click.argument("name")
-@click.option("--source-id", default=None,
-              help="MemForge source id (defaults to the profile's linked source).")
-@click.option("--limit", default=0, show_default=True, type=int,
-              help="Maximum files to push. 0 means push every included file.")
-@click.option("--process-now/--no-process-now", default=False, show_default=True,
-              help="Trigger source sync after the push completes.")
-@click.option("--submitted-by", default=None, help="Optional label recorded with each push.")
-@click.pass_context
-def adapter_kb_push(
-    ctx,
-    name: str,
-    source_id: str | None,
-    limit: int,
-    process_now: bool,
-    submitted_by: str | None,
-):
-    """Push local markdown files for a profile into a configured local_markdown source.
-
-    The source id defaults to the one stored in the profile by
-    ``adapter kb add --create-source``; pass ``--source-id`` to override it.
-    """
-    _emit_tool_payload(
-        ctx,
-        _push_kb_profile_payload(
-            ctx,
-            name,
-            source_id=source_id,
-            limit=limit,
-            process_now=process_now,
-            submitted_by=submitted_by,
-        ),
-    )
-
-
-def _push_kb_profile_payload(
-    ctx,
-    name: str,
-    *,
-    source_id: str | None,
-    limit: int,
-    process_now: bool,
-    submitted_by: str | None,
-) -> dict[str, Any]:
-    profiles = _read_adapter_config().get("kb", {})
-    profile = profiles.get(name)
-    if not isinstance(profile, dict):
-        raise click.ClickException(f"Unknown knowledge-base profile: {name}")
-
-    source_id = (source_id or "").strip() or str(profile.get("source_id") or "").strip()
-    if not source_id:
-        raise click.ClickException(
-            "No source id for this profile. Re-run with --source-id, or link one "
-            "with `adapter kb add " + name + " --root <path> --create-source`."
-        )
-    return _push_kb_profile_to_source(
-        name,
-        profile,
-        source_id=source_id,
-        limit=limit,
-        process_now=process_now,
-        submitted_by=submitted_by,
-        client=_tool_client(ctx),
-    )
-
-
 def _push_kb_profile_to_source(
     name: str,
     profile: dict[str, Any],
     *,
     source_id: str,
     limit: int,
-    process_now: bool,
+    force_full_sync: bool,
     submitted_by: str | None,
     client: ToolClient,
+    sync_snapshot_id: str | None = None,
+    local_agent_job_id: str | None = None,
+    local_agent_attempt_count: int | None = None,
 ) -> dict[str, Any]:
     root, include, exclude, vault_id = _resolve_kb_profile(name, profile)
     counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
@@ -3322,8 +2835,7 @@ def _push_kb_profile_to_source(
     entries = _scan_kb_profile(root, include=include, exclude=exclude, counts=counts)
     selected_entries = list(islice(entries, limit)) if limit else list(entries)
 
-    for index, entry in enumerate(selected_entries):
-        is_last = index == len(selected_entries) - 1
+    for entry in selected_entries:
         response = client.push_local_markdown_document(
             source_id=source_id,
             vault_id=vault_id,
@@ -3332,8 +2844,10 @@ def _push_kb_profile_to_source(
             content_type=entry["content_type"],
             title=entry["title"],
             raw_hash=entry["raw_hash"],
+            sync_snapshot_id=sync_snapshot_id,
+            local_agent_job_id=local_agent_job_id,
+            local_agent_attempt_count=local_agent_attempt_count,
             submitted_by=submitted_by,
-            process_now=process_now and is_last,
         )
         if isinstance(response, dict) and response.get("error"):
             failed.append({"relative_path": entry["relative_path"], "error": response.get("error"),
@@ -3354,71 +2868,21 @@ def _push_kb_profile_to_source(
     }
     if failed:
         payload["error"] = "one or more documents failed to push"
+    if not failed:
+        sync_result = client.start_source_processing(
+            source_id=source_id,
+            force_full_sync=force_full_sync,
+            sync_snapshot_id=sync_snapshot_id,
+            local_agent_job_id=local_agent_job_id,
+            local_agent_attempt_count=local_agent_attempt_count,
+        )
+        payload["sync_started"] = not bool(sync_result.get("error"))
+        if sync_result.get("error"):
+            payload["error"] = "source processing failed to start"
+            payload["sync_error"] = sync_result
+    if payload.get("error"):
+        payload["retryable"] = True
     return payload
-
-
-@adapter_kb.command("schedule")
-@click.argument("name")
-@click.option("--every", default="daily", show_default=True, type=click.Choice(list(KB_SCHEDULE_PRESETS)),
-              help="How often to sync. Ignored when --cron is given.")
-@click.option("--at", "at_time", default=None,
-              help="Time of day HH:MM for the daily and weekly presets (default 09:00).")
-@click.option("--cron", "cron_expr", default=None,
-              help="Raw 5-field cron expression. Overrides --every and --at.")
-@click.pass_context
-def adapter_kb_schedule(ctx, name: str, every: str, at_time: str | None, cron_expr: str | None):
-    """Install an OS cron job that runs ``adapter kb push NAME --process-now``.
-
-    Scheduling uses the user crontab today. A background watcher daemon is a
-    planned alternative (see docs/local-repo-sync.md).
-    """
-    name = _validate_kb_profile_name(name)
-    if not isinstance(_read_adapter_config().get("kb", {}).get(name), dict):
-        raise click.ClickException(f"Unknown knowledge-base profile: {name}")
-    try:
-        expr = _render_cron_expr(every=every, at_time=at_time, cron_expr=cron_expr)
-    except ValueError as exc:
-        raise click.ClickException(str(exc))
-    command = _kb_push_command(name)
-    _write_crontab(_apply_crontab_block(_read_crontab(), name, _render_crontab_block(name, expr, command)))
-    data = _read_adapter_config()
-    data.setdefault("kb", {}).setdefault(name, {})["schedule"] = expr
-    _write_adapter_config(data)
-    _emit_tool_payload(ctx, {"ok": True, "profile": name, "cron": expr, "command": command})
-
-
-@adapter_kb.command("schedule-list")
-@click.pass_context
-def adapter_kb_schedule_list(ctx):
-    """List KB sync schedules and whether each cron job is installed."""
-    profiles = _read_adapter_config().get("kb", {})
-    crontab = _read_crontab()
-    schedules = []
-    for name, profile in profiles.items():
-        if not isinstance(profile, dict):
-            continue
-        cron = str(profile.get("schedule") or "").strip()
-        installed = _has_crontab_block(crontab, name)
-        if cron or installed:
-            schedules.append({"profile": name, "cron": cron or None, "installed": installed})
-    _emit_tool_payload(ctx, {"schedules": schedules})
-
-
-@adapter_kb.command("unschedule")
-@click.argument("name")
-@click.pass_context
-def adapter_kb_unschedule(ctx, name: str):
-    """Remove the OS cron job for a KB profile."""
-    name = name.strip()
-    crontab = _read_crontab()
-    removed = _has_crontab_block(crontab, name)
-    if removed:
-        _write_crontab(_remove_crontab_block(crontab, name))
-    data = _read_adapter_config()
-    profile = data.get("kb", {}).get(name)
-    if isinstance(profile, dict) and profile.pop("schedule", None) is not None:
-        _write_adapter_config(data)
-    _emit_tool_payload(ctx, {"ok": True, "profile": name, "removed": removed})
 
 
 def _preview_kb_profile(name: str, profile: dict[str, Any], *, limit: int) -> dict[str, Any]:
@@ -3539,98 +3003,6 @@ def _markdown_title(markdown_body: str) -> str | None:
         if stripped.startswith("# "):
             return stripped[2:].strip() or None
     return None
-
-
-def _render_cron_expr(*, every: str, at_time: str | None = None, cron_expr: str | None = None) -> str:
-    """Resolve a 5-field cron expression from a preset (+ optional time) or a raw expression."""
-    if cron_expr:
-        fields = cron_expr.split()
-        if len(fields) != 5:
-            raise ValueError("--cron must be a 5-field expression, for example '0 9 * * 1'")
-        return " ".join(fields)
-    base = KB_SCHEDULE_PRESETS.get(every)
-    if base is None:
-        raise ValueError(f"Unknown schedule preset: {every}")
-    if at_time and every in ("daily", "weekly"):
-        hour, minute = _parse_hh_mm(at_time)
-        parts = base.split()
-        parts[0], parts[1] = str(minute), str(hour)
-        return " ".join(parts)
-    return base
-
-
-def _parse_hh_mm(value: str) -> tuple[int, int]:
-    try:
-        hh, mm = value.strip().split(":")
-        hour, minute = int(hh), int(mm)
-    except (ValueError, AttributeError):
-        raise ValueError("--at must be a 24-hour time HH:MM, for example 08:30") from None
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ValueError("--at must be a valid 24-hour time HH:MM")
-    return hour, minute
-
-
-def _kb_push_command(name: str) -> str:
-    memforge = shutil.which("memforge") or "memforge"
-    return f"{memforge} adapter kb push {name} --process-now >> $HOME/.memforge/kb-{name}.log 2>&1"
-
-
-def _render_crontab_block(name: str, cron_expr: str, command: str) -> str:
-    return "\n".join([
-        KB_CRON_MARK_START.format(name=name),
-        f"{cron_expr} {command}",
-        KB_CRON_MARK_END.format(name=name),
-    ])
-
-
-def _has_crontab_block(crontab: str, name: str) -> bool:
-    return KB_CRON_MARK_START.format(name=name) in crontab
-
-
-def _strip_crontab_block(crontab: str, name: str) -> str:
-    start = KB_CRON_MARK_START.format(name=name)
-    end = KB_CRON_MARK_END.format(name=name)
-    kept: list[str] = []
-    skipping = False
-    for line in crontab.splitlines():
-        if line.strip() == start:
-            skipping = True
-            continue
-        if skipping:
-            if line.strip() == end:
-                skipping = False
-            continue
-        kept.append(line)
-    return "\n".join(kept).rstrip("\n")
-
-
-def _apply_crontab_block(crontab: str, name: str, block: str) -> str:
-    cleaned = _strip_crontab_block(crontab, name)
-    body = "\n".join(part for part in (cleaned, block) if part)
-    return body + "\n"
-
-
-def _remove_crontab_block(crontab: str, name: str) -> str:
-    cleaned = _strip_crontab_block(crontab, name)
-    return cleaned + "\n" if cleaned else ""
-
-
-def _read_crontab() -> str:
-    try:
-        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-    except FileNotFoundError as exc:
-        raise click.ClickException("`crontab` is not available on this system.") from exc
-    # A missing crontab exits non-zero with a notice on stderr; treat that as empty.
-    return result.stdout if result.returncode == 0 else ""
-
-
-def _write_crontab(content: str) -> None:
-    try:
-        proc = subprocess.run(["crontab", "-"], input=content, capture_output=True, text=True)
-    except FileNotFoundError as exc:
-        raise click.ClickException("`crontab` is not available on this system.") from exc
-    if proc.returncode != 0:
-        raise click.ClickException(f"Failed to update crontab: {proc.stderr.strip()}")
 
 
 @adapter.group("auth")

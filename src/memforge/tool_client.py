@@ -189,9 +189,11 @@ class ToolClient:
         content_type: str = "text/markdown",
         title: str | None = None,
         raw_hash: str | None = None,
+        sync_snapshot_id: str | None = None,
+        local_agent_job_id: str | None = None,
+        local_agent_attempt_count: int | None = None,
         submitted_by: str | None = None,
         submitted_at: str | None = None,
-        process_now: bool = False,
     ) -> dict[str, Any]:
         """Push one file's raw text into a configured local repository source.
 
@@ -207,12 +209,17 @@ class ToolClient:
             "relative_path": relative_path,
             "markdown_body": markdown_body,
             "content_type": content_type,
-            "process_now": process_now,
         }
         if title is not None:
             body["title"] = title
         if raw_hash is not None:
             body["raw_hash"] = raw_hash
+        if sync_snapshot_id is not None:
+            body["sync_snapshot_id"] = sync_snapshot_id
+        if local_agent_job_id is not None:
+            body["local_agent_job_id"] = local_agent_job_id
+        if local_agent_attempt_count is not None:
+            body["local_agent_attempt_count"] = local_agent_attempt_count
         if submitted_by is not None:
             body["submitted_by"] = submitted_by
         if submitted_at is not None:
@@ -235,9 +242,11 @@ class ToolClient:
         title: str | None = None,
         raw_hash: str | None = None,
         blob_sha: str | None = None,
+        sync_snapshot_id: str | None = None,
+        local_agent_job_id: str | None = None,
+        local_agent_attempt_count: int | None = None,
         submitted_by: str | None = None,
         submitted_at: str | None = None,
-        process_now: bool = False,
     ) -> dict[str, Any]:
         """Push one GitHub repository file into a configured github_repo source."""
         source_id = source_id.strip()
@@ -249,7 +258,6 @@ class ToolClient:
             "relative_path": relative_path,
             "markdown_body": markdown_body,
             "content_type": content_type,
-            "process_now": process_now,
         }
         if title is not None:
             body["title"] = title
@@ -257,6 +265,12 @@ class ToolClient:
             body["raw_hash"] = raw_hash
         if blob_sha is not None:
             body["blob_sha"] = blob_sha
+        if sync_snapshot_id is not None:
+            body["sync_snapshot_id"] = sync_snapshot_id
+        if local_agent_job_id is not None:
+            body["local_agent_job_id"] = local_agent_job_id
+        if local_agent_attempt_count is not None:
+            body["local_agent_attempt_count"] = local_agent_attempt_count
         if submitted_by is not None:
             body["submitted_by"] = submitted_by
         if submitted_at is not None:
@@ -277,9 +291,11 @@ class ToolClient:
         source_url: str | None = None,
         title: str | None = None,
         raw_hash: str | None = None,
+        sync_snapshot_id: str | None = None,
+        local_agent_job_id: str | None = None,
+        local_agent_attempt_count: int | None = None,
         submitted_by: str | None = None,
         submitted_at: str | None = None,
-        process_now: bool = False,
     ) -> dict[str, Any]:
         """Push one raw Jira issue package into a configured local-agent source."""
         source_id = source_id.strip()
@@ -289,7 +305,6 @@ class ToolClient:
             "base_url": base_url,
             "issue_key": issue_key,
             "raw_payload": raw_payload,
-            "process_now": process_now,
         }
         if source_url is not None:
             body["source_url"] = source_url
@@ -297,6 +312,12 @@ class ToolClient:
             body["title"] = title
         if raw_hash is not None:
             body["raw_hash"] = raw_hash
+        if sync_snapshot_id is not None:
+            body["sync_snapshot_id"] = sync_snapshot_id
+        if local_agent_job_id is not None:
+            body["local_agent_job_id"] = local_agent_job_id
+        if local_agent_attempt_count is not None:
+            body["local_agent_attempt_count"] = local_agent_attempt_count
         if submitted_by is not None:
             body["submitted_by"] = submitted_by
         if submitted_at is not None:
@@ -320,9 +341,10 @@ class ToolClient:
         window_type: str | None = None,
         source_url: str | None = None,
         raw_hash: str | None = None,
+        local_agent_job_id: str | None = None,
+        local_agent_attempt_count: int | None = None,
         submitted_by: str | None = None,
         submitted_at: str | None = None,
-        process_now: bool = False,
     ) -> dict[str, Any]:
         """Push one raw Teams conversation-window package into a configured Teams source."""
         source_id = source_id.strip()
@@ -333,7 +355,6 @@ class ToolClient:
             "window_id": window_id,
             "revision_hash": revision_hash,
             "raw_payload": raw_payload,
-            "process_now": process_now,
         }
         if title is not None:
             body["title"] = title
@@ -345,6 +366,10 @@ class ToolClient:
             body["source_url"] = source_url
         if raw_hash is not None:
             body["raw_hash"] = raw_hash
+        if local_agent_job_id is not None:
+            body["local_agent_job_id"] = local_agent_job_id
+        if local_agent_attempt_count is not None:
+            body["local_agent_attempt_count"] = local_agent_attempt_count
         if submitted_by is not None:
             body["submitted_by"] = submitted_by
         if submitted_at is not None:
@@ -410,6 +435,28 @@ class ToolClient:
         if not source_id:
             return {"error": "source_id is required"}
         return self._resource_json("GET", f"/sources/{quote(source_id, safe='')}/schedule", None)
+
+    def start_source_processing(
+        self,
+        *,
+        source_id: str,
+        force_full_sync: bool = False,
+        sync_snapshot_id: str | None = None,
+        local_agent_job_id: str | None = None,
+        local_agent_attempt_count: int | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"force_full_sync": force_full_sync}
+        if sync_snapshot_id is not None:
+            body["sync_snapshot_id"] = sync_snapshot_id
+        if local_agent_job_id is not None:
+            body["local_agent_job_id"] = local_agent_job_id
+        if local_agent_attempt_count is not None:
+            body["local_agent_attempt_count"] = local_agent_attempt_count
+        return self._http_json(
+            "POST",
+            f"/api/sources/{quote(source_id, safe='')}/process",
+            body,
+        )
 
     def update_source_schedule(
         self,

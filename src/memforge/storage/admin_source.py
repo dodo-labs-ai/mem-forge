@@ -40,6 +40,13 @@ class SourceAdminReader(Protocol):
         self, source: str | None = None, limit: int = 20
     ) -> list[dict[str, Any]]: ...
 
+    async def get_latest_source_sync_run(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str = "default",
+    ) -> Any | None: ...
+
     async def get_source(self, source_id: str) -> dict[str, Any] | None: ...
 
     async def list_source_projects(

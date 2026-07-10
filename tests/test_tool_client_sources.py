@@ -110,9 +110,9 @@ def test_push_github_repo_document_posts_adapter_payload():
         title="Design",
         raw_hash="raw-1",
         blob_sha="blob-1",
+        sync_snapshot_id="laj-sync-1",
         submitted_by="codex",
         submitted_at="2026-07-07T08:00:00Z",
-        process_now=True,
     )
 
     assert result["package_id"] == "github_repo_document:hash"
@@ -126,10 +126,10 @@ def test_push_github_repo_document_posts_adapter_payload():
                 "relative_path": "docs/design.md",
                 "markdown_body": "# Design",
                 "content_type": "text/markdown",
-                "process_now": True,
                 "title": "Design",
                 "raw_hash": "raw-1",
                 "blob_sha": "blob-1",
+                "sync_snapshot_id": "laj-sync-1",
                 "submitted_by": "codex",
                 "submitted_at": "2026-07-07T08:00:00Z",
             },
@@ -148,9 +148,9 @@ def test_push_jira_package_posts_raw_payload_without_markdown_body():
         raw_payload={"key": "PAY-1", "fields": {"summary": "Payroll task"}},
         title="Payroll task",
         raw_hash="raw-1",
+        sync_snapshot_id="laj-sync-2",
         submitted_by="codex",
         submitted_at="2026-07-07T08:00:00Z",
-        process_now=False,
     )
 
     assert result["doc_id"] == "jira-doc"
@@ -163,9 +163,9 @@ def test_push_jira_package_posts_raw_payload_without_markdown_body():
                 "issue_key": "PAY-1",
                 "source_url": "https://jira.example.test/browse/PAY-1",
                 "raw_payload": {"key": "PAY-1", "fields": {"summary": "Payroll task"}},
-                "process_now": False,
                 "title": "Payroll task",
                 "raw_hash": "raw-1",
+                "sync_snapshot_id": "laj-sync-2",
                 "submitted_by": "codex",
                 "submitted_at": "2026-07-07T08:00:00Z",
             },
@@ -189,7 +189,6 @@ def test_push_teams_window_package_posts_raw_payload_without_markdown_body():
         raw_hash="raw-1",
         submitted_by="codex",
         submitted_at="2026-07-08T08:00:00Z",
-        process_now=True,
     )
 
     assert result["doc_id"] == "teams-doc"
@@ -202,7 +201,6 @@ def test_push_teams_window_package_posts_raw_payload_without_markdown_body():
                 "window_id": "teams-thread:src-teams:conv:root",
                 "revision_hash": "rev-1",
                 "raw_payload": {"messages": [{"id": "root-1", "content": "Decision captured."}]},
-                "process_now": True,
                 "title": "Teams decision",
                 "root_message_id": "root-1",
                 "window_type": "thread",
@@ -226,6 +224,32 @@ def test_start_source_sync_posts_source_sync_payload():
             "POST",
             "/api/sources/src-jira/sync",
             {"force_full_sync": False},
+        )
+    ]
+
+
+def test_start_source_processing_posts_snapshot_identity():
+    client = _RecordingClient({"ok": True})
+
+    result = client.start_source_processing(
+        source_id="src-local",
+        force_full_sync=True,
+        sync_snapshot_id="laj-sync-3",
+        local_agent_job_id="laj-sync",
+        local_agent_attempt_count=3,
+    )
+
+    assert result["ok"] is True
+    assert client.calls == [
+        (
+            "POST",
+            "/api/sources/src-local/process",
+            {
+                "force_full_sync": True,
+                "sync_snapshot_id": "laj-sync-3",
+                "local_agent_job_id": "laj-sync",
+                "local_agent_attempt_count": 3,
+            },
         )
     ]
 

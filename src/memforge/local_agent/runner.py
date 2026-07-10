@@ -9,15 +9,7 @@ import time
 from typing import Any, Callable
 
 from memforge.local_agent.state import LocalAgentStateStore
-from memforge.local_agent.tasks import (
-    LocalAgentHandlers,
-    LocalAgentTask,
-    discover_jira_auth_tasks,
-    discover_profile_tasks,
-    run_local_agent_task,
-)
 
-FAILED_TASK_RETRY_SECONDS = 300
 DEFAULT_CLOUD_JOB_LEASE_SECONDS = 60
 DEFAULT_CLOUD_JOB_HEARTBEAT_INTERVAL_SECONDS = 20
 
@@ -26,24 +18,16 @@ class LocalAgentRunner:
     def __init__(
         self,
         *,
-        adapter_config: dict[str, Any],
-        adapter_config_provider: Callable[[], dict[str, Any]] | None = None,
         state_store: LocalAgentStateStore,
-        handlers: LocalAgentHandlers,
-        jira_origins_provider: Callable[[], dict[str, Any]] | None = None,
+        cloud_job_handler: Callable[[dict[str, Any]], dict[str, Any]],
         cloud_jobs_provider: Callable[..., dict[str, Any]] | None = None,
         cloud_job_completer: Callable[[str, int, str, dict[str, Any], str | None], dict[str, Any]] | None = None,
         cloud_job_heartbeat: Callable[[str, int, int], dict[str, Any]] | None = None,
         cloud_job_lease_seconds: int = DEFAULT_CLOUD_JOB_LEASE_SECONDS,
         cloud_job_heartbeat_interval_seconds: int = DEFAULT_CLOUD_JOB_HEARTBEAT_INTERVAL_SECONDS,
-        default_sync_interval_seconds: int = 3600,
-        jira_interval_seconds: int = 1800,
     ) -> None:
-        self.adapter_config = adapter_config
-        self.adapter_config_provider = adapter_config_provider
         self.state_store = state_store
-        self.handlers = handlers
-        self.jira_origins_provider = jira_origins_provider
+        self.cloud_job_handler = cloud_job_handler
         self.cloud_jobs_provider = cloud_jobs_provider
         self.cloud_job_completer = cloud_job_completer
         self.cloud_job_heartbeat = cloud_job_heartbeat
@@ -55,76 +39,19 @@ class LocalAgentRunner:
             cloud_job_heartbeat_interval_seconds,
             default=DEFAULT_CLOUD_JOB_HEARTBEAT_INTERVAL_SECONDS,
         )
-        self.default_sync_interval_seconds = _positive_seconds(default_sync_interval_seconds, default=3600)
-        self.jira_interval_seconds = _positive_seconds(jira_interval_seconds, default=1800)
-        self._cached_jira_tasks: list[LocalAgentTask] = []
-        self._last_jira_discovery_at: datetime | None = None
-
-    def discover_tasks(self, *, include_jira: bool) -> list[LocalAgentTask]:
-        tasks = discover_profile_tasks(
-            self._adapter_config(),
-            default_interval_seconds=self.default_sync_interval_seconds,
-        )
-        if include_jira:
-            jira_tasks, _ = self._discover_jira_tasks(datetime.now(timezone.utc), only_due=False)
-            tasks.extend(jira_tasks)
-        return tasks
 
     def run_once(
         self,
         *,
         now: datetime | None = None,
-        include_jira: bool = True,
-        only_due: bool = False,
-    ) -> dict[str, Any]:
-        now = now or datetime.now(timezone.utc)
-        results: list[dict[str, Any]] = []
-        results.extend(self._run_scheduled_tasks(now=now, include_jira=include_jira, only_due=only_due))
-        results.extend(self._run_cloud_jobs(now=now, wait_seconds=0))
-        return _runner_report(results)
-
-    def run_cloud_jobs_once(
-        self,
-        *,
-        now: datetime | None = None,
         wait_seconds: int = 0,
     ) -> dict[str, Any]:
-        """Lease and execute only Cloud-triggered jobs.
-
-        This is the interactive control-plane path used by the foreground
-        daemon loop. It intentionally skips scheduled local profile/Jira tasks
-        so UI-triggered work is not tied to source sync cadence.
-        """
+        """Lease and execute one batch of server-owned local-agent jobs."""
         results = self._run_cloud_jobs(
             now=now or datetime.now(timezone.utc),
             wait_seconds=wait_seconds,
         )
         return _runner_report(results)
-
-    def _run_scheduled_tasks(
-        self,
-        *,
-        now: datetime,
-        include_jira: bool,
-        only_due: bool,
-    ) -> list[dict[str, Any]]:
-        tasks = self.discover_tasks(include_jira=False)
-        results: list[dict[str, Any]] = []
-        if include_jira:
-            jira_tasks, discovery_result = self._discover_jira_tasks(now, only_due=only_due)
-            tasks.extend(jira_tasks)
-            if discovery_result is not None:
-                self.state_store.record_result(discovery_result["task_id"], discovery_result)
-                results.append(discovery_result)
-        state = self.state_store.load()
-        for task in tasks:
-            if only_due and not _task_due(task, state, now):
-                results.append(_skipped_result(task, now, reason="not_due"))
-                continue
-            result = self._run_task(task, now, _previous_state_result(state, task.task_id))
-            self.state_store.record_result(task.task_id, result)
-            results.append(result)
-        return results
 
     def _run_cloud_jobs(
         self,
@@ -146,7 +73,6 @@ class LocalAgentRunner:
     def run_forever(
         self,
         *,
-        include_jira: bool = True,
         poll_interval_seconds: int = 60,
         cloud_job_wait_seconds: int = 0,
         stop_after_iterations: int | None = None,
@@ -157,14 +83,10 @@ class LocalAgentRunner:
         while True:
             iteration_failed = False
             try:
-                if int(cloud_job_wait_seconds) <= 0:
-                    self.run_once(include_jira=include_jira, only_due=True)
-                    cloud_results = []
-                else:
-                    cloud_results = self._run_cloud_jobs(
-                        now=datetime.now(timezone.utc),
-                        wait_seconds=max(int(cloud_job_wait_seconds), 0),
-                    )
+                cloud_results = self._run_cloud_jobs(
+                    now=datetime.now(timezone.utc),
+                    wait_seconds=max(int(cloud_job_wait_seconds), 0),
+                )
             except Exception as exc:
                 iteration_failed = True
                 cloud_results = []
@@ -187,51 +109,6 @@ class LocalAgentRunner:
             ):
                 sleep(max(int(poll_interval_seconds), 1))
 
-    def _run_task(
-        self,
-        task: LocalAgentTask,
-        now: datetime,
-        previous_result: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        started_at = now.isoformat()
-        try:
-            payload = run_local_agent_task(task, self.handlers, previous_result=previous_result)
-            error = _payload_error(task, payload)
-            if error:
-                return {
-                    "task_id": task.task_id,
-                    "kind": task.kind,
-                    "profile_name": task.profile_name,
-                    "origin": task.origin,
-                    "status": "failed",
-                    "started_at": started_at,
-                    "finished_at": datetime.now(timezone.utc).isoformat(),
-                    "error": error,
-                    "payload": payload,
-                }
-            return {
-                "task_id": task.task_id,
-                "kind": task.kind,
-                "profile_name": task.profile_name,
-                "origin": task.origin,
-                "status": "success",
-                "started_at": started_at,
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-                "payload": payload,
-            }
-        except Exception as exc:  # daemon keeps other tasks alive
-            return {
-                "task_id": task.task_id,
-                "kind": task.kind,
-                "profile_name": task.profile_name,
-                "origin": task.origin,
-                "status": "failed",
-                "started_at": started_at,
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-                "error": str(exc),
-                "error_type": type(exc).__name__,
-            }
-
     def _run_cloud_job(self, job: dict[str, Any], now: datetime) -> dict[str, Any]:
         job_id = str(job.get("job_id") or "").strip()
         task_id = f"cloud-job:{job_id or 'unknown'}"
@@ -241,8 +118,6 @@ class LocalAgentRunner:
         attempt_count = _job_attempt_count(job)
         if attempt_count is None:
             return _cloud_job_failed_result(task_id, started_at, "cloud job is missing attempt_count")
-        if self.handlers.run_cloud_job is None:
-            return _cloud_job_failed_result(task_id, started_at, "cloud job handler is not configured")
         try:
             self.state_store.record_running(
                 task_id,
@@ -270,7 +145,7 @@ class LocalAgentRunner:
                 lease_seconds=self.cloud_job_lease_seconds,
                 interval_seconds=self.cloud_job_heartbeat_interval_seconds,
             ) as heartbeat:
-                payload = self.handlers.run_cloud_job(job)
+                payload = self.cloud_job_handler(job)
             heartbeat_errors = heartbeat.errors
             if heartbeat_errors:
                 payload = dict(payload)
@@ -307,7 +182,13 @@ class LocalAgentRunner:
             return result
         except Exception as exc:  # cloud jobs must not stop the daemon loop
             error = str(exc)
-            completion_error = self._complete_cloud_job(job_id, attempt_count, "failed", {}, error)
+            completion_error = self._complete_cloud_job(
+                job_id,
+                attempt_count,
+                "failed",
+                {"retryable": isinstance(exc, (ConnectionError, TimeoutError))},
+                error,
+            )
             if completion_error:
                 error = f"{error}; completion failed: {completion_error}"
             return {
@@ -336,7 +217,7 @@ class LocalAgentRunner:
                 wait_seconds=wait_seconds,
                 lease_seconds=self.cloud_job_lease_seconds,
             )
-        except Exception as exc:  # cloud polling must not block local profile work
+        except Exception as exc:  # a failed lease must not stop the daemon loop
             started_at = now.isoformat()
             return [], _cloud_job_failed_result(
                 "cloud-jobs:lease",
@@ -353,7 +234,12 @@ class LocalAgentRunner:
             )
         jobs = response.get("jobs") if isinstance(response, dict) else None
         if not isinstance(jobs, list):
-            return [], None
+            return [], _cloud_job_failed_result(
+                "cloud-jobs:lease",
+                now.isoformat(),
+                "malformed local-agent lease response: jobs must be a list",
+                error_type="CloudJobLeaseError",
+            )
         valid_jobs = [job for job in jobs if isinstance(job, dict)]
         finished_at = datetime.now(timezone.utc).isoformat()
         return valid_jobs, {
@@ -384,54 +270,6 @@ class LocalAgentRunner:
                 return str(exc)
         return None
 
-    def _discover_jira_tasks(
-        self,
-        now: datetime,
-        *,
-        only_due: bool,
-    ) -> tuple[list[LocalAgentTask], dict[str, Any] | None]:
-        if self.jira_origins_provider is None:
-            return [], None
-        if (
-            only_due
-            and self._last_jira_discovery_at is not None
-            and (now - self._last_jira_discovery_at).total_seconds() < self.jira_interval_seconds
-        ):
-            return list(self._cached_jira_tasks), None
-        try:
-            tasks = discover_jira_auth_tasks(
-                self.jira_origins_provider(),
-                default_interval_seconds=self.jira_interval_seconds,
-            )
-            self._cached_jira_tasks = list(tasks)
-            self._last_jira_discovery_at = now
-            return tasks, None
-        except Exception as exc:
-            if self._cached_jira_tasks:
-                self._last_jira_discovery_at = now
-            return list(self._cached_jira_tasks), _discovery_failed_result(now, exc)
-
-    def _adapter_config(self) -> dict[str, Any]:
-        if self.adapter_config_provider is not None:
-            return self.adapter_config_provider()
-        return self.adapter_config
-
-
-def _payload_error(task: LocalAgentTask, payload: dict[str, Any]) -> str | None:
-    error = payload.get("error")
-    if error:
-        return str(error)
-    if task.kind == "jira_auth":
-        ok = payload.get("ok")
-        if ok is False:
-            action = str(payload.get("action") or "unknown").strip() or "unknown"
-            return f"Jira browser-session refresh returned {action}"
-        action = str(payload.get("action") or "").strip()
-        if action and action not in {"uploaded", "unchanged"}:
-            return f"Jira browser-session refresh returned {action}"
-    return None
-
-
 def _runner_report(results: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "status": "ok",
@@ -439,7 +277,6 @@ def _runner_report(results: list[dict[str, Any]]) -> dict[str, Any]:
             "total": len(results),
             "success": sum(1 for item in results if item["status"] == "success"),
             "failed": sum(1 for item in results if item["status"] == "failed"),
-            "skipped": sum(1 for item in results if item["status"] == "skipped"),
         },
         "results": results,
     }
@@ -528,29 +365,6 @@ def _call_cloud_jobs_provider(
     return provider()
 
 
-def _previous_state_result(state: dict[str, Any], task_id: str) -> dict[str, Any] | None:
-    tasks = state.get("tasks") if isinstance(state.get("tasks"), dict) else {}
-    entry = tasks.get(task_id) if isinstance(tasks, dict) else None
-    if not isinstance(entry, dict):
-        return None
-    result = entry.get("last_result")
-    return result if isinstance(result, dict) else None
-
-
-def _discovery_failed_result(now: datetime, exc: Exception) -> dict[str, Any]:
-    return {
-        "task_id": "jira-auth:discovery",
-        "kind": "jira_auth",
-        "profile_name": None,
-        "origin": None,
-        "status": "failed",
-        "started_at": now.isoformat(),
-        "finished_at": datetime.now(timezone.utc).isoformat(),
-        "error": str(exc),
-        "error_type": type(exc).__name__,
-    }
-
-
 def _runner_failed_result(now: datetime, exc: Exception) -> dict[str, Any]:
     return {
         "task_id": "runner:error",
@@ -608,43 +422,6 @@ def _api_error_message(response: dict[str, Any]) -> str:
     if detail:
         parts.append(detail)
     return ": ".join(parts)
-
-
-def _skipped_result(task: LocalAgentTask, now: datetime, *, reason: str) -> dict[str, Any]:
-    return {
-        "task_id": task.task_id,
-        "kind": task.kind,
-        "profile_name": task.profile_name,
-        "origin": task.origin,
-        "status": "skipped",
-        "reason": reason,
-        "started_at": now.isoformat(),
-        "finished_at": now.isoformat(),
-    }
-
-
-def _task_due(task: LocalAgentTask, state: dict[str, Any], now: datetime) -> bool:
-    tasks = state.get("tasks") if isinstance(state.get("tasks"), dict) else {}
-    entry = tasks.get(task.task_id) if isinstance(tasks, dict) else None
-    if not isinstance(entry, dict):
-        return True
-    if entry.get("last_status") == "failed":
-        retry_seconds = min(task.interval_seconds, FAILED_TASK_RETRY_SECONDS)
-        return _finished_at_elapsed(entry, now, retry_seconds)
-    return _finished_at_elapsed(entry, now, task.interval_seconds)
-
-
-def _finished_at_elapsed(entry: dict[str, Any], now: datetime, seconds: int) -> bool:
-    finished_at = str(entry.get("last_finished_at") or "").strip()
-    if not finished_at:
-        return True
-    try:
-        previous = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
-    except ValueError:
-        return True
-    if previous.tzinfo is None or previous.utcoffset() is None:
-        previous = previous.replace(tzinfo=timezone.utc)
-    return (now - previous).total_seconds() >= seconds
 
 
 def _positive_seconds(value: Any, *, default: int) -> int:
