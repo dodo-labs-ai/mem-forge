@@ -16,6 +16,11 @@ LOCAL_AGENT_SYNC_OPERATIONS = frozenset(
     }
 )
 
+_IMMUTABLE_EXECUTION_MODE_FIELDS = {
+    "github_repo": ("connection_mode",),
+    "jira": ("sync_mode",),
+}
+
 
 def _source_config(value: object) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
@@ -60,6 +65,22 @@ def is_local_agent_backed_source(source: Mapping[str, Any]) -> bool:
         )
         is not None
     )
+
+
+def source_execution_descriptor(
+    source_type: str,
+    config: Mapping[str, Any] | str | None,
+) -> dict[str, Any]:
+    """Return the canonical execution contract exposed to source clients."""
+    normalized_type = str(source_type or "").strip().lower()
+    operation = local_agent_sync_operation(normalized_type, config)
+    return {
+        "kind": "local_agent" if operation is not None else "server",
+        "operation": operation,
+        "immutable_config_fields": list(
+            _IMMUTABLE_EXECUTION_MODE_FIELDS.get(normalized_type, ())
+        ),
+    }
 
 
 def execution_owner_user_id(source: Mapping[str, Any]) -> str | None:

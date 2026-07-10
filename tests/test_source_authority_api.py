@@ -296,6 +296,17 @@ def test_local_source_creator_becomes_execution_owner_and_client_cannot_override
         assert source is not None
         assert source["created_by_user_id"] == "owner-a"
         assert source["execution_owner_user_id"] == "owner-a"
+        with TestClient(app) as client:
+            listed = client.get(
+                "/api/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+            )
+        assert listed.status_code == 200, listed.text
+        assert listed.json()["data"][0]["execution"] == {
+            "kind": "local_agent",
+            "operation": "teams_sync",
+            "immutable_config_fields": [],
+        }
     finally:
         asyncio.run(database.close())
 

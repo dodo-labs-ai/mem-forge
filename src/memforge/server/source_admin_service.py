@@ -7,6 +7,7 @@ from typing import Any
 from memforge.local_agent.source_contract import (
     execution_owner_user_id,
     is_local_agent_backed_source,
+    source_execution_descriptor,
 )
 from memforge.storage.admin_source import SourceAdminReader
 
@@ -97,6 +98,10 @@ async def list_source_admin_rows(
         )
         row["ownership"] = ownership
         row["capabilities"] = capabilities
+        row["execution"] = source_execution_descriptor(
+            str(row.get("type") or ""),
+            row.get("config"),
+        )
         enabled_for_me = await reader.is_source_enabled_for_user(source_id, viewer_id)
         row["subscription"] = {"enabled": enabled_for_me}
         row["enabled_for_me"] = enabled_for_me

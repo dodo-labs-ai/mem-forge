@@ -395,7 +395,7 @@ function SourceConfigForm({
                       hasExistingSecret={Boolean(config[`${field.key}_configured`])}
                       decryptFailed={Boolean(config[`${field.key}_decrypt_failed`])}
                       required={isFieldRequired(sourceType, field, config)}
-                      disabled={isEdit && isImmutableExecutionModeField(sourceType, field.key)}
+                      disabled={source ? isImmutableExecutionModeField(source, field.key) : false}
                       onChange={(value) => updateField(field, value)}
                     />
                     {sourceType === "confluence" && field.key === "base_url" && confluenceUrlInfo && (

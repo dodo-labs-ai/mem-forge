@@ -148,6 +148,12 @@ export interface SourceSyncSchedule {
   updated_at: string | null;
 }
 
+export interface SourceExecution {
+  kind: "server" | "local_agent";
+  operation: string | null;
+  immutable_config_fields: string[];
+}
+
 export interface Source {
   id: string;
   type: string;
@@ -175,6 +181,7 @@ export interface Source {
   project_binding?: ProjectBinding | null;
   ownership?: SourceOwnership;
   capabilities?: SourceCapabilities;
+  execution?: SourceExecution;
   subscription?: SourceSubscription;
   /** Convenience mirror of `subscription.enabled` for the current viewer. */
   enabled_for_me?: boolean;
