@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -15,11 +16,12 @@ from memforge.auth import browser_session
 from memforge.genes import GENE_REGISTRY, create_gene
 from memforge.llm.providers import is_litellm_provider_model
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
+from memforge.local_agent.source_contract import source_with_sync_inputs
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.health import MemoryIndexHealthChecker, MemoryIndexHealthReport
 from memforge.memory.store import MemoryStore
-from memforge.models import SyncState
+from memforge.models import SourceSyncRun, SyncState
 from memforge.pipeline.enricher import Enricher
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.source_support_detector import SourceSupportDetector
@@ -48,6 +50,10 @@ class SyncAlreadyRunningError(RuntimeError):
 
 class SourcePausedError(RuntimeError):
     """Raised when sync is requested for a paused source."""
+
+
+class SourceSyncLeaseLost(RuntimeError):
+    """Raised when a worker no longer owns the leased source-sync run."""
 
 
 @dataclass
@@ -586,6 +592,247 @@ async def run_source_sync(
     )
 
 
+class SourceSyncWorker:
+    """Durable source-sync worker that leases and executes one run at a time."""
+
+    def __init__(
+        self,
+        db: "Database",
+        config: AppConfig,
+        runtime_provider: RuntimeProvider | None = None,
+        *,
+        worker_id: str = "source-sync-worker",
+        workspace_id: str | None = None,
+        lease_seconds: int = 300,
+        heartbeat_seconds: float | None = None,
+    ) -> None:
+        self.db = db
+        self.config = config
+        self.runtime_provider = runtime_provider or DefaultRuntimeProvider()
+        self.worker_id = worker_id
+        self.workspace_id = workspace_id
+        self.lease_seconds = lease_seconds
+        self.heartbeat_seconds = (
+            max(0.001, float(heartbeat_seconds))
+            if heartbeat_seconds is not None
+            else max(1.0, min(30.0, lease_seconds / 3))
+        )
+        max_extraction_workers = max(0, int(config.sync.max_extraction_workers))
+        self._extraction_pool = (
+            ExtractionWorkPool(max_extraction_workers)
+            if max_extraction_workers
+            else None
+        )
+        max_document_lifecycles = max(0, int(config.sync.max_document_lifecycles))
+        self._document_lifecycle_admission = get_process_document_lifecycle_admission(max_document_lifecycles)
+
+    async def _heartbeat_until_stopped(
+        self,
+        run: SourceSyncRun,
+        stop: asyncio.Event,
+        lease_lost: asyncio.Event,
+    ) -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self.heartbeat_seconds)
+                return
+            except asyncio.TimeoutError:
+                try:
+                    renewed = await self.db.heartbeat_source_sync_run(
+                        run.run_id,
+                        worker_id=self.worker_id,
+                        lease_attempt_count=run.lease_attempt_count,
+                        lease_seconds=self.lease_seconds,
+                    )
+                except Exception:
+                    logger.exception("Source sync worker heartbeat failed for run %s", run.run_id)
+                    lease_lost.set()
+                    return
+                if not renewed:
+                    logger.warning("Source sync worker lost lease for run %s", run.run_id)
+                    lease_lost.set()
+                    return
+
+    async def _run_source_sync_with_heartbeat(self, run: SourceSyncRun, **kwargs: Any) -> SyncState | None:
+        stop = asyncio.Event()
+        lease_lost = asyncio.Event()
+        heartbeat_task = asyncio.create_task(self._heartbeat_until_stopped(run, stop, lease_lost))
+        sync_task = asyncio.create_task(self.runtime_provider.run_source_sync(**kwargs))
+        try:
+            done, _ = await asyncio.wait(
+                {sync_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done and lease_lost.is_set():
+                sync_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await sync_task
+                raise SourceSyncLeaseLost(f"source sync lease lost for run {run.run_id}")
+            result = await sync_task
+            if lease_lost.is_set():
+                raise SourceSyncLeaseLost(f"source sync lease lost for run {run.run_id}")
+            return result
+        finally:
+            stop.set()
+            if not sync_task.done():
+                sync_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await sync_task
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+
+    def _next_retry_at(self, run: SourceSyncRun, failed_at: datetime) -> datetime | None:
+        if run.lease_attempt_count >= self.config.sync.worker_max_attempts:
+            return None
+        exponent = max(0, run.lease_attempt_count - 1)
+        delay = min(
+            self.config.sync.worker_retry_max_seconds,
+            self.config.sync.worker_retry_base_seconds * (2 ** exponent),
+        )
+        return failed_at + timedelta(seconds=delay)
+
+    async def run_once(self) -> SourceSyncRun | None:
+        run = await self.db.lease_next_source_sync_run(
+            worker_id=self.worker_id,
+            workspace_id=self.workspace_id,
+            lease_seconds=self.lease_seconds,
+        )
+        if run is None:
+            return None
+
+        source: dict | None = None
+        try:
+            source = await self.db.get_source(run.source_id)
+            if source is None:
+                failed = await self.db.fail_source_sync_run(
+                    run.run_id,
+                    worker_id=self.worker_id,
+                    lease_attempt_count=run.lease_attempt_count,
+                    error_message=f"Source not found: {run.source_id}",
+                    retryable=False,
+                )
+                if not failed:
+                    raise SourceSyncLeaseLost(
+                        f"source sync lease lost before missing-source update for run {run.run_id}"
+                    )
+                return run
+            if source.get("status") == "paused":
+                failed = await self.db.fail_source_sync_run(
+                    run.run_id,
+                    worker_id=self.worker_id,
+                    lease_attempt_count=run.lease_attempt_count,
+                    error_message=f"Source is paused: {run.source_id}",
+                    retryable=False,
+                )
+                if not failed:
+                    raise SourceSyncLeaseLost(
+                        f"source sync lease lost before paused-source update for run {run.run_id}"
+                    )
+                return run
+
+            inputs = await self.db.list_source_sync_inputs(
+                source_id=run.source_id,
+                workspace_id=run.workspace_id,
+                input_snapshot_id=run.input_snapshot_id,
+            )
+            source = source_with_sync_inputs(
+                source,
+                inputs,
+                authoritative_snapshot=run.input_snapshot_id is not None,
+            )
+
+            runtime = await self.runtime_provider.build_sync_runtime(
+                self.db,
+                self.config,
+                extraction_pool=self._extraction_pool,
+                document_lifecycle_admission=self._document_lifecycle_admission,
+            )
+            final_state = await self._run_source_sync_with_heartbeat(
+                run,
+                db=self.db,
+                config=self.config,
+                source=source,
+                runtime=runtime,
+                progress_callback=None,
+                force_full_sync=(
+                    run.force_full_sync or run.input_snapshot_id is not None
+                ),
+            )
+            if final_state is None:
+                final_state = SyncState(
+                    source=run.source_id,
+                    last_sync_at=datetime.now(timezone.utc),
+                    last_sync_status="failed",
+                    error_message="sync completed without final state",
+                )
+            if final_state.last_sync_status in {"failed", "partial"}:
+                error_message = final_state.error_message or "source sync failed"
+                failed_at = datetime.now(timezone.utc)
+                next_attempt_at = self._next_retry_at(run, failed_at)
+                failed = await self.db.fail_source_sync_run(
+                    run.run_id,
+                    worker_id=self.worker_id,
+                    lease_attempt_count=run.lease_attempt_count,
+                    error_message=error_message,
+                    final_state=final_state,
+                    retryable=next_attempt_at is not None,
+                    failed_at=failed_at,
+                    next_attempt_at=next_attempt_at,
+                )
+                if not failed:
+                    raise SourceSyncLeaseLost(
+                        f"source sync lease lost before failure update for run {run.run_id}"
+                    )
+                return run
+            completed = await self.db.complete_source_sync_run(
+                run.run_id,
+                worker_id=self.worker_id,
+                lease_attempt_count=run.lease_attempt_count,
+                final_state=final_state,
+            )
+            if not completed:
+                raise SourceSyncLeaseLost(
+                    f"source sync lease lost before completion for run {run.run_id}"
+                )
+            return run
+        except asyncio.CancelledError:
+            raise
+        except SourceSyncLeaseLost:
+            logger.warning("Source sync worker stopped terminal update after losing lease for run %s", run.run_id)
+            return run
+        except Exception as exc:
+            logger.exception("Source sync worker failed run %s", run.run_id)
+            if source and "browser session" in str(exc).lower():
+                await browser_session.mark_expired_for_source(
+                    self.db,
+                    source.get("type", ""),
+                    str(source.get("config", {}).get("base_url") or ""),
+                    str(exc),
+                )
+            failed_at = datetime.now(timezone.utc)
+            next_attempt_at = self._next_retry_at(run, failed_at)
+            retryable = not isinstance(exc, SourcePausedError) and next_attempt_at is not None
+            failed = await self.db.fail_source_sync_run(
+                run.run_id,
+                worker_id=self.worker_id,
+                lease_attempt_count=run.lease_attempt_count,
+                error_message=str(exc),
+                retryable=retryable,
+                failed_at=failed_at,
+                next_attempt_at=next_attempt_at,
+            )
+            if not failed:
+                logger.warning("Source sync worker stopped failure update after losing lease for run %s", run.run_id)
+            return run
+
+    async def run_forever(self, *, poll_seconds: float | None = None) -> None:
+        interval = max(0.1, poll_seconds if poll_seconds is not None else self.config.sync.worker_poll_seconds)
+        while True:
+            run = await self.run_once()
+            await asyncio.sleep(0 if run is not None else interval)
+
+
 class SyncService:
     """App-scoped sync runner with task tracking and shutdown cleanup."""
 
@@ -599,7 +846,6 @@ class SyncService:
         self.config = config
         self.runtime_provider = runtime_provider or DefaultRuntimeProvider()
         self.tasks: dict[str, asyncio.Task] = {}
-        self.queued_tasks: dict[str, asyncio.Task] = {}
         self.progress: dict[str, dict] = {}
         max_active_sources = max(0, int(config.sync.max_active_sources))
         self._source_slots = (
@@ -618,13 +864,6 @@ class SyncService:
         task = self.tasks.get(source_id)
         return bool(task and not task.done())
 
-    def running_source_ids(self) -> set[str]:
-        return {
-            source_id
-            for source_id, task in self.tasks.items()
-            if task and not task.done()
-        }
-
     async def _ensure_source_can_sync(self, source_id: str) -> dict:
         source = await self.db.get_source(source_id)
         if source is None:
@@ -632,6 +871,24 @@ class SyncService:
         if source.get("status") == "paused":
             raise SourcePausedError(f"Source is paused: {source_id}")
         return source
+
+    async def enqueue_source(
+        self,
+        source_id: str,
+        *,
+        trigger: str = "manual",
+        force_full_sync: bool = False,
+        workspace_id: str = "default",
+        input_snapshot_id: str | None = None,
+    ) -> SourceSyncRun:
+        await self._ensure_source_can_sync(source_id)
+        return await self.db.enqueue_source_sync_run(
+            source_id=source_id,
+            workspace_id=workspace_id,
+            trigger=trigger,
+            force_full_sync=force_full_sync,
+            input_snapshot_id=input_snapshot_id,
+        )
 
     async def start_source(self, source_id: str, *, force_full_sync: bool = False) -> asyncio.Task:
         await self._ensure_source_can_sync(source_id)
@@ -683,44 +940,20 @@ class SyncService:
                 self.progress.pop(source_id, None)
 
     async def request_source_sync(self, source_id: str, *, delay_seconds: float = 1.0) -> bool:
-        """Queue one service-owned sync pass for a source, coalescing duplicates."""
+        """Queue one durable sync pass for a source, coalescing duplicates."""
+        del delay_seconds
         try:
-            await self._ensure_source_can_sync(source_id)
+            run = await self.enqueue_source(source_id, trigger="request")
         except SourcePausedError:
             return False
-        queued = self.queued_tasks.get(source_id)
-        if queued and not queued.done():
-            return False
-        task = asyncio.create_task(self._run_queued_source_sync(source_id, delay_seconds=delay_seconds))
-        self.queued_tasks[source_id] = task
-        return True
-
-    async def _run_queued_source_sync(self, source_id: str, *, delay_seconds: float) -> None:
-        try:
-            await asyncio.sleep(delay_seconds)
-            active = self.tasks.get(source_id)
-            if active and not active.done():
-                await active
-            try:
-                await self.start_source(source_id)
-            except (SourcePausedError, SyncAlreadyRunningError):
-                return
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Queued sync failed for source %s", source_id)
-        finally:
-            self.queued_tasks.pop(source_id, None)
+        return not run.coalesced
 
     async def run_all_active_sources(self) -> None:
         sources = await self.db.list_sources()
         for source in sources:
             if source.get("status") != "active":
                 continue
-            if self.is_running(source["id"]):
-                continue
-            task = await self.start_source(source["id"])
-            await task
+            await self.enqueue_source(source["id"], trigger="schedule_all")
 
     async def retire_expired_memories(self) -> int:
         runtime = await self.runtime_provider.build_sync_runtime(self.db, self.config)
@@ -746,16 +979,6 @@ class SyncService:
         self.progress.pop(source_id, None)
 
     async def shutdown(self) -> None:
-        queued_tasks = list(self.queued_tasks.values())
-        self.queued_tasks.clear()
-        for task in queued_tasks:
-            if task.done():
-                continue
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
         source_ids = list(self.tasks)
         for source_id in source_ids:
             await self.cancel_source(source_id)

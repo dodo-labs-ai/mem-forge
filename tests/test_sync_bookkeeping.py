@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -32,6 +34,7 @@ from memforge.pipeline.sync import (
 from memforge.runtime import SyncService
 from memforge.config import AppConfig, SyncConfig
 from memforge.storage.database import Database
+from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.scheduler import SyncScheduler
 
@@ -42,6 +45,838 @@ async def db(tmp_path):
     await database.connect()
     yield database
     await database.close()
+
+
+def test_local_agent_broker_has_its_own_forward_migration() -> None:
+    version, description, statements = next(
+        migration for migration in MIGRATIONS if migration[0] == 37
+    )
+
+    assert version == 37
+    assert description == "Add local agent job broker"
+    assert any("CREATE TABLE IF NOT EXISTS local_agent_jobs" in sql for sql in statements)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_migration_upgrades_database_that_already_recorded_migration_36(
+    tmp_path,
+) -> None:
+    path = tmp_path / "pre-snapshot.db"
+    database = Database(str(path))
+    await database.connect()
+    await database.close()
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE source_sync_snapshot_items")
+        conn.execute("ALTER TABLE source_sync_runs DROP COLUMN input_snapshot_id")
+        conn.execute("ALTER TABLE source_sync_runs DROP COLUMN rerun_input_snapshot_id")
+        conn.execute("DELETE FROM schema_migrations WHERE version = 38")
+        conn.commit()
+
+    upgraded = Database(str(path))
+    await upgraded.connect()
+    try:
+        columns = {
+            row["name"]
+            for row in await (
+                await upgraded.db.execute("PRAGMA table_info(source_sync_runs)")
+            ).fetchall()
+        }
+        table = await (
+            await upgraded.db.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'source_sync_snapshot_items'"
+            )
+        ).fetchone()
+    finally:
+        await upgraded.close()
+
+    assert {"input_snapshot_id", "rerun_input_snapshot_id"} <= columns
+    assert table is not None
+
+
+@pytest.mark.asyncio
+async def test_latest_source_sync_run_is_scoped_to_source_and_workspace(db: Database):
+    await db.upsert_source(
+        id="src-latest-a",
+        type="jira",
+        name="Latest A",
+        config_json="{}",
+    )
+    await db.upsert_source(
+        id="src-latest-b",
+        type="jira",
+        name="Latest B",
+        config_json="{}",
+    )
+    first = await db.enqueue_source_sync_run(
+        source_id="src-latest-a",
+        workspace_id="ws-a",
+    )
+    await db.enqueue_source_sync_run(
+        source_id="src-latest-b",
+        workspace_id="ws-a",
+    )
+
+    latest = await db.get_latest_source_sync_run(
+        source_id="src-latest-a",
+        workspace_id="ws-a",
+    )
+    missing = await db.get_latest_source_sync_run(
+        source_id="src-latest-a",
+        workspace_id="ws-b",
+    )
+
+    assert latest is not None
+    assert latest.run_id == first.run_id
+    assert missing is None
+
+
+@pytest.mark.asyncio
+async def test_enqueue_source_sync_run_coalesces_by_workspace_and_source(db: Database):
+    await db.upsert_source(
+        id="src-sync-run",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+
+    first = await db.enqueue_source_sync_run(
+        source_id="src-sync-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    second = await db.enqueue_source_sync_run(
+        source_id="src-sync-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    other_workspace = await db.enqueue_source_sync_run(
+        source_id="src-sync-run",
+        workspace_id="workspace-b",
+        trigger="manual",
+    )
+
+    assert second.run_id == first.run_id
+    assert second.coalesced is True
+    assert other_workspace.run_id != first.run_id
+    assert first.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_enqueue_source_sync_run_promotes_force_intent_on_active_run(db: Database):
+    await db.upsert_source(
+        id="src-force-run",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+
+    first = await db.enqueue_source_sync_run(
+        source_id="src-force-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc),
+    )
+    force = await db.enqueue_source_sync_run(
+        source_id="src-force-run",
+        workspace_id="workspace-a",
+        trigger="force",
+        force_full_sync=True,
+    )
+
+    assert force.run_id == first.run_id
+    assert force.coalesced is True
+    assert force.force_full_sync is True
+    assert force.rerun_requested is True
+
+
+@pytest.mark.asyncio
+async def test_duplicate_manual_trigger_does_not_schedule_successor_for_running_run(db: Database):
+    await db.upsert_source(
+        id="src-running-manual",
+        type="confluence",
+        name="Running manual",
+        config_json="{}",
+    )
+    first = await db.enqueue_source_sync_run(
+        source_id="src-running-manual",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc),
+    )
+    duplicate = await db.enqueue_source_sync_run(
+        source_id="src-running-manual",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+
+    assert leased is not None
+    assert duplicate.run_id == first.run_id
+    assert duplicate.coalesced is True
+    assert duplicate.rerun_requested is False
+
+
+@pytest.mark.asyncio
+async def test_duplicate_snapshot_does_not_schedule_running_successor(db: Database):
+    await db.upsert_source(id="src-same-snapshot", type="github_repo", name="Repo", config_json="{}")
+    first = await db.enqueue_source_sync_run(
+        source_id="src-same-snapshot",
+        input_snapshot_id="snapshot-a",
+    )
+    await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc),
+    )
+    duplicate = await db.enqueue_source_sync_run(
+        source_id="src-same-snapshot",
+        trigger="local_agent",
+        input_snapshot_id="snapshot-a",
+    )
+
+    assert duplicate.run_id == first.run_id
+    assert duplicate.rerun_requested is False
+
+
+@pytest.mark.asyncio
+async def test_lease_next_source_sync_run_recovers_expired_run_without_new_run(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-lease-run",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-lease-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+
+    first = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    before_expiry = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=30),
+    )
+    recovered = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=90),
+    )
+
+    assert first is not None
+    assert first.run_id == enqueued.run_id
+    assert first.status == "running"
+    assert first.lease_owner == "worker-a"
+    assert first.lease_attempt_count == 1
+    assert first.recovery_count == 0
+    assert before_expiry is None
+    assert recovered is not None
+    assert recovered.run_id == enqueued.run_id
+    assert recovered.lease_owner == "worker-b"
+    assert recovered.lease_attempt_count == 2
+    assert recovered.recovery_count == 1
+
+
+@pytest.mark.asyncio
+async def test_source_sync_run_lease_is_compare_and_swap_across_connections(tmp_path):
+    path = tmp_path / "shared-sync.db"
+    first_db = Database(str(path))
+    second_db = Database(str(path))
+    await first_db.connect()
+    await second_db.connect()
+    try:
+        await first_db.upsert_source(
+            id="src-cas-lease",
+            type="confluence",
+            name="CAS Lease",
+            config_json="{}",
+        )
+        await first_db.enqueue_source_sync_run(source_id="src-cas-lease")
+        now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+
+        leased = await asyncio.gather(
+            first_db.lease_next_source_sync_run(
+                worker_id="worker-a", lease_seconds=60, now=now
+            ),
+            second_db.lease_next_source_sync_run(
+                worker_id="worker-b", lease_seconds=60, now=now
+            ),
+        )
+
+        assert sum(run is not None for run in leased) == 1
+    finally:
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_source_sync_run_extends_only_current_worker_lease(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-heartbeat-run",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-heartbeat-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert leased is not None
+
+    wrong_worker = await db.heartbeat_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-b",
+        lease_attempt_count=leased.lease_attempt_count,
+        lease_seconds=60,
+        now=now + timedelta(seconds=10),
+    )
+    after_wrong_worker = await db.get_source_sync_run(enqueued.run_id)
+    right_worker = await db.heartbeat_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        lease_seconds=60,
+        now=now + timedelta(seconds=10),
+    )
+    after_right_worker = await db.get_source_sync_run(enqueued.run_id)
+
+    assert wrong_worker is False
+    assert after_wrong_worker is not None
+    assert after_wrong_worker.lease_expires_at == now + timedelta(seconds=60)
+    assert right_worker is True
+    assert after_right_worker is not None
+    assert after_right_worker.lease_expires_at == now + timedelta(seconds=70)
+
+
+@pytest.mark.asyncio
+async def test_complete_source_sync_run_releases_active_slot_for_next_run(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-complete-run",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-complete-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert leased is not None
+
+    completed_update = await db.complete_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        final_state=SyncState(
+            source="src-complete-run",
+            last_sync_at=now,
+            last_sync_status="success",
+            docs_processed=3,
+            docs_updated=2,
+            memories_extracted=4,
+        ),
+        completed_at=now + timedelta(seconds=10),
+    )
+    completed = await db.get_source_sync_run(enqueued.run_id)
+    next_run = await db.enqueue_source_sync_run(
+        source_id="src-complete-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+
+    assert completed_update is True
+    assert completed is not None
+    assert completed.status == "success"
+    assert completed.lease_owner is None
+    assert completed.completed_at == now + timedelta(seconds=10)
+    assert next_run.run_id != enqueued.run_id
+    assert next_run.coalesced is False
+
+
+@pytest.mark.asyncio
+async def test_terminal_source_sync_writes_require_current_lease(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-stale-terminal",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-stale-terminal",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    first = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    recovered = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=90),
+    )
+    assert first is not None
+    assert recovered is not None
+
+    stale_complete = await db.complete_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=first.lease_attempt_count,
+        final_state=SyncState(
+            source="src-stale-terminal",
+            last_sync_at=now + timedelta(seconds=95),
+            last_sync_status="success",
+            docs_processed=99,
+        ),
+        completed_at=now + timedelta(seconds=95),
+    )
+    after_stale_complete = await db.get_source_sync_run(enqueued.run_id)
+    sync_state_after_stale = await db.get_sync_state("src-stale-terminal")
+
+    stale_fail = await db.fail_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=first.lease_attempt_count,
+        error_message="stale failure",
+        final_state=SyncState(
+            source="src-stale-terminal",
+            last_sync_at=now + timedelta(seconds=96),
+            last_sync_status="failed",
+            error_message="stale failure",
+        ),
+        retryable=False,
+        failed_at=now + timedelta(seconds=96),
+    )
+    after_stale_fail = await db.get_source_sync_run(enqueued.run_id)
+    sync_state_after_stale_fail = await db.get_sync_state("src-stale-terminal")
+
+    assert stale_complete is False
+    assert stale_fail is False
+    assert after_stale_complete is not None
+    assert after_stale_complete.lease_owner == "worker-b"
+    assert after_stale_complete.lease_attempt_count == recovered.lease_attempt_count
+    assert after_stale_complete.status == "running"
+    assert after_stale_fail is not None
+    assert after_stale_fail.status == "running"
+    assert after_stale_fail.lease_owner == "worker-b"
+    assert sync_state_after_stale is None
+    assert sync_state_after_stale_fail is None
+
+
+@pytest.mark.asyncio
+async def test_fail_source_sync_run_requeues_retryable_failure_after_backoff(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-fail-run",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-fail-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert leased is not None
+
+    failed_update = await db.fail_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        error_message="temporary outage",
+        retryable=True,
+        failed_at=now + timedelta(seconds=5),
+        next_attempt_at=now + timedelta(seconds=65),
+    )
+    failed = await db.get_source_sync_run(enqueued.run_id)
+    too_early = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=6),
+    )
+    retried = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=65),
+    )
+
+    assert failed is not None
+    assert failed_update is True
+    assert failed.status == "pending"
+    assert failed.next_attempt_at == now + timedelta(seconds=65)
+    assert failed.error_message == "temporary outage"
+    assert failed.lease_owner is None
+    assert too_early is None
+    assert retried is not None
+    assert retried.run_id == enqueued.run_id
+    assert retried.lease_attempt_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fail_source_sync_run_marks_terminal_after_retry_budget(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-fail-budget",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-fail-budget",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert leased is not None
+
+    failed_update = await db.fail_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        error_message="permanent outage",
+        retryable=False,
+        failed_at=now + timedelta(seconds=5),
+        next_attempt_at=now + timedelta(seconds=65),
+    )
+    failed = await db.get_source_sync_run(enqueued.run_id)
+    retried = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=65),
+    )
+
+    assert failed is not None
+    assert failed_update is True
+    assert failed.status == "failed"
+    assert failed.next_attempt_at is None
+    assert failed.completed_at == now + timedelta(seconds=5)
+    assert retried is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_failure_preserves_coalesced_rerun(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-terminal-rerun",
+        type="teams",
+        name="Teams",
+        config_json="{}",
+    )
+    active = await db.enqueue_source_sync_run(
+        source_id="src-terminal-rerun",
+        trigger="local_agent",
+    )
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert leased is not None
+    await db.enqueue_source_sync_run(
+        source_id="src-terminal-rerun",
+        trigger="local_agent",
+    )
+
+    failed = await db.fail_source_sync_run(
+        active.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        error_message="retry budget exhausted",
+        retryable=False,
+        failed_at=now + timedelta(seconds=10),
+    )
+    successor = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        now=now + timedelta(seconds=11),
+    )
+
+    assert failed is True
+    assert successor is not None
+    assert successor.run_id != active.run_id
+    assert successor.trigger == "rerun"
+
+
+@pytest.mark.asyncio
+async def test_complete_source_sync_run_creates_successor_for_coalesced_request(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-successor",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+    )
+    active = await db.enqueue_source_sync_run(
+        source_id="src-successor",
+        workspace_id="workspace-a",
+        trigger="manual",
+        input_snapshot_id="snapshot-old",
+    )
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert leased is not None
+    coalesced = await db.enqueue_source_sync_run(
+        source_id="src-successor",
+        workspace_id="workspace-a",
+        trigger="force",
+        force_full_sync=True,
+        input_snapshot_id="snapshot-new",
+    )
+
+    completed_update = await db.complete_source_sync_run(
+        active.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        final_state=SyncState(
+            source="src-successor",
+            last_sync_at=now + timedelta(seconds=10),
+            last_sync_status="success",
+        ),
+        completed_at=now + timedelta(seconds=10),
+    )
+    completed = await db.get_source_sync_run(active.run_id)
+    successor = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=11),
+    )
+
+    assert coalesced.run_id == active.run_id
+    assert coalesced.coalesced is True
+    assert completed_update is True
+    assert completed is not None
+    assert completed.status == "success"
+    assert successor is not None
+    assert successor.run_id != active.run_id
+    assert successor.trigger == "rerun"
+    assert successor.force_full_sync is True
+    assert successor.input_snapshot_id == "snapshot-new"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_inputs_are_immutable_generations_per_workspace_source(db: Database):
+    await db.upsert_source(
+        id="src-input-run",
+        type="teams",
+        name="Teams",
+        config_json="{}",
+    )
+
+    first = await db.create_source_sync_input(
+        source_id="src-input-run",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-run/inputs/one.json",
+        raw_sha256="sha-one",
+        raw_content_type="application/json",
+        metadata={"conversation_id": "chat-1"},
+    )
+    second = await db.create_source_sync_input(
+        source_id="src-input-run",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-run/inputs/two.json",
+        raw_sha256="sha-two",
+        raw_content_type="application/json",
+        metadata={"conversation_id": "chat-1"},
+    )
+    listed = await db.list_source_sync_inputs(
+        source_id="src-input-run",
+        workspace_id="workspace-a",
+    )
+
+    assert first.input_generation == 1
+    assert second.input_generation == 2
+    assert [item.input_id for item in listed] == [first.input_id, second.input_id]
+    assert listed[0].metadata == {"conversation_id": "chat-1"}
+
+
+@pytest.mark.asyncio
+async def test_source_sync_inputs_are_idempotent_by_raw_hash(db: Database):
+    await db.upsert_source(
+        id="src-input-idempotent",
+        type="teams",
+        name="Teams",
+        config_json="{}",
+    )
+
+    first = await db.create_source_sync_input(
+        source_id="src-input-idempotent",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-idempotent/inputs/one.json",
+        raw_sha256="sha-same",
+        raw_content_type="application/json",
+        metadata={"conversation_id": "chat-1"},
+    )
+    duplicate = await db.create_source_sync_input(
+        source_id="src-input-idempotent",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-idempotent/inputs/one-copy.json",
+        raw_sha256="sha-same",
+        raw_content_type="application/json",
+        metadata={"conversation_id": "chat-1", "submitted_at": "later"},
+    )
+    listed = await db.list_source_sync_inputs(
+        source_id="src-input-idempotent",
+        workspace_id="workspace-a",
+    )
+
+    assert duplicate.input_id == first.input_id
+    assert duplicate.input_generation == first.input_generation
+    assert duplicate.raw_uri == first.raw_uri
+    assert [item.input_id for item in listed] == [first.input_id]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_input_uses_top_level_doc_id_and_rejects_missing_identity(db: Database):
+    await db.upsert_source(id="src-snapshot-doc", type="jira", name="Jira", config_json="{}")
+    created = await db.create_source_sync_input(
+        source_id="src-snapshot-doc",
+        raw_uri="object://input.json",
+        raw_sha256="sha-input",
+        raw_content_type="application/json",
+        metadata={"doc_id": "doc-top-level"},
+        sync_snapshot_id="snapshot-a",
+    )
+    listed = await db.list_source_sync_inputs(
+        source_id="src-snapshot-doc",
+        input_snapshot_id="snapshot-a",
+    )
+    assert [item.input_id for item in listed] == [created.input_id]
+    with pytest.raises(ValueError, match="requires doc_id"):
+        await db.create_source_sync_input(
+            source_id="src-snapshot-doc",
+            raw_uri="object://missing.json",
+            raw_sha256="sha-missing",
+            raw_content_type="application/json",
+            metadata={},
+            sync_snapshot_id="snapshot-b",
+        )
+
+
+@pytest.mark.asyncio
+async def test_source_sync_inputs_filter_by_current_snapshot_membership(db: Database):
+    await db.upsert_source(
+        id="src-input-snapshot",
+        type="local_markdown",
+        name="Local",
+        config_json="{}",
+    )
+
+    old = await db.create_source_sync_input(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-snapshot/inputs/old.json",
+        raw_sha256="sha-old",
+        raw_content_type="application/json",
+        sync_snapshot_id="snapshot-old",
+        metadata={
+            "manifest_entry": {"doc_id": "doc-old", "package_uri": "old"},
+        },
+    )
+    new = await db.create_source_sync_input(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-snapshot/inputs/new.json",
+        raw_sha256="sha-new",
+        raw_content_type="application/json",
+        sync_snapshot_id="snapshot-new",
+        metadata={
+            "manifest_entry": {"doc_id": "doc-new", "package_uri": "new"},
+        },
+    )
+    repeated = await db.create_source_sync_input(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+        raw_uri="object://workspace-a/src-input-snapshot/inputs/new-copy.json",
+        raw_sha256="sha-new",
+        raw_content_type="application/json",
+        sync_snapshot_id="snapshot-repeat",
+        metadata={
+            "manifest_entry": {"doc_id": "doc-new", "package_uri": "new"},
+        },
+    )
+
+    all_inputs = await db.list_source_sync_inputs(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+    )
+    new_snapshot = await db.list_source_sync_inputs(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+        input_snapshot_id="snapshot-new",
+    )
+    repeat_snapshot = await db.list_source_sync_inputs(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+        input_snapshot_id="snapshot-repeat",
+    )
+    empty_snapshot = await db.list_source_sync_inputs(
+        source_id="src-input-snapshot",
+        workspace_id="workspace-a",
+        input_snapshot_id="snapshot-empty",
+    )
+
+    assert [item.input_id for item in all_inputs] == [old.input_id, new.input_id]
+    assert [item.input_id for item in new_snapshot] == [new.input_id]
+    assert repeated.input_id == new.input_id
+    assert [item.input_id for item in repeat_snapshot] == [new.input_id]
+    assert empty_snapshot == []
 
 
 class EmptyGene:
@@ -1556,7 +2391,7 @@ async def test_auth_failure_records_failed_sync_state_without_secondary_error(db
 
 
 @pytest.mark.asyncio
-async def test_scheduled_sync_uses_tracked_source_tasks(db: Database, monkeypatch):
+async def test_run_all_active_sources_enqueues_durable_runs(db: Database):
     source_id = "src-scheduled-tracked"
     await db.upsert_source(
         id=source_id,
@@ -1565,29 +2400,14 @@ async def test_scheduled_sync_uses_tracked_source_tasks(db: Database, monkeypatc
         config_json="{}",
     )
     service = SyncService(db, AppConfig())
-    release = asyncio.Event()
-    running_observed = False
 
-    async def fake_run_source_task(running_source_id: str, *, force_full_sync: bool = False):
-        nonlocal running_observed
-        assert force_full_sync is False
-        running_observed = service.is_running(running_source_id)
-        await release.wait()
-        service.tasks.pop(running_source_id, None)
+    await service.run_all_active_sources()
+    run = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
 
-    monkeypatch.setattr(service, "_run_source_task", fake_run_source_task)
-
-    run_task = asyncio.create_task(service.run_all_active_sources())
-    for _ in range(20):
-        if running_observed:
-            break
-        await asyncio.sleep(0.01)
-
-    assert running_observed is True
-    assert source_id in service.tasks
-    release.set()
-    await run_task
-    assert source_id not in service.tasks
+    assert run.source_id == source_id
+    assert run.status == "pending"
+    assert run.coalesced is True
+    assert service.tasks == {}
 
 
 @pytest.mark.asyncio
@@ -1668,7 +2488,334 @@ async def test_source_sync_schedule_round_trips_and_claims_due_sources(db: Datab
 
 
 @pytest.mark.asyncio
-async def test_scheduler_starts_due_source_and_advances_next_run(db: Database, monkeypatch):
+async def test_enqueue_due_source_sync_runs_advances_schedule_with_run_acceptance(db: Database):
+    claim_time = datetime(2026, 6, 16, tzinfo=timezone.utc)
+    source_id = "src-scheduled-due"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Scheduled Due Source",
+        config_json="{}",
+    )
+    await db.set_source_sync_schedule(
+        source_id,
+        enabled=True,
+        interval_minutes=30,
+        next_run_at=claim_time - timedelta(minutes=1),
+    )
+
+    runs = await db.enqueue_due_source_sync_runs(now=claim_time)
+
+    assert [run.source_id for run in runs] == [source_id]
+    assert runs[0].trigger == "schedule"
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["sync_schedule"]["next_run_at"] == "2026-06-16T00:30:00+00:00"
+    coalesced = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    assert coalesced.run_id == runs[0].run_id
+    assert coalesced.coalesced is True
+
+
+@pytest.mark.asyncio
+async def test_advance_source_sync_schedule_uses_expected_due_timestamp(db: Database):
+    due_at = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    source_id = "src-local-schedule"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Scheduled Teams",
+        config_json="{}",
+    )
+    await db.set_source_sync_schedule(
+        source_id,
+        enabled=True,
+        interval_minutes=60,
+        next_run_at=due_at,
+    )
+
+    stale = await db.advance_source_sync_schedule(
+        source_id,
+        expected_next_run_at=(due_at - timedelta(minutes=1)).isoformat(),
+        now=due_at + timedelta(minutes=1),
+    )
+    advanced = await db.advance_source_sync_schedule(
+        source_id,
+        expected_next_run_at=due_at.isoformat(),
+        now=due_at + timedelta(minutes=1),
+    )
+
+    assert stale is False
+    assert advanced is True
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["sync_schedule"]["next_run_at"] == "2026-07-10T01:01:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_due_local_source_enqueues_owner_daemon_job_not_server_run(db: Database):
+    due_at = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    source_id = "src-local-owner-schedule"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Scheduled Teams",
+        config_json=json.dumps(
+            {
+                "region": "emea",
+                "conversation_ids": ["19:conversation-a@example.test"],
+                "access_token": "must-not-reach-daemon",
+            }
+        ),
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+    await db.set_source_sync_schedule(
+        source_id,
+        enabled=True,
+        interval_minutes=60,
+        next_run_at=due_at,
+    )
+
+    local_count = await db.enqueue_due_local_agent_jobs(now=due_at)
+    server_runs = await db.enqueue_due_source_sync_runs(now=due_at)
+    jobs = await db.lease_local_agent_jobs(
+        user_id="owner-a",
+        limit=5,
+        lease_seconds=60,
+        now=due_at,
+    )
+
+    assert local_count == 1
+    assert server_runs == []
+    assert len(jobs) == 1
+    assert jobs[0]["execution_owner_user_id"] == "owner-a"
+    assert jobs[0]["payload"]["region"] == "emea"
+    assert jobs[0]["payload"]["conversation_ids"] == ["19:conversation-a@example.test"]
+    assert "access_token" not in jobs[0]["payload"]
+    assert "config" not in jobs[0]["payload"]
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["sync_schedule"]["next_run_at"] == "2026-07-10T01:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_due_ownerless_local_source_advances_schedule_without_job(db: Database):
+    due_at = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    source_id = "src-ownerless-schedule"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Ownerless Scheduled Teams",
+        config_json='{"conversation_ids":["19:conversation@example.test"]}',
+    )
+    await db.set_source_sync_schedule(
+        source_id,
+        enabled=True,
+        interval_minutes=60,
+        next_run_at=due_at,
+    )
+
+    local_count = await db.enqueue_due_local_agent_jobs(now=due_at)
+
+    assert local_count == 0
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["sync_schedule"]["next_run_at"] == "2026-07-10T01:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
+    now = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    await db.insert_local_agent_job(
+        job_id="laj-retry",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_id": "src-local"},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+        now=now,
+    )
+    first = await db.lease_local_agent_jobs(
+        user_id="owner-a",
+        limit=1,
+        lease_seconds=60,
+        now=now,
+    )
+
+    completed = await db.complete_local_agent_job(
+        job_id="laj-retry",
+        user_id="owner-a",
+        attempt_count=first[0]["attempt_count"],
+        status="failed",
+        result={"retryable": True},
+        error="one package failed",
+        retryable=True,
+        now=now + timedelta(seconds=1),
+    )
+    second = await db.lease_local_agent_jobs(
+        user_id="owner-a",
+        limit=1,
+        lease_seconds=60,
+        now=now + timedelta(seconds=2),
+    )
+
+    assert completed is True
+    assert second[0]["job_id"] == "laj-retry"
+    assert second[0]["attempt_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_queued_force_request_promotes_existing_local_agent_job(db: Database):
+    first_id, first_created = await db.enqueue_local_agent_job(
+        job_id="laj-normal",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_config_revision": "rev-a", "force_full_sync": False},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+    promoted_id, promoted_created = await db.enqueue_local_agent_job(
+        job_id="laj-force",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_config_revision": "rev-a", "force_full_sync": True},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+    jobs = await db.lease_local_agent_jobs(
+        user_id="owner-a", limit=5, lease_seconds=60
+    )
+
+    assert first_created is True
+    assert promoted_created is False
+    assert promoted_id == first_id
+    assert len(jobs) == 1
+    assert jobs[0]["payload"]["force_full_sync"] is True
+
+
+@pytest.mark.asyncio
+async def test_leased_force_request_creates_serial_successor_job(db: Database):
+    first_id, _ = await db.enqueue_local_agent_job(
+        job_id="laj-leased-normal",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_config_revision": "rev-a", "force_full_sync": False},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+    leased = await db.lease_local_agent_jobs(
+        user_id="owner-a", limit=1, lease_seconds=60
+    )
+    promoted_id, created = await db.enqueue_local_agent_job(
+        job_id="laj-leased-force",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_config_revision": "rev-a", "force_full_sync": True},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+    blocked = await db.lease_local_agent_jobs(
+        user_id="owner-a", limit=5, lease_seconds=60
+    )
+    await db.complete_local_agent_job(
+        job_id=first_id,
+        user_id="owner-a",
+        attempt_count=leased[0]["attempt_count"],
+        status="succeeded",
+        result={},
+        error=None,
+        retryable=False,
+    )
+    successor = await db.lease_local_agent_jobs(
+        user_id="owner-a", limit=5, lease_seconds=60
+    )
+
+    assert leased[0]["job_id"] == first_id
+    assert promoted_id != first_id
+    assert created is True
+    assert blocked == []
+    assert successor[0]["job_id"] == promoted_id
+    assert successor[0]["payload"]["force_full_sync"] is True
+
+
+@pytest.mark.asyncio
+async def test_expired_original_and_successor_are_not_released_in_same_batch(db: Database):
+    now = datetime.now(timezone.utc)
+    first_id, _ = await db.enqueue_local_agent_job(
+        job_id="laj-expired-original",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_config_revision": "rev-a", "force_full_sync": False},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+    await db.lease_local_agent_jobs(
+        user_id="owner-a", limit=1, lease_seconds=60, now=now
+    )
+    successor_id, _ = await db.enqueue_local_agent_job(
+        job_id="laj-expired-successor",
+        source_id="src-local",
+        source_type="local_markdown",
+        operation="local_markdown_sync",
+        payload={"source_config_revision": "rev-a", "force_full_sync": True},
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+    )
+
+    recovered = await db.lease_local_agent_jobs(
+        user_id="owner-a",
+        limit=5,
+        lease_seconds=60,
+        now=now + timedelta(seconds=61),
+    )
+
+    assert [job["job_id"] for job in recovered] == [first_id]
+    assert successor_id != first_id
+
+
+@pytest.mark.asyncio
+async def test_enqueue_due_source_sync_runs_rolls_back_schedule_when_run_enqueue_fails(
+    db: Database,
+    monkeypatch,
+):
+    claim_time = datetime(2026, 6, 16, tzinfo=timezone.utc)
+    due_at = claim_time - timedelta(minutes=1)
+    source_id = "src-scheduled-rollback"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Scheduled Rollback Source",
+        config_json="{}",
+    )
+    await db.set_source_sync_schedule(
+        source_id,
+        enabled=True,
+        interval_minutes=30,
+        next_run_at=due_at,
+    )
+
+    async def fail_enqueue_locked(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("enqueue failed after schedule claim")
+
+    monkeypatch.setattr(db, "_enqueue_source_sync_run_locked", fail_enqueue_locked)
+
+    with pytest.raises(RuntimeError, match="enqueue failed"):
+        await db.enqueue_due_source_sync_runs(now=claim_time)
+
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["sync_schedule"]["next_run_at"] == due_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_enqueues_due_source_and_advances_next_run(db: Database):
     source_id = "src-scheduled-due"
     await db.upsert_source(
         id=source_id,
@@ -1684,17 +2831,12 @@ async def test_scheduler_starts_due_source_and_advances_next_run(db: Database, m
     )
     service = SyncService(db, AppConfig())
     scheduler = SyncScheduler(db, service)
-    started: list[str] = []
-
-    async def fake_start_source(started_source_id: str, *, force_full_sync: bool = False):
-        started.append(started_source_id)
-        return asyncio.create_task(asyncio.sleep(0))
-
-    monkeypatch.setattr(service, "start_source", fake_start_source)
 
     await scheduler._sync_due_sources()
 
-    assert started == [source_id]
+    run = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    assert run.source_id == source_id
+    assert run.coalesced is True
     source = await db.get_source(source_id)
     assert source is not None
     assert source["sync_schedule"]["next_run_at"] is not None
@@ -1702,7 +2844,7 @@ async def test_scheduler_starts_due_source_and_advances_next_run(db: Database, m
 
 
 @pytest.mark.asyncio
-async def test_scheduler_leaves_running_due_source_due(db: Database, monkeypatch):
+async def test_scheduler_coalesces_active_due_source_and_advances_next_run(db: Database):
     source_id = "src-scheduled-running"
     due_at = datetime.now(timezone.utc) - timedelta(minutes=1)
     await db.upsert_source(
@@ -1719,19 +2861,529 @@ async def test_scheduler_leaves_running_due_source_due(db: Database, monkeypatch
     )
     service = SyncService(db, AppConfig())
     scheduler = SyncScheduler(db, service)
-
-    monkeypatch.setattr(service, "running_source_ids", lambda: {source_id})
-
-    async def fail_start_source(started_source_id: str, *, force_full_sync: bool = False):
-        raise AssertionError("running scheduled source should not be started")
-
-    monkeypatch.setattr(service, "start_source", fail_start_source)
+    active = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
 
     await scheduler._sync_due_sources()
 
+    scheduled = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    assert scheduled.run_id == active.run_id
+    assert scheduled.coalesced is True
     source = await db.get_source(source_id)
     assert source is not None
-    assert source["sync_schedule"]["next_run_at"] == due_at.isoformat()
+    assert source["sync_schedule"]["next_run_at"] != due_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_still_scans_server_sources_when_local_job_scan_fails(db: Database, monkeypatch):
+    server_scan_calls: list[int] = []
+
+    async def fail_local_scan(*, limit):
+        raise RuntimeError("local broker unavailable")
+
+    async def record_server_scan(*, limit):
+        server_scan_calls.append(limit)
+        return []
+
+    monkeypatch.setattr(db, "enqueue_due_local_agent_jobs", fail_local_scan)
+    monkeypatch.setattr(db, "enqueue_due_source_sync_runs", record_server_scan)
+    scheduler = SyncScheduler(db, SyncService(db, AppConfig()))
+
+    await scheduler._sync_due_sources()
+
+    assert server_scan_calls == [50]
+
+
+@pytest.mark.asyncio
+async def test_sync_service_enqueue_source_creates_durable_run_without_local_task(db: Database):
+    source_id = "src-enqueue-service"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Enqueue Service",
+        config_json="{}",
+    )
+    service = SyncService(db, AppConfig())
+
+    run = await service.enqueue_source(
+        source_id,
+        trigger="manual",
+        force_full_sync=True,
+    )
+
+    assert run.source_id == source_id
+    assert run.force_full_sync is True
+    assert run.status == "pending"
+    assert service.tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-run"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker Run",
+        config_json="{}",
+    )
+
+    class CapturingRuntimeProvider:
+        def __init__(self) -> None:
+            self.force_full_sync_values: list[bool] = []
+            self.extraction_pools: list[ExtractionWorkPool | None] = []
+
+        async def build_sync_runtime(
+            self,
+            db: Database,
+            config: AppConfig,
+            *,
+            extraction_pool: ExtractionWorkPool | None = None,
+            document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
+        ):
+            del db, config, document_lifecycle_admission
+            self.extraction_pools.append(extraction_pool)
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            self.force_full_sync_values.append(bool(kwargs["force_full_sync"]))
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc),
+                last_sync_status="success",
+                docs_processed=1,
+                docs_updated=1,
+            )
+
+    provider = CapturingRuntimeProvider()
+    service = SyncService(
+        db,
+        AppConfig(sync=SyncConfig(max_extraction_workers=3)),
+        runtime_provider=provider,
+    )
+    enqueued = await service.enqueue_source(source_id, trigger="manual", force_full_sync=True)
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(sync=SyncConfig(max_extraction_workers=3)),
+        runtime_provider=provider,
+        worker_id="worker-a",
+    )
+
+    leased = await worker.run_once()
+    completed = await db.get_source_sync_run(enqueued.run_id)
+
+    assert leased is not None
+    assert leased.run_id == enqueued.run_id
+    assert completed is not None
+    assert completed.status == "success"
+    assert completed.lease_owner is None
+    assert provider.force_full_sync_values == [True]
+    assert provider.extraction_pools == [worker._extraction_pool]
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_treats_complete_input_snapshot_as_full_sync(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-snapshot-worker"
+    await db.upsert_source(
+        id=source_id,
+        type="local_markdown",
+        name="Snapshot Worker",
+        config_json='{"documents_dir":"/server/inbox"}',
+    )
+
+    class CapturingRuntimeProvider:
+        def __init__(self) -> None:
+            self.force_full_sync: bool | None = None
+            self.source: dict | None = None
+
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            self.force_full_sync = kwargs["force_full_sync"]
+            self.source = kwargs["source"]
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
+
+    provider = CapturingRuntimeProvider()
+    await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="local_agent",
+        force_full_sync=False,
+        input_snapshot_id="laj-empty",
+    )
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=provider,
+        worker_id="worker-snapshot",
+    )
+
+    await worker.run_once()
+
+    assert provider.force_full_sync is True
+    assert provider.source is not None
+    assert provider.source["config"]["local_agent_package_manifest"] == []
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_marks_missing_source_terminal(db: Database, monkeypatch):
+    import memforge.runtime as runtime
+
+    await db.upsert_source(
+        id="src-deleted-before-run",
+        type="jira",
+        name="Deleted Before Run",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-deleted-before-run",
+        trigger="manual",
+    )
+    async def missing_source(source_id: str):
+        del source_id
+        return None
+
+    monkeypatch.setattr(db, "get_source", missing_source)
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=object(),
+        worker_id="worker-a",
+    )
+
+    leased = await worker.run_once()
+    completed = await db.get_source_sync_run(enqueued.run_id)
+
+    assert leased is not None
+    assert completed is not None
+    assert completed.status == "failed"
+    assert completed.error_message == "Source not found: src-deleted-before-run"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_delays_retryable_failure(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-fail-backoff"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker Fail Backoff",
+        config_json="{}",
+    )
+
+    class FailingRuntimeProvider:
+        async def build_sync_runtime(
+            self,
+            db: Database,
+            config: AppConfig,
+            *,
+            extraction_pool: ExtractionWorkPool | None = None,
+            document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
+        ):
+            del db, config, extraction_pool, document_lifecycle_admission
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            raise RuntimeError("temporary failure")
+
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(sync=SyncConfig(worker_retry_base_seconds=120, worker_retry_max_seconds=120)),
+        runtime_provider=FailingRuntimeProvider(),
+        worker_id="worker-a",
+    )
+
+    await worker.run_once()
+    failed = await db.get_source_sync_run(enqueued.run_id)
+    too_early = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        now=datetime.now(timezone.utc) + timedelta(seconds=30),
+    )
+
+    assert failed is not None
+    assert failed.status == "pending"
+    assert failed.next_attempt_at is not None
+    assert failed.next_attempt_at > datetime.now(timezone.utc) + timedelta(seconds=100)
+    assert too_early is None
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_retries_failed_final_state(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-final-state-failed"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker Final State Failed",
+        config_json="{}",
+    )
+
+    class FailedStateRuntimeProvider:
+        async def build_sync_runtime(
+            self,
+            db: Database,
+            config: AppConfig,
+            *,
+            extraction_pool: ExtractionWorkPool | None = None,
+            document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
+        ):
+            del db, config, extraction_pool, document_lifecycle_admission
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            return SyncState(
+                source=source_id,
+                last_sync_at=None,
+                last_sync_status="failed",
+                error_message="temporary final-state failure",
+            )
+
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(sync=SyncConfig(worker_retry_base_seconds=120, worker_retry_max_seconds=120)),
+        runtime_provider=FailedStateRuntimeProvider(),
+        worker_id="worker-a",
+    )
+
+    await worker.run_once()
+    failed = await db.get_source_sync_run(enqueued.run_id)
+    sync_state = await db.get_sync_state(source_id)
+
+    assert failed is not None
+    assert failed.status == "pending"
+    assert failed.next_attempt_at is not None
+    assert failed.error_message == "temporary final-state failure"
+    assert sync_state is not None
+    assert sync_state.last_sync_status == "failed"
+    assert sync_state.error_message == "temporary final-state failure"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_retries_partial_final_state(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-final-state-partial"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker Partial State",
+        config_json="{}",
+    )
+
+    class PartialStateRuntimeProvider:
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="partial",
+                docs_processed=2,
+                docs_failed=1,
+                error_message="one document failed",
+            )
+
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(sync=SyncConfig(worker_retry_base_seconds=120)),
+        runtime_provider=PartialStateRuntimeProvider(),
+        worker_id="worker-a",
+    )
+
+    await worker.run_once()
+    failed = await db.get_source_sync_run(enqueued.run_id)
+    sync_state = await db.get_sync_state(source_id)
+
+    assert failed is not None
+    assert failed.status == "pending"
+    assert sync_state is not None
+    assert sync_state.last_sync_status == "partial"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_heartbeats_while_run_is_active(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-heartbeat"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker Heartbeat",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+
+    class WaitingRuntimeProvider:
+        async def build_sync_runtime(
+            self,
+            db: Database,
+            config: AppConfig,
+            *,
+            extraction_pool: ExtractionWorkPool | None = None,
+            document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
+        ):
+            del db, config, extraction_pool, document_lifecycle_admission
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            db = kwargs["db"]
+            initial = await db.get_source_sync_run(enqueued.run_id)
+            assert initial is not None
+            assert initial.lease_expires_at is not None
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                current = await db.get_source_sync_run(enqueued.run_id)
+                assert current is not None
+                if current.lease_expires_at and current.lease_expires_at > initial.lease_expires_at:
+                    return SyncState(
+                        source=source_id,
+                        last_sync_at=datetime.now(timezone.utc),
+                        last_sync_status="success",
+                    )
+            raise AssertionError("worker did not heartbeat the active source sync run")
+
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=WaitingRuntimeProvider(),
+        worker_id="worker-a",
+        lease_seconds=1,
+        heartbeat_seconds=0.01,
+    )
+
+    await worker.run_once()
+    completed = await db.get_source_sync_run(enqueued.run_id)
+
+    assert completed is not None
+    assert completed.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_does_not_complete_after_losing_lease(db: Database, monkeypatch):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-lost-lease"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker Lost Lease",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+
+    class SlowSuccessRuntimeProvider:
+        async def build_sync_runtime(
+            self,
+            db: Database,
+            config: AppConfig,
+            *,
+            extraction_pool: ExtractionWorkPool | None = None,
+            document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
+        ):
+            del db, config, extraction_pool, document_lifecycle_admission
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            await asyncio.sleep(0.03)
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
+
+    async def lost_lease(*args, **kwargs):
+        del args, kwargs
+        return False
+
+    monkeypatch.setattr(db, "heartbeat_source_sync_run", lost_lease)
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=SlowSuccessRuntimeProvider(),
+        worker_id="worker-a",
+        lease_seconds=1,
+        heartbeat_seconds=0.01,
+    )
+
+    await worker.run_once()
+    run = await db.get_source_sync_run(enqueued.run_id)
+
+    assert run is not None
+    assert run.status == "running"
+    assert run.lease_owner == "worker-a"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_run_forever_polls_until_cancelled(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-loop"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker Loop",
+        config_json="{}",
+    )
+
+    class InstantRuntimeProvider:
+        async def build_sync_runtime(
+            self,
+            db: Database,
+            config: AppConfig,
+            *,
+            extraction_pool: ExtractionWorkPool | None = None,
+            document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
+        ):
+            del db, config, extraction_pool, document_lifecycle_admission
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc),
+                last_sync_status="success",
+            )
+
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=InstantRuntimeProvider(),
+        worker_id="worker-loop",
+    )
+
+    task = asyncio.create_task(worker.run_forever(poll_seconds=0.01))
+    for _ in range(50):
+        completed = await db.get_source_sync_run(enqueued.run_id)
+        if completed and completed.status == "success":
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    completed = await db.get_source_sync_run(enqueued.run_id)
+    assert completed is not None
+    assert completed.status == "success"
 
 
 @pytest.mark.asyncio
@@ -1909,6 +3561,24 @@ def test_sync_max_document_lifecycles_can_be_set_from_env(monkeypatch):
     assert AppConfig().sync.max_document_lifecycles == 1
 
 
+def test_sync_worker_config_can_be_disabled_from_env(monkeypatch):
+    monkeypatch.setenv("MEMFORGE_SYNC_SCHEDULER_ENABLED", "false")
+    monkeypatch.setenv("MEMFORGE_SYNC_WORKER_ENABLED", "false")
+    monkeypatch.setenv("MEMFORGE_SYNC_WORKER_POLL_SECONDS", "0.25")
+    monkeypatch.setenv("MEMFORGE_SYNC_WORKER_RETRY_BASE_SECONDS", "2.5")
+    monkeypatch.setenv("MEMFORGE_SYNC_WORKER_RETRY_MAX_SECONDS", "5")
+    monkeypatch.setenv("MEMFORGE_SYNC_WORKER_MAX_ATTEMPTS", "2")
+
+    config = AppConfig()
+
+    assert config.sync.scheduler_enabled is False
+    assert config.sync.worker_enabled is False
+    assert config.sync.worker_poll_seconds == 0.25
+    assert config.sync.worker_retry_base_seconds == 2.5
+    assert config.sync.worker_retry_max_seconds == 5
+    assert config.sync.worker_max_attempts == 2
+
+
 @pytest.mark.asyncio
 async def test_sync_service_passes_shared_extraction_pool_to_runtime_provider(db: Database):
     source_id = "src-shared-pool"
@@ -2017,16 +3687,12 @@ async def test_requested_sync_runs_after_active_source_sync_finishes(db: Databas
     )
     service = SyncService(db, AppConfig())
     first_release = asyncio.Event()
-    followup_started = asyncio.Event()
     calls: list[str] = []
 
     async def fake_run_source_task(running_source_id: str, *, force_full_sync: bool = False):
         calls.append(running_source_id)
         try:
-            if len(calls) == 1:
-                await first_release.wait()
-            else:
-                followup_started.set()
+            await first_release.wait()
         finally:
             service.tasks.pop(running_source_id, None)
 
@@ -2038,13 +3704,15 @@ async def test_requested_sync_runs_after_active_source_sync_finishes(db: Databas
     assert await service.request_source_sync(source_id, delay_seconds=0) is True
     await asyncio.sleep(0)
     assert calls == [source_id]
+    pending = await db.enqueue_source_sync_run(source_id=source_id, trigger="request")
+    assert pending.coalesced is True
+    assert pending.status == "pending"
 
     first_release.set()
-    await asyncio.wait_for(followup_started.wait(), timeout=1)
     await first_task
     await service.shutdown()
 
-    assert calls == [source_id, source_id]
+    assert calls == [source_id]
 
 
 @pytest.mark.asyncio

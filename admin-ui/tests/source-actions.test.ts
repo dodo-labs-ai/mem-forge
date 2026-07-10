@@ -7,7 +7,11 @@ import {
   getSourceMenuStyle,
   sourceActionLayout,
 } from "../src/views/sources/sourceActions.js";
-import { isLocalAgentBackedSource, localAgentSyncOperation } from "../src/views/sources/localAgentSources.js";
+import {
+  isImmutableExecutionModeField,
+  isLocalAgentBackedSource,
+  localAgentSyncOperation,
+} from "../src/views/sources/localAgentSources.js";
 
 assert.deepEqual(
   sourceActionLayout.primary.map((action) => action.id),
@@ -96,6 +100,7 @@ const sourceRowSource = readFileSync("src/views/sources/SourceRow.tsx", "utf8");
 const localAgentSourcesSource = readFileSync("src/views/sources/localAgentSources.ts", "utf8");
 const syncStatusBarSource = readFileSync("src/components/admin/SyncStatusBar.tsx", "utf8");
 const localAgentJobsSource = readFileSync("src/api/localAgentJobs.ts", "utf8");
+const apiTypesSource = readFileSync("src/api/types.ts", "utf8");
 
 assert.match(
   sourcesPageSource,
@@ -149,8 +154,13 @@ assert.match(
 );
 assert.match(
   sourcesPageSource,
-  /delete payload\.local_agent_documents_dir;[\s\S]*delete payload\.local_agent_package_manifest;/,
-  "Local-agent job payloads should not forward server-side package inbox metadata to the local daemon",
+  /function localAgentJobPayload\(\s*forceFullSync = false,?[\s\S]*force_full_sync: forceFullSync/,
+  "Local-agent job creation should send only execution controls; the server supplies canonical source config",
+);
+assert.doesNotMatch(
+  sourcesPageSource,
+  /localAgentJobPayload[\s\S]{0,180}process_now/,
+  "Local-agent sync jobs should not expose the old raw-upload process_now switch",
 );
 assert.match(
   sourceRowSource,
@@ -164,8 +174,28 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
-  /<LocalAgentDaemonBadge \/>/,
-  "Local-agent backed source rows should surface daemon readiness instead of source lifecycle as the title badge",
+  /showLocalAgentStatus\s*=\s*!isPaused\s*&&\s*isLocalAgentBackedSource\(source\)\s*&&\s*capabilities\.can_sync/,
+  "Only the execution owner should query and display local daemon readiness",
+);
+assert.match(
+  sourcesPageSource,
+  /\["pending", "running", "recovering"\]\.includes\(source\.sync\?\.status/,
+  "Durable queued and recovering runs should keep source status polling active",
+);
+assert.match(
+  sourceRowSource,
+  /Waiting to sync[\s\S]*Recovering sync/,
+  "Source rows should distinguish queued work from worker recovery",
+);
+assert.match(
+  apiTypesSource,
+  /execution_owner_user_id:\s*string \| null;/,
+  "source ownership types should expose the persisted local execution owner",
+);
+assert.match(
+  apiTypesSource,
+  /can_configure_connection:\s*boolean;/,
+  "source capabilities should distinguish connector configuration from workspace management",
 );
 assert.match(
   sourcesPageSource,
@@ -194,8 +224,13 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
-  /onRetry=\{isPaused \? undefined : onSync\}/,
-  "Paused sources should not expose retry sync from the status bar",
+  /onRetry=\{isPaused \|\| !capabilities\.can_sync \? undefined : onSync\}/,
+  "Paused sources and non-owners should not expose retry sync from the status bar",
+);
+assert.match(
+  sourceRowSource,
+  /source\.auth_session\s*&&\s*capabilities\.can_configure_connection/,
+  "local Jira auth status should be visible only to the execution owner",
 );
 assert.match(
   sourceRowSource,
@@ -223,41 +258,26 @@ assert.match(
   /className="[^"]*cursor-pointer[^"]*disabled:cursor-not-allowed[^"]*"/,
   "enabled overflow menu actions should use a pointer cursor while disabled actions keep not-allowed",
 );
-assert.match(
-  localAgentSourcesSource,
-  /github_repo_sync/,
-  "Internal network GitHub source sync should enqueue a local-agent sync job",
-);
-assert.match(
-  localAgentSourcesSource,
-  /local_markdown_sync/,
-  "Local repository sync should enqueue a local-agent sync job",
-);
-assert.match(
-  localAgentSourcesSource,
-  /jira_sync/,
-  "Jira sources configured for local daemon sync should enqueue a local-agent sync job",
-);
-assert.match(
-  localAgentSourcesSource,
-  /teams_sync/,
-  "Teams source sync should enqueue a local-agent sync job",
-);
 assert.equal(
-  localAgentSyncOperation({ type: "teams", config: {} } as never),
+  localAgentSyncOperation({ execution: { kind: "local_agent", operation: "teams_sync", immutable_config_fields: [] } } as never),
   "teams_sync",
   "Teams sources should be local-agent backed",
 );
 assert.equal(
-  localAgentSyncOperation({ type: "jira", config: { sync_mode: "cloud" } } as never),
+  localAgentSyncOperation({ execution: { kind: "server", operation: null, immutable_config_fields: ["sync_mode"] } } as never),
   null,
   "Cloud Jira sources should not be treated as local-agent backed",
 );
 assert.equal(
-  isLocalAgentBackedSource({ type: "jira", config: { sync_mode: "local_agent" } } as never),
+  isLocalAgentBackedSource({ execution: { kind: "local_agent", operation: "jira_sync", immutable_config_fields: ["sync_mode"] } } as never),
   true,
   "Jira local-agent mode should share the daemon status badge path",
 );
+const jiraExecutionSource = {
+  execution: { kind: "local_agent", operation: "jira_sync", immutable_config_fields: ["sync_mode"] },
+} as never;
+assert.equal(isImmutableExecutionModeField(jiraExecutionSource, "sync_mode"), true);
+assert.equal(isImmutableExecutionModeField(jiraExecutionSource, "auth_mode"), false);
 assert.match(
   sourcesPageSource,
   /\/api\/cloud\/local-agent\/jobs/,
@@ -292,6 +312,34 @@ assert.doesNotMatch(
 const sourceConfigDialogSource = readFileSync("src/views/sources/SourceConfigDialog.tsx", "utf8");
 const teamsSourceWizardSource = readFileSync("src/views/sources/TeamsSourceWizard.tsx", "utf8");
 const githubRepoFolderPickerSource = readFileSync("src/views/sources/GitHubRepoFolderPicker.tsx", "utf8");
+assert.match(
+  sourceConfigDialogSource,
+  /const canConfigureConnection = source \? source\.capabilities\?\.can_configure_connection === true : true;/,
+  "existing local sources should consume the backend connection capability",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /canConfigureConnection\s*&&\s*fieldsByGroup\.map/,
+  "non-owner admins should not render local connector fields or pickers",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /disabled=\{source\s*\?\s*isImmutableExecutionModeField\(source, field\.key\)\s*:\s*false\}/,
+  "existing sources should render execution-mode selectors as read-only",
+);
+assert.match(sourceConfigDialogSource, /type="checkbox"[\s\S]*disabled=\{disabled\}/);
+assert.match(sourceConfigDialogSource, /<textarea[\s\S]*disabled=\{disabled\}/);
+assert.match(sourceConfigDialogSource, /<Input[\s\S]*disabled=\{disabled\}/);
+assert.doesNotMatch(
+  localAgentSourcesSource,
+  /source\.type\s*===|sync_mode|connection_mode|local_markdown/,
+  "the UI should consume the server execution descriptor instead of reclassifying source types",
+);
+assert.match(
+  sourceConfigDialogSource,
+  /\.\.\.\(canConfigureConnection\s*\?\s*\{\s*config:\s*serializeConfig\(schema\.fields, config\)\s*\}\s*:\s*\{\}\)/,
+  "management-only saves must omit connector config from the API payload",
+);
 assert.match(
   sourceConfigDialogSource,
   /const DISCOVERY_PREVIEW_LIMIT = 5;/,

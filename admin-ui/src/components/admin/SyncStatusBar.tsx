@@ -54,6 +54,16 @@ export function SyncStatusBar({
     );
   }
 
+  if (sync.status === "pending" || sync.status === "recovering") {
+    const label = sync.status === "pending" ? "Waiting for a sync worker" : "Recovering interrupted sync";
+    return (
+      <div role="status" aria-live="polite" className="flex items-center gap-2 rounded-md bg-muted px-3 py-2 text-sm text-muted-foreground">
+        <Loader2 className="size-3.5 shrink-0 animate-spin text-foreground" />
+        <span>{label}</span>
+      </div>
+    );
+  }
+
   if (sync.status === "success") {
     const duration =
       sync.started_at && sync.finished_at
@@ -64,13 +74,15 @@ export function SyncStatusBar({
       <div role="status" aria-live="polite" className="flex items-center gap-2 rounded-md bg-muted px-3 py-2 text-sm text-muted-foreground">
         <Check className="size-3.5 shrink-0 text-emerald-600" />
         <span>
-          {sync.docs_processed === 0 ? (
+          {typeof sync.docs_processed !== "number" ? (
+            "Sync completed"
+          ) : sync.docs_processed === 0 ? (
             "Up to date"
           ) : (
             <>
-              <span className="font-medium text-foreground">{sync.docs_processed}</span> {itemLabel} checked
+              <span className="font-medium text-foreground">{sync.docs_processed ?? 0}</span> {itemLabel} checked
               {" · "}
-              <span className="font-medium text-foreground">{sync.docs_updated}</span> updated
+              <span className="font-medium text-foreground">{sync.docs_updated ?? 0}</span> updated
             </>
           )}
           {duration && ` · ${duration}`}
@@ -99,7 +111,7 @@ export function SyncStatusBar({
           <div className="whitespace-normal break-words" title={message}>
             {isPartial ? (
               <>
-                <span className="font-medium text-foreground">{sync.docs_processed}</span> {itemLabel}
+                <span className="font-medium text-foreground">{sync.docs_processed ?? 0}</span> {itemLabel}
                 {" checked"}
                 {typeof sync.docs_failed === "number" && sync.docs_failed > 0 && (
                   <>
@@ -176,7 +188,12 @@ export function SyncStatusBar({
     );
   }
 
-  return null;
+  return (
+    <div role="status" aria-live="polite" className="flex items-center gap-2 rounded-md bg-muted px-3 py-2 text-sm text-muted-foreground">
+      <AlertCircle className="size-3.5 shrink-0" />
+      <span>Sync status: {sync.status}</span>
+    </div>
+  );
 }
 
 function runningProgressLabel(sync: SyncStatus, itemLabel: string) {
@@ -193,7 +210,7 @@ function runningProgressLabel(sync: SyncStatus, itemLabel: string) {
     if (total > 0) {
       return (
         <>
-          Processed <span className="font-medium text-foreground">{sync.docs_processed}</span>
+          Processed <span className="font-medium text-foreground">{sync.docs_processed ?? 0}</span>
           {" of "}
           <span className="font-medium text-foreground">{total}</span> {itemLabel}
           {typeof sync.docs_stored === "number" && sync.docs_stored > 0 && (

@@ -527,6 +527,43 @@ class SyncState:
 
 
 @dataclass
+class SourceSyncRun:
+    run_id: str
+    workspace_id: str
+    source_id: str
+    trigger: str
+    status: str
+    force_full_sync: bool = False
+    input_snapshot_id: str | None = None
+    rerun_input_snapshot_id: str | None = None
+    coalesced: bool = False
+    lease_owner: str | None = None
+    lease_expires_at: datetime | None = None
+    lease_attempt_count: int = 0
+    recovery_count: int = 0
+    rerun_requested: bool = False
+    next_attempt_at: datetime | None = None
+    error_message: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+@dataclass
+class SourceSyncInput:
+    input_id: str
+    workspace_id: str
+    source_id: str
+    input_generation: int
+    raw_uri: str
+    raw_sha256: str
+    raw_content_type: str
+    metadata: dict[str, object] = field(default_factory=dict)
+    created_at: datetime | None = None
+
+
+@dataclass
 class ChangelogEntry:
     id: int | None
     doc_id: str

@@ -138,6 +138,64 @@ def _hash_json(payload: Any) -> str:
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 
+def _hash_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _store_package_artifact(
+    *,
+    document_store: DocumentStore | None,
+    source: dict[str, Any],
+    source_id: str,
+    doc_id: str,
+    payload_text: str,
+    extension: str,
+) -> tuple[str | None, str]:
+    payload_bytes = payload_text.encode("utf-8")
+    package_sha256 = _hash_bytes(payload_bytes)
+    if document_store is None:
+        return None, package_sha256
+    package_uri = document_store.store_raw(
+        source.get("name") or source_id,
+        f"{doc_id}-{package_sha256}-package",
+        payload_bytes,
+        "application/json",
+        extension=extension,
+    )
+    return package_uri, package_sha256
+
+
+def _package_manifest_entry(
+    *,
+    doc_id: str,
+    title: str,
+    source_url: str,
+    last_modified: str,
+    space_or_project: str,
+    version: str,
+    package_uri: str,
+    package_path: str,
+    submitted_at: str,
+    submitted_by: str | None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    entry = {
+        "doc_id": doc_id,
+        "title": title,
+        "source_url": source_url,
+        "last_modified": last_modified,
+        "space_or_project": space_or_project,
+        "version": version,
+        "package_uri": package_uri,
+        "package_path": package_path,
+        "submitted_at": submitted_at,
+        "submitted_by": submitted_by,
+    }
+    if extra:
+        entry.update(extra)
+    return entry
+
+
 def _jira_title_from_payload(payload: dict[str, Any], fallback: str) -> str:
     fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
     summary = str(fields.get("summary") or "").strip()
@@ -179,6 +237,7 @@ async def submit_local_markdown_document(
     raw_hash: str | None = None,
     submitted_by: str | None = None,
     submitted_at: str | None = None,
+    document_store: DocumentStore | None = None,
 ) -> dict[str, Any]:
     """Validate, package, and persist one local repository file push.
 
@@ -237,6 +296,14 @@ async def submit_local_markdown_document(
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
+    package_uri, package_sha256 = _store_package_artifact(
+        document_store=document_store,
+        source=source,
+        source_id=source_id,
+        doc_id=doc_id,
+        payload_text=payload_text,
+        extension=".local-package.json",
+    )
     package_existed = package_path.exists()
     package_written = False
     tmp_fd, tmp_name = tempfile.mkstemp(dir=str(package_path.parent), suffix=".json.tmp")
@@ -257,20 +324,26 @@ async def submit_local_markdown_document(
                 pass
         raise
 
-    # The DB upsert refreshes documents_dir so a freshly created source picks
-    # up its inbox even if the gene has not authenticated yet. Any
-    # admin-attached project_binding rides through unchanged so this
-    # idempotent refresh never erases admin configuration.
-    refreshed_config = dict(source.get("config") or {})
-    refreshed_config["documents_dir"] = str(inbox)
-    await db.upsert_source(
-        id=source_id,
-        type=LOCAL_MARKDOWN_SOURCE_TYPE,
-        name=source.get("name") or source_id,
-        config_json=json.dumps(refreshed_config),
-        project_binding=source.get("project_binding"),
-    )
-
+    manifest_entry = None
+    if package_uri:
+        manifest_entry = _package_manifest_entry(
+            doc_id=doc_id,
+            title=doc_title,
+            source_url=source_url,
+            last_modified=submitted_at,
+            space_or_project=configured_vault,
+            version=document_hash,
+            package_uri=package_uri,
+            package_path=str(package_path),
+            submitted_at=submitted_at,
+            submitted_by=submitted_by,
+            extra={
+                "vault_id": configured_vault,
+                "relative_path": relative,
+                "content_type": content_type,
+                "raw_hash": raw_hash,
+            },
+        )
     return {
         "source_id": source_id,
         "doc_id": doc_id,
@@ -278,6 +351,9 @@ async def submit_local_markdown_document(
         "relative_path": relative,
         "document_hash": document_hash,
         "package_path": str(package_path),
+        "package_uri": package_uri,
+        "package_sha256": package_sha256,
+        "package_manifest_entry": manifest_entry,
         "submitted_at": submitted_at,
     }
 
@@ -297,6 +373,7 @@ async def submit_github_repo_document(
     blob_sha: str | None = None,
     submitted_by: str | None = None,
     submitted_at: str | None = None,
+    document_store: DocumentStore | None = None,
 ) -> dict[str, Any]:
     """Validate, package, and persist one GitHub repository file push."""
     if source.get("type") != GITHUB_REPO_SOURCE_TYPE:
@@ -375,6 +452,14 @@ async def submit_github_repo_document(
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
+    package_uri, package_sha256 = _store_package_artifact(
+        document_store=document_store,
+        source=source,
+        source_id=source_id,
+        doc_id=doc_id,
+        payload_text=payload_text,
+        extension=".github-repo-package.json",
+    )
     package_existed = package_path.exists()
     package_written = False
     tmp_fd, tmp_name = tempfile.mkstemp(dir=str(package_path.parent), suffix=".json.tmp")
@@ -395,16 +480,31 @@ async def submit_github_repo_document(
                 pass
         raise
 
-    refreshed_config = dict(source_config)
-    refreshed_config["documents_dir"] = str(inbox)
-    await db.upsert_source(
-        id=source_id,
-        type=GITHUB_REPO_SOURCE_TYPE,
-        name=source.get("name") or source_id,
-        config_json=json.dumps(refreshed_config),
-        project_binding=source.get("project_binding"),
-    )
-
+    manifest_entry = None
+    if package_uri:
+        manifest_entry = _package_manifest_entry(
+            doc_id=doc_id,
+            title=doc_title,
+            source_url=source_url,
+            last_modified=submitted_at,
+            space_or_project=f"{repo['owner']}/{repo['name']}",
+            version=blob_sha or raw_hash or document_hash,
+            package_uri=package_uri,
+            package_path=str(package_path),
+            submitted_at=submitted_at,
+            submitted_by=submitted_by,
+            extra={
+                "repo_url": repo["repo_url"],
+                "repo_host": repo["host"],
+                "repo_owner": repo["owner"],
+                "repo_name": repo["name"],
+                "repo_ref": ref,
+                "relative_path": relative,
+                "blob_sha": blob_sha,
+                "content_type": content_type,
+                "raw_hash": raw_hash,
+            },
+        )
     return {
         "source_id": source_id,
         "doc_id": doc_id,
@@ -413,6 +513,9 @@ async def submit_github_repo_document(
         "relative_path": relative,
         "document_hash": document_hash,
         "package_path": str(package_path),
+        "package_uri": package_uri,
+        "package_sha256": package_sha256,
+        "package_manifest_entry": manifest_entry,
         "submitted_at": submitted_at,
     }
 
@@ -430,6 +533,7 @@ async def submit_jira_package(
     raw_hash: str | None = None,
     submitted_by: str | None = None,
     submitted_at: str | None = None,
+    document_store: DocumentStore | None = None,
 ) -> dict[str, Any]:
     """Validate, package, and persist one raw Jira issue captured by the local daemon."""
     if source.get("type") != JIRA_SOURCE_TYPE:
@@ -481,6 +585,14 @@ async def submit_jira_package(
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
+    package_uri, package_sha256 = _store_package_artifact(
+        document_store=document_store,
+        source=source,
+        source_id=source_id,
+        doc_id=doc_id,
+        payload_text=payload_text,
+        extension=".jira-package.json",
+    )
     tmp_fd, tmp_name = tempfile.mkstemp(dir=str(package_path.parent), suffix=".json.tmp")
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
@@ -493,16 +605,26 @@ async def submit_jira_package(
             pass
         raise
 
-    refreshed_config = dict(source_config)
-    refreshed_config["local_agent_documents_dir"] = str(inbox)
-    await db.upsert_source(
-        id=source_id,
-        type=JIRA_SOURCE_TYPE,
-        name=source.get("name") or source_id,
-        config_json=json.dumps(refreshed_config),
-        project_binding=source.get("project_binding"),
-    )
-
+    manifest_entry = None
+    if package_uri:
+        manifest_entry = _package_manifest_entry(
+            doc_id=doc_id,
+            title=doc_title,
+            source_url=issue_url,
+            last_modified=submitted_at,
+            space_or_project=normalized_issue_key.split("-", 1)[0],
+            version=payload_hash,
+            package_uri=package_uri,
+            package_path=str(package_path),
+            submitted_at=submitted_at,
+            submitted_by=submitted_by,
+            extra={
+                "base_url": configured_base_url,
+                "issue_key": normalized_issue_key,
+                "content_type": "application/json",
+                "raw_hash": payload_hash,
+            },
+        )
     return {
         "source_id": source_id,
         "doc_id": doc_id,
@@ -510,6 +632,9 @@ async def submit_jira_package(
         "issue_key": normalized_issue_key,
         "document_hash": payload_hash,
         "package_path": str(package_path),
+        "package_uri": package_uri,
+        "package_sha256": package_sha256,
+        "package_manifest_entry": manifest_entry,
         "submitted_at": submitted_at,
     }
 
@@ -550,7 +675,6 @@ async def submit_teams_window_package(
 
     submitted_at = submitted_at or _now_iso()
     source_id = str(source["id"])
-    source_config = dict(source.get("config") or {})
     inbox = default_local_adapter_inbox(config, source_id)
     inbox.mkdir(parents=True, exist_ok=True)
 
@@ -584,15 +708,14 @@ async def submit_teams_window_package(
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
-    package_uri: str | None = None
-    if document_store is not None:
-        package_uri = document_store.store_raw(
-            source.get("name") or source_id,
-            f"{doc_id}-package",
-            payload_text.encode("utf-8"),
-            "application/json",
-            extension=".teams-package.json",
-        )
+    package_uri, package_sha256 = _store_package_artifact(
+        document_store=document_store,
+        source=source,
+        source_id=source_id,
+        doc_id=doc_id,
+        payload_text=payload_text,
+        extension=".teams-package.json",
+    )
     tmp_fd, tmp_name = tempfile.mkstemp(dir=str(package_path.parent), suffix=".json.tmp")
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
@@ -605,44 +728,27 @@ async def submit_teams_window_package(
             pass
         raise
 
-    refreshed_config = dict(source_config)
-    refreshed_config["local_agent_documents_dir"] = str(inbox)
+    manifest_entry = None
     if package_uri:
-        manifest = [
-            entry for entry in refreshed_config.get("local_agent_package_manifest", [])
-            if isinstance(entry, dict) and entry.get("doc_id") != doc_id
-        ]
-        manifest.append(
-            {
-                "doc_id": doc_id,
-                "title": doc_title,
-                "source_url": package["source_url"],
-                "last_modified": submitted_at,
-                "space_or_project": package["space_or_project"],
-                "version": normalized_revision_hash,
+        manifest_entry = _package_manifest_entry(
+            doc_id=doc_id,
+            title=doc_title,
+            source_url=package["source_url"],
+            last_modified=submitted_at,
+            space_or_project=package["space_or_project"],
+            version=normalized_revision_hash,
+            package_uri=package_uri,
+            package_path=str(package_path),
+            submitted_at=submitted_at,
+            submitted_by=submitted_by,
+            extra={
                 "conversation_id": normalized_conversation_id,
                 "root_message_id": package["root_message_id"],
                 "window_id": normalized_window_id,
                 "window_type": package["window_type"],
                 "revision_hash": normalized_revision_hash,
-                "package_uri": package_uri,
-                "package_path": str(package_path),
-                "submitted_at": submitted_at,
-                "submitted_by": submitted_by,
-            }
+            },
         )
-        refreshed_config["local_agent_package_manifest"] = sorted(
-            manifest,
-            key=lambda entry: (str(entry.get("last_modified") or ""), str(entry.get("doc_id") or "")),
-        )
-    await db.upsert_source(
-        id=source_id,
-        type=TEAMS_SOURCE_TYPE,
-        name=source.get("name") or source_id,
-        config_json=json.dumps(refreshed_config),
-        project_binding=source.get("project_binding"),
-    )
-
     return {
         "source_id": source_id,
         "doc_id": doc_id,
@@ -652,6 +758,8 @@ async def submit_teams_window_package(
         "document_hash": payload_hash,
         "package_path": str(package_path),
         "package_uri": package_uri,
+        "package_sha256": package_sha256,
+        "package_manifest_entry": manifest_entry,
         "submitted_at": submitted_at,
     }
 

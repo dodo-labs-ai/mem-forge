@@ -93,6 +93,7 @@ Standard rules:
 - Do not extract document metadata as memories: author names, last modified dates, document status, revision-history rows, reviewer lists, and link list rows belong to provenance/source metadata.
 - Do not infer relationships from reference/link-only evidence. If a source only provides a link or label, skip it or preserve the weaker relationship exactly as stated.
 - Preserve conditional language. If the source says "if", "provided", "as long as", "would", or "should", keep that condition in the memory. Do not turn open questions into decisions.
+- Preserve the source language of the durable claim in memory.content. If the source evidence is primarily Chinese, write the memory in Chinese. Do not translate memories to English unless the source itself is English or mixed-language phrasing is needed for exact technical identifiers.
 - Do NOT extract: formatting details, boilerplate, table-of-contents entries.
 - Do NOT extract: passwords, credentials, tokens, API keys, or any secret/authentication information.
 
@@ -152,6 +153,7 @@ Standard rules:
 - Treat normalized source headers and platform/provenance fields as operational metadata: workflow status, assignee/owner routing, sprint/milestone, rank/order, labels/tags, timestamps, participants, reactions, edit time, author/reviewer rows, revision history, link-list rows, and formatting.
 - Return an empty "memories" array for operational metadata-only changes unless the changed text explicitly states durable team knowledge, such as a decision, constraint, convention, procedure, product behavior, architectural fact, or long-lived ownership/responsibility rule.
 - Preserve conditional language. Do not turn open questions, suggestions, or unresolved discussion into decisions.
+- Preserve the source language of the durable claim in memory.content. If the source evidence is primarily Chinese, write the memory in Chinese. Do not translate memories to English unless the source itself is English or mixed-language phrasing is needed for exact technical identifiers.
 - Do NOT extract table-of-contents entries, boilerplate, passwords, credentials, tokens, or API keys.
 
 Return ONLY a JSON object with a "memories" array. Use {{"memories": []}} when there are no memory changes."""
@@ -215,6 +217,7 @@ Standard rules:
 - For agent_session sources, extract only durable project decisions, conventions, procedures, and architectural rules that are NOT visible by reading the current code. Skip receipt/session metadata, validation commands/results, runtime notes, service start/stop state, local paths, working-tree state, and facts about the agent session itself.
 - Do not extract passwords, credentials, tokens, API keys, or secrets.
 - Preserve conditional language.
+- Preserve the source language of the durable claim in memory.content. If the source evidence is primarily Chinese, write the memory in Chinese. Do not translate memories to English unless the source itself is English or mixed-language phrasing is needed for exact technical identifiers.
 
 Return ONLY a JSON object with a "memories" array. Use {{"memories": []}} when there are no memories."""
 

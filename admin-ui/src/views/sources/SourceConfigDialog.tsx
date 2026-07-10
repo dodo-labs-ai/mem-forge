@@ -38,6 +38,7 @@ import {
 } from "./confluenceConfig";
 import type { ParsedConfluenceWikiUrl } from "./confluenceConfig";
 import { GitHubRepoFolderPicker } from "./GitHubRepoFolderPicker";
+import { isImmutableExecutionModeField } from "./localAgentSources";
 import { canConfigureSourceType } from "./managedSources";
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
@@ -67,7 +68,8 @@ export function SourceConfigDialog({
   // not open the form. Type-level managed sources (agent_session) are also
   // blocked. New-source flows have no source row yet, so the type check is
   // the only gate there.
-  const canConfigureExisting = source ? source.capabilities?.can_configure !== false : true;
+  const canConfigureExisting = source ? source.capabilities?.can_configure === true : true;
+  const canConfigureConnection = source ? source.capabilities?.can_configure_connection === true : true;
 
   const schemaQuery = useQuery<GeneConfigSchema>({
     queryKey: ["gene-config-schema", sourceType],
@@ -114,6 +116,7 @@ export function SourceConfigDialog({
             onOpenChange={onOpenChange}
             onSaved={onSaved}
             initialFocus={initialFocus}
+            canConfigureConnection={canConfigureConnection}
           />
         )}
       </DialogContent>
@@ -128,6 +131,7 @@ function SourceConfigForm({
   onOpenChange,
   onSaved,
   initialFocus,
+  canConfigureConnection,
 }: {
   sourceType: string;
   source?: Source | null;
@@ -135,6 +139,7 @@ function SourceConfigForm({
   onOpenChange: (open: boolean) => void;
   onSaved?: () => void;
   initialFocus?: { step: "project" };
+  canConfigureConnection: boolean;
 }) {
   const queryClient = useQueryClient();
   const isEdit = Boolean(source);
@@ -162,7 +167,6 @@ function SourceConfigForm({
     ? stringValue(config.connection_mode) || "cloud_pull"
     : "";
   const githubRepoUrl = sourceType === "github_repo" ? stringValue(config.repo_url).trim() : "";
-  const githubRef = sourceType === "github_repo" ? stringValue(config.ref).trim() || "main" : "";
   const githubPickerConfig = sourceType === "github_repo" ? serializeConfig(schema.fields, config) : {};
   const jiraBaseUrl = stringValue(config.base_url).trim();
   const confluenceUrlInfo = useMemo(
@@ -183,13 +187,16 @@ function SourceConfigForm({
     queryKey: ["jira-session", jiraBaseUrl],
     queryFn: () =>
       client.get("/api/auth/jira-session", { params: { base_url: jiraBaseUrl } }).then((response) => response.data),
-    enabled: sourceType === "jira" && authMode === "browser_cookie" && jiraBaseUrl.startsWith("https://"),
+    enabled: canConfigureConnection
+      && sourceType === "jira"
+      && authMode === "browser_cookie"
+      && jiraBaseUrl.startsWith("https://"),
   });
 
   const saveSource = useMutation({
     mutationFn: async (payload: {
       name: string;
-      config: ConfigForm;
+      config?: ConfigForm;
       project_binding: ProjectBinding | null;
     }) => {
       const intervalMinutes = parseScheduleInterval(scheduleInterval);
@@ -277,6 +284,37 @@ function SourceConfigForm({
       setConfig((current) => ({ ...current, root }));
     },
   });
+  const pickGitHubRepoPath = useMutation<string | null, unknown, void>({
+    mutationFn: async () => {
+      const created = await createLocalAgentJob({
+        sourceId: source?.id ?? "",
+        sourceType: "github_repo",
+        operation: "github_repo_pick_root",
+        payload: {
+          title: "Choose local repository clone",
+          initial_directory: stringValue(config.repo_path).trim() || undefined,
+        },
+      });
+      const status = await pollLocalAgentPreviewJob(created.job_id);
+      if (status.status === "failed") {
+        throw new Error(status.last_error || "Local daemon could not open the folder picker.");
+      }
+      const result = status.result as { cancelled?: unknown; root?: unknown } | null;
+      if (result?.cancelled === true) {
+        return null;
+      }
+      const root = typeof result?.root === "string" ? result.root.trim() : "";
+      if (!root) {
+        throw new Error("Local daemon did not return a folder path.");
+      }
+      return root;
+    },
+    onSuccess: (repoPath) => {
+      if (repoPath === null) return;
+      setValidationMessage(null);
+      setConfig((current) => ({ ...current, repo_path: repoPath }));
+    },
+  });
 
   const fieldsByGroup = useMemo(() => {
     const fields = [...schema.fields].sort((a, b) => a.order - b.order);
@@ -330,7 +368,7 @@ function SourceConfigForm({
       sourceNameRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
       return;
     }
-    if (firstMissingField) {
+    if (canConfigureConnection && firstMissingField) {
       setValidationMessage(`Complete ${firstMissingField.label} before saving.`);
       configFieldsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
       return;
@@ -347,7 +385,7 @@ function SourceConfigForm({
     }
     saveSource.mutate({
       name: name.trim(),
-      config: serializeConfig(schema.fields, config),
+      ...(canConfigureConnection ? { config: serializeConfig(schema.fields, config) } : {}),
       project_binding: binding,
     });
   };
@@ -375,7 +413,7 @@ function SourceConfigForm({
         </div>
 
         <div ref={configFieldsRef} className="min-h-0 flex-1 space-y-5 overflow-y-auto pr-1">
-          {fieldsByGroup.map((group) => (
+          {canConfigureConnection && fieldsByGroup.map((group) => (
             <section key={group.key} className="space-y-3">
               <h3 className="text-sm font-semibold">{group.label}</h3>
               <div className="space-y-3">
@@ -387,6 +425,7 @@ function SourceConfigForm({
                       hasExistingSecret={Boolean(config[`${field.key}_configured`])}
                       decryptFailed={Boolean(config[`${field.key}_decrypt_failed`])}
                       required={isFieldRequired(sourceType, field, config)}
+                      disabled={source ? isImmutableExecutionModeField(source, field.key) : false}
                       onChange={(value) => updateField(field, value)}
                     />
                     {sourceType === "confluence" && field.key === "base_url" && confluenceUrlInfo && (
@@ -397,6 +436,13 @@ function SourceConfigForm({
                         isPending={pickLocalMarkdownRoot.isPending}
                         error={pickLocalMarkdownRoot.isError ? pickLocalMarkdownRoot.error : null}
                         onChoose={() => pickLocalMarkdownRoot.mutate()}
+                      />
+                    )}
+                    {sourceType === "github_repo" && field.key === "repo_path" && (
+                      <LocalMarkdownFolderPickerPanel
+                        isPending={pickGitHubRepoPath.isPending}
+                        error={pickGitHubRepoPath.isError ? pickGitHubRepoPath.error : null}
+                        onChoose={() => pickGitHubRepoPath.mutate()}
                       />
                     )}
                     {sourceType === "jira" && field.key === "jql" && (
@@ -425,16 +471,7 @@ function SourceConfigForm({
                       />
                     )}
                     {sourceType === "github_repo" && field.key === "repo_url" && (
-                      <>
-                        <GitHubRepoDetectedPanel repoUrl={githubRepoUrl} />
-                        {githubConnectionMode === "local_push" && (
-                          <GitHubRepoLocalPushPanel
-                            sourceId={source?.id ?? null}
-                            repoUrl={githubRepoUrl}
-                            repoRef={githubRef}
-                          />
-                        )}
-                      </>
+                      <GitHubRepoDetectedPanel repoUrl={githubRepoUrl} />
                     )}
                   </div>
                 ))}
@@ -450,7 +487,7 @@ function SourceConfigForm({
               )}
             </section>
           ))}
-          {advancedFields.length > 0 && (
+          {canConfigureConnection && advancedFields.length > 0 && (
             <details className="group space-y-3">
               <summary className="inline-flex cursor-pointer select-none items-center gap-1 rounded-md px-1 py-0.5 text-sm font-semibold hover:bg-muted focus:outline-none focus-visible:ring-1 focus-visible:ring-ring/40">
                 <ChevronRight className="size-4 transition-transform group-open:rotate-90" />
@@ -570,6 +607,7 @@ function ConfigFieldInput({
   hasExistingSecret,
   decryptFailed,
   required,
+  disabled,
   onChange,
 }: {
   field: ConfigField;
@@ -577,6 +615,7 @@ function ConfigFieldInput({
   hasExistingSecret?: boolean;
   decryptFailed?: boolean;
   required?: boolean;
+  disabled?: boolean;
   onChange: (value: ConfigValue) => void;
 }) {
   if (field.field_type === "boolean") {
@@ -586,6 +625,7 @@ function ConfigFieldInput({
           type="checkbox"
           className="mt-0.5 size-4"
           checked={toBoolean(value)}
+          disabled={disabled}
           onChange={(event) => onChange(event.target.checked)}
         />
         <span>
@@ -605,6 +645,7 @@ function ConfigFieldInput({
       <Field label={field.label} required={required} helpText={field.help_text}>
         <Select<string>
           value={optionValue(field, selected)}
+          disabled={disabled}
           onValueChange={(next) => onChange(optionFromValue(field, stringValue(next)))}
         >
           <SelectTrigger>
@@ -632,6 +673,7 @@ function ConfigFieldInput({
               <input
                 type="checkbox"
                 checked={selected.has(option)}
+                disabled={disabled}
                 onChange={(event) => {
                   const next = new Set(selected);
                   if (event.target.checked) next.add(option);
@@ -654,6 +696,7 @@ function ConfigFieldInput({
           className="min-h-20 w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs shadow-xs outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           rows={4}
           value={stringValue(value)}
+          disabled={disabled}
           placeholder={field.placeholder}
           onChange={(event) => onChange(event.target.value)}
         />
@@ -670,6 +713,7 @@ function ConfigFieldInput({
       <Input
         type={isInteger ? "number" : isSecret ? "password" : "text"}
         value={isList ? listValue(value).join(", ") : stringValue(value)}
+        disabled={disabled}
         onChange={(event) => {
           if (isInteger) {
             onChange(event.target.value === "" ? "" : Number(event.target.value));
@@ -868,52 +912,6 @@ function GitHubRepoDetectedPanel({ repoUrl }: { repoUrl: string }) {
       </dl>
     </div>
   );
-}
-
-function GitHubRepoLocalPushPanel({
-  sourceId,
-  repoUrl,
-  repoRef,
-}: {
-  sourceId: string | null;
-  repoUrl: string;
-  repoRef: string;
-}) {
-  const profile = githubRepoProfileName(repoUrl);
-  const command = sourceId
-    ? `memforge adapter github add ${profile} --repo-url ${repoUrl || "<repo-url>"} --repo-path <local-clone-path> --ref ${repoRef || "main"} --source-id ${sourceId} && memforge adapter github preview ${profile} && memforge adapter github push ${profile} --process-now`
-    : `memforge adapter github add ${profile} --repo-url ${repoUrl || "<repo-url>"} --repo-path <local-clone-path> --ref ${repoRef || "main"}`;
-  const ready = Boolean(repoUrl);
-  const handleCopy = () => {
-    if (typeof navigator === "undefined" || !navigator.clipboard) return;
-    void navigator.clipboard.writeText(command);
-  };
-
-  return (
-    <div className="rounded-lg border bg-muted/30 p-3 text-xs">
-      <div className="text-sm font-medium text-foreground">Sync from this computer</div>
-      <p className="mt-1 text-muted-foreground">
-        Use this for VPN or internal repos that MemForge Cloud cannot open.
-      </p>
-      <div className="mt-3 flex items-center gap-2 rounded-md border bg-background p-2">
-        <code className="flex-1 break-all font-mono text-[11px] text-foreground">{command}</code>
-        <Button type="button" variant="outline" size="sm" onClick={handleCopy} disabled={!ready}>
-          Copy
-        </Button>
-      </div>
-      {!sourceId && (
-        <p className="mt-2 text-muted-foreground">
-          Save this source first to get a source id, then rerun setup with <code>--source-id</code>.
-        </p>
-      )}
-    </div>
-  );
-}
-
-function githubRepoProfileName(repoUrl: string): string {
-  const parsed = parseGitHubRepoUrl(repoUrl);
-  if (!parsed) return "github-repo";
-  return `${parsed.owner}-${parsed.repo}`.toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
 }
 
 function DiscoveryPreviewPanel({
@@ -1143,6 +1141,7 @@ function isFieldVisible(sourceType: string, field: ConfigField, config: ConfigFo
   if (sourceType === "github_repo") {
     const connectionMode = stringValue(config.connection_mode) || "cloud_pull";
     if (field.key === "pat") return connectionMode === "cloud_pull";
+    if (field.key === "repo_path") return connectionMode === "local_push";
     if (field.key === "include_paths") return false;
     return true;
   }
@@ -1170,7 +1169,9 @@ function isFieldRequired(sourceType: string, field: ConfigField, config: ConfigF
     if (field.key === "pages") return syncMode === "explicit_list";
   }
   if (sourceType === "github_repo") {
+    const connectionMode = stringValue(config.connection_mode) || "cloud_pull";
     if (field.key === "pat") return false;
+    if (field.key === "repo_path") return connectionMode === "local_push";
     if (field.key === "include_paths") return false;
   }
   return field.required;

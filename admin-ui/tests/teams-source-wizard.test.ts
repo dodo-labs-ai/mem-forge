@@ -75,8 +75,8 @@ assert.match(
 );
 assert.match(
   localAgentSourcesSource,
-  /source\.type === "teams"[\s\S]*return "teams_sync"/,
-  "Teams source sync should enqueue a local-agent teams_sync job instead of server-side sync",
+  /source\.execution\?\.operation\s*\?\?\s*null/,
+  "Teams source sync should consume the server-provided local-agent operation",
 );
 assert.match(
   sourcesPageSource,
