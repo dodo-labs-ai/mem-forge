@@ -17,7 +17,7 @@ from importlib import metadata
 from itertools import islice
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 try:
@@ -338,8 +338,8 @@ def _build_local_agent_runner(
     client = _local_agent_tool_client(ctx)
     return LocalAgentRunner(
         state_store=_local_agent_state_store(),
-        cloud_job_handler=lambda job: _run_cloud_local_agent_job(
-            job, client, browser=browser
+        cloud_job_handler=lambda job, report_progress=None: _run_cloud_local_agent_job(
+            job, client, browser=browser, report_progress=report_progress
         ),
         cloud_jobs_provider=lambda wait_seconds=0, lease_seconds=60: client.lease_local_agent_jobs(
             wait_seconds=wait_seconds,
@@ -352,10 +352,11 @@ def _build_local_agent_runner(
             result=result,
             error=error,
         ),
-        cloud_job_heartbeat=lambda job_id, attempt_count, lease_seconds: client.heartbeat_local_agent_job(
+        cloud_job_heartbeat=lambda job_id, attempt_count, lease_seconds, progress=None: client.heartbeat_local_agent_job(
             job_id,
             attempt_count=attempt_count,
             lease_seconds=lease_seconds,
+            progress=progress,
         ),
     )
 
@@ -1956,6 +1957,7 @@ def _run_cloud_local_agent_job(
     client: ToolClient,
     *,
     browser: str | None = None,
+    report_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     handlers = {
@@ -1969,7 +1971,11 @@ def _run_cloud_local_agent_job(
         "teams_auth_check": lambda: _run_cloud_teams_auth_check_job(job),
         "teams_auth": lambda: _run_cloud_teams_auth_job(job),
         "teams_browse": lambda: _run_cloud_teams_browse_job(job),
-        "teams_sync": lambda: _run_cloud_teams_sync_job(job, client),
+        "teams_sync": lambda: _run_cloud_teams_sync_job(
+            job,
+            client,
+            report_progress=report_progress,
+        ),
     }
     handler = handlers.get(operation)
     if handler is None:
@@ -2284,7 +2290,12 @@ def _teams_region_from_payload(payload: dict[str, Any]) -> str:
     return region if region in {"emea", "amer", "apac"} else "emea"
 
 
-def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:
+def _run_cloud_teams_sync_job(
+    job: dict[str, Any],
+    client: ToolClient,
+    *,
+    report_progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     from memforge.local_agent.teams_audit import write_teams_audit_event
     from memforge.local_agent.teams_ledger import TeamsLedgerStateStore
 
@@ -2300,8 +2311,16 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
     ledger_state_path = Path(str(payload.get("ledger_state_path") or DEFAULT_TEAMS_LEDGER_STATE_PATH))
     ledger_store = TeamsLedgerStateStore(ledger_state_path)
     limit = _cloud_job_limit(payload.get("limit"), default=0)
+    _report_local_agent_progress(report_progress, {"stage": "connecting"})
     try:
-        collection = asyncio.run(_collect_teams_documents_from_cloud_job(job, source_id=source_id, limit=limit))
+        collection = asyncio.run(
+            _collect_teams_documents_from_cloud_job(
+                job,
+                source_id=source_id,
+                limit=limit,
+                report_progress=report_progress,
+            )
+        )
     except Exception as exc:
         collect_error: Exception | None = exc
         if _teams_auth_exception(exc):
@@ -2319,7 +2338,12 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             if not reauth.get("error"):
                 try:
                     collection = asyncio.run(
-                        _collect_teams_documents_from_cloud_job(job, source_id=source_id, limit=limit)
+                        _collect_teams_documents_from_cloud_job(
+                            job,
+                            source_id=source_id,
+                            limit=limit,
+                            report_progress=report_progress,
+                        )
                     )
                     collect_error = None
                 except Exception as retry_exc:
@@ -2348,6 +2372,7 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             }
 
     documents, poll_audits = _teams_collection_documents_and_polls(collection)
+    progress_summary = _teams_progress_summary(documents, poll_audits)
     for poll in poll_audits:
         event = {"event": "teams_conversation_poll", "run_id": run_id, "source_id": source_id, **poll}
         write_teams_audit_event(audit_path, event)
@@ -2360,7 +2385,20 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
     submitted_by = str(payload.get("submitted_by") or "memforge-local-agent")
     sync_started = False
 
-    for doc in documents:
+    processed_messages = 0
+    for index, doc in enumerate(documents, start=1):
+        processed_messages += _int_or_zero(doc.get("message_count"))
+        _report_local_agent_progress(
+            report_progress,
+            {
+                "stage": "uploading",
+                "current": index,
+                "total": len(documents),
+                "processed_messages": processed_messages,
+                "current_date": doc.get("date_from") or doc.get("date_to") or doc.get("last_modified"),
+                **progress_summary,
+            },
+        )
         window_id = str(doc["window_id"])
         revision_hash = str(doc["revision_hash"])
         window_id_hash = hashlib.sha256(window_id.encode("utf-8")).hexdigest()
@@ -2471,6 +2509,16 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
 
     sync_result = None
     if pushed:
+        _report_local_agent_progress(
+            report_progress,
+            {
+                "stage": "starting_processing",
+                "current": len(documents),
+                "total": len(documents),
+                "processed_messages": progress_summary.get("messages", 0),
+                **progress_summary,
+            },
+        )
         # Teams is incremental by stable window id and revision. Processing the
         # historical input set lets the server collapse each window to its
         # latest revision; document-style authoritative snapshots do not apply.
@@ -2500,6 +2548,10 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
             "skipped_existing": len(skipped_existing),
             "polls": len(poll_audits),
         },
+        "messages": progress_summary.get("messages", 0),
+        "conversations": progress_summary.get("conversations", 0),
+        "date_from": progress_summary.get("date_from"),
+        "date_to": progress_summary.get("date_to"),
         "pushed": pushed,
         "failed": failed,
         "skipped_existing": skipped_existing,
@@ -2662,6 +2714,7 @@ async def _collect_teams_documents_from_cloud_job(
     *,
     source_id: str,
     limit: int,
+    report_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     from memforge.genes.teams_gene import TeamsGene
 
@@ -2673,6 +2726,7 @@ async def _collect_teams_documents_from_cloud_job(
     config.setdefault("ledger_state_path", str(DEFAULT_TEAMS_LEDGER_STATE_PATH))
     gene = TeamsGene(config, source_id)
     await gene.authenticate()
+    _report_local_agent_progress(report_progress, {"stage": "reading"})
     documents: list[dict[str, Any]] = []
     poll_inputs: list[dict[str, Any]] = []
     try:
@@ -2696,6 +2750,11 @@ async def _collect_teams_documents_from_cloud_job(
             ).hexdigest())
             messages = raw_payload.get("messages") if isinstance(raw_payload, dict) else []
             message_count = item.extra.get("message_count") or (len(messages) if isinstance(messages, list) else None)
+            message_times = [
+                str(message.get("time") or "")
+                for message in messages
+                if isinstance(message, dict) and message.get("time")
+            ] if isinstance(messages, list) else []
             documents.append(
                 {
                     "conversation_id": conversation_id,
@@ -2706,6 +2765,8 @@ async def _collect_teams_documents_from_cloud_job(
                     "title": item.title,
                     "source_url": item.source_url,
                     "last_modified": item.last_modified.isoformat(),
+                    "date_from": min(message_times) if message_times else item.last_modified.isoformat(),
+                    "date_to": max(message_times) if message_times else item.last_modified.isoformat(),
                     "raw_payload": raw_payload,
                     "raw_hash": raw_hash,
                     "message_count": message_count,
@@ -2725,6 +2786,54 @@ async def _collect_teams_documents_from_cloud_job(
     if not poll_audits:
         poll_audits = _teams_poll_audits_from_documents(poll_inputs)
     return {"documents": documents, "poll_audits": poll_audits}
+
+
+def _report_local_agent_progress(
+    reporter: Callable[[dict[str, Any]], None] | None,
+    progress: dict[str, Any],
+) -> None:
+    if reporter is not None:
+        reporter(progress)
+
+
+def _teams_progress_summary(
+    documents: list[dict[str, Any]],
+    poll_audits: list[dict[str, Any]],
+) -> dict[str, Any]:
+    date_from_values = [
+        str(value)
+        for value in (
+            [poll.get("covered_created_from") for poll in poll_audits]
+            + [doc.get("date_from") or doc.get("last_modified") for doc in documents]
+        )
+        if value
+    ]
+    date_to_values = [
+        str(value)
+        for value in (
+            [poll.get("covered_created_to") for poll in poll_audits]
+            + [doc.get("date_to") or doc.get("last_modified") for doc in documents]
+        )
+        if value
+    ]
+    messages = sum(
+        _int_or_zero(
+            poll.get("selected_message_keys_seen")
+            or poll.get("unique_message_keys_seen")
+            or poll.get("raw_messages_seen")
+        )
+        for poll in poll_audits
+    )
+    if messages == 0:
+        messages = sum(_int_or_zero(doc.get("message_count")) for doc in documents)
+    return {
+        "date_from": min(date_from_values) if date_from_values else None,
+        "date_to": max(date_to_values) if date_to_values else None,
+        "messages": messages,
+        "conversations": len(poll_audits) or len({
+            str(doc.get("conversation_id")) for doc in documents if doc.get("conversation_id")
+        }),
+    }
 
 
 def _teams_direct_rest_config_from_cloud_payload(payload: dict[str, Any]) -> dict[str, Any]:

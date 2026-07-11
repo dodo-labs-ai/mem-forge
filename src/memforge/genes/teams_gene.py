@@ -293,8 +293,14 @@ class _TeamsAPIClient:
         all_messages: list[dict] = []
         url = f"/conversations/{conversation_id}/messages"
         params = {"pageSize": page_size}
+        requested_urls: set[str] = set()
+        seen_message_keys: set[tuple[str, str, str]] = set()
 
         while url:
+            if url in requested_urls:
+                self.mark_poll_complete(conversation_id, stop_reason="repeated_backward_link")
+                break
+            requested_urls.add(url)
             resp = await self._request(self._chat_client, "GET", url, params=params)
             data = resp.json()
             messages = data.get("messages", data) if isinstance(data, dict) else data
@@ -305,6 +311,10 @@ class _TeamsAPIClient:
                     parsed = self._parse_message(m)
                     if parsed:
                         parsed_page.append(parsed)
+                        message_key = _parsed_message_key(conversation_id, parsed)
+                        if message_key in seen_message_keys:
+                            continue
+                        seen_message_keys.add(message_key)
                         all_messages.append(parsed)
             self._record_message_poll_page(conversation_id, data, parsed_page)
 
@@ -329,8 +339,14 @@ class _TeamsAPIClient:
         url = f"/conversations/{conversation_id}/messages"
         params: dict = {"pageSize": _MAX_PAGE_SIZE}
         page_count = 0
+        requested_urls: set[str] = set()
+        seen_message_keys: set[tuple[str, str, str]] = set()
 
         while url:
+            if url in requested_urls:
+                self.mark_poll_complete(conversation_id, stop_reason="repeated_backward_link")
+                break
+            requested_urls.add(url)
             # Rate-limit: Teams allows 15 req/10s — pace at ~1 req/s
             if page_count > 0:
                 await asyncio.sleep(1.0)
@@ -349,6 +365,10 @@ class _TeamsAPIClient:
                             hit_cutoff = True
                             continue
                         parsed_page.append(parsed)
+                        message_key = _parsed_message_key(conversation_id, parsed)
+                        if message_key in seen_message_keys:
+                            continue
+                        seen_message_keys.add(message_key)
                         all_messages.append(parsed)
             self._record_message_poll_page(conversation_id, data, parsed_page)
 
@@ -397,8 +417,14 @@ class _TeamsAPIClient:
         url = f"/conversations/{conversation_id}/messages"
         params: dict = {"pageSize": _MAX_PAGE_SIZE}
         page_count = 0
+        requested_urls: set[str] = set()
+        seen_message_keys: set[tuple[str, str, str]] = set()
 
         while url:
+            if url in requested_urls:
+                self.mark_poll_complete(conversation_id, stop_reason="repeated_backward_link")
+                break
+            requested_urls.add(url)
             if page_count > 0:
                 await asyncio.sleep(1.0)
             resp = await self._request(self._chat_client, "GET", url, params=params)
@@ -407,12 +433,18 @@ class _TeamsAPIClient:
             raw_messages = data.get("messages", data) if isinstance(data, dict) else data
 
             page: list[dict] = []
+            parsed_page: list[dict] = []
             if isinstance(raw_messages, list):
                 for m in raw_messages:
                     parsed = self._parse_message(m)
                     if parsed:
+                        parsed_page.append(parsed)
+                        message_key = _parsed_message_key(conversation_id, parsed)
+                        if message_key in seen_message_keys:
+                            continue
+                        seen_message_keys.add(message_key)
                         page.append(parsed)
-            self._record_message_poll_page(conversation_id, data, page)
+            self._record_message_poll_page(conversation_id, data, parsed_page)
 
             if page:
                 yield page

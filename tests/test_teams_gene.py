@@ -452,6 +452,43 @@ class TestMessageParsing:
         assert audits[0]["parse_filtered_messages"] == 1
         assert audits[0]["stop_reason"] == "cutoff_reached"
 
+    @pytest.mark.asyncio
+    async def test_get_messages_until_stops_repeated_backward_link_and_deduplicates_messages(self):
+        client = _TeamsAPIClient(region="emea")
+        client._ensure_clients = AsyncMock()
+        client._chat_client = object()
+
+        def response(message_id: str, backward_link: str) -> MagicMock:
+            value = MagicMock()
+            value.json.return_value = {
+                "_metadata": {"backwardLink": backward_link},
+                "messages": [{
+                    "id": message_id,
+                    "conversationid": "19:conversation@thread.v2",
+                    "content": f"<p>{message_id}</p>",
+                    "messagetype": "RichText/Html",
+                    "composetime": NOW.isoformat(),
+                }],
+            }
+            return value
+
+        client._request = AsyncMock(side_effect=[
+            response("newest", "https://teams.cloud.microsoft/page-2"),
+            response("older", "https://teams.cloud.microsoft/repeated-page"),
+            response("older", "https://teams.cloud.microsoft/repeated-page"),
+        ])
+
+        messages = await client.get_messages_until(
+            "19:conversation@thread.v2",
+            NOW - timedelta(days=14),
+        )
+
+        assert [message["id"] for message in messages] == ["newest", "older"]
+        assert client._request.await_count == 3
+        audits = client.get_poll_audits()
+        assert audits[0]["duplicate_raw_messages"] == 1
+        assert audits[0]["stop_reason"] == "repeated_backward_link"
+
     def test_poll_audit_records_raw_page_counts_without_message_content(self):
         client = _TeamsAPIClient(region="emea")
 

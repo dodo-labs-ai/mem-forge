@@ -19,10 +19,10 @@ class LocalAgentRunner:
         self,
         *,
         state_store: LocalAgentStateStore,
-        cloud_job_handler: Callable[[dict[str, Any]], dict[str, Any]],
+        cloud_job_handler: Callable[..., dict[str, Any]],
         cloud_jobs_provider: Callable[..., dict[str, Any]] | None = None,
         cloud_job_completer: Callable[[str, int, str, dict[str, Any], str | None], dict[str, Any]] | None = None,
-        cloud_job_heartbeat: Callable[[str, int, int], dict[str, Any]] | None = None,
+        cloud_job_heartbeat: Callable[..., dict[str, Any]] | None = None,
         cloud_job_lease_seconds: int = DEFAULT_CLOUD_JOB_LEASE_SECONDS,
         cloud_job_heartbeat_interval_seconds: int = DEFAULT_CLOUD_JOB_HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
@@ -145,7 +145,11 @@ class LocalAgentRunner:
                 lease_seconds=self.cloud_job_lease_seconds,
                 interval_seconds=self.cloud_job_heartbeat_interval_seconds,
             ) as heartbeat:
-                payload = self.cloud_job_handler(job)
+                payload = _call_cloud_job_handler(
+                    self.cloud_job_handler,
+                    job,
+                    heartbeat.report_progress,
+                )
             heartbeat_errors = heartbeat.errors
             if heartbeat_errors:
                 payload = dict(payload)
@@ -293,7 +297,7 @@ class _CloudJobLeaseHeartbeat:
     def __init__(
         self,
         *,
-        heartbeat: Callable[[str, int, int], dict[str, Any]] | None,
+        heartbeat: Callable[..., dict[str, Any]] | None,
         job_id: str,
         attempt_count: int,
         lease_seconds: int,
@@ -305,6 +309,8 @@ class _CloudJobLeaseHeartbeat:
         self._lease_seconds = lease_seconds
         self._interval_seconds = interval_seconds
         self._stop = threading.Event()
+        self._progress_lock = threading.Lock()
+        self._progress: dict[str, Any] | None = None
         self._thread: threading.Thread | None = None
         self.errors: list[str] = []
 
@@ -330,19 +336,58 @@ class _CloudJobLeaseHeartbeat:
         while not self._stop.wait(self._interval_seconds):
             self._send_heartbeat()
 
+    def report_progress(self, progress: dict[str, Any]) -> None:
+        with self._progress_lock:
+            self._progress = dict(progress)
+        self._send_heartbeat()
+
     def _send_heartbeat(self) -> None:
         if self._heartbeat is None:
             return
         try:
-            response = self._heartbeat(
+            with self._progress_lock:
+                progress = dict(self._progress) if self._progress is not None else None
+            response = _call_cloud_job_heartbeat(
+                self._heartbeat,
                 self._job_id,
                 self._attempt_count,
                 self._lease_seconds,
+                progress,
             )
             if isinstance(response, dict) and response.get("error"):
                 self.errors.append(_api_error_message(response))
         except Exception as exc:
             self.errors.append(str(exc))
+
+
+def _call_cloud_job_handler(
+    handler: Callable[..., dict[str, Any]],
+    job: dict[str, Any],
+    report_progress: Callable[[dict[str, Any]], None],
+) -> dict[str, Any]:
+    try:
+        signature = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return handler(job)
+    if "report_progress" in signature.parameters:
+        return handler(job, report_progress=report_progress)
+    return handler(job)
+
+
+def _call_cloud_job_heartbeat(
+    heartbeat: Callable[..., dict[str, Any]],
+    job_id: str,
+    attempt_count: int,
+    lease_seconds: int,
+    progress: dict[str, Any] | None,
+) -> dict[str, Any]:
+    try:
+        signature = inspect.signature(heartbeat)
+    except (TypeError, ValueError):
+        return heartbeat(job_id, attempt_count, lease_seconds)
+    if "progress" in signature.parameters:
+        return heartbeat(job_id, attempt_count, lease_seconds, progress=progress)
+    return heartbeat(job_id, attempt_count, lease_seconds)
 
 
 def _call_cloud_jobs_provider(

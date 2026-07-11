@@ -60,7 +60,7 @@ export function TeamsSourceWizard({
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="gap-0 overflow-hidden p-0 sm:max-w-2xl">
+      <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl">
         {open && (
           <TeamsSourceWizardBody
             onOpenChange={onOpenChange}
@@ -194,7 +194,7 @@ function AuthCheckStep({ region, onAuthenticated }: { region: string; onAuthenti
       </div>
 
       {!data?.authenticated && !isLoading && (
-        <DialogFooter>
+        <DialogFooter className="mx-0 mb-0 shrink-0 px-5 py-4 rounded-none rounded-b-xl bg-background">
           <Button type="button" variant="outline" onClick={() => refetch()} disabled={busy}>
             {isFetching && !connectMutation.isPending && <Loader2 className="size-4 animate-spin" />}
             Check Again
@@ -334,7 +334,7 @@ function BrowseSelectStep({
 
   return (
     <>
-      <div className="space-y-4 p-4">
+      <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
         <DialogHeader>
           <DialogTitle>Select Teams conversations to sync</DialogTitle>
         </DialogHeader>
@@ -380,7 +380,7 @@ function BrowseSelectStep({
             No conversations found.
           </div>
         ) : (
-          <div className="max-h-[22rem] overflow-y-auto rounded-lg border">
+          <div className="min-h-0 max-h-[28rem] flex-1 overflow-y-auto rounded-lg border">
             {visibleItems.map((item) => (
               <button
                 key={item.id}
@@ -402,7 +402,7 @@ function BrowseSelectStep({
         )}
       </div>
 
-      <DialogFooter className="flex-row justify-between sm:justify-between">
+      <DialogFooter className="mx-0 mb-0 shrink-0 px-5 py-4 flex-row justify-between rounded-none rounded-b-xl bg-background sm:justify-between">
         <Button type="button" variant="ghost" onClick={onBack}>
           <ArrowLeft className="size-4" />
           Cancel
@@ -457,7 +457,7 @@ function ConfirmStep({
 
   return (
     <>
-      <div className="max-h-[32rem] space-y-4 overflow-y-auto p-4">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
         <DialogHeader>
           <DialogTitle>Configure Teams source</DialogTitle>
         </DialogHeader>
@@ -503,7 +503,7 @@ function ConfirmStep({
         )}
       </div>
 
-      <DialogFooter className="flex-row justify-between sm:justify-between">
+      <DialogFooter className="mx-0 mb-0 shrink-0 px-5 py-4 flex-row justify-between rounded-none rounded-b-xl bg-background sm:justify-between">
         <Button type="button" variant="ghost" onClick={onBack}>
           <ArrowLeft className="size-4" />
           Back

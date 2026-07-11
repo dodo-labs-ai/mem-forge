@@ -253,6 +253,34 @@ def test_start_source_processing_posts_snapshot_identity():
     ]
 
 
+def test_start_source_processing_resolves_the_workspace_resource_url(monkeypatch):
+    client = ToolClient(
+        target=build_target(
+            origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+            workspace_id="mount_tai",
+        ),
+        api_token="tok",
+    )
+    calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    def record_http_json(method, url, body):
+        calls.append((method, url, body))
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_http_json", record_http_json)
+
+    result = client.start_source_processing(source_id="src-local")
+
+    assert result == {"ok": True}
+    assert calls == [
+        (
+            "POST",
+            "https://memforge-dev.cfapps.eu12.hana.ondemand.com/api/workspaces/mount_tai/api/sources/src-local/process",
+            {"force_full_sync": False},
+        )
+    ]
+
+
 def test_local_agent_job_methods_use_cloud_local_agent_contract():
     client = _RecordingClient({"jobs": []})
 
@@ -297,6 +325,30 @@ def test_local_agent_job_lease_default_matches_ui_sync_wait_window():
             "POST",
             "/api/cloud/local-agent/jobs/lease",
             {"limit": 5, "lease_seconds": 60, "wait_seconds": 0},
+        )
+    ]
+
+
+def test_local_agent_job_heartbeat_sends_user_progress():
+    client = _RecordingClient({"ok": True})
+
+    result = client.heartbeat_local_agent_job(
+        "laj-1",
+        attempt_count=2,
+        lease_seconds=120,
+        progress={"stage": "uploading", "current": 7, "total": 16},
+    )
+
+    assert result == {"ok": True}
+    assert client.calls == [
+        (
+            "POST",
+            "/api/cloud/local-agent/jobs/laj-1/heartbeat",
+            {
+                "attempt_count": 2,
+                "lease_seconds": 120,
+                "progress": {"stage": "uploading", "current": 7, "total": 16},
+            },
         )
     ]
 
