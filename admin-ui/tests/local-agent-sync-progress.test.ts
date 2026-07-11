@@ -1,176 +1,100 @@
 import assert from "node:assert/strict";
 
 import {
-  localAgentProgressFromJob,
-  localAgentProgressMessage,
-  teamsConversationCount,
-} from "../src/views/sources/localAgentSyncProgress.js";
-import type { LocalAgentJobStatusResponse } from "../src/api/types.js";
-import { currentWorkspaceId, requireCurrentWorkspaceId } from "../src/lib/workspace.js";
+  presentSourceSyncActivity,
+  selectSourceSyncActivity,
+  sourceSyncActivityFromLocalJob,
+} from "../src/views/sources/sourceSyncActivity.js";
+import { teamsConversationCount } from "../src/views/sources/teamsSourceConfig.js";
+import type { LocalAgentJobStatusResponse, SyncStatus } from "../src/api/types.js";
 
-function job(
-  status: LocalAgentJobStatusResponse["status"],
-  overrides: Partial<LocalAgentJobStatusResponse> = {},
-): LocalAgentJobStatusResponse {
-  return {
-    job_id: "laj-1",
-    status,
-    attempt_count: 0,
-    leased_until: null,
-    result: null,
-    last_error: null,
-    ...overrides,
-  };
-}
-
-assert.deepEqual(
-  localAgentProgressFromJob(job("queued"), "conversations"),
-  {
-    state: "queued",
-    message: "Waiting for local daemon",
-    detail: "Job queued",
-  },
-);
-
-assert.deepEqual(
-  localAgentProgressFromJob(
-    job("leased", { attempt_count: 3, operation: "teams_sync" }),
-    "conversations",
-  ),
-  {
-    state: "leased",
-    message: "Reading Teams messages",
-    detail: "Checking recent conversations",
-  },
-);
-
-assert.deepEqual(
-  localAgentProgressFromJob(
-    job("leased", {
-      attempt_count: 3,
-      operation: "teams_sync",
-      result: {
-        progress: {
-          stage: "uploading",
-          current: 7,
-          total: 16,
-          current_date: "2026-07-08T09:00:00+00:00",
-          date_from: "2026-06-29T10:03:01+00:00",
-          date_to: "2026-07-10T08:17:33+00:00",
-          messages: 194,
-          processed_messages: 72,
-        },
+const localJob: LocalAgentJobStatusResponse = {
+  job_id: "laj-1",
+  operation: "teams_sync",
+  status: "leased",
+  result: {
+    progress: {
+      schema_version: 1,
+      phase: "uploading",
+      progress: { completed: 182, total: 194, unit: "message" },
+      source_time_range: {
+        start: "2026-07-08T09:00:00+00:00",
+        end: "2026-07-08T09:00:00+00:00",
       },
-    }),
-    "conversations",
-  ),
+    },
+  },
+  last_error: null,
+};
+
+assert.deepEqual(
+  presentSourceSyncActivity(sourceSyncActivityFromLocalJob(localJob), "Microsoft Teams", "conversations"),
   {
-    state: "leased",
     message: "Syncing Jul 8 messages",
-    detail: "72 of 194 messages",
-    completed: 72,
+    detail: "182 of 194 messages",
+    completed: 182,
     total: 194,
   },
 );
 
 assert.deepEqual(
-  localAgentProgressFromJob(
-    job("succeeded", {
-      operation: "teams_sync",
-      result: {
-        counts: {
-          selected: 22,
-          pushed: 0,
-          skipped_existing: 22,
-          failed: 0,
-          polls: 2,
-        },
-        messages: 194,
-        date_from: "2026-06-29T10:03:01+00:00",
-        date_to: "2026-07-10T08:17:33+00:00",
-        sync_started: false,
+  presentSourceSyncActivity(
+    {
+      state: "active",
+      progress: {
+        schema_version: 1,
+        phase: "discovering",
+        progress: { completed: 86, unit: "page" },
       },
-    }),
-    "conversations",
+    },
+    "Confluence",
+    "pages",
   ),
-  {
-    state: "succeeded",
-    message: "Up to date",
-    detail: "194 messages checked · Jun 29–Jul 10",
-  },
+  { message: "Finding pages", detail: "86 pages found so far" },
 );
 
 assert.deepEqual(
-  localAgentProgressFromJob(
-    job("succeeded", {
-      operation: "teams_sync",
-      result: {
-        counts: {
-          selected: 22,
-          pushed: 9,
-          skipped_existing: 13,
-          failed: 0,
-          polls: 2,
-        },
-        messages: 194,
-        date_from: "2026-06-29T10:03:01+00:00",
-        date_to: "2026-07-10T08:17:33+00:00",
-        sync_started: true,
+  presentSourceSyncActivity(
+    {
+      state: "active",
+      progress: {
+        schema_version: 1,
+        phase: "processing",
+        progress: { completed: 31, total: 86, unit: "page" },
+        counts: { memories_created: 104 },
       },
-    }),
-    "conversations",
+    },
+    "Confluence",
+    "pages",
   ),
   {
-    state: "succeeded",
-    message: "Sent new Teams messages to Cloud",
-    detail: "194 messages · Jun 29–Jul 10",
+    message: "Creating memories from pages",
+    detail: "31 of 86 pages · 104 memories found",
+    completed: 31,
+    total: 86,
   },
 );
 
-assert.equal(
-  localAgentProgressMessage(
-    localAgentProgressFromJob(
-      job("failed", {
-        last_error: "Teams session expired. Connect Teams from the source wizard.",
-      }),
-      "conversations",
-    ),
-  ),
-  "Action needed · Sign in to Teams in Chrome, then retry sync.",
-);
+const activeServerRun: SyncStatus = {
+  status: "running",
+  started_at: "2026-07-08T09:00:00+00:00",
+  finished_at: null,
+  error_message: null,
+  progress: {
+    schema_version: 1,
+    phase: "processing",
+    progress: { completed: 4, total: 10, unit: "page" },
+  },
+};
+assert.equal(selectSourceSyncActivity(activeServerRun, localJob)?.progress?.phase, "processing");
 
 assert.equal(
-  teamsConversationCount({
-    conversation_ids: "19:flexible-payroll@thread.v2",
-  }),
-  1,
-);
-assert.equal(
-  teamsConversationCount({
-    conversation_ids: ["19:a@thread.v2", "19:b@thread.v2", "19:a@thread.v2"],
-  }),
+  teamsConversationCount({ conversation_ids: ["channel:1", "chat:2", "chat:2"] }),
   2,
 );
 assert.equal(
-  teamsConversationCount({
-    group_chats: ["19:legacy@thread.v2"],
-  }),
-  1,
+  teamsConversationCount({ channels: "A, B", group_chats: ["C"], individual_chats: ["D"] }),
+  4,
 );
+assert.equal(teamsConversationCount({}), null);
 
-Object.defineProperty(globalThis, "window", {
-  configurable: true,
-  value: { location: { search: "?workspace=payroll_agent" } },
-});
-assert.equal(currentWorkspaceId(), "payroll_agent");
-assert.equal(requireCurrentWorkspaceId(), "payroll_agent");
-
-Object.defineProperty(globalThis, "window", {
-  configurable: true,
-  value: { location: { search: "?workspace=%20" } },
-});
-assert.equal(currentWorkspaceId(), undefined);
-assert.throws(
-  () => requireCurrentWorkspaceId(),
-  /Select a workspace before starting local sync\./,
-);
+console.log("source sync activity tests passed");

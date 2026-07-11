@@ -1751,22 +1751,21 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     assert payload["messages"] == 3
     assert payload["conversations"] == 1
     assert payload["sync_started"] is True
-    assert [item["stage"] for item in progress] == [
+    assert [item["phase"] for item in progress] == [
         "connecting",
         "uploading",
         "uploading",
-        "starting_processing",
+        "uploading",
     ]
     assert progress[1] == {
-        "stage": "uploading",
-        "current": 1,
-        "total": 2,
-        "processed_messages": 2,
-        "current_date": "2026-07-08T09:24:57.5870000Z",
-        "date_from": "2026-07-08T09:24:57.5870000Z",
-        "date_to": "2026-07-08T10:24:57.5870000Z",
-        "messages": 3,
-        "conversations": 1,
+        "schema_version": 1,
+        "phase": "uploading",
+        "progress": {"completed": 0, "total": 3, "unit": "message"},
+        "source_time_range": {
+            "start": "2026-07-08T09:24:57.5870000Z",
+            "end": "2026-07-08T09:24:57.5870000Z",
+        },
+        "counts": {"failed": 0},
     }
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
     assert len(push_calls) == 2

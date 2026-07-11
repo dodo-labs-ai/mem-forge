@@ -137,3 +137,25 @@ function stringListConfig(value: unknown): string[] {
   const values = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
   return [...new Set(values.map((item) => String(item).trim()).filter(Boolean))];
 }
+
+export function teamsConversationCount(config: Record<string, unknown>): number | null {
+  const canonical = stringList(config.conversation_ids);
+  const values = canonical.length > 0
+    ? canonical
+    : [
+        ...stringList(config.channels),
+        ...stringList(config.group_chats),
+        ...stringList(config.individual_chats),
+      ];
+  return values.length > 0 ? new Set(values).size : null;
+}
+
+function stringList(value: unknown): string[] {
+  if (typeof value === "string") {
+    return value.split(",").map((item) => item.trim()).filter(Boolean);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item).trim()).filter(Boolean);
+  }
+  return [];
+}

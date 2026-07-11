@@ -336,7 +336,11 @@ def test_local_agent_job_heartbeat_sends_user_progress():
         "laj-1",
         attempt_count=2,
         lease_seconds=120,
-        progress={"stage": "uploading", "current": 7, "total": 16},
+        progress={
+            "schema_version": 1,
+            "phase": "uploading",
+            "progress": {"completed": 7, "total": 16, "unit": "message"},
+        },
     )
 
     assert result == {"ok": True}
@@ -347,7 +351,11 @@ def test_local_agent_job_heartbeat_sends_user_progress():
             {
                 "attempt_count": 2,
                 "lease_seconds": 120,
-                "progress": {"stage": "uploading", "current": 7, "total": 16},
+                "progress": {
+                    "schema_version": 1,
+                    "phase": "uploading",
+                    "progress": {"completed": 7, "total": 16, "unit": "message"},
+                },
             },
         )
     ]

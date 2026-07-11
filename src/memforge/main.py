@@ -45,6 +45,7 @@ from memforge.github_repo_utils import (
 )
 from memforge.local_agent.folder_picker import FolderPickerCancelled, FolderPickerUnavailable, pick_folder
 from memforge.local_agent.source_contract import local_agent_sync_snapshot_id
+from memforge.sync_progress import normalize_sync_progress_snapshot
 from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
     SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES,
@@ -1862,6 +1863,7 @@ def _push_github_profile_to_source(
     sync_snapshot_id: str | None = None,
     local_agent_job_id: str | None = None,
     local_agent_attempt_count: int | None = None,
+    report_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     source_id = source_id.strip()
     if not source_id:
@@ -1871,6 +1873,14 @@ def _push_github_profile_to_source(
     repo_path = _repo_path_from_profile(profile, repo)
     preview = _preview_github_profile(name, profile, limit=None if limit == 0 else max(limit, 0))
     selected_entries = list(preview["items"])
+    _report_local_agent_progress(
+        report_progress,
+        _sync_progress_snapshot(
+            phase="discovering",
+            completed=len(selected_entries),
+            unit="file",
+        ),
+    )
 
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -1900,7 +1910,17 @@ def _push_github_profile_to_source(
             }
         )
 
-    for doc in prepared:
+    for index, doc in enumerate(prepared, start=1):
+        _report_local_agent_progress(
+            report_progress,
+            _sync_progress_snapshot(
+                phase="uploading",
+                completed=index,
+                total=len(prepared),
+                unit="file",
+                failed=len(failed),
+            ),
+        )
         response = client.push_github_repo_document(
             source_id=source_id,
             repo_url=repo["repo_url"],
@@ -1963,11 +1983,15 @@ def _run_cloud_local_agent_job(
     handlers = {
         "github_repo_pick_root": lambda: _run_cloud_pick_root_job(job),
         "github_repo_preview_tree": lambda: _run_cloud_github_preview_job(job),
-        "github_repo_sync": lambda: _run_cloud_github_sync_job(job, client),
+        "github_repo_sync": lambda: _run_cloud_github_sync_job(job, client, report_progress=report_progress),
         "local_markdown_pick_root": lambda: _run_cloud_pick_root_job(job),
         "local_markdown_preview_tree": lambda: _run_cloud_local_markdown_preview_job(job),
-        "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(job, client),
-        "jira_sync": lambda: _run_cloud_jira_sync_job(job, client, browser=browser),
+        "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(
+            job, client, report_progress=report_progress
+        ),
+        "jira_sync": lambda: _run_cloud_jira_sync_job(
+            job, client, browser=browser, report_progress=report_progress
+        ),
         "teams_auth_check": lambda: _run_cloud_teams_auth_check_job(job),
         "teams_auth": lambda: _run_cloud_teams_auth_job(job),
         "teams_browse": lambda: _run_cloud_teams_browse_job(job),
@@ -1995,7 +2019,12 @@ def _run_cloud_github_preview_job(job: dict[str, Any]) -> dict[str, Any]:
     return {"operation": operation, "source_id": source_id, **preview}
 
 
-def _run_cloud_github_sync_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:
+def _run_cloud_github_sync_job(
+    job: dict[str, Any],
+    client: ToolClient,
+    *,
+    report_progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     profile = _github_profile_from_cloud_job(job)
@@ -2015,6 +2044,7 @@ def _run_cloud_github_sync_job(job: dict[str, Any], client: ToolClient) -> dict[
         sync_snapshot_id=local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count")),
         local_agent_job_id=str(job["job_id"]),
         local_agent_attempt_count=int(job["attempt_count"]),
+        report_progress=report_progress,
     )
     return {"operation": operation, **result}
 
@@ -2044,7 +2074,12 @@ def _run_cloud_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
     return {"operation": operation, "root": root}
 
 
-def _run_cloud_local_markdown_sync_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:
+def _run_cloud_local_markdown_sync_job(
+    job: dict[str, Any],
+    client: ToolClient,
+    *,
+    report_progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
@@ -2063,6 +2098,7 @@ def _run_cloud_local_markdown_sync_job(job: dict[str, Any], client: ToolClient) 
         sync_snapshot_id=local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count")),
         local_agent_job_id=str(job["job_id"]),
         local_agent_attempt_count=int(job["attempt_count"]),
+        report_progress=report_progress,
     )
     return {"operation": operation, **result}
 
@@ -2072,6 +2108,7 @@ def _run_cloud_jira_sync_job(
     client: ToolClient,
     *,
     browser: str | None,
+    report_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
@@ -2079,6 +2116,10 @@ def _run_cloud_jira_sync_job(
     if error:
         return error
     client = client.for_workspace(workspace_id)
+    _report_local_agent_progress(
+        report_progress,
+        _sync_progress_snapshot(phase="connecting"),
+    )
     try:
         documents = asyncio.run(
             _collect_jira_documents_from_cloud_job(
@@ -2086,6 +2127,7 @@ def _run_cloud_jira_sync_job(
                 source_id=source_id,
                 browser=browser,
                 limit=0,
+                report_progress=report_progress,
             )
         )
     except Exception as exc:
@@ -2102,7 +2144,17 @@ def _run_cloud_jira_sync_job(
     scoped_client = client
     sync_snapshot_id = local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count"))
     sync_result: dict[str, Any] | None = None
-    for doc in documents:
+    for index, doc in enumerate(documents, start=1):
+        _report_local_agent_progress(
+            report_progress,
+            _sync_progress_snapshot(
+                phase="uploading",
+                completed=index,
+                total=len(documents),
+                unit="issue",
+                failed=len(failed),
+            ),
+        )
         response = scoped_client.push_jira_package(
             source_id=source_id,
             base_url=str(doc["base_url"]),
@@ -2311,7 +2363,10 @@ def _run_cloud_teams_sync_job(
     ledger_state_path = Path(str(payload.get("ledger_state_path") or DEFAULT_TEAMS_LEDGER_STATE_PATH))
     ledger_store = TeamsLedgerStateStore(ledger_state_path)
     limit = _cloud_job_limit(payload.get("limit"), default=0)
-    _report_local_agent_progress(report_progress, {"stage": "connecting"})
+    _report_local_agent_progress(
+        report_progress,
+        _sync_progress_snapshot(phase="connecting"),
+    )
     try:
         collection = asyncio.run(
             _collect_teams_documents_from_cloud_job(
@@ -2386,19 +2441,21 @@ def _run_cloud_teams_sync_job(
     sync_started = False
 
     processed_messages = 0
-    for index, doc in enumerate(documents, start=1):
-        processed_messages += _int_or_zero(doc.get("message_count"))
+    for doc in documents:
+        current_source_time = doc.get("date_from") or doc.get("date_to") or doc.get("last_modified")
         _report_local_agent_progress(
             report_progress,
-            {
-                "stage": "uploading",
-                "current": index,
-                "total": len(documents),
-                "processed_messages": processed_messages,
-                "current_date": doc.get("date_from") or doc.get("date_to") or doc.get("last_modified"),
-                **progress_summary,
-            },
+            _sync_progress_snapshot(
+                phase="uploading",
+                completed=processed_messages,
+                total=progress_summary.get("messages", 0),
+                unit="message",
+                source_time_start=current_source_time,
+                source_time_end=current_source_time,
+                failed=len(failed),
+            ),
         )
+        processed_messages += _int_or_zero(doc.get("message_count"))
         window_id = str(doc["window_id"])
         revision_hash = str(doc["revision_hash"])
         window_id_hash = hashlib.sha256(window_id.encode("utf-8")).hexdigest()
@@ -2511,13 +2568,15 @@ def _run_cloud_teams_sync_job(
     if pushed:
         _report_local_agent_progress(
             report_progress,
-            {
-                "stage": "starting_processing",
-                "current": len(documents),
-                "total": len(documents),
-                "processed_messages": progress_summary.get("messages", 0),
-                **progress_summary,
-            },
+            _sync_progress_snapshot(
+                phase="uploading",
+                completed=progress_summary.get("messages", 0),
+                total=progress_summary.get("messages", 0),
+                unit="message",
+                source_time_start=progress_summary.get("date_from"),
+                source_time_end=progress_summary.get("date_to"),
+                failed=len(failed),
+            ),
         )
         # Teams is incremental by stable window id and revision. Processing the
         # historical input set lets the server collapse each window to its
@@ -2660,6 +2719,7 @@ async def _collect_jira_documents_from_cloud_job(
     source_id: str,
     browser: str | None,
     limit: int,
+    report_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     from memforge.auth.jira_capture import capture_and_prevalidate
     from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE, JiraGene
@@ -2684,6 +2744,10 @@ async def _collect_jira_documents_from_cloud_job(
     gene = JiraGene(config, source_id)
     await gene.authenticate()
     documents: list[dict[str, Any]] = []
+    _report_local_agent_progress(
+        report_progress,
+        _sync_progress_snapshot(phase="discovering", completed=0, unit="issue"),
+    )
     try:
         async for item in gene.discover(None):
             if limit and len(documents) >= limit:
@@ -2701,6 +2765,14 @@ async def _collect_jira_documents_from_cloud_job(
                     "raw_payload": raw_payload,
                     "raw_hash": raw_hash,
                 }
+            )
+            _report_local_agent_progress(
+                report_progress,
+                _sync_progress_snapshot(
+                    phase="discovering",
+                    completed=len(documents),
+                    unit="issue",
+                ),
             )
     finally:
         client = getattr(gene, "_client", None)
@@ -2726,7 +2798,10 @@ async def _collect_teams_documents_from_cloud_job(
     config.setdefault("ledger_state_path", str(DEFAULT_TEAMS_LEDGER_STATE_PATH))
     gene = TeamsGene(config, source_id)
     await gene.authenticate()
-    _report_local_agent_progress(report_progress, {"stage": "reading"})
+    _report_local_agent_progress(
+        report_progress,
+        _sync_progress_snapshot(phase="discovering", completed=0, unit="message"),
+    )
     documents: list[dict[str, Any]] = []
     poll_inputs: list[dict[str, Any]] = []
     try:
@@ -2772,6 +2847,15 @@ async def _collect_teams_documents_from_cloud_job(
                     "message_count": message_count,
                 }
             )
+            message_count_value = sum(_int_or_zero(doc.get("message_count")) for doc in documents)
+            _report_local_agent_progress(
+                report_progress,
+                _sync_progress_snapshot(
+                    phase="discovering",
+                    completed=message_count_value,
+                    unit="message",
+                ),
+            )
             poll_inputs.append({
                 "conversation_id": conversation_id,
                 "message_count": message_count,
@@ -2794,6 +2878,44 @@ def _report_local_agent_progress(
 ) -> None:
     if reporter is not None:
         reporter(progress)
+
+
+def _sync_progress_snapshot(
+    *,
+    phase: str,
+    completed: int | None = None,
+    total: int | None = None,
+    unit: str | None = None,
+    source_time_start: str | None = None,
+    source_time_end: str | None = None,
+    changed: int | None = None,
+    failed: int | None = None,
+    memories_created: int | None = None,
+) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {"schema_version": 1, "phase": phase}
+    if completed is not None and unit is not None:
+        snapshot["progress"] = {"completed": completed, "unit": unit}
+        if total is not None:
+            snapshot["progress"]["total"] = total
+    source_time_range = {
+        key: value
+        for key, value in (("start", source_time_start), ("end", source_time_end))
+        if value
+    }
+    if source_time_range:
+        snapshot["source_time_range"] = source_time_range
+    counts = {
+        key: value
+        for key, value in (
+            ("changed", changed),
+            ("failed", failed),
+            ("memories_created", memories_created),
+        )
+        if value is not None
+    }
+    if counts:
+        snapshot["counts"] = counts
+    return normalize_sync_progress_snapshot(snapshot)
 
 
 def _teams_progress_summary(
@@ -2954,6 +3076,7 @@ def _push_kb_profile_to_source(
     sync_snapshot_id: str | None = None,
     local_agent_job_id: str | None = None,
     local_agent_attempt_count: int | None = None,
+    report_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     root, include, exclude, vault_id = _resolve_kb_profile(name, profile)
     counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
@@ -2962,8 +3085,26 @@ def _push_kb_profile_to_source(
 
     entries = _scan_kb_profile(root, include=include, exclude=exclude, counts=counts)
     selected_entries = list(islice(entries, limit)) if limit else list(entries)
+    _report_local_agent_progress(
+        report_progress,
+        _sync_progress_snapshot(
+            phase="discovering",
+            completed=len(selected_entries),
+            unit="file",
+        ),
+    )
 
-    for entry in selected_entries:
+    for index, entry in enumerate(selected_entries, start=1):
+        _report_local_agent_progress(
+            report_progress,
+            _sync_progress_snapshot(
+                phase="uploading",
+                completed=index,
+                total=len(selected_entries),
+                unit="file",
+                failed=len(failed),
+            ),
+        )
         response = client.push_local_markdown_document(
             source_id=source_id,
             vault_id=vault_id,
