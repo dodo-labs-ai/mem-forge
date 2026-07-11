@@ -1664,7 +1664,7 @@ def test_local_agent_cloud_teams_browse_reauths_after_stale_cached_session(monke
 def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_path: Path):
     from memforge.local_agent.teams_audit import validate_teams_audit_run
 
-    async def fake_collect(job, *, source_id, limit):
+    async def fake_collect(job, *, source_id, limit, report_progress=None):
         assert source_id == "src-teams"
         assert limit == 2
         assert job["payload"]["conversation_gap_minutes"] == 60
@@ -1721,6 +1721,7 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     audit_log_path = tmp_path / "teams-audit.jsonl"
     ledger_state_path = tmp_path / "teams-ledger.json"
 
+    progress: list[dict] = []
     payload = main._run_cloud_local_agent_job(
         {
             "job_id": "laj-teams-sync",
@@ -1736,11 +1737,36 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
             },
         },
         _cloud_test_client(),
+        report_progress=progress.append,
     )
 
     assert payload["operation"] == "teams_sync"
-    assert payload["counts"] == {"selected": 2, "pushed": 2, "failed": 0, "skipped_existing": 0, "polls": 0}
+    assert payload["counts"] == {
+        "selected": 2,
+        "pushed": 2,
+        "failed": 0,
+        "skipped_existing": 0,
+        "polls": 0,
+    }
+    assert payload["messages"] == 3
+    assert payload["conversations"] == 1
     assert payload["sync_started"] is True
+    assert [item["stage"] for item in progress] == [
+        "connecting",
+        "uploading",
+        "uploading",
+        "starting_processing",
+    ]
+    assert progress[1] == {
+        "stage": "uploading",
+        "current": 1,
+        "total": 2,
+        "current_date": "2026-07-08T09:24:57.5870000Z",
+        "date_from": "2026-07-08T09:24:57.5870000Z",
+        "date_to": "2026-07-08T10:24:57.5870000Z",
+        "messages": 3,
+        "conversations": 1,
+    }
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
     assert len(push_calls) == 2
     first = push_calls[0][1]
@@ -1785,7 +1811,7 @@ def test_local_agent_cloud_teams_sync_reauths_after_stale_session(monkeypatch, t
     collect_calls: list[int] = []
     auth_calls: list[tuple[int, float]] = []
 
-    async def fake_collect(job, *, source_id, limit):
+    async def fake_collect(job, *, source_id, limit, report_progress=None):
         assert source_id == "src-teams"
         collect_calls.append(1)
         if len(collect_calls) == 1:
@@ -1860,7 +1886,7 @@ def test_local_agent_cloud_teams_sync_reauths_after_stale_session(monkeypatch, t
 
 
 def test_local_agent_cloud_teams_sync_reports_push_failure_without_generic_source_sync(monkeypatch, tmp_path: Path):
-    async def fake_collect(job, *, source_id, limit):
+    async def fake_collect(job, *, source_id, limit, report_progress=None):
         return [
             {
                 "conversation_id": "19:conversation@thread.tacv2",
@@ -1925,7 +1951,7 @@ def test_local_agent_cloud_teams_sync_reports_push_failure_without_generic_sourc
 def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypatch, tmp_path: Path):
     from memforge.local_agent.teams_audit import validate_teams_audit_run
 
-    async def fake_collect(job, *, source_id, limit):
+    async def fake_collect(job, *, source_id, limit, report_progress=None):
         return [
             {
                 "conversation_id": "19:conversation@thread.tacv2",
@@ -1992,7 +2018,7 @@ def test_local_agent_cloud_teams_sync_retries_window_when_processing_was_not_acc
     monkeypatch,
     tmp_path: Path,
 ):
-    async def fake_collect(job, *, source_id, limit):
+    async def fake_collect(job, *, source_id, limit, report_progress=None):
         return [
             {
                 "conversation_id": "19:conversation@thread.tacv2",
@@ -2057,7 +2083,7 @@ def test_local_agent_cloud_teams_sync_retries_window_when_processing_was_not_acc
 def test_local_agent_cloud_teams_sync_writes_conversation_poll_audit(monkeypatch, tmp_path: Path):
     from memforge.local_agent.teams_audit import validate_teams_audit_run
 
-    async def fake_collect(job, *, source_id, limit):
+    async def fake_collect(job, *, source_id, limit, report_progress=None):
         assert source_id == "src-teams"
         return {
             "documents": [

@@ -329,6 +329,30 @@ def test_local_agent_job_lease_default_matches_ui_sync_wait_window():
     ]
 
 
+def test_local_agent_job_heartbeat_sends_user_progress():
+    client = _RecordingClient({"ok": True})
+
+    result = client.heartbeat_local_agent_job(
+        "laj-1",
+        attempt_count=2,
+        lease_seconds=120,
+        progress={"stage": "uploading", "current": 7, "total": 16},
+    )
+
+    assert result == {"ok": True}
+    assert client.calls == [
+        (
+            "POST",
+            "/api/cloud/local-agent/jobs/laj-1/heartbeat",
+            {
+                "attempt_count": 2,
+                "lease_seconds": 120,
+                "progress": {"stage": "uploading", "current": 7, "total": 16},
+            },
+        )
+    ]
+
+
 def test_tool_client_uses_target_for_workspace_resource_calls():
     client = ToolClient(
         target=build_target(

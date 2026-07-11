@@ -501,11 +501,18 @@ class ToolClient:
         *,
         attempt_count: int,
         lease_seconds: int = 60,
+        progress: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "attempt_count": attempt_count,
+            "lease_seconds": lease_seconds,
+        }
+        if progress is not None:
+            body["progress"] = progress
         return self._host_json(
             "POST",
             f"/api/cloud/local-agent/jobs/{quote(job_id, safe='')}/heartbeat",
-            {"attempt_count": attempt_count, "lease_seconds": lease_seconds},
+            body,
         )
 
     def complete_local_agent_job(

@@ -32,11 +32,42 @@ assert.deepEqual(
 );
 
 assert.deepEqual(
-  localAgentProgressFromJob(job("leased", { attempt_count: 1 }), "conversations"),
+  localAgentProgressFromJob(
+    job("leased", { attempt_count: 3, operation: "teams_sync" }),
+    "conversations",
+  ),
   {
     state: "leased",
-    message: "Local daemon is syncing conversations",
-    detail: "Attempt 1",
+    message: "Reading Teams messages",
+    detail: "Checking recent conversations",
+  },
+);
+
+assert.deepEqual(
+  localAgentProgressFromJob(
+    job("leased", {
+      attempt_count: 3,
+      operation: "teams_sync",
+      result: {
+        progress: {
+          stage: "uploading",
+          current: 7,
+          total: 16,
+          current_date: "2026-07-08T09:00:00+00:00",
+          date_from: "2026-06-29T10:03:01+00:00",
+          date_to: "2026-07-10T08:17:33+00:00",
+          messages: 194,
+        },
+      },
+    }),
+    "conversations",
+  ),
+  {
+    state: "leased",
+    message: "Syncing Jul 8 messages",
+    detail: "7 of 16 windows · 194 messages found",
+    completed: 7,
+    total: 16,
   },
 );
 
