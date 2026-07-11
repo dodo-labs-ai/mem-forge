@@ -699,25 +699,11 @@ class TeamsGene(Gene):
                     group="connection", order=0,
                 ),
                 ConfigField(
-                    key="channels", label="Team Channels",
+                    key="conversation_ids", label="Teams Conversations",
                     field_type=ConfigFieldType.TAG_LIST, required=False,
-                    placeholder="TeamName/ChannelName or conversation IDs",
-                    help_text="Comma-separated list of channels to sync",
+                    placeholder="Conversation IDs selected through Browse Teams",
+                    help_text="Direct Teams conversation IDs selected through Browse Teams",
                     group="scope", order=0,
-                ),
-                ConfigField(
-                    key="group_chats", label="Group Chats",
-                    field_type=ConfigFieldType.TAG_LIST, required=False,
-                    placeholder="Chat topic or conversation ID",
-                    help_text="Comma-separated group chat names or IDs",
-                    group="scope", order=1,
-                ),
-                ConfigField(
-                    key="individual_chats", label="Individual Chats",
-                    field_type=ConfigFieldType.TAG_LIST, required=False,
-                    placeholder="Person name or user ID",
-                    help_text="Comma-separated names or IDs for 1:1 chats",
-                    group="scope", order=2,
                 ),
                 ConfigField(
                     key="max_age_days", label="Max Age (days)",
@@ -761,12 +747,13 @@ class TeamsGene(Gene):
         # Local-agent Teams sources read already-captured raw window packages
         # from the server-side inbox. They do not need remote Teams selectors.
         if self._local_agent_documents_dir() is None and not self._local_agent_package_manifest():
+            conversation_ids = config.get("conversation_ids", [])
             channels = config.get("channels", [])
             group_chats = config.get("group_chats", [])
             individual_chats = config.get("individual_chats", [])
-            if not any([channels, group_chats, individual_chats]):
+            if not any([conversation_ids, channels, group_chats, individual_chats]):
                 raise ValueError(
-                    "At least one of channels, group_chats, or individual_chats must be configured"
+                    "At least one Teams conversation ID must be configured"
                 )
 
     async def authenticate(self) -> None:
@@ -1058,6 +1045,20 @@ class TeamsGene(Gene):
         """Resolve configured channels/chats to (conversation_id, metadata) pairs."""
         result: list[tuple[str, dict]] = []
 
+        conversation_ids = self.config.get("conversation_ids", [])
+        if isinstance(conversation_ids, str):
+            conversation_ids = [item.strip() for item in conversation_ids.split(",") if item.strip()]
+        for conversation_id in conversation_ids:
+            if conversation_id in conv_lookup:
+                result.append((conversation_id, conv_lookup[conversation_id]))
+            else:
+                result.append((conversation_id, {
+                    "id": conversation_id,
+                    "topic": "Teams conversation",
+                    "type": _TeamsAPIClient._infer_conversation_type(conversation_id),
+                    "lastActivity": datetime.now(timezone.utc),
+                }))
+
         # Channels
         channels = self.config.get("channels", [])
         if isinstance(channels, str):
@@ -1124,7 +1125,14 @@ class TeamsGene(Gene):
             else:
                 self._log.warning("No 1:1 conversation found with user: %s", person_spec)
 
-        return result
+        deduped: list[tuple[str, dict]] = []
+        seen_ids: set[str] = set()
+        for conversation_id, metadata in result:
+            if conversation_id in seen_ids:
+                continue
+            seen_ids.add(conversation_id)
+            deduped.append((conversation_id, metadata))
+        return deduped
 
     async def _resolve_channel(
         self, channel_spec: str, conv_lookup: dict[str, dict],

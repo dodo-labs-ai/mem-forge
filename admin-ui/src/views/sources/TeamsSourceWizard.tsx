@@ -20,6 +20,7 @@ import type {
   TeamsAuthStatus,
   TeamsBrowseData,
   TeamsChannel,
+  Source,
 } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -35,6 +36,9 @@ import { Separator } from "@/components/ui/separator";
 import {
   buildDefaultTeamsSourceConfig,
   buildTeamsSourcePayload,
+  buildTeamsSourceUpdatePayload,
+  editableTeamsSourceState,
+  existingTeamsSelection,
   teamsSelectionLabel,
   type TeamsSelectionItem,
   type TeamsSourceConfig,
@@ -47,10 +51,12 @@ export function TeamsSourceWizard({
   open,
   onOpenChange,
   onCreated,
+  source,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreated: () => void;
+  source?: Source | null;
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -59,6 +65,7 @@ export function TeamsSourceWizard({
           <TeamsSourceWizardBody
             onOpenChange={onOpenChange}
             onCreated={onCreated}
+            source={source}
           />
         )}
       </DialogContent>
@@ -69,13 +76,25 @@ export function TeamsSourceWizard({
 function TeamsSourceWizardBody({
   onOpenChange,
   onCreated,
+  source,
 }: {
   onOpenChange: (open: boolean) => void;
   onCreated: () => void;
+  source?: Source | null;
 }) {
   const [step, setStep] = useState<0 | 1 | 2>(0);
-  const [selections, setSelections] = useState<Map<string, TeamsSelectionItem>>(new Map());
-  const [config, setConfig] = useState(buildDefaultTeamsSourceConfig);
+  const initialState = useMemo(
+    () => source ? editableTeamsSourceState(source) : null,
+    [source],
+  );
+  const [selections, setSelections] = useState<Map<string, TeamsSelectionItem>>(
+    () => new Map(
+      (initialState?.conversationIds ?? []).map((id) => [id, existingTeamsSelection(id)]),
+    ),
+  );
+  const [config, setConfig] = useState(
+    () => initialState?.config ?? buildDefaultTeamsSourceConfig(),
+  );
 
   return (
     <>
@@ -106,6 +125,7 @@ function TeamsSourceWizardBody({
           onConfigChange={setConfig}
           onBack={() => setStep(1)}
           onCreated={onCreated}
+          source={source}
         />
       )}
     </>
@@ -284,6 +304,26 @@ function BrowseSelectStep({
   );
 
   const items = useMemo(() => flattenTeamsData(data), [data]);
+  useEffect(() => {
+    if (items.length === 0 || selections.size === 0) return;
+    const browsedById = new Map(items.map((item) => [item.id, item]));
+    const next = new Map(selections);
+    let changed = false;
+    for (const [id, selected] of selections) {
+      const browsed = browsedById.get(id);
+      if (
+        browsed
+        && (
+          browsed.type !== selected.type
+          || teamsSelectionLabel(browsed) !== teamsSelectionLabel(selected)
+        )
+      ) {
+        next.set(id, browsed);
+        changed = true;
+      }
+    }
+    if (changed) onSelectionsChange(next);
+  }, [items, onSelectionsChange, selections]);
   const visibleItems = useMemo(() => {
     const needle = search.trim().toLowerCase();
     if (!needle) return items;
@@ -383,30 +423,36 @@ function ConfirmStep({
   onConfigChange,
   onBack,
   onCreated,
+  source,
 }: {
   selections: Map<string, TeamsSelectionItem>;
   config: TeamsSourceConfig;
   onConfigChange: (config: TeamsSourceConfig) => void;
   onBack: () => void;
   onCreated: () => void;
+  source?: Source | null;
 }) {
   const queryClient = useQueryClient();
-  const createSource = useMutation({
-    mutationFn: (payload: { type: string; name: string; config: Record<string, unknown> }) =>
-      resourceClient.post("/sources", payload),
+  const selectedItems = [...selections.values()];
+  const saveSource = useMutation({
+    mutationFn: async () => {
+      if (source) {
+        return resourceClient.put(`/sources/${source.id}`, buildTeamsSourceUpdatePayload({
+          selections: selectedItems,
+          config,
+          existingConfig: source.config,
+        }));
+      }
+      return resourceClient.post("/sources", buildTeamsSourcePayload({ selections: selectedItems, config }));
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sources"] });
       onCreated();
     },
   });
 
-  const selectedItems = [...selections.values()];
   const updateNumber = (field: keyof TeamsSourceConfig, fallback: number) => (value: string) => {
     onConfigChange({ ...config, [field]: Number(value) || fallback });
-  };
-
-  const handleCreate = () => {
-    createSource.mutate(buildTeamsSourcePayload({ selections: selectedItems, config }));
   };
 
   return (
@@ -449,10 +495,10 @@ function ConfirmStep({
           </Field>
         </div>
 
-        {createSource.isError && (
+        {saveSource.isError && (
           <div className="flex items-start gap-2 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
             <AlertCircle className="mt-0.5 size-4 shrink-0" />
-            Failed to create source. Please try again.
+            Failed to {source ? "update" : "create"} source. Please try again.
           </div>
         )}
       </div>
@@ -462,9 +508,9 @@ function ConfirmStep({
           <ArrowLeft className="size-4" />
           Back
         </Button>
-        <Button type="button" onClick={handleCreate} disabled={!config.name.trim() || createSource.isPending}>
-          {createSource.isPending ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
-          Create Source
+        <Button type="button" onClick={() => saveSource.mutate()} disabled={!config.name.trim() || saveSource.isPending}>
+          {saveSource.isPending ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
+          {source ? "Save Changes" : "Create Source"}
         </Button>
       </DialogFooter>
     </>
@@ -532,5 +578,6 @@ function TypeIcon({
 }) {
   if (type === "channel") return <Hash className={className} />;
   if (type === "group_chat") return <MessageSquare className={className} />;
-  return <User className={className} />;
+  if (type === "individual_chat") return <User className={className} />;
+  return null;
 }

@@ -74,9 +74,10 @@ class TestMetadata:
         schema = TeamsGene.config_schema()
         field_keys = [f.key for f in schema.fields]
         assert "region" in field_keys
-        assert "channels" in field_keys
-        assert "group_chats" in field_keys
-        assert "individual_chats" in field_keys
+        assert "conversation_ids" in field_keys
+        assert "channels" not in field_keys
+        assert "group_chats" not in field_keys
+        assert "individual_chats" not in field_keys
         assert "max_age_days" in field_keys
         assert "conversation_gap_minutes" in field_keys
         assert "max_block_messages" in field_keys
@@ -220,6 +221,35 @@ class TestMetadata:
             source_id="test",
         )
         assert gene.source_id == "test"
+
+    def test_config_accepts_direct_conversation_ids(self):
+        gene = TeamsGene(
+            config={"conversation_ids": "19:group@thread.v2"},
+            source_id="test",
+        )
+
+        assert gene.source_id == "test"
+
+    @pytest.mark.asyncio
+    async def test_direct_conversation_ids_infer_type_when_browse_metadata_is_missing(self):
+        gene = TeamsGene(
+            config={
+                "conversation_ids": [
+                    "19:channel@thread.tacv2",
+                    "19:dm@unq.gbl.spaces",
+                    "19:group@thread.v2",
+                ]
+            },
+            source_id="test",
+        )
+
+        resolved = await gene._resolve_configured_conversations({})
+
+        assert [metadata["type"] for _, metadata in resolved] == [
+            "channel",
+            "individual_chat",
+            "group_chat",
+        ]
 
 
 # ---------------------------------------------------------------------------

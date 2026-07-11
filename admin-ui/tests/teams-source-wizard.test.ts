@@ -4,6 +4,9 @@ import { readFileSync } from "node:fs";
 import {
   buildDefaultTeamsSourceConfig,
   buildTeamsSourcePayload,
+  buildTeamsSourceUpdatePayload,
+  editableTeamsSourceState,
+  existingTeamsSelection,
   teamsSelectionLabel,
   type TeamsSelectionItem,
 } from "../src/views/sources/teamsSourceConfig.js";
@@ -55,10 +58,55 @@ assert.deepEqual(payload, {
 assert.equal(teamsSelectionLabel(selections[0]), "Engineering / Architecture");
 assert.equal(teamsSelectionLabel(selections[1]), "Planning Chat");
 assert.equal(teamsSelectionLabel(selections[2]), "Ada Lovelace");
+assert.equal(existingTeamsSelection("19:existing@thread.v2").type, "unknown");
 
 assert.equal(Object.hasOwn(payload.config, "channels"), false);
 assert.equal(Object.hasOwn(payload.config, "group_chats"), false);
 assert.equal(Object.hasOwn(payload.config, "individual_chats"), false);
+
+const existingSource = {
+  id: "src-teams",
+  name: "PCC Agent Dev",
+  config: {
+    region: "emea",
+    conversation_ids: "19:group@thread.v2, 19:dm@thread.v2",
+    max_age_days: 30,
+    conversation_gap_minutes: 45,
+    max_block_messages: 80,
+    language: "en",
+    channels: ["legacy/channel"],
+  },
+};
+const existingState = editableTeamsSourceState(existingSource);
+assert.deepEqual(existingState.config, {
+  name: "PCC Agent Dev",
+  region: "emea",
+  max_age_days: 30,
+  conversation_gap_minutes: 45,
+  max_block_messages: 80,
+});
+assert.deepEqual(existingState.conversationIds, [
+  "19:group@thread.v2",
+  "19:dm@thread.v2",
+]);
+assert.deepEqual(
+  buildTeamsSourceUpdatePayload({
+    selections: selections.slice(1),
+    config: existingState.config,
+    existingConfig: existingSource.config,
+  }),
+  {
+    name: "PCC Agent Dev",
+    config: {
+      region: "emea",
+      conversation_ids: "19:group@thread.v2, 19:dm@thread.v2",
+      max_age_days: 30,
+      conversation_gap_minutes: 45,
+      max_block_messages: 80,
+      language: "en",
+    },
+  },
+);
 
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
 const teamsWizardSource = readFileSync("src/views/sources/TeamsSourceWizard.tsx", "utf8");
@@ -92,6 +140,21 @@ assert.match(
   teamsWizardSource,
   /runTeamsLocalAgentJob\("teams_auth"/,
   "Teams auth should be triggered through the local daemon instead of CLI instructions",
+);
+assert.match(
+  sourcesPageSource,
+  /source\.type\s*===\s*"teams"[\s\S]{0,240}setTeamsWizardSource\(source\)/,
+  "Existing Teams sources should open the Teams wizard instead of the stale generic schema form",
+);
+assert.match(
+  sourcesPageSource,
+  /<TeamsSourceWizard[\s\S]{0,240}source=\{teamsWizardSource\}/,
+  "The Teams wizard should receive the existing source when Configure is selected",
+);
+assert.match(
+  teamsWizardSource,
+  /resourceClient\.put\(`\/sources\/\$\{source\.id\}`/,
+  "Editing through the Teams wizard should update the existing source",
 );
 assert.match(
   teamsWizardSource,

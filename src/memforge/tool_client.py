@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from memforge.api_target import MemForgeTarget
+from memforge.api_target import MemForgeTarget, build_target
 
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -46,6 +46,14 @@ class ToolClient:
         self.target = target
         self.api_token = api_token
         self.timeout_seconds = timeout_seconds
+
+    def for_workspace(self, workspace_id: str) -> ToolClient:
+        """Return a client scoped to one workspace from a server-level client."""
+        return ToolClient(
+            target=build_target(origin=self.target.origin, workspace_id=workspace_id),
+            api_token=self.api_token,
+            timeout_seconds=self.timeout_seconds,
+        )
 
     def _resource_url(self, path: str) -> str:
         return self.target.resource_url(path)
