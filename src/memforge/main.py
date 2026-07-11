@@ -2564,20 +2564,21 @@ def _run_cloud_teams_sync_job(
             },
         )
 
+    _report_local_agent_progress(
+        report_progress,
+        _sync_progress_snapshot(
+            phase="uploading",
+            completed=processed_messages,
+            total=progress_summary.get("messages", 0),
+            unit="message",
+            source_time_start=progress_summary.get("date_from"),
+            source_time_end=progress_summary.get("date_to"),
+            failed=len(failed),
+        ),
+    )
+
     sync_result = None
     if pushed:
-        _report_local_agent_progress(
-            report_progress,
-            _sync_progress_snapshot(
-                phase="uploading",
-                completed=progress_summary.get("messages", 0),
-                total=progress_summary.get("messages", 0),
-                unit="message",
-                source_time_start=progress_summary.get("date_from"),
-                source_time_end=progress_summary.get("date_to"),
-                failed=len(failed),
-            ),
-        )
         # Teams is incremental by stable window id and revision. Processing the
         # historical input set lets the server collapse each window to its
         # latest revision; document-style authoritative snapshots do not apply.
