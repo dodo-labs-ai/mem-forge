@@ -1996,14 +1996,21 @@ def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypat
     assert len([call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]) == 1
 
     FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
+    retry_progress: list[dict] = []
     second = main._run_cloud_local_agent_job(
         {**job, "job_id": "laj-teams-sync-retry"},
         _cloud_test_client(),
+        report_progress=retry_progress.append,
     )
 
     assert second["counts"] == {"selected": 1, "pushed": 0, "failed": 0, "skipped_existing": 1, "polls": 0}
     assert not [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
     assert not [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
+    assert retry_progress[-1]["progress"] == {
+        "completed": 2,
+        "total": 2,
+        "unit": "message",
+    }
 
     audit_rows = [json.loads(line) for line in audit_log_path.read_text(encoding="utf-8").splitlines()]
     second_run = [row for row in audit_rows if row["run_id"] == "laj-teams-sync-retry"]
