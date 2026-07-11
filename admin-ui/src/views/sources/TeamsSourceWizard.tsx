@@ -194,7 +194,7 @@ function AuthCheckStep({ region, onAuthenticated }: { region: string; onAuthenti
       </div>
 
       {!data?.authenticated && !isLoading && (
-        <DialogFooter className="mx-0 mb-0 shrink-0 p-5 rounded-none rounded-b-xl bg-background">
+        <DialogFooter className="mx-0 mb-0 shrink-0 px-5 py-4 rounded-none rounded-b-xl bg-background">
           <Button type="button" variant="outline" onClick={() => refetch()} disabled={busy}>
             {isFetching && !connectMutation.isPending && <Loader2 className="size-4 animate-spin" />}
             Check Again
@@ -380,7 +380,7 @@ function BrowseSelectStep({
             No conversations found.
           </div>
         ) : (
-          <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border">
+          <div className="min-h-0 max-h-[28rem] flex-1 overflow-y-auto rounded-lg border">
             {visibleItems.map((item) => (
               <button
                 key={item.id}
@@ -402,7 +402,7 @@ function BrowseSelectStep({
         )}
       </div>
 
-      <DialogFooter className="mx-0 mb-0 shrink-0 p-5 flex-row justify-between rounded-none rounded-b-xl bg-background sm:justify-between">
+      <DialogFooter className="mx-0 mb-0 shrink-0 px-5 py-4 flex-row justify-between rounded-none rounded-b-xl bg-background sm:justify-between">
         <Button type="button" variant="ghost" onClick={onBack}>
           <ArrowLeft className="size-4" />
           Cancel
@@ -503,7 +503,7 @@ function ConfirmStep({
         )}
       </div>
 
-      <DialogFooter className="mx-0 mb-0 shrink-0 p-5 flex-row justify-between rounded-none rounded-b-xl bg-background sm:justify-between">
+      <DialogFooter className="mx-0 mb-0 shrink-0 px-5 py-4 flex-row justify-between rounded-none rounded-b-xl bg-background sm:justify-between">
         <Button type="button" variant="ghost" onClick={onBack}>
           <ArrowLeft className="size-4" />
           Back
