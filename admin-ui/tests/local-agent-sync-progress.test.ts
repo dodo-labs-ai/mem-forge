@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   localAgentProgressFromJob,
   localAgentProgressMessage,
+  teamsConversationCount,
 } from "../src/views/sources/localAgentSyncProgress.js";
 import type { LocalAgentJobStatusResponse } from "../src/api/types.js";
 import { currentWorkspaceId, requireCurrentWorkspaceId } from "../src/lib/workspace.js";
@@ -57,6 +58,7 @@ assert.deepEqual(
           date_from: "2026-06-29T10:03:01+00:00",
           date_to: "2026-07-10T08:17:33+00:00",
           messages: 194,
+          processed_messages: 72,
         },
       },
     }),
@@ -65,15 +67,16 @@ assert.deepEqual(
   {
     state: "leased",
     message: "Syncing Jul 8 messages",
-    detail: "7 of 16 windows · 194 messages found",
-    completed: 7,
-    total: 16,
+    detail: "72 of 194 messages",
+    completed: 72,
+    total: 194,
   },
 );
 
 assert.deepEqual(
   localAgentProgressFromJob(
     job("succeeded", {
+      operation: "teams_sync",
       result: {
         counts: {
           selected: 22,
@@ -82,6 +85,9 @@ assert.deepEqual(
           failed: 0,
           polls: 2,
         },
+        messages: 194,
+        date_from: "2026-06-29T10:03:01+00:00",
+        date_to: "2026-07-10T08:17:33+00:00",
         sync_started: false,
       },
     }),
@@ -90,13 +96,14 @@ assert.deepEqual(
   {
     state: "succeeded",
     message: "Up to date",
-    detail: "22 conversations checked · 22 unchanged",
+    detail: "194 messages checked · Jun 29–Jul 10",
   },
 );
 
 assert.deepEqual(
   localAgentProgressFromJob(
     job("succeeded", {
+      operation: "teams_sync",
       result: {
         counts: {
           selected: 22,
@@ -105,6 +112,9 @@ assert.deepEqual(
           failed: 0,
           polls: 2,
         },
+        messages: 194,
+        date_from: "2026-06-29T10:03:01+00:00",
+        date_to: "2026-07-10T08:17:33+00:00",
         sync_started: true,
       },
     }),
@@ -112,8 +122,8 @@ assert.deepEqual(
   ),
   {
     state: "succeeded",
-    message: "Sent 9 changed conversations to Cloud",
-    detail: "22 conversations checked · 13 unchanged",
+    message: "Sent new Teams messages to Cloud",
+    detail: "194 messages · Jun 29–Jul 10",
   },
 );
 
@@ -127,6 +137,25 @@ assert.equal(
     ),
   ),
   "Action needed · Sign in to Teams in Chrome, then retry sync.",
+);
+
+assert.equal(
+  teamsConversationCount({
+    conversation_ids: "19:flexible-payroll@thread.v2",
+  }),
+  1,
+);
+assert.equal(
+  teamsConversationCount({
+    conversation_ids: ["19:a@thread.v2", "19:b@thread.v2", "19:a@thread.v2"],
+  }),
+  2,
+);
+assert.equal(
+  teamsConversationCount({
+    group_chats: ["19:legacy@thread.v2"],
+  }),
+  1,
 );
 
 Object.defineProperty(globalThis, "window", {

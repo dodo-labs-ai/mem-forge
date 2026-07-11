@@ -398,6 +398,7 @@ export interface LocalAgentJobProgress {
   date_from?: string | null;
   date_to?: string | null;
   messages?: number;
+  processed_messages?: number;
   conversations?: number;
 }
 

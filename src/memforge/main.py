@@ -2385,13 +2385,16 @@ def _run_cloud_teams_sync_job(
     submitted_by = str(payload.get("submitted_by") or "memforge-local-agent")
     sync_started = False
 
+    processed_messages = 0
     for index, doc in enumerate(documents, start=1):
+        processed_messages += _int_or_zero(doc.get("message_count"))
         _report_local_agent_progress(
             report_progress,
             {
                 "stage": "uploading",
                 "current": index,
                 "total": len(documents),
+                "processed_messages": processed_messages,
                 "current_date": doc.get("date_from") or doc.get("date_to") or doc.get("last_modified"),
                 **progress_summary,
             },
@@ -2512,6 +2515,7 @@ def _run_cloud_teams_sync_job(
                 "stage": "starting_processing",
                 "current": len(documents),
                 "total": len(documents),
+                "processed_messages": progress_summary.get("messages", 0),
                 **progress_summary,
             },
         )
