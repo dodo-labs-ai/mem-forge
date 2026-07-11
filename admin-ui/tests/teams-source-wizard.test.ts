@@ -193,8 +193,8 @@ assert.match(
 );
 assert.match(
   teamsWizardSource,
-  /<div className="min-h-0 flex-1 overflow-y-auto rounded-lg border">/,
-  "Teams conversation results should scroll inside the dialog instead of pushing actions out of view",
+  /<div className="min-h-0 max-h-\[28rem\] flex-1 overflow-y-auto rounded-lg border">/,
+  "Teams conversation results should stay compact and scroll instead of stretching the dialog",
 );
 assert.equal(
   teamsWizardSource.match(/<DialogFooter className="mx-0 mb-0/g)?.length,
@@ -202,7 +202,7 @@ assert.equal(
   "Every Teams wizard step should keep its footer inside the zero-padding dialog boundary",
 );
 assert.equal(
-  teamsWizardSource.match(/<DialogFooter className="mx-0 mb-0 shrink-0 p-5/g)?.length,
+  teamsWizardSource.match(/<DialogFooter className="mx-0 mb-0 shrink-0 px-5 py-4/g)?.length,
   3,
-  "Every Teams wizard footer should keep comfortable spacing from the dialog edges",
+  "Every Teams wizard footer should balance horizontal edge spacing with a compact height",
 );
