@@ -253,6 +253,31 @@ def test_start_source_processing_posts_snapshot_identity():
     ]
 
 
+def test_start_source_processing_resolves_the_host_url(monkeypatch):
+    client = ToolClient(
+        target=build_target(origin="https://self.example.test", workspace_id=None),
+        api_token="tok",
+    )
+    calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    def record_http_json(method, url, body):
+        calls.append((method, url, body))
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_http_json", record_http_json)
+
+    result = client.start_source_processing(source_id="src-local")
+
+    assert result == {"ok": True}
+    assert calls == [
+        (
+            "POST",
+            "https://self.example.test/api/sources/src-local/process",
+            {"force_full_sync": False},
+        )
+    ]
+
+
 def test_local_agent_job_methods_use_cloud_local_agent_contract():
     client = _RecordingClient({"jobs": []})
 
