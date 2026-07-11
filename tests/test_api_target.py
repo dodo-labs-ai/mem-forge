@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from memforge.api_target import Edition, MemForgeTarget, TargetConfigurationError, build_target
+from memforge.api_target import (
+    Edition,
+    MemForgeTarget,
+    TargetConfigurationError,
+    build_host_target,
+    build_target,
+)
 from memforge.plugin_config import configured_target
 
 
@@ -56,6 +62,18 @@ def test_build_target_defaults_only_when_all_configuration_is_absent():
         workspace_id=None,
     )
     assert target.workspace_api_base == "http://127.0.0.1:8765/api"
+
+
+def test_build_host_target_allows_cloud_control_plane_without_workspace():
+    target = build_host_target(
+        origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com/",
+    )
+
+    assert target == MemForgeTarget(
+        edition=Edition.CLOUD,
+        origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+        workspace_id=None,
+    )
 
 
 def test_build_target_normalizes_origin_and_quotes_workspace():

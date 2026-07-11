@@ -207,6 +207,7 @@ export function SourcesPage() {
   const queryClient = useQueryClient();
   const [addOpen, setAddOpen] = useState(false);
   const [teamsWizardOpen, setTeamsWizardOpen] = useState(false);
+  const [teamsWizardSource, setTeamsWizardSource] = useState<Source | null>(null);
   const [configDialog, setConfigDialog] = useState<{
     sourceType: string | null;
     source?: Source | null;
@@ -577,6 +578,11 @@ export function SourcesPage() {
                         isSubscriptionPending={pendingSubscriptionIds.has(source.id)}
                         onConfigure={() => {
                           if (!capabilities.can_configure) return;
+                          if (source.type === "teams" && capabilities.can_configure_connection) {
+                            setTeamsWizardSource(source);
+                            setTeamsWizardOpen(true);
+                            return;
+                          }
                           setConfigDialog({
                             sourceType: source.type,
                             source,
@@ -642,6 +648,7 @@ export function SourcesPage() {
         isLoading={genesQuery.isLoading}
         onTeamsSelected={() => {
           setAddOpen(false);
+          setTeamsWizardSource(null);
           setTeamsWizardOpen(true);
         }}
         onConfigureSelected={(sourceType) => {
@@ -669,9 +676,14 @@ export function SourcesPage() {
 
       <TeamsSourceWizard
         open={teamsWizardOpen}
-        onOpenChange={setTeamsWizardOpen}
+        source={teamsWizardSource}
+        onOpenChange={(open) => {
+          setTeamsWizardOpen(open);
+          if (!open) setTeamsWizardSource(null);
+        }}
         onCreated={() => {
           setTeamsWizardOpen(false);
+          setTeamsWizardSource(null);
           queryClient.invalidateQueries({ queryKey: ["sources"] });
           queryClient.invalidateQueries({ queryKey: ["stats"] });
         }}

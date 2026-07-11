@@ -30,7 +30,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
-from memforge.api_target import MemForgeTarget, TargetConfigurationError, build_target
+from memforge.api_target import MemForgeTarget, TargetConfigurationError, build_host_target, build_target
 from memforge.auth import browser_session
 from memforge.config import AppConfig, load_config
 from memforge.github_repo_utils import (
@@ -158,12 +158,17 @@ def _toml_key(value: str) -> str:
     return json.dumps(value)
 
 
-def _resolve_api_target(_config: AppConfig) -> _ResolvedCliTarget:
+def _resolve_api_target(
+    _config: AppConfig,
+    *,
+    allow_cloud_without_workspace: bool = False,
+) -> _ResolvedCliTarget:
     target_env_names = ("MEMFORGE_API_URL", "MEMFORGE_WORKSPACE_ID")
     if any(os.getenv(name, "").strip() for name in target_env_names):
         target = _build_cli_target(
             api_url=os.getenv("MEMFORGE_API_URL"),
             workspace_id=os.getenv("MEMFORGE_WORKSPACE_ID"),
+            allow_cloud_without_workspace=allow_cloud_without_workspace,
         )
         return _ResolvedCliTarget(
             target=target,
@@ -180,6 +185,7 @@ def _resolve_api_target(_config: AppConfig) -> _ResolvedCliTarget:
         target = _build_cli_target(
             api_url=profile.get("api_url"),
             workspace_id=profile.get("workspace_id"),
+            allow_cloud_without_workspace=allow_cloud_without_workspace,
         )
         token_env = str(profile.get("token_env") or "")
         return _ResolvedCliTarget(
@@ -197,18 +203,33 @@ def _resolve_api_target(_config: AppConfig) -> _ResolvedCliTarget:
     )
 
 
-def _build_cli_target(*, api_url: object, workspace_id: object) -> MemForgeTarget:
+def _build_cli_target(
+    *,
+    api_url: object,
+    workspace_id: object,
+    allow_cloud_without_workspace: bool = False,
+) -> MemForgeTarget:
     try:
         return build_target(
             origin=str(api_url) if api_url is not None else None,
             workspace_id=str(workspace_id) if workspace_id is not None else None,
         )
     except TargetConfigurationError as exc:
+        if allow_cloud_without_workspace and exc.code == "cloud_workspace_required":
+            return build_host_target(origin=str(api_url) if api_url is not None else None)
         raise click.ClickException(exc.code) from exc
 
 
 def _tool_client(ctx) -> ToolClient:
     resolved = _resolve_api_target(ctx.obj["config"])
+    return ToolClient(target=resolved.target, api_token=resolved.api_token)
+
+
+def _local_agent_tool_client(ctx) -> ToolClient:
+    resolved = _resolve_api_target(
+        ctx.obj["config"],
+        allow_cloud_without_workspace=True,
+    )
     return ToolClient(target=resolved.target, api_token=resolved.api_token)
 
 
@@ -314,7 +335,7 @@ def _build_local_agent_runner(
 ):
     from memforge.local_agent.runner import LocalAgentRunner
 
-    client = _tool_client(ctx)
+    client = _local_agent_tool_client(ctx)
     return LocalAgentRunner(
         state_store=_local_agent_state_store(),
         cloud_job_handler=lambda job: _run_cloud_local_agent_job(
@@ -1653,7 +1674,7 @@ def _local_agent_clean_target_summary(target: dict[str, Any]) -> dict[str, Any]:
 
 def _local_agent_target_summary(ctx) -> dict[str, Any]:
     config: AppConfig = ctx.obj["config"]
-    resolved = _resolve_api_target(config)
+    resolved = _resolve_api_target(config, allow_cloud_without_workspace=True)
     return {
         "edition": resolved.target.edition.value,
         "api_url": resolved.target.origin,
@@ -1972,9 +1993,10 @@ def _run_cloud_github_sync_job(job: dict[str, Any], client: ToolClient) -> dict[
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     profile = _github_profile_from_cloud_job(job)
-    source_id, _workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
     if error:
         return error
+    client = client.for_workspace(workspace_id)
     profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
     result = _push_github_profile_to_source(
         profile_name,
@@ -2019,9 +2041,10 @@ def _run_cloud_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
 def _run_cloud_local_markdown_sync_job(job: dict[str, Any], client: ToolClient) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, _workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
     if error:
         return error
+    client = client.for_workspace(workspace_id)
     profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
     result = _push_kb_profile_to_source(
         profile_name,
@@ -2046,9 +2069,10 @@ def _run_cloud_jira_sync_job(
 ) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, _workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
     if error:
         return error
+    client = client.for_workspace(workspace_id)
     try:
         documents = asyncio.run(
             _collect_jira_documents_from_cloud_job(
@@ -2266,9 +2290,10 @@ def _run_cloud_teams_sync_job(job: dict[str, Any], client: ToolClient) -> dict[s
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, _workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
     if error:
         return error
+    client = client.for_workspace(workspace_id)
 
     run_id = str(job.get("job_id") or f"teams-sync-{int(time.time())}")
     audit_path = Path(str(payload.get("audit_log_path") or DEFAULT_TEAMS_AUDIT_LOG_PATH))
@@ -2716,7 +2741,7 @@ def _teams_direct_rest_config_from_cloud_payload(payload: dict[str, Any]) -> dic
     if not direct_ids:
         raise ValueError("teams_sync_requires_direct_conversation_ids")
 
-    config["group_chats"] = _dedupe_preserving_order(direct_ids)
+    config["conversation_ids"] = _dedupe_preserving_order(direct_ids)
     return config
 
 
@@ -3195,12 +3220,12 @@ def auth():
 @click.option("--region", default="emea", type=click.Choice(["emea", "amer", "apac"]),
               help="Teams API region")
 def auth_teams(region: str):
-    """Authenticate with Microsoft Teams by extracting Chrome session tokens."""
+    """Authenticate with Microsoft Teams from Keychain or Chrome."""
 
     from memforge.auth.teams_auth import TeamsAuthenticator
 
     authenticator = TeamsAuthenticator()
-    console.print("[bold]Extracting Teams tokens from Chrome...[/]\n")
+    console.print("[bold]Loading Teams session...[/]\n")
 
     try:
         token_data = authenticator.authenticate(region=region)
@@ -3252,7 +3277,13 @@ def auth_teams(region: str):
     else:
         console.print("[yellow]No Chat API token found — skipping verification[/]")
 
-    console.print("\n[bold green]Done! Tokens saved to ~/.memforge/tokens/teams.json[/]")
+    if authenticator.keychain_session_available:
+        console.print("\n[bold green]Done! Teams session saved to the OS keychain.[/]")
+    else:
+        console.print(
+            "\n[bold yellow]Done! Teams session saved to the local compatibility cache; "
+            "the OS keychain was unavailable.[/]"
+        )
 
 
 @auth.command("status")

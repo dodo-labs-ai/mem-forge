@@ -42,6 +42,7 @@ dependencies = [
     "click>=8.1",
     "rich>=13.9",
     "browser_cookie3>=0.20",
+    "keyring>=25.7",
     "tomli>=2.0; python_version < '3.11'",
     "weasyprint>=68.1",
 ]

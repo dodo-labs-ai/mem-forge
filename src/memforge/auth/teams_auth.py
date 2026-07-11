@@ -1,11 +1,13 @@
 """Teams OAuth token capture — extracts tokens from Chrome browser cookies.
 
-Primary approach: extract Bearer tokens from Chrome cookies for
-teams.microsoft.com. This requires the user to have an active Teams session
-in Chrome. If no valid tokens are found, opens the system browser to the
-Teams login page for the user to authenticate.
+Primary approach: reuse the cached Teams session from the operating-system
+keychain. A legacy file cache remains readable for migration and compatibility.
+Only when neither cache has a valid session does MemForge inspect Chrome and,
+if necessary, open the Teams login page.
 
-Token location: ~/.memforge/tokens/teams.json
+Primary token location: operating-system keychain service
+``memforge-teams-session``. The legacy compatibility cache remains at
+``~/.memforge/tokens/teams.json``.
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ __all__ = ["TeamsAuthenticator"]
 
 TOKEN_DIR = Path.home() / ".memforge" / "tokens"
 TOKEN_FILE = TOKEN_DIR / "teams.json"
+KEYCHAIN_SERVICE = "memforge-teams-session"
+KEYCHAIN_USERNAME = "default"
 
 CHAT_API_AUDIENCE = "https://ic3.teams.office.com"
 _TEAMS_LOGIN_URL = "https://teams.microsoft.com/v2/"
@@ -44,6 +48,9 @@ def _open_teams_login() -> None:
 class TeamsAuthenticator:
     """Extracts Teams OAuth tokens from Chrome cookies or cached files."""
 
+    def __init__(self) -> None:
+        self.keychain_session_available = False
+
     def authenticate(
         self,
         region: str = "emea",
@@ -52,13 +59,25 @@ class TeamsAuthenticator:
         poll_interval_seconds: float = 2.0,
         rejected_token_hashes: set[str] | None = None,
     ) -> dict:
-        """Extract tokens from Chrome cookies. Opens browser if no session found.
+        """Reuse cached tokens, then capture from Chrome or open login if needed.
 
         Returns:
             Token data dict with version, captured_at, region, tokens.
         """
-        # Try extracting from Chrome cookies first
         rejected_token_hashes = rejected_token_hashes or set()
+
+        keychain_data = self._load_keychain_token_data()
+        tokens = self._valid_tokens_from_data(keychain_data)
+        if tokens and not self._has_rejected_token(tokens, rejected_token_hashes):
+            self.keychain_session_available = True
+            return keychain_data  # type: ignore[return-value]
+
+        file_data = self._load_file_token_data()
+        tokens = self._valid_tokens_from_data(file_data)
+        if tokens and not self._has_rejected_token(tokens, rejected_token_hashes):
+            self.keychain_session_available = self._save_keychain_token_data(file_data)  # type: ignore[arg-type]
+            return file_data  # type: ignore[return-value]
+
         tokens = self._extract_from_chrome()
         if tokens and self._has_rejected_token(tokens, rejected_token_hashes):
             tokens = None
@@ -88,7 +107,7 @@ class TeamsAuthenticator:
             "tokens": tokens,
         }
 
-        self.save_tokens(token_data)
+        self.keychain_session_available = self.save_tokens(token_data)
         logger.info("Saved %d tokens to %s", len(tokens), TOKEN_FILE)
         return token_data
 
@@ -168,40 +187,86 @@ class TeamsAuthenticator:
         return False
 
     @staticmethod
-    def save_tokens(token_data: dict) -> None:
-        """Save token data to disk."""
+    def save_tokens(token_data: dict) -> bool:
+        """Save token data and return whether the OS keychain write succeeded."""
+        keychain_saved = TeamsAuthenticator._save_keychain_token_data(token_data)
         TOKEN_DIR.mkdir(parents=True, exist_ok=True)
         TOKEN_FILE.write_text(json.dumps(token_data, indent=2))
         TOKEN_FILE.chmod(0o600)
+        return keychain_saved
+
+    @staticmethod
+    def _load_keychain_token_data() -> dict | None:
+        try:
+            import keyring
+
+            value = keyring.get_password(KEYCHAIN_SERVICE, KEYCHAIN_USERNAME)
+            if not value:
+                return None
+            data = json.loads(value)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            logger.warning("Unable to read the Teams session from the OS keychain; using the local cache")
+            return None
+
+    @staticmethod
+    def _save_keychain_token_data(token_data: dict) -> bool:
+        try:
+            import keyring
+
+            keyring.set_password(
+                KEYCHAIN_SERVICE,
+                KEYCHAIN_USERNAME,
+                json.dumps(token_data, separators=(",", ":")),
+            )
+            return True
+        except Exception:
+            logger.warning("Unable to save the Teams session to the OS keychain; using the local cache")
+            return False
+
+    @staticmethod
+    def _load_file_token_data() -> dict | None:
+        if not TOKEN_FILE.exists():
+            return None
+        try:
+            data = json.loads(TOKEN_FILE.read_text())
+            return data if isinstance(data, dict) else None
+        except Exception:
+            logger.warning("Failed to read %s", TOKEN_FILE, exc_info=True)
+            return None
+
+    @staticmethod
+    def _valid_tokens_from_data(token_data: dict | None) -> dict | None:
+        if not isinstance(token_data, dict):
+            return None
+        tokens = token_data.get("tokens")
+        if not isinstance(tokens, dict) or not tokens:
+            return None
+        validity = TeamsAuthenticator.check_token_expiry(tokens)
+        return tokens if validity.get(CHAT_API_AUDIENCE, False) else None
 
     @staticmethod
     def load_tokens() -> dict | None:
         """Load tokens from available sources.
 
         Search order:
-        1. ~/.memforge/tokens/teams.json (cached)
-        2. Chrome cookies (live extraction)
+        1. operating-system keychain
+        2. ~/.memforge/tokens/teams.json (legacy compatibility cache)
+        3. Chrome cookies (live extraction)
         """
-        # 1. Cached tokens
-        if TOKEN_FILE.exists():
-            try:
-                data = json.loads(TOKEN_FILE.read_text())
-                tokens = data.get("tokens", {})
-                if tokens:
-                    now = datetime.now(timezone.utc).timestamp()
-                    has_valid = any(
-                        (t.get("expiresAt", 0) == 0 or t.get("expiresAt", 0) > now)
-                        for t in tokens.values()
-                        if isinstance(t, dict)
-                    )
-                    if has_valid:
-                        logger.debug("Loaded tokens from %s", TOKEN_FILE)
-                        return tokens
-                    logger.debug("Cached tokens expired, trying Chrome...")
-            except Exception:
-                logger.warning("Failed to read %s", TOKEN_FILE, exc_info=True)
+        keychain_data = TeamsAuthenticator._load_keychain_token_data()
+        tokens = TeamsAuthenticator._valid_tokens_from_data(keychain_data)
+        if tokens:
+            logger.debug("Loaded Teams session from the OS keychain")
+            return tokens
 
-        # 2. Live Chrome cookie extraction
+        file_data = TeamsAuthenticator._load_file_token_data()
+        tokens = TeamsAuthenticator._valid_tokens_from_data(file_data)
+        if tokens:
+            TeamsAuthenticator._save_keychain_token_data(file_data)  # type: ignore[arg-type]
+            logger.debug("Loaded Teams session from %s", TOKEN_FILE)
+            return tokens
+
         auth = TeamsAuthenticator()
         chrome_tokens = auth._extract_from_chrome()
         if chrome_tokens:

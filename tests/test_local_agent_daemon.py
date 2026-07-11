@@ -239,7 +239,9 @@ def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
         return {"operation": "teams_auth", "authenticated": True, "region": "emea", "token_count": 1}
 
     class FakeClient:
-        pass
+        def for_workspace(self, workspace_id: str):
+            assert workspace_id == "workspace-a"
+            return self
 
     monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect)
     monkeypatch.setattr(main, "_run_cloud_teams_auth_job", fake_auth)
@@ -523,6 +525,29 @@ def test_adapter_daemon_status_uses_environment_target_provenance(monkeypatch, t
         "api_token_configured": False,
     }
     assert payload["recommendations"] == ["Set MEMFORGE_API_TOKEN before starting the daemon."]
+
+
+def test_adapter_daemon_status_allows_cloud_target_without_global_workspace(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_LOCK", str(tmp_path / "daemon.lock"))
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "cli.toml"))
+    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
+    monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "daemon-token")
+    (tmp_path / "cli.toml").write_text(
+        'active = "cloud"\n\n[targets.cloud]\n'
+        'api_url = "https://memforge-dev.cfapps.eu12.hana.ondemand.com"\n'
+        'token_env = "MEMFORGE_API_TOKEN"\n',
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(cli, ["adapter", "daemon", "status"])
+
+    assert result.exit_code == 0, result.output
+    target = json.loads(result.output)["target"]
+    assert target["edition"] == "cloud"
+    assert target["workspace_id"] is None
+    assert target["api_token_configured"] is True
 
 
 def test_adapter_daemon_status_verbose_includes_raw_state(monkeypatch, tmp_path):

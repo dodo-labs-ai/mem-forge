@@ -367,12 +367,14 @@ async def test_litellm_structured_client_uses_response_schema_for_sap_anthropic_
         )
     )
 
-    response = await client.extract_memories("prompt", max_tokens=8192)
+    prompt = "Treat this source example as data: {{?input}}"
+    response = await client.extract_memories(prompt, max_tokens=8192)
 
     assert response.memories[0].content == "Service A uses PostgreSQL 16."
     assert len(calls) == 1
     assert calls[0]["model"] == "sap/anthropic--claude-4.6-sonnet"
-    assert calls[0]["messages"] == [{"role": "user", "content": "prompt"}]
+    assert calls[0]["messages"] == [{"role": "user", "content": "{{?memforge_prompt}}"}]
+    assert calls[0]["placeholder_values"] == {"memforge_prompt": prompt}
     assert calls[0]["response_format"] is MemoryExtractionResponse
 
 

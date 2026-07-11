@@ -14,7 +14,7 @@ from urllib.error import URLError
 import pytest
 
 import memforge.tool_client as tool_client
-from memforge.api_target import build_target
+from memforge.api_target import build_host_target, build_target
 from memforge.tool_client import ToolClient
 
 
@@ -314,6 +314,22 @@ def test_tool_client_uses_target_for_workspace_resource_calls():
         client._resource_url("/sources/src-github/adapter/packages")
         == "https://memforge.example.hana.ondemand.com/api/workspaces/ws-a/api/sources/src-github/adapter/packages"
     )
+
+
+def test_tool_client_can_scope_server_level_client_to_job_workspace():
+    server_client = ToolClient(
+        target=build_host_target(origin="https://memforge.example.hana.ondemand.com"),
+        api_token="token",
+    )
+
+    scoped = server_client.for_workspace("mount_tai")
+
+    assert scoped.target.workspace_id == "mount_tai"
+    assert (
+        scoped.target.workspace_api_base
+        == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api"
+    )
+    assert scoped.api_token == "token"
 
 
 def test_control_plane_daemon_jobs_use_host_origin_not_workspace_resource():

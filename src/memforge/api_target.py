@@ -62,6 +62,14 @@ def build_target(
     return MemForgeTarget(target_edition, canonical_origin, workspace_value)
 
 
+def build_host_target(*, origin: str | None) -> MemForgeTarget:
+    """Build a host-level target for APIs that are not workspace-routed."""
+    origin_value = _normalized_optional(origin)
+    canonical_origin = _canonical_origin(origin_value)
+    target_edition = Edition.CLOUD if _is_cloud_origin(canonical_origin) else Edition.OSS
+    return MemForgeTarget(target_edition, canonical_origin, None)
+
+
 def _normalized_optional(value: str | None) -> str | None:
     normalized = value.strip() if value is not None else ""
     return normalized or None

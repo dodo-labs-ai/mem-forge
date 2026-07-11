@@ -6,7 +6,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Literal, Protocol, get_args, get_origin
+from typing import Any, Literal, Protocol, get_args, get_origin
 
 import litellm
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -668,9 +668,18 @@ class LiteLlmStructuredClient:
         native_schema: bool,
     ):
         request_prompt = prompt if native_schema else _json_text_prompt(prompt, response_format)
+        messages = [{"role": "user", "content": request_prompt}]
+        provider_kwargs: dict[str, Any] = {}
+        if model_name.startswith("sap/"):
+            # SAP AI Core treats every chat message as a prompt template. Source
+            # documents can legitimately contain examples such as {{?input}};
+            # pass the complete MemForge prompt as one placeholder value so
+            # nested template syntax remains source data rather than SAP input.
+            messages = [{"role": "user", "content": "{{?memforge_prompt}}"}]
+            provider_kwargs["placeholder_values"] = {"memforge_prompt": request_prompt}
         response = await litellm.acompletion(
             model=model_name,
-            messages=[{"role": "user", "content": request_prompt}],
+            messages=messages,
             timeout=self.config.timeout_s,
             max_tokens=max_tokens,
             num_retries=self.config.num_retries,
@@ -678,6 +687,7 @@ class LiteLlmStructuredClient:
                 api_base=self.config.base_url,
                 api_key=self.config.api_key,
             ),
+            **provider_kwargs,
             **({"response_format": response_format} if native_schema else {}),
         )
         raw_content = _message_content(response)
