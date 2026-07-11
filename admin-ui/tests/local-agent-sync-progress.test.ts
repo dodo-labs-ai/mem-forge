@@ -88,6 +88,26 @@ const activeServerRun: SyncStatus = {
 assert.equal(selectSourceSyncActivity(activeServerRun, localJob)?.progress?.phase, "processing");
 
 assert.equal(
+  selectSourceSyncActivity(
+    {
+      ...activeServerRun,
+      status: "success",
+      started_at: "2026-07-08T08:00:00Z",
+      finished_at: "2026-07-08T09:00:00Z",
+    },
+    {
+      ...localJob,
+      status: "failed",
+      created_at: "2026-07-08T10:00:00Z",
+      updated_at: "2026-07-08T10:01:00Z",
+      finished_at: "2026-07-08T10:01:00Z",
+      last_error: "collection failed",
+    },
+  )?.state,
+  "failed",
+);
+
+assert.equal(
   sourceSyncActivityFromLocalJob({
     ...localJob,
     leased_until: "2000-01-01T00:00:00Z",

@@ -13,6 +13,7 @@ from memforge.sync_progress import normalize_sync_progress_snapshot
 
 DEFAULT_CLOUD_JOB_LEASE_SECONDS = 60
 DEFAULT_CLOUD_JOB_HEARTBEAT_INTERVAL_SECONDS = 20
+DEFAULT_CLOUD_JOB_PROGRESS_FLUSH_SECONDS = 2
 
 
 class LocalAgentRunner:
@@ -306,12 +307,14 @@ class _CloudJobLeaseHeartbeat:
         attempt_count: int,
         lease_seconds: int,
         interval_seconds: int,
+        progress_flush_seconds: int = DEFAULT_CLOUD_JOB_PROGRESS_FLUSH_SECONDS,
     ) -> None:
         self._heartbeat = heartbeat
         self._job_id = job_id
         self._attempt_count = attempt_count
         self._lease_seconds = lease_seconds
         self._interval_seconds = interval_seconds
+        self._progress_flush_seconds = min(progress_flush_seconds, interval_seconds)
         self._stop = threading.Event()
         self._progress_lock = threading.Lock()
         self._progress: dict[str, Any] | None = None
@@ -342,8 +345,16 @@ class _CloudJobLeaseHeartbeat:
             self._send_heartbeat()
 
     def _run(self) -> None:
-        while not self._stop.wait(self._interval_seconds):
+        next_lease_heartbeat = time.monotonic() + self._interval_seconds
+        while not self._stop.wait(self._progress_flush_seconds):
+            with self._progress_lock:
+                progress_dirty = self._progress_revision > self._sent_progress_revision
+            lease_due = time.monotonic() >= next_lease_heartbeat
+            if not progress_dirty and not lease_due:
+                continue
             self._send_heartbeat()
+            if lease_due:
+                next_lease_heartbeat = time.monotonic() + self._interval_seconds
 
     def report_progress(self, progress: dict[str, Any]) -> None:
         with self._progress_lock:
