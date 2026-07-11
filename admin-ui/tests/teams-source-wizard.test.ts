@@ -181,3 +181,23 @@ assert.doesNotMatch(
   /memforge auth teams|\.venv\/bin\/memforge auth teams|Run this from the project directory|Terminal/,
   "Teams auth prompt should not expose CLI fallback instructions",
 );
+assert.match(
+  teamsWizardSource,
+  /<DialogContent className="flex max-h-\[calc\(100dvh-2rem\)\] flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl">/,
+  "Teams wizard should stay inside the visible viewport and lay out its steps vertically",
+);
+assert.match(
+  teamsWizardSource,
+  /<div className="flex min-h-0 flex-1 flex-col gap-4 p-4">/,
+  "Teams conversation browsing should give the results list the remaining dialog height",
+);
+assert.match(
+  teamsWizardSource,
+  /<div className="min-h-0 flex-1 overflow-y-auto rounded-lg border">/,
+  "Teams conversation results should scroll inside the dialog instead of pushing actions out of view",
+);
+assert.equal(
+  teamsWizardSource.match(/<DialogFooter className="mx-0 mb-0/g)?.length,
+  3,
+  "Every Teams wizard step should keep its footer inside the zero-padding dialog boundary",
+);
