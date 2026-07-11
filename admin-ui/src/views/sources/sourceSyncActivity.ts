@@ -21,6 +21,7 @@ export interface SourceSyncActivity {
     items?: Array<{ doc_id: string; title: string; error: string }>;
   };
   startedAt?: string | null;
+  updatedAt?: string | null;
   finishedAt?: string | null;
 }
 
@@ -44,6 +45,7 @@ export function sourceSyncActivityFromLocalJob(job: LocalAgentJobStatusResponse)
     progress: job.result?.progress,
     error: { message: job.result?.error || job.last_error },
     startedAt: job.created_at,
+    updatedAt: job.updated_at,
     finishedAt: job.finished_at,
   };
 }
@@ -58,6 +60,7 @@ export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivi
     progress: sync.progress ?? undefined,
     error: { message: sync.error_message, items: sync.failed_docs },
     startedAt: sync.started_at,
+    updatedAt: sync.progress_updated_at,
     finishedAt: sync.finished_at,
   };
 }
@@ -72,9 +75,25 @@ export function selectSourceSyncActivity(
   if (localJob && ["queued", "leased"].includes(localJob.status)) {
     return sourceSyncActivityFromLocalJob(localJob);
   }
+  if (sync && localJob) {
+    const serverActivity = sourceSyncActivityFromStatus(sync);
+    const localActivity = sourceSyncActivityFromLocalJob(localJob);
+    return activityTime(localActivity) > activityTime(serverActivity)
+      ? localActivity
+      : serverActivity;
+  }
   if (sync) return sourceSyncActivityFromStatus(sync);
   if (localJob) return sourceSyncActivityFromLocalJob(localJob);
   return undefined;
+}
+
+function activityTime(activity: SourceSyncActivity): number {
+  for (const value of [activity.finishedAt, activity.updatedAt, activity.startedAt]) {
+    if (!value) continue;
+    const parsed = new Date(value).getTime();
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return Number.NEGATIVE_INFINITY;
 }
 
 export function presentSourceSyncActivity(
