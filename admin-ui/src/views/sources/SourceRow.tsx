@@ -13,7 +13,10 @@ import { formatDuration, timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
 import { LocalAgentDaemonBadge } from "./LocalAgentDaemonStatus";
 import { isLocalAgentBackedSource } from "./localAgentSources";
-import type { LocalAgentSyncProgress } from "./localAgentSyncProgress";
+import {
+  teamsConversationCount,
+  type LocalAgentSyncProgress,
+} from "./localAgentSyncProgress";
 
 /**
  * One row in the project-grouped sources view. Behaviour and DOM match the
@@ -87,6 +90,15 @@ export function SourceRow({
   const showLocalAgentStatus = !isPaused && isLocalAgentBackedSource(source) && capabilities.can_sync;
   const pausedSyncHint = "Source is paused. Resume the source to sync again.";
   const ownershipText = formatOwnership(source.ownership);
+  const configuredTeamsConversations = source.type === "teams"
+    ? teamsConversationCount(source.config)
+    : null;
+  const displayedItemCount = source.type === "teams"
+    ? configuredTeamsConversations
+    : source.doc_count;
+  const displayedItemLabel = source.type === "teams"
+    ? displayedItemCount === 1 ? "conversation" : "conversations"
+    : itemLabel;
   const hasManagementControl =
     capabilities.can_configure || capabilities.can_sync || isManaged;
   const durableSyncLabel = activeSyncLabel(source.sync?.status);
@@ -118,9 +130,11 @@ export function SourceRow({
               </p>
             )}
             <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-sm text-muted-foreground">
-              <span>
-                <span className="font-medium text-foreground">{source.doc_count}</span> {itemLabel}
-              </span>
+              {displayedItemCount !== null && (
+                <span>
+                  <span className="font-medium text-foreground">{displayedItemCount}</span> {displayedItemLabel}
+                </span>
+              )}
               <span>
                 <span className="font-medium text-foreground">{perGroupMemoryCount}</span> memories
               </span>

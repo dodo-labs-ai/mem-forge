@@ -1761,6 +1761,7 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
         "stage": "uploading",
         "current": 1,
         "total": 2,
+        "processed_messages": 2,
         "current_date": "2026-07-08T09:24:57.5870000Z",
         "date_from": "2026-07-08T09:24:57.5870000Z",
         "date_to": "2026-07-08T10:24:57.5870000Z",

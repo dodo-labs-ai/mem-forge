@@ -70,7 +70,7 @@ const SOURCE_ITEM_LABELS: Record<string, string> = {
   github_pages: "documents",
   jira: "issues",
   local_markdown: "files",
-  teams: "conversation windows",
+  teams: "conversations",
 };
 
 interface SourcesResponse {
