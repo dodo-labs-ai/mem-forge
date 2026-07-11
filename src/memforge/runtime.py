@@ -37,6 +37,7 @@ from memforge.retrieval.embeddings import get_chroma_collection
 from memforge.source_secrets import decrypt_source_config_for_runtime, source_secret_fields
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from memforge.sync_progress import source_sync_progress_from_pipeline
 
 if TYPE_CHECKING:
     from memforge.storage.database import Database
@@ -605,6 +606,7 @@ class SourceSyncWorker:
         workspace_id: str | None = None,
         lease_seconds: int = 300,
         heartbeat_seconds: float | None = None,
+        progress_flush_seconds: float = 1.0,
     ) -> None:
         self.db = db
         self.config = config
@@ -617,6 +619,7 @@ class SourceSyncWorker:
             if heartbeat_seconds is not None
             else max(1.0, min(30.0, lease_seconds / 3))
         )
+        self.progress_flush_seconds = max(0.001, float(progress_flush_seconds))
         max_extraction_workers = max(0, int(config.sync.max_extraction_workers))
         self._extraction_pool = (
             ExtractionWorkPool(max_extraction_workers)
@@ -653,17 +656,62 @@ class SourceSyncWorker:
                     lease_lost.set()
                     return
 
+    async def _progress_until_stopped(
+        self,
+        run: SourceSyncRun,
+        stop: asyncio.Event,
+        lease_lost: asyncio.Event,
+        latest: dict[str, Any],
+    ) -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self.progress_flush_seconds)
+                return
+            except asyncio.TimeoutError:
+                revision = int(latest.get("revision") or 0)
+                snapshot = latest.get("snapshot")
+                if revision <= int(latest.get("flushed_revision") or 0) or not isinstance(snapshot, dict):
+                    continue
+                try:
+                    stored = await self.db.report_source_sync_run_progress(
+                        run.run_id,
+                        worker_id=self.worker_id,
+                        lease_attempt_count=run.lease_attempt_count,
+                        progress=snapshot,
+                    )
+                except Exception:
+                    logger.exception("Source sync progress update failed for run %s", run.run_id)
+                    continue
+                if not stored:
+                    lease_lost.set()
+                    return
+                latest["flushed_revision"] = revision
+
     async def _run_source_sync_with_heartbeat(self, run: SourceSyncRun, **kwargs: Any) -> SyncState | None:
         stop = asyncio.Event()
         lease_lost = asyncio.Event()
+        source_type = str(kwargs.get("source", {}).get("type") or "")
+        latest_progress: dict[str, Any] = {"revision": 0, "flushed_revision": 0, "snapshot": None}
+
+        def report_progress(value: dict[str, Any]) -> None:
+            snapshot = source_sync_progress_from_pipeline(value, source_type=source_type)
+            if snapshot is None:
+                return
+            latest_progress["revision"] = int(latest_progress["revision"]) + 1
+            latest_progress["snapshot"] = snapshot
+
+        kwargs["progress_callback"] = report_progress
         heartbeat_task = asyncio.create_task(self._heartbeat_until_stopped(run, stop, lease_lost))
+        progress_task = asyncio.create_task(
+            self._progress_until_stopped(run, stop, lease_lost, latest_progress)
+        )
         sync_task = asyncio.create_task(self.runtime_provider.run_source_sync(**kwargs))
         try:
             done, _ = await asyncio.wait(
-                {sync_task, heartbeat_task},
+                {sync_task, heartbeat_task, progress_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if heartbeat_task in done and lease_lost.is_set():
+            if lease_lost.is_set() and (heartbeat_task in done or progress_task in done):
                 sync_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await sync_task
@@ -671,6 +719,23 @@ class SourceSyncWorker:
             result = await sync_task
             if lease_lost.is_set():
                 raise SourceSyncLeaseLost(f"source sync lease lost for run {run.run_id}")
+            revision = int(latest_progress["revision"])
+            if revision > int(latest_progress["flushed_revision"]):
+                snapshot = latest_progress.get("snapshot")
+                if isinstance(snapshot, dict):
+                    try:
+                        stored = await self.db.report_source_sync_run_progress(
+                            run.run_id,
+                            worker_id=self.worker_id,
+                            lease_attempt_count=run.lease_attempt_count,
+                            progress=snapshot,
+                        )
+                    except Exception:
+                        logger.exception("Final source sync progress update failed for run %s", run.run_id)
+                    else:
+                        if not stored:
+                            raise SourceSyncLeaseLost(f"source sync lease lost for run {run.run_id}")
+                        latest_progress["flushed_revision"] = revision
             return result
         finally:
             stop.set()
@@ -681,6 +746,9 @@ class SourceSyncWorker:
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_task
+            progress_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await progress_task
 
     def _next_retry_at(self, run: SourceSyncRun, failed_at: datetime) -> datetime | None:
         if run.lease_attempt_count >= self.config.sync.worker_max_attempts:

@@ -377,6 +377,66 @@ async def test_heartbeat_source_sync_run_extends_only_current_worker_lease(db: D
 
 
 @pytest.mark.asyncio
+async def test_source_sync_run_progress_is_durable_and_fenced_by_current_lease(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-progress-run",
+        type="confluence",
+        name="Engineering Wiki",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-progress-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert leased is not None
+
+    stored = await db.report_source_sync_run_progress(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        progress={
+            "schema_version": 1,
+            "phase": "processing",
+            "progress": {"completed": 31, "total": 86, "unit": "page"},
+            "counts": {"changed": 12, "failed": 0, "memories_created": 104},
+        },
+        now=now + timedelta(seconds=5),
+    )
+    stale = await db.report_source_sync_run_progress(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count + 1,
+        progress={
+            "schema_version": 1,
+            "phase": "processing",
+            "progress": {"completed": 86, "total": 86, "unit": "page"},
+        },
+        now=now + timedelta(seconds=6),
+    )
+    current = await db.get_source_sync_run(enqueued.run_id)
+
+    assert stored is True
+    assert stale is False
+    assert current is not None
+    assert current.progress == {
+        "schema_version": 1,
+        "phase": "processing",
+        "progress": {"completed": 31, "total": 86, "unit": "page"},
+        "counts": {"changed": 12, "failed": 0, "memories_created": 104},
+    }
+    assert current.progress_revision == 1
+    assert current.progress_updated_at == now + timedelta(seconds=5)
+
+
+@pytest.mark.asyncio
 async def test_complete_source_sync_run_releases_active_slot_for_next_run(db: Database):
     now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
     await db.upsert_source(
@@ -3273,6 +3333,62 @@ async def test_source_sync_worker_heartbeats_while_run_is_active(db: Database):
 
     assert completed is not None
     assert completed.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_persists_pipeline_progress_while_run_is_active(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-progress"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Engineering Wiki",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+
+    class ProgressRuntimeProvider:
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            kwargs["progress_callback"](
+                {
+                    "phase": "processing",
+                    "current": 31,
+                    "total": 86,
+                    "docs_updated": 12,
+                    "memories_extracted": 104,
+                }
+            )
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
+
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=ProgressRuntimeProvider(),
+        worker_id="worker-a",
+        progress_flush_seconds=0.01,
+    )
+
+    await worker.run_once()
+    completed = await db.get_source_sync_run(enqueued.run_id)
+
+    assert completed is not None
+    assert completed.status == "success"
+    assert completed.progress_revision > 0
+    assert completed.progress == {
+        "schema_version": 1,
+        "phase": "processing",
+        "progress": {"completed": 31, "total": 86, "unit": "page"},
+        "counts": {"changed": 12, "memories_created": 104},
+    }
 
 
 @pytest.mark.asyncio

@@ -391,7 +391,11 @@ def test_local_agent_reports_handler_progress_through_heartbeat(tmp_path):
     heartbeats: list[dict | None] = []
 
     def handle(job, *, report_progress):
-        report_progress({"stage": "uploading", "current": 7, "total": 16})
+        report_progress({
+            "schema_version": 1,
+            "phase": "uploading",
+            "progress": {"completed": 7, "total": 16, "unit": "message"},
+        })
         return {"count": 1}
 
     runner = LocalAgentRunner(
@@ -415,7 +419,11 @@ def test_local_agent_reports_handler_progress_through_heartbeat(tmp_path):
     report = runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
 
     assert report["counts"]["failed"] == 0
-    assert heartbeats == [None, {"stage": "uploading", "current": 7, "total": 16}]
+    assert heartbeats == [None, {
+        "schema_version": 1,
+        "phase": "uploading",
+        "progress": {"completed": 7, "total": 16, "unit": "message"},
+    }]
 
 
 def test_local_agent_completion_failure_does_not_abort_following_job(tmp_path):

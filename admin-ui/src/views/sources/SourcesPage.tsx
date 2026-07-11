@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Files, Info, Loader2, MoreHorizontal, Pause, Play, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { resourceClient } from "@/api/client";
-import { createLocalAgentJob, getLocalAgentJob } from "@/api/localAgentJobs";
+import { createLocalAgentJob, getCurrentLocalAgentJobs, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
   AgentSessionCompleteness,
   GeneMetadata,
@@ -43,10 +43,7 @@ import {
 } from "./projectGrouping";
 import { SourceRow } from "./SourceRow";
 import { TeamsSourceWizard } from "./TeamsSourceWizard";
-import {
-  type LocalAgentSyncProgress,
-  localAgentProgressFromJob,
-} from "./localAgentSyncProgress";
+import { selectSourceSyncActivity } from "./sourceSyncActivity";
 import { localAgentSyncOperation } from "./localAgentSources";
 
 const SOURCE_LABELS: Record<string, { name: string; subtitle: string; description: string }> = {
@@ -138,8 +135,7 @@ function cleanLocalAgentJobError(value: string): string {
 async function createLocalAgentSyncJob(
   source: Source,
   options: {
-    itemLabel: string;
-    onProgress?: (progress: LocalAgentSyncProgress) => void;
+    onStatus?: (status: LocalAgentJobStatusResponse) => void;
     forceFullSync?: boolean;
   },
 ): Promise<LocalAgentJobCreateResponse | null> {
@@ -156,17 +152,13 @@ async function createLocalAgentSyncJob(
     operation,
     payload: localAgentJobPayload(options.forceFullSync),
   });
-  options.onProgress?.(
-    localAgentProgressFromJob(
-      {
-        job_id: created.job_id,
-        status: "queued",
-        result: null,
-        last_error: null,
-      },
-      options.itemLabel,
-    ),
-  );
+  options.onStatus?.({
+    job_id: created.job_id,
+    operation,
+    status: "queued",
+    result: null,
+    last_error: null,
+  });
   const status = await pollLocalAgentSyncJob(created.job_id, options);
   if (status.status === "failed") {
     if (status.last_error) {
@@ -180,13 +172,12 @@ async function createLocalAgentSyncJob(
 async function pollLocalAgentSyncJob(
   jobId: string,
   options: {
-    itemLabel: string;
-    onProgress?: (progress: LocalAgentSyncProgress) => void;
+    onStatus?: (status: LocalAgentJobStatusResponse) => void;
   },
 ): Promise<LocalAgentJobStatusResponse> {
   for (let attempt = 0; attempt < LOCAL_AGENT_SYNC_POLL_ATTEMPTS; attempt += 1) {
     const status = await getLocalAgentJob(jobId);
-    options.onProgress?.(localAgentProgressFromJob(status, options.itemLabel));
+    options.onStatus?.(status);
     if (status.status === "succeeded" || status.status === "failed") {
       return status;
     }
@@ -197,10 +188,6 @@ async function pollLocalAgentSyncJob(
 
 function sourceItemLabel(source: Source): string {
   return SOURCE_ITEM_LABELS[source.id] ?? SOURCE_ITEM_LABELS[source.type] ?? "documents";
-}
-
-function isActiveLocalAgentProgress(progress: LocalAgentSyncProgress | undefined): boolean {
-  return progress?.state === "queued" || progress?.state === "leased";
 }
 
 export function SourcesPage() {
@@ -217,8 +204,8 @@ export function SourcesPage() {
   const [openMenuSourceId, setOpenMenuSourceId] = useState<string | null>(null);
   const [sourcePendingDelete, setSourcePendingDelete] = useState<Source | null>(null);
   const [pendingSyncIds, setPendingSyncIds] = useState<Set<string>>(new Set());
-  const [localAgentProgressBySource, setLocalAgentProgressBySource] = useState<
-    Record<string, LocalAgentSyncProgress | undefined>
+  const [localAgentJobBySource, setLocalAgentJobBySource] = useState<
+    Record<string, LocalAgentJobStatusResponse | undefined>
   >({});
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
   const [pendingSubscriptionIds, setPendingSubscriptionIds] = useState<Set<string>>(
@@ -238,12 +225,12 @@ export function SourcesPage() {
     return false;
   };
 
-  const setLocalAgentProgress = (sourceId: string, progress: LocalAgentSyncProgress) => {
-    setLocalAgentProgressBySource((current) => ({ ...current, [sourceId]: progress }));
+  const setLocalAgentJob = (sourceId: string, job: LocalAgentJobStatusResponse) => {
+    setLocalAgentJobBySource((current) => ({ ...current, [sourceId]: job }));
   };
 
-  const clearLocalAgentProgress = (sourceId: string) => {
-    setLocalAgentProgressBySource((current) => {
+  const clearLocalAgentJob = (sourceId: string) => {
+    setLocalAgentJobBySource((current) => {
       if (!current[sourceId]) return current;
       const next = { ...current };
       delete next[sourceId];
@@ -269,6 +256,18 @@ export function SourcesPage() {
     },
   });
 
+  const currentLocalJobsQuery = useQuery<LocalAgentJobStatusResponse[]>({
+    queryKey: ["currentLocalAgentJobs"],
+    queryFn: getCurrentLocalAgentJobs,
+    refetchInterval: (query) => query.state.data?.some((job) => ["queued", "leased"].includes(job.status)) ? 2_000 : false,
+  });
+
+  const currentLocalJobBySource = Object.fromEntries(
+    (currentLocalJobsQuery.data ?? [])
+      .filter((job): job is LocalAgentJobStatusResponse & { source_id: string } => Boolean(job.source_id))
+      .map((job) => [job.source_id, job]),
+  );
+
   const projectsQuery = useQuery<Project[]>({
     queryKey: ["projects"],
     queryFn: () => resourceClient.get("/projects").then((response) => response.data),
@@ -279,8 +278,7 @@ export function SourcesPage() {
       const sourceId = source.id;
       setPendingSyncIds((current) => new Set(current).add(sourceId));
       const localAgentJob = await createLocalAgentSyncJob(source, {
-        itemLabel: sourceItemLabel(source),
-        onProgress: (progress) => setLocalAgentProgress(sourceId, progress),
+        onStatus: (status) => setLocalAgentJob(sourceId, status),
         forceFullSync,
       });
       if (localAgentJob) {
@@ -290,10 +288,11 @@ export function SourcesPage() {
     },
     onError: (error, variables) => {
       if (localAgentSyncOperation(variables.source)) {
-        setLocalAgentProgress(variables.source.id, {
-          state: "failed",
-          message: "Action needed",
-          detail: safeSourceErrorMessage(error) ?? LOCAL_AGENT_SYNC_FAILED_MESSAGE,
+        setLocalAgentJob(variables.source.id, {
+          job_id: `failed:${variables.source.id}`,
+          status: "failed",
+          result: { error: safeSourceErrorMessage(error) ?? LOCAL_AGENT_SYNC_FAILED_MESSAGE },
+          last_error: null,
         });
       }
       handleAuthorityError(error, "Failed to start sync.");
@@ -306,13 +305,14 @@ export function SourcesPage() {
       });
       if (!_error && localAgentSyncOperation(variables.source)) {
         window.setTimeout(
-          () => clearLocalAgentProgress(variables.source.id),
+          () => clearLocalAgentJob(variables.source.id),
           LOCAL_AGENT_TERMINAL_PROGRESS_RETENTION_MS,
         );
       } else if (!localAgentSyncOperation(variables.source)) {
-        clearLocalAgentProgress(variables.source.id);
+        clearLocalAgentJob(variables.source.id);
       }
       queryClient.invalidateQueries({ queryKey: ["sources"] });
+      queryClient.invalidateQueries({ queryKey: ["currentLocalAgentJobs"] });
       queryClient.invalidateQueries({ queryKey: ["stats"] });
     },
   });
@@ -323,6 +323,7 @@ export function SourcesPage() {
     onSuccess: () => {
       setSourcePendingDelete(null);
       queryClient.invalidateQueries({ queryKey: ["sources"] });
+      queryClient.invalidateQueries({ queryKey: ["currentLocalAgentJobs"] });
       queryClient.invalidateQueries({ queryKey: ["stats"] });
       queryClient.invalidateQueries({ queryKey: ["memories"] });
     },
@@ -332,8 +333,7 @@ export function SourcesPage() {
     mutationFn: async (source: Source) => {
       setPendingSyncIds((current) => new Set(current).add(source.id));
       const localAgentJob = await createLocalAgentSyncJob(source, {
-        itemLabel: sourceItemLabel(source),
-        onProgress: (progress) => setLocalAgentProgress(source.id, progress),
+        onStatus: (status) => setLocalAgentJob(source.id, status),
         forceFullSync: true,
       });
       if (localAgentJob) {
@@ -343,10 +343,11 @@ export function SourcesPage() {
     },
     onError: (error, source) => {
       if (localAgentSyncOperation(source)) {
-        setLocalAgentProgress(source.id, {
-          state: "failed",
-          message: "Action needed",
-          detail: safeSourceErrorMessage(error) ?? LOCAL_AGENT_SYNC_FAILED_MESSAGE,
+        setLocalAgentJob(source.id, {
+          job_id: `failed:${source.id}`,
+          status: "failed",
+          result: { error: safeSourceErrorMessage(error) ?? LOCAL_AGENT_SYNC_FAILED_MESSAGE },
+          last_error: null,
         });
       }
       handleAuthorityError(error, "Failed to start refresh.");
@@ -359,11 +360,11 @@ export function SourcesPage() {
       });
       if (!_error && localAgentSyncOperation(source)) {
         window.setTimeout(
-          () => clearLocalAgentProgress(source.id),
+          () => clearLocalAgentJob(source.id),
           LOCAL_AGENT_TERMINAL_PROGRESS_RETENTION_MS,
         );
       } else if (!localAgentSyncOperation(source)) {
-        clearLocalAgentProgress(source.id);
+        clearLocalAgentJob(source.id);
       }
       queryClient.invalidateQueries({ queryKey: ["sources"] });
       queryClient.invalidateQueries({ queryKey: ["stats"] });
@@ -530,11 +531,12 @@ export function SourcesPage() {
                   onToggle={() => toggleGroup(group)}
                 >
                   {group.sources.map(({ source, memory_count }) => {
-                    const localAgentProgress = localAgentProgressBySource[source.id];
+                    const localAgentJob = currentLocalJobBySource[source.id] ?? localAgentJobBySource[source.id];
+                    const syncActivity = selectSourceSyncActivity(source.sync, localAgentJob);
                     const isSyncing =
                       ["pending", "running", "recovering"].includes(source.sync?.status ?? "") ||
                       pendingSyncIds.has(source.id) ||
-                      isActiveLocalAgentProgress(localAgentProgress);
+                      Boolean(localAgentJob && ["queued", "leased"].includes(localAgentJob.status));
                     const isDeleting = deleteSource.isPending && sourcePendingDelete?.id === source.id;
                     const isUpdatingStatus =
                       setSourceStatus.isPending &&
@@ -567,7 +569,7 @@ export function SourcesPage() {
                         source={source}
                         perGroupMemoryCount={memory_count}
                         isSyncing={isSyncing}
-                        localAgentProgress={localAgentProgress}
+                        syncActivity={syncActivity}
                         isDeleting={isDeleting}
                         isUpdatingStatus={isUpdatingStatus}
                         isManaged={isManaged}

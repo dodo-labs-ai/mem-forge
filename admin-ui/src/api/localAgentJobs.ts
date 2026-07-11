@@ -36,6 +36,13 @@ export async function getLocalAgentJob(jobId: string): Promise<LocalAgentJobStat
   return response.data;
 }
 
+export async function getCurrentLocalAgentJobs(): Promise<LocalAgentJobStatusResponse[]> {
+  const response = await hostClient.get<{ data: LocalAgentJobStatusResponse[] }>(
+    localAgentUrl("/jobs/current"),
+  );
+  return response.data.data;
+}
+
 export async function getLocalAgentDaemonStatus(): Promise<LocalAgentDaemonStatusResponse> {
   const response = await hostClient.get<LocalAgentDaemonStatusResponse>(localAgentUrl("/status"));
   return response.data;

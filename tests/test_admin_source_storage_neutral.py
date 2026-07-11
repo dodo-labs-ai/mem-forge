@@ -83,7 +83,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
                     "memories_extracted": 4,
                     "error_message": "one failed",
                     "failed_docs": [{"doc_id": "doc-1", "error": "boom"}],
-                    }
+                }
                 ]
 
         async def get_latest_source_sync_run(
@@ -140,6 +140,12 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
         "memories_extracted": 4,
         "error_message": "one failed",
         "failed_docs": [{"doc_id": "doc-1", "error": "boom"}],
+        "progress": {
+            "schema_version": 1,
+            "phase": "processing",
+            "progress": {"completed": 3, "unit": "page"},
+            "counts": {"changed": 2, "failed": 1, "memories_created": 4},
+        },
     }
     assert source["sync_schedule"] == {
         "enabled": True,

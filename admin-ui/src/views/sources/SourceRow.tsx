@@ -1,9 +1,9 @@
 import type { ReactNode } from "react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
-import { AlertCircle, Check, Info, Loader2, Pause, Play, SlidersHorizontal } from "lucide-react";
+import { Info, Loader2, Pause, Play, SlidersHorizontal } from "lucide-react";
 import type { Source, SourceCapabilities, SourceOwnership, SyncStatus } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
-import { SyncStatusBar } from "@/components/admin/SyncStatusBar";
+import { SourceSyncStatusCard } from "@/components/admin/SourceSyncStatusCard";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -13,10 +13,8 @@ import { formatDuration, timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
 import { LocalAgentDaemonBadge } from "./LocalAgentDaemonStatus";
 import { isLocalAgentBackedSource } from "./localAgentSources";
-import {
-  teamsConversationCount,
-  type LocalAgentSyncProgress,
-} from "./localAgentSyncProgress";
+import type { SourceSyncActivity } from "./sourceSyncActivity";
+import { teamsConversationCount } from "./teamsSourceConfig";
 
 /**
  * One row in the project-grouped sources view. Behaviour and DOM match the
@@ -50,7 +48,7 @@ export function SourceRow({
   source,
   perGroupMemoryCount,
   isSyncing,
-  localAgentProgress,
+  syncActivity,
   isDeleting,
   isUpdatingStatus = false,
   isManaged,
@@ -69,7 +67,7 @@ export function SourceRow({
   source: Source;
   perGroupMemoryCount: number;
   isSyncing: boolean;
-  localAgentProgress?: LocalAgentSyncProgress;
+  syncActivity?: SourceSyncActivity;
   isDeleting: boolean;
   isUpdatingStatus?: boolean;
   isManaged: boolean;
@@ -99,8 +97,6 @@ export function SourceRow({
   const displayedItemLabel = source.type === "teams"
     ? displayedItemCount === 1 ? "conversation" : "conversations"
     : itemLabel;
-  const hasManagementControl =
-    capabilities.can_configure || capabilities.can_sync || isManaged;
   const durableSyncLabel = activeSyncLabel(source.sync?.status);
 
   return (
@@ -139,7 +135,7 @@ export function SourceRow({
                 <span className="font-medium text-foreground">{perGroupMemoryCount}</span> memories
               </span>
               <span>
-                {isActiveLocalAgentProgress(localAgentProgress)
+                {syncActivity && ["queued", "active", "recovering"].includes(syncActivity.state)
                   ? "Syncing now"
                   : durableSyncLabel ?? <LastSyncDetails source={source} itemLabel={itemLabel} />}
               </span>
@@ -257,17 +253,12 @@ export function SourceRow({
         </div>
       )}
 
-      {localAgentProgress && (
-        <LocalAgentProgressBar progress={localAgentProgress} />
-      )}
-
-      {hasManagementControl && (
-        <SyncStatusBar
-          sync={source.sync}
-          itemLabel={itemLabel}
-          onRetry={isPaused || !capabilities.can_sync ? undefined : onSync}
-        />
-      )}
+      <SourceSyncStatusCard
+        activity={syncActivity}
+        sourceName={sourceLabel.name}
+        itemLabel={itemLabel}
+        onRetry={isPaused || !capabilities.can_sync ? undefined : onSync}
+      />
     </div>
   );
 }
@@ -290,66 +281,6 @@ function SourceLifecycleBadge({ status }: { status: Source["status"] }) {
       </Badge>
     </>
   );
-}
-
-function LocalAgentProgressBar({ progress }: { progress: LocalAgentSyncProgress }) {
-  const isActive = progress.state === "queued" || progress.state === "leased";
-  const isFailed = progress.state === "failed";
-  const Icon = isActive ? Loader2 : isFailed ? AlertCircle : Check;
-  const showProgress = isActive && Boolean(progress.total && progress.total > 0);
-  const percentage = showProgress
-    ? Math.min(100, Math.round(((progress.completed ?? 0) / (progress.total ?? 1)) * 100))
-    : 0;
-
-  return (
-    <div
-      role={isFailed ? "alert" : "status"}
-      aria-live="polite"
-      className={cn(
-        "flex flex-col gap-2 rounded-md px-3 py-2 text-sm",
-        isFailed
-          ? "bg-destructive/10 text-destructive"
-          : progress.state === "succeeded"
-            ? "bg-emerald-50 text-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-100"
-            : "bg-muted text-muted-foreground",
-      )}
-    >
-      <div className="flex min-w-0 items-center gap-2">
-        <Icon
-          className={cn(
-            "size-3.5 shrink-0",
-            isActive && "animate-spin text-foreground",
-            progress.state === "succeeded" && "text-emerald-600 dark:text-emerald-300",
-          )}
-        />
-        <span className={cn("shrink-0 font-medium", !isFailed && "text-foreground")}>
-          {progress.message}
-        </span>
-        {progress.detail && (
-          <span className="min-w-0 truncate text-xs opacity-80">{progress.detail}</span>
-        )}
-      </div>
-      {showProgress && (
-        <div
-          role="progressbar"
-          aria-label="Teams sync progress"
-          aria-valuemin={0}
-          aria-valuemax={progress.total}
-          aria-valuenow={Math.min(progress.completed ?? 0, progress.total ?? 0)}
-          className="h-1 overflow-hidden rounded-full bg-background/80"
-        >
-          <div
-            className="h-full rounded-full bg-foreground/70 transition-[width] duration-300"
-            style={{ width: `${percentage}%` }}
-          />
-        </div>
-      )}
-    </div>
-  );
-}
-
-function isActiveLocalAgentProgress(progress: LocalAgentSyncProgress | undefined): boolean {
-  return progress?.state === "queued" || progress?.state === "leased";
 }
 
 function activeSyncLabel(status: SyncStatus["status"] | undefined): string | null {

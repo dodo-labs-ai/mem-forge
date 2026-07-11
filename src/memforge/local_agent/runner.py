@@ -9,6 +9,7 @@ import time
 from typing import Any, Callable
 
 from memforge.local_agent.state import LocalAgentStateStore
+from memforge.sync_progress import normalize_sync_progress_snapshot
 
 DEFAULT_CLOUD_JOB_LEASE_SECONDS = 60
 DEFAULT_CLOUD_JOB_HEARTBEAT_INTERVAL_SECONDS = 20
@@ -338,7 +339,7 @@ class _CloudJobLeaseHeartbeat:
 
     def report_progress(self, progress: dict[str, Any]) -> None:
         with self._progress_lock:
-            self._progress = dict(progress)
+            self._progress = normalize_sync_progress_snapshot(progress)
         self._send_heartbeat()
 
     def _send_heartbeat(self) -> None:
