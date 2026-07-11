@@ -81,16 +81,6 @@ export function SourceSyncStatusCard({
           />
         </div>
       )}
-      {failed && activity.error?.items && activity.error.items.length > 0 && (
-        <details className="text-xs">
-          <summary className="cursor-pointer">Review failed {itemLabel}</summary>
-          <ul className="mt-1 space-y-0.5">
-            {activity.error.items.slice(0, 4).map((item) => (
-              <li key={item.doc_id} className="break-words">{item.title}: {item.error}</li>
-            ))}
-          </ul>
-        </details>
-      )}
     </div>
   );
 }

@@ -260,7 +260,6 @@ def _plural(count: int, singular: str, plural: str | None = None) -> str:
 
 def _is_provider_unreachable(error: str) -> bool:
     normalized = error.lower()
-    # Keep this list aligned with admin-ui/src/components/admin/syncFailureDetails.ts.
     return any(
         marker in normalized
         for marker in (
@@ -614,6 +613,15 @@ class GeneSyncOrchestrator:
             async for item in gene.discover(since=last_sync_time):
                 items.append(item)
                 crawled_doc_ids.add(item.item_id)
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "phase": "discovering",
+                            "current": len(items),
+                            "total": 0,
+                            "title": None,
+                        }
+                    )
 
             logger.info(
                 "Discovered %d content items from %s (since=%s)",
@@ -796,8 +804,8 @@ class GeneSyncOrchestrator:
                     progress_callback(
                         {
                             "phase": "detecting_deletions",
-                            "current": len(items),
-                            "total": len(items),
+                            "current": 0,
+                            "total": 0,
                             "title": None,
                         }
                     )

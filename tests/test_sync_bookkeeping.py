@@ -2708,7 +2708,14 @@ async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
         user_id="owner-a",
         attempt_count=first[0]["attempt_count"],
         status="failed",
-        result={"retryable": True},
+        result={
+            "retryable": True,
+            "progress": {
+                "schema_version": 1,
+                "phase": "uploading",
+                "progress": {"completed": 9, "total": 10, "unit": "file"},
+            },
+        },
         error="one package failed",
         retryable=True,
         now=now + timedelta(seconds=1),
@@ -2723,6 +2730,7 @@ async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
     assert completed is True
     assert second[0]["job_id"] == "laj-retry"
     assert second[0]["attempt_count"] == 2
+    assert second[0]["result"] == {}
 
 
 @pytest.mark.asyncio
@@ -3389,6 +3397,15 @@ async def test_source_sync_worker_persists_pipeline_progress_while_run_is_active
         "progress": {"completed": 31, "total": 86, "unit": "page"},
         "counts": {"changed": 12, "memories_created": 104},
     }
+
+
+def test_reconciliation_without_measurable_work_is_indeterminate():
+    from memforge.sync_progress import source_sync_progress_from_pipeline
+
+    assert source_sync_progress_from_pipeline(
+        {"phase": "detecting_deletions", "current": 0, "total": 0},
+        source_type="confluence",
+    ) == {"schema_version": 1, "phase": "reconciling"}
 
 
 @pytest.mark.asyncio
@@ -4327,6 +4344,20 @@ async def test_running_progress_reports_extracted_memories(db: Database):
     )
 
     assert any(event.get("memories_extracted") == 3 for event in progress_events)
+    assert [
+        event["current"]
+        for event in progress_events
+        if event.get("phase") == "discovering"
+    ] == [0, 1]
+    reconciliation = [
+        event for event in progress_events if event.get("phase") == "detecting_deletions"
+    ]
+    assert reconciliation == [{
+        "phase": "detecting_deletions",
+        "current": 0,
+        "total": 0,
+        "title": None,
+    }]
 
 
 @pytest.mark.asyncio

@@ -1911,16 +1911,6 @@ def _push_github_profile_to_source(
         )
 
     for index, doc in enumerate(prepared, start=1):
-        _report_local_agent_progress(
-            report_progress,
-            _sync_progress_snapshot(
-                phase="uploading",
-                completed=index,
-                total=len(prepared),
-                unit="file",
-                failed=len(failed),
-            ),
-        )
         response = client.push_github_repo_document(
             source_id=source_id,
             repo_url=repo["repo_url"],
@@ -1943,6 +1933,16 @@ def _push_github_profile_to_source(
             pushed.append({"relative_path": doc["relative_path"],
                            "doc_id": response.get("doc_id"),
                            "document_hash": response.get("document_hash")})
+        _report_local_agent_progress(
+            report_progress,
+            _sync_progress_snapshot(
+                phase="uploading",
+                completed=index,
+                total=len(prepared),
+                unit="file",
+                failed=len(failed),
+            ),
+        )
 
     payload = {
         "profile": name,
@@ -2145,16 +2145,6 @@ def _run_cloud_jira_sync_job(
     sync_snapshot_id = local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count"))
     sync_result: dict[str, Any] | None = None
     for index, doc in enumerate(documents, start=1):
-        _report_local_agent_progress(
-            report_progress,
-            _sync_progress_snapshot(
-                phase="uploading",
-                completed=index,
-                total=len(documents),
-                unit="issue",
-                failed=len(failed),
-            ),
-        )
         response = scoped_client.push_jira_package(
             source_id=source_id,
             base_url=str(doc["base_url"]),
@@ -2175,6 +2165,16 @@ def _run_cloud_jira_sync_job(
             pushed.append({"issue_key": doc["issue_key"],
                            "doc_id": response.get("doc_id"),
                            "document_hash": response.get("document_hash")})
+        _report_local_agent_progress(
+            report_progress,
+            _sync_progress_snapshot(
+                phase="uploading",
+                completed=index,
+                total=len(documents),
+                unit="issue",
+                failed=len(failed),
+            ),
+        )
     if not failed:
         sync_result = scoped_client.start_source_processing(
             source_id=source_id,
@@ -3095,16 +3095,6 @@ def _push_kb_profile_to_source(
     )
 
     for index, entry in enumerate(selected_entries, start=1):
-        _report_local_agent_progress(
-            report_progress,
-            _sync_progress_snapshot(
-                phase="uploading",
-                completed=index,
-                total=len(selected_entries),
-                unit="file",
-                failed=len(failed),
-            ),
-        )
         response = client.push_local_markdown_document(
             source_id=source_id,
             vault_id=vault_id,
@@ -3125,6 +3115,16 @@ def _push_kb_profile_to_source(
             pushed.append({"relative_path": entry["relative_path"],
                            "doc_id": response.get("doc_id"),
                            "document_hash": response.get("document_hash")})
+        _report_local_agent_progress(
+            report_progress,
+            _sync_progress_snapshot(
+                phase="uploading",
+                completed=index,
+                total=len(selected_entries),
+                unit="file",
+                failed=len(failed),
+            ),
+        )
 
     payload = {
         "profile": name,

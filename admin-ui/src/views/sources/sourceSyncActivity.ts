@@ -32,11 +32,14 @@ export interface SourceSyncPresentation {
 }
 
 export function sourceSyncActivityFromLocalJob(job: LocalAgentJobStatusResponse): SourceSyncActivity {
+  const leaseExpired = job.status === "leased"
+    && job.leased_until != null
+    && new Date(job.leased_until).getTime() <= Date.now();
   return {
     state: job.status === "queued"
       ? "queued"
       : job.status === "leased"
-        ? "active"
+        ? leaseExpired ? "recovering" : "active"
         : job.status === "succeeded" ? "success" : "failed",
     progress: job.result?.progress,
     error: { message: job.result?.error || job.last_error },
@@ -86,7 +89,7 @@ export function presentSourceSyncActivity(
     return withProgress("Recovering sync", activity.progress, fallbackItems);
   }
   if (activity.state === "failed") {
-    return { message: "Action needed", detail: cleanError(activity.error?.message) };
+    return { message: "Action needed", detail: safeFailureDetail(activity.error) };
   }
   if (activity.state === "partial") {
     return withProgress("Partially synced", activity.progress, fallbackItems);
@@ -171,9 +174,10 @@ function currentSourceDate(snapshot: SyncProgressSnapshot): string {
   }).format(parsed);
 }
 
-function cleanError(value: string | null | undefined): string {
-  const text = value?.trim() || "Sync failed. Retry when ready.";
-  const normalized = text.toLowerCase();
+function safeFailureDetail(error: SourceSyncActivity["error"]): string {
+  const messages = [error?.message, ...(error?.items ?? []).map((item) => item.error)]
+    .filter((value): value is string => Boolean(value?.trim()));
+  const normalized = messages.join(" ").toLowerCase();
   if (normalized.includes("teams") && (
     normalized.includes("session expired")
     || normalized.includes("no teams session")
@@ -182,5 +186,35 @@ function cleanError(value: string | null | undefined): string {
   )) {
     return "Sign in to Teams in Chrome, then retry sync.";
   }
-  return text;
+  if (normalized.includes("embedding provider unreachable")) {
+    return "The embedding provider is unavailable. Check its connection, then retry.";
+  }
+  if (normalized.includes("llm provider unreachable") || (
+    normalized.includes("litellm") && isConnectivityFailure(normalized)
+  )) {
+    return "The AI provider is unavailable. Check its connection, then retry.";
+  }
+  if (normalized.includes("rate limit") || normalized.includes("429")) {
+    return "The source is temporarily rate limited. Wait a few minutes, then retry.";
+  }
+  if (normalized.includes("pdf export") || normalized.includes("did not produce a pdf")) {
+    return "Some pages could not be exported. Check source access, then retry.";
+  }
+  if (normalized.includes("certificate_verify_failed") || normalized.includes("certificate verify")) {
+    return "The source certificate could not be verified. Check the connection, then retry.";
+  }
+  return "Sync failed. Retry when ready.";
+}
+
+function isConnectivityFailure(value: string): boolean {
+  return [
+    "all connection attempts failed",
+    "cannot connect to host",
+    "connect call failed",
+    "connect timeout",
+    "connection refused",
+    "connection timed out",
+    "failed to connect",
+    "network is unreachable",
+  ].some((marker) => value.includes(marker));
 }
