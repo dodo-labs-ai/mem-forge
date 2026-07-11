@@ -201,3 +201,8 @@ assert.equal(
   3,
   "Every Teams wizard step should keep its footer inside the zero-padding dialog boundary",
 );
+assert.equal(
+  teamsWizardSource.match(/<DialogFooter className="mx-0 mb-0 shrink-0 p-5/g)?.length,
+  3,
+  "Every Teams wizard footer should keep comfortable spacing from the dialog edges",
+);

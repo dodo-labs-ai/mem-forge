@@ -194,7 +194,7 @@ function AuthCheckStep({ region, onAuthenticated }: { region: string; onAuthenti
       </div>
 
       {!data?.authenticated && !isLoading && (
-        <DialogFooter className="mx-0 mb-0 rounded-none rounded-b-xl bg-background">
+        <DialogFooter className="mx-0 mb-0 shrink-0 p-5 rounded-none rounded-b-xl bg-background">
           <Button type="button" variant="outline" onClick={() => refetch()} disabled={busy}>
             {isFetching && !connectMutation.isPending && <Loader2 className="size-4 animate-spin" />}
             Check Again
@@ -402,7 +402,7 @@ function BrowseSelectStep({
         )}
       </div>
 
-      <DialogFooter className="mx-0 mb-0 flex-row justify-between rounded-none rounded-b-xl bg-background sm:justify-between">
+      <DialogFooter className="mx-0 mb-0 shrink-0 p-5 flex-row justify-between rounded-none rounded-b-xl bg-background sm:justify-between">
         <Button type="button" variant="ghost" onClick={onBack}>
           <ArrowLeft className="size-4" />
           Cancel
@@ -503,7 +503,7 @@ function ConfirmStep({
         )}
       </div>
 
-      <DialogFooter className="mx-0 mb-0 flex-row justify-between rounded-none rounded-b-xl bg-background sm:justify-between">
+      <DialogFooter className="mx-0 mb-0 shrink-0 p-5 flex-row justify-between rounded-none rounded-b-xl bg-background sm:justify-between">
         <Button type="button" variant="ghost" onClick={onBack}>
           <ArrowLeft className="size-4" />
           Back
