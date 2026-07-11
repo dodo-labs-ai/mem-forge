@@ -390,8 +390,20 @@ export interface LocalAgentJobCounts {
   polls?: number;
 }
 
+export interface LocalAgentJobProgress {
+  stage?: "connecting" | "reading" | "uploading" | "starting_processing";
+  current?: number;
+  total?: number;
+  current_date?: string | null;
+  date_from?: string | null;
+  date_to?: string | null;
+  messages?: number;
+  conversations?: number;
+}
+
 export interface LocalAgentJobStatusResponse {
   job_id: string;
+  operation?: string;
   status: "queued" | "leased" | "succeeded" | "failed";
   attempt_count?: number;
   leased_until?: string | null;
@@ -411,6 +423,11 @@ export interface LocalAgentJobStatusResponse {
     individual_chats?: TeamsChat[];
     truncated?: boolean;
     counts?: LocalAgentJobCounts;
+    progress?: LocalAgentJobProgress;
+    date_from?: string | null;
+    date_to?: string | null;
+    messages?: number;
+    conversations?: number;
     sync_started?: boolean;
   } | null;
   last_error?: string | null;
