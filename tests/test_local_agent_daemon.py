@@ -228,7 +228,7 @@ def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
     calls = {"collect": 0}
     auth_jobs: list[dict] = []
 
-    async def fake_collect(job, *, source_id: str, limit: int):
+    async def fake_collect(job, *, source_id: str, limit: int, report_progress=None):
         calls["collect"] += 1
         if calls["collect"] == 1:
             raise ValueError("No Teams session found.")
@@ -385,6 +385,37 @@ def test_local_agent_forwards_retryable_handler_failure_to_broker(tmp_path):
             "source processing failed to start",
         )
     ]
+
+
+def test_local_agent_reports_handler_progress_through_heartbeat(tmp_path):
+    heartbeats: list[dict | None] = []
+
+    def handle(job, *, report_progress):
+        report_progress({"stage": "uploading", "current": 7, "total": 16})
+        return {"count": 1}
+
+    runner = LocalAgentRunner(
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        cloud_job_handler=handle,
+        cloud_jobs_provider=lambda: {
+            "jobs": [
+                {
+                    "job_id": "laj-progress",
+                    "operation": "teams_sync",
+                    "source_id": "src-teams",
+                    "attempt_count": 1,
+                }
+            ]
+        },
+        cloud_job_heartbeat=lambda job_id, attempt_count, lease_seconds, progress=None: (
+            heartbeats.append(progress) or {"ok": True}
+        ),
+    )
+
+    report = runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
+
+    assert report["counts"]["failed"] == 0
+    assert heartbeats == [None, {"stage": "uploading", "current": 7, "total": 16}]
 
 
 def test_local_agent_completion_failure_does_not_abort_following_job(tmp_path):

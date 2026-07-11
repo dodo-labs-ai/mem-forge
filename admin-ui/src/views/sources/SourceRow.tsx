@@ -13,7 +13,10 @@ import { formatDuration, timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
 import { LocalAgentDaemonBadge } from "./LocalAgentDaemonStatus";
 import { isLocalAgentBackedSource } from "./localAgentSources";
-import type { LocalAgentSyncProgress } from "./localAgentSyncProgress";
+import {
+  teamsConversationCount,
+  type LocalAgentSyncProgress,
+} from "./localAgentSyncProgress";
 
 /**
  * One row in the project-grouped sources view. Behaviour and DOM match the
@@ -87,6 +90,15 @@ export function SourceRow({
   const showLocalAgentStatus = !isPaused && isLocalAgentBackedSource(source) && capabilities.can_sync;
   const pausedSyncHint = "Source is paused. Resume the source to sync again.";
   const ownershipText = formatOwnership(source.ownership);
+  const configuredTeamsConversations = source.type === "teams"
+    ? teamsConversationCount(source.config)
+    : null;
+  const displayedItemCount = source.type === "teams"
+    ? configuredTeamsConversations
+    : source.doc_count;
+  const displayedItemLabel = source.type === "teams"
+    ? displayedItemCount === 1 ? "conversation" : "conversations"
+    : itemLabel;
   const hasManagementControl =
     capabilities.can_configure || capabilities.can_sync || isManaged;
   const durableSyncLabel = activeSyncLabel(source.sync?.status);
@@ -118,9 +130,11 @@ export function SourceRow({
               </p>
             )}
             <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-sm text-muted-foreground">
-              <span>
-                <span className="font-medium text-foreground">{source.doc_count}</span> {itemLabel}
-              </span>
+              {displayedItemCount !== null && (
+                <span>
+                  <span className="font-medium text-foreground">{displayedItemCount}</span> {displayedItemLabel}
+                </span>
+              )}
               <span>
                 <span className="font-medium text-foreground">{perGroupMemoryCount}</span> memories
               </span>
@@ -282,13 +296,17 @@ function LocalAgentProgressBar({ progress }: { progress: LocalAgentSyncProgress 
   const isActive = progress.state === "queued" || progress.state === "leased";
   const isFailed = progress.state === "failed";
   const Icon = isActive ? Loader2 : isFailed ? AlertCircle : Check;
+  const showProgress = isActive && Boolean(progress.total && progress.total > 0);
+  const percentage = showProgress
+    ? Math.min(100, Math.round(((progress.completed ?? 0) / (progress.total ?? 1)) * 100))
+    : 0;
 
   return (
     <div
       role={isFailed ? "alert" : "status"}
       aria-live="polite"
       className={cn(
-        "flex items-center gap-2 rounded-md px-3 py-2 text-sm",
+        "flex flex-col gap-2 rounded-md px-3 py-2 text-sm",
         isFailed
           ? "bg-destructive/10 text-destructive"
           : progress.state === "succeeded"
@@ -296,18 +314,35 @@ function LocalAgentProgressBar({ progress }: { progress: LocalAgentSyncProgress 
             : "bg-muted text-muted-foreground",
       )}
     >
-      <Icon
-        className={cn(
-          "size-3.5 shrink-0",
-          isActive && "animate-spin text-foreground",
-          progress.state === "succeeded" && "text-emerald-600 dark:text-emerald-300",
+      <div className="flex min-w-0 items-center gap-2">
+        <Icon
+          className={cn(
+            "size-3.5 shrink-0",
+            isActive && "animate-spin text-foreground",
+            progress.state === "succeeded" && "text-emerald-600 dark:text-emerald-300",
+          )}
+        />
+        <span className={cn("shrink-0 font-medium", !isFailed && "text-foreground")}>
+          {progress.message}
+        </span>
+        {progress.detail && (
+          <span className="min-w-0 truncate text-xs opacity-80">{progress.detail}</span>
         )}
-      />
-      <span className={cn("font-medium", !isFailed && "text-foreground")}>
-        {progress.message}
-      </span>
-      {progress.detail && (
-        <span className="min-w-0 truncate text-xs opacity-80">{progress.detail}</span>
+      </div>
+      {showProgress && (
+        <div
+          role="progressbar"
+          aria-label="Teams sync progress"
+          aria-valuemin={0}
+          aria-valuemax={progress.total}
+          aria-valuenow={Math.min(progress.completed ?? 0, progress.total ?? 0)}
+          className="h-1 overflow-hidden rounded-full bg-background/80"
+        >
+          <div
+            className="h-full rounded-full bg-foreground/70 transition-[width] duration-300"
+            style={{ width: `${percentage}%` }}
+          />
+        </div>
       )}
     </div>
   );
