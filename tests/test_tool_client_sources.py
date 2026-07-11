@@ -253,9 +253,12 @@ def test_start_source_processing_posts_snapshot_identity():
     ]
 
 
-def test_start_source_processing_resolves_the_host_url(monkeypatch):
+def test_start_source_processing_resolves_the_workspace_resource_url(monkeypatch):
     client = ToolClient(
-        target=build_target(origin="https://self.example.test", workspace_id=None),
+        target=build_target(
+            origin="https://memforge.example.com",
+            workspace_id="team_alpha",
+        ),
         api_token="tok",
     )
     calls: list[tuple[str, str, dict[str, Any] | None]] = []
@@ -272,7 +275,7 @@ def test_start_source_processing_resolves_the_host_url(monkeypatch):
     assert calls == [
         (
             "POST",
-            "https://self.example.test/api/sources/src-local/process",
+            "https://memforge.example.com/api/workspaces/team_alpha/api/sources/src-local/process",
             {"force_full_sync": False},
         )
     ]

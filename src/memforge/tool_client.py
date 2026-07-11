@@ -460,9 +460,9 @@ class ToolClient:
             body["local_agent_job_id"] = local_agent_job_id
         if local_agent_attempt_count is not None:
             body["local_agent_attempt_count"] = local_agent_attempt_count
-        return self._host_json(
+        return self._resource_json(
             "POST",
-            f"/api/sources/{quote(source_id, safe='')}/process",
+            f"/sources/{quote(source_id, safe='')}/process",
             body,
         )
 
