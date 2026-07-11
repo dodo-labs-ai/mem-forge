@@ -389,6 +389,7 @@ def test_local_agent_forwards_retryable_handler_failure_to_broker(tmp_path):
 
 def test_local_agent_reports_handler_progress_through_heartbeat(tmp_path):
     heartbeats: list[dict | None] = []
+    completions: list[dict] = []
 
     def handle(job, *, report_progress):
         report_progress({
@@ -414,6 +415,9 @@ def test_local_agent_reports_handler_progress_through_heartbeat(tmp_path):
         cloud_job_heartbeat=lambda job_id, attempt_count, lease_seconds, progress=None: (
             heartbeats.append(progress) or {"ok": True}
         ),
+        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: (
+            completions.append(result) or {"ok": True}
+        ),
     )
 
     report = runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
@@ -423,6 +427,14 @@ def test_local_agent_reports_handler_progress_through_heartbeat(tmp_path):
         "schema_version": 1,
         "phase": "uploading",
         "progress": {"completed": 7, "total": 16, "unit": "message"},
+    }]
+    assert completions == [{
+        "count": 1,
+        "progress": {
+            "schema_version": 1,
+            "phase": "uploading",
+            "progress": {"completed": 7, "total": 16, "unit": "message"},
+        },
     }]
 
 

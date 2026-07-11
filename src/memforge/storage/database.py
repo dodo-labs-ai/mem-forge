@@ -2380,6 +2380,26 @@ class Database:
             row = await cursor.fetchone()
         return _local_agent_job_from_row(row) if row else None
 
+    async def list_current_local_agent_jobs(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+    ) -> list[dict[str, Any]]:
+        async with self.db.execute(
+            """SELECT * FROM local_agent_jobs
+               WHERE workspace_id = ? AND execution_owner_user_id = ? AND source_id <> ''
+               ORDER BY CASE WHEN status IN ('queued', 'leased') THEN 0 ELSE 1 END,
+                        created_at DESC LIMIT 200""",
+            (workspace_id, user_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        latest_by_source: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            job = _local_agent_job_from_row(row)
+            latest_by_source.setdefault(str(job["source_id"]), job)
+        return list(latest_by_source.values())
+
     async def lease_local_agent_jobs(
         self,
         *,
@@ -2422,7 +2442,8 @@ class Database:
                 cursor = await self.db.execute(
                     """UPDATE local_agent_jobs SET status = 'leased',
                        lease_owner_user_id = ?, leased_until = ?,
-                       attempt_count = attempt_count + 1, updated_at = ?
+                       attempt_count = attempt_count + 1, result_json = NULL,
+                       last_error = NULL, finished_at = NULL, updated_at = ?
                        WHERE job_id = ? AND execution_owner_user_id = ?
                          AND (status = 'queued' OR
                               (status = 'leased' AND leased_until <= ?))
@@ -2454,6 +2475,7 @@ class Database:
         user_id: str,
         attempt_count: int,
         lease_seconds: int,
+        progress: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> bool:
         heartbeat_at = now or datetime.now(timezone.utc)
@@ -2466,11 +2488,19 @@ class Database:
                    last_seen_at = excluded.last_seen_at""",
                 (user_id, now_iso),
             )
+            result_json = None
+            if progress is not None:
+                result_json = json.dumps(
+                    {"progress": normalize_sync_progress_snapshot(progress)},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
             cursor = await self.db.execute(
-                """UPDATE local_agent_jobs SET leased_until = ?, updated_at = ?
+                """UPDATE local_agent_jobs SET leased_until = ?,
+                       result_json = COALESCE(?, result_json), updated_at = ?
                    WHERE job_id = ? AND status = 'leased'
                      AND lease_owner_user_id = ? AND attempt_count = ?""",
-                (leased_until, now_iso, job_id, user_id, attempt_count),
+                (leased_until, result_json, now_iso, job_id, user_id, attempt_count),
             )
             await self.db.commit()
         return bool(cursor.rowcount)

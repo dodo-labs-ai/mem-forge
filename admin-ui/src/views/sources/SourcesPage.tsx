@@ -531,7 +531,7 @@ export function SourcesPage() {
                   onToggle={() => toggleGroup(group)}
                 >
                   {group.sources.map(({ source, memory_count }) => {
-                    const localAgentJob = currentLocalJobBySource[source.id] ?? localAgentJobBySource[source.id];
+                    const localAgentJob = localAgentJobBySource[source.id] ?? currentLocalJobBySource[source.id];
                     const syncActivity = selectSourceSyncActivity(source.sync, localAgentJob);
                     const isSyncing =
                       ["pending", "running", "recovering"].includes(source.sync?.status ?? "") ||

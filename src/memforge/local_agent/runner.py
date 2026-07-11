@@ -151,6 +151,9 @@ class LocalAgentRunner:
                     job,
                     heartbeat.report_progress,
                 )
+            latest_progress = heartbeat.latest_progress
+            if latest_progress is not None:
+                payload = {**payload, "progress": latest_progress}
             heartbeat_errors = heartbeat.errors
             if heartbeat_errors:
                 payload = dict(payload)
@@ -312,6 +315,8 @@ class _CloudJobLeaseHeartbeat:
         self._stop = threading.Event()
         self._progress_lock = threading.Lock()
         self._progress: dict[str, Any] | None = None
+        self._progress_revision = 0
+        self._sent_progress_revision = 0
         self._thread: threading.Thread | None = None
         self.errors: list[str] = []
 
@@ -328,10 +333,13 @@ class _CloudJobLeaseHeartbeat:
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if self._thread is None:
-            return
-        self._stop.set()
-        self._thread.join(timeout=1)
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=1)
+        with self._progress_lock:
+            progress_dirty = self._progress_revision > self._sent_progress_revision
+        if progress_dirty:
+            self._send_heartbeat()
 
     def _run(self) -> None:
         while not self._stop.wait(self._interval_seconds):
@@ -340,7 +348,12 @@ class _CloudJobLeaseHeartbeat:
     def report_progress(self, progress: dict[str, Any]) -> None:
         with self._progress_lock:
             self._progress = normalize_sync_progress_snapshot(progress)
-        self._send_heartbeat()
+            self._progress_revision += 1
+
+    @property
+    def latest_progress(self) -> dict[str, Any] | None:
+        with self._progress_lock:
+            return dict(self._progress) if self._progress is not None else None
 
     def _send_heartbeat(self) -> None:
         if self._heartbeat is None:
@@ -348,6 +361,7 @@ class _CloudJobLeaseHeartbeat:
         try:
             with self._progress_lock:
                 progress = dict(self._progress) if self._progress is not None else None
+                progress_revision = self._progress_revision
             response = _call_cloud_job_heartbeat(
                 self._heartbeat,
                 self._job_id,
@@ -357,6 +371,12 @@ class _CloudJobLeaseHeartbeat:
             )
             if isinstance(response, dict) and response.get("error"):
                 self.errors.append(_api_error_message(response))
+            else:
+                with self._progress_lock:
+                    self._sent_progress_revision = max(
+                        self._sent_progress_revision,
+                        progress_revision,
+                    )
         except Exception as exc:
             self.errors.append(str(exc))
 

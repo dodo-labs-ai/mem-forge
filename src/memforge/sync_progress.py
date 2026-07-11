@@ -55,7 +55,8 @@ def source_sync_progress_from_pipeline(
     }
     if total > 0:
         progress["total"] = total
-    snapshot["progress"] = progress
+    if phase != "reconciling" or completed > 0 or total > 0:
+        snapshot["progress"] = progress
     counts = {
         "changed": value.get("docs_updated"),
         "failed": value.get("docs_failed"),

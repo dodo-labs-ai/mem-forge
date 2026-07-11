@@ -88,6 +88,44 @@ const activeServerRun: SyncStatus = {
 assert.equal(selectSourceSyncActivity(activeServerRun, localJob)?.progress?.phase, "processing");
 
 assert.equal(
+  sourceSyncActivityFromLocalJob({
+    ...localJob,
+    leased_until: "2000-01-01T00:00:00Z",
+  }).state,
+  "recovering",
+);
+
+assert.deepEqual(
+  presentSourceSyncActivity(
+    {
+      state: "failed",
+      error: {
+        message: "request failed for /Users/alice/private?token=secret",
+        items: [{ doc_id: "doc-1", title: "Payroll Secret", error: "token=secret" }],
+      },
+    },
+    "Confluence",
+    "pages",
+  ),
+  { message: "Action needed", detail: "Sync failed. Retry when ready." },
+);
+
+assert.deepEqual(
+  presentSourceSyncActivity(
+    {
+      state: "failed",
+      error: { message: "Embedding provider unreachable: connection refused" },
+    },
+    "Confluence",
+    "pages",
+  ),
+  {
+    message: "Action needed",
+    detail: "The embedding provider is unavailable. Check its connection, then retry.",
+  },
+);
+
+assert.equal(
   teamsConversationCount({ conversation_ids: ["channel:1", "chat:2", "chat:2"] }),
   2,
 );
