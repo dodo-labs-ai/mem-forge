@@ -711,6 +711,7 @@ class TeamsGene(Gene):
             default_sync_interval_minutes=60,
             auth_method="browser_cookie",
             data_shape="message",
+            execution_kinds=("local_agent",),
         )
 
     @classmethod

@@ -451,6 +451,9 @@ class NormalizedContent:
     source_semantics: dict = field(default_factory=dict)
 
 
+SourceExecutionKind = Literal["server", "local_agent"]
+
+
 @dataclass
 class GeneMetadata:
     """Static metadata for a gene type."""
@@ -460,6 +463,8 @@ class GeneMetadata:
     default_sync_interval_minutes: int
     auth_method: str                     # "pat" | "oauth2" | "api_key" | "browser_cookie"
     data_shape: str                      # "document" | "ticket" | "message" | "email"
+    # Where source collection may run. Memory processing remains server-side.
+    execution_kinds: tuple[SourceExecutionKind, ...] = ("server",)
 
 
 @dataclass

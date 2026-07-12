@@ -32,7 +32,7 @@ import { timeAgo } from "@/utils/date";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { SourceConfigDialog } from "./SourceConfigDialog";
 import { LocalAgentDaemonStatus } from "./LocalAgentDaemonStatus";
-import { isManagedSourceId, isManagedSourceType, isPushBasedSourceType, userConfigurableGenes } from "./managedSources";
+import { isManagedSourceId, isManagedSourceType, userConfigurableGenes } from "./managedSources";
 import { getSourceActionEndpoint, getSourceMenuStyle, sourceActionLayout } from "./sourceActions";
 import { ProjectGroup } from "./ProjectGroup";
 import {
@@ -45,6 +45,10 @@ import { SourceRow } from "./SourceRow";
 import { TeamsSourceWizard } from "./TeamsSourceWizard";
 import { selectSourceSyncActivity } from "./sourceSyncActivity";
 import { localAgentSyncOperation } from "./localAgentSources";
+import {
+  presentSourceConnection,
+  type SourceConnectionMode,
+} from "./sourceConnectionPresentation";
 
 const SOURCE_LABELS: Record<string, { name: string; subtitle: string; description: string }> = {
   // Per-client agent-session sources returned by the split backend.
@@ -1096,8 +1100,6 @@ function AddSourceDialog({
   onConfigureSelected: (sourceType: string) => void;
 }) {
   const configurableGenes = userConfigurableGenes(genes);
-  const remoteGenes = configurableGenes.filter((gene) => !isPushBasedSourceType(gene.name));
-  const pushGenes = configurableGenes.filter((gene) => isPushBasedSourceType(gene.name));
   const [agentSetupClient, setAgentSetupClient] = useState<AgentSessionClient | null>(null);
 
   const renderConfigurableGene = (gene: (typeof configurableGenes)[number]) => {
@@ -1107,22 +1109,26 @@ function AddSourceDialog({
       description: gene.description,
     };
     const isTeams = gene.name === "teams";
+    const connection = presentSourceConnection(gene);
     return (
-      <div key={gene.name} className="rounded-lg border p-4">
-        <div className="flex items-start gap-3">
-          <SourceIcon type={gene.name} className="mt-0.5 size-6" />
-          <div className="min-w-0">
-            <div className="text-sm font-medium">{source.name}</div>
-            <div className="mt-1 text-xs text-muted-foreground">{source.description}</div>
+      <div key={gene.name} className="flex min-h-36 flex-col rounded-lg border p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex min-w-0 items-start gap-3">
+            <SourceIcon type={gene.name} className="mt-0.5 size-6" />
+            <div className="min-w-0">
+              <div className="text-sm font-medium">{source.name}</div>
+              <div className="mt-1 text-xs text-muted-foreground">{source.description}</div>
+            </div>
           </div>
+          <SourceConnectionBadge mode={connection.mode} label={connection.label} />
         </div>
-        <div className="mt-4 flex flex-wrap gap-2">
+        <div className="mt-auto flex flex-wrap gap-2 pt-4">
           <Button
             type="button"
             size="sm"
             onClick={() => (isTeams ? onTeamsSelected() : onConfigureSelected(gene.name))}
           >
-            {isTeams ? "Browse Teams" : "Configure"}
+            {isTeams ? "Select conversations" : "Set up"}
           </Button>
         </div>
       </div>
@@ -1132,11 +1138,11 @@ function AddSourceDialog({
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>Connect a new source</DialogTitle>
             <DialogDescription>
-              Configure source connection and sync scope before creating it.
+              Choose how MemForge reaches the source, then configure what to sync.
             </DialogDescription>
           </DialogHeader>
 
@@ -1148,37 +1154,51 @@ function AddSourceDialog({
           )}
 
           {!isLoading && (
-            <div className="space-y-5">
-              {remoteGenes.length > 0 && (
-                <section className="space-y-3">
-                  <SectionDivider label="Pull from a remote service" />
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    {remoteGenes.map(renderConfigurableGene)}
-                  </div>
-                </section>
-              )}
-
+            <div className="space-y-6">
               <section className="space-y-3">
-                <SectionDivider label="Push from your local device" />
-                <LocalAgentDaemonStatus />
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <h3 className="text-sm font-semibold text-foreground">Sources</h3>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      Select a source to configure its connection and sync scope.
+                    </p>
+                  </div>
+                  <LocalAgentDaemonStatus />
+                </div>
                 <div className="grid gap-3 sm:grid-cols-2">
-                  {pushGenes.map(renderConfigurableGene)}
+                  {configurableGenes.map(renderConfigurableGene)}
+                </div>
+              </section>
+
+              <section className="space-y-3 border-t pt-5">
+                <div>
+                  <h3 className="text-sm font-semibold text-foreground">Coding agent integrations</h3>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    Installed plugins add these sources automatically.
+                  </p>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
                   {AGENT_SESSION_CARDS.map((card) => (
-                    <div key={card.client} className="rounded-lg border p-4">
-                      <div className="flex items-start gap-3">
-                        <SourceIcon
-                          type="agent_session"
-                          client={card.client}
-                          className="mt-0.5 size-6"
-                        />
-                        <div className="min-w-0">
-                          <div className="text-sm font-medium">{card.title}</div>
-                          <div className="mt-1 text-xs text-muted-foreground">
-                            {card.description}
+                    <div key={card.client} className="flex min-h-36 flex-col rounded-lg border p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex min-w-0 items-start gap-3">
+                          <SourceIcon
+                            type="agent_session"
+                            client={card.client}
+                            className="mt-0.5 size-6"
+                          />
+                          <div className="min-w-0">
+                            <div className="text-sm font-medium">{card.title}</div>
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              {card.description}
+                            </div>
                           </div>
                         </div>
+                        <span className="shrink-0 rounded-full bg-muted px-2 py-1 text-[11px] font-medium text-muted-foreground">
+                          Plugin
+                        </span>
                       </div>
-                      <div className="mt-4">
+                      <div className="mt-auto pt-4">
                         <Button
                           type="button"
                           size="sm"
@@ -1331,13 +1351,22 @@ function AgentPluginInstructions({
   );
 }
 
-function SectionDivider({ label }: { label: string }) {
+function SourceConnectionBadge({
+  mode,
+  label,
+}: {
+  mode: SourceConnectionMode;
+  label: string;
+}) {
+  const tone = mode === "device"
+    ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200"
+    : mode === "choice"
+      ? "bg-violet-50 text-violet-700 dark:bg-violet-950/40 dark:text-violet-200"
+      : "bg-muted text-muted-foreground";
   return (
-    <div className="flex items-center gap-3">
-      <div className="h-px flex-1 bg-border" />
-      <span className="text-xs font-medium text-muted-foreground">{label}</span>
-      <div className="h-px flex-1 bg-border" />
-    </div>
+    <span className={`shrink-0 rounded-full px-2 py-1 text-[11px] font-medium ${tone}`}>
+      {label}
+    </span>
   );
 }
 
