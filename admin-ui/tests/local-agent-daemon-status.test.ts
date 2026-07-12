@@ -112,7 +112,7 @@ assert.doesNotMatch(
 );
 
 // The Add Source dialog lives inside SourcesPage; the daemon status should
-// only appear there, alongside the "Push from your local device" selection.
+// only appear there, alongside sources that use the local sync app.
 assert.match(
   sourcesPageSource,
   /import \{ LocalAgentDaemonStatus \}/,
@@ -121,8 +121,8 @@ assert.match(
 
 assert.match(
   sourcesPageSource,
-  /<SectionDivider label="Push from your local device" \/>\s*<LocalAgentDaemonStatus \/>/,
-  "Add Source push-from-local section should surface the daemon status inline",
+  /Select a source to configure its connection and sync scope\.[\s\S]*<LocalAgentDaemonStatus \/>/,
+  "Add Source source grid should surface the local sync status inline",
 );
 
 const localAgentStatusUsages = sourcesPageSource.match(/<LocalAgentDaemonStatus \/>/g) ?? [];

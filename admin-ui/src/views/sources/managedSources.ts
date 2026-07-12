@@ -7,12 +7,6 @@ type NamedSourceType = {
 const MANAGED_SOURCE_TYPES = new Set(["agent_session"]);
 const MANAGED_SOURCE_ID_PREFIX = "src-agent-sessions-";
 
-// Source types whose data lives on the user's machine and is delivered to
-// MemForge by a local CLI or plugin push, rather than pulled from a remote
-// service. The Add Source dialog groups these into a "Push from your local
-// agent" section because they share that delivery model.
-const PUSH_BASED_SOURCE_TYPES = new Set(["local_markdown", "agent_session"]);
-
 export function isManagedSourceType(sourceType: string): boolean {
   return MANAGED_SOURCE_TYPES.has(sourceType);
 }
@@ -28,10 +22,6 @@ export function canConfigureSourceType(sourceType: string): boolean {
 
 export function canDeleteSourceType(sourceType: string): boolean {
   return !isManagedSourceType(sourceType);
-}
-
-export function isPushBasedSourceType(sourceType: string): boolean {
-  return PUSH_BASED_SOURCE_TYPES.has(sourceType);
 }
 
 export function userConfigurableGenes<T extends NamedSourceType>(genes: readonly T[]): T[] {

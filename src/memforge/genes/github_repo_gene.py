@@ -83,6 +83,7 @@ class GitHubRepoGene(Gene):
             default_sync_interval_minutes=1440,
             auth_method="github_repo",
             data_shape="document",
+            execution_kinds=("server", "local_agent"),
         )
 
     @classmethod

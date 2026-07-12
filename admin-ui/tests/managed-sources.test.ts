@@ -5,14 +5,17 @@ import {
   canConfigureSourceType,
   canDeleteSourceType,
   isManagedSourceType,
-  isPushBasedSourceType,
   userConfigurableGenes,
 } from "../src/views/sources/managedSources.js";
+import {
+  presentSourceConnection,
+} from "../src/views/sources/sourceConnectionPresentation.js";
 
 const genes = [
-  { name: "confluence", display_name: "Confluence" },
-  { name: "agent_session", display_name: "Agent Session" },
-  { name: "jira", display_name: "Jira" },
+  { name: "confluence", display_name: "Confluence", execution_kinds: ["server"] as const },
+  { name: "agent_session", display_name: "Agent Session", execution_kinds: [] as const },
+  { name: "jira", display_name: "Jira", execution_kinds: ["server", "local_agent"] as const },
+  { name: "teams", display_name: "Teams", execution_kinds: ["local_agent"] as const },
 ];
 
 assert.equal(isManagedSourceType("agent_session"), true);
@@ -22,10 +25,27 @@ assert.equal(canConfigureSourceType("confluence"), true);
 assert.equal(canDeleteSourceType("confluence"), true);
 assert.equal(canConfigureSourceType("github_repo"), true);
 assert.equal(canDeleteSourceType("github_repo"), true);
-assert.equal(isPushBasedSourceType("github_repo"), false);
-assert.deepEqual(userConfigurableGenes(genes).map((gene) => gene.name), ["confluence", "jira"]);
+assert.deepEqual(userConfigurableGenes(genes).map((gene) => gene.name), ["confluence", "jira", "teams"]);
+assert.deepEqual(
+  userConfigurableGenes(genes).map((gene) => presentSourceConnection(gene)),
+  [
+    { mode: "direct", label: "Cloud" },
+    { mode: "choice", label: "Cloud or local" },
+    { mode: "device", label: "Local sync" },
+  ],
+);
+assert.throws(
+  () => presentSourceConnection(genes[1]),
+  /must declare at least one execution kind/,
+);
 
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
+
+assert.match(
+  sourcesPageSource,
+  /max-h-\[calc\(100dvh-2rem\)\] overflow-y-auto/,
+  "Add Source dialog should stay scrollable inside the visible viewport",
+);
 
 assert.match(
   sourcesPageSource,
