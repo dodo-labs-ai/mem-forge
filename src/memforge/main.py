@@ -2219,12 +2219,12 @@ def _run_cloud_teams_auth_job(job: dict[str, Any]) -> dict[str, Any]:
             poll_interval_seconds=2.0,
             rejected_token_hashes=_teams_rejected_token_hashes_from_payload(payload),
         )
-    except RuntimeError:
+    except RuntimeError as exc:
         return {
             "operation": operation,
             "authenticated": False,
             "region": region,
-            "error": "Sign in to Teams in the browser window, then retry.",
+            "error": str(exc),
         }
     except Exception as exc:
         return {
@@ -3471,7 +3471,7 @@ def auth():
 @click.option("--region", default="emea", type=click.Choice(["emea", "amer", "apac"]),
               help="Teams API region")
 def auth_teams(region: str):
-    """Authenticate with Microsoft Teams from Keychain or Chrome."""
+    """Authenticate with Microsoft Teams through Keychain and Teams Web."""
 
     from memforge.auth.teams_auth import TeamsAuthenticator
 
@@ -3479,7 +3479,7 @@ def auth_teams(region: str):
     console.print("[bold]Loading Teams session...[/]\n")
 
     try:
-        token_data = authenticator.authenticate(region=region)
+        token_data = authenticator.authenticate(region=region, wait_seconds=300)
     except RuntimeError as e:
         console.print(f"[yellow]{e}[/]")
         return
@@ -3532,8 +3532,8 @@ def auth_teams(region: str):
         console.print("\n[bold green]Done! Teams session saved to the OS keychain.[/]")
     else:
         console.print(
-            "\n[bold yellow]Done! Teams session saved to the local compatibility cache; "
-            "the OS keychain was unavailable.[/]"
+            "\n[bold yellow]Teams is connected for this command, but the access token could not be saved "
+            "to the OS keychain.[/]"
         )
 
 

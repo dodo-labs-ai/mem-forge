@@ -4,9 +4,9 @@ Wraps the Teams Chat API and Microsoft Graph API to discover, fetch, and
 normalize conversation threads and message blocks into comprehensive markdown
 for memory extraction.
 
-Authentication extracts OAuth tokens from Chrome browser cookies via the
-``memforge auth teams`` CLI command. Tokens are cached at
-``~/.memforge/tokens/teams.json``.
+Authentication reuses a Teams Access Token from the OS keychain. The
+``memforge auth teams`` CLI initializes or renews it through the dedicated
+Teams Browser Session when required.
 
 Document granularity:
 - Threaded channel messages (rootMessageId) → one thread = one document
@@ -82,9 +82,7 @@ class _TeamsAPIClient:
     async def _load_tokens(self) -> tuple[str, str]:
         """Load chat and graph tokens.
 
-        Search order:
-        1. ~/.memforge/tokens/teams.json (cached)
-        2. Chrome cookies (live extraction)
+        The collection path is read-only and never starts authentication UI.
         """
         from memforge.auth.teams_auth import (
             TeamsAuthenticator,
@@ -790,7 +788,7 @@ class TeamsGene(Gene):
                 )
 
     async def authenticate(self) -> None:
-        """Authenticate using tokens from Chrome cookies."""
+        """Authenticate with the cached Teams Access Token."""
         local_documents_dir = self._local_agent_documents_dir()
         if self._local_agent_package_manifest():
             return
