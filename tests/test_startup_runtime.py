@@ -320,6 +320,25 @@ def test_gene_config_schema_hides_runtime_transport_fields_from_ui(tmp_path):
     assert "tls_ca_bundle" not in fields
 
 
+def test_gene_metadata_declares_available_execution_kinds(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    app = create_admin_app(config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.get("/api/genes")
+
+    assert response.status_code == 200
+    genes = {gene["name"]: gene for gene in response.json()}
+    assert genes["confluence"]["execution_kinds"] == ["server"]
+    assert genes["github_pages"]["execution_kinds"] == ["server"]
+    assert genes["jira"]["execution_kinds"] == ["server", "local_agent"]
+    assert genes["github_repo"]["execution_kinds"] == ["server", "local_agent"]
+    assert genes["teams"]["execution_kinds"] == ["local_agent"]
+    assert genes["local_markdown"]["execution_kinds"] == ["local_agent"]
+    assert genes["agent_session"]["execution_kinds"] == []
+
+
 def test_admin_source_create_encrypts_and_redacts_pat(tmp_path, monkeypatch):
     import sqlite3
 

@@ -248,6 +248,7 @@ class JiraGene(Gene):
             default_sync_interval_minutes=360,  # 6 hours
             auth_method="browser_cookie",
             data_shape="ticket",
+            execution_kinds=("server", "local_agent"),
         )
 
     @classmethod

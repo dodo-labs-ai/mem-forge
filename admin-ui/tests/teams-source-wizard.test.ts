@@ -118,7 +118,7 @@ assert.match(
 );
 assert.match(
   sourcesPageSource,
-  /isTeams\s*\?\s*"Browse Teams"\s*:\s*"Configure"/,
+  /isTeams\s*\?\s*"Select conversations"\s*:\s*"Set up"/,
   "Teams source card should not expose the generic hand-written config path as the primary action",
 );
 assert.match(

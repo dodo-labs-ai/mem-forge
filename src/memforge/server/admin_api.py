@@ -67,6 +67,7 @@ from memforge.models import (
     MemoryType,
     MemoryReview,
     Project,
+    SourceExecutionKind,
     UNSORTED_PROJECT_KEY,
     canonicalize_entity_name,
 )
@@ -685,6 +686,7 @@ class GeneMetadataResponse(BaseModel):
     default_sync_interval_minutes: int
     auth_method: str
     data_shape: str
+    execution_kinds: list[SourceExecutionKind]
 
 
 class ConfigFieldResponse(BaseModel):
@@ -3354,6 +3356,7 @@ def create_admin_app(
                 default_sync_interval_minutes=g.default_sync_interval_minutes,
                 auth_method=g.auth_method,
                 data_shape=g.data_shape,
+                execution_kinds=list(g.execution_kinds),
             )
             for g in genes
         ]

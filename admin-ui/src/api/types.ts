@@ -178,8 +178,10 @@ export interface SourceSyncSchedule {
   updated_at: string | null;
 }
 
+export type SourceExecutionKind = "server" | "local_agent";
+
 export interface SourceExecution {
-  kind: "server" | "local_agent";
+  kind: SourceExecutionKind;
   operation: string | null;
   immutable_config_fields: string[];
 }
@@ -341,6 +343,8 @@ export interface GeneMetadata {
   default_sync_interval_minutes: number;
   auth_method: string;
   data_shape: string;
+  /** Where source collection may run. Memory processing remains server-side. */
+  execution_kinds: SourceExecutionKind[];
 }
 
 export interface ConfigField {

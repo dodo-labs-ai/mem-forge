@@ -74,6 +74,7 @@ class LocalMarkdownGene(Gene):
             default_sync_interval_minutes=0,
             auth_method="local_adapter",
             data_shape="document",
+            execution_kinds=("local_agent",),
         )
 
     @classmethod
