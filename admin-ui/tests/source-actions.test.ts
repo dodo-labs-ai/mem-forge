@@ -399,6 +399,11 @@ assert.match(
 );
 assert.match(
   sourceSetupSource,
+  /preview-discovery[\s\S]*source \? \{ source_id: source\.id \} : \{\}/,
+  "editing an existing source must let discovery preview reuse its stored credentials",
+);
+assert.match(
+  sourceSetupSource,
   /const payloadWithSchedule = \{/,
   "Source saves should bundle automatic sync settings into the source payload",
 );
