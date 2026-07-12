@@ -10,10 +10,10 @@ export interface SourceAction {
 }
 
 export const sourceActionLayout = {
-  primary: [
-    { id: "configure", label: "Configure", tone: "neutral" },
-    { id: "sync", label: "Sync", tone: "primary" },
-  ],
+  primary: {
+    configure: { id: "configure", label: "Configure", tone: "neutral" },
+    sync: { id: "sync", label: "Sync", tone: "primary" },
+  },
   menu: [
     {
       id: "toggle-status",
@@ -38,7 +38,7 @@ export const sourceActionLayout = {
     },
   ],
 } as const satisfies {
-  primary: readonly SourceAction[];
+  primary: Readonly<Record<"configure" | "sync", SourceAction>>;
   menu: readonly SourceAction[];
 };
 
