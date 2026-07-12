@@ -1022,8 +1022,8 @@ class GeneSyncOrchestrator:
         Steps:
             1. Fetch raw content
             2. Normalize to markdown
-            3. Store raw + normalized on disk
-            4. Content hash comparison (skip if unchanged)
+            3. Compare the content hash and inspect stored artifacts
+            4. Store new or missing artifacts
             5. Count tokens
             6. Call 1: Enrich document -> entity resolution
             7. Call 2: Extract memories -> dedup + persist
@@ -1086,33 +1086,11 @@ class GeneSyncOrchestrator:
             existing_doc = await self.db.get_document(doc_id)
             existing_metadata = await self.db.get_metadata(doc_id) if existing_hash == new_hash else None
 
+        unchanged = existing_hash == new_hash and existing_metadata is not None and not force_reprocess
         previous_markdown = (
             self._read_previous_normalized_content(existing_doc)
             if existing_hash is not None and existing_hash != new_hash
             else None
-        )
-
-        # ------------------------------------------------------------------
-        # 3. Store raw + normalized on disk
-        # ------------------------------------------------------------------
-        raw_uri = self.doc_store.store_raw(
-            source_id=source_id,
-            title=item.title,
-            content=raw.body,
-            content_type=raw.content_type,
-        )
-        norm_uri = self.doc_store.store_normalized(
-            source_id=source_id,
-            title=item.title,
-            markdown=markdown_body,
-        )
-        self._memory_sample(
-            "after_raw_store",
-            source_id=source_id,
-            run_id=run_id,
-            doc_id=doc_id,
-            raw_bytes=len(raw.body),
-            content_chars=len(markdown_body),
         )
 
         source_type = gene.metadata().name
@@ -1125,10 +1103,44 @@ class GeneSyncOrchestrator:
         )
 
         # ------------------------------------------------------------------
+        # 3. Store raw + normalized on disk
+        # ------------------------------------------------------------------
+        raw_uri = existing_doc.raw_content_uri if unchanged and existing_doc else None
+        norm_uri = existing_doc.normalized_content_uri if unchanged and existing_doc else None
+        stored_content_artifact = False
+        if not unchanged or not raw_uri:
+            raw_uri = self.doc_store.store_raw(
+                source_id=source_id,
+                title=item.title,
+                content=raw.body,
+                content_type=raw.content_type,
+            )
+            stored_content_artifact = True
+        if not unchanged or not norm_uri:
+            norm_uri = self.doc_store.store_normalized(
+                source_id=source_id,
+                title=item.title,
+                markdown=markdown_body,
+            )
+            stored_content_artifact = True
+        if stored_content_artifact:
+            self._memory_sample(
+                "after_raw_store",
+                source_id=source_id,
+                run_id=run_id,
+                doc_id=doc_id,
+                raw_bytes=len(raw.body),
+                content_chars=len(markdown_body),
+            )
+
+        # ------------------------------------------------------------------
         # 3b. Export PDF (if gene supports it)
         # ------------------------------------------------------------------
-        pdf_uri: str | None = None
-        if hasattr(gene, "fetch_pdf"):
+        pdf_uri = existing_doc.pdf_content_uri if unchanged and existing_doc else None
+        should_fetch_pdf = hasattr(gene, "fetch_pdf") and (
+            not unchanged or requires_pdf_uri or not pdf_uri
+        )
+        if should_fetch_pdf:
             try:
                 pdf_bytes = await gene.fetch_pdf(item)
             except Exception as e:
@@ -1184,17 +1196,16 @@ class GeneSyncOrchestrator:
             content_hash=new_hash,
             token_count=token_count,
             raw_content_uri=raw_uri,
-            raw_content_type=raw.content_type,
+            raw_content_type=(
+                existing_doc.raw_content_type if unchanged and existing_doc else raw.content_type
+            ),
             normalized_content_uri=norm_uri,
             pdf_content_uri=pdf_uri,
             last_synced=now,
             client=normalized.source_semantics.get("client") or None,
         )
 
-        if existing_hash == new_hash and existing_metadata and not force_reprocess:
-            if existing_doc and not doc_record.pdf_content_uri:
-                doc_record.pdf_content_uri = existing_doc.pdf_content_uri
-
+        if unchanged:
             if vector_current:
                 async with self._db_lock:
                     await self.db.upsert_document(doc_record)
