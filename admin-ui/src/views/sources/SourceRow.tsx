@@ -84,9 +84,10 @@ export function SourceRow({
   const isPaused = source.status === "paused";
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
   const localExecution = isLocalAgentBackedSource(source);
+  const connectionRequiresAction = source.connection_status?.state === "action_required";
   const showReadiness = !isPaused
     && capabilities.can_sync
-    && (localExecution || source.connection_status != null);
+    && (localExecution || connectionRequiresAction);
   const pausedSyncHint = "Source is paused. Resume the source to sync again.";
   const ownershipText = formatOwnership(source.ownership);
   const configuredTeamsConversations = source.type === "teams"

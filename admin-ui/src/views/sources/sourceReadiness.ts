@@ -5,7 +5,6 @@ export type SourceReadiness =
   | "checking_local_sync"
   | "local_sync_ready"
   | "local_sync_unavailable"
-  | "connection_ready"
   | "sign_in_required"
   | "configuration_required"
   | "account_mismatch";
@@ -31,6 +30,5 @@ export function resolveSourceReadiness({
   }
 
   if (localExecution) return "local_sync_ready";
-  if (connectionStatus?.state === "ready") return "connection_ready";
   return null;
 }
