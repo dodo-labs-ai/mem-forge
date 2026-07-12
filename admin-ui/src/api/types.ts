@@ -186,6 +186,13 @@ export interface SourceExecution {
   immutable_config_fields: string[];
 }
 
+export type SourceConnectionStatusReason = "authentication" | "configuration" | "identity_conflict";
+
+export interface SourceConnectionStatus {
+  state: "ready" | "action_required";
+  reason: SourceConnectionStatusReason | null;
+}
+
 export interface Source {
   id: string;
   type: string;
@@ -203,7 +210,7 @@ export interface Source {
   doc_count: number;
   memory_count?: number;
   sync?: SyncStatus | null;
-  auth_session?: JiraAuthSession | null;
+  connection_status?: SourceConnectionStatus | null;
   created_at: string;
   /**
    * How memories extracted from this source are routed to projects.

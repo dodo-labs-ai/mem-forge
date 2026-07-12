@@ -11,7 +11,7 @@ import { SourceIcon } from "@/components/sources/SourceIcon";
 import { cn } from "@/lib/utils";
 import { formatDuration, timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
-import { LocalAgentDaemonBadge } from "./LocalAgentDaemonStatus";
+import { LocalSourceReadinessBadge } from "./LocalSourceReadinessBadge";
 import { isLocalAgentBackedSource } from "./localAgentSources";
 import type { SourceSyncActivity } from "./sourceSyncActivity";
 import { teamsConversationCount } from "./teamsSourceConfig";
@@ -54,7 +54,6 @@ export function SourceRow({
   isManaged,
   sourceLabel,
   itemLabel,
-  authSessionLabel,
   enabledForMe,
   isSubscriptionPending,
   onConfigure,
@@ -73,7 +72,6 @@ export function SourceRow({
   isManaged: boolean;
   sourceLabel: SourceRowLabels;
   itemLabel: string;
-  authSessionLabel: (status: string) => string;
   enabledForMe: boolean;
   isSubscriptionPending: boolean;
   onConfigure: () => void;
@@ -85,7 +83,7 @@ export function SourceRow({
 }) {
   const isPaused = source.status === "paused";
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
-  const showLocalAgentStatus = !isPaused && isLocalAgentBackedSource(source) && capabilities.can_sync;
+  const showLocalReadiness = !isPaused && isLocalAgentBackedSource(source) && capabilities.can_sync;
   const pausedSyncHint = "Source is paused. Resume the source to sync again.";
   const ownershipText = formatOwnership(source.ownership);
   const configuredTeamsConversations = source.type === "teams"
@@ -107,10 +105,9 @@ export function SourceRow({
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="truncate text-sm font-medium">{source.name}</h3>
-              {showLocalAgentStatus ? (
-                <LocalAgentDaemonBadge />
-              ) : (
-                <SourceLifecycleBadge status={source.status} />
+              <SourceLifecycleBadge status={source.status} />
+              {showLocalReadiness && (
+                <LocalSourceReadinessBadge connectionStatus={source.connection_status} />
               )}
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
@@ -145,17 +142,6 @@ export function SourceRow({
                   {source.sync_schedule.next_run_at
                     ? `, next ${formatRelativeFuture(source.sync_schedule.next_run_at)}`
                     : ""}
-                </span>
-              )}
-              {source.type === "jira" && source.auth_session && capabilities.can_configure_connection && (
-                <span
-                  className={
-                    source.auth_session.status === "active"
-                      ? "text-emerald-600"
-                      : "text-destructive"
-                  }
-                >
-                  Browser session (local adapter): {authSessionLabel(source.auth_session.status)}
                 </span>
               )}
             </div>
