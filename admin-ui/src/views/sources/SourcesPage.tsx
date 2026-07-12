@@ -19,6 +19,7 @@ import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
 import { EmptyState } from "@/components/admin/EmptyState";
 import { PageHeader } from "@/components/admin/PageHeader";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -1194,9 +1195,12 @@ function AddSourceDialog({
                             </div>
                           </div>
                         </div>
-                        <span className="shrink-0 rounded-full bg-muted px-2 py-1 text-[11px] font-medium text-muted-foreground">
+                        <Badge
+                          variant="outline"
+                          className="border-amber-200 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200"
+                        >
                           Plugin
-                        </span>
+                        </Badge>
                       </div>
                       <div className="mt-auto pt-4">
                         <Button
@@ -1359,14 +1363,14 @@ function SourceConnectionBadge({
   label: string;
 }) {
   const tone = mode === "device"
-    ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200"
+    ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200"
     : mode === "choice"
-      ? "bg-violet-50 text-violet-700 dark:bg-violet-950/40 dark:text-violet-200"
-      : "bg-muted text-muted-foreground";
+      ? "border-violet-200 bg-violet-50 text-violet-700 dark:border-violet-800 dark:bg-violet-950/50 dark:text-violet-200"
+      : "border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-800 dark:bg-sky-950/50 dark:text-sky-200";
   return (
-    <span className={`shrink-0 rounded-full px-2 py-1 text-[11px] font-medium ${tone}`}>
+    <Badge variant="outline" className={`text-[11px] ${tone}`}>
       {label}
-    </span>
+    </Badge>
   );
 }
 
