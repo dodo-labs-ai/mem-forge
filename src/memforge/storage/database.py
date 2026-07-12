@@ -41,12 +41,15 @@ from memforge.models import (
     Project,
     ReplacementKind,
     SHARED_PROJECT_KEY,
+    SourceArtifactCleanupTask,
+    SourceDeletionResult,
     SourceSyncInput,
     SourceSyncRun,
     SyncState,
     UNSORTED_PROJECT_KEY,
     Visibility,
     canonicalize_entity_name,
+    source_artifact_cleanup_task_id,
 )
 from memforge.memory.evidence import (
     AuthorityCase,
@@ -547,6 +550,17 @@ CREATE TABLE IF NOT EXISTS memory_curation_runs (
     error                TEXT,
     started_at           TEXT NOT NULL,
     completed_at         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS source_artifact_cleanup_tasks (
+    task_id        TEXT PRIMARY KEY,
+    source_id      TEXT NOT NULL,
+    artifact_uri   TEXT NOT NULL,
+    attempt_count  INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (source_id, artifact_uri)
 );
 
 CREATE TABLE IF NOT EXISTS evidence_units (
@@ -2057,6 +2071,15 @@ class Database:
 
     async def upsert_document(self, doc: DocumentRecord) -> None:
         async with self._write_lock:
+            async with self.db.execute(
+                "SELECT status FROM sources WHERE id = ?",
+                (doc.source,),
+            ) as cursor:
+                source_row = await cursor.fetchone()
+            if source_row is not None and source_row["status"] != "active":
+                if source_row["status"] == "deleting":
+                    raise ValueError(f"Source is being deleted: {doc.source}")
+                raise ValueError(f"Source is not active: {doc.source}")
             await self.db.execute(
                 """INSERT INTO documents (
                     doc_id, source, source_url, title, space_or_project,
@@ -2649,6 +2672,32 @@ class Database:
         async with self._write_lock:
             try:
                 memory_ids: list[str] = []
+                async with self.db.execute(
+                    "SELECT source, raw_content_uri, normalized_content_uri, pdf_content_uri "
+                    "FROM documents WHERE doc_id = ?",
+                    (doc_id,),
+                ) as cursor:
+                    document_row = await cursor.fetchone()
+                if document_row is not None:
+                    source_id = str(document_row["source"])
+                    for artifact_uri in dict.fromkeys(
+                        str(uri)
+                        for uri in (
+                            document_row["raw_content_uri"],
+                            document_row["normalized_content_uri"],
+                            document_row["pdf_content_uri"],
+                        )
+                        if uri
+                    ):
+                        await self.db.execute(
+                            "INSERT OR IGNORE INTO source_artifact_cleanup_tasks "
+                            "(task_id, source_id, artifact_uri) VALUES (?, ?, ?)",
+                            (
+                                source_artifact_cleanup_task_id(source_id, artifact_uri),
+                                source_id,
+                                artifact_uri,
+                            ),
+                        )
                 async with self.db.execute(
                     "SELECT memory_id FROM memory_sources WHERE doc_id = ?",
                     (doc_id,),
@@ -6885,7 +6934,7 @@ class Database:
             await self.db.execute("DELETE FROM projects WHERE id = ?", (project_id,))
             await self.db.commit()
 
-    async def delete_source_cascade(self, source_id: str) -> list[str]:
+    async def delete_source_cascade(self, source_id: str) -> SourceDeletionResult:
         """Delete a source and cascade to all documents + memories linked to those docs.
 
         Returns memory IDs retired because the source removal left them without
@@ -6893,11 +6942,37 @@ class Database:
         """
         async with self._write_lock:
             try:
+                await self.db.execute(
+                    "UPDATE sources SET status = 'deleting' WHERE id = ?",
+                    (source_id,),
+                )
                 retired_ids: list[str] = []
                 doc_ids: list[str] = []
-                async with self.db.execute("SELECT doc_id FROM documents WHERE source = ?", (source_id,)) as cursor:
+                artifact_uris: list[str] = []
+                async with self.db.execute(
+                    "SELECT doc_id, raw_content_uri, normalized_content_uri, pdf_content_uri "
+                    "FROM documents WHERE source = ?",
+                    (source_id,),
+                ) as cursor:
                     async for row in cursor:
-                        doc_ids.append(row[0])
+                        doc_ids.append(row["doc_id"])
+                        artifact_uris.extend(
+                            str(uri)
+                            for uri in (
+                                row["raw_content_uri"],
+                                row["normalized_content_uri"],
+                                row["pdf_content_uri"],
+                            )
+                            if uri
+                        )
+
+                for artifact_uri in dict.fromkeys(artifact_uris):
+                    task_id = source_artifact_cleanup_task_id(source_id, artifact_uri)
+                    await self.db.execute(
+                        "INSERT OR IGNORE INTO source_artifact_cleanup_tasks "
+                        "(task_id, source_id, artifact_uri) VALUES (?, ?, ?)",
+                        (task_id, source_id, artifact_uri),
+                    )
 
                 await self._delete_evidence_graph_for_source_id_unlocked(source_id)
                 for doc_id in doc_ids:
@@ -6931,10 +7006,58 @@ class Database:
                 await self.db.execute("DELETE FROM sync_history WHERE source = ?", (source_id,))
                 await self.db.execute("DELETE FROM sources WHERE id = ?", (source_id,))
                 await self.db.commit()
-                return list(dict.fromkeys(retired_ids))
+                return SourceDeletionResult(
+                    retired_memory_ids=tuple(dict.fromkeys(retired_ids)),
+                    retired_search_cleanup_required=True,
+                )
             except Exception:
                 await self.db.rollback()
                 raise
+
+    async def list_source_artifact_cleanup_tasks(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[SourceArtifactCleanupTask]:
+        if limit <= 0:
+            return []
+        tasks: list[SourceArtifactCleanupTask] = []
+        async with self.db.execute(
+            "SELECT task_id, source_id, artifact_uri, attempt_count, last_error, created_at, updated_at "
+            "FROM source_artifact_cleanup_tasks ORDER BY created_at, task_id LIMIT ?",
+            (limit,),
+        ) as cursor:
+            async for row in cursor:
+                tasks.append(
+                    SourceArtifactCleanupTask(
+                        task_id=str(row["task_id"]),
+                        source_id=str(row["source_id"]),
+                        artifact_uri=str(row["artifact_uri"]),
+                        attempt_count=int(row["attempt_count"]),
+                        last_error=row["last_error"],
+                        created_at=_parse_dt(row["created_at"]),
+                        updated_at=_parse_dt(row["updated_at"]),
+                    )
+                )
+        return tasks
+
+    async def complete_source_artifact_cleanup_task(self, task_id: str) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                "DELETE FROM source_artifact_cleanup_tasks WHERE task_id = ?",
+                (task_id,),
+            )
+            await self.db.commit()
+
+    async def fail_source_artifact_cleanup_task(self, task_id: str, error: str) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                "UPDATE source_artifact_cleanup_tasks SET "
+                "attempt_count = attempt_count + 1, last_error = ?, updated_at = datetime('now') "
+                "WHERE task_id = ?",
+                (error, task_id),
+            )
+            await self.db.commit()
 
     async def update_source_doc_count(self, source_id: str, count: int) -> None:
         async with self._write_lock:
@@ -7378,6 +7501,15 @@ class Database:
     ) -> SourceSyncRun:
         now_iso = now or _now_iso()
         normalized_snapshot_id = _non_empty_string(input_snapshot_id)
+        async with self.db.execute(
+            "SELECT status FROM sources WHERE id = ?",
+            (source_id,),
+        ) as cursor:
+            source = await cursor.fetchone()
+        if source is None:
+            raise ValueError(f"Source not found: {source_id}")
+        if source["status"] != "active":
+            raise ValueError(f"Source is not active: {source_id} ({source['status']})")
         async with self.db.execute(
             """SELECT * FROM source_sync_runs
                WHERE workspace_id = ?

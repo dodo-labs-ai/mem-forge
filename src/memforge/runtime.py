@@ -53,6 +53,10 @@ class SourcePausedError(RuntimeError):
     """Raised when sync is requested for a paused source."""
 
 
+class SourceNotActiveError(RuntimeError):
+    """Raised when sync is requested while a source lifecycle is not active."""
+
+
 class SourceSyncLeaseLost(RuntimeError):
     """Raised when a worker no longer owns the leased source-sync run."""
 
@@ -884,7 +888,7 @@ class SourceSyncWorker:
                 )
             failed_at = datetime.now(timezone.utc)
             next_attempt_at = self._next_retry_at(run, failed_at)
-            retryable = not isinstance(exc, SourcePausedError) and next_attempt_at is not None
+            retryable = not isinstance(exc, (SourcePausedError, SourceNotActiveError)) and next_attempt_at is not None
             failed = await self.db.fail_source_sync_run(
                 run.run_id,
                 worker_id=self.worker_id,
@@ -942,6 +946,10 @@ class SyncService:
             raise ValueError(f"Source not found: {source_id}")
         if source.get("status") == "paused":
             raise SourcePausedError(f"Source is paused: {source_id}")
+        if source.get("status") != "active":
+            raise SourceNotActiveError(
+                f"Source is not active: {source_id} ({source.get('status')})"
+            )
         return source
 
     async def enqueue_source(
@@ -1016,7 +1024,7 @@ class SyncService:
         del delay_seconds
         try:
             run = await self.enqueue_source(source_id, trigger="request")
-        except SourcePausedError:
+        except (SourcePausedError, SourceNotActiveError):
             return False
         return not run.coalesced
 

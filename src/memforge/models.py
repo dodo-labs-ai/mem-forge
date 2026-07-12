@@ -572,6 +572,34 @@ class SourceSyncInput:
 
 
 @dataclass
+class SourceArtifactCleanupTask:
+    task_id: str
+    source_id: str
+    artifact_uri: str
+    attempt_count: int = 0
+    last_error: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class SourceDeletionResult:
+    retired_memory_ids: tuple[str, ...] = ()
+    retired_search_cleanup_required: bool = True
+
+
+_SOURCE_ARTIFACT_CLEANUP_NAMESPACE = uuid.UUID("8d83ca08-5d8c-45f4-8e50-0cd9964a89a7")
+
+
+def source_artifact_cleanup_task_id(source_id: str, artifact_uri: str) -> str:
+    """Return the stable idempotency key for one deleted source artifact."""
+    return "sac-" + uuid.uuid5(
+        _SOURCE_ARTIFACT_CLEANUP_NAMESPACE,
+        f"{source_id}\0{artifact_uri}",
+    ).hex
+
+
+@dataclass
 class ChangelogEntry:
     id: int | None
     doc_id: str

@@ -1096,13 +1096,13 @@ class GeneSyncOrchestrator:
         # 3. Store raw + normalized on disk
         # ------------------------------------------------------------------
         raw_uri = self.doc_store.store_raw(
-            source_name=source_name,
+            source_id=source_id,
             title=item.title,
             content=raw.body,
             content_type=raw.content_type,
         )
         norm_uri = self.doc_store.store_normalized(
-            source_name=source_name,
+            source_id=source_id,
             title=item.title,
             markdown=markdown_body,
         )
@@ -1138,7 +1138,7 @@ class GeneSyncOrchestrator:
                 pdf_bytes = None
             if pdf_bytes and len(pdf_bytes) > 100:
                 pdf_uri = self.doc_store.store_raw(
-                    source_name=source_name,
+                    source_id=source_id,
                     title=item.title,
                     content=pdf_bytes,
                     content_type="application/pdf",
@@ -2019,13 +2019,6 @@ class GeneSyncOrchestrator:
                 )
                 async with self._db_lock:
                     await self._insert_changelog(changelog_entry)
-
-                # Clean up stored files
-                if existing_doc:
-                    self.doc_store.delete_document_files(
-                        source_name=source_name,
-                        title=existing_doc.title,
-                    )
 
                 # Delete the document record and hide memories left without support.
                 await self.memory_store.delete_document(

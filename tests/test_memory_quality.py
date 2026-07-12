@@ -119,14 +119,22 @@ async def _insert_document(
     db: Database,
     *,
     doc_id: str = "doc-acd",
+    source: str = "src-confluence",
     raw_content_uri: str | None = "/tmp/source.raw",
     normalized_content_uri: str | None = "/tmp/source.md",
     pdf_content_uri: str | None = None,
 ) -> DocumentRecord:
+    if await db.get_source(source) is None:
+        await db.upsert_source(
+            id=source,
+            type="confluence",
+            name="Confluence",
+            config_json="{}",
+        )
     now = datetime.now(timezone.utc)
     doc = DocumentRecord(
         doc_id=doc_id,
-        source="src-confluence",
+        source=source,
         source_url=f"https://confluence.example/{doc_id}",
         title="Payroll Processing V2",
         space_or_project="PAY",
@@ -785,9 +793,6 @@ async def test_admin_document_artifacts_can_use_non_filesystem_store(db: Databas
         def store_pdf(self, *args, **kwargs) -> str:
             raise AssertionError("not used")
 
-        def delete_document_files(self, *, source_name: str, title: str) -> None:
-            raise AssertionError("not used")
-
     await _insert_document(
         db,
         doc_id="doc-object-artifact-url",
@@ -861,10 +866,10 @@ async def test_delete_source_uses_injected_document_store(
 
     class RecordingDocumentStore:
         def __init__(self) -> None:
-            self.deleted: list[tuple[str, str]] = []
+            self.deleted: list[str] = []
 
-        def delete_document_files(self, *, source_name: str, title: str) -> None:
-            self.deleted.append((source_name, title))
+        def delete_artifact(self, uri: str) -> None:
+            self.deleted.append(uri)
 
         def get_artifact(self, uri, media_type):
             return None
@@ -884,12 +889,15 @@ async def test_delete_source_uses_injected_document_store(
         def store_pdf(self, *args, **kwargs) -> str:
             raise AssertionError("not used")
 
-    class NoopMemoryStore:
+    class DatabaseMemoryStore:
+        def __init__(self, database: Database) -> None:
+            self.database = database
+
         async def delete_source_cascade(self, source_id: str):
-            return []
+            return await self.database.delete_source_cascade(source_id)
 
     async def fake_build_memory_store(*args, **kwargs):
-        return NoopMemoryStore()
+        return DatabaseMemoryStore(db)
 
     monkeypatch.setattr(admin_api, "_build_memory_store", fake_build_memory_store)
     await db.upsert_source("src-confluence", "confluence", "Delete Route Source", "{}")
@@ -906,7 +914,124 @@ async def test_delete_source_uses_injected_document_store(
         response = client.delete("/api/sources/src-confluence")
 
     assert response.status_code == 200, response.text
-    assert store.deleted == [("Delete Route Source", "Payroll Processing V2")]
+    assert store.deleted == ["mem://doc.md"]
+
+
+@pytest.mark.asyncio
+async def test_delete_source_is_idempotent_when_source_is_already_absent(
+    db: Database,
+    tmp_path: Path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        response = client.delete("/api/sources/src-already-deleted")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "ok": True,
+        "deleted_source": "src-already-deleted",
+        "already_deleted": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_delete_source_succeeds_and_retains_cleanup_task_when_artifact_delete_fails(
+    db: Database,
+    tmp_path: Path,
+    monkeypatch,
+):
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    class UnavailableDocumentStore:
+        def delete_artifact(self, uri: str) -> None:
+            raise RuntimeError("object store unavailable")
+
+        def get_artifact(self, uri, media_type):
+            return None
+
+        def read_artifact(self, uri: str) -> bytes:
+            raise AssertionError("not used")
+
+        def read_normalized(self, stored_path: str) -> str | None:
+            return None
+
+        def store_raw(self, *args, **kwargs) -> str:
+            raise AssertionError("not used")
+
+        def store_normalized(self, *args, **kwargs) -> str:
+            raise AssertionError("not used")
+
+        def store_pdf(self, *args, **kwargs) -> str:
+            raise AssertionError("not used")
+
+    class DatabaseMemoryStore:
+        async def delete_source_cascade(self, source_id: str):
+            return await db.delete_source_cascade(source_id)
+
+    async def fake_build_memory_store(*args, **kwargs):
+        return DatabaseMemoryStore()
+
+    monkeypatch.setattr(admin_api, "_build_memory_store", fake_build_memory_store)
+    await db.upsert_source("src-cleanup-failure", "confluence", "Cleanup Failure", "{}")
+    await _insert_document(
+        db,
+        doc_id="doc-cleanup-failure",
+        source="src-cleanup-failure",
+        raw_content_uri=None,
+        normalized_content_uri="object-store://workspace/documents/src-cleanup-failure/page.md",
+    )
+
+    app = create_admin_app(
+        db=db,
+        config=_config(tmp_path),
+        document_store=UnavailableDocumentStore(),
+    )
+    with TestClient(app) as client:
+        response = client.delete("/api/sources/src-cleanup-failure")
+
+    tasks = await db.list_source_artifact_cleanup_tasks(limit=10)
+    assert response.status_code == 200, response.text
+    assert await db.get_source("src-cleanup-failure") is None
+    assert [(task.attempt_count, task.last_error) for task in tasks] == [
+        (1, "object store unavailable")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delete_source_restores_previous_status_when_delete_transaction_fails(
+    db: Database,
+    tmp_path: Path,
+    monkeypatch,
+):
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    class FailingMemoryStore:
+        async def delete_source_cascade(self, source_id: str):
+            raise RuntimeError("delete transaction failed")
+
+    async def fake_build_memory_store(*args, **kwargs):
+        return FailingMemoryStore()
+
+    monkeypatch.setattr(admin_api, "_build_memory_store", fake_build_memory_store)
+    await db.upsert_source("src-delete-rollback", "confluence", "Delete Rollback", "{}")
+    await db.db.execute(
+        "UPDATE sources SET status = 'paused' WHERE id = ?",
+        ("src-delete-rollback",),
+    )
+    await db.db.commit()
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.delete("/api/sources/src-delete-rollback")
+
+    source = await db.get_source("src-delete-rollback")
+    assert response.status_code == 500
+    assert source is not None
+    assert source["status"] == "paused"
 
 
 def test_sync_previous_content_read_does_not_bypass_document_store(tmp_path: Path):
