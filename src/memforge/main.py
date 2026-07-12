@@ -2121,22 +2121,57 @@ def _run_cloud_jira_sync_job(
         _sync_progress_snapshot(phase="connecting"),
     )
     try:
+        from memforge.auth.jira_capture import capture_and_prevalidate
+
+        session_config = _jira_cloud_config_from_job_payload(payload)
+        base_url = str(session_config["base_url"])
+        captured = asyncio.run(
+            capture_and_prevalidate(
+                base_url,
+                browser=browser,
+                tls_config=session_config,
+            )
+        )
+        uploaded_session = client.upload_jira_session(
+            base_url=captured.origin,
+            cookie_header=captured.cookie_header,
+            browser=captured.browser,
+        )
+        if uploaded_session.get("status_code") == 409:
+            principal_change = _principal_change_payload(uploaded_session)
+            return {
+                "operation": operation,
+                "source_id": source_id,
+                **principal_change,
+                "error_type": "JiraPrincipalChangedError",
+                "retryable": False,
+            }
+        if uploaded_session.get("error"):
+            return {
+                "operation": operation,
+                "source_id": source_id,
+                "error": "Unable to store the renewed Jira browser session",
+                "error_type": "JiraSessionUploadError",
+                "retryable": True,
+            }
         documents = asyncio.run(
             _collect_jira_documents_from_cloud_job(
                 job,
                 source_id=source_id,
-                browser=browser,
+                jira_cookie=captured.cookie_header,
                 limit=0,
                 report_progress=report_progress,
             )
         )
     except Exception as exc:
+        from memforge.auth.jira_auth import JiraAuthSessionMissingError
+
         return {
             "operation": operation,
             "source_id": source_id,
             "error": str(exc),
             "error_type": type(exc).__name__,
-            "retryable": True,
+            "retryable": not isinstance(exc, JiraAuthSessionMissingError),
         }
 
     pushed: list[dict[str, Any]] = []
@@ -2718,29 +2753,16 @@ async def _collect_jira_documents_from_cloud_job(
     job: dict[str, Any],
     *,
     source_id: str,
-    browser: str | None,
     limit: int,
+    jira_cookie: str,
     report_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
-    from memforge.auth.jira_capture import capture_and_prevalidate
-    from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE, JiraGene
+    from memforge.genes.jira_gene import JiraGene
 
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    config = dict(payload)
-    config.pop("local_agent_documents_dir", None)
-    config.pop("pat", None)
-    config.pop("pat_encrypted", None)
-    config.pop("pat_configured", None)
-    config["sync_mode"] = "cloud"
-    base_url = str(config.get("base_url") or "").strip().rstrip("/")
-    if not base_url:
-        raise click.ClickException("Jira base_url is required")
-    auth_mode = str(config.get("auth_mode") or JIRA_AUTH_MODE_COOKIE).strip().lower()
-    if auth_mode != JIRA_AUTH_MODE_COOKIE:
-        raise click.ClickException("Jira local sync requires browser-session authentication")
-    if not str(config.get("jira_cookie") or "").strip():
-        captured = await capture_and_prevalidate(base_url, browser=browser, tls_config=config)
-        config["jira_cookie"] = captured.cookie_header
+    config = _jira_cloud_config_from_job_payload(payload)
+    base_url = str(config["base_url"])
+    config["jira_cookie"] = jira_cookie
 
     gene = JiraGene(config, source_id)
     await gene.authenticate()
@@ -2780,6 +2802,26 @@ async def _collect_jira_documents_from_cloud_job(
         if client is not None:
             await client.aclose()
     return documents
+
+
+def _jira_cloud_config_from_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE
+
+    config = dict(payload)
+    config.pop("local_agent_documents_dir", None)
+    config.pop("pat", None)
+    config.pop("pat_encrypted", None)
+    config.pop("pat_configured", None)
+    config["sync_mode"] = "cloud"
+    base_url = str(config.get("base_url") or "").strip().rstrip("/")
+    if not base_url:
+        raise click.ClickException("Jira base_url is required")
+    auth_mode = str(config.get("auth_mode") or JIRA_AUTH_MODE_COOKIE).strip().lower()
+    if auth_mode != JIRA_AUTH_MODE_COOKIE:
+        raise click.ClickException("Jira local sync requires browser-session authentication")
+    config["base_url"] = base_url
+    config["auth_mode"] = auth_mode
+    return config
 
 
 async def _collect_teams_documents_from_cloud_job(
@@ -3377,8 +3419,13 @@ def _make_browser_session_group(descriptor):
     @click.option("--base-url", required=True, help="Origin whose stored session to delete.")
     @click.pass_context
     def forget_cmd(ctx, base_url):
-        """Forget the server's stored session for an origin."""
-        _emit_tool_payload(ctx, _tool_client(ctx).forget_jira_session(base_url))
+        """Forget the local and server-side stored session for an origin."""
+        from memforge.auth.jira_auth import canonical_jira_origin
+        from memforge.auth.jira_browser_session import JiraBrowserSession
+
+        origin = canonical_jira_origin(base_url)
+        JiraBrowserSession().forget(origin=origin)
+        _emit_tool_payload(ctx, _tool_client(ctx).forget_jira_session(origin))
 
     @group.command("refresh")
     @click.option("--base-url", required=True, help=f"{descriptor.label} base URL.")
@@ -3391,7 +3438,13 @@ def _make_browser_session_group(descriptor):
         from memforge.auth.jira_auth import JiraAuthSessionError, JiraAuthSessionMissingError
 
         try:
-            result = asyncio.run(jira_capture.capture_and_prevalidate(base_url, browser=browser))
+            result = asyncio.run(
+                jira_capture.capture_and_prevalidate(
+                    base_url,
+                    browser=browser,
+                    interactive=True,
+                )
+            )
         except JiraAuthSessionMissingError as exc:
             _emit_tool_payload(ctx, {"error": "no_session", "detail": str(exc)})
             return
