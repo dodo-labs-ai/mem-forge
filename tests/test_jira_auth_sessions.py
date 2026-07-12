@@ -364,7 +364,17 @@ async def test_runtime_resolves_jira_browser_session_without_persisting_cookie(d
     captured = {}
 
     class FakeOrchestrator:
-        async def sync_gene(self, *, gene, source_name, source_id, progress_callback=None, force_full_sync=False):
+        async def sync_gene(
+            self,
+            *,
+            gene,
+            source_name,
+            source_id,
+            progress_callback=None,
+            force_full_sync=False,
+            authoritative_snapshot=False,
+        ):
+            del authoritative_snapshot
             captured["gene_config"] = gene.config
             return SyncState(source=source_id, last_sync_status="success")
 
@@ -434,7 +444,17 @@ async def test_runtime_keeps_legacy_jira_pat_source_in_pat_mode(db, tmp_path, mo
             raise AssertionError("legacy PAT source should not resolve a browser session")
 
     class FakeOrchestrator:
-        async def sync_gene(self, *, gene, source_name, source_id, progress_callback=None, force_full_sync=False):
+        async def sync_gene(
+            self,
+            *,
+            gene,
+            source_name,
+            source_id,
+            progress_callback=None,
+            force_full_sync=False,
+            authoritative_snapshot=False,
+        ):
+            del authoritative_snapshot
             captured["gene_config"] = gene.config
             return SyncState(source=source_id, last_sync_status="success")
 

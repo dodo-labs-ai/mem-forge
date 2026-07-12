@@ -1742,7 +1742,17 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(monkeypatch
         def orchestrator(self):
             return self
 
-        async def sync_gene(self, *, gene, source_name, source_id, progress_callback=None, force_full_sync=False):
+        async def sync_gene(
+            self,
+            *,
+            gene,
+            source_name,
+            source_id,
+            progress_callback=None,
+            force_full_sync=False,
+            authoritative_snapshot=False,
+        ):
+            del authoritative_snapshot
             await gene.authenticate()
             return SyncState(source=source_id, last_sync_status="success")
 
@@ -1822,7 +1832,17 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(monkeypatch,
         def orchestrator(self):
             return self
 
-        async def sync_gene(self, *, gene, source_name, source_id, progress_callback=None, force_full_sync=False):
+        async def sync_gene(
+            self,
+            *,
+            gene,
+            source_name,
+            source_id,
+            progress_callback=None,
+            force_full_sync=False,
+            authoritative_snapshot=False,
+        ):
+            del authoritative_snapshot
             self.gene = gene
             return SyncState(source=source_id, last_sync_status="success")
 
