@@ -14,9 +14,14 @@ import {
 } from "../src/views/sources/localAgentSources.js";
 
 assert.deepEqual(
-  sourceActionLayout.primary.map((action) => action.id),
+  Object.values(sourceActionLayout.primary).map((action) => action.id),
   ["configure", "sync"],
   "source cards should keep only Configure and Sync as visible primary actions",
+);
+assert.deepEqual(
+  Object.values(sourceActionLayout.primary).map((action) => action.tone),
+  ["neutral", "primary"],
+  "Configure should stay neutral while Sync remains the primary source-row action",
 );
 
 assert.deepEqual(
@@ -222,6 +227,26 @@ assert.match(
   sourceRowSource,
   /disabled=\{isSyncing \|\| isDeleting \|\| isPaused\}/,
   "Paused sources should not expose an enabled primary Sync button",
+);
+assert.match(
+  sourceRowSource,
+  /<span>Include memories<\/span>/,
+  "The subscription toggle should describe the memories it includes for the current user",
+);
+assert.match(
+  sourceRowSource,
+  /className="inline-flex min-h-8 cursor-pointer items-center gap-2 px-1 text-xs/,
+  "The inline source preference should not look like a third bordered action button",
+);
+assert.match(
+  sourceRowSource,
+  /pending && <Loader2 className="size-3 animate-spin"/,
+  "Saving a personal visibility preference should not replace the stable toggle label",
+);
+assert.match(
+  sourceRowSource,
+  /aria-label=\{`Configure \$\{source\.name\}`\}/,
+  "Configure should keep a source-specific accessible label when its text is hidden",
 );
 assert.match(
   sourceRowSource,

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
-import { Info, Loader2, Pause, Play, SlidersHorizontal } from "lucide-react";
+import { Info, Loader2, Pause, Play, RefreshCw, SlidersHorizontal } from "lucide-react";
 import type { Source, SourceCapabilities, SourceOwnership, SyncStatus } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
 import { SourceSyncStatusCard } from "@/components/admin/SourceSyncStatusCard";
@@ -162,7 +162,7 @@ export function SourceRow({
           </div>
         </div>
 
-        <div className="flex items-center justify-end gap-2 sm:shrink-0">
+        <div className="ml-8 flex flex-wrap items-center justify-start gap-2 sm:ml-0 sm:shrink-0 sm:justify-end">
           {capabilities.can_subscribe && (
             <SubscriptionToggle
               sourceName={source.name}
@@ -187,12 +187,12 @@ export function SourceRow({
             <Button
               type="button"
               variant="outline"
-              aria-label="Configure source"
+              aria-label={`Configure ${source.name}`}
               disabled={isDeleting}
               onClick={onConfigure}
             >
               <SlidersHorizontal className="size-4" />
-              <span className="hidden lg:inline">{sourceActionLayout.primary[0].label}</span>
+              <span className="hidden md:inline">{sourceActionLayout.primary.configure.label}</span>
             </Button>
           )}
           {capabilities.can_sync && !isManaged && (
@@ -206,15 +206,15 @@ export function SourceRow({
                   ? pausedSyncHint
                   : isSyncing
                     ? "Sync in progress"
-                    : sourceActionLayout.primary[1].label
+                    : sourceActionLayout.primary.sync.label
               }
             >
               {isSyncing ? (
                 <Loader2 className="size-4 animate-spin" />
               ) : (
-                <Play className="size-4" />
+                <RefreshCw className="size-4" />
               )}
-              {isSyncing ? "Syncing" : sourceActionLayout.primary[1].label}
+              {isSyncing ? "Syncing" : sourceActionLayout.primary.sync.label}
             </Button>
           )}
           {actionsMenu}
@@ -415,12 +415,10 @@ function SubscriptionToggle({
   pending: boolean;
   onChange: (enabled: boolean) => void;
 }) {
-  const label = pending ? "Saving..." : enabled ? "Enabled for me" : "Disabled for me";
-
   return (
     <label
-      className="inline-flex h-8 cursor-pointer items-center gap-2 rounded-md border bg-background px-2.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 has-data-[disabled]:cursor-not-allowed has-data-[disabled]:opacity-60"
-      title={`Toggle whether memories from "${sourceName}" appear in your views`}
+      className="inline-flex min-h-8 cursor-pointer items-center gap-2 px-1 text-xs text-muted-foreground transition-colors hover:text-foreground has-data-[disabled]:cursor-not-allowed has-data-[disabled]:opacity-60"
+      title={`Include memories from "${sourceName}" in your searches and memory views`}
     >
       <Switch
         aria-label={`${enabled ? "Disable" : "Enable"} "${sourceName}" for me`}
@@ -428,7 +426,8 @@ function SubscriptionToggle({
         disabled={pending}
         onCheckedChange={onChange}
       />
-      <span>{label}</span>
+      <span>Include memories</span>
+      {pending && <Loader2 className="size-3 animate-spin" aria-hidden="true" />}
     </label>
   );
 }
