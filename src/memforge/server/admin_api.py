@@ -70,6 +70,7 @@ from memforge.models import (
     UNSORTED_PROJECT_KEY,
     canonicalize_entity_name,
 )
+from memforge.sync_progress import normalize_sync_progress_snapshot
 from memforge.provenance import (
     DocumentArtifactStore,
     document_content_url,
@@ -889,6 +890,7 @@ class LocalAgentJobLeaseRequest(BaseModel):
 class LocalAgentJobHeartbeatRequest(BaseModel):
     attempt_count: int = Field(ge=1)
     lease_seconds: int = Field(default=60, ge=1, le=3600)
+    progress: dict[str, Any] | None = None
 
 
 class LocalAgentJobCompleteRequest(BaseModel):
@@ -5011,11 +5013,20 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
     ):
+        try:
+            progress = (
+                normalize_sync_progress_snapshot(req.progress)
+                if req.progress is not None
+                else None
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         wrote = await db.heartbeat_local_agent_job(
             job_id=job_id,
             user_id=resolve_request_principal(request),
             attempt_count=req.attempt_count,
             lease_seconds=req.lease_seconds,
+            progress=progress,
         )
         if not wrote:
             raise HTTPException(status_code=404, detail="local_agent_job_not_found")
@@ -5055,6 +5066,17 @@ def create_admin_app(
                 attempt_count=req.attempt_count,
             )
         return {"ok": True, "job_id": job_id, "status": status}
+
+    @local_agent_router.get("/jobs/current")
+    async def read_current_local_agent_jobs(
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        jobs = await db.list_current_local_agent_jobs(
+            workspace_id="default",
+            user_id=resolve_request_principal(request),
+        )
+        return {"data": [_shape_local_agent_job(job) for job in jobs]}
 
     @local_agent_router.get("/jobs/{job_id}")
     async def read_local_agent_job(

@@ -1751,22 +1751,21 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     assert payload["messages"] == 3
     assert payload["conversations"] == 1
     assert payload["sync_started"] is True
-    assert [item["stage"] for item in progress] == [
+    assert [item["phase"] for item in progress] == [
         "connecting",
         "uploading",
         "uploading",
-        "starting_processing",
+        "uploading",
     ]
     assert progress[1] == {
-        "stage": "uploading",
-        "current": 1,
-        "total": 2,
-        "processed_messages": 2,
-        "current_date": "2026-07-08T09:24:57.5870000Z",
-        "date_from": "2026-07-08T09:24:57.5870000Z",
-        "date_to": "2026-07-08T10:24:57.5870000Z",
-        "messages": 3,
-        "conversations": 1,
+        "schema_version": 1,
+        "phase": "uploading",
+        "progress": {"completed": 0, "total": 3, "unit": "message"},
+        "source_time_range": {
+            "start": "2026-07-08T09:24:57.5870000Z",
+            "end": "2026-07-08T09:24:57.5870000Z",
+        },
+        "counts": {"failed": 0},
     }
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
     assert len(push_calls) == 2
@@ -1997,14 +1996,21 @@ def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypat
     assert len([call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]) == 1
 
     FakeToolClient.reset({"doc_id": "teams-doc", "document_hash": "hash"})
+    retry_progress: list[dict] = []
     second = main._run_cloud_local_agent_job(
         {**job, "job_id": "laj-teams-sync-retry"},
         _cloud_test_client(),
+        report_progress=retry_progress.append,
     )
 
     assert second["counts"] == {"selected": 1, "pushed": 0, "failed": 0, "skipped_existing": 1, "polls": 0}
     assert not [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
     assert not [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
+    assert retry_progress[-1]["progress"] == {
+        "completed": 2,
+        "total": 2,
+        "unit": "message",
+    }
 
     audit_rows = [json.loads(line) for line in audit_log_path.read_text(encoding="utf-8").splitlines()]
     second_run = [row for row in audit_rows if row["run_id"] == "laj-teams-sync-retry"]

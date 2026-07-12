@@ -1172,6 +1172,12 @@ async def test_admin_sources_exposes_running_stored_counts_separately(db, tmp_pa
     assert source["sync"]["docs_total"] == 3
     assert source["sync"]["docs_stored"] == 2
     assert source["sync"]["memories_stored"] == 2
+    assert source["sync"]["progress"] == {
+        "schema_version": 1,
+        "phase": "processing",
+        "progress": {"completed": 1, "total": 3, "unit": "page"},
+        "counts": {"changed": 1, "failed": 0, "memories_created": 4},
+    }
     assert "docs_committed" not in source["sync"]
     assert "memories_committed" not in source["sync"]
 
@@ -1736,7 +1742,17 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(monkeypatch
         def orchestrator(self):
             return self
 
-        async def sync_gene(self, *, gene, source_name, source_id, progress_callback=None, force_full_sync=False):
+        async def sync_gene(
+            self,
+            *,
+            gene,
+            source_name,
+            source_id,
+            progress_callback=None,
+            force_full_sync=False,
+            authoritative_snapshot=False,
+        ):
+            del authoritative_snapshot
             await gene.authenticate()
             return SyncState(source=source_id, last_sync_status="success")
 
@@ -1816,7 +1832,17 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(monkeypatch,
         def orchestrator(self):
             return self
 
-        async def sync_gene(self, *, gene, source_name, source_id, progress_callback=None, force_full_sync=False):
+        async def sync_gene(
+            self,
+            *,
+            gene,
+            source_name,
+            source_id,
+            progress_callback=None,
+            force_full_sync=False,
+            authoritative_snapshot=False,
+        ):
+            del authoritative_snapshot
             self.gene = gene
             return SyncState(source=source_id, last_sync_status="success")
 
@@ -2344,6 +2370,55 @@ async def test_admin_source_sync_status_uses_durable_worker_run(db, tmp_path):
     source = next(row for row in response.json()["data"] if row["id"] == source_id)
     assert source["sync"]["status"] == "pending"
     assert source["sync"]["run_id"].startswith("ssr-")
+
+
+@pytest.mark.asyncio
+async def test_admin_source_sync_status_exposes_durable_progress_after_refresh(db, tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    source_id = "src-durable-progress"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Engineering Wiki",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        now=datetime.now(timezone.utc),
+        lease_seconds=300,
+    )
+    assert leased is not None
+    await db.report_source_sync_run_progress(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        progress={
+            "schema_version": 1,
+            "phase": "processing",
+            "progress": {"completed": 31, "total": 86, "unit": "page"},
+            "counts": {"memories_created": 104},
+        },
+    )
+
+    config = _config(tmp_path)
+    config.sync.worker_enabled = False
+    app = create_admin_app(db=db, config=config)
+    with TestClient(app) as client:
+        response = client.get("/api/sources")
+
+    assert response.status_code == 200, response.text
+    source = next(row for row in response.json()["data"] if row["id"] == source_id)
+    assert source["sync"]["status"] == "running"
+    assert source["sync"]["progress"] == {
+        "schema_version": 1,
+        "phase": "processing",
+        "progress": {"completed": 31, "total": 86, "unit": "page"},
+        "counts": {"memories_created": 104},
+    }
+    assert source["sync"]["progress_revision"] == 1
+    assert source["sync"]["progress_updated_at"] is not None
 
 
 @pytest.mark.asyncio

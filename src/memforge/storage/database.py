@@ -24,6 +24,7 @@ from memforge.local_agent.source_contract import (
     local_agent_sync_job_payload,
     local_agent_sync_operation,
 )
+from memforge.sync_progress import normalize_sync_progress_snapshot
 from memforge.models import (
     AgentHookReceipt,
     AgentSessionReceipt,
@@ -268,6 +269,9 @@ def _source_sync_run_from_row(row: Mapping[str, Any], *, coalesced: bool = False
         rerun_requested=bool(data.get("rerun_requested")),
         next_attempt_at=_parse_dt(data.get("next_attempt_at")),
         error_message=data.get("error_message"),
+        progress=json.loads(data["progress_json"]) if data.get("progress_json") else None,
+        progress_revision=int(data.get("progress_revision") or 0),
+        progress_updated_at=_parse_dt(data.get("progress_updated_at")),
         created_at=_parse_dt(data.get("created_at")),
         updated_at=_parse_dt(data.get("updated_at")),
         started_at=_parse_dt(data.get("started_at")),
@@ -851,6 +855,9 @@ CREATE TABLE IF NOT EXISTS source_sync_runs (
     rerun_requested         INTEGER NOT NULL DEFAULT 0,
     next_attempt_at         TEXT,
     error_message           TEXT,
+    progress_json           TEXT,
+    progress_revision       INTEGER NOT NULL DEFAULT 0,
+    progress_updated_at     TEXT,
     created_at              TEXT NOT NULL,
     updated_at              TEXT NOT NULL,
     started_at              TEXT,
@@ -1909,6 +1916,15 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                ON source_sync_snapshot_items(input_id)""",
         ],
     ),
+    (
+        39,
+        "Persist source sync progress",
+        [
+            "ALTER TABLE source_sync_runs ADD COLUMN progress_json TEXT",
+            "ALTER TABLE source_sync_runs ADD COLUMN progress_revision INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE source_sync_runs ADD COLUMN progress_updated_at TEXT",
+        ],
+    ),
 ]
 
 
@@ -2364,6 +2380,26 @@ class Database:
             row = await cursor.fetchone()
         return _local_agent_job_from_row(row) if row else None
 
+    async def list_current_local_agent_jobs(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+    ) -> list[dict[str, Any]]:
+        async with self.db.execute(
+            """SELECT * FROM local_agent_jobs
+               WHERE workspace_id = ? AND execution_owner_user_id = ? AND source_id <> ''
+               ORDER BY CASE WHEN status IN ('queued', 'leased') THEN 0 ELSE 1 END,
+                        created_at DESC LIMIT 200""",
+            (workspace_id, user_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        latest_by_source: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            job = _local_agent_job_from_row(row)
+            latest_by_source.setdefault(str(job["source_id"]), job)
+        return list(latest_by_source.values())
+
     async def lease_local_agent_jobs(
         self,
         *,
@@ -2406,7 +2442,8 @@ class Database:
                 cursor = await self.db.execute(
                     """UPDATE local_agent_jobs SET status = 'leased',
                        lease_owner_user_id = ?, leased_until = ?,
-                       attempt_count = attempt_count + 1, updated_at = ?
+                       attempt_count = attempt_count + 1, result_json = NULL,
+                       last_error = NULL, finished_at = NULL, updated_at = ?
                        WHERE job_id = ? AND execution_owner_user_id = ?
                          AND (status = 'queued' OR
                               (status = 'leased' AND leased_until <= ?))
@@ -2438,6 +2475,7 @@ class Database:
         user_id: str,
         attempt_count: int,
         lease_seconds: int,
+        progress: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> bool:
         heartbeat_at = now or datetime.now(timezone.utc)
@@ -2450,11 +2488,19 @@ class Database:
                    last_seen_at = excluded.last_seen_at""",
                 (user_id, now_iso),
             )
+            result_json = None
+            if progress is not None:
+                result_json = json.dumps(
+                    {"progress": normalize_sync_progress_snapshot(progress)},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
             cursor = await self.db.execute(
-                """UPDATE local_agent_jobs SET leased_until = ?, updated_at = ?
+                """UPDATE local_agent_jobs SET leased_until = ?,
+                       result_json = COALESCE(?, result_json), updated_at = ?
                    WHERE job_id = ? AND status = 'leased'
                      AND lease_owner_user_id = ? AND attempt_count = ?""",
-                (leased_until, now_iso, job_id, user_id, attempt_count),
+                (leased_until, result_json, now_iso, job_id, user_id, attempt_count),
             )
             await self.db.commit()
         return bool(cursor.rowcount)
@@ -7332,7 +7378,6 @@ class Database:
     ) -> SourceSyncRun:
         now_iso = now or _now_iso()
         normalized_snapshot_id = _non_empty_string(input_snapshot_id)
-        force_full_sync = force_full_sync or normalized_snapshot_id is not None
         async with self.db.execute(
             """SELECT * FROM source_sync_runs
                WHERE workspace_id = ?
@@ -7533,6 +7578,38 @@ class Database:
                 (
                     lease_expires_at,
                     heartbeat_iso,
+                    run_id,
+                    worker_id,
+                    lease_attempt_count,
+                ),
+            )
+            await self.db.commit()
+        return bool(cursor.rowcount)
+
+    async def report_source_sync_run_progress(
+        self,
+        run_id: str,
+        *,
+        worker_id: str,
+        lease_attempt_count: int,
+        progress: Mapping[str, Any],
+        now: datetime | None = None,
+    ) -> bool:
+        snapshot = normalize_sync_progress_snapshot(progress)
+        progress_at = _utc_iso(now)
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE source_sync_runs
+                   SET progress_json = ?,
+                       progress_revision = progress_revision + 1,
+                       progress_updated_at = ?
+                   WHERE run_id = ?
+                     AND status = 'running'
+                     AND lease_owner = ?
+                     AND lease_attempt_count = ?""",
+                (
+                    json.dumps(snapshot, sort_keys=True, separators=(",", ":")),
+                    progress_at,
                     run_id,
                     worker_id,
                     lease_attempt_count,
