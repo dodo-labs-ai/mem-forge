@@ -101,18 +101,12 @@ export function buildTeamsSourcePayload({
 export function buildTeamsSourceUpdatePayload({
   selections,
   config,
-  existingConfig = {},
 }: {
   selections: TeamsSelectionItem[];
   config: TeamsSourceConfig;
-  existingConfig?: Record<string, unknown>;
 }): TeamsSourceUpdatePayload {
   const payload = buildTeamsSourcePayload({ selections, config });
-  const mergedConfig: Record<string, unknown> = { ...existingConfig, ...payload.config };
-  delete mergedConfig.channels;
-  delete mergedConfig.group_chats;
-  delete mergedConfig.individual_chats;
-  return { name: payload.name, config: mergedConfig };
+  return { name: payload.name, config: payload.config };
 }
 
 export function existingTeamsSelection(id: string): TeamsSelectionItem {
@@ -139,14 +133,7 @@ function stringListConfig(value: unknown): string[] {
 }
 
 export function teamsConversationCount(config: Record<string, unknown>): number | null {
-  const canonical = stringList(config.conversation_ids);
-  const values = canonical.length > 0
-    ? canonical
-    : [
-        ...stringList(config.channels),
-        ...stringList(config.group_chats),
-        ...stringList(config.individual_chats),
-      ];
+  const values = stringList(config.conversation_ids);
   return values.length > 0 ? new Set(values).size : null;
 }
 

@@ -8,8 +8,8 @@ const componentSource = readFileSync(
 const querySource = readFileSync("src/views/sources/localAgentDaemonStatusQuery.ts", "utf8");
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
 const sourceRowSource = readFileSync("src/views/sources/SourceRow.tsx", "utf8");
-const sourceConfigDialogSource = readFileSync(
-  "src/views/sources/SourceConfigDialog.tsx",
+const schemaSourceSetupSource = readFileSync(
+  "src/views/sources/SchemaSourceSetup.tsx",
   "utf8",
 );
 const topbarSource = readFileSync("src/components/layout/Topbar.tsx", "utf8");
@@ -146,7 +146,7 @@ assert.match(
 // --- Configure dialog ----------------------------------------------------
 
 assert.doesNotMatch(
-  sourceConfigDialogSource,
+  schemaSourceSetupSource,
   /LocalAgentDaemonStatus/,
-  "SourceConfigDialog should not surface daemon status on the source configuration form",
+  "source setup should not surface daemon status inside an individual source form",
 );

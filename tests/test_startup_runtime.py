@@ -1972,6 +1972,120 @@ async def test_gene_discovery_preview_runs_configured_gene_without_saving_source
 
 
 @pytest.mark.asyncio
+async def test_gene_discovery_preview_reuses_existing_source_secret(db, tmp_path, monkeypatch):
+    from memforge.genes import GENE_REGISTRY
+    from memforge.genes.base import Gene
+    from memforge.models import (
+        ConfigField,
+        ConfigFieldType,
+        ConfigGroup,
+        ContentItem,
+        GeneConfigSchema,
+        GeneMetadata,
+        NormalizedContent,
+        RawContent,
+    )
+    from memforge.server.admin_api import create_admin_app
+
+    class SecretPreviewGene(Gene):
+        @classmethod
+        def metadata(cls) -> GeneMetadata:
+            return GeneMetadata(
+                name="secret_preview_gene",
+                display_name="Secret Preview Gene",
+                description="Test preview gene with a stored credential",
+                default_sync_interval_minutes=60,
+                auth_method="pat",
+                data_shape="document",
+            )
+
+        @classmethod
+        def config_schema(cls) -> GeneConfigSchema:
+            return GeneConfigSchema(
+                groups=[ConfigGroup(key="connection", label="Connection")],
+                fields=[
+                    ConfigField(
+                        key="base_url",
+                        label="Base URL",
+                        field_type=ConfigFieldType.URL,
+                        group="connection",
+                    ),
+                    ConfigField(
+                        key="pat",
+                        label="Personal Access Token",
+                        field_type=ConfigFieldType.SECRET,
+                        group="connection",
+                    ),
+                ],
+            )
+
+        async def authenticate(self) -> None:
+            if self.config.get("pat") != "stored-preview-secret":
+                raise ValueError("stored preview credential was not resolved")
+
+        async def discover(self, since=None):
+            yield ContentItem(
+                item_id="doc-1",
+                title="Stored credential document",
+                source_url="https://docs.example.test/doc-1",
+                last_modified=None,
+            )
+
+        async def fetch(self, item: ContentItem) -> RawContent:
+            raise NotImplementedError
+
+        async def normalize(self, raw: RawContent) -> NormalizedContent:
+            raise NotImplementedError
+
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
+    monkeypatch.setitem(GENE_REGISTRY, "secret_preview_gene", SecretPreviewGene)
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/sources",
+            json={
+                "name": "Stored Secret Source",
+                "type": "secret_preview_gene",
+                "config": {
+                    "base_url": "https://docs.example.test",
+                    "pat": "stored-preview-secret",
+                },
+            },
+        )
+        assert created.status_code == 200
+        source_id = created.json()["id"]
+        response = client.post(
+            "/api/genes/secret_preview_gene/preview-discovery",
+            json={
+                "source_id": source_id,
+                "config": {"base_url": "https://docs.example.test"},
+                "limit": 2,
+            },
+        )
+        missing_explicit_secret = client.post(
+            "/api/genes/secret_preview_gene/preview-discovery",
+            json={
+                "config": {"base_url": "https://docs.example.test"},
+                "limit": 2,
+            },
+        )
+        mismatched_source_type = client.post(
+            "/api/genes/confluence/preview-discovery",
+            json={
+                "source_id": source_id,
+                "config": {"base_url": "https://docs.example.test"},
+                "limit": 2,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["title"] == "Stored credential document"
+    assert missing_explicit_secret.status_code == 400
+    assert mismatched_source_type.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_github_pages_source_config_requires_scope_url_for_selected_mode(db, tmp_path):
     from memforge.server.admin_api import create_admin_app
 
