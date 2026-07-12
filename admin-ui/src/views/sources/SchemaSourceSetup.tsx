@@ -246,6 +246,7 @@ function SourceConfigForm({
       }
       return resourceClient
         .post(`/genes/${sourceType}/preview-discovery`, {
+          ...(source ? { source_id: source.id } : {}),
           config: serializedConfig,
           limit: DISCOVERY_PREVIEW_LIMIT,
         })

@@ -92,6 +92,7 @@ from memforge.runtime import (
 )
 from memforge.scheduler import SyncScheduler
 from memforge.source_secrets import (
+    decrypt_source_config_for_runtime,
     decrypt_secret,
     SecretConfigurationError,
     prepare_source_config_for_storage,
@@ -715,6 +716,7 @@ class GeneConfigSchemaResponse(BaseModel):
 
 
 class DiscoveryPreviewRequest(BaseModel):
+    source_id: str | None = None
     config: dict[str, Any]
     limit: int = Field(default=50, ge=1, le=200)
 
@@ -3394,15 +3396,30 @@ def create_admin_app(
     async def preview_gene_discovery(
         name: str,
         req: DiscoveryPreviewRequest,
+        request: Request,
         db: Database = Depends(get_db),
     ):
         """Preview the documents a source config would discover without saving it."""
         if name not in GENE_REGISTRY:
             raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
 
+        preview_config = dict(req.config)
+        if req.source_id:
+            existing = await db.get_source(req.source_id)
+            if not existing:
+                raise HTTPException(status_code=404, detail="Source not found")
+            _require_source_management(request, existing)
+            _require_local_agent_connection_management(request, existing)
+            if existing["type"] != name:
+                raise HTTPException(status_code=400, detail="Preview source type does not match the existing source")
+            stored_config = decrypt_source_config_for_runtime(
+                existing["config"],
+                secret_fields=_source_secret_fields(name),
+            )
+            preview_config = {**stored_config, **preview_config}
+
         try:
-            _validate_source_config(name, req.config)
-            preview_config = dict(req.config)
+            _validate_source_config(name, preview_config)
             preview_config["_memforge_preview_limit"] = req.limit + 1
             # Browser-session sources keep the cookie in the auth store, not the
             # source config. Inject it the same way a real sync does (no-op for
