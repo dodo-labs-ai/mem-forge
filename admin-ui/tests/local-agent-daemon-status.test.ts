@@ -77,8 +77,8 @@ assert.match(
 );
 assert.match(
   componentSource,
-  /export function LocalAgentDaemonBadge/,
-  "Local-agent daemon status should provide a compact badge for source rows",
+  /export function LocalAgentDaemonStatus/,
+  "Local-agent daemon status should keep the detailed Add Source presentation",
 );
 
 // --- Types ---------------------------------------------------------------
@@ -134,13 +134,18 @@ assert.equal(
 
 assert.match(
   sourceRowSource,
-  /LocalAgentDaemonBadge/,
-  "Source rows should reuse the daemon status UI instead of hardcoding active for local-agent backed sources",
+  /LocalSourceReadinessBadge/,
+  "Source rows should use the shared local source readiness presenter",
 );
 assert.match(
   sourceRowSource,
-  /showLocalAgentStatus = !isPaused && isLocalAgentBackedSource\(source\) && capabilities\.can_sync/,
-  "Paused lifecycle and execution ownership should gate daemon readiness in the title badge",
+  /showLocalReadiness = !isPaused && isLocalAgentBackedSource\(source\) && capabilities\.can_sync/,
+  "Paused lifecycle and execution ownership should gate local source readiness",
+);
+assert.match(
+  sourceRowSource,
+  /<SourceLifecycleBadge status=\{source\.status\} \/>[\s\S]*showLocalReadiness &&/,
+  "Source lifecycle should remain visible independently of local readiness",
 );
 
 // --- Configure dialog ----------------------------------------------------

@@ -180,7 +180,7 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
-  /showLocalAgentStatus\s*=\s*!isPaused\s*&&\s*isLocalAgentBackedSource\(source\)\s*&&\s*capabilities\.can_sync/,
+  /showLocalReadiness\s*=\s*!isPaused\s*&&\s*isLocalAgentBackedSource\(source\)\s*&&\s*capabilities\.can_sync/,
   "Only the execution owner should query and display local daemon readiness",
 );
 assert.match(
@@ -253,10 +253,15 @@ assert.match(
   /onRetry=\{isPaused \|\| !capabilities\.can_sync \? undefined : onSync\}/,
   "Paused sources and non-owners should not expose retry sync from the status bar",
 );
+assert.doesNotMatch(
+  sourceRowSource,
+  /source\.type === "jira"|Browser session \(local adapter\)|auth_session/,
+  "SourceRow should not contain Jira-specific readiness presentation",
+);
 assert.match(
   sourceRowSource,
-  /source\.auth_session\s*&&\s*capabilities\.can_configure_connection/,
-  "local Jira auth status should be visible only to the execution owner",
+  /connectionStatus=\{source\.connection_status\}/,
+  "SourceRow should pass the provider-neutral connection status to shared readiness UI",
 );
 assert.match(
   sourceRowSource,

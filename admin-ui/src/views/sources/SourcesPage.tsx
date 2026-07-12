@@ -595,7 +595,6 @@ export function SourcesPage() {
                         isManaged={isManaged}
                         sourceLabel={sourceLabel}
                         itemLabel={itemLabel}
-                        authSessionLabel={authSessionLabel}
                         enabledForMe={enabledForMe}
                         isSubscriptionPending={pendingSubscriptionIds.has(source.id)}
                         onConfigure={() => {
@@ -1039,13 +1038,6 @@ function DetailMetric({
 
 function formatCount(value: number | undefined): string {
   return (value ?? 0).toLocaleString();
-}
-
-function authSessionLabel(status: string) {
-  if (status === "active") return "active";
-  if (status === "expired") return "expired";
-  if (status === "failed") return "failed";
-  return "missing";
 }
 
 function StatCard({ label, value }: { label: string; value: string }) {

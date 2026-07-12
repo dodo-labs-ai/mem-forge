@@ -75,42 +75,6 @@ export function LocalAgentDaemonStatus({ className }: LocalAgentDaemonStatusProp
   );
 }
 
-export function LocalAgentDaemonBadge() {
-  const query = useLocalAgentDaemonStatus();
-  const data = query.data;
-
-  if (query.isPending) {
-    return (
-      <>
-        <Loader2 className="size-2.5 animate-spin text-muted-foreground" aria-hidden="true" />
-        <span className="rounded-full bg-muted px-2.5 py-0.5 text-xs font-medium text-muted-foreground">
-          Checking local sync
-        </span>
-      </>
-    );
-  }
-
-  if (query.isError || !data || data.status !== "online") {
-    return (
-      <>
-        <Circle className="size-2 fill-amber-500 text-amber-500" aria-hidden="true" />
-        <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-700 dark:border-amber-900 dark:bg-amber-900/30 dark:text-amber-200">
-          Local sync unavailable
-        </span>
-      </>
-    );
-  }
-
-  return (
-    <>
-      <Circle className="size-2 fill-emerald-500 text-emerald-500" aria-hidden="true" />
-      <span className="rounded-full bg-secondary px-2.5 py-0.5 text-xs font-medium text-secondary-foreground">
-        Local sync ready
-      </span>
-    </>
-  );
-}
-
 function copyDaemonCommand() {
   if (typeof navigator === "undefined" || !navigator.clipboard) return;
   void navigator.clipboard.writeText(LOCAL_AGENT_DAEMON_COMMAND);

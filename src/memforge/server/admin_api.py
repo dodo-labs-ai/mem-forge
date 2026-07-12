@@ -109,6 +109,7 @@ from memforge.server.source_admin_service import (
     list_source_admin_rows,
     normalize_workspace_role,
 )
+from memforge.local_agent.readiness import connection_status_from_browser_session
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
     execution_owner_user_id,
@@ -3542,15 +3543,14 @@ def create_admin_app(
                 and s.get("capabilities", {}).get("can_configure_connection")
             ):
                 try:
-                    s["auth_session"] = await jira_auth_service.get_status(
+                    session = await jira_auth_service.get_status(
                         str(s.get("config", {}).get("base_url") or "")
                     )
-                except ValueError as exc:
-                    s["auth_session"] = {
-                        "provider": "jira",
-                        "origin": "",
-                        "status": "failed",
-                        "last_error": str(exc),
+                    s["connection_status"] = connection_status_from_browser_session(session)
+                except ValueError:
+                    s["connection_status"] = {
+                        "state": "action_required",
+                        "reason": "configuration",
                     }
 
         return {"data": sources}

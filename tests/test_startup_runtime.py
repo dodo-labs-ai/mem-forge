@@ -952,8 +952,18 @@ def test_admin_source_create_allows_jira_browser_session_without_source_cookie(t
                 "project_binding": _project_binding(),
             },
         )
+        sources_response = client.get("/api/sources")
 
     assert response.status_code == 200, response.text
+    assert sources_response.status_code == 200, sources_response.text
+    source = next(
+        item for item in sources_response.json()["data"] if item["id"] == response.json()["id"]
+    )
+    assert "auth_session" not in source
+    assert source["connection_status"] == {
+        "state": "action_required",
+        "reason": "authentication",
+    }
 
 
 def test_admin_source_create_rejects_missing_required_source_scope(tmp_path, monkeypatch):
