@@ -287,6 +287,11 @@ export function SourcesPage() {
       return resourceClient.post(`/sources/${sourceId}/sync`, { force_full_sync: forceFullSync });
     },
     onError: (error, variables) => {
+      setPendingSyncIds((current) => {
+        const next = new Set(current);
+        next.delete(variables.source.id);
+        return next;
+      });
       if (localAgentSyncOperation(variables.source)) {
         setLocalAgentJob(variables.source.id, {
           job_id: `failed:${variables.source.id}`,
@@ -297,12 +302,7 @@ export function SourcesPage() {
       }
       handleAuthorityError(error, "Failed to start sync.");
     },
-    onSettled: (_data, _error, variables) => {
-      setPendingSyncIds((current) => {
-        const next = new Set(current);
-        next.delete(variables.source.id);
-        return next;
-      });
+    onSettled: async (_data, _error, variables) => {
       if (!_error && localAgentSyncOperation(variables.source)) {
         window.setTimeout(
           () => clearLocalAgentJob(variables.source.id),
@@ -311,9 +311,16 @@ export function SourcesPage() {
       } else if (!localAgentSyncOperation(variables.source)) {
         clearLocalAgentJob(variables.source.id);
       }
-      queryClient.invalidateQueries({ queryKey: ["sources"] });
-      queryClient.invalidateQueries({ queryKey: ["currentLocalAgentJobs"] });
-      queryClient.invalidateQueries({ queryKey: ["stats"] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["sources"] }),
+        queryClient.invalidateQueries({ queryKey: ["currentLocalAgentJobs"] }),
+        queryClient.invalidateQueries({ queryKey: ["stats"] }),
+      ]);
+      setPendingSyncIds((current) => {
+        const next = new Set(current);
+        next.delete(variables.source.id);
+        return next;
+      });
     },
   });
 
@@ -342,6 +349,11 @@ export function SourcesPage() {
       return resourceClient.post(getSourceActionEndpoint(source.id, "force-resync"));
     },
     onError: (error, source) => {
+      setPendingSyncIds((current) => {
+        const next = new Set(current);
+        next.delete(source.id);
+        return next;
+      });
       if (localAgentSyncOperation(source)) {
         setLocalAgentJob(source.id, {
           job_id: `failed:${source.id}`,
@@ -352,12 +364,7 @@ export function SourcesPage() {
       }
       handleAuthorityError(error, "Failed to start refresh.");
     },
-    onSettled: (_data, _error, source) => {
-      setPendingSyncIds((current) => {
-        const next = new Set(current);
-        next.delete(source.id);
-        return next;
-      });
+    onSettled: async (_data, _error, source) => {
       if (!_error && localAgentSyncOperation(source)) {
         window.setTimeout(
           () => clearLocalAgentJob(source.id),
@@ -366,8 +373,15 @@ export function SourcesPage() {
       } else if (!localAgentSyncOperation(source)) {
         clearLocalAgentJob(source.id);
       }
-      queryClient.invalidateQueries({ queryKey: ["sources"] });
-      queryClient.invalidateQueries({ queryKey: ["stats"] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["sources"] }),
+        queryClient.invalidateQueries({ queryKey: ["stats"] }),
+      ]);
+      setPendingSyncIds((current) => {
+        const next = new Set(current);
+        next.delete(source.id);
+        return next;
+      });
     },
   });
 
@@ -532,7 +546,11 @@ export function SourcesPage() {
                 >
                   {group.sources.map(({ source, memory_count }) => {
                     const localAgentJob = localAgentJobBySource[source.id] ?? currentLocalJobBySource[source.id];
-                    const syncActivity = selectSourceSyncActivity(source.sync, localAgentJob);
+                    const syncActivity = selectSourceSyncActivity(
+                      source.sync,
+                      localAgentJob,
+                      pendingSyncIds.has(source.id),
+                    );
                     const isSyncing =
                       ["pending", "running", "recovering"].includes(source.sync?.status ?? "") ||
                       pendingSyncIds.has(source.id) ||

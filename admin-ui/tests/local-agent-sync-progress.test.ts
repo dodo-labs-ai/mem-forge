@@ -87,6 +87,19 @@ const activeServerRun: SyncStatus = {
 };
 assert.equal(selectSourceSyncActivity(activeServerRun, localJob)?.progress?.phase, "processing");
 
+assert.deepEqual(
+  selectSourceSyncActivity(
+    {
+      ...activeServerRun,
+      status: "success",
+      finished_at: "2026-07-08T09:00:00Z",
+    },
+    null,
+    true,
+  ),
+  { state: "queued" },
+);
+
 assert.equal(
   selectSourceSyncActivity(
     {

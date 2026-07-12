@@ -2269,6 +2269,39 @@ async def test_force_full_sync_ignores_incremental_cursor(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_authoritative_snapshot_ignores_cursor_without_forcing_reprocessing(db: Database):
+    source_id = "src-authoritative-snapshot"
+    await _insert_source_and_doc(db, source_id)
+    await db.upsert_sync_state(
+        SyncState(
+            source=source_id,
+            last_sync_at=datetime(2026, 5, 26, 14, 55, 33, tzinfo=timezone.utc),
+            last_sync_status="success",
+            docs_processed=1,
+            docs_updated=1,
+        ),
+    )
+    gene = SinceRecordingEmptyGene()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=None,
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=None,
+        memory_store=None,
+    )
+
+    await orchestrator.sync_gene(
+        gene=gene,
+        source_name="Architecture",
+        source_id=source_id,
+        authoritative_snapshot=True,
+    )
+
+    assert gene.seen_since is None
+
+
+@pytest.mark.asyncio
 async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_path):
     source_id = "src-force-reprocess"
     markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
@@ -3050,7 +3083,7 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
 
 
 @pytest.mark.asyncio
-async def test_source_sync_worker_treats_complete_input_snapshot_as_full_sync(db: Database):
+async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_snapshot(db: Database):
     import memforge.runtime as runtime
 
     source_id = "src-snapshot-worker"
@@ -3064,6 +3097,7 @@ async def test_source_sync_worker_treats_complete_input_snapshot_as_full_sync(db
     class CapturingRuntimeProvider:
         def __init__(self) -> None:
             self.force_full_sync: bool | None = None
+            self.authoritative_snapshot: bool | None = None
             self.source: dict | None = None
 
         async def build_sync_runtime(self, db, config, **kwargs):
@@ -3072,6 +3106,7 @@ async def test_source_sync_worker_treats_complete_input_snapshot_as_full_sync(db
 
         async def run_source_sync(self, **kwargs):
             self.force_full_sync = kwargs["force_full_sync"]
+            self.authoritative_snapshot = kwargs["authoritative_snapshot"]
             self.source = kwargs["source"]
             return SyncState(
                 source=source_id,
@@ -3095,7 +3130,8 @@ async def test_source_sync_worker_treats_complete_input_snapshot_as_full_sync(db
 
     await worker.run_once()
 
-    assert provider.force_full_sync is True
+    assert provider.force_full_sync is False
+    assert provider.authoritative_snapshot is True
     assert provider.source is not None
     assert provider.source["config"]["local_agent_package_manifest"] == []
 

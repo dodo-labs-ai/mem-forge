@@ -68,6 +68,7 @@ export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivi
 export function selectSourceSyncActivity(
   sync: SyncStatus | null | undefined,
   localJob: LocalAgentJobStatusResponse | null | undefined,
+  pending = false,
 ): SourceSyncActivity | undefined {
   if (sync && ["pending", "running", "recovering"].includes(sync.status)) {
     return sourceSyncActivityFromStatus(sync);
@@ -75,6 +76,7 @@ export function selectSourceSyncActivity(
   if (localJob && ["queued", "leased"].includes(localJob.status)) {
     return sourceSyncActivityFromLocalJob(localJob);
   }
+  if (pending) return { state: "queued" };
   if (sync && localJob) {
     const serverActivity = sourceSyncActivityFromStatus(sync);
     const localActivity = sourceSyncActivityFromLocalJob(localJob);

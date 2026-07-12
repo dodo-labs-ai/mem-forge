@@ -162,6 +162,7 @@ class RuntimeProvider(Protocol):
         runtime: SyncRuntime | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
+        authoritative_snapshot: bool = False,
     ) -> SyncState: ...
 
 
@@ -216,6 +217,7 @@ class DefaultRuntimeProvider:
         runtime: SyncRuntime | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
+        authoritative_snapshot: bool = False,
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -224,6 +226,7 @@ class DefaultRuntimeProvider:
             runtime=runtime,
             progress_callback=progress_callback,
             force_full_sync=force_full_sync,
+            authoritative_snapshot=authoritative_snapshot,
         )
 
 
@@ -574,6 +577,7 @@ async def run_source_sync(
     runtime: SyncRuntime | None = None,
     progress_callback: Callable[[dict], None] | None = None,
     force_full_sync: bool = False,
+    authoritative_snapshot: bool = False,
 ) -> SyncState:
     runtime = runtime or await build_sync_runtime(db, config)
     secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
@@ -590,6 +594,7 @@ async def run_source_sync(
         source_id=source["id"],
         progress_callback=progress_callback,
         force_full_sync=force_full_sync,
+        authoritative_snapshot=authoritative_snapshot,
     )
 
 
@@ -823,9 +828,8 @@ class SourceSyncWorker:
                 source=source,
                 runtime=runtime,
                 progress_callback=None,
-                force_full_sync=(
-                    run.force_full_sync or run.input_snapshot_id is not None
-                ),
+                force_full_sync=run.force_full_sync,
+                authoritative_snapshot=run.input_snapshot_id is not None,
             )
             if final_state is None:
                 final_state = SyncState(
