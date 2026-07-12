@@ -30,28 +30,28 @@ class StoredDocumentArtifact:
 class DocumentStore(Protocol):
     def store_raw(
         self,
-        source_name: str,
+        source_id: str,
         title: str,
         content: bytes,
         content_type: str,
         extension: str | None = None,
     ) -> str: ...
 
-    def store_normalized(self, source_name: str, title: str, markdown: str) -> str: ...
-    def store_pdf(self, source_name: str, title: str, pdf_bytes: bytes) -> str: ...
+    def store_normalized(self, source_id: str, title: str, markdown: str) -> str: ...
+    def store_pdf(self, source_id: str, title: str, pdf_bytes: bytes) -> str: ...
     def read_normalized(self, stored_path: str) -> str | None: ...
     def get_artifact(self, uri: str | None, media_type: str) -> StoredDocumentArtifact | None: ...
     def read_artifact(self, uri: str) -> bytes: ...
-    def delete_document_files(self, source_name: str, title: str) -> None: ...
+    def delete_artifact(self, uri: str) -> None: ...
 
 
 class LocalDocumentStore:
     """Filesystem-based document content storage.
 
     Directory layout:
-        {docs_path}/{source_slug}/{doc_slug}.raw.html   (or .raw.json)
-        {docs_path}/{source_slug}/{doc_slug}.md
-        {docs_path}/{source_slug}/{doc_slug}.pdf         (optional)
+        {docs_path}/{source_id_slug}/{doc_slug}.raw.html   (or .raw.json)
+        {docs_path}/{source_id_slug}/{doc_slug}.md
+        {docs_path}/{source_id_slug}/{doc_slug}.pdf         (optional)
     """
 
     def __init__(self, docs_path: str) -> None:
@@ -77,22 +77,22 @@ class LocalDocumentStore:
             return None
         return resolved
 
-    def _source_dir(self, source_name: str) -> Path:
-        return self._root / slugify(source_name)
+    def _source_dir(self, source_id: str) -> Path:
+        return self._root / slugify(source_id)
 
     def _doc_stem(self, title: str) -> str:
         return slugify(title)
 
     def store_raw(
         self,
-        source_name: str,
+        source_id: str,
         title: str,
         content: bytes,
         content_type: str,
         extension: str | None = None,
     ) -> str:
         """Store raw document content. Returns the stored file path."""
-        source_dir = self._source_dir(source_name)
+        source_dir = self._source_dir(source_id)
         source_dir.mkdir(parents=True, exist_ok=True)
         if extension:
             ext = extension
@@ -108,12 +108,12 @@ class LocalDocumentStore:
 
     def store_normalized(
         self,
-        source_name: str,
+        source_id: str,
         title: str,
         markdown: str,
     ) -> str:
         """Store normalized markdown content. Returns the stored file path."""
-        source_dir = self._source_dir(source_name)
+        source_dir = self._source_dir(source_id)
         source_dir.mkdir(parents=True, exist_ok=True)
         path = source_dir / f"{self._doc_stem(title)}.md"
         path.write_text(markdown, encoding="utf-8")
@@ -121,12 +121,12 @@ class LocalDocumentStore:
 
     def store_pdf(
         self,
-        source_name: str,
+        source_id: str,
         title: str,
         pdf_bytes: bytes,
     ) -> str:
         """Store PDF export. Returns the stored file path."""
-        source_dir = self._source_dir(source_name)
+        source_dir = self._source_dir(source_id)
         source_dir.mkdir(parents=True, exist_ok=True)
         path = source_dir / f"{self._doc_stem(title)}.pdf"
         path.write_bytes(pdf_bytes)
@@ -158,12 +158,13 @@ class LocalDocumentStore:
             raise FileNotFoundError(uri)
         return path.read_bytes()
 
-    def delete_document_files(self, source_name: str, title: str) -> None:
-        """Delete all files for a document."""
-        source_dir = self._source_dir(source_name)
-        stem = self._doc_stem(title)
-        for ext in [".raw.html", ".raw.json", ".md", ".pdf"]:
-            path = source_dir / f"{stem}{ext}"
-            if path.exists():
-                path.unlink()
-                logger.debug("Deleted %s", path)
+    def delete_artifact(self, uri: str) -> None:
+        """Idempotently delete one exact artifact owned by this store."""
+        candidate = Path(uri).expanduser()
+        if not candidate.is_absolute():
+            candidate = self._root / candidate
+        path = candidate.resolve()
+        docs_root = self._root.expanduser().resolve()
+        if path != docs_root and docs_root not in path.parents:
+            raise ValueError("artifact URI is outside the document store")
+        path.unlink(missing_ok=True)

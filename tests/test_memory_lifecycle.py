@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from memforge.models import Memory, content_hash
+from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.storage.database import Database
 
 
@@ -180,6 +180,163 @@ class TestSupportAwareRetirement:
         assert stored.status == "retired"
         assert stored.retirement_reason == "source_deleted"
         assert sources == []
+
+    @pytest.mark.asyncio
+    async def test_source_cascade_removes_subscription_and_durable_sync_state(self, db):
+        source_id = "src-reusable"
+        await db.upsert_source(source_id, "confluence", "Reusable Source", "{}")
+        await db.set_source_subscription(source_id, "user-1", False)
+        await db.create_source_sync_input(
+            source_id=source_id,
+            raw_uri="object-store://old-input",
+            raw_sha256="old-sha",
+            raw_content_type="application/json",
+        )
+        await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+
+        await db.delete_source_cascade(source_id)
+
+        assert await db.get_latest_source_sync_run(source_id=source_id) is None
+        assert await db.list_source_sync_inputs(source_id=source_id) == []
+
+        await db.upsert_source(source_id, "confluence", "Recreated Source", "{}")
+        assert await db.is_source_enabled_for_user(source_id, "user-1") is True
+
+    @pytest.mark.asyncio
+    async def test_source_cascade_durably_records_exact_artifacts_for_cleanup(self, db):
+        source_id = "src-artifacts"
+        now = datetime.now(timezone.utc)
+        await db.upsert_source(source_id, "confluence", "Artifact Source", "{}")
+        await db.upsert_document(
+            DocumentRecord(
+                doc_id="doc-artifacts",
+                source=source_id,
+                source_url="https://wiki.example.test/doc-artifacts",
+                title="Architecture",
+                space_or_project="SFPAY",
+                author=None,
+                last_modified=now,
+                labels=[],
+                version="1",
+                content_hash="artifact-hash",
+                token_count=100,
+                raw_content_uri="object-store://workspace/documents/src-artifacts/raw.html",
+                raw_content_type="text/html",
+                normalized_content_uri="object-store://workspace/documents/src-artifacts/page.md",
+                pdf_content_uri="object-store://workspace/documents/src-artifacts/page.pdf",
+                last_synced=now,
+            )
+        )
+
+        await db.delete_source_cascade(source_id)
+
+        tasks = await db.list_source_artifact_cleanup_tasks(limit=10)
+        assert {(task.source_id, task.artifact_uri) for task in tasks} == {
+            (source_id, "object-store://workspace/documents/src-artifacts/raw.html"),
+            (source_id, "object-store://workspace/documents/src-artifacts/page.md"),
+            (source_id, "object-store://workspace/documents/src-artifacts/page.pdf"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_artifact_cleanup_removes_exact_file_and_completes_outbox_task(self, db, tmp_path):
+        from memforge.storage.document_store import LocalDocumentStore
+        from memforge.storage.source_cleanup import SourceArtifactCleanupService
+
+        source_id = "src-cleanup"
+        now = datetime.now(timezone.utc)
+        document_store = LocalDocumentStore(str(tmp_path / "documents"))
+        artifact_uri = document_store.store_normalized(source_id, "Architecture", "# Architecture")
+        await db.upsert_source(source_id, "confluence", "Cleanup Source", "{}")
+        await db.upsert_document(
+            DocumentRecord(
+                doc_id="doc-cleanup",
+                source=source_id,
+                source_url="https://wiki.example.test/doc-cleanup",
+                title="Architecture",
+                space_or_project="SFPAY",
+                author=None,
+                last_modified=now,
+                labels=[],
+                version="1",
+                content_hash="cleanup-hash",
+                token_count=10,
+                raw_content_uri=None,
+                raw_content_type=None,
+                normalized_content_uri=artifact_uri,
+                pdf_content_uri=None,
+                last_synced=now,
+            )
+        )
+        await db.delete_source_cascade(source_id)
+
+        processed = await SourceArtifactCleanupService(db, document_store).run_pending(limit=10)
+
+        assert processed == 1
+        assert document_store.get_artifact(artifact_uri, "text/markdown") is None
+        assert await db.list_source_artifact_cleanup_tasks(limit=10) == []
+
+    @pytest.mark.asyncio
+    async def test_document_deletion_uses_the_same_artifact_cleanup_outbox(self, db):
+        source_id = "src-document-cleanup"
+        now = datetime.now(timezone.utc)
+        await db.upsert_source(source_id, "confluence", "Document Cleanup", "{}")
+        await db.upsert_document(
+            DocumentRecord(
+                doc_id="doc-document-cleanup",
+                source=source_id,
+                source_url="https://wiki.example.test/doc-document-cleanup",
+                title="Architecture",
+                space_or_project="SFPAY",
+                author=None,
+                last_modified=now,
+                labels=[],
+                version="1",
+                content_hash="document-cleanup-hash",
+                token_count=10,
+                raw_content_uri=None,
+                raw_content_type=None,
+                normalized_content_uri="object-store://workspace/documents/src-document-cleanup/page.md",
+                pdf_content_uri=None,
+                last_synced=now,
+            )
+        )
+
+        await db.delete_document("doc-document-cleanup")
+
+        tasks = await db.list_source_artifact_cleanup_tasks(limit=10)
+        assert [(task.source_id, task.artifact_uri) for task in tasks] == [
+            (source_id, "object-store://workspace/documents/src-document-cleanup/page.md")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_source_deletion_fence_rejects_new_document_writes(self, db):
+        source_id = "src-fenced"
+        now = datetime.now(timezone.utc)
+        await db.upsert_source(source_id, "confluence", "Fenced Source", "{}")
+
+        await db.db.execute("UPDATE sources SET status = 'deleting' WHERE id = ?", (source_id,))
+        await db.db.commit()
+        with pytest.raises(ValueError, match="Source is being deleted"):
+            await db.upsert_document(
+                DocumentRecord(
+                    doc_id="doc-after-fence",
+                    source=source_id,
+                    source_url="https://wiki.example.test/doc-after-fence",
+                    title="Architecture",
+                    space_or_project="SFPAY",
+                    author=None,
+                    last_modified=now,
+                    labels=[],
+                    version="1",
+                    content_hash="fenced-hash",
+                    token_count=10,
+                    raw_content_uri=None,
+                    raw_content_type=None,
+                    normalized_content_uri=None,
+                    pdf_content_uri=None,
+                    last_synced=now,
+                )
+            )
 
 
 class TestSupersessionMetadata:

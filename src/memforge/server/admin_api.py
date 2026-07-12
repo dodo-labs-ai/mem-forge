@@ -100,6 +100,7 @@ from memforge.source_secrets import (
     source_secret_fields,
 )
 from memforge.storage.document_store import LocalDocumentStore
+from memforge.storage.source_cleanup import SourceArtifactCleanupService
 from memforge.server.memory_admin_service import (
     list_memory_admin_page,
     pick_origin_source_type,
@@ -3934,21 +3935,21 @@ def create_admin_app(
         """Delete a source, its documents, and retire memories left without support."""
         existing = await db.get_source(source_id)
         if not existing:
-            raise HTTPException(status_code=404, detail="Source not found")
+            return {
+                "ok": True,
+                "deleted_source": source_id,
+                "already_deleted": True,
+            }
         _require_source_management(request, existing)
-
-        # Cancel running sync task if any
         await sync_service.cancel_source(source_id)
         release_atlassian_request_limiter(
             str(existing["config"].get("base_url") or ""),
             owner_id=source_id,
         )
 
-        for doc in await db.list_documents(source=source_id, limit=100000):
-            document_store.delete_document_files(source_name=existing["name"], title=doc.title)
-
         memory_store = await _build_memory_store(db, config, runtime_provider)
         await memory_store.delete_source_cascade(source_id)
+        await SourceArtifactCleanupService(db, document_store).run_pending(limit=1000)
         return {"ok": True, "deleted_source": source_id}
 
     async def _enqueue_sync_local_agent_job(
