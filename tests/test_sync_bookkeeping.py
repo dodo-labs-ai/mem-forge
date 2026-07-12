@@ -1317,6 +1317,14 @@ class StubDocumentStore:
         return self.normalized_content.get(uri)
 
 
+class NoArtifactRewriteDocumentStore(StubDocumentStore):
+    def store_raw(self, **kwargs):
+        raise AssertionError("unchanged document artifacts must not be rewritten")
+
+    def store_normalized(self, **kwargs):
+        raise AssertionError("unchanged document artifacts must not be rewritten")
+
+
 class RecordingSyncMemoryLogger:
     def __init__(self):
         self.records: list[tuple[str, dict]] = []
@@ -1701,6 +1709,11 @@ class PdfBackfillGene(BlockingFetchGene):
 class MissingPdfGene(PdfBackfillGene):
     async def fetch_pdf(self, item):
         return None
+
+
+class UnexpectedPdfExportGene(PdfBackfillGene):
+    async def fetch_pdf(self, item):
+        raise AssertionError("unchanged document with a stored PDF must not export again")
 
 
 class UpdatingDocumentGene:
@@ -4824,6 +4837,64 @@ async def test_existing_confluence_pdf_uri_is_preserved_when_unchanged_export_is
     assert state.last_sync_status == "success"
     assert state.docs_updated == 0
     assert document is not None
+    assert document.pdf_content_uri == "file:///tmp/Architecture/existing.pdf"
+
+
+@pytest.mark.asyncio
+async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_export_pdf(
+    db: Database,
+):
+    source_id = "src-unchanged-complete-artifacts"
+    markdown = "# Jira 0\n\nBody"
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="jira-0",
+        title="Jira 0",
+        markdown=markdown,
+        version="0",
+        normalized_content_uri="file:///tmp/Architecture/existing.md",
+    )
+    await db.db.execute("UPDATE sources SET type = ? WHERE id = ?", ("confluence", source_id))
+    await db.db.execute(
+        """UPDATE documents
+           SET raw_content_uri = ?, raw_content_type = ?, pdf_content_uri = ?
+           WHERE doc_id = ?""",
+        (
+            "file:///tmp/Architecture/existing.raw",
+            "application/json",
+            "file:///tmp/Architecture/existing.pdf",
+            "jira-0",
+        ),
+    )
+    await db.db.commit()
+    release = asyncio.Event()
+    release.set()
+
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=NoArtifactRewriteDocumentStore(),
+        enricher=ExplodingEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        vector_store=None,
+        embed_cfg={},
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=UnexpectedPdfExportGene(item_count=1, release=release),
+        source_name="Architecture",
+        source_id=source_id,
+    )
+
+    document = await db.get_document("jira-0")
+    assert state.last_sync_status == "success"
+    assert state.docs_updated == 0
+    assert document is not None
+    assert document.raw_content_uri == "file:///tmp/Architecture/existing.raw"
+    assert document.normalized_content_uri == "file:///tmp/Architecture/existing.md"
     assert document.pdf_content_uri == "file:///tmp/Architecture/existing.pdf"
 
 
