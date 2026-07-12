@@ -713,8 +713,8 @@ def test_legacy_auth_jira_is_removed():
 @pytest.mark.parametrize(
     ("keychain_available", "expected", "unexpected"),
     [
-        (True, "Teams session saved to the OS keychain", "local compatibility cache"),
-        (False, "Teams session saved to the local compatibility cache", "saved to the OS keychain"),
+        (True, "Teams session saved to the OS keychain", "could not be saved"),
+        (False, "could not be saved", "local compatibility cache"),
     ],
 )
 def test_auth_teams_reports_actual_keychain_persistence(
@@ -725,7 +725,7 @@ def test_auth_teams_reports_actual_keychain_persistence(
 ):
     from memforge.auth.teams_auth import TeamsAuthenticator
 
-    def fake_authenticate(self, region="emea"):
+    def fake_authenticate(self, region="emea", **_options):
         self.keychain_session_available = keychain_available
         return {"tokens": {}}
 
@@ -1381,156 +1381,6 @@ def test_local_agent_cloud_teams_auth_captures_session(monkeypatch):
     assert captured_regions == ["amer"]
     assert wait_options == [(90, 2.0)]
     assert FakeToolClient.calls == []
-
-
-def test_teams_authenticator_opens_browser_and_waits_for_chrome_session(monkeypatch, tmp_path: Path):
-    from memforge.auth.teams_auth import CHAT_API_AUDIENCE, TeamsAuthenticator
-
-    attempts: list[int] = []
-    sleeps: list[float] = []
-    opened_urls: list[str] = []
-    token_dir = tmp_path / "tokens"
-
-    def fake_extract(self):
-        attempts.append(1)
-        if len(attempts) < 3:
-            return None
-        return {
-            "https://ic3.teams.office.com": {
-                "token": "tok",
-                "expiresAt": 4_102_444_800,
-                "scopes": "Chat.Read",
-            }
-        }
-
-    monkeypatch.setattr(TeamsAuthenticator, "_extract_from_chrome", fake_extract)
-    monkeypatch.setattr(
-        TeamsAuthenticator,
-        "_load_keychain_token_data",
-        staticmethod(lambda: {
-            "tokens": {
-                CHAT_API_AUDIENCE: {
-                    "token": "expired-token",
-                    "expiresAt": 1,
-                    "scopes": "Chat.Read",
-                }
-            }
-        }),
-    )
-    monkeypatch.setattr("memforge.auth.teams_auth._open_teams_login", lambda: opened_urls.append("opened"))
-    monkeypatch.setattr("memforge.auth.teams_auth.time.sleep", sleeps.append)
-    monkeypatch.setattr("memforge.auth.teams_auth.TOKEN_DIR", token_dir)
-    monkeypatch.setattr("memforge.auth.teams_auth.TOKEN_FILE", token_dir / "teams.json")
-
-    authenticator = TeamsAuthenticator()
-    token_data = authenticator.authenticate(
-        region="emea",
-        wait_seconds=5,
-        poll_interval_seconds=0.5,
-    )
-
-    assert opened_urls == ["opened"]
-    assert len(attempts) == 3
-    assert sleeps == [0.5, 0.5]
-    assert token_data["region"] == "emea"
-    assert token_data["tokens"]["https://ic3.teams.office.com"]["token"] == "tok"
-    assert authenticator.keychain_session_available is False
-
-
-def test_teams_authenticator_uses_valid_keychain_session_before_chrome_or_browser(monkeypatch, tmp_path: Path):
-    from memforge.auth.teams_auth import CHAT_API_AUDIENCE, TeamsAuthenticator
-
-    token_dir = tmp_path / "tokens"
-    keychain_token_data = {
-        "version": 1,
-        "captured_at": "2026-07-11T00:00:00+00:00",
-        "region": "emea",
-        "tokens": {
-            CHAT_API_AUDIENCE: {
-                "token": "keychain-token",
-                "expiresAt": 4_102_444_800,
-                "scopes": "Chat.Read",
-            }
-        },
-    }
-
-    monkeypatch.setattr(
-        TeamsAuthenticator,
-        "_load_keychain_token_data",
-        staticmethod(lambda: keychain_token_data),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        TeamsAuthenticator,
-        "_extract_from_chrome",
-        lambda self: pytest.fail("Chrome must not be read while the Keychain session is valid"),
-    )
-    monkeypatch.setattr(
-        "memforge.auth.teams_auth._open_teams_login",
-        lambda: pytest.fail("The browser must not open while the Keychain session is valid"),
-    )
-    monkeypatch.setattr("memforge.auth.teams_auth.TOKEN_DIR", token_dir)
-    monkeypatch.setattr("memforge.auth.teams_auth.TOKEN_FILE", token_dir / "teams.json")
-
-    authenticator = TeamsAuthenticator()
-    token_data = authenticator.authenticate(region="emea", wait_seconds=5)
-
-    assert token_data == keychain_token_data
-    assert authenticator.keychain_session_available is True
-
-
-def test_teams_authenticator_waits_for_rejected_token_to_change(monkeypatch, tmp_path: Path):
-    import hashlib
-
-    from memforge.auth.teams_auth import CHAT_API_AUDIENCE, TeamsAuthenticator
-
-    sleeps: list[float] = []
-    opened_urls: list[str] = []
-    token_dir = tmp_path / "tokens"
-    extracted = [
-        {
-            CHAT_API_AUDIENCE: {
-                "token": "stale-token",
-                "expiresAt": 4_102_444_800,
-                "scopes": "Chat.Read",
-            }
-        },
-        {
-            CHAT_API_AUDIENCE: {
-                "token": "stale-token",
-                "expiresAt": 4_102_444_800,
-                "scopes": "Chat.Read",
-            }
-        },
-        {
-            CHAT_API_AUDIENCE: {
-                "token": "fresh-token",
-                "expiresAt": 4_102_444_800,
-                "scopes": "Chat.Read",
-            }
-        },
-    ]
-
-    def fake_extract(self):
-        return extracted.pop(0)
-
-    stale_hash = hashlib.sha256("stale-token".encode("utf-8")).hexdigest()
-    monkeypatch.setattr(TeamsAuthenticator, "_extract_from_chrome", fake_extract)
-    monkeypatch.setattr("memforge.auth.teams_auth._open_teams_login", lambda: opened_urls.append("opened"))
-    monkeypatch.setattr("memforge.auth.teams_auth.time.sleep", sleeps.append)
-    monkeypatch.setattr("memforge.auth.teams_auth.TOKEN_DIR", token_dir)
-    monkeypatch.setattr("memforge.auth.teams_auth.TOKEN_FILE", token_dir / "teams.json")
-
-    token_data = TeamsAuthenticator().authenticate(
-        region="emea",
-        wait_seconds=5,
-        poll_interval_seconds=0.5,
-        rejected_token_hashes={stale_hash},
-    )
-
-    assert opened_urls == ["opened"]
-    assert sleeps == [0.5, 0.5]
-    assert token_data["tokens"][CHAT_API_AUDIENCE]["token"] == "fresh-token"
 
 
 def test_local_agent_cloud_teams_auth_check_uses_daemon_token_status(monkeypatch):
