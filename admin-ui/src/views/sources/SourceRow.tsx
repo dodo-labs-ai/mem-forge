@@ -11,7 +11,7 @@ import { SourceIcon } from "@/components/sources/SourceIcon";
 import { cn } from "@/lib/utils";
 import { formatDuration, timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
-import { LocalSourceReadinessBadge } from "./LocalSourceReadinessBadge";
+import { SourceReadinessBadge } from "./SourceReadinessBadge";
 import { isLocalAgentBackedSource } from "./localAgentSources";
 import type { SourceSyncActivity } from "./sourceSyncActivity";
 import { teamsConversationCount } from "./teamsSourceConfig";
@@ -83,7 +83,10 @@ export function SourceRow({
 }) {
   const isPaused = source.status === "paused";
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
-  const showLocalReadiness = !isPaused && isLocalAgentBackedSource(source) && capabilities.can_sync;
+  const localExecution = isLocalAgentBackedSource(source);
+  const showReadiness = !isPaused
+    && capabilities.can_sync
+    && (localExecution || source.connection_status != null);
   const pausedSyncHint = "Source is paused. Resume the source to sync again.";
   const ownershipText = formatOwnership(source.ownership);
   const configuredTeamsConversations = source.type === "teams"
@@ -106,8 +109,11 @@ export function SourceRow({
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="truncate text-sm font-medium">{source.name}</h3>
               <SourceLifecycleBadge status={source.status} />
-              {showLocalReadiness && (
-                <LocalSourceReadinessBadge connectionStatus={source.connection_status} />
+              {showReadiness && (
+                <SourceReadinessBadge
+                  localExecution={localExecution}
+                  connectionStatus={source.connection_status}
+                />
               )}
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
