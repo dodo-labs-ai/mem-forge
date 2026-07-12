@@ -4,7 +4,6 @@ import { resourceClient } from "@/api/client";
 import { createLocalAgentJob, getLocalAgentJob } from "@/api/localAgentJobs";
 import type { GitHubRepoTreeResponse, LocalAgentJobStatusResponse } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import {
   normalizeRepoPickerPath,
   repoPickerItemsFromFilePaths,
@@ -32,7 +31,6 @@ export function GitHubRepoFolderPicker({
   const [items, setItems] = useState<RepoPickerItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-  const [manualPath, setManualPath] = useState("");
   const selected = useMemo(() => new Set(value.map(normalizeRepoPickerPath)), [value]);
   const isLocalPush = connectionMode === "local_push";
 
@@ -82,13 +80,6 @@ export function GitHubRepoFolderPicker({
     } finally {
       setLoading(false);
     }
-  };
-
-  const addManualPath = () => {
-    const normalized = normalizeRepoPickerPath(manualPath);
-    if (!normalized) return;
-    onChange(updateRepoPathSelection(value, normalized, true));
-    setManualPath("");
   };
 
   return (
@@ -145,28 +136,6 @@ export function GitHubRepoFolderPicker({
           ))}
         </div>
       )}
-
-      <details className="mt-3">
-        <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
-          Type a path instead
-        </summary>
-        <div className="mt-2 flex gap-2">
-          <Input
-            value={manualPath}
-            onChange={(event) => setManualPath(event.target.value)}
-            placeholder="repo/folder or repo/file.md"
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                addManualPath();
-              }
-            }}
-          />
-          <Button type="button" variant="outline" size="sm" onClick={addManualPath}>
-            Add
-          </Button>
-        </div>
-      </details>
     </div>
   );
 }

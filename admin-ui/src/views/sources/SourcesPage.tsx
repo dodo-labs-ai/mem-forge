@@ -31,7 +31,7 @@ import {
 } from "@/components/ui/dialog";
 import { timeAgo } from "@/utils/date";
 import { SourceIcon } from "@/components/sources/SourceIcon";
-import { SourceConfigDialog } from "./SourceConfigDialog";
+import { SourceSetupDialog } from "./SourceSetupDialog";
 import { LocalAgentDaemonStatus } from "./LocalAgentDaemonStatus";
 import { isManagedSourceId, isManagedSourceType, userConfigurableGenes } from "./managedSources";
 import { getSourceActionEndpoint, getSourceMenuStyle, sourceActionLayout } from "./sourceActions";
@@ -43,7 +43,6 @@ import {
   type ResolvedBySource,
 } from "./projectGrouping";
 import { SourceRow } from "./SourceRow";
-import { TeamsSourceWizard } from "./TeamsSourceWizard";
 import { selectSourceSyncActivity } from "./sourceSyncActivity";
 import { localAgentSyncOperation } from "./localAgentSources";
 import {
@@ -198,8 +197,6 @@ function sourceItemLabel(source: Source): string {
 export function SourcesPage() {
   const queryClient = useQueryClient();
   const [addOpen, setAddOpen] = useState(false);
-  const [teamsWizardOpen, setTeamsWizardOpen] = useState(false);
-  const [teamsWizardSource, setTeamsWizardSource] = useState<Source | null>(null);
   const [configDialog, setConfigDialog] = useState<{
     sourceType: string | null;
     source?: Source | null;
@@ -603,11 +600,6 @@ export function SourcesPage() {
                         isSubscriptionPending={pendingSubscriptionIds.has(source.id)}
                         onConfigure={() => {
                           if (!capabilities.can_configure) return;
-                          if (source.type === "teams" && capabilities.can_configure_connection) {
-                            setTeamsWizardSource(source);
-                            setTeamsWizardOpen(true);
-                            return;
-                          }
                           setConfigDialog({
                             sourceType: source.type,
                             source,
@@ -671,18 +663,13 @@ export function SourcesPage() {
         onOpenChange={setAddOpen}
         genes={genes}
         isLoading={genesQuery.isLoading}
-        onTeamsSelected={() => {
-          setAddOpen(false);
-          setTeamsWizardSource(null);
-          setTeamsWizardOpen(true);
-        }}
         onConfigureSelected={(sourceType) => {
           setAddOpen(false);
           setConfigDialog({ sourceType, source: null });
         }}
       />
 
-      <SourceConfigDialog
+      <SourceSetupDialog
         open={Boolean(configDialog.sourceType)}
         onOpenChange={(open) => {
           if (!open) setConfigDialog({ sourceType: null, source: null });
@@ -696,21 +683,6 @@ export function SourcesPage() {
         source={detailsSource}
         onOpenChange={(open) => {
           if (!open) setDetailsSource(null);
-        }}
-      />
-
-      <TeamsSourceWizard
-        open={teamsWizardOpen}
-        source={teamsWizardSource}
-        onOpenChange={(open) => {
-          setTeamsWizardOpen(open);
-          if (!open) setTeamsWizardSource(null);
-        }}
-        onCreated={() => {
-          setTeamsWizardOpen(false);
-          setTeamsWizardSource(null);
-          queryClient.invalidateQueries({ queryKey: ["sources"] });
-          queryClient.invalidateQueries({ queryKey: ["stats"] });
         }}
       />
 
@@ -1090,14 +1062,12 @@ function AddSourceDialog({
   onOpenChange,
   genes,
   isLoading,
-  onTeamsSelected,
   onConfigureSelected,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   genes: GeneMetadata[];
   isLoading: boolean;
-  onTeamsSelected: () => void;
   onConfigureSelected: (sourceType: string) => void;
 }) {
   const configurableGenes = userConfigurableGenes(genes);
@@ -1109,7 +1079,6 @@ function AddSourceDialog({
       subtitle: gene.data_shape,
       description: gene.description,
     };
-    const isTeams = gene.name === "teams";
     const connection = presentSourceConnection(gene);
     return (
       <div key={gene.name} className="flex min-h-36 flex-col rounded-lg border p-4">
@@ -1127,9 +1096,9 @@ function AddSourceDialog({
           <Button
             type="button"
             size="sm"
-            onClick={() => (isTeams ? onTeamsSelected() : onConfigureSelected(gene.name))}
+            onClick={() => onConfigureSelected(gene.name)}
           >
-            {isTeams ? "Select conversations" : "Set up"}
+            Set up
           </Button>
         </div>
       </div>

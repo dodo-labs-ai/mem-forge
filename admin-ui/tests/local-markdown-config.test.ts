@@ -22,38 +22,38 @@ assert.match(
   "SourcesPage should describe local_markdown items as 'files'",
 );
 
-const sourceConfigDialogSource = readFileSync("src/views/sources/SourceConfigDialog.tsx", "utf8");
+const schemaSourceSetupSource = readFileSync("src/views/sources/SchemaSourceSetup.tsx", "utf8");
 
 assert.match(
-  sourceConfigDialogSource,
+  schemaSourceSetupSource,
   /local_markdown_preview_tree/,
-  "SourceConfigDialog should preview local_markdown through the local-agent queue",
+  "SchemaSourceSetup should preview local_markdown through the local-agent queue",
 );
 
 assert.match(
-  sourceConfigDialogSource,
+  schemaSourceSetupSource,
   /local_markdown_pick_root/,
-  "SourceConfigDialog should let local_markdown choose a folder through the local-agent queue",
+  "SchemaSourceSetup should let local_markdown choose a folder through the local-agent queue",
 );
 
 assert.match(
-  sourceConfigDialogSource,
+  schemaSourceSetupSource,
   /Choose folder/,
-  "SourceConfigDialog should expose a friendly folder picker action",
+  "SchemaSourceSetup should expose a friendly folder picker action",
 );
 
 assert.match(
-  sourceConfigDialogSource,
+  schemaSourceSetupSource,
   /pollLocalAgentPreviewJob/,
-  "SourceConfigDialog should poll the local-agent preview job",
+  "SchemaSourceSetup should poll the local-agent preview job",
 );
 assert.doesNotMatch(
-  sourceConfigDialogSource,
+  schemaSourceSetupSource,
   /sourceType !== "local_markdown"/,
   "local_markdown preview should be reachable in the source dialog",
 );
 assert.doesNotMatch(
-  sourceConfigDialogSource,
+  schemaSourceSetupSource,
   /LocalRepoSetupInstructions/,
   "local_markdown should use the normal source form instead of the legacy CLI-only setup panel",
 );
@@ -91,13 +91,13 @@ assert.match(
 );
 
 assert.match(
-  sourceConfigDialogSource,
+  schemaSourceSetupSource,
   /github_repo_pick_root/,
-  "SourceConfigDialog should let github_repo choose a local clone through the local-agent queue",
+  "SchemaSourceSetup should let github_repo choose a local clone through the local-agent queue",
 );
 
 assert.doesNotMatch(
-  sourceConfigDialogSource,
+  schemaSourceSetupSource,
   /memforge adapter github/,
   "github_repo local mode should not expose legacy CLI profile commands",
 );
