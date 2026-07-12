@@ -180,8 +180,8 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
-  /showLocalReadiness\s*=\s*!isPaused\s*&&\s*isLocalAgentBackedSource\(source\)\s*&&\s*capabilities\.can_sync/,
-  "Only the execution owner should query and display local daemon readiness",
+  /showReadiness\s*=\s*!isPaused[\s\S]*capabilities\.can_sync[\s\S]*localExecution \|\| source\.connection_status != null/,
+  "Only the execution owner should see local or connection readiness",
 );
 assert.match(
   sourcesPageSource,
@@ -262,6 +262,11 @@ assert.match(
   sourceRowSource,
   /connectionStatus=\{source\.connection_status\}/,
   "SourceRow should pass the provider-neutral connection status to shared readiness UI",
+);
+assert.match(
+  sourceRowSource,
+  /localExecution=\{localExecution\}/,
+  "SourceRow should let the shared presenter distinguish local collection from a local connection dependency",
 );
 assert.match(
   sourceRowSource,

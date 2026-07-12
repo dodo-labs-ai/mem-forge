@@ -134,17 +134,17 @@ assert.equal(
 
 assert.match(
   sourceRowSource,
-  /LocalSourceReadinessBadge/,
+  /SourceReadinessBadge/,
   "Source rows should use the shared local source readiness presenter",
 );
 assert.match(
   sourceRowSource,
-  /showLocalReadiness = !isPaused && isLocalAgentBackedSource\(source\) && capabilities\.can_sync/,
-  "Paused lifecycle and execution ownership should gate local source readiness",
+  /const localExecution = isLocalAgentBackedSource\(source\);[\s\S]*const showReadiness = !isPaused[\s\S]*capabilities\.can_sync/,
+  "Paused lifecycle and execution ownership should gate source readiness",
 );
 assert.match(
   sourceRowSource,
-  /<SourceLifecycleBadge status=\{source\.status\} \/>[\s\S]*showLocalReadiness &&/,
+  /<SourceLifecycleBadge status=\{source\.status\} \/>[\s\S]*showReadiness &&/,
   "Source lifecycle should remain visible independently of local readiness",
 );
 
