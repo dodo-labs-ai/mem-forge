@@ -7378,7 +7378,6 @@ class Database:
     ) -> SourceSyncRun:
         now_iso = now or _now_iso()
         normalized_snapshot_id = _non_empty_string(input_snapshot_id)
-        force_full_sync = force_full_sync or normalized_snapshot_id is not None
         async with self.db.execute(
             """SELECT * FROM source_sync_runs
                WHERE workspace_id = ?
