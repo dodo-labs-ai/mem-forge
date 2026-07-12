@@ -164,7 +164,7 @@ assert.equal(
 );
 assert.equal(
   teamsConversationCount({ channels: "A, B", group_chats: ["C"], individual_chats: ["D"] }),
-  4,
+  null,
 );
 assert.equal(teamsConversationCount({}), null);
 

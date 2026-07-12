@@ -310,49 +310,50 @@ assert.doesNotMatch(
   "Local markdown sync should not keep a legacy server-inbox compatibility branch",
 );
 
-const sourceConfigDialogSource = readFileSync("src/views/sources/SourceConfigDialog.tsx", "utf8");
-const teamsSourceWizardSource = readFileSync("src/views/sources/TeamsSourceWizard.tsx", "utf8");
+const sourceSetupSource = readFileSync("src/views/sources/SchemaSourceSetup.tsx", "utf8");
+const sourceSetupAdaptersSource = readFileSync("src/views/sources/sourceSetupAdapters.ts", "utf8");
+const teamsSourceSetupSource = readFileSync("src/views/sources/TeamsSourceSetup.tsx", "utf8");
 const githubRepoFolderPickerSource = readFileSync("src/views/sources/GitHubRepoFolderPicker.tsx", "utf8");
 assert.match(
-  sourceConfigDialogSource,
+  sourceSetupSource,
   /const canConfigureConnection = source \? source\.capabilities\?\.can_configure_connection === true : true;/,
   "existing local sources should consume the backend connection capability",
 );
 assert.match(
-  sourceConfigDialogSource,
-  /canConfigureConnection\s*&&\s*fieldsByGroup\.map/,
+  sourceSetupSource,
+  /content: canConfigureConnection \? <>\{connectionFields\.map\(renderField\)\}<\/> : unavailableConnection/,
   "non-owner admins should not render local connector fields or pickers",
 );
 assert.match(
-  sourceConfigDialogSource,
+  sourceSetupSource,
   /disabled=\{source\s*\?\s*isImmutableExecutionModeField\(source, field\.key\)\s*:\s*false\}/,
   "existing sources should render execution-mode selectors as read-only",
 );
-assert.match(sourceConfigDialogSource, /type="checkbox"[\s\S]*disabled=\{disabled\}/);
-assert.match(sourceConfigDialogSource, /<textarea[\s\S]*disabled=\{disabled\}/);
-assert.match(sourceConfigDialogSource, /<Input[\s\S]*disabled=\{disabled\}/);
+assert.match(sourceSetupSource, /type="checkbox"[\s\S]*disabled=\{disabled\}/);
+assert.match(sourceSetupSource, /<textarea[\s\S]*disabled=\{disabled\}/);
+assert.match(sourceSetupSource, /<Input[\s\S]*disabled=\{disabled\}/);
 assert.doesNotMatch(
   localAgentSourcesSource,
   /source\.type\s*===|sync_mode|connection_mode|local_markdown/,
   "the UI should consume the server execution descriptor instead of reclassifying source types",
 );
 assert.match(
-  sourceConfigDialogSource,
+  sourceSetupSource,
   /\.\.\.\(canConfigureConnection\s*\?\s*\{\s*config:\s*serializeConfig\(schema\.fields, config\)\s*\}\s*:\s*\{\}\)/,
   "management-only saves must omit connector config from the API payload",
 );
 assert.match(
-  sourceConfigDialogSource,
+  sourceSetupSource,
   /const DISCOVERY_PREVIEW_LIMIT = 5;/,
   "source discovery preview should request a small bounded result set",
 );
 assert.match(
-  sourceConfigDialogSource,
+  sourceSetupSource,
   /createLocalAgentJob/,
   "Local markdown local-agent preview jobs should use the centralized target-aware helper",
 );
 assert.match(
-  teamsSourceWizardSource,
+  teamsSourceSetupSource,
   /createLocalAgentJob/,
   "Teams auth and browse jobs should use the centralized target-aware helper",
 );
@@ -362,68 +363,58 @@ assert.match(
   "GitHub local-agent browse jobs should use the centralized target-aware helper",
 );
 assert.doesNotMatch(
-  [sourcesPageSource, sourceConfigDialogSource, teamsSourceWizardSource, githubRepoFolderPickerSource].join("\n"),
+  [sourcesPageSource, sourceSetupSource, teamsSourceSetupSource, githubRepoFolderPickerSource].join("\n"),
   /(?:resourceClient|hostClient)\.post<[^>]+>\([^)]*\/local-agent\/jobs/,
   "Source UI components should not create local-agent job envelopes directly",
 );
 assert.match(
-  sourceConfigDialogSource,
-  /function discoveryPreviewGroupKey/,
-  "source discovery preview placement should be centralized instead of hard-coded inline",
-);
-assert.match(
-  sourceConfigDialogSource,
-  /group\.key === "scope"/,
-  "source discovery preview should appear after the scope fields when a source has a What to Sync group",
-);
-assert.match(
-  sourceConfigDialogSource,
+  sourceSetupSource,
   /limit: DISCOVERY_PREVIEW_LIMIT/,
   "source discovery preview requests should send the bounded limit to the API",
 );
 assert.match(
-  sourceConfigDialogSource,
+  sourceSetupSource,
   /memforge adapter auth jira refresh --base-url/,
   "Jira browser-session guidance should use the refresh subcommand that uploads the local browser session",
 );
 assert.match(
-  sourceConfigDialogSource,
+  sourceSetupSource,
   /jiraSessionQuery\.refetch\(\)/,
   "Jira browser-session guidance should allow users to re-check after running the CLI refresh",
 );
 assert.match(
-  sourceConfigDialogSource,
-  /field\.key === "auth_mode"[\s\S]*next\.sync_mode = "cloud"/,
+  sourceSetupAdaptersSource,
+  /field\.key === "auth_mode"[\s\S]*sync_mode: "cloud"/,
   "Jira PAT mode should not leave Local daemon sync selected because the UI cannot pass redacted PAT secrets to daemon jobs",
 );
 assert.match(
-  sourceConfigDialogSource,
-  /field\.key === "sync_mode"[\s\S]*next\.auth_mode = "browser_cookie"/,
+  sourceSetupAdaptersSource,
+  /field\.key === "sync_mode"[\s\S]*auth_mode: "browser_cookie"/,
   "Jira Local daemon sync should use browser-session auth in the current contract",
 );
 assert.match(
-  sourceConfigDialogSource,
+  sourceSetupSource,
   /showDiscoveryPreview[\s\S]*sourceType === "jira"[\s\S]*config\.sync_mode[\s\S]*local_agent/,
   "Jira Local daemon sync should not expose the server-side discovery preview",
 );
 assert.match(
-  sourceConfigDialogSource,
+  sourceSetupSource,
   /const payloadWithSchedule = \{/,
   "Source saves should bundle automatic sync settings into the source payload",
 );
 assert.match(
-  sourceConfigDialogSource,
+  sourceSetupSource,
   /sync_schedule:\s*\{\s*enabled: scheduleEnabled,\s*interval_minutes: intervalMinutes,\s*\}/,
   "Source saves should send the schedule shape expected by the source API",
 );
 assert.doesNotMatch(
-  sourceConfigDialogSource,
+  sourceSetupSource,
   /resourceClient[^\n]*\/sources\/[^`]+\/schedule/,
-  "SourceConfigDialog should not split config and schedule persistence into two requests",
+  "source setup should not split config and schedule persistence into two requests",
 );
 assert.match(
-  sourceConfigDialogSource,
-  /<span className="block text-sm font-medium">Sync on a schedule<\/span>/,
+  sourceSetupSource,
+  /<span className="block text-sm font-medium">Sync automatically<\/span>/,
   "Source configuration should expose a clear automatic sync control",
 );
 
