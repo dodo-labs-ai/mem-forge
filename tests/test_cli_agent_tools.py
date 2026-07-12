@@ -118,6 +118,13 @@ class FakeToolClient:
         ))
         return self.response
 
+    def upload_jira_session(self, **kwargs):
+        self.calls.append((
+            "upload_jira_session",
+            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+        ))
+        return self.response
+
     def push_teams_window_package(self, **kwargs):
         self.calls.append((
             "push_teams_window_package",
@@ -601,7 +608,8 @@ def test_adapter_jira_refresh_captures_and_uploads(monkeypatch):
 
     captured = {}
 
-    async def fake_capture(base_url, *, browser=None):
+    async def fake_capture(base_url, *, browser=None, interactive=False):
+        assert interactive is True
         captured["base_url"] = base_url
         captured["browser"] = browser
         return jira_capture.JiraCaptureResult(
@@ -628,7 +636,8 @@ def test_adapter_jira_refresh_no_session_returns_json_error(monkeypatch):
     from memforge.auth import jira_capture
     from memforge.auth.jira_auth import JiraAuthSessionMissingError
 
-    async def fake_capture(base_url, *, browser=None):
+    async def fake_capture(base_url, *, browser=None, interactive=False):
+        assert interactive is True
         raise JiraAuthSessionMissingError("No active Jira browser session cookies were found")
 
     monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
@@ -644,7 +653,8 @@ def test_adapter_jira_refresh_no_session_returns_json_error(monkeypatch):
 def test_adapter_jira_refresh_capture_error_returns_json_error(monkeypatch):
     from memforge.auth import jira_capture
 
-    async def fake_capture(base_url, *, browser=None):
+    async def fake_capture(base_url, *, browser=None, interactive=False):
+        assert interactive is True
         raise ValueError("Unsupported browser for Jira session extraction: netscape")
 
     monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
@@ -662,7 +672,8 @@ def test_adapter_jira_refresh_capture_error_returns_json_error(monkeypatch):
 def test_adapter_jira_refresh_principal_change_returns_json_error(monkeypatch):
     from memforge.auth import jira_capture
 
-    async def fake_capture(base_url, *, browser=None):
+    async def fake_capture(base_url, *, browser=None, interactive=False):
+        assert interactive is True
         return jira_capture.JiraCaptureResult(
             origin=base_url, cookie_header="SESSION=x", browser=None, principal={"accountId": "u1"},
         )
@@ -687,6 +698,12 @@ def test_adapter_jira_refresh_principal_change_returns_json_error(monkeypatch):
 
 
 def test_adapter_jira_list_and_forget(monkeypatch):
+    forgotten_locally = []
+
+    monkeypatch.setattr(
+        "memforge.auth.jira_browser_session.JiraBrowserSession.forget",
+        lambda self, *, origin: forgotten_locally.append(origin),
+    )
     stub = _StubClient(
         list_jira_origins={"origins": [{"origin": "https://jira.tools.sap", "status": "active"}]},
         forget_jira_session={"ok": True, "origin": "https://jira.tools.sap", "forgotten": True},
@@ -698,6 +715,7 @@ def test_adapter_jira_list_and_forget(monkeypatch):
     forget_result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "forget", "--base-url", "https://jira.tools.sap"])
     assert forget_result.exit_code == 0, forget_result.output
     assert json.loads(forget_result.output)["forgotten"] is True
+    assert forgotten_locally == ["https://jira.tools.sap"]
 
 
 def test_legacy_auth_jira_is_removed():
@@ -1197,6 +1215,18 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
 
     assert payload["operation"] == "jira_sync"
     assert payload["counts"] == {"selected": 1, "pushed": 1, "failed": 0}
+    upload_calls = [call for call in FakeToolClient.calls if call[0] == "upload_jira_session"]
+    assert upload_calls == [(
+        "upload_jira_session",
+        {
+            "api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+            "api_token": "tok",
+            "workspace_id": "ws-from-cloud",
+            "base_url": "https://jira.example.test",
+            "cookie_header": "JSESSIONID=local",
+            "browser": "chrome",
+        },
+    )]
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_jira_package"]
     assert len(push_calls) == 1
     kwargs = push_calls[0][1]
@@ -1237,6 +1267,60 @@ def test_local_agent_cloud_jira_sync_rejects_pat_payload():
     assert payload["operation"] == "jira_sync"
     assert payload["error_type"] == "ClickException"
     assert "browser-session" in payload["error"]
+    assert not [call for call in FakeToolClient.calls if call[0] == "push_jira_package"]
+
+
+def test_local_agent_cloud_jira_sync_stops_on_principal_change(monkeypatch):
+    from memforge.auth import jira_capture
+
+    async def fake_capture(base_url, *, browser=None, tls_config=None):
+        return jira_capture.JiraCaptureResult(
+            origin=base_url,
+            cookie_header="JSESSIONID=different-user",
+            browser=browser,
+            principal={"name": "different-user"},
+        )
+
+    conflict = {
+        "error": "MemForge API request failed",
+        "status_code": 409,
+        "detail": json.dumps({"detail": {
+            "origin": "https://jira.example.test",
+            "old_principal_id": "old-user",
+            "new_principal_id": "different-user",
+        }}),
+    }
+    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset(conflict)
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-jira-principal-change",
+            "attempt_count": 1,
+            "workspace_id": "ws-from-cloud",
+            "operation": "jira_sync",
+            "source_id": "src-jira",
+            "payload": {
+                "base_url": "https://jira.example.test",
+                "auth_mode": "browser_cookie",
+                "projects": ["PAY"],
+            },
+        },
+        _cloud_test_client(),
+        browser="chrome",
+    )
+
+    assert payload == {
+        "operation": "jira_sync",
+        "source_id": "src-jira",
+        "error": "principal_changed",
+        "origin": "https://jira.example.test",
+        "old_principal_id": "old-user",
+        "new_principal_id": "different-user",
+        "error_type": "JiraPrincipalChangedError",
+        "retryable": False,
+    }
     assert not [call for call in FakeToolClient.calls if call[0] == "push_jira_package"]
 
 

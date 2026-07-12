@@ -8,7 +8,10 @@ depends on ``browser_cookie3``.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import inspect
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,6 +24,14 @@ from memforge.auth.jira_auth import (
     canonical_jira_origin,
     validate_jira_cookie_session,
 )
+from memforge.auth.jira_browser_session import (
+    JiraBrowserCaptureStatus,
+    JiraBrowserSession,
+    JiraBrowserSessionProtocol,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -38,25 +49,89 @@ async def capture_and_prevalidate(
     tls_config: dict[str, Any] | None = None,
     extractor: Callable[[str, str | None], tuple[str, str]] | None = None,
     validator: Callable[..., Any] | None = None,
+    interactive: bool = False,
+    browser_session: JiraBrowserSessionProtocol | None = None,
+    silent_timeout_seconds: int = 3,
+    interactive_timeout_seconds: int = 300,
+    poll_interval_seconds: float = 0.5,
 ) -> JiraCaptureResult:
-    """Scrape the local browser cookie for one Jira origin and pre-validate it.
+    """Acquire and validate one Jira session, preferring silent renewal.
 
-    Raises ``JiraAuthSessionMissingError`` when no live session can be captured,
-    so the caller never uploads a dead cookie.
+    The persistent MemForge browser profile is tried headlessly first. A signed-in
+    system browser is the second silent path. Only an explicit interactive caller
+    may open the persistent profile for visible SSO reauthentication.
     """
     origin = canonical_jira_origin(base_url)
     extract = extractor or extract_browser_cookie_header
     validate = validator or validate_jira_cookie_session
+    session = browser_session or JiraBrowserSession()
+    rejected_cookie_hashes: set[str] = set()
+    missing_details: list[str] = []
 
-    cookie_header, browser_name = extract(origin, browser)
-    result = validate(origin, cookie_header, tls_config)
-    principal = await result if inspect.isawaitable(result) else result
-    return JiraCaptureResult(
+    async def validated_result(cookie_header: str, browser_name: str | None) -> JiraCaptureResult:
+        result = validate(origin, cookie_header, tls_config)
+        principal = await result if inspect.isawaitable(result) else result
+        return JiraCaptureResult(
+            origin=origin,
+            cookie_header=cookie_header,
+            browser=browser_name,
+            principal=principal,
+        )
+
+    silent = await asyncio.to_thread(
+        session.capture,
         origin=origin,
-        cookie_header=cookie_header,
-        browser=browser_name,
-        principal=principal,
+        interactive=False,
+        timeout_seconds=silent_timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        rejected_cookie_hashes=rejected_cookie_hashes,
     )
+    if silent.status is JiraBrowserCaptureStatus.CAPTURED and silent.cookie_header:
+        try:
+            return await validated_result(silent.cookie_header, silent.browser)
+        except JiraAuthSessionMissingError as exc:
+            rejected_cookie_hashes.add(_cookie_hash(silent.cookie_header))
+            missing_details.append(str(exc))
+    elif silent.detail:
+        missing_details.append(silent.detail)
+
+    try:
+        cookie_header, browser_name = extract(origin, browser)
+    except JiraAuthSessionMissingError as exc:
+        missing_details.append(str(exc))
+    else:
+        try:
+            captured = await validated_result(cookie_header, browser_name)
+        except JiraAuthSessionMissingError as exc:
+            rejected_cookie_hashes.add(_cookie_hash(cookie_header))
+            missing_details.append(str(exc))
+        else:
+            try:
+                await asyncio.to_thread(session.store, origin=origin, cookie_header=cookie_header)
+            except Exception as exc:
+                logger.warning("Unable to persist the validated Jira session in the browser profile: %s", exc)
+            return captured
+
+    if interactive:
+        visible = await asyncio.to_thread(
+            session.capture,
+            origin=origin,
+            interactive=True,
+            timeout_seconds=interactive_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            rejected_cookie_hashes=rejected_cookie_hashes,
+        )
+        if visible.status is JiraBrowserCaptureStatus.CAPTURED and visible.cookie_header:
+            return await validated_result(visible.cookie_header, visible.browser)
+        if visible.detail:
+            missing_details.append(visible.detail)
+
+    detail = next((value for value in reversed(missing_details) if value), "No active Jira session was found")
+    raise JiraAuthSessionMissingError(detail)
+
+
+def _cookie_hash(cookie_header: str) -> str:
+    return hashlib.sha256(cookie_header.encode("utf-8")).hexdigest()
 
 
 def extract_browser_cookie_header(origin: str, browser: str | None = None) -> tuple[str, str]:
