@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, Check, ChevronRight, FolderOpen, Loader2, RefreshCw } from "lucide-react";
+import { AlertCircle, ChevronRight, FolderOpen, Loader2, RefreshCw } from "lucide-react";
 import { resourceClient } from "@/api/client";
 import { createLocalAgentJob, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
@@ -17,7 +17,6 @@ import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
-  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -29,27 +28,36 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
 import {
-  applyConfluenceUrlInference,
-  isConfluenceFieldRequired,
-  isConfluenceFieldVisible,
   parseConfluenceWikiUrl,
 } from "./confluenceConfig";
 import type { ParsedConfluenceWikiUrl } from "./confluenceConfig";
 import { GitHubRepoFolderPicker } from "./GitHubRepoFolderPicker";
 import { isImmutableExecutionModeField } from "./localAgentSources";
-import { canConfigureSourceType } from "./managedSources";
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
+import { SourceSetupShell } from "./SourceSetupShell";
+import type { SourceSetupSection, SourceSetupSectionId } from "./SourceSetupShell";
+import {
+  booleanValue,
+  buildDefaultConfig,
+  firstMissingRequiredField,
+  isSchemaSourceType,
+  listValue,
+  optionLabel,
+  serializeConfig,
+  sourceSetupAdapterFor,
+  stringValue,
+  type ConfigForm,
+  type ConfigValue,
+  type SourceSetupAdapter,
+} from "./sourceSetupAdapters";
 
-type ConfigValue = string | number | boolean | string[] | null;
-type ConfigForm = Record<string, ConfigValue>;
 const DISCOVERY_PREVIEW_LIMIT = 5;
 const LOCAL_AGENT_PREVIEW_POLL_ATTEMPTS = 90;
 const LOCAL_AGENT_PREVIEW_POLL_INTERVAL_MS = 2_000;
 
-export function SourceConfigDialog({
+export function SchemaSourceSetup({
   open,
   onOpenChange,
   sourceType,
@@ -78,16 +86,16 @@ export function SourceConfigDialog({
     enabled:
       open
       && Boolean(sourceType)
-      && canConfigureSourceType(sourceType ?? "")
+      && isSchemaSourceType(sourceType ?? "")
       && canConfigureExisting,
   });
 
-  if (!sourceType || !canConfigureSourceType(sourceType)) return null;
+  if (!sourceType || !isSchemaSourceType(sourceType)) return null;
   if (!canConfigureExisting) return null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[90vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl">
+      <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl">
         {schemaQuery.isPending ? (
           <div className="flex items-center justify-center gap-2 p-12 text-sm text-muted-foreground">
             <Loader2 className="size-4 animate-spin" />
@@ -143,10 +151,11 @@ function SourceConfigForm({
 }) {
   const queryClient = useQueryClient();
   const isEdit = Boolean(source);
+  const adapter = sourceSetupAdapterFor(sourceType);
   const [name, setName] = useState(source?.name ?? "");
   const [config, setConfig] = useState<ConfigForm>(() => ({
-    ...buildDefaultConfig(schema.fields),
-    ...initialSourceConfig(sourceType, (source?.config ?? {}) as ConfigForm),
+    ...buildDefaultConfig(schema),
+    ...adapter.normalizeInitialConfig((source?.config ?? {}) as ConfigForm),
   }));
   const [binding, setBinding] = useState<ProjectBinding | null>(
     () => source?.project_binding ?? null,
@@ -158,10 +167,9 @@ function SourceConfigForm({
     () => String(source?.sync_schedule?.interval_minutes ?? 1440),
   );
   const [validationMessage, setValidationMessage] = useState<string | null>(null);
-  const sourceNameRef = useRef<HTMLDivElement | null>(null);
-  const configFieldsRef = useRef<HTMLDivElement | null>(null);
-  const projectSectionRef = useRef<HTMLDivElement | null>(null);
-  const scheduleSectionRef = useRef<HTMLDetailsElement | null>(null);
+  const [focusSection, setFocusSection] = useState<SourceSetupSectionId>(
+    initialFocus?.step === "project" ? "project" : isEdit ? "basics" : "basics",
+  );
   const authMode = stringValue(config.auth_mode) || "browser_cookie";
   const githubConnectionMode = sourceType === "github_repo"
     ? stringValue(config.connection_mode) || "cloud_pull"
@@ -173,15 +181,6 @@ function SourceConfigForm({
     () => sourceType === "confluence" ? parseConfluenceWikiUrl(stringValue(config.base_url)) : null,
     [config.base_url, sourceType],
   );
-
-  useEffect(() => {
-    if (initialFocus?.step === "project" && projectSectionRef.current) {
-      projectSectionRef.current.scrollIntoView({
-        behavior: "smooth",
-        block: "start",
-      });
-    }
-  }, [initialFocus]);
 
   const jiraSessionQuery = useQuery<JiraAuthSession>({
     queryKey: ["jira-session", jiraBaseUrl],
@@ -247,6 +246,7 @@ function SourceConfigForm({
       }
       return resourceClient
         .post(`/genes/${sourceType}/preview-discovery`, {
+          ...(source ? { source_id: source.id } : {}),
           config: serializedConfig,
           limit: DISCOVERY_PREVIEW_LIMIT,
         })
@@ -316,71 +316,56 @@ function SourceConfigForm({
     },
   });
 
-  const fieldsByGroup = useMemo(() => {
-    const fields = [...schema.fields].sort((a, b) => a.order - b.order);
-    return [...schema.groups]
-      .sort((a, b) => a.order - b.order)
-      .map((group) => ({
-        ...group,
-        fields: fields.filter((field) => field.group === group.key && !field.advanced && isFieldVisible(sourceType, field, config)),
-      }))
-      .filter((group) => group.fields.length > 0);
-  }, [config, schema, sourceType]);
-  const advancedFields = useMemo(
-    () => [...schema.fields]
-      .filter((field) => field.advanced && isFieldVisible(sourceType, field, config))
-      .sort((a, b) => a.order - b.order),
-    [config, schema, sourceType],
+  const sortedFields = useMemo(
+    () => [...schema.fields].sort((a, b) => a.order - b.order),
+    [schema.fields],
   );
-  const previewGroupKey = discoveryPreviewGroupKey(fieldsByGroup);
-  const firstMissingField = firstMissingRequiredField(sourceType, schema.fields, config);
+  const connectionFields = sortedFields.filter(
+    (field) => adapter.sectionForField(field, config) === "connection",
+  );
+  const contentFields = sortedFields.filter(
+    (field) => adapter.sectionForField(field, config) === "content",
+  );
+  const advancedFields = sortedFields.filter(
+    (field) => adapter.sectionForField(field, config) === "advanced",
+  );
+  const firstMissingField = firstMissingRequiredField(adapter, schema.fields, config);
+  const connectionMissing = firstMissingRequiredField(adapter, connectionFields, config);
+  const contentMissing = firstMissingRequiredField(adapter, [...contentFields, ...advancedFields], config);
   const scheduleIntervalValid = parseScheduleInterval(scheduleInterval) >= 5;
 
   const previewReady = firstMissingField === null;
   const showDiscoveryPreview = sourceType !== "github_repo"
     && !(sourceType === "jira" && stringValue(config.sync_mode) === "local_agent");
   const scheduleSummary = scheduleEnabled
-    ? `Scheduled: ${scheduleIntervalLabel(scheduleInterval)}`
-    : "Manual sync only";
+    ? scheduleIntervalLabel(scheduleInterval)
+    : "Manual only";
 
   const updateField = (field: ConfigField, value: ConfigValue) => {
     setValidationMessage(null);
-    setConfig((current) => {
-      const next = { ...current, [field.key]: value };
-      if (sourceType === "jira") {
-        if (field.key === "auth_mode" && stringValue(value) === "pat") {
-          next.sync_mode = "cloud";
-        }
-        if (field.key === "sync_mode" && stringValue(value) === "local_agent") {
-          next.auth_mode = "browser_cookie";
-        }
-      }
-      if (sourceType === "confluence" && field.key === "base_url") {
-        return applyConfluenceUrlInference(next) as ConfigForm;
-      }
-      return next;
-    });
+    setConfig((current) => adapter.normalizeFieldChange(field, value, current));
   };
 
   const handleSave = () => {
     if (name.trim().length === 0) {
       setValidationMessage("Enter a source name before saving.");
-      sourceNameRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      setFocusSection("basics");
       return;
     }
     if (canConfigureConnection && firstMissingField) {
       setValidationMessage(`Complete ${firstMissingField.label} before saving.`);
-      configFieldsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      const section = adapter.sectionForField(firstMissingField, config);
+      setFocusSection(section === "connection" ? "connection" : "content");
       return;
     }
     if (!projectBindingIsComplete(binding)) {
       setValidationMessage("Choose where this source should land, or leave it unmapped.");
-      projectSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      setFocusSection("project");
       return;
     }
-    if (!scheduleIntervalValid) {
+    if (scheduleEnabled && !scheduleIntervalValid) {
       setValidationMessage("Choose an automatic sync interval of at least 5 minutes.");
-      scheduleSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      setFocusSection("schedule");
       return;
     }
     saveSource.mutate({
@@ -390,218 +375,228 @@ function SourceConfigForm({
     });
   };
 
-  return (
-    <>
-      <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
-        <DialogHeader>
-          <DialogTitle>
-            {isEdit ? "Configure source" : `Configure ${sourceType ?? "source"}`}
-          </DialogTitle>
-        </DialogHeader>
-
-        <div ref={sourceNameRef}>
-          <Field label="Source name" required>
-            <Input
-              value={name}
-              onChange={(event) => {
-                setValidationMessage(null);
-                setName(event.target.value);
-              }}
-              placeholder="Source name"
-            />
-          </Field>
-        </div>
-
-        <div ref={configFieldsRef} className="min-h-0 flex-1 space-y-5 overflow-y-auto pr-1">
-          {canConfigureConnection && fieldsByGroup.map((group) => (
-            <section key={group.key} className="space-y-3">
-              <h3 className="text-sm font-semibold">{group.label}</h3>
-              <div className="space-y-3">
-                {group.fields.map((field) => (
-                  <div key={field.key} className="space-y-3">
-                    <ConfigFieldInput
-                      field={field}
-                      value={config[field.key]}
-                      hasExistingSecret={Boolean(config[`${field.key}_configured`])}
-                      decryptFailed={Boolean(config[`${field.key}_decrypt_failed`])}
-                      required={isFieldRequired(sourceType, field, config)}
-                      disabled={source ? isImmutableExecutionModeField(source, field.key) : false}
-                      onChange={(value) => updateField(field, value)}
-                    />
-                    {sourceType === "confluence" && field.key === "base_url" && confluenceUrlInfo && (
-                      <ConfluenceDetectedPanel info={confluenceUrlInfo} />
-                    )}
-                    {sourceType === "local_markdown" && field.key === "root" && (
-                      <LocalMarkdownFolderPickerPanel
-                        isPending={pickLocalMarkdownRoot.isPending}
-                        error={pickLocalMarkdownRoot.isError ? pickLocalMarkdownRoot.error : null}
-                        onChoose={() => pickLocalMarkdownRoot.mutate()}
-                      />
-                    )}
-                    {sourceType === "github_repo" && field.key === "repo_path" && (
-                      <LocalMarkdownFolderPickerPanel
-                        isPending={pickGitHubRepoPath.isPending}
-                        error={pickGitHubRepoPath.isError ? pickGitHubRepoPath.error : null}
-                        onChoose={() => pickGitHubRepoPath.mutate()}
-                      />
-                    )}
-                    {sourceType === "jira" && field.key === "jql" && (
-                      <JiraEffectiveQueryPanel jql={stringValue(config.jql)} />
-                    )}
-                    {sourceType === "jira" && field.key === "auth_mode" && authMode === "browser_cookie" && (
-                      <JiraBrowserSessionPanel
-                        baseUrl={jiraBaseUrl}
-                        session={jiraSessionQuery.data}
-                        loading={jiraSessionQuery.isFetching}
-                        error={jiraSessionQuery.error}
-                        onRefresh={() => {
-                          void jiraSessionQuery.refetch();
-                        }}
-                      />
-                    )}
-                    {sourceType === "github_repo" && field.key === "ref" && (
-                      <GitHubRepoFolderPicker
-                        connectionMode={githubConnectionMode}
-                        config={githubPickerConfig}
-                        value={listValue(config.include_paths)}
-                        onChange={(paths: string[]) => {
-                          setValidationMessage(null);
-                          setConfig((current) => ({ ...current, include_paths: paths }));
-                        }}
-                      />
-                    )}
-                    {sourceType === "github_repo" && field.key === "repo_url" && (
-                      <GitHubRepoDetectedPanel repoUrl={githubRepoUrl} />
-                    )}
-                  </div>
-                ))}
-              </div>
-              {showDiscoveryPreview && group.key === previewGroupKey && (
-                <DiscoveryPreviewPanel
-                  ready={previewReady}
-                  isPending={previewDiscovery.isPending}
-                  error={previewDiscovery.isError ? previewDiscovery.error : null}
-                  data={previewDiscovery.data}
-                  onPreview={() => previewDiscovery.mutate()}
-                />
-              )}
-            </section>
-          ))}
-          {canConfigureConnection && advancedFields.length > 0 && (
-            <details className="group space-y-3">
-              <summary className="inline-flex cursor-pointer select-none items-center gap-1 rounded-md px-1 py-0.5 text-sm font-semibold hover:bg-muted focus:outline-none focus-visible:ring-1 focus-visible:ring-ring/40">
-                <ChevronRight className="size-4 transition-transform group-open:rotate-90" />
-                Advanced
-              </summary>
-              <div className="space-y-3 pt-2">
-                {advancedFields.map((field) => (
-                  <ConfigFieldInput
-                    key={field.key}
-                    field={field}
-                    value={config[field.key]}
-                    hasExistingSecret={Boolean(config[`${field.key}_configured`])}
-                    decryptFailed={Boolean(config[`${field.key}_decrypt_failed`])}
-                    required={isFieldRequired(sourceType, field, config)}
-                    onChange={(value) => updateField(field, value)}
-                  />
-                ))}
-              </div>
-            </details>
-          )}
-
-          <div ref={projectSectionRef} className="space-y-4 pt-1">
-            <Separator />
-            <ProjectBindingFields
-              schema={schema}
-              sourceId={source?.id ?? null}
-              value={binding}
-              onChange={(nextBinding) => {
-                setValidationMessage(null);
-                setBinding(nextBinding);
-              }}
-            />
-          </div>
-
-          <details ref={scheduleSectionRef} className="space-y-3">
-            <summary className="cursor-pointer text-sm font-semibold">
-              Automatic sync
-              <span className="ml-2 text-xs font-normal text-muted-foreground">{scheduleSummary}</span>
-            </summary>
-            <div className="space-y-3 pt-2">
-              <label className="flex items-start gap-3 rounded-lg border p-3">
-                <input
-                  type="checkbox"
-                  className="mt-0.5 size-4"
-                  checked={scheduleEnabled}
-                  onChange={(event) => {
-                    setValidationMessage(null);
-                    setScheduleEnabled(event.target.checked);
-                  }}
-                />
-                <span className="min-w-0 flex-1">
-                  <span className="block text-sm font-medium">Sync on a schedule</span>
-                  <span className="mt-1 block text-xs text-muted-foreground">
-                    Runs through the same queue as manual syncs.
-                  </span>
-                </span>
-              </label>
-              <Field
-                label="Interval"
-                helpText="Minimum 5 minutes. Existing syncs are not interrupted."
-              >
-                <Select<string>
-                  value={scheduleInterval}
-                  onValueChange={(value) => {
-                    if (value) {
-                      setValidationMessage(null);
-                      setScheduleInterval(value);
-                    }
-                  }}
-                >
-                  <SelectTrigger>
-                    <SelectValue>{scheduleIntervalLabel(scheduleInterval)}</SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="30">Every 30 minutes</SelectItem>
-                    <SelectItem value="60">Hourly</SelectItem>
-                    <SelectItem value="360">Every 6 hours</SelectItem>
-                    <SelectItem value="720">Every 12 hours</SelectItem>
-                    <SelectItem value="1440">Daily</SelectItem>
-                    <SelectItem value="10080">Weekly</SelectItem>
-                  </SelectContent>
-                </Select>
-              </Field>
-            </div>
-          </details>
-        </div>
-
-        {saveSource.isError && (
-          <div className="rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
-            {extractSaveError(saveSource.error)}
-          </div>
+  const renderField = (field: ConfigField) => {
+    if (sourceType === "local_markdown" && field.key === "root") {
+      return (
+        <FolderSelectionField
+          key={field.key}
+          label="Root folder"
+          path={stringValue(config.root)}
+          emptyLabel="No folder selected"
+          isPending={pickLocalMarkdownRoot.isPending}
+          error={pickLocalMarkdownRoot.isError ? pickLocalMarkdownRoot.error : null}
+          onChoose={() => pickLocalMarkdownRoot.mutate()}
+        />
+      );
+    }
+    if (sourceType === "github_repo" && field.key === "repo_path") {
+      return (
+        <FolderSelectionField
+          key={field.key}
+          label="Local repository clone"
+          path={stringValue(config.repo_path)}
+          emptyLabel="No folder selected"
+          isPending={pickGitHubRepoPath.isPending}
+          error={pickGitHubRepoPath.isError ? pickGitHubRepoPath.error : null}
+          onChoose={() => pickGitHubRepoPath.mutate()}
+        />
+      );
+    }
+    return (
+      <div key={field.key} className="space-y-3">
+        <ConfigFieldInput
+          adapter={adapter}
+          field={field}
+          value={config[field.key]}
+          hasExistingSecret={Boolean(config[`${field.key}_configured`])}
+          decryptFailed={Boolean(config[`${field.key}_decrypt_failed`])}
+          required={adapter.isRequired(field, config)}
+          disabled={source ? isImmutableExecutionModeField(source, field.key) : false}
+          onChange={(value) => updateField(field, value)}
+        />
+        {sourceType === "confluence" && field.key === "base_url" && confluenceUrlInfo && (
+          <ConfluenceDetectedPanel info={confluenceUrlInfo} />
         )}
-        {validationMessage && (
-          <div className="flex items-start gap-2 rounded-lg bg-muted/50 p-3 text-sm text-muted-foreground">
-            <AlertCircle className="mt-0.5 size-4 shrink-0" />
-            <span>{validationMessage}</span>
-          </div>
+        {sourceType === "jira" && field.key === "jql" && (
+          <JiraEffectiveQueryPanel jql={stringValue(config.jql)} />
+        )}
+        {sourceType === "jira" && field.key === "auth_mode" && authMode === "browser_cookie" && (
+          <JiraBrowserSessionPanel
+            baseUrl={jiraBaseUrl}
+            session={jiraSessionQuery.data}
+            loading={jiraSessionQuery.isFetching}
+            error={jiraSessionQuery.error}
+            onRefresh={() => void jiraSessionQuery.refetch()}
+          />
+        )}
+        {sourceType === "github_repo" && field.key === "ref" && (
+          <GitHubRepoFolderPicker
+            connectionMode={githubConnectionMode}
+            config={githubPickerConfig}
+            value={listValue(config.include_paths)}
+            onChange={(paths) => {
+              setValidationMessage(null);
+              setConfig((current) => ({ ...current, include_paths: paths }));
+            }}
+          />
+        )}
+        {sourceType === "github_repo" && field.key === "repo_url" && (
+          <GitHubRepoDetectedPanel repoUrl={githubRepoUrl} />
         )}
       </div>
+    );
+  };
 
-      <DialogFooter className="mx-0 mb-0 flex-row justify-between rounded-none rounded-b-xl bg-background p-3 sm:justify-between">
-        <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-          Cancel
-        </Button>
-        <Button type="button" onClick={handleSave} disabled={saveSource.isPending}>
-          {saveSource.isPending ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
-          {isEdit ? "Save Changes" : "Create Source"}
-        </Button>
-      </DialogFooter>
+  const unavailableConnection = (
+    <p className="text-sm text-muted-foreground">
+      Connection and content settings are managed by the source owner. You can still change its project and sync frequency.
+    </p>
+  );
+  const contentBody = canConfigureConnection ? (
+    <>
+      {contentFields.map(renderField)}
+      {showDiscoveryPreview && (
+        <VerifySetupPanel
+          ready={previewReady}
+          isPending={previewDiscovery.isPending}
+          error={previewDiscovery.isError ? previewDiscovery.error : null}
+          data={previewDiscovery.data}
+          onVerify={() => previewDiscovery.mutate()}
+        />
+      )}
+      {advancedFields.length > 0 && (
+        <details className="group space-y-3 border-t pt-3">
+          <summary className="inline-flex cursor-pointer select-none items-center gap-1 rounded-md px-1 py-0.5 text-sm font-semibold hover:bg-muted focus:outline-none focus-visible:ring-1 focus-visible:ring-ring/40">
+            <ChevronRight className="size-4 transition-transform group-open:rotate-90" />
+            Advanced settings
+          </summary>
+          <div className="space-y-3 pt-2">{advancedFields.map(renderField)}</div>
+        </details>
+      )}
     </>
+  ) : unavailableConnection;
+
+  const sections: SourceSetupSection[] = [
+    {
+      id: "basics",
+      title: "Basics",
+      summary: name.trim() ? `Name · ${name.trim()}` : "Name this source",
+      state: name.trim() ? "complete" : "incomplete",
+      content: (
+        <Field label="Source name" required helpText="Use a name your workspace members will recognize.">
+          <Input
+            value={name}
+            autoComplete="off"
+            onChange={(event) => {
+              setValidationMessage(null);
+              setName(event.target.value);
+            }}
+            placeholder="Source name"
+          />
+        </Field>
+      ),
+    },
+    {
+      id: "connection",
+      title: adapter.connectionTitle,
+      summary: canConfigureConnection ? adapter.connectionSummary(config) : "Managed by source owner",
+      state: canConfigureConnection && connectionMissing ? "incomplete" : "complete",
+      content: canConfigureConnection ? <>{connectionFields.map(renderField)}</> : unavailableConnection,
+    },
+    {
+      id: "content",
+      title: adapter.contentTitle,
+      summary: canConfigureConnection ? adapter.contentSummary(config) : "Managed by source owner",
+      state: canConfigureConnection && contentMissing ? "incomplete" : "complete",
+      content: contentBody,
+    },
+    {
+      id: "project",
+      title: "Save memories to",
+      summary: projectBindingSummary(binding),
+      state: projectBindingIsComplete(binding) ? "complete" : "incomplete",
+      content: (
+        <ProjectBindingFields
+          schema={schema}
+          sourceId={source?.id ?? null}
+          value={binding}
+          onChange={(nextBinding) => {
+            setValidationMessage(null);
+            setBinding(nextBinding);
+          }}
+        />
+      ),
+    },
+    {
+      id: "schedule",
+      title: "Automatic sync",
+      summary: scheduleSummary,
+      state: !scheduleEnabled || scheduleIntervalValid ? "complete" : "incomplete",
+      content: (
+        <>
+          <label className="flex items-start gap-3 rounded-lg border bg-background p-3">
+            <input
+              type="checkbox"
+              className="mt-0.5 size-4"
+              checked={scheduleEnabled}
+              onChange={(event) => {
+                setValidationMessage(null);
+                setScheduleEnabled(event.target.checked);
+              }}
+            />
+            <span className="min-w-0 flex-1">
+              <span className="block text-sm font-medium">Sync automatically</span>
+              <span className="mt-1 block text-xs text-muted-foreground">Manual sync remains available at any time.</span>
+            </span>
+          </label>
+          {scheduleEnabled && (
+            <Field label="Frequency">
+              <Select<string>
+                value={scheduleInterval}
+                onValueChange={(value) => {
+                  if (!value) return;
+                  setValidationMessage(null);
+                  setScheduleInterval(value);
+                }}
+              >
+                <SelectTrigger><SelectValue>{scheduleIntervalLabel(scheduleInterval)}</SelectValue></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="30">Every 30 minutes</SelectItem>
+                  <SelectItem value="60">Hourly</SelectItem>
+                  <SelectItem value="360">Every 6 hours</SelectItem>
+                  <SelectItem value="720">Every 12 hours</SelectItem>
+                  <SelectItem value="1440">Daily</SelectItem>
+                  <SelectItem value="10080">Weekly</SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+          )}
+        </>
+      ),
+    },
+  ];
+
+  return (
+    <SourceSetupShell
+      sourceType={sourceType}
+      sourceLabel={adapter.displayName}
+      sourceName={name}
+      connection={adapter.connection}
+      isEdit={isEdit}
+      sections={sections}
+      openSection={focusSection}
+      onOpenSectionChange={setFocusSection}
+      error={saveSource.isError ? extractSaveError(saveSource.error) : null}
+      validationMessage={validationMessage}
+      saving={saveSource.isPending}
+      onCancel={() => onOpenChange(false)}
+      onSave={handleSave}
+    />
   );
 }
 
 function ConfigFieldInput({
+  adapter,
   field,
   value,
   hasExistingSecret,
@@ -610,6 +605,7 @@ function ConfigFieldInput({
   disabled,
   onChange,
 }: {
+  adapter: SourceSetupAdapter;
   field: ConfigField;
   value: ConfigValue | undefined;
   hasExistingSecret?: boolean;
@@ -624,7 +620,7 @@ function ConfigFieldInput({
         <input
           type="checkbox"
           className="mt-0.5 size-4"
-          checked={toBoolean(value)}
+          checked={booleanValue(value)}
           disabled={disabled}
           onChange={(event) => onChange(event.target.checked)}
         />
@@ -644,17 +640,17 @@ function ConfigFieldInput({
     return (
       <Field label={field.label} required={required} helpText={field.help_text}>
         <Select<string>
-          value={optionValue(field, selected)}
+          value={selected}
           disabled={disabled}
-          onValueChange={(next) => onChange(optionFromValue(field, stringValue(next)))}
+          onValueChange={(next) => onChange(stringValue(next))}
         >
           <SelectTrigger>
-            <SelectValue>{selected ? optionLabel(field, selected) : "Select..."}</SelectValue>
+            <SelectValue>{selected ? optionLabel(adapter, field, selected) : "Select..."}</SelectValue>
           </SelectTrigger>
           <SelectContent>
             {field.options.map((option) => (
-              <SelectItem key={option} value={optionValue(field, option)}>
-                {optionLabel(field, option)}
+              <SelectItem key={option} value={option}>
+                {optionLabel(adapter, field, option)}
               </SelectItem>
             ))}
           </SelectContent>
@@ -712,6 +708,8 @@ function ConfigFieldInput({
     <Field label={field.label} required={required} helpText={field.help_text}>
       <Input
         type={isInteger ? "number" : isSecret ? "password" : "text"}
+        autoComplete={isSecret ? "new-password" : "off"}
+        name={`source-${field.key}`}
         value={isList ? listValue(value).join(", ") : stringValue(value)}
         disabled={disabled}
         onChange={(event) => {
@@ -874,22 +872,37 @@ function parseGitHubRepoUrl(repoUrl: string): { host: string; owner: string; rep
   }
 }
 
-function LocalMarkdownFolderPickerPanel({
+function FolderSelectionField({
+  label,
+  path,
+  emptyLabel,
   isPending,
   error,
   onChoose,
 }: {
+  label: string;
+  path: string;
+  emptyLabel: string;
   isPending: boolean;
   error: unknown;
   onChoose: () => void;
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <Button type="button" variant="outline" size="sm" onClick={onChoose} disabled={isPending}>
-        {isPending ? <Loader2 className="size-3.5 animate-spin" /> : <FolderOpen className="size-3.5" />}
-        Choose folder
-      </Button>
-      {error ? <span className="text-xs text-destructive">{extractSaveError(error)}</span> : null}
+    <div className="overflow-hidden rounded-lg border bg-background">
+      <div className="flex flex-wrap items-center justify-between gap-3 p-3">
+        <div>
+          <div className="text-sm font-medium">{label}</div>
+          <div className="mt-0.5 text-xs text-muted-foreground">Selected through the local sync app.</div>
+        </div>
+        <Button type="button" variant="outline" size="sm" onClick={onChoose} disabled={isPending}>
+          {isPending ? <Loader2 className="size-3.5 animate-spin" /> : <FolderOpen className="size-3.5" />}
+          Choose folder
+        </Button>
+      </div>
+      <div className="border-t bg-muted/30 px-3 py-2 font-mono text-xs">
+        {path || <span className="font-sans text-muted-foreground">{emptyLabel}</span>}
+      </div>
+      {error ? <div className="border-t px-3 py-2 text-xs text-destructive">{extractSaveError(error)}</div> : null}
     </div>
   );
 }
@@ -914,41 +927,44 @@ function GitHubRepoDetectedPanel({ repoUrl }: { repoUrl: string }) {
   );
 }
 
-function DiscoveryPreviewPanel({
+function VerifySetupPanel({
   ready,
   isPending,
   error,
   data,
-  onPreview,
+  onVerify,
 }: {
   ready: boolean;
   isPending: boolean;
   error: unknown;
   data: DiscoveryPreviewResponse | undefined;
-  onPreview: () => void;
+  onVerify: () => void;
 }) {
   return (
     <section className="space-y-2">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold">Preview files</h3>
+        <div>
+          <h3 className="text-sm font-semibold">Verify setup</h3>
+          <p className="mt-0.5 text-xs text-muted-foreground">Checks the connection and returns a small content sample.</p>
+        </div>
         <Button
           type="button"
           variant="outline"
           size="sm"
-          onClick={onPreview}
+          onClick={onVerify}
           disabled={!ready || isPending}
         >
           {isPending ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-          {data ? "Refresh" : "Preview"}
+          {data ? "Verify again" : "Verify setup"}
         </Button>
       </div>
       {!ready ? (
         <p className="text-xs text-muted-foreground">
-          Fill in the required fields above to preview discoverable items.
+          Complete the required connection and content settings before verifying.
         </p>
       ) : !data && !error && !isPending ? (
         <p className="text-xs text-muted-foreground">
-          Check which files MemForge can see before saving.
+          Confirm that MemForge can reach the source and see the intended content.
         </p>
       ) : null}
       {error != null && (
@@ -999,12 +1015,6 @@ function DiscoveryPreviewPanel({
   );
 }
 
-function discoveryPreviewGroupKey(groups: Array<{ key: string }>): string | undefined {
-  if (groups.some((group) => group.key === "scope")) return "scope";
-  if (groups.some((group) => group.key === "connection")) return "connection";
-  return groups[0]?.key;
-}
-
 function formatPreviewDate(value: string): string {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
@@ -1034,221 +1044,12 @@ function Field({
   );
 }
 
-function buildDefaultConfig(fields: ConfigField[]): ConfigForm {
-  return fields.reduce<ConfigForm>((acc, field) => {
-    if (field.default !== "") {
-      acc[field.key] = defaultValueForField(field);
-    }
-    return acc;
-  }, {});
-}
-
-function initialSourceConfig(sourceType: string, sourceConfig: ConfigForm): ConfigForm {
-  const next = { ...sourceConfig };
-  if (sourceType === "jira" && !next.auth_mode) {
-    if (next.pat_configured) next.auth_mode = "pat";
-    else if (next.jira_cookie_configured) next.auth_mode = "browser_cookie";
-  }
-  if (sourceType === "confluence") {
-    return applyConfluenceUrlInference(next) as ConfigForm;
-  }
-  return next;
-}
-
-function defaultValueForField(field: ConfigField): ConfigValue {
-  if (field.field_type === "boolean") return field.default === "true";
-  if (field.field_type === "integer") return Number(field.default);
-  if (field.field_type === "tag_list" || field.field_type === "multi_select") {
-    return parseCommaList(field.default);
-  }
-  return field.default;
-}
-
-function serializeConfig(fields: ConfigField[], config: ConfigForm): ConfigForm {
-  return fields.reduce<ConfigForm>((acc, field) => {
-    const value = config[field.key];
-    if (field.field_type === "tag_list" || field.field_type === "multi_select") {
-      acc[field.key] = listValue(value);
-    } else if (field.field_type === "boolean") {
-      acc[field.key] = toBoolean(value);
-    } else if (field.field_type === "integer") {
-      acc[field.key] = value === "" || value == null ? null : Number(value);
-    } else if (field.field_type === "secret") {
-      const text = stringValue(value);
-      if (text.trim().length > 0 || !config[`${field.key}_configured`]) {
-        acc[field.key] = text;
-      }
-    } else {
-      acc[field.key] = stringValue(value);
-    }
-    return acc;
-  }, {});
-}
-
 function localMarkdownPreviewJobConfig(config: ConfigForm, source?: Source | null): ConfigForm {
   const sourceVaultId = source?.config?.vault_id;
   return {
     ...config,
     vault_id: (typeof sourceVaultId === "string" ? sourceVaultId.trim() : "") || "preview",
   };
-}
-
-function firstMissingRequiredField(
-  sourceType: string,
-  fields: ConfigField[],
-  config: ConfigForm,
-): ConfigField | null {
-  for (const field of fields) {
-    if (!isFieldVisible(sourceType, field, config)) continue;
-    if (!isFieldRequired(sourceType, field, config)) continue;
-    const value = config[field.key];
-    if (field.field_type === "tag_list" || field.field_type === "multi_select") {
-      if (listValue(value).length === 0) return field;
-      continue;
-    }
-    if (field.field_type === "secret" && config[`${field.key}_configured`]) {
-      continue;
-    }
-    if (stringValue(value).trim().length === 0) return field;
-  }
-  return null;
-}
-
-function isFieldVisible(sourceType: string, field: ConfigField, config: ConfigForm): boolean {
-  if (sourceType === "confluence") {
-    return isConfluenceFieldVisible(field.key, config);
-  }
-  if (sourceType === "jira") {
-    const authMode = stringValue(config.auth_mode) || "browser_cookie";
-    if (field.key === "jira_cookie") return false;
-    if (field.key === "pat") return authMode === "pat";
-    const queryMode = stringValue(config.query_mode) || "simple";
-    if (field.key === "jql") return queryMode === "advanced";
-    if (field.key === "projects" || field.key === "issue_types" || field.key === "jql_filter") {
-      return queryMode === "simple";
-    }
-    return true;
-  }
-  if (sourceType === "github_pages") {
-    const authMode = stringValue(config.auth_mode) || "github_pat";
-    const syncMode = stringValue(config.sync_mode) || "single_page";
-    if (field.field_type === "secret") return authMode !== "none";
-    if (GITHUB_PAGES_MODE_FIELDS.has(field.key)) {
-      return GITHUB_PAGES_VISIBILITY[syncMode]?.has(field.key) ?? false;
-    }
-    return true;
-  }
-  if (sourceType === "github_repo") {
-    const connectionMode = stringValue(config.connection_mode) || "cloud_pull";
-    if (field.key === "pat") return connectionMode === "cloud_pull";
-    if (field.key === "repo_path") return connectionMode === "local_push";
-    if (field.key === "include_paths") return false;
-    return true;
-  }
-  return true;
-}
-
-function isFieldRequired(sourceType: string, field: ConfigField, config: ConfigForm): boolean {
-  if (sourceType === "confluence") {
-    return field.required || isConfluenceFieldRequired(field.key, config);
-  }
-  if (sourceType === "jira") {
-    const authMode = stringValue(config.auth_mode) || "browser_cookie";
-    if (field.key === "jira_cookie") return false;
-    if (field.key === "pat") return authMode === "pat";
-    const queryMode = stringValue(config.query_mode) || "simple";
-    if (field.key === "projects") return queryMode === "simple";
-    if (field.key === "jql") return queryMode === "advanced";
-  }
-  if (sourceType === "github_pages") {
-    const syncMode = stringValue(config.sync_mode) || "single_page";
-    const authMode = stringValue(config.auth_mode) || "github_pat";
-    if (field.key === "pat") return authMode === "github_pat";
-    if (field.key === "page_url") return syncMode === "single_page";
-    if (field.key === "root_url") return syncMode === "subtree";
-    if (field.key === "pages") return syncMode === "explicit_list";
-  }
-  if (sourceType === "github_repo") {
-    const connectionMode = stringValue(config.connection_mode) || "cloud_pull";
-    if (field.key === "pat") return false;
-    if (field.key === "repo_path") return connectionMode === "local_push";
-    if (field.key === "include_paths") return false;
-  }
-  return field.required;
-}
-
-const GITHUB_PAGES_VISIBILITY: Record<string, Set<string>> = {
-  single_page: new Set(["page_url"]),
-  subtree: new Set(["root_url", "max_depth", "max_pages", "exclude_url_patterns"]),
-  explicit_list: new Set(["pages", "max_pages", "exclude_url_patterns"]),
-};
-
-const GITHUB_PAGES_MODE_FIELDS = new Set<string>([
-  "page_url",
-  "root_url",
-  "max_depth",
-  "max_pages",
-  "exclude_url_patterns",
-  "pages",
-]);
-
-function optionLabel(field: ConfigField, option: string): string {
-  if (field.key === "query_mode") {
-    if (option === "simple") return "Simple (projects & issue types)";
-    if (option === "advanced") return "Advanced (raw JQL)";
-  }
-  if (field.key === "auth_mode") {
-    if (option === "browser_cookie") return "Browser session (local adapter)";
-    if (option === "pat") return "Personal access token";
-    if (option === "github_pat") return "Personal access token";
-    if (option === "none") return "No authentication";
-  }
-  if (field.key === "sync_mode") {
-    if (option === "cloud") return "Cloud";
-    if (option === "local_agent") return "Local daemon";
-    if (option === "page_tree") return "This page tree";
-    if (option === "space") return "Whole space";
-    if (option === "single_page") return "Single page";
-    if (option === "subtree") return "Subtree";
-    if (option === "explicit_list") return "Explicit list";
-  }
-  if (field.key === "connection_mode") {
-    if (option === "cloud_pull") return "Public internet";
-    if (option === "local_push") return "Internal network / VPN";
-  }
-  return option;
-}
-
-function optionValue(field: ConfigField, option: string): string {
-  if (field.key === "auth_mode") {
-    if (option === "browser_cookie") return "browser_session";
-    if (option === "pat") return "personal_access_token";
-  }
-  return option;
-}
-
-function optionFromValue(field: ConfigField, value: string): string {
-  if (field.key === "auth_mode") {
-    if (value === "browser_session") return "browser_cookie";
-    if (value === "personal_access_token") return "pat";
-  }
-  return value;
-}
-
-function listValue(value: ConfigValue | undefined): string[] {
-  if (Array.isArray(value)) return value;
-  if (typeof value === "string") return parseCommaList(value);
-  return [];
-}
-
-function parseCommaList(value: string): string[] {
-  return value.split(",").map((item) => item.trim()).filter(Boolean);
-}
-
-function stringValue(value: ConfigValue | undefined): string {
-  if (Array.isArray(value)) return value.join(", ");
-  if (value == null) return "";
-  return String(value);
 }
 
 function parseScheduleInterval(value: string): number {
@@ -1272,6 +1073,13 @@ function scheduleIntervalLabel(value: string): string {
     default:
       return "Daily";
   }
+}
+
+function projectBindingSummary(binding: ProjectBinding | null): string {
+  if (!binding) return "Unmapped";
+  if (binding.mode === "fixed") return binding.project_key || "Choose a project";
+  const mapped = Object.keys(binding.map ?? {}).length;
+  return `${mapped} mapped value${mapped === 1 ? "" : "s"} · default ${binding.default || "not selected"}`;
 }
 
 async function pollLocalAgentPreviewJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
@@ -1321,10 +1129,4 @@ function extractSaveError(error: unknown): string {
   }
   if (error instanceof Error && error.message) return error.message;
   return fallback;
-}
-
-function toBoolean(value: ConfigValue | undefined): boolean {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "string") return value === "true";
-  return Boolean(value);
 }
