@@ -10,6 +10,7 @@ from memforge.local_agent.source_contract import (
     is_local_agent_backed_source,
     source_execution_descriptor,
 )
+from memforge.sync_progress import source_progress_unit, source_sync_progress_from_pipeline
 from memforge.storage.admin_source import SourceAdminReader
 
 WORKSPACE_ADMIN_ROLE = "workspace_admin"
@@ -103,6 +104,11 @@ def _durable_sync_payload(run: Any) -> dict[str, Any]:
         ),
         "recovery_count": run.recovery_count,
         "error_message": run.error_message,
+        "progress": run.progress,
+        "progress_revision": run.progress_revision,
+        "progress_updated_at": (
+            run.progress_updated_at.isoformat() if run.progress_updated_at else None
+        ),
     }
 
 
@@ -142,6 +148,17 @@ async def list_source_admin_rows(
             row["sync"] = _durable_sync_payload(durable_run)
         elif _sync_is_running(sync_service, source_id):
             progress = sync_service.progress.get(source_id, {})
+            progress_snapshot = source_sync_progress_from_pipeline(
+                {
+                    "phase": progress.get("phase"),
+                    "current": progress.get("docs_processed", 0),
+                    "total": progress.get("docs_total", 0),
+                    "docs_updated": progress.get("docs_updated", 0),
+                    "docs_failed": progress.get("docs_failed", 0),
+                    "memories_extracted": progress.get("memories_extracted", 0),
+                },
+                source_type=str(row.get("type") or ""),
+            )
             row["sync"] = {
                 "status": "running",
                 "phase": progress.get("phase"),
@@ -156,6 +173,7 @@ async def list_source_admin_rows(
                 "memories_stored": row["memory_count"],
                 "current_title": progress.get("title"),
                 "error_message": None,
+                "progress": progress_snapshot,
             }
         else:
             history = await reader.get_sync_history(source=source_id, limit=1)
@@ -171,6 +189,19 @@ async def list_source_admin_rows(
                     "memories_extracted": latest.get("memories_extracted", 0),
                     "error_message": latest.get("error_message"),
                     "failed_docs": latest.get("failed_docs", []),
+                    "progress": {
+                        "schema_version": 1,
+                        "phase": "processing",
+                        "progress": {
+                            "completed": latest.get("docs_processed", 0),
+                            "unit": source_progress_unit(str(row.get("type") or "")),
+                        },
+                        "counts": {
+                            "changed": latest.get("docs_updated", 0),
+                            "failed": latest.get("docs_failed", 0),
+                            "memories_created": latest.get("memories_extracted", 0),
+                        },
+                    },
                 }
             elif durable_run is not None:
                 row["sync"] = _durable_sync_payload(durable_run)

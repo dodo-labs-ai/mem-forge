@@ -544,6 +544,9 @@ class SourceSyncRun:
     rerun_requested: bool = False
     next_attempt_at: datetime | None = None
     error_message: str | None = None
+    progress: dict[str, object] | None = None
+    progress_revision: int = 0
+    progress_updated_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     started_at: datetime | None = None

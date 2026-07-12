@@ -15,6 +15,7 @@ from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from memforge.api_target import MemForgeTarget, build_target
+from memforge.sync_progress import normalize_sync_progress_snapshot
 
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -508,7 +509,7 @@ class ToolClient:
             "lease_seconds": lease_seconds,
         }
         if progress is not None:
-            body["progress"] = progress
+            body["progress"] = normalize_sync_progress_snapshot(progress)
         return self._host_json(
             "POST",
             f"/api/cloud/local-agent/jobs/{quote(job_id, safe='')}/heartbeat",

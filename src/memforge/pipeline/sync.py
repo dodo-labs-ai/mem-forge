@@ -260,7 +260,6 @@ def _plural(count: int, singular: str, plural: str | None = None) -> str:
 
 def _is_provider_unreachable(error: str) -> bool:
     normalized = error.lower()
-    # Keep this list aligned with admin-ui/src/components/admin/syncFailureDetails.ts.
     return any(
         marker in normalized
         for marker in (
@@ -508,6 +507,7 @@ class GeneSyncOrchestrator:
         source_id: str,
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
+        authoritative_snapshot: bool = False,
     ) -> SyncState:
         """Run the full sync pipeline for a gene.
 
@@ -525,6 +525,9 @@ class GeneSyncOrchestrator:
         force_full_sync:
             When true, ignore the incremental cursor and reprocess discovered
             documents even when their content hash is unchanged.
+        authoritative_snapshot:
+            When true, discover the complete submitted snapshot so removals can
+            be reconciled, while still skipping documents whose content is unchanged.
 
         Returns
         -------
@@ -575,7 +578,11 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             # Step 2: Get last sync time for incremental discovery
             # ----------------------------------------------------------
-            last_sync_time = None if force_full_sync else (existing_state.last_sync_at if existing_state else None)
+            last_sync_time = (
+                None
+                if force_full_sync or authoritative_snapshot
+                else (existing_state.last_sync_at if existing_state else None)
+            )
             if last_sync_time and hasattr(gene, "fetch_pdf"):
                 missing_pdf_count = await self._count_missing_pdf_uris(source_id)
                 if missing_pdf_count:
@@ -614,6 +621,15 @@ class GeneSyncOrchestrator:
             async for item in gene.discover(since=last_sync_time):
                 items.append(item)
                 crawled_doc_ids.add(item.item_id)
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "phase": "discovering",
+                            "current": len(items),
+                            "total": 0,
+                            "title": None,
+                        }
+                    )
 
             logger.info(
                 "Discovered %d content items from %s (since=%s)",
@@ -796,8 +812,8 @@ class GeneSyncOrchestrator:
                     progress_callback(
                         {
                             "phase": "detecting_deletions",
-                            "current": len(items),
-                            "total": len(items),
+                            "current": 0,
+                            "total": 0,
                             "title": None,
                         }
                     )

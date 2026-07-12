@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 
 from click.testing import CliRunner
@@ -389,9 +390,14 @@ def test_local_agent_forwards_retryable_handler_failure_to_broker(tmp_path):
 
 def test_local_agent_reports_handler_progress_through_heartbeat(tmp_path):
     heartbeats: list[dict | None] = []
+    completions: list[dict] = []
 
     def handle(job, *, report_progress):
-        report_progress({"stage": "uploading", "current": 7, "total": 16})
+        report_progress({
+            "schema_version": 1,
+            "phase": "uploading",
+            "progress": {"completed": 7, "total": 16, "unit": "message"},
+        })
         return {"count": 1}
 
     runner = LocalAgentRunner(
@@ -410,12 +416,53 @@ def test_local_agent_reports_handler_progress_through_heartbeat(tmp_path):
         cloud_job_heartbeat=lambda job_id, attempt_count, lease_seconds, progress=None: (
             heartbeats.append(progress) or {"ok": True}
         ),
+        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: (
+            completions.append(result) or {"ok": True}
+        ),
     )
 
     report = runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
 
     assert report["counts"]["failed"] == 0
-    assert heartbeats == [None, {"stage": "uploading", "current": 7, "total": 16}]
+    assert heartbeats == [None, {
+        "schema_version": 1,
+        "phase": "uploading",
+        "progress": {"completed": 7, "total": 16, "unit": "message"},
+    }]
+    assert completions == [{
+        "count": 1,
+        "progress": {
+            "schema_version": 1,
+            "phase": "uploading",
+            "progress": {"completed": 7, "total": 16, "unit": "message"},
+        },
+    }]
+
+
+def test_local_agent_flushes_dirty_progress_before_lease_heartbeat():
+    from memforge.local_agent.runner import _CloudJobLeaseHeartbeat
+
+    flushed = threading.Event()
+
+    def heartbeat(job_id, attempt_count, lease_seconds, progress=None):
+        if progress is not None:
+            flushed.set()
+        return {"ok": True}
+
+    with _CloudJobLeaseHeartbeat(
+        heartbeat=heartbeat,
+        job_id="laj-progress-cadence",
+        attempt_count=1,
+        lease_seconds=60,
+        interval_seconds=20,
+        progress_flush_seconds=1,
+    ) as lease:
+        lease.report_progress({
+            "schema_version": 1,
+            "phase": "discovering",
+            "progress": {"completed": 3, "unit": "file"},
+        })
+        assert flushed.wait(1.5)
 
 
 def test_local_agent_completion_failure_does_not_abort_following_job(tmp_path):

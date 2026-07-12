@@ -98,7 +98,8 @@ assert.deepEqual(
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
 const sourceRowSource = readFileSync("src/views/sources/SourceRow.tsx", "utf8");
 const localAgentSourcesSource = readFileSync("src/views/sources/localAgentSources.ts", "utf8");
-const syncStatusBarSource = readFileSync("src/components/admin/SyncStatusBar.tsx", "utf8");
+const syncStatusCardSource = readFileSync("src/components/admin/SourceSyncStatusCard.tsx", "utf8");
+const syncActivitySource = readFileSync("src/views/sources/sourceSyncActivity.ts", "utf8");
 const localAgentJobsSource = readFileSync("src/api/localAgentJobs.ts", "utf8");
 const apiTypesSource = readFileSync("src/api/types.ts", "utf8");
 
@@ -139,8 +140,8 @@ assert.match(
 );
 assert.match(
   sourcesPageSource,
-  /localAgentProgressBySource/,
-  "Local-agent sync should track row-level progress instead of relying only on a global banner",
+  /localAgentJobBySource/,
+  "Local-agent sync should retain the durable job record used by the shared activity projector",
 );
 assert.match(
   sourcesPageSource,
@@ -164,8 +165,8 @@ assert.doesNotMatch(
 );
 assert.match(
   sourceRowSource,
-  /localAgentProgress/,
-  "SourceRow should render local-agent job progress for the matching source row",
+  /syncActivity/,
+  "SourceRow should render the normalized sync activity for the matching source row",
 );
 assert.match(
   sourceRowSource,
@@ -183,9 +184,9 @@ assert.match(
   "Durable queued and recovering runs should keep source status polling active",
 );
 assert.match(
-  sourceRowSource,
+  syncActivitySource,
   /Waiting to sync[\s\S]*Recovering sync/,
-  "Source rows should distinguish queued work from worker recovery",
+  "The shared presenter should distinguish queued work from worker recovery",
 );
 assert.match(
   apiTypesSource,
@@ -247,10 +248,10 @@ assert.doesNotMatch(
   /New memories/,
   "last-sync details should not label extraction candidates as new durable memories",
 );
-assert.doesNotMatch(
-  syncStatusBarSource,
-  /new memories|stored memories/i,
-  "sync status details should avoid memory extraction counters that can differ from durable memory counts",
+assert.match(
+  syncStatusCardSource,
+  /aria-valuenow=\{determinate/,
+  "the shared status card should expose numeric accessibility state only for determinate progress",
 );
 
 assert.match(

@@ -100,6 +100,31 @@ export interface SyncStatus {
     title: string;
     error: string;
   }>;
+  progress?: SyncProgressSnapshot | null;
+  progress_revision?: number;
+  progress_updated_at?: string | null;
+}
+
+export type SyncProgressPhase =
+  | "waiting_for_device"
+  | "connecting"
+  | "discovering"
+  | "uploading"
+  | "processing"
+  | "reconciling";
+
+export type SyncProgressUnit = "item" | "page" | "file" | "issue" | "message" | "conversation";
+
+export interface SyncProgressSnapshot {
+  schema_version: 1;
+  phase: SyncProgressPhase;
+  progress?: {
+    completed: number;
+    total?: number | null;
+    unit: SyncProgressUnit;
+  };
+  source_time_range?: { start?: string; end?: string };
+  counts?: { changed?: number; failed?: number; memories_created?: number };
 }
 
 /**
@@ -390,24 +415,16 @@ export interface LocalAgentJobCounts {
   polls?: number;
 }
 
-export interface LocalAgentJobProgress {
-  stage?: "connecting" | "reading" | "uploading" | "starting_processing";
-  current?: number;
-  total?: number;
-  current_date?: string | null;
-  date_from?: string | null;
-  date_to?: string | null;
-  messages?: number;
-  processed_messages?: number;
-  conversations?: number;
-}
-
 export interface LocalAgentJobStatusResponse {
   job_id: string;
+  source_id?: string;
   operation?: string;
   status: "queued" | "leased" | "succeeded" | "failed";
   attempt_count?: number;
   leased_until?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  finished_at?: string | null;
   result: {
     authenticated?: boolean;
     expires_in_minutes?: number | null;
@@ -424,7 +441,7 @@ export interface LocalAgentJobStatusResponse {
     individual_chats?: TeamsChat[];
     truncated?: boolean;
     counts?: LocalAgentJobCounts;
-    progress?: LocalAgentJobProgress;
+    progress?: SyncProgressSnapshot;
     date_from?: string | null;
     date_to?: string | null;
     messages?: number;

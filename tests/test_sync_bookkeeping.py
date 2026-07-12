@@ -377,6 +377,66 @@ async def test_heartbeat_source_sync_run_extends_only_current_worker_lease(db: D
 
 
 @pytest.mark.asyncio
+async def test_source_sync_run_progress_is_durable_and_fenced_by_current_lease(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-progress-run",
+        type="confluence",
+        name="Engineering Wiki",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id="src-progress-run",
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert leased is not None
+
+    stored = await db.report_source_sync_run_progress(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        progress={
+            "schema_version": 1,
+            "phase": "processing",
+            "progress": {"completed": 31, "total": 86, "unit": "page"},
+            "counts": {"changed": 12, "failed": 0, "memories_created": 104},
+        },
+        now=now + timedelta(seconds=5),
+    )
+    stale = await db.report_source_sync_run_progress(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count + 1,
+        progress={
+            "schema_version": 1,
+            "phase": "processing",
+            "progress": {"completed": 86, "total": 86, "unit": "page"},
+        },
+        now=now + timedelta(seconds=6),
+    )
+    current = await db.get_source_sync_run(enqueued.run_id)
+
+    assert stored is True
+    assert stale is False
+    assert current is not None
+    assert current.progress == {
+        "schema_version": 1,
+        "phase": "processing",
+        "progress": {"completed": 31, "total": 86, "unit": "page"},
+        "counts": {"changed": 12, "failed": 0, "memories_created": 104},
+    }
+    assert current.progress_revision == 1
+    assert current.progress_updated_at == now + timedelta(seconds=5)
+
+
+@pytest.mark.asyncio
 async def test_complete_source_sync_run_releases_active_slot_for_next_run(db: Database):
     now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
     await db.upsert_source(
@@ -2209,6 +2269,39 @@ async def test_force_full_sync_ignores_incremental_cursor(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_authoritative_snapshot_ignores_cursor_without_forcing_reprocessing(db: Database):
+    source_id = "src-authoritative-snapshot"
+    await _insert_source_and_doc(db, source_id)
+    await db.upsert_sync_state(
+        SyncState(
+            source=source_id,
+            last_sync_at=datetime(2026, 5, 26, 14, 55, 33, tzinfo=timezone.utc),
+            last_sync_status="success",
+            docs_processed=1,
+            docs_updated=1,
+        ),
+    )
+    gene = SinceRecordingEmptyGene()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=None,
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=None,
+        memory_store=None,
+    )
+
+    await orchestrator.sync_gene(
+        gene=gene,
+        source_name="Architecture",
+        source_id=source_id,
+        authoritative_snapshot=True,
+    )
+
+    assert gene.seen_since is None
+
+
+@pytest.mark.asyncio
 async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_path):
     source_id = "src-force-reprocess"
     markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
@@ -2648,7 +2741,14 @@ async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
         user_id="owner-a",
         attempt_count=first[0]["attempt_count"],
         status="failed",
-        result={"retryable": True},
+        result={
+            "retryable": True,
+            "progress": {
+                "schema_version": 1,
+                "phase": "uploading",
+                "progress": {"completed": 9, "total": 10, "unit": "file"},
+            },
+        },
         error="one package failed",
         retryable=True,
         now=now + timedelta(seconds=1),
@@ -2663,6 +2763,7 @@ async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
     assert completed is True
     assert second[0]["job_id"] == "laj-retry"
     assert second[0]["attempt_count"] == 2
+    assert second[0]["result"] == {}
 
 
 @pytest.mark.asyncio
@@ -2982,7 +3083,7 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
 
 
 @pytest.mark.asyncio
-async def test_source_sync_worker_treats_complete_input_snapshot_as_full_sync(db: Database):
+async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_snapshot(db: Database):
     import memforge.runtime as runtime
 
     source_id = "src-snapshot-worker"
@@ -2996,6 +3097,7 @@ async def test_source_sync_worker_treats_complete_input_snapshot_as_full_sync(db
     class CapturingRuntimeProvider:
         def __init__(self) -> None:
             self.force_full_sync: bool | None = None
+            self.authoritative_snapshot: bool | None = None
             self.source: dict | None = None
 
         async def build_sync_runtime(self, db, config, **kwargs):
@@ -3004,6 +3106,7 @@ async def test_source_sync_worker_treats_complete_input_snapshot_as_full_sync(db
 
         async def run_source_sync(self, **kwargs):
             self.force_full_sync = kwargs["force_full_sync"]
+            self.authoritative_snapshot = kwargs["authoritative_snapshot"]
             self.source = kwargs["source"]
             return SyncState(
                 source=source_id,
@@ -3027,7 +3130,8 @@ async def test_source_sync_worker_treats_complete_input_snapshot_as_full_sync(db
 
     await worker.run_once()
 
-    assert provider.force_full_sync is True
+    assert provider.force_full_sync is False
+    assert provider.authoritative_snapshot is True
     assert provider.source is not None
     assert provider.source["config"]["local_agent_package_manifest"] == []
 
@@ -3273,6 +3377,71 @@ async def test_source_sync_worker_heartbeats_while_run_is_active(db: Database):
 
     assert completed is not None
     assert completed.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_persists_pipeline_progress_while_run_is_active(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-progress"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Engineering Wiki",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+
+    class ProgressRuntimeProvider:
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            kwargs["progress_callback"](
+                {
+                    "phase": "processing",
+                    "current": 31,
+                    "total": 86,
+                    "docs_updated": 12,
+                    "memories_extracted": 104,
+                }
+            )
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
+
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=ProgressRuntimeProvider(),
+        worker_id="worker-a",
+        progress_flush_seconds=0.01,
+    )
+
+    await worker.run_once()
+    completed = await db.get_source_sync_run(enqueued.run_id)
+
+    assert completed is not None
+    assert completed.status == "success"
+    assert completed.progress_revision > 0
+    assert completed.progress == {
+        "schema_version": 1,
+        "phase": "processing",
+        "progress": {"completed": 31, "total": 86, "unit": "page"},
+        "counts": {"changed": 12, "memories_created": 104},
+    }
+
+
+def test_reconciliation_without_measurable_work_is_indeterminate():
+    from memforge.sync_progress import source_sync_progress_from_pipeline
+
+    assert source_sync_progress_from_pipeline(
+        {"phase": "detecting_deletions", "current": 0, "total": 0},
+        source_type="confluence",
+    ) == {"schema_version": 1, "phase": "reconciling"}
 
 
 @pytest.mark.asyncio
@@ -4211,6 +4380,20 @@ async def test_running_progress_reports_extracted_memories(db: Database):
     )
 
     assert any(event.get("memories_extracted") == 3 for event in progress_events)
+    assert [
+        event["current"]
+        for event in progress_events
+        if event.get("phase") == "discovering"
+    ] == [0, 1]
+    reconciliation = [
+        event for event in progress_events if event.get("phase") == "detecting_deletions"
+    ]
+    assert reconciliation == [{
+        "phase": "detecting_deletions",
+        "current": 0,
+        "total": 0,
+        "title": None,
+    }]
 
 
 @pytest.mark.asyncio
