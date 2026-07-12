@@ -42,8 +42,8 @@ assert.equal(
     localExecution: false,
     connectionStatus: { state: "ready", reason: null },
   }),
-  "connection_ready",
-  "server-executed sources should report connection health without claiming local collection",
+  null,
+  "healthy server-executed sources should not gain a redundant readiness badge",
 );
 assert.equal(
   resolveSourceReadiness({

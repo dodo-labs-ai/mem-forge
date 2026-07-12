@@ -180,7 +180,7 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
-  /showReadiness\s*=\s*!isPaused[\s\S]*capabilities\.can_sync[\s\S]*localExecution \|\| source\.connection_status != null/,
+  /connectionRequiresAction = source\.connection_status\?\.state === "action_required";[\s\S]*showReadiness\s*=\s*!isPaused[\s\S]*capabilities\.can_sync[\s\S]*localExecution \|\| connectionRequiresAction/,
   "Only the execution owner should see local or connection readiness",
 );
 assert.match(

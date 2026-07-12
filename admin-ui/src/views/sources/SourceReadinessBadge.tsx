@@ -3,7 +3,6 @@ import {
   Loader2,
   LogIn,
   MonitorCheck,
-  Plug,
   TriangleAlert,
 } from "lucide-react";
 import type { SourceConnectionStatus } from "@/api/types";
@@ -40,11 +39,6 @@ const PRESENTATION: Record<SourceReadiness, {
     label: "Local sync unavailable",
     icon: CircleAlert,
     className: "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-900/30 dark:text-amber-200",
-  },
-  connection_ready: {
-    label: "Connection ready",
-    icon: Plug,
-    className: "bg-secondary text-secondary-foreground",
   },
   sign_in_required: {
     label: "Sign in required",
