@@ -122,6 +122,7 @@ class AgentSessionGene(Gene):
             default_sync_interval_minutes=0,
             auth_method="local_file",
             data_shape="message",
+            execution_kinds=(),
         )
 
     @classmethod

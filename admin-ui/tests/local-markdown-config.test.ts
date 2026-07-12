@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { isPushBasedSourceType } from "../src/views/sources/managedSources.js";
+import { presentSourceConnection } from "../src/views/sources/sourceConnectionPresentation.js";
 
-assert.equal(isPushBasedSourceType("local_markdown"), true);
+assert.deepEqual(
+  presentSourceConnection({ execution_kinds: ["local_agent"] }),
+  { mode: "device", label: "Local sync" },
+);
 
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
 
@@ -17,12 +20,6 @@ assert.match(
   sourcesPageSource,
   /local_markdown:\s*"files"/,
   "SourcesPage should describe local_markdown items as 'files'",
-);
-
-assert.doesNotMatch(
-  sourcesPageSource,
-  /const isPushBased = isPushBasedSourceType\(gene\.name\)/,
-  "Add Source configurable cards should not turn local_markdown into a setup-only card",
 );
 
 const sourceConfigDialogSource = readFileSync("src/views/sources/SourceConfigDialog.tsx", "utf8");
