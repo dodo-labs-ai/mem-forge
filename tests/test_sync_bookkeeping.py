@@ -1304,20 +1304,17 @@ class StubDocumentStore:
     def __init__(self) -> None:
         self.normalized_content: dict[str, str] = {}
 
-    def store_raw(self, *, source_name, title, content, content_type, extension=None):
+    def store_raw(self, *, source_id, title, content, content_type, extension=None):
         suffix = extension or ".raw"
-        return f"file:///tmp/{source_name}/{title}{suffix}"
+        return f"file:///tmp/{source_id}/{title}{suffix}"
 
-    def store_normalized(self, *, source_name, title, markdown):
-        uri = f"stub-doc://{source_name}/{title}.md"
+    def store_normalized(self, *, source_id, title, markdown):
+        uri = f"stub-doc://{source_id}/{title}.md"
         self.normalized_content[uri] = markdown
         return uri
 
     def read_normalized(self, uri):
         return self.normalized_content.get(uri)
-
-    def delete_document_files(self, *, source_name, title):
-        return None
 
 
 class RecordingSyncMemoryLogger:
@@ -1336,11 +1333,11 @@ class RecordingSyncMemoryLogger:
 
 
 class FailingPdfDocumentStore(StubDocumentStore):
-    def store_raw(self, *, source_name, title, content, content_type, extension=None):
+    def store_raw(self, *, source_id, title, content, content_type, extension=None):
         if content_type == "application/pdf":
             raise RuntimeError("disk full while storing PDF")
         return super().store_raw(
-            source_name=source_name,
+            source_id=source_id,
             title=title,
             content=content,
             content_type=content_type,
@@ -2307,7 +2304,7 @@ async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_
     markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
     doc_store = StubDocumentStore()
     normalized_content_uri = doc_store.store_normalized(
-        source_name="Documents",
+        source_id="src-documents",
         title="Design Doc",
         markdown=markdown,
     )
@@ -3015,6 +3012,38 @@ async def test_sync_service_enqueue_source_creates_durable_run_without_local_tas
     assert run.force_full_sync is True
     assert run.status == "pending"
     assert service.tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_sync_service_rejects_source_while_deletion_is_in_progress(db: Database):
+    source_id = "src-deleting-service"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Deleting Service",
+        config_json="{}",
+    )
+    await db.db.execute("UPDATE sources SET status = 'deleting' WHERE id = ?", (source_id,))
+    await db.db.commit()
+
+    with pytest.raises(RuntimeError, match="not active.*deleting"):
+        await SyncService(db, AppConfig()).enqueue_source(source_id)
+
+
+@pytest.mark.asyncio
+async def test_database_rejects_direct_enqueue_while_source_is_deleting(db: Database):
+    source_id = "src-deleting-direct-enqueue"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Deleting Direct Enqueue",
+        config_json="{}",
+    )
+    await db.db.execute("UPDATE sources SET status = 'deleting' WHERE id = ?", (source_id,))
+    await db.db.commit()
+
+    with pytest.raises(ValueError, match="not active.*deleting"):
+        await db.enqueue_source_sync_run(source_id=source_id)
 
 
 @pytest.mark.asyncio
@@ -3992,7 +4021,7 @@ async def test_document_update_uses_diff_guided_extraction_and_audits_strategy(
     new_markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
     doc_store = StubDocumentStore()
     normalized_content_uri = doc_store.store_normalized(
-        source_name="Documents",
+        source_id="src-documents",
         title="Design Doc",
         markdown=old_markdown,
     )
@@ -4069,7 +4098,7 @@ async def test_structured_source_update_uses_diff_guided_extraction_and_audits_s
     new_markdown = "# [Story] PAY-123: Cutoff flow\n\n## Source Metadata\n- Status: Done"
     doc_store = StubDocumentStore()
     normalized_content_uri = doc_store.store_normalized(
-        source_name="Jira Board",
+        source_id=source_id,
         title="PAY-123",
         markdown=old_markdown,
     )
@@ -4177,6 +4206,12 @@ async def test_document_update_falls_back_to_full_extraction_when_previous_conte
 @pytest.mark.asyncio
 async def test_large_full_document_uses_deterministic_units(db: Database):
     source_id = "src-large-doc-full"
+    await db.upsert_source(
+        id=source_id,
+        type="github_pages",
+        name="Documents",
+        config_json="{}",
+    )
     markdown = "# Design Doc\n\nIntro.\n\n" + "\n\n".join(
         f"## Section {index}\n\n" + ("Durable design detail. " * 900) for index in range(8)
     )
@@ -4267,7 +4302,7 @@ async def test_partial_unit_extraction_failure_skips_reconciliation(db: Database
     )
     doc_store = StubDocumentStore()
     normalized_content_uri = doc_store.store_normalized(
-        source_name="Documents",
+        source_id=source_id,
         title="Design Doc",
         markdown=markdown,
     )
@@ -4611,7 +4646,7 @@ async def test_unchanged_document_backfills_pdf_uri_without_llm_reprocessing(db:
     assert state.last_sync_status == "success"
     assert state.docs_updated == 0
     assert document is not None
-    assert document.pdf_content_uri == "file:///tmp/Architecture/Jira 0.pdf"
+    assert document.pdf_content_uri == f"file:///tmp/{source_id}/Jira 0.pdf"
 
 
 @pytest.mark.asyncio
@@ -4660,7 +4695,7 @@ async def test_missing_pdf_uri_forces_full_sync_without_llm_reprocessing(db: Dat
     assert state.docs_processed == 1
     assert state.docs_updated == 0
     assert document is not None
-    assert document.pdf_content_uri == "file:///tmp/Architecture/Jira 0.pdf"
+    assert document.pdf_content_uri == f"file:///tmp/{source_id}/Jira 0.pdf"
 
 
 @pytest.mark.asyncio
@@ -4837,6 +4872,13 @@ async def test_embedding_connection_failure_is_reported_as_provider_unreachable(
     db: Database,
     monkeypatch,
 ):
+    source_id = "src-embedding-refused"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Board",
+        config_json="{}",
+    )
     release = asyncio.Event()
     release.set()
 
@@ -4852,7 +4894,7 @@ async def test_embedding_connection_failure_is_reported_as_provider_unreachable(
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, "src-embedding-refused"),
+        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -4864,7 +4906,7 @@ async def test_embedding_connection_failure_is_reported_as_provider_unreachable(
     state = await orchestrator.sync_gene(
         gene=BlockingFetchGene(item_count=1, release=release),
         source_name="Jira Board",
-        source_id="src-embedding-refused",
+        source_id=source_id,
     )
 
     assert state.last_sync_status == "failed"

@@ -1653,7 +1653,7 @@ class MemoryStore:
                 )
             raise
         try:
-            retired_ids = await self.db.delete_source_cascade(source_id)
+            deletion_result = await self.db.delete_source_cascade(source_id)
         except Exception:
             await self._restore_deleted_source_state(
                 source_snapshot=source_snapshot,
@@ -1665,19 +1665,21 @@ class MemoryStore:
                 context=context,
             )
             raise
-        try:
-            await self._remove_retired_from_search_indexes(retired_ids, context=context)
-        except Exception:
-            await self._restore_deleted_source_state(
-                source_snapshot=source_snapshot,
-                document_snapshots=document_snapshots,
-                document_side_snapshot=document_side_snapshot,
-                document_vector_snapshots=document_vector_snapshots,
-                memory_snapshots=memory_snapshots,
-                source_snapshots=source_snapshots,
-                context=context,
-            )
-            raise
+        retired_ids = list(deletion_result.retired_memory_ids)
+        if deletion_result.retired_search_cleanup_required:
+            try:
+                await self._remove_retired_from_search_indexes(retired_ids, context=context)
+            except Exception:
+                await self._restore_deleted_source_state(
+                    source_snapshot=source_snapshot,
+                    document_snapshots=document_snapshots,
+                    document_side_snapshot=document_side_snapshot,
+                    document_vector_snapshots=document_vector_snapshots,
+                    memory_snapshots=memory_snapshots,
+                    source_snapshots=source_snapshots,
+                    context=context,
+                )
+                raise
         await self._emit(
             "source_delete_cascade_committed",
             "committed",

@@ -487,9 +487,6 @@ class TestReviewCrud:
             def store_pdf(self, *args, **kwargs) -> str:
                 raise AssertionError("not used")
 
-            def delete_document_files(self, *, source_name: str, title: str) -> None:
-                raise AssertionError("not used")
-
         incumbent, challenger, review = await _seed_supersede_review(db, chroma, suffix="objecturls")
         await _upsert_doc_with_artifacts(
             db,

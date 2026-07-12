@@ -68,15 +68,12 @@ async def database_fixture(tmp_path):
 
 
 class _StubDocumentStore:
-    def store_raw(self, *, source_name, title, content, content_type, extension=None):
+    def store_raw(self, *, source_id, title, content, content_type, extension=None):
         suffix = extension or ".raw"
-        return f"file:///tmp/{source_name}/{title}{suffix}"
+        return f"file:///tmp/{source_id}/{title}{suffix}"
 
-    def store_normalized(self, *, source_name, title, markdown):
-        return f"file:///tmp/{source_name}/{title}.md"
-
-    def delete_document_files(self, *, source_name, title):
-        return None
+    def store_normalized(self, *, source_id, title, markdown):
+        return f"file:///tmp/{source_id}/{title}.md"
 
 
 class _StubEnricher:

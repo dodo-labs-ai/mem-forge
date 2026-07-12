@@ -43,8 +43,8 @@ class FakeDocumentStore:
     def __init__(self):
         self._objects: dict[str, bytes] = {}
 
-    def store_raw(self, source_name, title, content, content_type, extension=None):
-        uri = f"fake://{source_name}/{title}{extension or ''}"
+    def store_raw(self, source_id, title, content, content_type, extension=None):
+        uri = f"fake://{source_id}/{title}{extension or ''}"
         self._objects[uri] = content
         return uri
 
