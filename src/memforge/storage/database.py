@@ -78,9 +78,12 @@ from memforge.storage.admin_memory import (
     MemoryAdminQueryPage,
 )
 from memforge.storage.admin_source import (
+    SOURCE_LIST_DEFAULT_SORT_MODE,
     SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES,
     SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
     SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES,
+    SourceListSortMode,
+    validate_source_list_sort_mode,
 )
 
 logger = logging.getLogger(__name__)
@@ -733,6 +736,22 @@ CREATE TABLE IF NOT EXISTS source_subscriptions (
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (source_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS source_list_pins (
+    source_id   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    user_id     TEXT NOT NULL,
+    pinned_at   TEXT NOT NULL,
+    PRIMARY KEY (source_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_list_pins_user
+    ON source_list_pins(user_id, pinned_at);
+
+CREATE TABLE IF NOT EXISTS source_list_preferences (
+    user_id     TEXT PRIMARY KEY,
+    sort_mode   TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_sources_sync_schedule_due
@@ -1937,6 +1956,24 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE source_sync_runs ADD COLUMN progress_json TEXT",
             "ALTER TABLE source_sync_runs ADD COLUMN progress_revision INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE source_sync_runs ADD COLUMN progress_updated_at TEXT",
+        ],
+    ),
+    (
+        40,
+        "Persist personal Source List pins",
+        [
+            """CREATE TABLE IF NOT EXISTS source_list_pins (
+                source_id   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                user_id     TEXT NOT NULL,
+                pinned_at   TEXT NOT NULL,
+                PRIMARY KEY (source_id, user_id)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_source_list_pins_user ON source_list_pins(user_id, pinned_at)",
+            """CREATE TABLE IF NOT EXISTS source_list_preferences (
+                user_id     TEXT PRIMARY KEY,
+                sort_mode   TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )""",
         ],
     ),
 ]
@@ -6684,6 +6721,56 @@ class Database:
             )
             await self.db.commit()
 
+    async def is_source_pinned_for_user(self, source_id: str, user_id: str) -> bool:
+        async with self.db.execute(
+            "SELECT 1 FROM source_list_pins WHERE source_id = ? AND user_id = ?",
+            (source_id, user_id),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def set_source_pinned_for_user(
+        self, source_id: str, user_id: str, pinned: bool
+    ) -> None:
+        async with self._write_lock:
+            if pinned:
+                await self.db.execute(
+                    """INSERT INTO source_list_pins (source_id, user_id, pinned_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(source_id, user_id) DO NOTHING""",
+                    (source_id, user_id, _now_iso()),
+                )
+            else:
+                await self.db.execute(
+                    "DELETE FROM source_list_pins WHERE source_id = ? AND user_id = ?",
+                    (source_id, user_id),
+                )
+            await self.db.commit()
+
+    async def get_source_list_sort_mode(self, user_id: str) -> SourceListSortMode:
+        async with self.db.execute(
+            "SELECT sort_mode FROM source_list_preferences WHERE user_id = ?",
+            (user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return SOURCE_LIST_DEFAULT_SORT_MODE
+        return validate_source_list_sort_mode(str(row["sort_mode"]))
+
+    async def set_source_list_sort_mode(
+        self, user_id: str, sort_mode: SourceListSortMode
+    ) -> None:
+        normalized = validate_source_list_sort_mode(sort_mode)
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT INTO source_list_preferences (user_id, sort_mode, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                   sort_mode=excluded.sort_mode,
+                   updated_at=excluded.updated_at""",
+                (user_id, normalized, _now_iso()),
+            )
+            await self.db.commit()
+
     async def list_disabled_source_ids_for_user(self, user_id: str) -> list[str]:
         results: list[str] = []
         async with self.db.execute(
@@ -7004,6 +7091,7 @@ class Database:
                 await self.db.execute("DELETE FROM agent_session_receipts WHERE source_id = ?", (source_id,))
                 await self.db.execute("DELETE FROM sync_state WHERE source = ?", (source_id,))
                 await self.db.execute("DELETE FROM sync_history WHERE source = ?", (source_id,))
+                await self.db.execute("DELETE FROM source_list_pins WHERE source_id = ?", (source_id,))
                 await self.db.execute("DELETE FROM sources WHERE id = ?", (source_id,))
                 await self.db.commit()
                 return SourceDeletionResult(

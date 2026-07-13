@@ -224,6 +224,8 @@ export interface Source {
   subscription?: SourceSubscription;
   /** Convenience mirror of `subscription.enabled` for the current viewer. */
   enabled_for_me?: boolean;
+  /** Personal Source List organization state for the current viewer. */
+  pinned_for_me?: boolean;
   sync_schedule?: SourceSyncSchedule | null;
 }
 

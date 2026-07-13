@@ -1,7 +1,7 @@
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Files, Info, Loader2, MoreHorizontal, Pause, Play, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { Files, Info, Loader2, MoreHorizontal, Pause, Pin, PinOff, Play, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { resourceClient } from "@/api/client";
 import { createLocalAgentJob, getCurrentLocalAgentJobs, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
@@ -21,6 +21,7 @@ import { EmptyState } from "@/components/admin/EmptyState";
 import { PageHeader } from "@/components/admin/PageHeader";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   Dialog,
   DialogContent,
@@ -44,6 +45,7 @@ import {
 } from "./projectGrouping";
 import { SourceRow } from "./SourceRow";
 import { selectSourceSyncActivity } from "./sourceSyncActivity";
+import { organizeSourceGroups, type SourceListSortMode } from "./sourceListOrganization";
 import { localAgentSyncOperation } from "./localAgentSources";
 import {
   presentSourceConnection,
@@ -76,6 +78,10 @@ const SOURCE_ITEM_LABELS: Record<string, string> = {
 
 interface SourcesResponse {
   data?: Source[];
+}
+
+interface SourceListPreferencesResponse {
+  sort_mode: SourceListSortMode;
 }
 
 function normalizeSources(payload: SourcesResponse | Source[] | undefined): Source[] {
@@ -214,6 +220,9 @@ export function SourcesPage() {
     () => new Set(),
   );
   const [authorityMessage, setAuthorityMessage] = useState<string | null>(null);
+  const [sourceSearch, setSourceSearch] = useState("");
+  const [pinnedOnly, setPinnedOnly] = useState(false);
+  const [newSourceId, setNewSourceId] = useState<string | null>(null);
 
   const handleAuthorityError = (error: unknown, fallback: string) => {
     if (isForbiddenError(error)) {
@@ -256,6 +265,29 @@ export function SourcesPage() {
         return Boolean(status && !terminal.has(status));
       }) ? 2000 : false;
     },
+  });
+
+  const sourceListPreferencesQuery = useQuery<SourceListPreferencesResponse>({
+    queryKey: ["source-list-preferences"],
+    queryFn: () => resourceClient.get("/source-list/preferences").then((response) => response.data),
+  });
+
+  const setSourceListSort = useMutation({
+    mutationFn: (sortMode: SourceListSortMode) =>
+      resourceClient.put("/source-list/preferences", { sort_mode: sortMode }),
+    onSuccess: (_data, sortMode) => {
+      queryClient.setQueryData(["source-list-preferences"], { sort_mode: sortMode });
+    },
+    onError: (error) => handleAuthorityError(error, "Failed to save Source List sorting."),
+  });
+
+  const setSourcePin = useMutation({
+    mutationFn: ({ sourceId, pinned }: { sourceId: string; pinned: boolean }) =>
+      pinned
+        ? resourceClient.put(`/sources/${sourceId}/pin`)
+        : resourceClient.delete(`/sources/${sourceId}/pin`),
+    onError: (error) => handleAuthorityError(error, "Failed to update the pinned source."),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["sources"] }),
   });
 
   const currentLocalJobsQuery = useQuery<LocalAgentJobStatusResponse[]>({
@@ -447,10 +479,52 @@ export function SourcesPage() {
     }
   });
 
-  const groups = groupSourcesByProject(sources, projects, resolvedBySource);
+  const sourceTypeLabels = Object.fromEntries(
+    Object.entries(SOURCE_LABELS).map(([type, label]) => [type, label.name]),
+  );
+  const baseGroups = groupSourcesByProject(sources, projects, resolvedBySource);
+  const groups = organizeSourceGroups(
+    baseGroups,
+    {
+      query: sourceSearch,
+      pinnedOnly,
+      sortMode: sourceListPreferencesQuery.data?.sort_mode ?? "newest",
+      typeLabels: sourceTypeLabels,
+    },
+  );
+  const visibleSourceIds = new Set(groups.flatMap((group) => group.sources.map(({ source }) => source.id)));
+  const visibleSourceCount = visibleSourceIds.size;
+  const pinnedSourceCount = sources.filter((source) => source.pinned_for_me).length;
+  const hasOrganizationFilter = sourceSearch.trim().length > 0 || pinnedOnly;
+  const newSourceGroup = newSourceId
+    ? groups.find((group) => group.sources.some(({ source }) => source.id === newSourceId))
+    : undefined;
+  const newSourceGroupKey = newSourceGroup ? projectGroupKey(newSourceGroup) : null;
+
+  useEffect(() => {
+    if (!newSourceId || !sources.some((source) => source.id === newSourceId)) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (newSourceGroupKey && collapsedGroups.has(newSourceGroupKey)) {
+        setCollapsedGroups((current) => {
+          const next = new Set(current);
+          next.delete(newSourceGroupKey);
+          return next;
+        });
+        return;
+      }
+      const row = document.getElementById(`source-row-${newSourceId}`);
+      row?.scrollIntoView({ behavior: "smooth", block: "center" });
+      row?.focus({ preventScroll: true });
+    });
+    const timeout = window.setTimeout(() => setNewSourceId(null), 3_000);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timeout);
+    };
+  }, [collapsedGroups, newSourceGroupKey, newSourceId, sources]);
 
   const allInUnmapped =
-    sources.length > 0 && groups.length === 1 && groups[0].project === null;
+    sources.length > 0 && baseGroups.length === 1 && baseGroups[0].project === null;
 
   const isGroupExpanded = (group: typeof groups[number]) => {
     const key = projectGroupKey(group);
@@ -491,10 +565,59 @@ export function SourcesPage() {
 
       <DataSurface>
         <div className="border-b p-4">
-          <h2 className="text-base font-semibold">Source List</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {sources.length.toLocaleString()} configured ingestion sources.
-          </p>
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+            <div>
+              <h2 className="text-base font-semibold">Source List</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                {hasOrganizationFilter
+                  ? `${visibleSourceCount.toLocaleString()} of ${sources.length.toLocaleString()} sources`
+                  : `${sources.length.toLocaleString()} configured ingestion sources.`}
+              </p>
+            </div>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <label className="relative min-w-0 sm:w-64">
+                <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <input
+                  type="search"
+                  value={sourceSearch}
+                  onChange={(event) => setSourceSearch(event.target.value)}
+                  placeholder="Search sources"
+                  aria-label="Search sources"
+                  className="h-9 w-full rounded-md border bg-background pl-9 pr-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+              </label>
+              <Select<SourceListSortMode>
+                value={sourceListPreferencesQuery.data?.sort_mode ?? "newest"}
+                disabled={sourceListPreferencesQuery.isLoading || setSourceListSort.isPending}
+                onValueChange={(value) => value && setSourceListSort.mutate(value)}
+              >
+                <SelectTrigger aria-label="Sort sources" className="h-9 w-full sm:w-44">
+                  <SelectValue>
+                    {sourceListPreferencesQuery.data?.sort_mode === "name"
+                      ? "Name"
+                      : sourceListPreferencesQuery.data?.sort_mode === "recently_synced"
+                        ? "Recently synced"
+                        : "Newest added"}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="newest">Newest added</SelectItem>
+                  <SelectItem value="name">Name</SelectItem>
+                  <SelectItem value="recently_synced">Recently synced</SelectItem>
+                </SelectContent>
+              </Select>
+              <Button
+                type="button"
+                variant={pinnedOnly ? "secondary" : "outline"}
+                size="sm"
+                aria-pressed={pinnedOnly}
+                onClick={() => setPinnedOnly((current) => !current)}
+              >
+                <Pin className="size-4" />
+                Pinned {pinnedSourceCount}
+              </Button>
+            </div>
+          </div>
         </div>
         {authorityMessage && (
           <div
@@ -529,6 +652,29 @@ export function SourcesPage() {
           }
         >
           <div>
+            {sources.length > 0 && groups.length === 0 && (
+              <div className="flex flex-col items-center justify-center px-6 py-16 text-center">
+                <div className="mb-3 grid size-10 place-items-center rounded-full bg-muted text-muted-foreground">
+                  <Search className="size-5" />
+                </div>
+                <h3 className="text-sm font-medium">No matching sources</h3>
+                <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+                  Search by source name, type, or project.
+                </p>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="mt-4"
+                  onClick={() => {
+                    setSourceSearch("");
+                    setPinnedOnly(false);
+                  }}
+                >
+                  Show all sources
+                </Button>
+              </div>
+            )}
             {allInUnmapped && (
               <div className="border-b bg-amber-50/60 px-4 py-3 text-sm text-amber-900 dark:bg-amber-900/20 dark:text-amber-100">
                 None of your sources are bound to a project yet. Open Configure on any source
@@ -577,10 +723,6 @@ export function SourcesPage() {
                     };
                     const itemLabel =
                       sourceItemLabel(source);
-                    const showActionsMenu =
-                      capabilities.can_configure ||
-                      capabilities.can_force_resync ||
-                      capabilities.can_delete;
                     const enabledForMe = source.enabled_for_me ?? source.subscription?.enabled ?? true;
 
                     return (
@@ -618,8 +760,7 @@ export function SourcesPage() {
                           setSubscription.mutate({ sourceId: source.id, enabled });
                         }}
                         actionsMenu={
-                          showActionsMenu ? (
-                            <SourceActionsMenu
+                          <SourceActionsMenu
                               source={source}
                               capabilities={capabilities}
                               open={openMenuSourceId === source.id}
@@ -641,11 +782,22 @@ export function SourcesPage() {
                                   status: source.status === "paused" ? "active" : "paused",
                                 });
                               }}
+                              onTogglePin={() => {
+                                setOpenMenuSourceId(null);
+                                setSourcePin.mutate({
+                                  sourceId: source.id,
+                                  pinned: !source.pinned_for_me,
+                                });
+                              }}
                               disableForceResync={isSyncing || isDeleting || source.status === "paused"}
                               disableToggleStatus={isSyncing || isDeleting || isUpdatingStatus}
                               isUpdatingStatus={isUpdatingStatus}
-                            />
-                          ) : null
+                          />
+                        }
+                        highlighted={newSourceId === source.id}
+                        onUnpin={() => setSourcePin.mutate({ sourceId: source.id, pinned: false })}
+                        isPinPending={
+                          setSourcePin.isPending && setSourcePin.variables?.sourceId === source.id
                         }
                       />
                     );
@@ -676,6 +828,13 @@ export function SourcesPage() {
         sourceType={configDialog.sourceType}
         source={configDialog.source}
         initialFocus={configDialog.initialFocus}
+        onSaved={(sourceId) => {
+          if (!configDialog.source) {
+            setSourceSearch("");
+            setPinnedOnly(false);
+            setNewSourceId(sourceId);
+          }
+        }}
       />
 
       <AgentSessionDetailsDialog
@@ -708,6 +867,7 @@ function SourceActionsMenu({
   onDelete,
   onForceResync,
   onToggleStatus,
+  onTogglePin,
   disableForceResync,
   disableToggleStatus,
   isUpdatingStatus,
@@ -719,6 +879,7 @@ function SourceActionsMenu({
   onDelete: () => void;
   onForceResync: () => void;
   onToggleStatus: () => void;
+  onTogglePin: () => void;
   disableForceResync: boolean;
   disableToggleStatus: boolean;
   isUpdatingStatus: boolean;
@@ -733,6 +894,7 @@ function SourceActionsMenu({
   const canToggleStatus = capabilities.can_configure;
   const canForceResync = capabilities.can_force_resync;
   const canDelete = capabilities.can_delete;
+  const isPinned = Boolean(source.pinned_for_me);
   const toggleStatusLabel = isPaused ? "Resume source" : "Pause source";
   const ToggleStatusIcon = isPaused ? Play : Pause;
   const forceResyncDisabledHint = isPaused
@@ -809,6 +971,23 @@ function SourceActionsMenu({
           className="z-50 rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg"
           style={menuStyle}
         >
+          <button
+            type="button"
+            role="menuitem"
+            className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm hover:bg-muted"
+            onClick={onTogglePin}
+          >
+            {isPinned ? <PinOff className="mt-0.5 size-4" /> : <Pin className="mt-0.5 size-4" />}
+            <span>
+              <span className="block font-medium text-foreground">
+                {isPinned ? "Unpin source" : "Pin source"}
+              </span>
+              <span className="mt-0.5 block text-xs">
+                {isPinned ? "Return it to the selected sort order." : "Show it first wherever it appears."}
+              </span>
+            </span>
+          </button>
+          {(canToggleStatus || canForceResync || canDelete) && <div className="my-1 h-px bg-border" />}
           {canToggleStatus && (
             <button
               type="button"

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
-import { Info, Loader2, Pause, Play, RefreshCw, SlidersHorizontal } from "lucide-react";
+import { Info, Loader2, Pause, Pin, Play, RefreshCw, SlidersHorizontal } from "lucide-react";
 import type { Source, SourceCapabilities, SourceOwnership, SyncStatus } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
 import { SourceSyncStatusCard } from "@/components/admin/SourceSyncStatusCard";
@@ -62,6 +62,9 @@ export function SourceRow({
   onShowDetails,
   onSubscriptionChange,
   actionsMenu,
+  highlighted = false,
+  onUnpin,
+  isPinPending = false,
 }: {
   source: Source;
   perGroupMemoryCount: number;
@@ -80,6 +83,9 @@ export function SourceRow({
   onShowDetails: () => void;
   onSubscriptionChange: (enabled: boolean) => void;
   actionsMenu: ReactNode;
+  highlighted?: boolean;
+  onUnpin?: () => void;
+  isPinPending?: boolean;
 }) {
   const isPaused = source.status === "paused";
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
@@ -102,13 +108,34 @@ export function SourceRow({
   const durableSyncLabel = activeSyncLabel(source.sync?.status);
 
   return (
-    <div className="space-y-3 p-4">
+    <div
+      id={`source-row-${source.id}`}
+      tabIndex={-1}
+      className={cn(
+        "space-y-3 p-4 transition-colors duration-700 focus:outline-none",
+        highlighted && "bg-primary/5 ring-2 ring-inset ring-primary/30",
+      )}
+    >
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="flex min-w-0 items-start gap-3">
           <SourceIcon type={source.type} client={source.client} className="mt-0.5 size-5" />
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="truncate text-sm font-medium">{source.name}</h3>
+              {source.pinned_for_me && onUnpin && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  disabled={isPinPending}
+                  aria-label={`Unpin ${source.name}`}
+                  title="Unpin source"
+                  className="-m-1 text-muted-foreground hover:text-foreground"
+                  onClick={onUnpin}
+                >
+                  <Pin className="size-3.5 fill-current" />
+                </Button>
+              )}
               <SourceLifecycleBadge status={source.status} />
               {showReadiness && (
                 <SourceReadinessBadge

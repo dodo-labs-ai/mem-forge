@@ -100,6 +100,10 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
             assert source_id == "src-neutral"
             return True
 
+        async def is_source_pinned_for_user(self, source_id: str, user_id: str) -> bool:
+            assert source_id == "src-neutral"
+            return False
+
         async def set_source_subscription(
             self, source_id: str, user_id: str, enabled: bool
         ) -> None:
@@ -129,6 +133,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
     }
     assert source["doc_count"] == 3
     assert source["memory_count"] == 7
+    assert source["pinned_for_me"] is False
     assert source["client"] is None
     assert source["sync"] == {
         "status": "partial",

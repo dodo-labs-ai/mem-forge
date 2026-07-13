@@ -46,7 +46,7 @@ export function TeamsSourceSetup({
   source?: Source | null;
   schema: GeneConfigSchema;
   onOpenChange: (open: boolean) => void;
-  onSaved?: () => void;
+  onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" };
 }) {
   const queryClient = useQueryClient();
@@ -143,13 +143,13 @@ export function TeamsSourceSetup({
       if (source) return resourceClient.put(`/sources/${source.id}`, payload);
       return resourceClient.post("/sources", payload);
     },
-    onSuccess: async () => {
+    onSuccess: async (response) => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["sources"] }),
         queryClient.invalidateQueries({ queryKey: ["projects"] }),
         queryClient.invalidateQueries({ queryKey: ["stats"] }),
       ]);
-      onSaved?.();
+      onSaved?.(source?.id ?? String(response.data.id));
       onOpenChange(false);
     },
   });
