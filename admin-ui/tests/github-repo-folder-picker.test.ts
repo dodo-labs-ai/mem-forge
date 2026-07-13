@@ -118,6 +118,7 @@ assert.deepEqual(repoScopeSummary(nestedItems, ["docs"], ["docs/archived-topics"
 });
 
 const pickerSource = readFileSync("src/views/sources/GitHubRepoFolderPicker.tsx", "utf8");
+const setupSource = readFileSync("src/views/sources/SchemaSourceSetup.tsx", "utf8");
 assert.match(
   pickerSource,
   /createLocalAgentJob/,
@@ -151,3 +152,15 @@ assert.match(pickerSource, /aria-expanded/);
 assert.match(pickerSource, /tone="exclude"/);
 assert.match(pickerSource, /Enter a valid HTTPS Repository URL before browsing/);
 assert.doesNotMatch(pickerSource, /Choose local repository clone|github_repo_pick_root/);
+assert.doesNotMatch(
+  pickerSource,
+  /useState<RepoPickerItem\[\]>/,
+  "Repository preview results should belong to the configuration session, not the collapsible picker section",
+);
+assert.match(
+  setupSource,
+  /const \[githubRepoTreeItems, setGitHubRepoTreeItems\] = useState<RepoPickerItem\[\]>\(\[\]\)/,
+  "The configuration session should preserve repository preview results while sections mount and unmount",
+);
+assert.match(setupSource, /items=\{githubRepoTreeItems\}/);
+assert.match(setupSource, /onItemsChange=\{setGitHubRepoTreeItems\}/);
