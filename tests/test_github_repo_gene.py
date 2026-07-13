@@ -94,6 +94,8 @@ def test_github_repo_gene_is_registered_and_schema_is_repo_oriented():
     assert fields["repo_url"].required is True
     assert fields["ref"].default == "main"
     assert fields["include_paths"].required is False
+    assert fields["exclude_paths"].required is False
+    assert "repo_path" not in fields
     assert fields["include_extensions"].default == "md, markdown, txt, adoc, rst"
     assert fields["max_files"].default == "500"
     assert fields["pat"].required is False
@@ -109,7 +111,8 @@ async def test_cloud_pull_discovers_scoped_markdown_and_fetches_content(monkeypa
             "connection_mode": "cloud_pull",
             "repo_url": "https://github.example.test/payroll/architecture",
             "ref": "main",
-            "include_paths": ["Payroll Processing/"],
+            "include_paths": [],
+            "exclude_paths": ["Flexible Payroll", "Payroll Processing V2"],
             "include_extensions": ["md"],
             "max_files": 10,
         },
@@ -157,6 +160,20 @@ async def test_cloud_pull_discovers_scoped_markdown_and_fetches_content(monkeypa
         "content_type": "text/markdown",
         "canonical_url": "https://github.example.test/payroll/architecture/blob/main/Payroll%20Processing/README.md",
     }
+
+
+def test_normalize_config_canonicalizes_repository_scope() -> None:
+    config = {
+        "connection_mode": "local_push",
+        "repo_url": "https://github.example.test/payroll/architecture",
+        "include_paths": ["docs/current/guide.md", "docs"],
+        "exclude_paths": ["docs/archive/old.md", "docs/archive"],
+    }
+
+    GitHubRepoGene.normalize_config(config)
+
+    assert config["include_paths"] == ["docs"]
+    assert config["exclude_paths"] == ["docs/archive"]
 
 
 @pytest.mark.asyncio

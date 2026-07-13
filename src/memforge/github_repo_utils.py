@@ -63,7 +63,22 @@ def normalize_github_relative_path(value: str) -> str:
 
 
 def github_include_paths(config: dict) -> list[str]:
-    return [normalize_github_relative_path(path) for path in list_config(config.get("include_paths"))]
+    return normalize_github_scope_paths(list_config(config.get("include_paths")))
+
+
+def github_exclude_paths(config: dict) -> list[str]:
+    return normalize_github_scope_paths(list_config(config.get("exclude_paths")))
+
+
+def normalize_github_scope_paths(paths: list[str]) -> list[str]:
+    """Canonicalize repository paths and remove selections covered by an ancestor."""
+    normalized = sorted({normalize_github_relative_path(path).rstrip("/") for path in paths})
+    collapsed: list[str] = []
+    for path in normalized:
+        if any(path == ancestor or path.startswith(ancestor + "/") for ancestor in collapsed):
+            continue
+        collapsed.append(path)
+    return collapsed
 
 
 def github_include_extensions(config: dict) -> set[str]:
@@ -75,14 +90,24 @@ def github_include_extensions(config: dict) -> set[str]:
     return {item.lower().lstrip(".") for item in values if item.strip()}
 
 
-def github_path_in_scope(relative_path: str, include_paths: list[str]) -> bool:
+def github_path_in_scope(
+    relative_path: str,
+    include_paths: list[str],
+    exclude_paths: list[str],
+) -> bool:
     try:
         path = normalize_github_relative_path(relative_path)
     except ValueError:
         return False
-    if not include_paths:
-        return True
-    return any(path == scope or path.startswith(scope.rstrip("/") + "/") for scope in include_paths)
+    included = not include_paths or any(
+        path == scope or path.startswith(scope.rstrip("/") + "/")
+        for scope in include_paths
+    )
+    excluded = any(
+        path == scope or path.startswith(scope.rstrip("/") + "/")
+        for scope in exclude_paths
+    )
+    return included and not excluded
 
 
 def github_extension(relative_path: str) -> str:

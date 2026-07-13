@@ -84,16 +84,16 @@ assert.doesNotMatch(
 );
 
 const githubRepoGenePy = readFileSync("../src/memforge/genes/github_repo_gene.py", "utf8");
-assert.match(
+assert.doesNotMatch(
   githubRepoGenePy,
   /key="repo_path"/,
-  "github_repo local mode should persist the local clone path in source config",
+  "github_repo local mode should not persist a daemon filesystem path",
 );
 
-assert.match(
+assert.doesNotMatch(
   schemaSourceSetupSource,
-  /github_repo_pick_root/,
-  "SchemaSourceSetup should let github_repo choose a local clone through the local-agent queue",
+  /github_repo_pick_root|config\.repo_path|Local repository clone/,
+  "SchemaSourceSetup should not present GitHub Repository as a local-folder source",
 );
 
 assert.doesNotMatch(

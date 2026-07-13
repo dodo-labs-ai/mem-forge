@@ -10,6 +10,7 @@ def test_github_repo_tree_items_synthesizes_folders_and_files():
             {"path": "Flexible Payroll/Overview.md", "type": "blob", "size": 11},
         ],
         limit=20,
+        include_extensions={"md"},
     )
 
     assert [(item.type, item.path, item.size) for item in items] == [
@@ -30,6 +31,24 @@ def test_github_repo_tree_items_returns_limit_plus_one_for_truncation_detection(
             {"path": "c/three.md", "type": "blob"},
         ],
         limit=2,
+        include_extensions={"md"},
     )
 
     assert len(items) == 3
+
+
+def test_github_repo_tree_items_omit_unsupported_files_and_empty_folders():
+    items = _github_repo_tree_items(
+        [
+            {"path": "docs/README.md", "type": "blob"},
+            {"path": "assets/logo.png", "type": "blob"},
+            {"path": "assets", "type": "tree"},
+        ],
+        limit=20,
+        include_extensions={"md"},
+    )
+
+    assert [(item.type, item.path) for item in items] == [
+        ("tree", "docs"),
+        ("blob", "docs/README.md"),
+    ]

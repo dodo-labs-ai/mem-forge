@@ -43,6 +43,7 @@ from memforge.genes.atlassian_auth import (
     require_https_base_url,
     validate_tls_ca_bundle,
 )
+from memforge.github_repo_utils import github_extension_allowed, github_include_extensions
 from memforge.memory.audit import AuditContext
 from memforge.memory.lifecycle import normalize_memory_status
 from memforge.memory.lifecycle_service import (
@@ -139,7 +140,6 @@ SOURCE_ACTIVE_STATUS = "active"
 SOURCE_PAUSED_STATUS = "paused"
 LOCAL_AGENT_STATUS_STALE_SECONDS = 90
 LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES = {
-    "github_repo_pick_root": "github_repo",
     "github_repo_preview_tree": "github_repo",
     "local_markdown_pick_root": "local_markdown",
     "local_markdown_preview_tree": "local_markdown",
@@ -739,6 +739,7 @@ class DiscoveryPreviewResponse(BaseModel):
 
 
 class GitHubRepoTreeRequest(BaseModel):
+    source_id: str | None = None
     config: dict[str, Any]
     limit: int = Field(default=2_000, ge=1, le=10_000)
 
@@ -1514,6 +1515,10 @@ def _validate_github_repo_config(
     existing_config: dict[str, Any] | None = None,
 ) -> None:
     existing_config = existing_config or {}
+    if "repo_path" in config:
+        raise ValueError(
+            "GitHub Repository reads the configured remote repository; repo_path is not a supported field"
+        )
     repo_url = str(config.get("repo_url") or existing_config.get("repo_url") or "").strip()
     require_https_base_url(repo_url, "GitHub Repository")
     from urllib.parse import urlsplit
@@ -1970,7 +1975,12 @@ def _dt_iso(dt: date | datetime | None) -> str | None:
     return value.astimezone(timezone.utc).isoformat()
 
 
-def _github_repo_tree_items(entries: list[dict], *, limit: int) -> list[GitHubRepoTreeItemResponse]:
+def _github_repo_tree_items(
+    entries: list[dict],
+    *,
+    limit: int,
+    include_extensions: set[str],
+) -> list[GitHubRepoTreeItemResponse]:
     folders: set[str] = set()
     blobs: dict[str, int | None] = {}
     for entry in entries:
@@ -1978,10 +1988,9 @@ def _github_repo_tree_items(entries: list[dict], *, limit: int) -> list[GitHubRe
         if not raw_path:
             continue
         entry_type = str(entry.get("type") or "")
-        if entry_type == "tree":
-            folders.add(raw_path)
-            continue
         if entry_type != "blob":
+            continue
+        if not github_extension_allowed(raw_path, include_extensions):
             continue
         try:
             size = int(entry["size"]) if entry.get("size") is not None else None
@@ -3472,11 +3481,28 @@ def create_admin_app(
         )
 
     @gene_router.post("/github_repo/browse-tree", response_model=GitHubRepoTreeResponse)
-    async def browse_github_repo_tree(req: GitHubRepoTreeRequest):
+    async def browse_github_repo_tree(
+        req: GitHubRepoTreeRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
         """List selectable repository paths for the GitHub Repository source UI."""
         try:
-            _validate_source_config("github_repo", req.config)
             config = dict(req.config)
+            if req.source_id:
+                existing = await db.get_source(req.source_id)
+                if not existing:
+                    raise HTTPException(status_code=404, detail="Source not found")
+                _require_source_management(request, existing)
+                _require_local_agent_connection_management(request, existing)
+                if existing["type"] != "github_repo":
+                    raise ValueError("Repository browse source type does not match the existing source")
+                stored_config = decrypt_source_config_for_runtime(
+                    existing["config"],
+                    secret_fields=_source_secret_fields("github_repo"),
+                )
+                config = {**stored_config, **config}
+            _validate_source_config("github_repo", config)
             if str(config.get("connection_mode") or "cloud_pull").strip().lower() != "cloud_pull":
                 raise ValueError("GitHub Repository folder browsing is available only for Public internet access")
             gene = create_gene("github_repo", config, source_id="browse-github-repo")
@@ -3486,7 +3512,13 @@ def create_admin_app(
             if not ref:
                 ref = await gene._default_branch(repo_ref)  # noqa: SLF001 - shared source implementation.
             entries = await gene._repo_tree(repo_ref, ref)  # noqa: SLF001 - shared source implementation.
-            items = _github_repo_tree_items(entries, limit=req.limit)
+            items = _github_repo_tree_items(
+                entries,
+                limit=req.limit,
+                include_extensions=github_include_extensions(config),
+            )
+        except HTTPException:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:

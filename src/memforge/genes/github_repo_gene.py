@@ -26,10 +26,13 @@ from memforge.github_repo_utils import (
     build_github_repo_doc_id,
     decode_github_base64_content,
     github_content_type,
+    github_exclude_paths,
     github_extension_allowed,
     github_include_extensions,
     github_include_paths,
     github_path_in_scope,
+    list_config,
+    normalize_github_scope_paths,
     normalize_github_relative_path,
     parse_github_repo_url,
 )
@@ -70,8 +73,8 @@ class GitHubRepoGene(Gene):
 
     The same source type supports two delivery modes:
     - ``cloud_pull``: MemForge calls the GitHub REST API directly.
-    - ``local_push``: the source config names a local clone and the user's
-      daemon uploads raw file packages for server-side processing.
+    - ``local_push``: the user's daemon reads the remote repository with its
+      local GitHub session and uploads raw file packages for server processing.
     """
 
     @classmethod
@@ -125,16 +128,6 @@ class GitHubRepoGene(Gene):
                     order=2,
                 ),
                 ConfigField(
-                    key="repo_path",
-                    label="Local Clone Path",
-                    field_type=ConfigFieldType.STRING,
-                    required=False,
-                    placeholder="/Users/me/work/repo",
-                    help_text="Local clone path on the machine running the MemForge daemon.",
-                    group="connection",
-                    order=3,
-                ),
-                ConfigField(
                     key="ref",
                     label="Branch, Tag, or Commit",
                     field_type=ConfigFieldType.STRING,
@@ -156,6 +149,16 @@ class GitHubRepoGene(Gene):
                     order=1,
                 ),
                 ConfigField(
+                    key="exclude_paths",
+                    label="Folders or Files to Exclude",
+                    field_type=ConfigFieldType.TAG_LIST,
+                    required=False,
+                    placeholder="docs/archived/, docs/outdated.md",
+                    help_text="Repository-relative folders or files to leave out. Exclusions override selected paths.",
+                    group="scope",
+                    order=2,
+                ),
+                ConfigField(
                     key="include_extensions",
                     label="File Extensions",
                     field_type=ConfigFieldType.TAG_LIST,
@@ -164,7 +167,7 @@ class GitHubRepoGene(Gene):
                     placeholder=DEFAULT_INCLUDE_EXTENSIONS,
                     help_text="Text-like extensions to sync. Binary assets are skipped unless explicitly allowed.",
                     group="scope",
-                    order=2,
+                    order=3,
                     advanced=True,
                 ),
                 ConfigField(
@@ -175,7 +178,7 @@ class GitHubRepoGene(Gene):
                     default=str(DEFAULT_MAX_FILES),
                     help_text="Stop with an error if the selected scope contains more files.",
                     group="scope",
-                    order=3,
+                    order=4,
                     advanced=True,
                 ),
             ],
@@ -191,8 +194,8 @@ class GitHubRepoGene(Gene):
         config["connection_mode"] = _connection_mode(config)
         if not str(config.get("ref") or "").strip():
             config["ref"] = "main"
-        if "repo_path" in config:
-            config["repo_path"] = str(config.get("repo_path") or "").strip()
+        config["include_paths"] = normalize_github_scope_paths(list_config(config.get("include_paths")))
+        config["exclude_paths"] = normalize_github_scope_paths(list_config(config.get("exclude_paths")))
 
     async def authenticate(self) -> None:
         self._repo_ref = _parse_repo_url(str(self.config.get("repo_url") or ""))
@@ -228,13 +231,14 @@ class GitHubRepoGene(Gene):
             ref = await self._default_branch(repo_ref)
         entries = await self._repo_tree(repo_ref, ref)
         include_paths = github_include_paths(self.config)
+        exclude_paths = github_exclude_paths(self.config)
         include_exts = github_include_extensions(self.config)
         max_files = _int_config(self.config, "max_files", DEFAULT_MAX_FILES)
         selected = [
             entry
             for entry in entries
             if entry.get("type") == "blob"
-            and github_path_in_scope(str(entry.get("path") or ""), include_paths)
+            and github_path_in_scope(str(entry.get("path") or ""), include_paths, exclude_paths)
             and github_extension_allowed(str(entry.get("path") or ""), include_exts)
         ]
         if len(selected) > max_files:
@@ -495,10 +499,11 @@ def _package_matches_config(package: dict, config: dict) -> bool:
         return False
     try:
         include_paths = github_include_paths(config)
+        exclude_paths = github_exclude_paths(config)
         normalized_path = normalize_github_relative_path(relative_path)
     except ValueError:
         return False
-    if not github_path_in_scope(normalized_path, include_paths):
+    if not github_path_in_scope(normalized_path, include_paths, exclude_paths):
         return False
     return github_extension_allowed(normalized_path, github_include_extensions(config))
 

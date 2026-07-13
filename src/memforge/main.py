@@ -37,6 +37,7 @@ from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSION_LIST,
     decode_github_base64_content,
     github_content_type,
+    github_exclude_paths,
     github_extension,
     github_include_extensions,
     github_include_paths,
@@ -420,82 +421,6 @@ def _gh_api_json(repo: dict[str, str], endpoint: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _git_run(repo_path: Path, args: list[str], *, text: bool = True) -> subprocess.CompletedProcess:
-    try:
-        return subprocess.run(
-            ["git", "-C", str(repo_path), *args],
-            capture_output=True,
-            text=text,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise click.ClickException("Git is required for local GitHub repository clone sync.") from exc
-
-
-def _git_checked(repo_path: Path, args: list[str], *, text: bool = True) -> subprocess.CompletedProcess:
-    result = _git_run(repo_path, args, text=text)
-    if result.returncode != 0:
-        stderr = result.stderr if isinstance(result.stderr, str) else bytes(result.stderr or b"").decode("utf-8", "replace")
-        stdout = result.stdout if isinstance(result.stdout, str) else bytes(result.stdout or b"").decode("utf-8", "replace")
-        detail = (stderr or stdout or "git command failed").strip()
-        raise click.ClickException(f"Local Git repository request failed: {detail}")
-    return result
-
-
-def _repo_path_from_profile(profile: dict[str, Any], repo: dict[str, str]) -> Path | None:
-    raw_path = str(profile.get("repo_path") or "").strip()
-    if not raw_path:
-        return None
-    candidate = Path(raw_path).expanduser()
-    if not candidate.exists() or not candidate.is_dir():
-        raise click.ClickException(f"GitHub repository path does not exist or is not a directory: {candidate}")
-    top_level = _git_checked(candidate, ["rev-parse", "--show-toplevel"]).stdout.strip()
-    repo_path = Path(top_level).resolve()
-    remote = _git_checked(repo_path, ["remote", "get-url", "origin"]).stdout.strip()
-    try:
-        remote_repo = parse_github_repo_url(remote)
-    except ValueError as exc:
-        raise click.ClickException("GitHub repository path origin remote must be an https GitHub URL.") from exc
-    if remote_repo["repo_url"] != repo["repo_url"]:
-        raise click.ClickException(
-            f"GitHub repository path origin {remote_repo['repo_url']} does not match configured repo_url {repo['repo_url']}."
-        )
-    return repo_path
-
-
-def _github_local_tree(repo_path: Path, ref: str) -> list[dict[str, Any]]:
-    result = _git_checked(repo_path, ["ls-tree", "-z", "-r", "-l", ref, "--"])
-    entries: list[dict[str, Any]] = []
-    for line in result.stdout.split("\0"):
-        if not line:
-            continue
-        metadata, separator, path = line.partition("\t")
-        if not separator:
-            continue
-        parts = metadata.split()
-        if len(parts) < 4 or parts[1] != "blob":
-            continue
-        size_raw = parts[3]
-        try:
-            size = int(size_raw)
-        except ValueError:
-            size = 0
-        entries.append({"path": path, "type": "blob", "sha": parts[2], "size": size})
-    return entries
-
-
-def _github_tree_for_profile(repo: dict[str, str], ref: str, profile: dict[str, Any]) -> tuple[list[dict[str, Any]], Path | None]:
-    repo_path = _repo_path_from_profile(profile, repo)
-    if repo_path is not None:
-        return _github_local_tree(repo_path, ref), repo_path
-    return _github_tree(repo, ref), None
-
-
-def _github_local_content(repo_path: Path, ref: str, relative_path: str) -> bytes:
-    result = _git_checked(repo_path, ["show", f"{ref}:{relative_path}"], text=False)
-    return result.stdout
-
-
 def _github_tree(repo: dict[str, str], ref: str) -> list[dict[str, Any]]:
     payload = _gh_api_json(
         repo,
@@ -525,17 +450,21 @@ def _github_content(repo: dict[str, str], ref: str, relative_path: str) -> bytes
         raise click.ClickException(str(exc)) from exc
 
 
-def _resolve_github_profile(name: str, profile: dict[str, Any]) -> tuple[dict[str, str], str, list[str], list[str]]:
+def _resolve_github_profile(
+    name: str,
+    profile: dict[str, Any],
+) -> tuple[dict[str, str], str, list[str], list[str], list[str]]:
     repo = _parse_github_repo_url(str(profile.get("repo_url") or ""))
     ref = str(profile.get("ref") or "main").strip() or "main"
     if ref.startswith("-"):
         raise click.ClickException("GitHub repository ref must not start with '-'.")
     try:
         include_paths = github_include_paths(profile)
+        exclude_paths = github_exclude_paths(profile)
     except ValueError as exc:
         raise click.ClickException(str(exc).replace("relative_path", "GitHub include path")) from exc
     include_extensions = sorted(github_include_extensions(profile))
-    return repo, ref, include_paths, include_extensions
+    return repo, ref, include_paths, exclude_paths, include_extensions
 
 
 def _github_title(markdown_body: str, fallback: str) -> str:
@@ -547,16 +476,16 @@ def _github_title(markdown_body: str, fallback: str) -> str:
 
 
 def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | None) -> dict[str, Any]:
-    repo, ref, include_paths, include_extensions = _resolve_github_profile(name, profile)
+    repo, ref, include_paths, exclude_paths, include_extensions = _resolve_github_profile(name, profile)
     counts = {"included": 0, "ignored": 0}
     extension_counts: dict[str, int] = {}
     items: list[dict[str, Any]] = []
-    tree, repo_path = _github_tree_for_profile(repo, ref, profile)
+    tree = _github_tree(repo, ref)
     for entry in tree:
         if entry.get("type") != "blob":
             continue
         relative_path = str(entry.get("path") or "")
-        if not github_path_in_scope(relative_path, include_paths):
+        if not github_path_in_scope(relative_path, include_paths, exclude_paths):
             counts["ignored"] += 1
             continue
         extension = github_extension(relative_path)
@@ -580,13 +509,12 @@ def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | 
         "repo_url": repo["repo_url"],
         "ref": ref,
         "include_paths": include_paths,
+        "exclude_paths": exclude_paths,
         "include_extensions": include_extensions,
         "counts": counts,
         "extension_counts": dict(sorted(extension_counts.items())),
         "items": items,
     }
-    if repo_path is not None:
-        payload["repo_path"] = str(repo_path)
     return payload
 
 
@@ -1869,8 +1797,7 @@ def _push_github_profile_to_source(
     if not source_id:
         raise click.ClickException("source_id is required")
 
-    repo, ref, _include_paths, _include_extensions = _resolve_github_profile(name, profile)
-    repo_path = _repo_path_from_profile(profile, repo)
+    repo, ref, _include_paths, _exclude_paths, _include_extensions = _resolve_github_profile(name, profile)
     preview = _preview_github_profile(name, profile, limit=None if limit == 0 else max(limit, 0))
     selected_entries = list(preview["items"])
     _report_local_agent_progress(
@@ -1888,9 +1815,7 @@ def _push_github_profile_to_source(
     for entry in selected_entries:
         relative_path = str(entry["relative_path"])
         try:
-            raw = _github_local_content(repo_path, ref, relative_path) if repo_path is not None else _github_content(
-                repo, ref, relative_path
-            )
+            raw = _github_content(repo, ref, relative_path)
             text_body = raw.decode("utf-8")
         except UnicodeDecodeError:
             failed.append({"relative_path": relative_path, "error": "invalid utf-8"})
@@ -1981,7 +1906,6 @@ def _run_cloud_local_agent_job(
 ) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     handlers = {
-        "github_repo_pick_root": lambda: _run_cloud_pick_root_job(job),
         "github_repo_preview_tree": lambda: _run_cloud_github_preview_job(job),
         "github_repo_sync": lambda: _run_cloud_github_sync_job(job, client, report_progress=report_progress),
         "local_markdown_pick_root": lambda: _run_cloud_pick_root_job(job),
@@ -2015,7 +1939,8 @@ def _run_cloud_github_preview_job(job: dict[str, Any]) -> dict[str, Any]:
     profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
 
     limit = _cloud_job_limit(payload.get("limit"), default=200)
-    preview = _preview_github_profile(profile_name, profile, limit=limit)
+    tree_profile = {**profile, "include_paths": [], "exclude_paths": []}
+    preview = _preview_github_profile(profile_name, tree_profile, limit=limit)
     return {"operation": operation, "source_id": source_id, **preview}
 
 
@@ -2709,7 +2634,7 @@ def _github_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
         "repo_url": str(payload.get("repo_url") or "").strip(),
         "ref": str(payload.get("ref") or "main").strip() or "main",
     }
-    for key in ("include_paths", "include_extensions", "repo_path"):
+    for key in ("include_paths", "exclude_paths", "include_extensions"):
         if key in payload:
             profile[key] = payload[key]
     return profile
