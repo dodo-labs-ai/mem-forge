@@ -161,7 +161,7 @@ function withProgress(
     : `${progress.completed} ${label}${discovered ? " found so far" : ""}`;
   const presentation: SourceSyncPresentation = {
     message,
-    detail: [count, memories != null ? `${memories} memories found` : ""].filter(Boolean).join(" · "),
+    detail: [count, memories != null ? `${memories} new memories saved` : ""].filter(Boolean).join(" · "),
   };
   if (progress.total != null && progress.total > 0) {
     presentation.completed = progress.completed;
