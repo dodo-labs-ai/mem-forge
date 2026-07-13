@@ -1,7 +1,7 @@
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Files, Info, Loader2, MoreHorizontal, Pause, Pin, PinOff, Play, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
+import { Files, Info, Loader2, LockKeyhole, MoreHorizontal, Pause, Pin, PinOff, Play, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { resourceClient } from "@/api/client";
 import { createLocalAgentJob, getCurrentLocalAgentJobs, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
@@ -33,6 +33,7 @@ import {
 import { timeAgo } from "@/utils/date";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { SourceSetupDialog } from "./SourceSetupDialog";
+import { SourceAccessChangeDialog } from "./SourceAccessChangeDialog";
 import { LocalAgentDaemonStatus } from "./LocalAgentDaemonStatus";
 import { isManagedSourceId, isManagedSourceType, userConfigurableGenes } from "./managedSources";
 import { getSourceActionEndpoint, getSourceMenuStyle, sourceActionLayout } from "./sourceActions";
@@ -209,6 +210,7 @@ export function SourcesPage() {
     initialFocus?: { step: "project" };
   }>({ sourceType: null, source: null });
   const [detailsSource, setDetailsSource] = useState<Source | null>(null);
+  const [accessSource, setAccessSource] = useState<Source | null>(null);
   const [openMenuSourceId, setOpenMenuSourceId] = useState<string | null>(null);
   const [sourcePendingDelete, setSourcePendingDelete] = useState<Source | null>(null);
   const [pendingSyncIds, setPendingSyncIds] = useState<Set<string>>(new Set());
@@ -261,6 +263,9 @@ export function SourcesPage() {
       const sources = normalizeSources(query.state.data);
       const terminal = new Set(["success", "partial", "failed"]);
       return sources.some((source) => {
+        if (source.access_state === "changing" && source.access_transition?.status !== "failed") {
+          return true;
+        }
         const status = source.sync?.status;
         return Boolean(status && !terminal.has(status));
       }) ? 2000 : false;
@@ -443,6 +448,24 @@ export function SourcesPage() {
       queryClient.invalidateQueries({ queryKey: ["sources"] });
       queryClient.invalidateQueries({ queryKey: ["memories"] });
     },
+  });
+
+  const retrySourceAccess = useMutation({
+    mutationFn: (source: Source) => {
+      const operationId = source.access_transition?.operation_id;
+      if (!operationId) throw new Error("No access operation is available to retry.");
+      return resourceClient.post(`/sources/${source.id}/access-transitions/${operationId}/retry`);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["sources"] }),
+  });
+
+  const revertSourceAccess = useMutation({
+    mutationFn: (source: Source) => {
+      const operationId = source.access_transition?.operation_id;
+      if (!operationId) throw new Error("No access operation is available to revert.");
+      return resourceClient.post(`/sources/${source.id}/access-transitions/${operationId}/revert`);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["sources"] }),
   });
 
   const sources = normalizeSources(sourcesQuery.data);
@@ -714,6 +737,7 @@ export function SourcesPage() {
                       can_sync: false,
                       can_force_resync: false,
                       can_delete: false,
+                      can_change_access: false,
                     };
                     const isManaged = isManagedSourceType(source.type) || isManagedSourceId(source.id);
                     const gene = geneByName.get(source.type);
@@ -789,6 +813,10 @@ export function SourcesPage() {
                                   pinned: !source.pinned_for_me,
                                 });
                               }}
+                              onChangeAccess={() => {
+                                setOpenMenuSourceId(null);
+                                setAccessSource(source);
+                              }}
                               disableForceResync={isSyncing || isDeleting || source.status === "paused"}
                               disableToggleStatus={isSyncing || isDeleting || isUpdatingStatus}
                               isUpdatingStatus={isUpdatingStatus}
@@ -798,6 +826,18 @@ export function SourcesPage() {
                         onUnpin={() => setSourcePin.mutate({ sourceId: source.id, pinned: false })}
                         isPinPending={
                           setSourcePin.isPending && setSourcePin.variables?.sourceId === source.id
+                        }
+                        onRetryAccess={
+                          source.ownership?.viewer_relationship === "owner"
+                          && source.access_transition?.status === "failed"
+                            ? () => retrySourceAccess.mutate(source)
+                            : undefined
+                        }
+                        onRevertAccess={
+                          source.ownership?.viewer_relationship === "owner"
+                          && source.access_transition?.status === "failed"
+                            ? () => revertSourceAccess.mutate(source)
+                            : undefined
                         }
                       />
                     );
@@ -835,6 +875,14 @@ export function SourcesPage() {
             setNewSourceId(sourceId);
           }
         }}
+        onRequestAccessChange={setAccessSource}
+      />
+
+      <SourceAccessChangeDialog
+        source={accessSource}
+        onOpenChange={(open) => {
+          if (!open) setAccessSource(null);
+        }}
       />
 
       <AgentSessionDetailsDialog
@@ -868,6 +916,7 @@ function SourceActionsMenu({
   onForceResync,
   onToggleStatus,
   onTogglePin,
+  onChangeAccess,
   disableForceResync,
   disableToggleStatus,
   isUpdatingStatus,
@@ -880,6 +929,7 @@ function SourceActionsMenu({
   onForceResync: () => void;
   onToggleStatus: () => void;
   onTogglePin: () => void;
+  onChangeAccess: () => void;
   disableForceResync: boolean;
   disableToggleStatus: boolean;
   isUpdatingStatus: boolean;
@@ -894,6 +944,7 @@ function SourceActionsMenu({
   const canToggleStatus = capabilities.can_configure;
   const canForceResync = capabilities.can_force_resync;
   const canDelete = capabilities.can_delete;
+  const canChangeAccess = capabilities.can_change_access && source.access_state === "active";
   const isPinned = Boolean(source.pinned_for_me);
   const toggleStatusLabel = isPaused ? "Resume source" : "Pause source";
   const ToggleStatusIcon = isPaused ? Play : Pause;
@@ -987,7 +1038,21 @@ function SourceActionsMenu({
               </span>
             </span>
           </button>
-          {(canToggleStatus || canForceResync || canDelete) && <div className="my-1 h-px bg-border" />}
+          {(canToggleStatus || canForceResync || canChangeAccess || canDelete) && <div className="my-1 h-px bg-border" />}
+          {canChangeAccess && (
+            <button
+              type="button"
+              role="menuitem"
+              className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm hover:bg-muted"
+              onClick={onChangeAccess}
+            >
+              <LockKeyhole className="mt-0.5 size-4" />
+              <span>
+                <span className="block font-medium text-foreground">Change access</span>
+                <span className="mt-0.5 block text-xs">Choose only you or everyone in the workspace.</span>
+              </span>
+            </button>
+          )}
           {canToggleStatus && (
             <button
               type="button"
@@ -1029,7 +1094,7 @@ function SourceActionsMenu({
           )}
           {canDelete && (
             <>
-              {(canToggleStatus || canForceResync) && <div className="my-1 h-px bg-border" />}
+              {(canToggleStatus || canForceResync || canChangeAccess) && <div className="my-1 h-px bg-border" />}
               <button
                 type="button"
                 role="menuitem"
@@ -1548,7 +1613,7 @@ function DeleteSourceDialog({
   const ownership = source?.ownership;
   const creatorLabel = (() => {
     if (!ownership) return null;
-    if (ownership.viewer_relationship === "creator") return "Created by you";
+    if (ownership.viewer_relationship === "owner") return "Created by you";
     if (ownership.created_by_user_id) return `Created by ${ownership.created_by_user_id}`;
     return null;
   })();

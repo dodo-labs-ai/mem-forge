@@ -11,10 +11,14 @@ async def test_promote_to_workspace_raises_audits_and_does_not_mutate(tmp_path):
     await db.connect()
     try:
         priv = Memory(
-            id="m-priv", memory_type="fact", content="x",
+            id="m-priv",
+            memory_type="fact",
+            content="x",
             content_hash=content_hash("x"),
-            visibility=Visibility.PRIVATE.value, owner_user_id="u-alice",
-            project_key=SHARED_PROJECT_KEY, tags=[],
+            visibility=Visibility.PRIVATE.value,
+            owner_user_id="u-alice",
+            project_key=SHARED_PROJECT_KEY,
+            tags=[],
         )
         await db.insert_memory(priv)
 
@@ -48,10 +52,14 @@ async def test_promote_to_workspace_rejects_non_owner(tmp_path):
     await db.connect()
     try:
         priv = Memory(
-            id="m-priv", memory_type="fact", content="x",
+            id="m-priv",
+            memory_type="fact",
+            content="x",
             content_hash=content_hash("x"),
-            visibility=Visibility.PRIVATE.value, owner_user_id="u-alice",
-            project_key=SHARED_PROJECT_KEY, tags=[],
+            visibility=Visibility.PRIVATE.value,
+            owner_user_id="u-alice",
+            project_key=SHARED_PROJECT_KEY,
+            tags=[],
         )
         await db.insert_memory(priv)
 
@@ -99,10 +107,14 @@ async def test_promote_to_workspace_rejects_workspace_memory(tmp_path):
     await db.connect()
     try:
         ws = Memory(
-            id="m-ws", memory_type="fact", content="x",
+            id="m-ws",
+            memory_type="fact",
+            content="x",
             content_hash=content_hash("x"),
-            visibility=Visibility.WORKSPACE.value, owner_user_id=None,
-            project_key=SHARED_PROJECT_KEY, tags=[],
+            visibility=Visibility.WORKSPACE.value,
+            owner_user_id=None,
+            project_key=SHARED_PROJECT_KEY,
+            tags=[],
         )
         await db.insert_memory(ws)
         adapters = build_sqlite_adapters(db, memory_collection=None)

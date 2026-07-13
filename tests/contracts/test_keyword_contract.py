@@ -31,8 +31,7 @@ class KeywordSearchContract:
     @pytest.fixture
     def adapters_factory(self) -> AdaptersFactory:  # pragma: no cover - subclass override
         raise NotImplementedError(
-            "Subclass must override adapters_factory with an async callable "
-            "that returns FactoryResult"
+            "Subclass must override adapters_factory with an async callable that returns FactoryResult"
         )
 
     @pytest.fixture
@@ -43,25 +42,15 @@ class KeywordSearchContract:
         finally:
             await result.teardown()
 
-    async def test_satisfies_keyword_search_protocol(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_satisfies_keyword_search_protocol(self, adapters: ContractAdapters) -> None:
         assert isinstance(adapters.keyword, KeywordSearch)
 
-    async def test_search_matches_active_memory_by_content(
-        self, adapters: ContractAdapters
-    ) -> None:
-        await adapters.relational.insert_memory(
-            make_memory("m1", content="PostgreSQL connection pooling")
-        )
-        hits = await adapters.keyword.search(
-            '"PostgreSQL"', make_scope(), None, limit=10
-        )
+    async def test_search_matches_active_memory_by_content(self, adapters: ContractAdapters) -> None:
+        await adapters.relational.insert_memory(make_memory("m1", content="PostgreSQL connection pooling"))
+        hits = await adapters.keyword.search('"PostgreSQL"', make_scope(), None, limit=10)
         assert [mid for mid, _ in hits] == ["m1"]
 
-    async def test_search_filters_by_status_via_scope(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_search_filters_by_status_via_scope(self, adapters: ContractAdapters) -> None:
         await adapters.relational.insert_memory(
             make_memory("m-active", content="Redis cache eviction", status="active")
         )
@@ -71,40 +60,22 @@ class KeywordSearchContract:
         hits = await adapters.keyword.search('"Redis"', make_scope(), None, limit=10)
         assert [mid for mid, _ in hits] == ["m-active"]
 
-    async def test_search_filters_by_memory_type(
-        self, adapters: ContractAdapters
-    ) -> None:
-        await adapters.relational.insert_memory(
-            make_memory("m1", content="deploy via ArgoCD", memory_type="fact")
-        )
-        empty = await adapters.keyword.search(
-            '"deploy"', make_scope(), ["decision"], limit=10
-        )
+    async def test_search_filters_by_memory_type(self, adapters: ContractAdapters) -> None:
+        await adapters.relational.insert_memory(make_memory("m1", content="deploy via ArgoCD", memory_type="fact"))
+        empty = await adapters.keyword.search('"deploy"', make_scope(), ["decision"], limit=10)
         assert empty == []
-        kept = await adapters.keyword.search(
-            '"deploy"', make_scope(), ["fact"], limit=10
-        )
+        kept = await adapters.keyword.search('"deploy"', make_scope(), ["fact"], limit=10)
         assert [mid for mid, _ in kept] == ["m1"]
 
-    async def test_remove_drops_the_row_from_keyword_results(
-        self, adapters: ContractAdapters
-    ) -> None:
-        await adapters.relational.insert_memory(
-            make_memory("m1", content="PostgreSQL connection pooling")
-        )
-        before = await adapters.keyword.search(
-            '"PostgreSQL"', make_scope(), None, limit=10
-        )
+    async def test_remove_drops_the_row_from_keyword_results(self, adapters: ContractAdapters) -> None:
+        await adapters.relational.insert_memory(make_memory("m1", content="PostgreSQL connection pooling"))
+        before = await adapters.keyword.search('"PostgreSQL"', make_scope(), None, limit=10)
         assert before != []
         await adapters.keyword.remove("m1")
-        after = await adapters.keyword.search(
-            '"PostgreSQL"', make_scope(), None, limit=10
-        )
+        after = await adapters.keyword.search('"PostgreSQL"', make_scope(), None, limit=10)
         assert after == []
 
-    async def test_metadata_title_tokens_recall_memory(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_metadata_title_tokens_recall_memory(self, adapters: ContractAdapters) -> None:
         await adapters.relational.insert_memory(
             make_memory(
                 "m-blocker",
@@ -128,18 +99,14 @@ class KeywordSearchContract:
             source_updated_at=None,
         )
 
-        hits = await adapters.keyword.search_metadata(
-            '"create" "blocker" "hint"', make_scope(), None, limit=10
-        )
+        hits = await adapters.keyword.search_metadata('"create" "blocker" "hint"', make_scope(), None, limit=10)
 
         assert [hit.memory_id for hit in hits] == ["m-blocker"]
         assert hits[0].channel == "bm25_metadata_tokens"
         assert "metadata_any" in hits[0].matched_fields
         assert hits[0].source_refs[0].doc_id == "SFPAY-179397"
 
-    async def test_metadata_source_filter_applies_to_matching_support_row(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_metadata_source_filter_applies_to_matching_support_row(self, adapters: ContractAdapters) -> None:
         await adapters.relational.insert_memory(
             make_memory(
                 "m-shared",
@@ -187,9 +154,7 @@ class KeywordSearchContract:
 
         assert hits == []
 
-    async def test_metadata_client_filter_matches_document_client(
-        self, adapters: ContractAdapters
-    ) -> None:
+    async def test_metadata_client_filter_matches_document_client(self, adapters: ContractAdapters) -> None:
         await adapters.relational.insert_memory(
             make_memory(
                 "m-codex",
@@ -222,10 +187,13 @@ class KeywordSearchContract:
         )
 
         assert [hit.memory_id for hit in hits] == ["m-codex"]
-        assert await adapters.keyword.search_metadata(
-            '"create" "blocker" "hint"',
-            make_scope(),
-            None,
-            limit=10,
-            source_filter=MemorySourceFilter(clients=("claude-code",)),
-        ) == []
+        assert (
+            await adapters.keyword.search_metadata(
+                '"create" "blocker" "hint"',
+                make_scope(),
+                None,
+                limit=10,
+                source_filter=MemorySourceFilter(clients=("claude-code",)),
+            )
+            == []
+        )

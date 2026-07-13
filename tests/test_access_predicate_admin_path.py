@@ -124,7 +124,8 @@ class _Coll:
 
 @pytest.mark.asyncio
 async def test_search_with_admin_styled_caller_still_hides_other_users_private(
-    db, monkeypatch,
+    db,
+    monkeypatch,
 ):
     """Even if a caller arrives with attributes that look administrative
     (here, an attempt to attach a `role` and `is_admin` flag to the scope's
@@ -133,24 +134,33 @@ async def test_search_with_admin_styled_caller_still_hides_other_users_private(
 
     coll = _Coll()
     coll.upsert(
-        ids=["a-shared"], embeddings=[[0.1, 0.1, 0.1]],
-        metadatas=[{
-            "status": "active", "visibility": WORKSPACE,
-            "owner_user_id": "", "project_key": SHARED_PROJECT_KEY,
-            "memory_type": "fact",
-        }],
+        ids=["a-shared"],
+        embeddings=[[0.1, 0.1, 0.1]],
+        metadatas=[
+            {
+                "status": "active",
+                "visibility": WORKSPACE,
+                "owner_user_id": "",
+                "project_key": SHARED_PROJECT_KEY,
+                "memory_type": "fact",
+            }
+        ],
     )
     coll.upsert(
-        ids=["a-priv-u2"], embeddings=[[0.1, 0.1, 0.1]],
-        metadatas=[{
-            "status": "active", "visibility": PRIVATE,
-            "owner_user_id": "u-2", "project_key": SHARED_PROJECT_KEY,
-            "memory_type": "fact",
-        }],
+        ids=["a-priv-u2"],
+        embeddings=[[0.1, 0.1, 0.1]],
+        metadatas=[
+            {
+                "status": "active",
+                "visibility": PRIVATE,
+                "owner_user_id": "u-2",
+                "project_key": SHARED_PROJECT_KEY,
+                "memory_type": "fact",
+            }
+        ],
     )
     await db.insert_memory(_mem("a-shared", "deploy decision"))
-    await db.insert_memory(_mem("a-priv-u2", "deploy decision",
-                                 visibility=PRIVATE, owner="u-2"))
+    await db.insert_memory(_mem("a-priv-u2", "deploy decision", visibility=PRIVATE, owner="u-2"))
 
     adapters = build_sqlite_adapters(db, coll)
     engine = SearchEngine(
@@ -172,7 +182,9 @@ async def test_search_with_admin_styled_caller_still_hides_other_users_private(
         scope_mode="project-first",
     )
     result = await engine.search(
-        "deploy", top_k=10, request_scope=admin_styled_scope,
+        "deploy",
+        top_k=10,
+        request_scope=admin_styled_scope,
     )
     ids = {row.memory_id for row in result["results"]}
     assert "a-shared" in ids

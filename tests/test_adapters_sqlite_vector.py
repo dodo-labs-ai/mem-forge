@@ -133,5 +133,7 @@ async def test_get_record_returns_embedding_and_metadata():
     record = await store.get_record("m1")
     assert record is not None
     stored_metadata = dict(record["metadata"])
-    stored_metadata.pop("embedding_vector_hash", None)  # stamped by upsert_with_stored_vector_hash, not part of the caller payload
+    stored_metadata.pop(
+        "embedding_vector_hash", None
+    )  # stamped by upsert_with_stored_vector_hash, not part of the caller payload
     assert stored_metadata == {"memory_type": "fact"}

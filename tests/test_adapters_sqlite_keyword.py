@@ -89,7 +89,7 @@ async def test_search_filters_by_memory_type(db):
 async def test_metadata_title_tokens_recall_source_title(db):
     now = datetime.now(timezone.utc).isoformat()
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await db.db.execute(
         """INSERT INTO documents
            (doc_id, source, source_url, title, space_or_project, labels, last_modified, version, content_hash, last_synced)
@@ -135,7 +135,7 @@ async def test_metadata_title_tokens_recall_source_title(db):
 async def test_metadata_search_can_return_subchannel_hits_for_ranker(db):
     now = datetime.now(timezone.utc).isoformat()
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await db.db.execute(
         """INSERT INTO documents
            (doc_id, source, source_url, title, space_or_project, labels, last_modified, version, content_hash, last_synced)
@@ -181,7 +181,7 @@ async def test_metadata_search_can_return_subchannel_hits_for_ranker(db):
 @pytest.mark.asyncio
 async def test_metadata_alias_recall_splits_camel_case_source_title(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="SFPAY-179397: PeriodCutOffBlockerHint regression",
@@ -206,7 +206,7 @@ async def test_metadata_alias_recall_splits_camel_case_source_title(db):
 @pytest.mark.asyncio
 async def test_metadata_trigram_recall_handles_compound_no_space_query(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
@@ -230,7 +230,7 @@ async def test_metadata_trigram_recall_handles_compound_no_space_query(db):
 
 @pytest.mark.asyncio
 async def test_metadata_index_populates_from_atomic_memory_source_insert(db):
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
@@ -251,7 +251,7 @@ async def test_metadata_index_populates_from_atomic_memory_source_insert(db):
 @pytest.mark.asyncio
 async def test_metadata_search_excludes_user_disabled_source_rows(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
@@ -273,8 +273,10 @@ async def test_metadata_search_excludes_user_disabled_source_rows(db):
 @pytest.mark.asyncio
 async def test_metadata_search_applies_source_filter_to_matching_support_row(db):
     await db.insert_memory(_memory("m-shared", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
-    await db.upsert_source("src-wiki", "confluence", "Payroll Wiki", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source(
+        "src-wiki", "confluence", "Payroll Wiki", "{}", access_policy="workspace", owner_user_id="dev"
+    )
     await _upsert_doc(
         db,
         doc_id="SFPAY-179397",
@@ -304,19 +306,22 @@ async def test_metadata_search_applies_source_filter_to_matching_support_row(db)
 
     keyword = SqliteKeywordSearch(db)
 
-    assert await keyword.search_metadata(
-        '"create" "blocker" "hint"',
-        _scope(),
-        None,
-        limit=10,
-        source_filter=MemorySourceFilter(source_ids=("src-wiki",)),
-    ) == []
+    assert (
+        await keyword.search_metadata(
+            '"create" "blocker" "hint"',
+            _scope(),
+            None,
+            limit=10,
+            source_filter=MemorySourceFilter(source_ids=("src-wiki",)),
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio
 async def test_metadata_search_applies_source_time_range_to_matching_support_row(db):
     await db.insert_memory(_memory("m-shared", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
@@ -331,23 +336,28 @@ async def test_metadata_search_applies_source_time_range_to_matching_support_row
 
     keyword = SqliteKeywordSearch(db)
 
-    assert await keyword.search_metadata(
-        '"create" "blocker" "hint"',
-        _scope(),
-        None,
-        limit=10,
-        time_range=MemoryTimeRange(
-            after=datetime(2026, 6, 19, tzinfo=timezone.utc),
-            before=datetime(2026, 6, 21, tzinfo=timezone.utc),
-            date_type="source_updated_at",
-        ),
-    ) == []
+    assert (
+        await keyword.search_metadata(
+            '"create" "blocker" "hint"',
+            _scope(),
+            None,
+            limit=10,
+            time_range=MemoryTimeRange(
+                after=datetime(2026, 6, 19, tzinfo=timezone.utc),
+                before=datetime(2026, 6, 21, tzinfo=timezone.utc),
+                date_type="source_updated_at",
+            ),
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio
 async def test_metadata_search_applies_client_filter_to_matching_support_row(db):
     await db.insert_memory(_memory("m-codex", "Agent session summary"))
-    await db.upsert_source("src-codex", "agent_session", "Codex Sessions", "{}")
+    await db.upsert_source(
+        "src-codex", "agent_session", "Codex Sessions", "{}", access_policy="private", owner_user_id="dev"
+    )
     await _upsert_doc(
         db,
         doc_id="codex-session-1",
@@ -375,13 +385,16 @@ async def test_metadata_search_applies_client_filter_to_matching_support_row(db)
 
     assert [hit.memory_id for hit in hits] == ["m-codex"]
     assert hits[0].source_refs[0].doc_id == "codex-session-1"
-    assert await keyword.search_metadata(
-        '"create" "blocker" "hint"',
-        _scope(),
-        None,
-        limit=10,
-        source_filter=MemorySourceFilter(clients=("claude-code",)),
-    ) == []
+    assert (
+        await keyword.search_metadata(
+            '"create" "blocker" "hint"',
+            _scope(),
+            None,
+            limit=10,
+            source_filter=MemorySourceFilter(clients=("claude-code",)),
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio
@@ -393,7 +406,9 @@ async def test_metadata_search_applies_repo_identifier_filter(db):
             repo_identifier="github.tools.sap/hcm/memforge-cloud",
         )
     )
-    await db.upsert_source("src-codex", "agent_session", "Codex Sessions", "{}")
+    await db.upsert_source(
+        "src-codex", "agent_session", "Codex Sessions", "{}", access_policy="private", owner_user_id="dev"
+    )
     await _upsert_doc(
         db,
         doc_id="codex-session-1",
@@ -422,13 +437,16 @@ async def test_metadata_search_applies_repo_identifier_filter(db):
     )
 
     assert [hit.memory_id for hit in hits] == ["m-repo"]
-    assert await keyword.search_metadata(
-        '"create" "blocker" "hint"',
-        _scope(),
-        None,
-        limit=10,
-        source_filter=MemorySourceFilter(repo_identifiers=("github.tools.sap/hcm/other",)),
-    ) == []
+    assert (
+        await keyword.search_metadata(
+            '"create" "blocker" "hint"',
+            _scope(),
+            None,
+            limit=10,
+            source_filter=MemorySourceFilter(repo_identifiers=("github.tools.sap/hcm/other",)),
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio
@@ -440,7 +458,7 @@ async def test_metadata_search_applies_memory_updated_time_range(db):
             updated_at=datetime(2026, 6, 20, tzinfo=timezone.utc),
         )
     )
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
@@ -468,17 +486,20 @@ async def test_metadata_search_applies_memory_updated_time_range(db):
     )
 
     assert [hit.memory_id for hit in hits] == ["m-updated"]
-    assert await keyword.search_metadata(
-        '"create" "blocker" "hint"',
-        _scope(),
-        None,
-        limit=10,
-        time_range=MemoryTimeRange(
-            after=datetime(2026, 6, 21, tzinfo=timezone.utc),
-            before=datetime(2026, 6, 22, tzinfo=timezone.utc),
-            date_type="memory_updated_at",
-        ),
-    ) == []
+    assert (
+        await keyword.search_metadata(
+            '"create" "blocker" "hint"',
+            _scope(),
+            None,
+            limit=10,
+            time_range=MemoryTimeRange(
+                after=datetime(2026, 6, 21, tzinfo=timezone.utc),
+                before=datetime(2026, 6, 22, tzinfo=timezone.utc),
+                date_type="memory_updated_at",
+            ),
+        )
+        == []
+    )
 
 
 async def _upsert_doc(
@@ -516,7 +537,7 @@ async def _upsert_doc(
 @pytest.mark.asyncio
 async def test_metadata_index_refreshes_when_document_title_changes(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(db, title="Old Lifecycle Title")
     await db.add_memory_source(
         "m-blocker",
@@ -540,7 +561,7 @@ async def test_metadata_index_refreshes_when_document_title_changes(db):
 @pytest.mark.asyncio
 async def test_metadata_index_refreshes_when_source_name_changes(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(db, title="SFPAY-179397")
     await db.add_memory_source(
         "m-blocker",
@@ -553,7 +574,9 @@ async def test_metadata_index_refreshes_when_source_name_changes(db):
     keyword = SqliteKeywordSearch(db)
     assert await keyword.search_metadata('"blocker" "hint" "queue"', _scope(), None, limit=10) == []
 
-    await db.upsert_source("src-jira", "jira", "Create Blocker Hint Queue", "{}")
+    await db.upsert_source(
+        "src-jira", "jira", "Create Blocker Hint Queue", "{}", access_policy="workspace", owner_user_id="dev"
+    )
 
     hits = await keyword.search_metadata('"blocker" "hint" "queue"', _scope(), None, limit=10)
     assert [hit.memory_id for hit in hits] == ["m-blocker"]
@@ -562,7 +585,7 @@ async def test_metadata_index_refreshes_when_source_name_changes(db):
 @pytest.mark.asyncio
 async def test_rebuild_metadata_index_backfills_existing_sources(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
@@ -591,7 +614,7 @@ async def test_rebuild_metadata_index_backfills_existing_sources(db):
 @pytest.mark.asyncio
 async def test_metadata_index_drops_deleted_document_support(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
@@ -604,9 +627,9 @@ async def test_metadata_index_drops_deleted_document_support(db):
         source_updated_at=datetime.now(timezone.utc),
     )
     keyword = SqliteKeywordSearch(db)
-    assert [hit.memory_id for hit in await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10)] == [
-        "m-blocker"
-    ]
+    assert [
+        hit.memory_id for hit in await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10)
+    ] == ["m-blocker"]
 
     await db.delete_document("SFPAY-179397")
 
@@ -616,7 +639,7 @@ async def test_metadata_index_drops_deleted_document_support(db):
 @pytest.mark.asyncio
 async def test_metadata_search_collapses_multiple_matching_sources_per_memory(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         doc_id="SFPAY-179397",
@@ -652,7 +675,7 @@ async def test_metadata_search_collapses_multiple_matching_sources_per_memory(db
 @pytest.mark.asyncio
 async def test_metadata_search_preserves_source_refs_before_memory_limit(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     doc_ids = [f"SFPAY-17939{i}" for i in range(6)]
     for doc_id in doc_ids:
         await _upsert_doc(

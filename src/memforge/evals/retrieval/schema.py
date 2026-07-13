@@ -472,6 +472,17 @@ def _validate_case(case_set: RetrievalCaseSet, case: RetrievalCase) -> None:
 
 def _validate_fixture_source_subscriptions(fixture_name: str, fixture: Mapping[str, Any]) -> None:
     users = [str(user) for user in fixture.get("users") or ()]
+    invalid_sources = [
+        str(source.get("id") or "<unknown>")
+        for source in fixture.get("sources") or ()
+        if not isinstance(source, Mapping)
+        or source.get("access_policy") not in {"private", "workspace"}
+        or not str(source.get("owner_user_id") or "").strip()
+    ]
+    if invalid_sources:
+        raise CaseSetValidationError(
+            f"Fixture {fixture_name} sources require access_policy and owner_user_id: {invalid_sources}"
+        )
     source_ids = [
         str(source["id"]) if isinstance(source, Mapping) else str(source)
         for source in fixture.get("sources") or ()

@@ -499,7 +499,16 @@ async def test_dedup_corrobates_active_chroma_candidate(db: Database):
 
 @pytest.mark.asyncio
 async def test_agent_claim_retry_with_unknown_source_timestamp_clears_stale_value(db: Database):
-    await _insert_doc(db)
+    await db.upsert_source(
+        "agent-source-codex",
+        "agent_session",
+        "Codex Session",
+        "{}",
+        "private",
+        "andrew.sun01@sap.com",
+        created_by_user_id="andrew.sun01@sap.com",
+    )
+    await _insert_doc(db, source="agent-source-codex")
     observed_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
     source_updated_at = datetime(2026, 6, 19, 8, 30, tzinfo=timezone.utc)
     memory = _memory("mem-agent-claim-source-updated", "Agent claim source timestamp")
@@ -1561,7 +1570,9 @@ async def test_delete_document_rolls_back_sqlite_when_db_delete_fails_mid_transa
 
 @pytest.mark.asyncio
 async def test_delete_source_cascade_restores_db_when_retired_memory_index_delete_fails(db: Database):
-    await db.upsert_source("src-rollback", "confluence", "Rollback Source", "{}")
+    await db.upsert_source(
+        "src-rollback", "confluence", "Rollback Source", "{}", access_policy="workspace", owner_user_id="dev"
+    )
     await db.db.execute(
         """UPDATE sources
            SET status = ?, last_sync = ?, doc_count = ?, created_at = ?
@@ -1642,7 +1653,14 @@ async def test_delete_source_cascade_restores_db_when_retired_memory_index_delet
 
 @pytest.mark.asyncio
 async def test_delete_source_cascade_restores_document_vectors_when_later_delete_fails(db: Database):
-    await db.upsert_source("src-partial-doc-delete", "confluence", "Partial Delete Source", "{}")
+    await db.upsert_source(
+        "src-partial-doc-delete",
+        "confluence",
+        "Partial Delete Source",
+        "{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
     await _insert_doc(db, "doc-partial-1", source="src-partial-doc-delete")
     await _insert_doc(db, "doc-partial-2", source="src-partial-doc-delete")
     doc_collection = FailingSecondDeleteCollection()

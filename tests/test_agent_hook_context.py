@@ -188,7 +188,9 @@ def test_hook_context_reports_source_warnings_even_for_trivial_prompt(tmp_path):
 
     async def _setup():
         await database.connect()
-        await database.upsert_source("src-warn", "jira", "Project Jira", "{}")
+        await database.upsert_source(
+            "src-warn", "jira", "Project Jira", "{}", access_policy="workspace", owner_user_id="dev"
+        )
         await database.upsert_sync_state(
             SyncState(
                 source="src-warn",

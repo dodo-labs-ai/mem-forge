@@ -34,13 +34,15 @@ def _project_source_inputs(database: Database, source: dict) -> dict:
     return source_with_sync_inputs(source, inputs)
 
 
-def _create_local_markdown_source(client: TestClient, *, name: str = "Engineering notes",
-                                  vault_id: str = "engineering") -> dict:
+def _create_local_markdown_source(
+    client: TestClient, *, name: str = "Engineering notes", vault_id: str = "engineering"
+) -> dict:
     response = client.post(
         "/api/sources",
         json={
             "type": "local_markdown",
             "name": name,
+            "access_policy": "private",
             "config": {
                 "root": "/Users/test/engineering-notes",
                 "vault_id": vault_id,
@@ -53,13 +55,15 @@ def _create_local_markdown_source(client: TestClient, *, name: str = "Engineerin
     return response.json()
 
 
-def _create_unmapped_local_markdown_source(client: TestClient, *, name: str = "Engineering notes",
-                                           vault_id: str = "engineering") -> dict:
+def _create_unmapped_local_markdown_source(
+    client: TestClient, *, name: str = "Engineering notes", vault_id: str = "engineering"
+) -> dict:
     response = client.post(
         "/api/sources",
         json={
             "type": "local_markdown",
             "name": name,
+            "access_policy": "private",
             "config": {
                 "root": "/Users/test/engineering-notes",
                 "vault_id": vault_id,
@@ -84,6 +88,7 @@ def _create_github_repo_source(
         json={
             "type": "github_repo",
             "name": name,
+            "access_policy": "private",
             "config": {
                 "connection_mode": connection_mode,
                 "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
@@ -111,6 +116,7 @@ def _create_jira_source(
         json={
             "type": "jira",
             "name": name,
+            "access_policy": "private",
             "config": {
                 "base_url": "https://jira.example.test",
                 "auth_mode": "browser_cookie",
@@ -132,6 +138,7 @@ def _create_teams_source(client: TestClient, *, name: str = "Teams Channel") -> 
         json={
             "type": "teams",
             "name": name,
+            "access_policy": "private",
             "config": {
                 "region": "emea",
                 "channels": ["19:channel@example.test"],
@@ -180,6 +187,7 @@ def test_create_local_markdown_source_generates_internal_vault_id(tmp_path):
                 json={
                     "type": "local_markdown",
                     "name": "Engineering notes",
+                    "access_policy": "private",
                     "config": {
                         "root": "/Users/test/engineering-notes",
                         "display_label": "Engineering notes",
@@ -356,9 +364,7 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
         )
         assert [item.input_id for item in repeated_snapshot_inputs] == [inputs[0].input_id]
         assert process_response.status_code == 202, process_response.text
-        run = asyncio.run(
-            database.get_source_sync_run(process_response.json()["run_id"])
-        )
+        run = asyncio.run(database.get_source_sync_run(process_response.json()["run_id"]))
         assert run is not None
         assert run.input_snapshot_id == "test-local-agent-job:attempt:1"
 
@@ -397,6 +403,7 @@ def test_jira_local_agent_mode_rejects_pat_auth(tmp_path):
                 json={
                     "type": "jira",
                     "name": "Payroll Jira",
+                    "access_policy": "private",
                     "config": {
                         "base_url": "https://jira.example.test",
                         "auth_mode": "pat",
@@ -851,6 +858,8 @@ def test_local_adapter_document_push_requires_execution_owner(tmp_path):
             ),
             created_by_user_id="alice",
             execution_owner_user_id="alice",
+            access_policy="workspace",
+            owner_user_id="alice",
         )
 
     asyncio.run(_seed_source())
@@ -1196,6 +1205,8 @@ def test_local_adapter_push_requires_local_adapter_source(tmp_path):
             type="agent_session",
             name="Agent Sessions",
             config_json=json.dumps({"documents_dir": str(tmp_path / "as-inbox")}),
+            access_policy="private",
+            owner_user_id="dev",
         )
         return "src-other"
 
@@ -1324,6 +1335,8 @@ def test_local_markdown_gene_converts_by_content_type(tmp_path):
         assert by_path["note.txt"].markdown_body == "plain reminder"
     finally:
         asyncio.run(database.close())
+
+
 async def _allow_local_agent_lease(*args, **kwargs) -> bool:
     return True
 

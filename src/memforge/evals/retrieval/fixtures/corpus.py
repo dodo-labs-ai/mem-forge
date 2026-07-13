@@ -42,6 +42,9 @@ async def _seed_sources(db: Database, fixture: Mapping[str, Any]) -> None:
             str(_value_or_default(source, "type", "generic")),
             str(_value_or_default(source, "name", source["id"])),
             json.dumps(_value_or_default(source, "config", {})),
+            access_policy=str(source["access_policy"]),
+            owner_user_id=str(source["owner_user_id"]),
+            created_by_user_id=str(source["owner_user_id"]),
             status=str(_value_or_default(source, "status", "active")),
         )
 

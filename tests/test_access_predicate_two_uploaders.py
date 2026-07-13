@@ -33,12 +33,12 @@ class FakeCollection:
         pass
 
 
-async def _document(db: Database, doc_id: str) -> None:
+async def _document(db: Database, doc_id: str, source_id: str) -> None:
     now = datetime.now(timezone.utc)
     await db.upsert_document(
         DocumentRecord(
             doc_id=doc_id,
-            source="src-agent",
+            source=source_id,
             source_url=f"agent://{doc_id}",
             title="t",
             space_or_project="PROJ",
@@ -98,8 +98,26 @@ def _personalized_scope(user_id: str) -> AccessScope:
 @pytest.mark.asyncio
 async def test_two_uploaders_each_owns_their_private_session_memory(engine_fixture):
     engine, database, adapters = engine_fixture
-    await _document(database, "doc-u1")
-    await _document(database, "doc-u2")
+    await database.upsert_source(
+        "src-agent-u1",
+        "agent_session",
+        "U1 session",
+        "{}",
+        "private",
+        "u-1",
+        created_by_user_id="u-1",
+    )
+    await database.upsert_source(
+        "src-agent-u2",
+        "agent_session",
+        "U2 session",
+        "{}",
+        "private",
+        "u-2",
+        created_by_user_id="u-2",
+    )
+    await _document(database, "doc-u1", "src-agent-u1")
+    await _document(database, "doc-u2", "src-agent-u2")
 
     u1_raw = [RawMemory(memory_type="fact", content="u1 deploys via argo", entity_refs=[], tags=[], confidence=0.9)]
     u2_raw = [RawMemory(memory_type="fact", content="u2 deploys via flux", entity_refs=[], tags=[], confidence=0.9)]

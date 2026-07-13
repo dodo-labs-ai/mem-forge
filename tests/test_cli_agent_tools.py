@@ -62,10 +62,12 @@ class FakeToolClient:
         return self.create_response
 
     def get_source_schedule(self, source_id: str):
-        self.calls.append((
-            "get_source_schedule",
-            {"api_url": self.api_url, "api_token": self.api_token, "source_id": source_id},
-        ))
+        self.calls.append(
+            (
+                "get_source_schedule",
+                {"api_url": self.api_url, "api_token": self.api_token, "source_id": source_id},
+            )
+        )
         return self.response
 
     def update_source_schedule(self, **kwargs):
@@ -77,7 +79,9 @@ class FakeToolClient:
         return self.response
 
     def get_memory(self, memory_id: str):
-        self.calls.append(("get_memory", {"api_url": self.api_url, "api_token": self.api_token, "memory_id": memory_id}))
+        self.calls.append(
+            ("get_memory", {"api_url": self.api_url, "api_token": self.api_token, "memory_id": memory_id})
+        )
         return self.response
 
     def get_resource(self, **kwargs):
@@ -85,52 +89,66 @@ class FakeToolClient:
         return self.response
 
     def start_source_sync(self, **kwargs):
-        self.calls.append((
-            "start_source_sync",
-            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
-        ))
+        self.calls.append(
+            (
+                "start_source_sync",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
         return self.response
 
     def start_source_processing(self, **kwargs):
-        self.calls.append((
-            "start_source_processing",
-            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
-        ))
+        self.calls.append(
+            (
+                "start_source_processing",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
         return self.response
 
     def push_local_markdown_document(self, **kwargs):
-        self.calls.append((
-            "push_local_markdown_document",
-            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
-        ))
+        self.calls.append(
+            (
+                "push_local_markdown_document",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
         return self.response
 
     def push_github_repo_document(self, **kwargs):
-        self.calls.append((
-            "push_github_repo_document",
-            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
-        ))
+        self.calls.append(
+            (
+                "push_github_repo_document",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
         return self.response
 
     def push_jira_package(self, **kwargs):
-        self.calls.append((
-            "push_jira_package",
-            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
-        ))
+        self.calls.append(
+            (
+                "push_jira_package",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
         return self.response
 
     def upload_jira_session(self, **kwargs):
-        self.calls.append((
-            "upload_jira_session",
-            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
-        ))
+        self.calls.append(
+            (
+                "upload_jira_session",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
         return self.response
 
     def push_teams_window_package(self, **kwargs):
-        self.calls.append((
-            "push_teams_window_package",
-            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
-        ))
+        self.calls.append(
+            (
+                "push_teams_window_package",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
         return self.response
 
     def health(self):
@@ -179,7 +197,11 @@ def test_search_cli_forwards_mcp_shape(monkeypatch):
             "fact",
             "--include-superseded",
         ],
-        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_WORKSPACE_ID": "ws-from-cloud", "MEMFORGE_API_TOKEN": "token-1"},
+        env={
+            "MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+            "MEMFORGE_WORKSPACE_ID": "ws-from-cloud",
+            "MEMFORGE_API_TOKEN": "token-1",
+        },
     )
 
     assert result.exit_code == 0, result.output
@@ -214,7 +236,11 @@ def test_search_cli_forwards_exact_source_ids(monkeypatch):
             "--end-date",
             "2026-06-26",
         ],
-        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_WORKSPACE_ID": "ws-from-cloud", "MEMFORGE_API_TOKEN": "token-1"},
+        env={
+            "MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+            "MEMFORGE_WORKSPACE_ID": "ws-from-cloud",
+            "MEMFORGE_API_TOKEN": "token-1",
+        },
     )
 
     assert result.exit_code == 0, result.output
@@ -345,7 +371,11 @@ def test_sources_list_cli_reads_configured_sources_from_active_api_target(monkey
     result = CliRunner().invoke(
         cli,
         ["sources", "list"],
-        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_WORKSPACE_ID": "ws-from-cloud", "MEMFORGE_API_TOKEN": "token-1"},
+        env={
+            "MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+            "MEMFORGE_WORKSPACE_ID": "ws-from-cloud",
+            "MEMFORGE_API_TOKEN": "token-1",
+        },
     )
 
     assert result.exit_code == 0, result.output
@@ -382,7 +412,11 @@ def test_sources_searchable_cli_reads_searchable_sources_from_active_api_target(
     result = CliRunner().invoke(
         cli,
         ["sources", "searchable"],
-        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_WORKSPACE_ID": "ws-from-cloud", "MEMFORGE_API_TOKEN": "token-1"},
+        env={
+            "MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+            "MEMFORGE_WORKSPACE_ID": "ws-from-cloud",
+            "MEMFORGE_API_TOKEN": "token-1",
+        },
     )
 
     assert result.exit_code == 0, result.output
@@ -403,7 +437,11 @@ def test_sources_schedule_cli_updates_active_api_target(monkeypatch):
     result = CliRunner().invoke(
         cli,
         ["sources", "schedule", "src-1", "--every-minutes", "60"],
-        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_WORKSPACE_ID": "ws-from-cloud", "MEMFORGE_API_TOKEN": "token-1"},
+        env={
+            "MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+            "MEMFORGE_WORKSPACE_ID": "ws-from-cloud",
+            "MEMFORGE_API_TOKEN": "token-1",
+        },
     )
 
     assert result.exit_code == 0, result.output
@@ -429,7 +467,11 @@ def test_sources_schedule_show_cli_reads_active_api_target(monkeypatch):
     result = CliRunner().invoke(
         cli,
         ["sources", "schedule-show", "src-1"],
-        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_WORKSPACE_ID": "ws-from-cloud", "MEMFORGE_API_TOKEN": "token-1"},
+        env={
+            "MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+            "MEMFORGE_WORKSPACE_ID": "ws-from-cloud",
+            "MEMFORGE_API_TOKEN": "token-1",
+        },
     )
 
     assert result.exit_code == 0, result.output
@@ -473,7 +515,7 @@ def test_target_profile_sets_default_api_url(monkeypatch, tmp_path: Path):
     assert FakeToolClient.calls == [
         ("health", {"api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "api_token": "secret-token"})
     ]
-    assert 'edition = ' not in cli_config.read_text(encoding="utf-8")
+    assert "edition = " not in cli_config.read_text(encoding="utf-8")
     assert 'workspace_id = "mount_tai"' in cli_config.read_text(encoding="utf-8")
 
 
@@ -541,9 +583,7 @@ def test_env_api_url_does_not_use_active_target_token(monkeypatch, tmp_path: Pat
 
     assert add_result.exit_code == 0, add_result.output
     assert check_result.exit_code == 0, check_result.output
-    assert FakeToolClient.calls == [
-        ("health", {"api_url": "https://override.example.test", "api_token": None})
-    ]
+    assert FakeToolClient.calls == [("health", {"api_url": "https://override.example.test", "api_token": None})]
 
 
 def test_target_add_rejects_invalid_tagged_union_before_writing(monkeypatch, tmp_path: Path):
@@ -583,10 +623,15 @@ class _StubClient:
 
 
 def test_adapter_jira_status_reports_stored_session(monkeypatch):
-    stub = _StubClient(get_jira_session={
-        "provider": "jira", "origin": "https://jira.tools.sap", "status": "active",
-        "principal_name": "Rose H", "browser": "chrome",
-    })
+    stub = _StubClient(
+        get_jira_session={
+            "provider": "jira",
+            "origin": "https://jira.tools.sap",
+            "status": "active",
+            "principal_name": "Rose H",
+            "browser": "chrome",
+        }
+    )
     monkeypatch.setattr(main, "_tool_client", lambda ctx: stub)
     result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "status", "--base-url", "https://jira.tools.sap"])
     assert result.exit_code == 0, result.output
@@ -614,7 +659,10 @@ def test_adapter_jira_refresh_captures_and_uploads(monkeypatch):
         captured["base_url"] = base_url
         captured["browser"] = browser
         return jira_capture.JiraCaptureResult(
-            origin=base_url, cookie_header="SESSION=x", browser=browser, principal={"accountId": "u1"},
+            origin=base_url,
+            cookie_header="SESSION=x",
+            browser=browser,
+            principal={"accountId": "u1"},
         )
 
     stub = _StubClient(upload_jira_session={"provider": "jira", "origin": "https://jira.tools.sap", "status": "active"})
@@ -622,7 +670,8 @@ def test_adapter_jira_refresh_captures_and_uploads(monkeypatch):
     monkeypatch.setattr(main, "_tool_client", lambda ctx: stub)
 
     result = CliRunner().invoke(
-        cli, ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap", "--browser", "chrome"],
+        cli,
+        ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap", "--browser", "chrome"],
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
@@ -662,7 +711,8 @@ def test_adapter_jira_refresh_capture_error_returns_json_error(monkeypatch):
     monkeypatch.setattr(main, "_tool_client", lambda ctx: _StubClient())
 
     result = CliRunner().invoke(
-        cli, ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap", "--browser", "netscape"],
+        cli,
+        ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap", "--browser", "netscape"],
     )
     assert result.exit_code == 1
     payload = json.loads(result.output)
@@ -676,16 +726,29 @@ def test_adapter_jira_refresh_principal_change_returns_json_error(monkeypatch):
     async def fake_capture(base_url, *, browser=None, interactive=False):
         assert interactive is True
         return jira_capture.JiraCaptureResult(
-            origin=base_url, cookie_header="SESSION=x", browser=None, principal={"accountId": "u1"},
+            origin=base_url,
+            cookie_header="SESSION=x",
+            browser=None,
+            principal={"accountId": "u1"},
         )
 
-    body = json.dumps({"detail": {
-        "message": "changed", "origin": "https://jira.tools.sap",
-        "old_principal_id": "old-user", "new_principal_id": "new-user",
-    }})
-    stub = _StubClient(upload_jira_session={
-        "error": "MemForge API request failed", "status_code": 409, "detail": body,
-    })
+    body = json.dumps(
+        {
+            "detail": {
+                "message": "changed",
+                "origin": "https://jira.tools.sap",
+                "old_principal_id": "old-user",
+                "new_principal_id": "new-user",
+            }
+        }
+    )
+    stub = _StubClient(
+        upload_jira_session={
+            "error": "MemForge API request failed",
+            "status_code": 409,
+            "detail": body,
+        }
+    )
     monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
     monkeypatch.setattr(main, "_tool_client", lambda ctx: stub)
 
@@ -713,7 +776,9 @@ def test_adapter_jira_list_and_forget(monkeypatch):
     list_result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "list"])
     assert list_result.exit_code == 0, list_result.output
     assert json.loads(list_result.output)["origins"][0]["origin"] == "https://jira.tools.sap"
-    forget_result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "forget", "--base-url", "https://jira.tools.sap"])
+    forget_result = CliRunner().invoke(
+        cli, ["adapter", "auth", "jira", "forget", "--base-url", "https://jira.tools.sap"]
+    )
     assert forget_result.exit_code == 0, forget_result.output
     assert json.loads(forget_result.output)["forgotten"] is True
     assert forgotten_locally == ["https://jira.tools.sap"]
@@ -1067,11 +1132,11 @@ def test_local_agent_cloud_local_markdown_sync_publishes_empty_snapshot(monkeypa
             "api_token": "tok",
             "workspace_id": "ws-from-cloud",
             "source_id": "src-local",
-                "force_full_sync": False,
-                "sync_snapshot_id": "laj-empty-snapshot:attempt:1",
-                "local_agent_job_id": "laj-empty-snapshot",
-                "local_agent_attempt_count": 1,
-            }
+            "force_full_sync": False,
+            "sync_snapshot_id": "laj-empty-snapshot:attempt:1",
+            "local_agent_job_id": "laj-empty-snapshot",
+            "local_agent_attempt_count": 1,
+        }
     ]
 
 
@@ -1161,17 +1226,19 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
     assert payload["operation"] == "jira_sync"
     assert payload["counts"] == {"selected": 1, "pushed": 1, "failed": 0}
     upload_calls = [call for call in FakeToolClient.calls if call[0] == "upload_jira_session"]
-    assert upload_calls == [(
-        "upload_jira_session",
-        {
-            "api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
-            "api_token": "tok",
-            "workspace_id": "ws-from-cloud",
-            "base_url": "https://jira.example.test",
-            "cookie_header": "JSESSIONID=local",
-            "browser": "chrome",
-        },
-    )]
+    assert upload_calls == [
+        (
+            "upload_jira_session",
+            {
+                "api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+                "api_token": "tok",
+                "workspace_id": "ws-from-cloud",
+                "base_url": "https://jira.example.test",
+                "cookie_header": "JSESSIONID=local",
+                "browser": "chrome",
+            },
+        )
+    ]
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_jira_package"]
     assert len(push_calls) == 1
     kwargs = push_calls[0][1]
@@ -1193,10 +1260,10 @@ def test_local_agent_cloud_jira_sync_rejects_pat_payload():
     FakeToolClient.reset({"doc_id": "jira-doc", "document_hash": "hash"})
 
     payload = main._run_cloud_local_agent_job(
-            {
-                "job_id": "laj-jira-sync",
-                "attempt_count": 1,
-                "workspace_id": "ws-from-cloud",
+        {
+            "job_id": "laj-jira-sync",
+            "attempt_count": 1,
+            "workspace_id": "ws-from-cloud",
             "operation": "jira_sync",
             "source_id": "src-jira",
             "payload": {
@@ -1229,11 +1296,15 @@ def test_local_agent_cloud_jira_sync_stops_on_principal_change(monkeypatch):
     conflict = {
         "error": "MemForge API request failed",
         "status_code": 409,
-        "detail": json.dumps({"detail": {
-            "origin": "https://jira.example.test",
-            "old_principal_id": "old-user",
-            "new_principal_id": "different-user",
-        }}),
+        "detail": json.dumps(
+            {
+                "detail": {
+                    "origin": "https://jira.example.test",
+                    "old_principal_id": "old-user",
+                    "new_principal_id": "different-user",
+                }
+            }
+        ),
     }
     monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
@@ -1317,10 +1388,12 @@ def test_local_agent_cloud_jira_sync_does_not_publish_partial_snapshot(monkeypat
         )
 
     def fake_push_jira_package(self, **kwargs):
-        self.calls.append((
-            "push_jira_package",
-            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
-        ))
+        self.calls.append(
+            (
+                "push_jira_package",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
         if kwargs["issue_key"] == "PAY-2":
             return {"error": "push failed", "status_code": 500}
         return {"doc_id": f"jira-{kwargs['issue_key'].lower()}", "document_hash": "hash"}
@@ -1586,10 +1659,12 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
 
     def fake_push_teams_window_package(self, **kwargs):
-        self.calls.append((
-            "push_teams_window_package",
-            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
-        ))
+        self.calls.append(
+            (
+                "push_teams_window_package",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
         return {
             "doc_id": "teams-doc",
             "document_hash": "hash",
@@ -1786,10 +1861,12 @@ def test_local_agent_cloud_teams_sync_reports_push_failure_without_generic_sourc
         ]
 
     def failing_push_teams_window_package(self, **kwargs):
-        self.calls.append((
-            "push_teams_window_package",
-            {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
-        ))
+        self.calls.append(
+            (
+                "push_teams_window_package",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
         return {"error": "MemForge API unavailable", "detail": "Server disconnected without sending a response."}
 
     monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect, raising=False)
@@ -2102,14 +2179,16 @@ def test_collect_teams_documents_from_cloud_job_uses_gene_window_shape(monkeypat
         async def fetch(self, item):
             return RawContent(
                 item=item,
-                body=json.dumps({
-                    "conversation_type": "group_chat",
-                    "messages": [
-                        {"id": "1783500000000", "content": "Window body.", "from": "Andrew"},
-                        {"id": "1783500000001", "content": "Second", "from": "Ada"},
-                        {"id": "1783500000002", "content": "Third", "from": "Grace"},
-                    ],
-                }).encode(),
+                body=json.dumps(
+                    {
+                        "conversation_type": "group_chat",
+                        "messages": [
+                            {"id": "1783500000000", "content": "Window body.", "from": "Andrew"},
+                            {"id": "1783500000001", "content": "Second", "from": "Ada"},
+                            {"id": "1783500000002", "content": "Third", "from": "Grace"},
+                        ],
+                    }
+                ).encode(),
                 content_type="application/json",
             )
 

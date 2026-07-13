@@ -385,10 +385,7 @@ def test_tool_client_can_scope_server_level_client_to_job_workspace():
     scoped = server_client.for_workspace("mount_tai")
 
     assert scoped.target.workspace_id == "mount_tai"
-    assert (
-        scoped.target.workspace_api_base
-        == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api"
-    )
+    assert scoped.target.workspace_api_base == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api"
     assert scoped.api_token == "token"
 
 
@@ -640,5 +637,8 @@ def test_tool_client_fetches_resource_through_hosted_workspace(monkeypatch):
     result = client.get_resource(url="/api/documents/doc-1/content")
 
     assert result["text"] == "# Source"
-    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/documents/doc-1/content"
+    assert (
+        captured["url"]
+        == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/documents/doc-1/content"
+    )
     assert captured["authorization"] == "Bearer tok"

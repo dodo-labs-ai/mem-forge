@@ -16,6 +16,7 @@ export function SourceSetupDialog({
   source,
   onSaved,
   initialFocus,
+  onRequestAccessChange,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -23,6 +24,7 @@ export function SourceSetupDialog({
   source?: Source | null;
   onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" };
+  onRequestAccessChange?: (source: Source) => void;
 }) {
   if (!sourceType) return null;
   if (sourceType === "teams") {
@@ -33,6 +35,7 @@ export function SourceSetupDialog({
         source={source}
         onSaved={onSaved}
         initialFocus={initialFocus}
+        onRequestAccessChange={onRequestAccessChange}
       />
     );
   }
@@ -47,6 +50,7 @@ export function SourceSetupDialog({
       source={source}
       onSaved={onSaved}
       initialFocus={initialFocus}
+      onRequestAccessChange={onRequestAccessChange}
     />
   );
 }
@@ -57,12 +61,14 @@ function TeamsSetupDialog({
   source,
   onSaved,
   initialFocus,
+  onRequestAccessChange,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   source?: Source | null;
   onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" };
+  onRequestAccessChange?: (source: Source) => void;
 }) {
   const canConfigure = source ? source.capabilities?.can_configure === true : true;
   const schemaQuery = useQuery<GeneConfigSchema>({
@@ -93,6 +99,7 @@ function TeamsSetupDialog({
             onOpenChange={onOpenChange}
             onSaved={onSaved}
             initialFocus={initialFocus}
+            onRequestAccessChange={onRequestAccessChange}
           />
         )}
       </DialogContent>

@@ -20,8 +20,10 @@ class _Client:
 
 async def _capture_good(base_url, *, browser=None):
     from memforge.auth.jira_capture import JiraCaptureResult
-    return JiraCaptureResult(origin=base_url, cookie_header="SESSION=good", browser="Chrome",
-                             principal={"accountId": "u1"})
+
+    return JiraCaptureResult(
+        origin=base_url, cookie_header="SESSION=good", browser="Chrome", principal={"accountId": "u1"}
+    )
 
 
 async def _capture_dead(base_url, *, browser=None):
@@ -30,10 +32,15 @@ async def _capture_dead(base_url, *, browser=None):
 
 async def test_tick_uploads_changed_cookie():
     from memforge.main import run_watch_tick
+
     client = _Client()
     action, new_hash = await run_watch_tick(
-        base_url="https://jira.example.test", browser=None, client=client,
-        last_hash=None, capture=_capture_good, log=lambda m: None,
+        base_url="https://jira.example.test",
+        browser=None,
+        client=client,
+        last_hash=None,
+        capture=_capture_good,
+        log=lambda m: None,
     )
     assert action == "uploaded"
     assert client.uploaded == ["SESSION=good"]
@@ -42,11 +49,16 @@ async def test_tick_uploads_changed_cookie():
 
 async def test_tick_skips_unchanged_cookie():
     from memforge.main import run_watch_tick, _cookie_hash
+
     client = _Client()
     same = _cookie_hash("SESSION=good")
     action, new_hash = await run_watch_tick(
-        base_url="https://jira.example.test", browser=None, client=client,
-        last_hash=same, capture=_capture_good, log=lambda m: None,
+        base_url="https://jira.example.test",
+        browser=None,
+        client=client,
+        last_hash=same,
+        capture=_capture_good,
+        log=lambda m: None,
     )
     assert action == "unchanged"
     assert client.uploaded == []
@@ -55,10 +67,15 @@ async def test_tick_skips_unchanged_cookie():
 
 async def test_tick_marks_expired_when_session_dead():
     from memforge.main import run_watch_tick
+
     client = _Client()
     action, new_hash = await run_watch_tick(
-        base_url="https://jira.example.test", browser=None, client=client,
-        last_hash="abc", capture=_capture_dead, log=lambda m: None,
+        base_url="https://jira.example.test",
+        browser=None,
+        client=client,
+        last_hash="abc",
+        capture=_capture_dead,
+        log=lambda m: None,
     )
     assert action == "expired"
     assert client.expired and new_hash is None
@@ -66,20 +83,30 @@ async def test_tick_marks_expired_when_session_dead():
 
 async def test_tick_flags_principal_conflict():
     from memforge.main import run_watch_tick
+
     client = _Client(upload_result={"error": "MemForge API request failed", "status_code": 409, "detail": "{}"})
     action, _ = await run_watch_tick(
-        base_url="https://jira.example.test", browser=None, client=client,
-        last_hash=None, capture=_capture_good, log=lambda m: None,
+        base_url="https://jira.example.test",
+        browser=None,
+        client=client,
+        last_hash=None,
+        capture=_capture_good,
+        log=lambda m: None,
     )
     assert action == "principal_conflict"
 
 
 async def test_tick_reports_transport_error_on_upload_failure():
     from memforge.main import run_watch_tick
+
     client = _Client(upload_result={"error": "MemForge API unavailable", "detail": "connection refused"})
     action, new_hash = await run_watch_tick(
-        base_url="https://jira.example.test", browser=None, client=client,
-        last_hash="abc", capture=_capture_good, log=lambda m: None,
+        base_url="https://jira.example.test",
+        browser=None,
+        client=client,
+        last_hash="abc",
+        capture=_capture_good,
+        log=lambda m: None,
     )
     assert action == "transport_error"
     # On a failed upload the old hash is retained so the next tick retries.

@@ -27,10 +27,7 @@ def test_normalize_repo_identifier_prefers_canonical_remote_slug():
         normalize_repo_identifier("git@github.tools.sap:HCM/memforge-cloud.git")
         == "github.tools.sap/hcm/memforge-cloud"
     )
-    assert (
-        normalize_repo_identifier("https://github.com/shno-labs/mem-forge.git")
-        == "github.com/shno-labs/mem-forge"
-    )
+    assert normalize_repo_identifier("https://github.com/shno-labs/mem-forge.git") == "github.com/shno-labs/mem-forge"
     assert normalize_repo_identifier("mem-inception") == "mem-inception"
     assert normalize_repo_identifier(None) is None
 
@@ -44,6 +41,7 @@ async def test_submit_agent_session_document_persists_repo_identifier(tmp_path: 
         result = await submit_agent_session_document(
             db=db,
             config=cfg,
+            user_id="user-owner",
             client="codex",
             session_id="sess-repo-id",
             trigger="Stop",
@@ -54,12 +52,8 @@ async def test_submit_agent_session_document_persists_repo_identifier(tmp_path: 
 
         package = json.loads(Path(result["document_uri"]).read_text(encoding="utf-8"))
 
-        assert package["receipt"]["metadata"]["repo_identifier"] == (
-            "github.tools.sap/hcm/memforge-cloud"
-        )
-        assert result["receipt"]["metadata"]["repo_identifier"] == (
-            "github.tools.sap/hcm/memforge-cloud"
-        )
+        assert package["receipt"]["metadata"]["repo_identifier"] == ("github.tools.sap/hcm/memforge-cloud")
+        assert result["receipt"]["metadata"]["repo_identifier"] == ("github.tools.sap/hcm/memforge-cloud")
     finally:
         await db.close()
 
@@ -81,7 +75,7 @@ async def test_agent_session_gene_exposes_repo_identifier_in_source_semantics(tm
         "markdown": "# Summary\n\n- Durable repo-level finding.",
         "receipt": {
             "doc_id": "agent-session-codex-sess-stop",
-            "source_id": agent_session_source_id("codex"),
+            "source_id": agent_session_source_id("codex", "user-owner"),
             "client": "codex",
             "session_id": "sess",
             "trigger": "Stop",
@@ -107,12 +101,10 @@ async def test_agent_session_gene_exposes_repo_identifier_in_source_semantics(tm
 
     gene = AgentSessionGene(
         config={"documents_dir": str(documents_dir), "client": "codex"},
-        source_id=agent_session_source_id("codex"),
+        source_id=agent_session_source_id("codex", "user-owner"),
     )
     item = [item async for item in gene.discover()][0]
     raw = await gene.fetch(item)
     normalized = await gene.normalize(raw)
 
-    assert normalized.source_semantics["repo_identifier"] == (
-        "github.tools.sap/hcm/memforge-cloud"
-    )
+    assert normalized.source_semantics["repo_identifier"] == ("github.tools.sap/hcm/memforge-cloud")

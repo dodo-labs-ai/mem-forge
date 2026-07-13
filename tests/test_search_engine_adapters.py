@@ -99,6 +99,27 @@ async def _document(
 async def db(tmp_path):
     database = Database(str(tmp_path / "search-adapters.db"))
     await database.connect()
+    for source_id in (
+        "wiki",
+        "jira",
+        "other",
+        "slack",
+        "src-agent-codex",
+        "src-jira",
+        "src-mounttai",
+        "src-other",
+        "src-target",
+        "src-wiki",
+    ):
+        await database.upsert_source(
+            source_id,
+            "test",
+            source_id,
+            "{}",
+            "workspace",
+            "dev",
+            created_by_user_id="dev",
+        )
     yield database
     await database.close()
 
@@ -151,7 +172,7 @@ async def test_search_path_uses_entity_linker_not_legacy_query_analysis(db, monk
 async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch):
     target = _memory("m-blocker", "Lifecycle assignment skips person assignment creation")
     await db.insert_memory(target)
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _document(
         db,
         "SFPAY-179397",
@@ -198,7 +219,7 @@ async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch)
 async def test_search_recalls_compound_query_from_metadata_trigram(db, monkeypatch):
     target = _memory("m-blocker", "Lifecycle assignment skips person assignment creation")
     await db.insert_memory(target)
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _document(
         db,
         "SFPAY-179397",
@@ -230,8 +251,10 @@ async def test_search_recalls_compound_query_from_metadata_trigram(db, monkeypat
 async def test_source_filter_prevents_non_matching_metadata_evidence(db, monkeypatch):
     shared = _memory("m-shared", "Lifecycle assignment skips person assignment creation")
     await db.insert_memory(shared)
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
-    await db.upsert_source("src-wiki", "confluence", "Payroll Wiki", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source(
+        "src-wiki", "confluence", "Payroll Wiki", "{}", access_policy="workspace", owner_user_id="dev"
+    )
     await _document(
         db,
         "SFPAY-179397",
@@ -272,7 +295,7 @@ async def test_source_filter_prevents_non_matching_metadata_evidence(db, monkeyp
 async def test_rerank_prompt_includes_metadata_evidence_for_metadata_hits(db, monkeypatch):
     target = _memory("m-blocker", "Lifecycle assignment skips person assignment creation")
     await db.insert_memory(target)
-    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}")
+    await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _document(
         db,
         "SFPAY-179397",
@@ -478,7 +501,7 @@ async def test_identifier_lookup_prefers_rank_one_metadata_over_vector_plus_cont
     content_competitor = _memory("m-content", "ISSUE 12345 lifecycle blocker note from content")
     await db.insert_memory(metadata_target)
     await db.insert_memory(content_competitor)
-    await db.upsert_source("src-issues", "issue", "Issue Tracker", "{}")
+    await db.upsert_source("src-issues", "issue", "Issue Tracker", "{}", access_policy="workspace", owner_user_id="dev")
     await _document(
         db,
         "ISSUE-12345",
@@ -510,7 +533,9 @@ async def test_code_symbol_metadata_hit_uses_identifier_profile(db, monkeypatch)
     semantic_competitor = _memory("m-semantic", "Payroll cutoff command retries after lock contention")
     await db.insert_memory(metadata_target)
     await db.insert_memory(semantic_competitor)
-    await db.upsert_source("src-code", "github", "Payroll Repository", "{}")
+    await db.upsert_source(
+        "src-code", "github", "Payroll Repository", "{}", access_policy="workspace", owner_user_id="dev"
+    )
     await _document(
         db,
         "src/payroll/PayrollCutoffCommand.py",
@@ -547,7 +572,7 @@ async def test_code_symbol_without_metadata_support_does_not_force_identifier_pr
     semantic_competitor = _memory("m-semantic", "Command implementation retry analysis")
     await db.insert_memory(metadata_target)
     await db.insert_memory(semantic_competitor)
-    await db.upsert_source("src-jira", "jira", "Mount Tai Jira", "{}")
+    await db.upsert_source("src-jira", "jira", "Mount Tai Jira", "{}", access_policy="workspace", owner_user_id="dev")
     await _document(
         db,
         "SFPAY-100",
@@ -597,7 +622,7 @@ async def test_metadata_core_token_coverage_ignores_generic_work_item_modifiers(
     content_competitor = _memory("m-content", "General Jira task discussion")
     await db.insert_memory(metadata_target)
     await db.insert_memory(content_competitor)
-    await db.upsert_source("src-jira", "jira", "Mount Tai Jira", "{}")
+    await db.upsert_source("src-jira", "jira", "Mount Tai Jira", "{}", access_policy="workspace", owner_user_id="dev")
     await _document(
         db,
         "SFPAY-179397",
@@ -724,10 +749,7 @@ async def test_graph_exploration_downweights_broad_entity_fanout(db, monkeypatch
     )
 
     assert result["query_analysis"]["ranking_profile"] == "graph_exploration"
-    linked = {
-        item["canonical_name"]: item
-        for item in result["query_analysis"]["entity_linking"]
-    }
+    linked = {item["canonical_name"]: item for item in result["query_analysis"]["entity_linking"]}
     assert linked["specific topic"]["specificity"] == pytest.approx(1.0)
     assert linked["broad topic"]["visible_memory_count"] >= 100
     assert linked["broad topic"]["specificity"] < 1.0
@@ -805,10 +827,7 @@ async def test_queried_search_honors_offset_after_ranking(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_queried_search_top_k_does_not_change_ranking_prefix(db, monkeypatch):
-    memories = [
-        _memory(f"m-{index}", f"Payroll rank window memory {index}")
-        for index in range(40)
-    ]
+    memories = [_memory(f"m-{index}", f"Payroll rank window memory {index}") for index in range(40)]
     for memory in memories:
         await db.insert_memory(memory)
 
@@ -826,10 +845,7 @@ async def test_queried_search_top_k_does_not_change_ranking_prefix(db, monkeypat
     lexical_order = [f"m-{index}" for index in range(20, 40)] + [f"m-{index}" for index in range(20)]
 
     async def bm25_results(_query, _analysis, _memory_types, _scope, limit):
-        return [
-            (memory_id, float(len(lexical_order) - index))
-            for index, memory_id in enumerate(lexical_order[:limit])
-        ]
+        return [(memory_id, float(len(lexical_order) - index)) for index, memory_id in enumerate(lexical_order[:limit])]
 
     async def metadata_results(
         _query,
@@ -855,9 +871,7 @@ async def test_queried_search_top_k_does_not_change_ranking_prefix(db, monkeypat
     first_page = await engine.search("Payroll rank window", top_k=10)
     larger_page = await engine.search("Payroll rank window", top_k=20)
 
-    assert [r.memory_id for r in first_page["results"]] == [
-        r.memory_id for r in larger_page["results"][:10]
-    ]
+    assert [r.memory_id for r in first_page["results"]] == [r.memory_id for r in larger_page["results"][:10]]
     assert first_page["ranking_window_size"] == larger_page["ranking_window_size"]
     assert first_page["candidate_count_kind"] == "windowed"
     assert first_page["has_more"] is True
@@ -865,10 +879,7 @@ async def test_queried_search_top_k_does_not_change_ranking_prefix(db, monkeypat
 
 @pytest.mark.asyncio
 async def test_queried_search_top_k_prefix_stable_with_sqlite_metadata_channel(db, monkeypatch):
-    memories = [
-        _memory(f"m-sqlite-{index}", f"Unrelated memory body {index}")
-        for index in range(40)
-    ]
+    memories = [_memory(f"m-sqlite-{index}", f"Unrelated memory body {index}") for index in range(40)]
     for index, memory in enumerate(memories):
         await db.insert_memory(memory)
         await _document(
@@ -899,19 +910,12 @@ async def test_queried_search_top_k_prefix_stable_with_sqlite_metadata_channel(d
     first_page = await engine.search("create blocker hint", top_k=10)
     larger_page = await engine.search("create blocker hint", top_k=20)
 
-    assert [r.memory_id for r in first_page["results"]] == [
-        r.memory_id for r in larger_page["results"][:10]
-    ]
-    assert (
-        first_page["ranking_window_size"]
-        == larger_page["ranking_window_size"]
-        == DEFAULT_RANK_WINDOW_SIZE
-    )
+    assert [r.memory_id for r in first_page["results"]] == [r.memory_id for r in larger_page["results"][:10]]
+    assert first_page["ranking_window_size"] == larger_page["ranking_window_size"] == DEFAULT_RANK_WINDOW_SIZE
     assert "bm25_metadata_tokens" in first_page["query_analysis"]["strategies_used"]
     assert any(
         result.retrieval_evidence
-        and result.retrieval_evidence.get("metadata_lexical", {}).get("channel")
-        == "bm25_metadata_tokens"
+        and result.retrieval_evidence.get("metadata_lexical", {}).get("channel") == "bm25_metadata_tokens"
         for result in first_page["results"]
     )
 

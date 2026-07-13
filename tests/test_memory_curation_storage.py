@@ -41,9 +41,7 @@ async def test_memory_curation_fields_roundtrip(db: Database):
 
     assert loaded is not None
     assert loaded.memory_level == MemoryLevel.CONSOLIDATED.value
-    assert loaded.curation_cluster_id == (
-        "agent-session|repo:github.tools.sap/hcm/memforge-cloud|deploy"
-    )
+    assert loaded.curation_cluster_id == ("agent-session|repo:github.tools.sap/hcm/memforge-cloud|deploy")
     assert loaded.repo_identifier == "github.tools.sap/hcm/memforge-cloud"
 
 
@@ -118,6 +116,4 @@ async def test_sqlite_ranking_metadata_includes_curation_fields(db: Database):
     assert metadata["mem-ranked"]["project_key"] == "UNSORTED"
     assert metadata["mem-ranked"]["memory_level"] == MemoryLevel.CONSOLIDATED.value
     assert metadata["mem-ranked"]["curation_cluster_id"] == "cluster-1"
-    assert metadata["mem-ranked"]["repo_identifier"] == (
-        "github.tools.sap/hcm/memforge-cloud"
-    )
+    assert metadata["mem-ranked"]["repo_identifier"] == ("github.tools.sap/hcm/memforge-cloud")

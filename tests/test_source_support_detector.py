@@ -381,7 +381,14 @@ async def test_sqlite_corroborate_memory_overwrites_source_updated_at_with_unkno
 async def test_source_support_candidates_exclude_disabled_private_sources(db: Database):
     await _insert_doc(db, "doc-origin", project="ORIGIN")
     await _insert_doc(db, "doc-support", project="PAY")
-    await db.upsert_source("src-ORIGIN", "confluence", "Origin", "{}")
+    await db.upsert_source(
+        "src-ORIGIN",
+        "confluence",
+        "Origin",
+        "{}",
+        access_policy="private",
+        owner_user_id="alice@example.com",
+    )
     entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle", tags=["feature"])
     memory = _memory(
         "mem-disabled-source-support",
@@ -433,7 +440,14 @@ async def test_source_support_workspace_candidates_ignore_personal_disabled_sour
     await _insert_doc(db, "doc-support", project="PAY")
     await db.db.execute("UPDATE documents SET source = ? WHERE doc_id = ?", ("src-ORIGIN", "doc-origin"))
     await db.db.commit()
-    await db.upsert_source("src-ORIGIN", "confluence", "Origin", "{}")
+    await db.upsert_source(
+        "src-ORIGIN",
+        "confluence",
+        "Origin",
+        "{}",
+        access_policy="workspace",
+        owner_user_id="alice@example.com",
+    )
     entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle", tags=["feature"])
     memory = _memory("mem-workspace-source-support", "Period lifecycle assignment transitions to ASSIGNED.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)

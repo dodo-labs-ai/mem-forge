@@ -73,9 +73,7 @@ def test_clack_package_is_wired_in_repository():
     assert package_json.exists()
     data = json.loads(package_json.read_text())
     assert data.get("type") == "module"
-    assert data.get("dependencies", {}).get("@clack/prompts"), (
-        "interactive package.json must declare @clack/prompts"
-    )
+    assert data.get("dependencies", {}).get("@clack/prompts"), "interactive package.json must declare @clack/prompts"
     assert (main._interactive_resource_dir() / "index.mjs").exists()
 
 

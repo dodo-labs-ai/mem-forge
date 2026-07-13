@@ -130,6 +130,8 @@ async def _insert_document(
             type="confluence",
             name="Confluence",
             config_json="{}",
+            access_policy="workspace",
+            owner_user_id="dev",
         )
     now = datetime.now(timezone.utc)
     doc = DocumentRecord(
@@ -262,6 +264,7 @@ def test_classifier_keeps_useful_memory_with_link_list_context():
 
 @pytest.mark.asyncio
 async def test_engine_skips_metadata_only_candidate(db: Database):
+    await _insert_document(db)
     adapters = build_sqlite_adapters(db, FakeCollection())
     engine = MemoryEngine(
         relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db)
@@ -280,6 +283,7 @@ async def test_engine_skips_metadata_only_candidate(db: Database):
 
 @pytest.mark.asyncio
 async def test_engine_skips_open_question_candidate(db: Database):
+    await _insert_document(db)
     adapters = build_sqlite_adapters(db, FakeCollection())
     engine = MemoryEngine(
         relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db)
@@ -298,6 +302,7 @@ async def test_engine_skips_open_question_candidate(db: Database):
 
 @pytest.mark.asyncio
 async def test_engine_keeps_conditional_ap_rule(db: Database):
+    await _insert_document(db)
     adapters = build_sqlite_adapters(db, FakeCollection())
     engine = MemoryEngine(
         relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db)
@@ -900,7 +905,9 @@ async def test_delete_source_uses_injected_document_store(
         return DatabaseMemoryStore(db)
 
     monkeypatch.setattr(admin_api, "_build_memory_store", fake_build_memory_store)
-    await db.upsert_source("src-confluence", "confluence", "Delete Route Source", "{}")
+    await db.upsert_source(
+        "src-confluence", "confluence", "Delete Route Source", "{}", access_policy="workspace", owner_user_id="dev"
+    )
     await _insert_document(
         db,
         doc_id="doc-delete-route",
@@ -975,7 +982,9 @@ async def test_delete_source_succeeds_and_retains_cleanup_task_when_artifact_del
         return DatabaseMemoryStore()
 
     monkeypatch.setattr(admin_api, "_build_memory_store", fake_build_memory_store)
-    await db.upsert_source("src-cleanup-failure", "confluence", "Cleanup Failure", "{}")
+    await db.upsert_source(
+        "src-cleanup-failure", "confluence", "Cleanup Failure", "{}", access_policy="workspace", owner_user_id="dev"
+    )
     await _insert_document(
         db,
         doc_id="doc-cleanup-failure",
@@ -995,9 +1004,7 @@ async def test_delete_source_succeeds_and_retains_cleanup_task_when_artifact_del
     tasks = await db.list_source_artifact_cleanup_tasks(limit=10)
     assert response.status_code == 200, response.text
     assert await db.get_source("src-cleanup-failure") is None
-    assert [(task.attempt_count, task.last_error) for task in tasks] == [
-        (1, "object store unavailable")
-    ]
+    assert [(task.attempt_count, task.last_error) for task in tasks] == [(1, "object store unavailable")]
 
 
 @pytest.mark.asyncio
@@ -1017,7 +1024,9 @@ async def test_delete_source_restores_previous_status_when_delete_transaction_fa
         return FailingMemoryStore()
 
     monkeypatch.setattr(admin_api, "_build_memory_store", fake_build_memory_store)
-    await db.upsert_source("src-delete-rollback", "confluence", "Delete Rollback", "{}")
+    await db.upsert_source(
+        "src-delete-rollback", "confluence", "Delete Rollback", "{}", access_policy="workspace", owner_user_id="dev"
+    )
     await db.db.execute(
         "UPDATE sources SET status = 'paused' WHERE id = ?",
         ("src-delete-rollback",),
@@ -1314,7 +1323,9 @@ async def test_admin_memory_search_validates_source_ids_without_hydrating_admin_
     from memforge.server.admin_api import create_admin_app
     from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 
-    await db.upsert_source("src-mounttai", "jira", "MountTai Defects", "{}")
+    await db.upsert_source(
+        "src-mounttai", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev"
+    )
 
     calls = []
 

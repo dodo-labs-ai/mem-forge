@@ -65,12 +65,10 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
     await database.connect()
     try:
         await database.insert_memory(
-            _memory("p-u2-private", "secret meeting notes",
-                    visibility=PRIVATE, owner="u-2"),
+            _memory("p-u2-private", "secret meeting notes", visibility=PRIVATE, owner="u-2"),
         )
         await database.insert_memory(
-            _memory("p-shared", "team meeting notes",
-                    visibility=WORKSPACE, owner=None),
+            _memory("p-shared", "team meeting notes", visibility=WORKSPACE, owner=None),
         )
 
         async def fake_build_search_engine(db, config, *, audit_logger=None):
@@ -107,9 +105,7 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
 
         from memforge import runtime as runtime_module
 
-        monkeypatch.setattr(
-            runtime_module, "build_search_engine", fake_build_search_engine
-        )
+        monkeypatch.setattr(runtime_module, "build_search_engine", fake_build_search_engine)
 
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:

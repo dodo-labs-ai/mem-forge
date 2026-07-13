@@ -14,6 +14,7 @@ from memforge.memory.store import MemoryStore
 from memforge.models import Memory, Visibility, content_hash
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
+from memforge.source_access_transition import SourceAccessTransitionService
 
 
 class RecordingCollection:
@@ -51,6 +52,16 @@ class RecordingCollection:
 async def bundle_stack(tmp_path, monkeypatch):
     db = Database(str(tmp_path / "agent-knowledge.db"))
     await db.connect()
+    await db.upsert_source(
+        id="src-agent-sessions-codex",
+        type="agent_session",
+        name="Codex Session",
+        config_json='{"client":"codex"}',
+        access_policy="private",
+        owner_user_id="u-andrew",
+        created_by_user_id="u-andrew",
+        execution_owner_user_id="u-andrew",
+    )
     collection = RecordingCollection()
     adapters = build_sqlite_adapters(db, collection)
     store = MemoryStore(
@@ -158,8 +169,7 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
     assert memory.owner_user_id == "u-andrew"
     assert memory.repo_identifier == "github.tools.sap/hcm/memforge-cloud"
     assert (
-        memory.content
-        == "Workspace source schedulers must start during app startup.\n"
+        memory.content == "Workspace source schedulers must start during app startup.\n"
         "Applies: Workspace source scheduling in MemForge.\n"
         "Why: This lets overdue schedules run without waiting for UI traffic."
     )
@@ -181,6 +191,54 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
     assert [(relation.memory_id, relation.relation_type) for relation in relations] == [
         (result.memory_id, RelationType.SUPPORTS)
     ]
+
+
+@pytest.mark.asyncio
+async def test_shared_managed_source_exposes_concepts_to_subscribed_workspace_members(bundle_stack):
+    db, store, _ = bundle_stack
+    bundle = AgentKnowledgeBundleService(db=db, memory_store=store)
+    result = await bundle.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-share",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+
+    assert (
+        await db.list_agent_concepts(
+            viewer_user_id="u-bob",
+            repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        )
+        == []
+    )
+
+    access = SourceAccessTransitionService(db=db, memory_store=store)
+    transition = await access.start(
+        source_id="src-agent-sessions-codex",
+        actor_user_id="u-andrew",
+        target_policy="workspace",
+        idempotency_key="share-codex-source",
+    )
+    await access.run(transition["operation_id"])
+
+    shared = await db.list_agent_concepts(
+        viewer_user_id="u-bob",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+    )
+    assert [concept["id"] for concept in shared] == [result.concept_id]
+    await db.set_source_subscription("src-agent-sessions-codex", "u-bob", False)
+    assert (
+        await db.list_agent_concepts(
+            viewer_user_id="u-bob",
+            repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio
@@ -700,7 +758,9 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
                 "Workspace source schedulers must start during app startup, claim due "
                 "source schedules, and advance next_run_at after a successful claim."
             ),
-            durable_claim=_durable("Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."),
+            durable_claim=_durable(
+                "Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."
+            ),
             reason="New evidence refines the scheduler lifecycle claim.",
             citations=["agent-window://codex/sess-2/sha256-window"],
         ),
@@ -721,12 +781,9 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
 
     memory = await db.get_memory(updated.memory_id)
     assert memory is not None
-    assert (
-        memory.content
-        == (
-            "Source schedulers start on app startup, claim due schedules, and advance next_run_at after success.\n"
-            "Applies: Agent-session memory extraction."
-        )
+    assert memory.content == (
+        "Source schedulers start on app startup, claim due schedules, and advance next_run_at after success.\n"
+        "Applies: Agent-session memory extraction."
     )
     assert "advance next_run_at" in (memory.extraction_context or "")
     assert collection.upserted[updated.memory_id]["content_hash"] == memory.content_hash
@@ -991,7 +1048,9 @@ async def test_update_existing_claim_retry_is_idempotent_after_replacement(bundl
             "Workspace source schedulers must start during app startup, claim due "
             "source schedules, and advance next_run_at after a successful claim."
         ),
-        durable_claim=_durable("Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."),
+        durable_claim=_durable(
+            "Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."
+        ),
         reason="New evidence refines the scheduler lifecycle claim.",
         citations=["agent-window://codex/sess-2/sha256-window"],
     )
@@ -1084,7 +1143,9 @@ async def test_update_existing_claim_retry_rejects_changed_relation_payload(bund
             "Workspace source schedulers must start during app startup, claim due "
             "source schedules, and advance next_run_at after a successful claim."
         ),
-        durable_claim=_durable("Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."),
+        durable_claim=_durable(
+            "Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."
+        ),
         reason="New evidence refines the scheduler lifecycle claim.",
     )
     first_update = await service.apply_patch_proposal(
@@ -1147,7 +1208,9 @@ async def test_update_existing_claim_retry_rejects_committed_candidate_snapshot_
             "Workspace source schedulers must start during app startup, claim due "
             "source schedules, and advance next_run_at after a successful claim."
         ),
-        durable_claim=_durable("Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."),
+        durable_claim=_durable(
+            "Source schedulers start on app startup, claim due schedules, and advance next_run_at after success."
+        ),
         reason="New evidence refines the scheduler lifecycle claim.",
     )
     first_update = await service.apply_patch_proposal(

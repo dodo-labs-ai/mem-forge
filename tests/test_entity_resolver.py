@@ -16,6 +16,7 @@ from memforge.models import Entity, canonicalize_entity_name
 # canonicalize_entity_name
 # ---------------------------------------------------------------------------
 
+
 class TestCanonicalizeEntityName:
     def test_lowercase(self):
         assert canonicalize_entity_name("PostgreSQL") == "postgresql"
@@ -76,6 +77,7 @@ class TestCanonicalizeEntityName:
 # validate_alias
 # ---------------------------------------------------------------------------
 
+
 class TestValidateAlias:
     def test_token_overlap_plausible(self):
         """'Project Payroll' and 'OnDemand Payroll' share 'payroll' -> plausible."""
@@ -107,6 +109,7 @@ class TestValidateAlias:
 # ---------------------------------------------------------------------------
 # Entity model (tags)
 # ---------------------------------------------------------------------------
+
 
 class TestEntityTags:
     def test_entity_tags_default(self):

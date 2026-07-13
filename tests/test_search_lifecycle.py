@@ -26,6 +26,16 @@ class FakeCollection:
 async def db(tmp_path):
     database = Database(str(tmp_path / "search.db"))
     await database.connect()
+    for source_id in ("src-confluence", "src-jira"):
+        await database.upsert_source(
+            source_id,
+            "test",
+            source_id,
+            "{}",
+            "workspace",
+            "dev",
+            created_by_user_id="dev",
+        )
     yield database
     await database.close()
 

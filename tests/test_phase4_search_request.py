@@ -58,9 +58,7 @@ def test_source_filter_accepts_exact_agent_session_facets():
     assert req.active_repo_identifier == "github.tools.sap/hcm/memforge-cloud"
     assert req.source_filter is not None
     assert req.source_filter.clients == ["codex"]
-    assert req.source_filter.repo_identifiers == [
-        "github.tools.sap/hcm/memforge-cloud"
-    ]
+    assert req.source_filter.repo_identifiers == ["github.tools.sap/hcm/memforge-cloud"]
 
 
 def test_source_filter_accepts_exact_source_ids():

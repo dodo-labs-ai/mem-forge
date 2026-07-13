@@ -52,6 +52,15 @@ class FakeCollection:
 async def db(tmp_path):
     database = Database(str(tmp_path / "reconciliation.db"))
     await database.connect()
+    await database.upsert_source(
+        "src-1",
+        "confluence",
+        "Test Source",
+        "{}",
+        "workspace",
+        "dev",
+        created_by_user_id="dev",
+    )
     yield database
     await database.close()
 
@@ -901,9 +910,7 @@ async def test_reconciliation_rejects_update_without_current_doc_extracted_suppo
     )
     await db.add_memory_source(target.id, "doc-owner", "confluence", support_kind="extracted", source_updated_at=None)
     # The anchor makes reconciliation run while the target remains outside current-doc extracted authority.
-    await db.add_memory_source(
-        anchor.id, "doc-current", "confluence", support_kind="extracted", source_updated_at=None
-    )
+    await db.add_memory_source(anchor.id, "doc-current", "confluence", support_kind="extracted", source_updated_at=None)
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -969,9 +976,7 @@ async def test_reconciliation_rejects_delete_for_corroborated_only_current_doc_s
     )
     await db.add_memory_source(target.id, "doc-owner", "confluence", support_kind="extracted", source_updated_at=None)
     # The anchor makes reconciliation run while the target remains outside current-doc extracted authority.
-    await db.add_memory_source(
-        anchor.id, "doc-current", "confluence", support_kind="extracted", source_updated_at=None
-    )
+    await db.add_memory_source(anchor.id, "doc-current", "confluence", support_kind="extracted", source_updated_at=None)
 
     collection = FakeCollection()
     adapters = build_sqlite_adapters(db, collection)

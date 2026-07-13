@@ -353,6 +353,7 @@ def test_admin_source_create_encrypts_and_redacts_pat(tmp_path, monkeypatch):
             "/api/sources",
             json={
                 "type": "confluence",
+                "access_policy": "private",
                 "name": "Engineering Wiki",
                 "config": {
                     "base_url": "https://wiki.example.test",
@@ -396,6 +397,7 @@ def test_admin_source_create_and_update_persist_sync_schedule(tmp_path, monkeypa
             json={
                 "type": "confluence",
                 "name": "Scheduled Wiki",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://wiki.example.test",
                     "spaces": ["PAY"],
@@ -454,6 +456,7 @@ def test_admin_source_update_preserves_encrypted_pat_when_blank(tmp_path, monkey
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://wiki.example.test",
                     "spaces": ["PAY"],
@@ -517,6 +520,7 @@ def test_admin_source_update_persists_status(tmp_path, monkeypatch):
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://wiki.example.test",
                     "spaces": ["PAY"],
@@ -551,6 +555,7 @@ def test_admin_source_update_rejects_unknown_status(tmp_path, monkeypatch):
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://wiki.example.test",
                     "spaces": ["PAY"],
@@ -583,6 +588,7 @@ def test_admin_source_sync_rejects_paused_source(tmp_path, monkeypatch):
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://wiki.example.test",
                     "spaces": ["PAY"],
@@ -605,13 +611,15 @@ async def test_agent_session_document_intake_is_retired_before_source_status(db,
     from memforge.agent_sessions import agent_session_source_id
     from memforge.server.admin_api import create_admin_app
 
-    source_id = agent_session_source_id("codex")
+    source_id = agent_session_source_id("codex", "dev")
     await db.upsert_source(
         id=source_id,
         type="agent_session",
         name="Codex Session",
         config_json=json.dumps({"documents_dir": str(tmp_path / "sessions"), "client": "codex"}),
         status="paused",
+        access_policy="private",
+        owner_user_id="dev",
     )
 
     app = create_admin_app(db=db, config=_config(tmp_path))
@@ -640,13 +648,15 @@ async def test_agent_session_window_intake_rejects_paused_source_before_llm(
     from memforge.agent_sessions import agent_session_source_id
     from memforge.server.admin_api import create_admin_app
 
-    source_id = agent_session_source_id("claude-code")
+    source_id = agent_session_source_id("claude-code", "dev")
     await db.upsert_source(
         id=source_id,
         type="agent_session",
         name="Claude Code Session",
         config_json=json.dumps({"documents_dir": str(tmp_path / "sessions"), "client": "claude-code"}),
         status="paused",
+        access_policy="private",
+        owner_user_id="dev",
     )
 
     class FailingWindowClient:
@@ -683,6 +693,8 @@ async def test_sync_service_rejects_paused_source_at_start_boundary(db, tmp_path
         name="Paused Boundary",
         config_json=json.dumps({"base_url": "https://wiki.example.test", "spaces": ["PAY"]}),
         status="paused",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     sync_service = SyncService(db, _config(tmp_path))
@@ -704,6 +716,8 @@ async def test_sync_service_does_not_queue_paused_source(db, tmp_path):
         name="Paused Queued",
         config_json=json.dumps({"base_url": "https://wiki.example.test", "spaces": ["PAY"]}),
         status="paused",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     sync_service = SyncService(db, _config(tmp_path))
@@ -723,6 +737,8 @@ async def test_queued_sync_stops_quietly_if_source_is_paused_before_execution(db
         name="Paused After Queue",
         config_json=json.dumps({"base_url": "https://wiki.example.test", "spaces": ["PAY"]}),
         status="active",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     logged_errors: list[tuple] = []
@@ -741,6 +757,8 @@ async def test_queued_sync_stops_quietly_if_source_is_paused_before_execution(db
         name="Paused After Queue",
         config_json=json.dumps({"base_url": "https://wiki.example.test", "spaces": ["PAY"]}),
         status="paused",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     worker = SourceSyncWorker(db, _config(tmp_path), worker_id="test-worker")
     await worker.run_once()
@@ -766,6 +784,7 @@ def test_admin_source_save_rejects_missing_tls_ca_bundle(tmp_path, monkeypatch):
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://wiki.example.test",
                     "spaces": ["PAY"],
@@ -791,6 +810,7 @@ def test_admin_source_save_rejects_insecure_atlassian_base_url(tmp_path, monkeyp
             "/api/sources",
             json={
                 "type": "jira",
+                "access_policy": "private",
                 "name": "Enterprise Jira",
                 "config": {
                     "base_url": "http://jira.example.test",
@@ -817,6 +837,7 @@ def test_admin_source_save_rejects_pat_without_base_url(tmp_path, monkeypatch):
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
+                "access_policy": "private",
                 "config": {
                     "spaces": ["PAY"],
                     "pat": "wiki-pat-secret",
@@ -861,6 +882,7 @@ def test_admin_source_create_rejects_missing_atlassian_pat(
             json={
                 "type": source_type,
                 "name": name,
+                "access_policy": "private",
                 "config": config,
             },
         )
@@ -884,6 +906,7 @@ def test_admin_source_create_accepts_confluence_page_url_without_spaces(tmp_path
             json={
                 "type": "confluence",
                 "name": "Payroll Architecture",
+                "access_policy": "private",
                 "config": {
                     "base_url": ("https://wiki.company.example/wiki/spaces/PAY/pages/5695886009/Flexible+Payroll"),
                     "pat": "wiki-pat-secret",
@@ -920,6 +943,7 @@ def test_admin_source_create_requires_spaces_for_confluence_space_scope(tmp_path
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://wiki.example.test",
                     "sync_mode": "space",
@@ -944,6 +968,7 @@ def test_admin_source_create_allows_jira_browser_session_without_source_cookie(t
             json={
                 "type": "jira",
                 "name": "Enterprise Jira",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://jira.example.test",
                     "projects": ["PAY"],
@@ -956,9 +981,7 @@ def test_admin_source_create_allows_jira_browser_session_without_source_cookie(t
 
     assert response.status_code == 200, response.text
     assert sources_response.status_code == 200, sources_response.text
-    source = next(
-        item for item in sources_response.json()["data"] if item["id"] == response.json()["id"]
-    )
+    source = next(item for item in sources_response.json()["data"] if item["id"] == response.json()["id"])
     assert "auth_session" not in source
     assert source["connection_status"] == {
         "state": "action_required",
@@ -978,6 +1001,7 @@ def test_admin_source_create_rejects_missing_required_source_scope(tmp_path, mon
             json={
                 "type": "jira",
                 "name": "Enterprise Jira",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://jira.example.test",
                     "pat": "jira-pat-secret",
@@ -1001,6 +1025,7 @@ def test_admin_source_create_ignores_forged_jira_cookie_configured_flag(tmp_path
             json={
                 "type": "jira",
                 "name": "Enterprise Jira",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://jira.example.test",
                     "projects": ["PAY"],
@@ -1030,6 +1055,7 @@ def test_admin_source_create_rejects_forged_jira_pat_configured_flag(tmp_path, m
             json={
                 "type": "jira",
                 "name": "Enterprise Jira",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://jira.example.test",
                     "projects": ["PAY"],
@@ -1052,6 +1078,8 @@ async def test_admin_sources_exposes_failed_and_partial_sync_status(db, tmp_path
         type="jira",
         name="Failed Jira",
         config_json=json.dumps({}),
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.insert_sync_history(
         source="src-failed-visible",
@@ -1070,6 +1098,8 @@ async def test_admin_sources_exposes_failed_and_partial_sync_status(db, tmp_path
         type="confluence",
         name="Partial Confluence",
         config_json=json.dumps({}),
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.insert_sync_history(
         source="src-partial-visible",
@@ -1110,6 +1140,8 @@ async def test_admin_sources_exposes_running_stored_counts_separately(db, tmp_pa
         type="github_pages",
         name="Runbook Source",
         config_json=json.dumps({}),
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     for index in range(2):
         doc_id = f"doc-{index}"
@@ -1230,8 +1262,10 @@ async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(db, t
         type="agent_session",
         name="Codex Session",
         config_json=json.dumps({}),
+        access_policy="private",
+        owner_user_id="viewer-a",
     )
-    for index, owner in enumerate(["viewer-a", "viewer-a", "viewer-b"], start=1):
+    for index in range(1, 4):
         doc_id = f"doc-private-{index}"
         memory_id = f"mem-private-{index}"
         await db.db.execute(
@@ -1259,7 +1293,7 @@ async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(db, t
                 content=f"Private memory {index}",
                 content_hash=content_hash(f"Private memory {index}"),
                 visibility=Visibility.PRIVATE.value,
-                owner_user_id=owner,
+                owner_user_id="viewer-a",
                 confidence=0.9,
                 status="active",
             )
@@ -1307,11 +1341,12 @@ async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(db, t
     source = next(item for item in sources_response.json()["data"] if item["id"] == source_id)
     memories = memories_response.json()
     assert source["sync"]["memories_extracted"] == 3
-    assert memories["total"] == 2
-    assert source["memory_count"] == 2
+    assert memories["total"] == 3
+    assert source["memory_count"] == 3
     assert {item["id"] for item in memories["data"]} == {
         "mem-private-1",
         "mem-private-2",
+        "mem-private-3",
     }
 
 
@@ -1341,6 +1376,8 @@ async def test_unknown_source_type_still_redacts_and_encrypts_secret_fields(db, 
         type="removed_confluence",
         name="Removed Gene",
         config_json=json.dumps({"base_url": "https://wiki.example.test", "pat": "legacy-plain"}),
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     app = create_admin_app(db=db, config=cfg)
@@ -1402,6 +1439,8 @@ async def test_pat_source_noop_update_preserves_sync_cursor(db, tmp_path, monkey
         type="confluence",
         name="Engineering Wiki",
         config_json=json.dumps(source_config),
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.upsert_sync_state(
         SyncState(
@@ -1473,6 +1512,8 @@ async def test_pat_replacement_preserves_jira_sync_cursor_when_scope_is_unchange
         type="jira",
         name="Delivery Board",
         config_json=json.dumps(stored_config),
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.upsert_sync_state(
         SyncState(
@@ -1541,6 +1582,8 @@ async def test_jira_pat_replacement_resets_sync_cursor_when_secret_changes(db, t
         type="jira",
         name="Delivery Board",
         config_json=json.dumps(stored_config),
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.upsert_sync_state(
         SyncState(
@@ -1608,6 +1651,8 @@ async def test_jira_auth_mode_change_resets_sync_cursor(db, tmp_path, monkeypatc
         type="jira",
         name="Delivery Board",
         config_json=json.dumps(stored_config),
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.upsert_sync_state(
         SyncState(
@@ -1686,6 +1731,8 @@ async def test_source_base_url_update_releases_old_atlassian_limiter(db, tmp_pat
         type="jira",
         name="Delivery Board",
         config_json=json.dumps(stored_config),
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     app = create_admin_app(db=db, config=_config(tmp_path))
@@ -1728,6 +1775,8 @@ async def test_non_secret_source_noop_update_preserves_sync_cursor(db, tmp_path)
         config_json=json.dumps(source_config),
         created_by_user_id=LOCAL_DEV_USER_ID,
         execution_owner_user_id=LOCAL_DEV_USER_ID,
+        access_policy="workspace",
+        owner_user_id=LOCAL_DEV_USER_ID,
     )
     await db.upsert_sync_state(
         SyncState(
@@ -2057,6 +2106,7 @@ async def test_gene_discovery_preview_reuses_existing_source_secret(db, tmp_path
             json={
                 "name": "Stored Secret Source",
                 "type": "secret_preview_gene",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://docs.example.test",
                     "pat": "stored-preview-secret",
@@ -2106,6 +2156,7 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
             json={
                 "name": "Payroll Docs",
                 "type": "github_pages",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://github-pages.example.test/pages/org/repo",
                     "auth_mode": "none",
@@ -2118,6 +2169,7 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
             json={
                 "name": "Payroll Docs",
                 "type": "github_pages",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://github-pages.example.test/pages/org/repo",
                     "auth_mode": "none",
@@ -2132,6 +2184,7 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
             json={
                 "name": "Other Docs",
                 "type": "github_pages",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://github-pages.example.test/pages/org/repo",
                     "auth_mode": "none",
@@ -2145,6 +2198,7 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
             json={
                 "name": "PAT Docs",
                 "type": "github_pages",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://github-pages.example.test/pages/org/repo",
                     "auth_mode": "github_pat",
@@ -2187,6 +2241,8 @@ async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path,
         type="jira",
         name="Delivery Board",
         config_json=json.dumps(stored_config),
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.upsert_sync_state(
         SyncState(
@@ -2258,6 +2314,8 @@ async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path
         type="confluence",
         name="SFPAY Arch",
         config_json=json.dumps(stored_config),
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.upsert_sync_state(
         SyncState(
@@ -2280,6 +2338,7 @@ async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path
             return None
 
     fake_sync_service = FakeSyncService()
+
     async def allow_lease(*args, **kwargs):
         return True
 
@@ -2319,6 +2378,8 @@ async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds
         type="confluence",
         name="Force Resync",
         config_json=json.dumps({"base_url": "https://wiki.example", "spaces": ["PAY"]}),
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.upsert_sync_state(
         SyncState(
@@ -2406,6 +2467,8 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
         config_json=json.dumps({"root": "/repo", "vault_id": "notes"}),
         created_by_user_id=LOCAL_DEV_USER_ID,
         execution_owner_user_id=LOCAL_DEV_USER_ID,
+        access_policy="workspace",
+        owner_user_id=LOCAL_DEV_USER_ID,
     )
 
     class FakeSyncService:
@@ -2438,6 +2501,7 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
             return None
 
     fake_sync_service = FakeSyncService()
+
     async def allow_lease(*args, **kwargs):
         return True
 
@@ -2480,6 +2544,8 @@ async def test_local_agent_process_endpoint_rejects_server_owned_source(db, tmp_
         name="Server-owned source",
         config_json=json.dumps({"base_url": "https://wiki.example", "spaces": ["PAY"]}),
         created_by_user_id=LOCAL_DEV_USER_ID,
+        access_policy="workspace",
+        owner_user_id=LOCAL_DEV_USER_ID,
     )
 
     app = create_admin_app(db=db, config=_config(tmp_path))
@@ -2500,6 +2566,8 @@ async def test_admin_source_sync_status_uses_durable_worker_run(db, tmp_path):
         type="jira",
         name="Durable status",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
 
@@ -2525,6 +2593,8 @@ async def test_admin_source_sync_status_exposes_durable_progress_after_refresh(d
         type="confluence",
         name="Engineering Wiki",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
     leased = await db.lease_next_source_sync_run(
@@ -2574,6 +2644,8 @@ async def test_admin_source_sync_status_marks_expired_worker_lease_recovering(db
         type="jira",
         name="Durable recovering",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
     leased = await db.lease_next_source_sync_run(

@@ -30,10 +30,7 @@ def test_simple_mode_appends_filter_and_delta():
 def test_advanced_mode_injects_delta_before_user_order_by():
     user = 'project = PROJ AND type not in ("Test") ORDER BY Rank ASC'
     jql = _build_jql({"query_mode": "advanced", "jql": user}, _since())
-    assert jql == (
-        '(project = PROJ AND type not in ("Test")) '
-        "AND updated >= '2026-06-01 12:00' ORDER BY Rank ASC"
-    )
+    assert jql == ("(project = PROJ AND type not in (\"Test\")) AND updated >= '2026-06-01 12:00' ORDER BY Rank ASC")
 
 
 def test_advanced_mode_defaults_order_when_user_has_none():

@@ -34,7 +34,7 @@ from memforge.memory.evidence import (
 )
 from memforge.memory.lifecycle import requires_human_review
 from memforge.memory.quality import classify_memory_candidate
-from memforge.memory.visibility_policy import default_visibility
+from memforge.source_access import memory_visibility_for_document
 from memforge.models import (
     Memory,
     MemoryReview,
@@ -196,7 +196,6 @@ class MemoryEngine:
                 source_type=source_type,
                 project_key=project_key,
                 repo_identifier=repo_identifier,
-                user_id=user_id,
                 extractor_run_id=getattr(audit_context, "run_id", None),
             )
             if await self._evidence_unit_has_materialized_memory(unit):
@@ -224,14 +223,13 @@ class MemoryEngine:
                 continue
 
             # Build memory object
-            visibility, owner_user_id = default_visibility(source_type, user_id=user_id)
             memory = Memory(
                 id=lifecycle.created_memory_id,
                 memory_type=raw.memory_type,
                 content=raw.content.strip(),
                 content_hash=content_hash(raw.content.strip()),
-                visibility=visibility,
-                owner_user_id=owner_user_id,
+                visibility=unit.visibility,
+                owner_user_id=unit.owner_user_id,
                 project_key=project_key,
                 repo_identifier=repo_identifier,
                 entity_refs=raw.entity_refs,
@@ -617,7 +615,6 @@ class MemoryEngine:
                         source_type=source_type,
                         project_key=project_key,
                         repo_identifier=repo_identifier,
-                        user_id=user_id,
                         extractor_run_id=getattr(audit_context, "run_id", None),
                     )
                     if await self._evidence_unit_has_materialized_memory(unit):
@@ -647,8 +644,8 @@ class MemoryEngine:
                     memory = self._build_memory(
                         op.memory,
                         project_key,
-                        source_type,
-                        user_id=user_id,
+                        visibility=unit.visibility,
+                        owner_user_id=unit.owner_user_id,
                         repo_identifier=repo_identifier,
                         memory_id=lifecycle.created_memory_id,
                     )
@@ -724,8 +721,8 @@ class MemoryEngine:
                     new_memory = self._build_memory(
                         op.memory,
                         project_key,
-                        source_type,
-                        user_id=user_id,
+                        visibility=unit.visibility,
+                        owner_user_id=unit.owner_user_id,
                         repo_identifier=repo_identifier,
                     )
                     memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
@@ -802,8 +799,8 @@ class MemoryEngine:
                     new_memory = self._build_memory(
                         op.memory,
                         project_key,
-                        source_type,
-                        user_id=user_id,
+                        visibility=unit.visibility,
+                        owner_user_id=unit.owner_user_id,
                         repo_identifier=repo_identifier,
                     )
                     memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
@@ -960,9 +957,6 @@ class MemoryEngine:
         """Insert a hidden challenger and create a review case for a replacement."""
         if not op.memory or not self._candidate_can_persist(op.memory, stats):
             return False
-        challenger = self._build_memory(op.memory, project_key, source_type, user_id=user_id)
-        challenger.status = "pending_review"
-        memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
         is_revision = op.action == ReconcileAction.UPDATE
         replacement_relation = RelationType.REFINES if is_revision else RelationType.CONTRADICTS
         replacement_kind: ReplacementKind = "revision" if is_revision else "supersession"
@@ -984,6 +978,14 @@ class MemoryEngine:
             audit_context=audit_context,
             lifecycle_action=LifecycleAction.CREATE_REVIEW,
         )
+        challenger = self._build_memory(
+            op.memory,
+            project_key,
+            visibility=unit.visibility,
+            owner_user_id=unit.owner_user_id,
+        )
+        challenger.status = "pending_review"
+        memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
         existing_case = await self.db.get_open_review_for_incumbent_source_doc(
             incumbent_memory_id=existing_memory.id,
             doc_id=doc_id,
@@ -1179,13 +1181,13 @@ class MemoryEngine:
         self,
         raw: RawMemory,
         project_key: str | None,
-        source_type: str,
-        user_id: str | None = None,
+        *,
+        visibility: str,
+        owner_user_id: str | None,
         repo_identifier: str | None = None,
         memory_id: str | None = None,
     ) -> Memory:
         """Build a Memory object from a RawMemory."""
-        visibility, owner_user_id = default_visibility(source_type, user_id=user_id)
         return Memory(
             id=memory_id or generate_memory_id(),
             memory_type=raw.memory_type,
@@ -1227,7 +1229,6 @@ class MemoryEngine:
         source_type: str,
         project_key: str | None,
         repo_identifier: str | None,
-        user_id: str | None,
         extractor_run_id: str | None,
     ) -> EvidenceUnit:
         document = await self.db.get_document(doc_id)
@@ -1236,7 +1237,10 @@ class MemoryEngine:
         if document is not None:
             doc_revision_id = document.content_hash or document.version
             source_id = document.source or source_type
-        visibility, owner_user_id = default_visibility(source_type, user_id=user_id)
+        visibility, owner_user_id = await memory_visibility_for_document(
+            self.db,
+            doc_id=doc_id,
+        )
         content = raw.content.strip()
         evidence_id = _document_evidence_unit_id(
             source_id=source_id,
@@ -1296,7 +1300,6 @@ class MemoryEngine:
             source_type=source_type,
             project_key=project_key,
             repo_identifier=repo_identifier,
-            user_id=user_id,
             extractor_run_id=getattr(audit_context, "run_id", None),
         )
         relation_run_id = _document_relation_run_id(
@@ -1462,7 +1465,6 @@ class MemoryEngine:
             source_type=source_type,
             project_key=project_key,
             repo_identifier=repo_identifier,
-            user_id=user_id,
             extractor_run_id=getattr(audit_context, "run_id", None),
         )
         relation_type = RelationType.REFINES if op.action == ReconcileAction.UPDATE else RelationType.CONTRADICTS

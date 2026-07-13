@@ -145,9 +145,7 @@ def test_entity_admin_routes_use_adapter_methods_without_sqlite_db(tmp_path: Pat
     assert aliases_response.status_code == 200, aliases_response.text
     assert aliases_response.json()["data"][0]["alias"] == "Payroll Zone"
     assert add_alias_response.status_code == 200, add_alias_response.text
-    assert database.inserted_aliases == [
-        ("Payroll Org", "payroll org", 1, "admin_manual")
-    ]
+    assert database.inserted_aliases == [("Payroll Org", "payroll org", 1, "admin_manual")]
     assert remove_alias_response.status_code == 200, remove_alias_response.text
     assert database.removed_aliases == [(1, "payroll zone")]
     assert merge_response.status_code == 200, merge_response.text

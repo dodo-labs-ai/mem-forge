@@ -38,12 +38,7 @@ def test_local_agent_attempt_identity_and_retry_status_are_deterministic() -> No
     assert local_agent_sync_snapshot_id("job-1", 2) == "job-1:attempt:2"
     assert local_agent_completion_status("failed", retryable=True, attempt_count=4) == "queued"
     assert local_agent_completion_status("failed", retryable=True, attempt_count=5) == "failed"
-    assert (
-        local_agent_authoritative_snapshot_id(
-            "jira", "job-1", 2, "job-1:attempt:2"
-        )
-        == "job-1:attempt:2"
-    )
+    assert local_agent_authoritative_snapshot_id("jira", "job-1", 2, "job-1:attempt:2") == "job-1:attempt:2"
     with pytest.raises(ValueError, match="does not match"):
         local_agent_authoritative_snapshot_id("jira", "job-1", 2, "spoofed")
     assert local_agent_authoritative_snapshot_id("teams", "job-1", 2) is None
@@ -110,9 +105,7 @@ def test_local_agent_sync_operation_classifies_execution_mode(
     expected_operation: str | None,
 ) -> None:
     assert local_agent_sync_operation(source_type, config) == expected_operation
-    assert is_local_agent_backed_source({"type": source_type, "config": config}) is (
-        expected_operation is not None
-    )
+    assert is_local_agent_backed_source({"type": source_type, "config": config}) is (expected_operation is not None)
 
 
 @pytest.mark.parametrize(
@@ -300,6 +293,9 @@ def test_local_source_owner_receives_execution_capabilities() -> None:
         "type": "teams",
         "config": {},
         "created_by_user_id": "owner-a",
+        "access_policy": "private",
+        "access_state": "active",
+        "owner_user_id": "owner-a",
         "execution_owner_user_id": "owner-a",
     }
 
@@ -321,6 +317,9 @@ def test_local_source_non_owner_admin_keeps_management_without_execution() -> No
         "type": "teams",
         "config": {},
         "created_by_user_id": "owner-a",
+        "access_policy": "workspace",
+        "access_state": "active",
+        "owner_user_id": "owner-a",
         "execution_owner_user_id": "owner-a",
     }
 
@@ -343,6 +342,9 @@ def test_local_source_without_execution_owner_cannot_execute() -> None:
         "type": "local_markdown",
         "config": {"root": "/repo"},
         "created_by_user_id": "owner-a",
+        "access_policy": "private",
+        "access_state": "active",
+        "owner_user_id": "owner-a",
         "execution_owner_user_id": None,
     }
 
@@ -363,6 +365,9 @@ def test_server_source_admin_retains_existing_execution_capabilities() -> None:
         "type": "confluence",
         "config": {},
         "created_by_user_id": "owner-a",
+        "access_policy": "workspace",
+        "access_state": "active",
+        "owner_user_id": "owner-a",
         "execution_owner_user_id": None,
     }
 

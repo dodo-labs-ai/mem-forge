@@ -58,6 +58,10 @@ class SourceAdminReader(Protocol):
 
     async def get_source(self, source_id: str) -> dict[str, Any] | None: ...
 
+    async def get_active_source_access_transition(
+        self, source_id: str
+    ) -> dict[str, Any] | None: ...
+
     async def list_source_projects(
         self,
         source_id: str,

@@ -45,6 +45,16 @@ def _sqlite_adapters_factory(tmp_path) -> AdaptersFactory:
         collection_name = f"contract-{uuid.uuid4().hex[:12]}"
         database = Database(str(tmp_path / f"contract-{uuid.uuid4().hex[:8]}.db"))
         await database.connect()
+        for source_id in ("src-codex", "src-jira", "src-wiki", "src-mounttai", "src-other"):
+            await database.upsert_source(
+                id=source_id,
+                type="contract_fixture",
+                name=source_id,
+                config_json="{}",
+                access_policy="workspace",
+                owner_user_id="dev",
+                created_by_user_id="dev",
+            )
         collection = chroma_client.get_or_create_collection(collection_name)
         adapters = build_sqlite_adapters(database, collection)
         bundle = ContractAdapters(

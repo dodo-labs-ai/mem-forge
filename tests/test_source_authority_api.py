@@ -46,10 +46,15 @@ def _app(tmp_path: Path, database: Database):
     )
 
 
-def _confluence_payload(name: str = "Architecture Wiki") -> dict:
+def _confluence_payload(
+    name: str = "Architecture Wiki",
+    *,
+    access_policy: str = "workspace",
+) -> dict:
     return {
         "type": "confluence",
         "name": name,
+        "access_policy": access_policy,
         "config": {
             "base_url": "https://wiki.example.test/wiki/spaces/ARCH/pages/12345/Home",
             "pat": "super-secret-token",
@@ -64,6 +69,7 @@ def _teams_payload(name: str = "PCC Agent Dev") -> dict:
     return {
         "type": "teams",
         "name": name,
+        "access_policy": "workspace",
         "config": {
             "region": "emea",
             "conversation_ids": ["19:conversation-a@example.test"],
@@ -76,6 +82,7 @@ def _github_repo_payload(*, connection_mode: str) -> dict:
     return {
         "type": "github_repo",
         "name": "Internal Cookbook",
+        "access_policy": "workspace",
         "config": {
             "repo_url": "https://github.example.test/platform/cookbook",
             "ref": "main",
@@ -88,6 +95,7 @@ def _jira_payload(*, sync_mode: str) -> dict:
     return {
         "type": "jira",
         "name": "Payroll Jira",
+        "access_policy": "workspace",
         "config": {
             "base_url": "https://jira.example.test",
             "auth_mode": "browser_cookie",
@@ -138,6 +146,138 @@ async def _insert_source_backed_memory(
     await database.add_memory_source(memory_id, "doc-source-backed", "confluence", source_updated_at=None)
 
 
+def test_create_source_requires_explicit_access_policy(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        payload = _confluence_payload()
+        payload.pop("access_policy")
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
+                json=payload,
+            )
+
+        assert response.status_code == 422, response.text
+    finally:
+        asyncio.run(database.close())
+
+
+def test_private_source_is_undiscoverable_to_members_and_admins(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
+                json=_confluence_payload(access_policy="private"),
+            )
+            assert created.status_code == 200, created.text
+            source_id = created.json()["id"]
+
+            member_list = client.get(
+                "/api/sources",
+                headers={"x-test-user": "member-b", "x-test-workspace-role": "member"},
+            )
+            admin_list = client.get(
+                "/api/sources",
+                headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
+            )
+            direct_subscription = client.put(
+                f"/api/sources/{source_id}/subscription",
+                headers={"x-test-user": "member-b", "x-test-workspace-role": "member"},
+                json={"enabled": True},
+            )
+
+        assert member_list.status_code == 200
+        assert member_list.json()["data"] == []
+        assert admin_list.status_code == 200
+        assert admin_list.json()["data"] == []
+        assert direct_subscription.status_code == 404
+    finally:
+        asyncio.run(database.close())
+
+
+def test_owner_can_share_private_source_with_idempotent_transition(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        owner_headers = {
+            "x-test-user": "owner-user",
+            "x-test-workspace-role": "member",
+        }
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/sources",
+                headers=owner_headers,
+                json=_confluence_payload(access_policy="private"),
+            )
+            source_id = created.json()["id"]
+            transition_headers = {
+                **owner_headers,
+                "Idempotency-Key": "share-source-once",
+            }
+            started = client.post(
+                f"/api/sources/{source_id}/access-transitions",
+                headers=transition_headers,
+                json={"target_policy": "workspace"},
+            )
+            repeated = client.post(
+                f"/api/sources/{source_id}/access-transitions",
+                headers=transition_headers,
+                json={"target_policy": "workspace"},
+            )
+            member_list = client.get(
+                "/api/sources",
+                headers={
+                    "x-test-user": "other-user",
+                    "x-test-workspace-role": "member",
+                },
+            )
+
+        assert started.status_code == 202, started.text
+        assert repeated.status_code == 202, repeated.text
+        assert repeated.json()["operation_id"] == started.json()["operation_id"]
+        source = asyncio.run(database.get_source(source_id))
+        assert source["access_policy"] == "workspace"
+        assert source["access_state"] == "active"
+        assert source_id in {row["id"] for row in member_list.json()["data"]}
+    finally:
+        asyncio.run(database.close())
+
+
+def test_private_source_access_transition_does_not_leak_to_workspace_admin(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/sources",
+                headers={
+                    "x-test-user": "owner-user",
+                    "x-test-workspace-role": "member",
+                },
+                json=_confluence_payload(access_policy="private"),
+            )
+            source_id = created.json()["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/access-transitions",
+                headers={
+                    "x-test-user": "admin-b",
+                    "x-test-workspace-role": "workspace_admin",
+                    "Idempotency-Key": "unauthorized-share",
+                },
+                json={"target_policy": "workspace"},
+            )
+
+        assert response.status_code == 404
+    finally:
+        asyncio.run(database.close())
+
+
 def test_source_list_exposes_capabilities_and_redacts_config_for_non_owner_member(tmp_path):
     database = _connect_database(tmp_path)
     try:
@@ -159,6 +299,7 @@ def test_source_list_exposes_capabilities_and_redacts_config_for_non_owner_membe
         source = response.json()["data"][0]
         assert source["ownership"] == {
             "created_by_user_id": "owner-user",
+            "owner_user_id": "owner-user",
             "execution_owner_user_id": None,
             "viewer_role": "member",
             "viewer_relationship": "member",
@@ -170,6 +311,7 @@ def test_source_list_exposes_capabilities_and_redacts_config_for_non_owner_membe
             "can_sync": False,
             "can_force_resync": False,
             "can_delete": False,
+            "can_change_access": False,
         }
         assert source["config"] == {}
     finally:
@@ -202,7 +344,7 @@ def test_source_creator_can_manage_and_receives_redacted_config(tmp_path):
         assert updated.status_code == 200, updated.text
         source = listed.json()["data"][0]
         assert source["name"] == "Architecture Wiki Updated"
-        assert source["ownership"]["viewer_relationship"] == "creator"
+        assert source["ownership"]["viewer_relationship"] == "owner"
         assert source["capabilities"]["can_configure"] is True
         assert source["capabilities"]["can_sync"] is True
         assert source["capabilities"]["can_delete"] is True
@@ -332,7 +474,7 @@ def test_non_owner_member_cannot_manage_source(tmp_path):
         assert updated.status_code == 403
         assert updated.json()["detail"] == {
             "error": "source_management_forbidden",
-            "message": "Only the source creator or a workspace admin can manage this source.",
+            "message": "Only the source owner or a workspace admin can manage this source.",
         }
         assert deleted.status_code == 403
     finally:
@@ -415,6 +557,7 @@ def test_local_markdown_source_requires_root_before_execution_classification(tmp
                 json={
                     "type": "local_markdown",
                     "name": "Incomplete local source",
+                    "access_policy": "workspace",
                     "config": {},
                 },
             )
@@ -460,9 +603,7 @@ def test_non_owner_admin_can_manage_local_source_but_cannot_change_connection(tm
 
         assert managed.status_code == 200, managed.text
         assert connection_update.status_code == 403, connection_update.text
-        assert connection_update.json()["detail"]["error"] == (
-            "local_agent_source_connection_owner_forbidden"
-        )
+        assert connection_update.json()["detail"]["error"] == ("local_agent_source_connection_owner_forbidden")
         source = asyncio.run(database.get_source(source_id))
         assert source is not None
         assert source["name"] == "Admin Renamed"
@@ -627,9 +768,7 @@ def test_source_config_change_fences_leased_job_and_enqueues_successor(tmp_path)
         app = _app(tmp_path, database)
         headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
         with TestClient(app) as client:
-            created = client.post(
-                "/api/sources", headers=headers, json=_jira_payload(sync_mode="local_agent")
-            )
+            created = client.post("/api/sources", headers=headers, json=_jira_payload(sync_mode="local_agent"))
             source_id = created.json()["id"]
             first = client.post(f"/api/sources/{source_id}/sync", headers=headers)
             leased = client.post(
@@ -639,9 +778,7 @@ def test_source_config_change_fences_leased_job_and_enqueues_successor(tmp_path)
             ).json()["jobs"][0]
             updated_payload = _jira_payload(sync_mode="local_agent")
             updated_payload["config"]["projects"] = ["PAY", "TIME"]
-            updated = client.put(
-                f"/api/sources/{source_id}", headers=headers, json=updated_payload
-            )
+            updated = client.put(f"/api/sources/{source_id}", headers=headers, json=updated_payload)
             stale = client.post(
                 f"/api/sources/{source_id}/process",
                 headers=headers,
@@ -707,12 +844,8 @@ def test_local_agent_sync_job_can_only_be_created_and_leased_by_source_owner(tmp
         assert forbidden.status_code == 403, forbidden.text
         assert accepted.status_code == 201, accepted.text
         assert other_jobs.json() == {"jobs": []}
-        assert [job["job_id"] for job in owner_jobs.json()["jobs"]] == [
-            accepted.json()["job_id"]
-        ]
-        assert owner_jobs.json()["jobs"][0]["payload"]["conversation_ids"] == [
-            "19:conversation-a@example.test"
-        ]
+        assert [job["job_id"] for job in owner_jobs.json()["jobs"]] == [accepted.json()["job_id"]]
+        assert owner_jobs.json()["jobs"][0]["payload"]["conversation_ids"] == ["19:conversation-a@example.test"]
         assert "config" not in owner_jobs.json()["jobs"][0]["payload"]
     finally:
         asyncio.run(database.close())
@@ -760,6 +893,8 @@ def test_local_source_sync_without_execution_owner_returns_contract_error(tmp_pa
                 type="local_markdown",
                 name="Ownerless Local",
                 config_json='{"vault_id":"notes"}',
+                access_policy="workspace",
+                owner_user_id="owner-a",
             )
         )
         app = _app(tmp_path, database)

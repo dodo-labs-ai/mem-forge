@@ -10,16 +10,30 @@ async def test_filter_visible_ids_strips_other_users_private(tmp_path):
     db = Database(str(tmp_path / "f.db"))
     await db.connect()
     try:
-        await db.insert_memory(Memory(
-            id="ws", memory_type="fact", content="x", content_hash=content_hash("x1"),
-            visibility=Visibility.WORKSPACE.value, owner_user_id=None,
-            project_key=SHARED_PROJECT_KEY, tags=[],
-        ))
-        await db.insert_memory(Memory(
-            id="priv", memory_type="fact", content="y", content_hash=content_hash("y1"),
-            visibility=Visibility.PRIVATE.value, owner_user_id="u-2",
-            project_key=SHARED_PROJECT_KEY, tags=[],
-        ))
+        await db.insert_memory(
+            Memory(
+                id="ws",
+                memory_type="fact",
+                content="x",
+                content_hash=content_hash("x1"),
+                visibility=Visibility.WORKSPACE.value,
+                owner_user_id=None,
+                project_key=SHARED_PROJECT_KEY,
+                tags=[],
+            )
+        )
+        await db.insert_memory(
+            Memory(
+                id="priv",
+                memory_type="fact",
+                content="y",
+                content_hash=content_hash("y1"),
+                visibility=Visibility.PRIVATE.value,
+                owner_user_id="u-2",
+                project_key=SHARED_PROJECT_KEY,
+                tags=[],
+            )
+        )
         adapters = build_sqlite_adapters(db, memory_collection=None)
         scope = AccessScope(
             user_id="u-1",

@@ -249,6 +249,15 @@ async def test_replace_document_memory_without_provenance_fails_closed(db: Datab
 async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     observed_at = datetime(2026, 6, 28, tzinfo=timezone.utc)
     old = _memory("mem-agent-tool-old", "Use claude-code to invoke Claude Code CLI")
+    await db.upsert_source(
+        "src-agent-sessions-codex",
+        "agent_session",
+        "Codex Session",
+        "{}",
+        "private",
+        "andrew.sun01@sap.com",
+        created_by_user_id="andrew.sun01@sap.com",
+    )
     await db.upsert_document(
         DocumentRecord(
             doc_id="concept-claude-cli",
@@ -328,9 +337,7 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     assert concept is not None
     assert "Invoke Claude Code with `claude`, not `claude-code`." in concept["markdown_body"]
     assert "Use claude-code to invoke Claude Code CLI" not in concept["markdown_body"]
-    assert [(source.doc_id, source.source_type) for source in new_sources] == [
-        ("concept-claude-cli", "agent_session")
-    ]
+    assert [(source.doc_id, source.source_type) for source in new_sources] == [("concept-claude-cli", "agent_session")]
 
 
 @pytest.mark.asyncio

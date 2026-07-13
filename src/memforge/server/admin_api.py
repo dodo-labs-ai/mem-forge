@@ -22,7 +22,7 @@ from typing import Any, Awaitable, Callable, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -111,6 +111,11 @@ from memforge.server.source_admin_service import (
     list_source_admin_rows,
     normalize_workspace_role,
 )
+from memforge.source_access import source_is_discoverable
+from memforge.source_access_transition import (
+    SourceAccessTransitionError,
+    SourceAccessTransitionService,
+)
 from memforge.local_agent.readiness import connection_status_from_browser_session
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
@@ -133,6 +138,18 @@ from memforge.storage.admin_source import (
 from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
+
+
+async def _run_source_access_background(
+    operation_id: str,
+    action: Callable[[str], Awaitable[dict[str, Any]]],
+) -> None:
+    """Run a durable access command without leaking its recorded failure to ASGI."""
+
+    try:
+        await action(operation_id)
+    except Exception:
+        logger.exception("Background Source access operation failed: %s", operation_id)
 
 SEARCH_CLIENTS = ("claude-code", "codex")
 
@@ -198,18 +215,27 @@ def _source_management_forbidden() -> HTTPException:
         status_code=403,
         detail={
             "error": "source_management_forbidden",
-            "message": "Only the source creator or a workspace admin can manage this source.",
+            "message": "Only the source owner or a workspace admin can manage this source.",
         },
     )
 
 
 def _require_source_management(request: Request, source: dict[str, Any]) -> None:
+    _require_source_discoverability(request, source)
     if not can_manage_source(
         source,
         viewer_id=resolve_request_principal(request),
         viewer_role=resolve_request_workspace_role(request),
     ):
         raise _source_management_forbidden()
+
+
+def _require_source_discoverability(request: Request, source: dict[str, Any]) -> None:
+    if not source_is_discoverable(
+        source,
+        viewer_id=resolve_request_principal(request),
+    ):
+        raise HTTPException(status_code=404, detail="Source not found")
 
 
 def _require_local_agent_connection_management(
@@ -243,6 +269,7 @@ def _require_source_sync_execution(
     request: Request,
     source: dict[str, Any],
 ) -> None:
+    _require_source_discoverability(request, source)
     if not is_local_agent_backed_source(source):
         _require_source_management(request, source)
         return
@@ -807,6 +834,9 @@ class SourceResponse(BaseModel):
     name: str
     config: dict
     status: str
+    owner_user_id: str
+    access_policy: Literal["private", "workspace"]
+    access_state: Literal["active", "changing", "orphaned_private"]
     last_sync: str | None = None
     doc_count: int = 0
     created_at: str | None = None
@@ -869,9 +899,14 @@ class ProjectDeleteResponse(BaseModel):
 class CreateSourceRequest(BaseModel):
     type: str
     name: str
+    access_policy: Literal["private", "workspace"]
     config: dict
     project_binding: dict | None = None
     sync_schedule: SourceSyncScheduleRequest | None = None
+
+
+class SourceAccessTransitionRequest(BaseModel):
+    target_policy: Literal["private", "workspace"]
 
 
 class SourceSyncRequest(BaseModel):
@@ -3553,10 +3588,7 @@ def create_admin_app(
         )
 
         # Attach memory_count and sync status to each source
-        from memforge.agent_sessions import (
-            AGENT_SESSION_SOURCE_TYPE,
-            agent_session_client_for_source_id,
-        )
+        from memforge.agent_sessions import AGENT_SESSION_SOURCE_TYPE
 
         jira_auth_service = JiraAuthSessionService(db)
         for s in sources:
@@ -3571,9 +3603,9 @@ def create_admin_app(
             else:
                 s["config"] = {}
             # Surface the originating client for agent-session sources so the UI
-            # can pick a per-client brand mark without re-deriving from the id.
+            # can pick a per-client brand mark without decoding opaque source ids.
             if s["type"] == AGENT_SESSION_SOURCE_TYPE:
-                s["client"] = agent_session_client_for_source_id(s["id"])
+                s["client"] = original_config.get("client")
             else:
                 s["client"] = None
             if (
@@ -3643,6 +3675,7 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
 
         projects = [
             SourceProjectResponse(
@@ -3676,6 +3709,7 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
 
         rows = await db.list_resolved_projects_for_source(
             source_id,
@@ -3696,6 +3730,7 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
         await db.set_source_subscription(
             source_id,
             resolve_request_principal(request),
@@ -3717,6 +3752,7 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
         await db.set_source_pinned_for_user(
             source_id,
             resolve_request_principal(request),
@@ -3734,12 +3770,176 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
         await db.set_source_pinned_for_user(
             source_id,
             resolve_request_principal(request),
             False,
         )
         return {"source_id": source_id, "pinned": False}
+
+    async def _source_access_transition_service(
+        db: Database,
+        config: AppConfig,
+        runtime_provider: RuntimeProvider,
+        sync_service: SyncService,
+    ) -> SourceAccessTransitionService:
+        return SourceAccessTransitionService(
+            db=db,
+            memory_store=await _build_memory_store(db, config, runtime_provider),
+            sync_service=sync_service,
+        )
+
+    @source_router.post("/{source_id}/access-transitions", status_code=202)
+    async def start_source_access_transition(
+        request: Request,
+        source_id: str,
+        req: SourceAccessTransitionRequest,
+        background_tasks: BackgroundTasks,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+        sync_service: SyncService = Depends(get_sync_service),
+    ):
+        """Start a durable whole-history Source access change."""
+        source = await db.get_source(source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        service = await _source_access_transition_service(
+            db,
+            config,
+            runtime_provider,
+            sync_service,
+        )
+        try:
+            transition = await service.start(
+                source_id=source_id,
+                actor_user_id=resolve_request_principal(request),
+                target_policy=req.target_policy,
+                idempotency_key=idempotency_key,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        background_tasks.add_task(
+            _run_source_access_background,
+            transition["operation_id"],
+            service.run,
+        )
+        return transition
+
+    @source_router.get("/{source_id}/access-transition")
+    async def get_source_access_transition(
+        request: Request,
+        source_id: str,
+        db: Database = Depends(get_db),
+    ):
+        """Return the Source's current access operation, if any."""
+        source = await db.get_source(source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
+        return {"transition": await db.get_active_source_access_transition(source_id)}
+
+    @source_router.get("/{source_id}/access-transitions/{operation_id}")
+    async def get_source_access_transition_operation(
+        request: Request,
+        source_id: str,
+        operation_id: str,
+        db: Database = Depends(get_db),
+    ):
+        """Return one durable access operation, including terminal history."""
+        source = await db.get_source(source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
+        transition = await db.get_source_access_transition(operation_id)
+        if transition is None or transition["source_id"] != source_id:
+            raise HTTPException(status_code=404, detail="Access transition not found")
+        return {"transition": transition}
+
+    @source_router.post("/{source_id}/access-transitions/{operation_id}/retry")
+    async def retry_source_access_transition(
+        request: Request,
+        source_id: str,
+        operation_id: str,
+        background_tasks: BackgroundTasks,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+        sync_service: SyncService = Depends(get_sync_service),
+    ):
+        """Retry a failed access operation without widening visibility."""
+        source = await db.get_source(source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
+        if source.get("owner_user_id") != resolve_request_principal(request):
+            raise _source_management_forbidden()
+        transition = await db.get_source_access_transition(operation_id)
+        if transition is None or transition["source_id"] != source_id:
+            raise HTTPException(status_code=404, detail="Access transition not found")
+        service = await _source_access_transition_service(
+            db,
+            config,
+            runtime_provider,
+            sync_service,
+        )
+        try:
+            if transition["status"] != "failed":
+                raise SourceAccessTransitionError(
+                    "source_access_transition_not_retryable"
+                )
+        except SourceAccessTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        background_tasks.add_task(
+            _run_source_access_background,
+            operation_id,
+            service.retry,
+        )
+        return {"operation_id": operation_id, "status": "queued"}
+
+    @source_router.post("/{source_id}/access-transitions/{operation_id}/revert")
+    async def revert_source_access_transition(
+        request: Request,
+        source_id: str,
+        operation_id: str,
+        background_tasks: BackgroundTasks,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+        sync_service: SyncService = Depends(get_sync_service),
+    ):
+        """Restore the complete previous policy for a failed operation."""
+        source = await db.get_source(source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
+        if source.get("owner_user_id") != resolve_request_principal(request):
+            raise _source_management_forbidden()
+        transition = await db.get_source_access_transition(operation_id)
+        if transition is None or transition["source_id"] != source_id:
+            raise HTTPException(status_code=404, detail="Access transition not found")
+        service = await _source_access_transition_service(
+            db,
+            config,
+            runtime_provider,
+            sync_service,
+        )
+        if transition["status"] != "failed":
+            raise HTTPException(
+                status_code=409,
+                detail="source_access_transition_not_revertible",
+            )
+        background_tasks.add_task(
+            _run_source_access_background,
+            operation_id,
+            service.revert,
+        )
+        return {"operation_id": operation_id, "status": "queued"}
 
     @source_list_router.get("/preferences")
     async def get_source_list_preferences(
@@ -3903,6 +4103,8 @@ def create_admin_app(
             type=req.type,
             name=req.name,
             config_json=json.dumps(source_config),
+            access_policy=req.access_policy,
+            owner_user_id=creator_user_id,
             project_binding=req.project_binding,
             created_by_user_id=creator_user_id,
             execution_owner_user_id=(
@@ -3915,7 +4117,12 @@ def create_admin_app(
                 enabled=req.sync_schedule.enabled,
                 interval_minutes=req.sync_schedule.interval_minutes,
             )
-        return {"id": source_id, "name": req.name, "type": req.type}
+        return {
+            "id": source_id,
+            "name": req.name,
+            "type": req.type,
+            "access_policy": req.access_policy,
+        }
 
     @source_router.put("/{source_id}")
     async def update_source(
@@ -3998,6 +4205,9 @@ def create_admin_app(
             type=existing["type"],
             name=name,
             config_json=json.dumps(src_config),
+            access_policy=existing["access_policy"],
+            owner_user_id=existing["owner_user_id"],
+            access_state=existing["access_state"],
             status=req.status if _request_includes_field(req, "status") else None,
             project_binding=(
                 req.project_binding
@@ -4480,7 +4690,11 @@ def create_admin_app(
         if req.schema_version != "agent-session-window/v1":
             raise HTTPException(status_code=400, detail=f"unsupported schema_version: {req.schema_version}")
 
-        await _raise_if_source_paused(db, agent_session_source_id(req.client))
+        owner_user_id = resolve_request_principal(request)
+        await _raise_if_source_paused(
+            db,
+            agent_session_source_id(req.client, owner_user_id),
+        )
 
         structured_client = getattr(request.app.state, "agent_session_window_client", None)
         if structured_client is None:
@@ -4508,7 +4722,7 @@ def create_admin_app(
                 submitted_at=req.submitted_at,
                 source_updated_at=req.source_updated_at,
                 process_now=req.process_now,
-                user_id=resolve_request_principal(request),
+                user_id=owner_user_id,
             )
         except ValueError as e:
             detail = str(e)
@@ -5051,6 +5265,7 @@ def create_admin_app(
             source = await db.get_source(source_id)
             if source is None:
                 raise HTTPException(status_code=404, detail="local_agent_source_not_found")
+            _require_source_discoverability(request, source)
             operation = local_agent_sync_operation(source["type"], source.get("config"))
             if operation != req.operation or source["type"] != req.source_type:
                 raise HTTPException(status_code=400, detail="local_agent_operation_source_mismatch")

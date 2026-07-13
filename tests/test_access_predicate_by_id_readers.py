@@ -69,16 +69,13 @@ async def seeded_app(tmp_path):
     await database.connect()
     try:
         await database.insert_memory(
-            _memory("m-shared", "team meeting notes",
-                    visibility=WORKSPACE, owner=None),
+            _memory("m-shared", "team meeting notes", visibility=WORKSPACE, owner=None),
         )
         await database.insert_memory(
-            _memory("m-u1-private", "u1 personal note",
-                    visibility=PRIVATE, owner=LOCAL_DEV_USER_ID),
+            _memory("m-u1-private", "u1 personal note", visibility=PRIVATE, owner=LOCAL_DEV_USER_ID),
         )
         await database.insert_memory(
-            _memory("m-u2-private", "u2 secret meeting notes",
-                    visibility=PRIVATE, owner="u-2"),
+            _memory("m-u2-private", "u2 secret meeting notes", visibility=PRIVATE, owner="u-2"),
         )
 
         app = create_admin_app(db=database, config=cfg)
@@ -127,7 +124,8 @@ async def test_list_memories_excludes_other_users_private(seeded_app):
 
         # Search-mode list path.
         searched = client.get(
-            "/api/memories", params={"search": "meeting", "limit": 50},
+            "/api/memories",
+            params={"search": "meeting", "limit": 50},
         )
         assert searched.status_code == 200, searched.text
         searched_ids = {row["id"] for row in searched.json()["data"]}

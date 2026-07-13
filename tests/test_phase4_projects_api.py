@@ -210,6 +210,7 @@ def _local_markdown_source_payload(
     payload = {
         "type": "local_markdown",
         "name": name,
+        "access_policy": "private",
         "config": {
             "root": root,
             "vault_id": "engineering-notes",
@@ -467,6 +468,8 @@ def test_resolved_projects_endpoint_groups_memories_by_resolved_key(tmp_path):
             type="agent_session",
             name="codex sessions",
             config_json="{}",
+            access_policy="private",
+            owner_user_id="dev",
         )
         ts = datetime.now(tz=timezone.utc)
         for doc_id in ("doc-1", "doc-2"):

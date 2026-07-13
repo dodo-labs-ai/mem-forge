@@ -46,9 +46,7 @@ else:
 """
         ).body[0],
     ]
-    expected_import_switch_asts = {
-        ast.dump(node, include_attributes=False) for node in expected_import_switches
-    }
+    expected_import_switch_asts = {ast.dump(node, include_attributes=False) for node in expected_import_switches}
     normalized_body: list[ast.stmt] = []
     for node in module.body:
         contains_target_import = any(
@@ -62,9 +60,9 @@ else:
             for child in ast.walk(node)
         )
         if contains_target_import:
-            assert (
-                ast.dump(node, include_attributes=False) in expected_import_switch_asts
-            ), "target import compatibility block must be exact"
+            assert ast.dump(node, include_attributes=False) in expected_import_switch_asts, (
+                "target import compatibility block must be exact"
+            )
             continue
         normalized_body.append(node)
     module.body = normalized_body
@@ -623,9 +621,7 @@ def test_worker_normalizes_legacy_capture_trigger_names(monkeypatch, tmp_path):
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
-    submitted = hook_adapter.run_agent_window_worker_once(
-        timeout=5, queue_db_path=queue_db
-    )
+    submitted = hook_adapter.run_agent_window_worker_once(timeout=5, queue_db_path=queue_db)
 
     assert submitted == 1
     assert requests[0][1]["trigger"] == "REQUIRED_CAPTURE"
@@ -872,7 +868,7 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
         assert all("plugins/cache/memforge/memory" not in command for command in hook_commands)
         assert all("version=" not in command for command in hook_commands)
         assert "plugins/cache/memforge/memory/*" not in commands
-        assert ' -nt ' not in commands
+        assert " -nt " not in commands
     codex_mcp = json.loads((codex_root / ".mcp.json").read_text())
     claude_mcp = json.loads((claude_root / ".mcp.json").read_text())
 
@@ -912,9 +908,7 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
         ),
     ],
 )
-def test_plugin_hook_commands_skip_when_registered_root_is_stale(
-    tmp_path, plugin_path, home_cache, env_root
-):
+def test_plugin_hook_commands_skip_when_registered_root_is_stale(tmp_path, plugin_path, home_cache, env_root):
     root = Path(__file__).resolve().parents[1]
     hooks = json.loads((root / plugin_path).read_text())
     command = hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
@@ -922,8 +916,7 @@ def test_plugin_hook_commands_skip_when_registered_root_is_stale(
     cache_script = tmp_path / home_cache / "0.1.20" / "scripts" / "memforge_hook.py"
     cache_script.parent.mkdir(parents=True)
     cache_script.write_text(
-        "import os, pathlib, sys\n"
-        "pathlib.Path(os.environ['MEMFORGE_TEST_MARKER']).write_text(' '.join(sys.argv[1:]))\n"
+        "import os, pathlib, sys\npathlib.Path(os.environ['MEMFORGE_TEST_MARKER']).write_text(' '.join(sys.argv[1:]))\n"
     )
     env = os.environ.copy()
     env["HOME"] = str(tmp_path)
@@ -1019,6 +1012,7 @@ def test_packaged_plugin_config_matches_canonical_target_and_helpers():
 
 def test_mcp_and_hook_share_cloud_resource_url(monkeypatch):
     from memforge import hook_adapter, plugin_mcp_proxy
+
     monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example.hana.ondemand.com")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
 
@@ -1032,6 +1026,7 @@ def test_mcp_and_hook_share_cloud_resource_url(monkeypatch):
 
 def test_invalid_hook_target_fails_before_urlopen(monkeypatch):
     from memforge import hook_adapter
+
     monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example.hana.ondemand.com")
     monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
     monkeypatch.setattr(
@@ -1176,9 +1171,7 @@ def test_mcp_proxy_retries_roots_request_after_list_changed_while_previous_reque
     first_roots_request = proxy._handle_rpc_message({"jsonrpc": "2.0", "method": "notifications/initialized"})
     assert first_roots_request["method"] == "roots/list"
 
-    retry_roots_request = proxy._handle_rpc_message(
-        {"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}
-    )
+    retry_roots_request = proxy._handle_rpc_message({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"})
 
     assert retry_roots_request["method"] == "roots/list"
     assert retry_roots_request["id"] == first_roots_request["id"]
@@ -1424,7 +1417,9 @@ def test_mcp_proxy_forwards_list_sources_to_searchable_sources(monkeypatch):
     result = proxy._call_tool("list_sources", {})
 
     assert result["data"][0]["source_id"] == "src-mounttai"
-    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/sources/searchable"
+    assert (
+        captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/sources/searchable"
+    )
     assert captured["authorization"] == "Bearer token-123"
 
 
@@ -1821,9 +1816,10 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "provenance" in replace_schema["properties"]
     assert "Do not put confirmation details" in replace_schema["properties"]["replacement_content"]["description"]
     assert "provenance" in tools["replace_memory"]["description"]
-    assert "old claim, new claim, provenance/evidence, scope, and replacement reason" in tools[
-        "replace_memory"
-    ]["description"]
+    assert (
+        "old claim, new claim, provenance/evidence, scope, and replacement reason"
+        in tools["replace_memory"]["description"]
+    )
     assert replace_schema["properties"]["replacement_kind"]["enum"] == ["revision", "supersession"]
     assert "status" not in replace_schema["properties"]
 
@@ -1912,7 +1908,10 @@ def test_mcp_proxy_forwards_retire_memory_to_lifecycle_endpoint(monkeypatch):
 
     assert result == {"status": "retired", "memory_id": "mem-123"}
     assert captured["method"] == "POST"
-    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/memories/mem-123/retire"
+    assert (
+        captured["url"]
+        == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/memories/mem-123/retire"
+    )
     assert json.loads(captured["body"].decode()) == {
         "reason": "User confirmed this memory is obsolete.",
         "expected_content_hash": "hash-old",
@@ -2338,10 +2337,7 @@ def test_mcp_proxy_forwards_search_offset_for_deterministic_listing(monkeypatch)
             return False
 
         def read(self, _size=-1):
-            return (
-                b'{"results":[],"total_candidates":52,"candidate_count_kind":"exact",'
-                b'"limit":10,"offset":10}'
-            )
+            return b'{"results":[],"total_candidates":52,"candidate_count_kind":"exact","limit":10,"offset":10}'
 
     class FakeOpener:
         def open(self, request, timeout):
@@ -2442,9 +2438,7 @@ def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
                             "freshness": "current",
                             "status": "active",
                             "follow_up": {"suggested_tool": "get_memory"},
-                            "retrieval_evidence": {
-                                "metadata_lexical": {"matched_text": ["large debug text"]}
-                            },
+                            "retrieval_evidence": {"metadata_lexical": {"matched_text": ["large debug text"]}},
                             "repo_identifier": "repo",
                             "memory_level": "atomic",
                         }
@@ -2613,9 +2607,7 @@ def test_mcp_proxy_rejects_queryless_without_deterministic_filter(monkeypatch):
 
     result = proxy._call_tool("search", {})
 
-    assert result == {
-        "error": "search.query may be omitted only when source_filter or time_range is provided"
-    }
+    assert result == {"error": "search.query may be omitted only when source_filter or time_range is provided"}
 
 
 def test_mcp_proxy_forwards_explicit_optional_date_bounds(monkeypatch):
@@ -2695,9 +2687,7 @@ def test_mcp_proxy_rejects_empty_source_ids(monkeypatch):
         },
     )
 
-    assert result == {
-        "error": "source_filter.source_ids must be a non-empty array of source IDs from list_sources"
-    }
+    assert result == {"error": "source_filter.source_ids must be a non-empty array of source IDs from list_sources"}
 
 
 def test_mcp_proxy_rejects_removed_backend_search_knobs(monkeypatch):
@@ -2779,7 +2769,10 @@ def test_mcp_proxy_fetches_resource_through_hosted_workspace(monkeypatch):
 
     assert result["text"] == "# Source"
     assert result["url"] == "/api/documents/doc-1/content"
-    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/documents/doc-1/content"
+    assert (
+        captured["url"]
+        == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/documents/doc-1/content"
+    )
     assert captured["authorization"] == "Bearer token-123"
 
 
@@ -3704,18 +3697,14 @@ def test_worker_single_flight_skips_when_locked(monkeypatch, tmp_path):
     held = hook_adapter._acquire_worker_lock(queue_db)
     assert held is not None and held is not hook_adapter._NULL_WORKER_LOCK
     try:
-        skipped = hook_adapter.run_agent_window_worker_once(
-            timeout=5, queue_db_path=queue_db
-        )
+        skipped = hook_adapter.run_agent_window_worker_once(timeout=5, queue_db_path=queue_db)
     finally:
         hook_adapter._release_worker_lock(held)
 
     assert skipped == 0
     assert posts == []  # nothing processed while another worker holds the lock
 
-    processed = hook_adapter.run_agent_window_worker_once(
-        timeout=5, queue_db_path=queue_db
-    )
+    processed = hook_adapter.run_agent_window_worker_once(timeout=5, queue_db_path=queue_db)
     assert processed == 1
     assert posts and posts[0] == "/agent-sessions/windows"
 
@@ -3777,9 +3766,7 @@ def test_worker_keeps_pending_when_capture_requested_during_upload(monkeypatch, 
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
-    submitted = hook_adapter.run_agent_window_worker_once(
-        timeout=5, queue_db_path=queue_db
-    )
+    submitted = hook_adapter.run_agent_window_worker_once(timeout=5, queue_db_path=queue_db)
 
     assert submitted == 1
     with sqlite3.connect(queue_db) as connection:
@@ -3825,9 +3812,7 @@ def test_worker_keeps_pending_when_request_timestamp_collides(monkeypatch, tmp_p
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
-    submitted = hook_adapter.run_agent_window_worker_once(
-        timeout=5, queue_db_path=queue_db
-    )
+    submitted = hook_adapter.run_agent_window_worker_once(timeout=5, queue_db_path=queue_db)
 
     assert submitted == 1
     with sqlite3.connect(queue_db) as connection:
@@ -3862,9 +3847,7 @@ def test_stale_worker_cannot_rewind_bookmark_after_lease_reclaim(monkeypatch, tm
                         "UPDATE session_cursor SET lease_until = ? WHERE client = ? AND session_id = ?",
                         ("1970-01-01T00:00:00+00:00", "codex", "sess"),
                     )
-                hook_adapter._process_session_captures(
-                    queue_db, timeout=5, max_sessions=5
-                )
+                hook_adapter._process_session_captures(queue_db, timeout=5, max_sessions=5)
         return {"ok": True}
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)

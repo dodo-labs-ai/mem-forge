@@ -39,8 +39,22 @@ class RecordingCollection:
         return out
 
 
-async def _document(db: Database, doc_id: str) -> None:
+async def _document(
+    db: Database,
+    doc_id: str,
+    *,
+    access_policy: str = "workspace",
+    owner_user_id: str = "owner-a",
+) -> None:
     now = datetime.now(timezone.utc)
+    await db.upsert_source(
+        "src-x",
+        "manual",
+        "Test Source",
+        "{}",
+        access_policy=access_policy,
+        owner_user_id=owner_user_id,
+    )
     await db.upsert_document(
         DocumentRecord(
             doc_id=doc_id,
@@ -138,7 +152,12 @@ async def test_process_memories_persists_explicit_source_updated_at(db, monkeypa
         return [0.1]
 
     monkeypatch.setattr(store, "_embed", fake_embed)
-    await _document(db, "doc-observed")
+    await _document(
+        db,
+        "doc-observed",
+        access_policy="private",
+        owner_user_id="owner-a",
+    )
 
     engine = MemoryEngine(
         relational=adapters.relational,

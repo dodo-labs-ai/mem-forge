@@ -126,11 +126,14 @@ async def test_curator_runner_creates_consolidated_memory_and_lineage(store):
         min_cluster_size=2,
     )
 
-    result = await runner.curate([
-        CuratorCandidate(source_memories[0], "agent_session", "codex"),
-        CuratorCandidate(source_memories[1], "agent_session", "claude-code"),
-        CuratorCandidate(source_memories[2], "agent_session", "codex"),
-    ], run_id="cur-run-agent-1")
+    result = await runner.curate(
+        [
+            CuratorCandidate(source_memories[0], "agent_session", "codex"),
+            CuratorCandidate(source_memories[1], "agent_session", "claude-code"),
+            CuratorCandidate(source_memories[2], "agent_session", "codex"),
+        ],
+        run_id="cur-run-agent-1",
+    )
 
     assert result.created_memory_count == 1
     consolidated = await db.get_memory(result.created_memory_ids[0])

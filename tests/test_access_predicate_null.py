@@ -85,6 +85,7 @@ async def _insert_null_visibility_row(db: Database, mid: str, content: str) -> N
     db_path = db.db_path
     await db._db.close()
     import aiosqlite
+
     db._db = await aiosqlite.connect(db_path)
     db._db.row_factory = aiosqlite.Row
     await db.db.execute(
@@ -103,25 +104,29 @@ async def _insert_null_visibility_row(db: Database, mid: str, content: str) -> N
                   NULL, NULL, NULL,
                   NULL, NULL,
                   ?, ?)""",
-        (mid, "fact", content, content_hash(content + mid),
-         SHARED_PROJECT_KEY, now, now),
+        (mid, "fact", content, content_hash(content + mid), SHARED_PROJECT_KEY, now, now),
     )
     # FTS5 row so BM25 can attempt to surface it; the predicate must still hide.
     await db.db.execute(
-        "INSERT INTO memories_fts (memory_id, content, entities_text, tags_text) "
-        "VALUES (?, ?, '', '')",
+        "INSERT INTO memories_fts (memory_id, content, entities_text, tags_text) VALUES (?, ?, '', '')",
         (mid, content),
     )
     await db.db.commit()
 
 
 async def _insert_workspace_row(db: Database, mid: str, content: str) -> None:
-    await db.insert_memory(Memory(
-        id=mid, memory_type="fact", content=content,
-        content_hash=content_hash(content + mid),
-        visibility=WORKSPACE, owner_user_id=None,
-        project_key=SHARED_PROJECT_KEY, tags=[],
-    ))
+    await db.insert_memory(
+        Memory(
+            id=mid,
+            memory_type="fact",
+            content=content,
+            content_hash=content_hash(content + mid),
+            visibility=WORKSPACE,
+            owner_user_id=None,
+            project_key=SHARED_PROJECT_KEY,
+            tags=[],
+        )
+    )
 
 
 def test_is_visible_null_row_default_denied():
@@ -143,8 +148,10 @@ async def test_keyword_channel_hides_null_visibility_row(db):
 
     for include_private in (False, True):
         hits = await adapters.keyword.search(
-            "argocd", _scope(include_private=include_private),
-            memory_types=None, limit=10,
+            "argocd",
+            _scope(include_private=include_private),
+            memory_types=None,
+            limit=10,
         )
         ids = {mid for mid, _ in hits}
         assert "n-bm25" not in ids
@@ -162,8 +169,10 @@ async def test_graph_channel_hides_null_visibility_row(db):
 
     for include_private in (False, True):
         hits = await adapters.relational.graph_search(
-            [eid], _scope(include_private=include_private),
-            memory_types=None, limit=10,
+            [eid],
+            _scope(include_private=include_private),
+            memory_types=None,
+            limit=10,
         )
         ids = {mid for mid, _ in hits}
         assert "n-graph" not in ids
@@ -178,6 +187,7 @@ async def test_filter_visible_ids_strips_null_visibility_row(db):
 
     for include_private in (False, True):
         survivors = await adapters.relational.filter_visible_ids(
-            ["n-post", "ws-post"], _scope(include_private=include_private),
+            ["n-post", "ws-post"],
+            _scope(include_private=include_private),
         )
         assert survivors == {"ws-post"}

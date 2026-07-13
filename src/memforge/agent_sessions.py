@@ -27,32 +27,27 @@ from memforge.llm.structured import AgentSessionAuthorityResponse
 from memforge.models import AgentHookReceipt, AgentSessionReceipt, content_hash, slugify
 from memforge.storage.database import Database
 
-# Historical singleton source id. New writes use the per-client source derived
-# by agent_session_source_id().
-AGENT_SESSION_SOURCE_ID = "src-agent-sessions"
 AGENT_SESSION_SOURCE_TYPE = "agent_session"
 AGENT_SESSION_SOURCE_KIND = "generated_agent_summary"
 AGENT_SESSION_WINDOW_SOURCE_KIND = "generated_agent_window_summary"
 AGENT_SESSION_KNOWLEDGE_PATCH_MAX_TOKENS = 8192
 
-# Whitelisted clients with well-known source ids and display names.
-_KNOWN_CLIENT_SOURCE_IDS: dict[str, str] = {
-    "codex": "src-agent-sessions-codex",
-    "claude-code": "src-agent-sessions-claude-code",
-}
 _KNOWN_CLIENT_SOURCE_NAMES: dict[str, str] = {
     "codex": "Codex Session",
     "claude-code": "Claude Code Session",
 }
 
 
-def agent_session_source_id(client: str) -> str:
-    """Return the canonical source id for the given client.
-
-    Whitelisted clients ('codex', 'claude-code') map to their well-known ids.
-    Any other client falls back to 'src-agent-sessions-<slug>'.
-    """
-    return _KNOWN_CLIENT_SOURCE_IDS.get(client, f"src-agent-sessions-{slugify(client)}")
+def agent_session_source_id(client: str, owner_user_id: str) -> str:
+    """Return the opaque, stable source id for one client and owner."""
+    normalized_client = client.strip()
+    normalized_owner = owner_user_id.strip()
+    if not normalized_client:
+        raise ValueError("client is required")
+    if not normalized_owner:
+        raise ValueError("owner_user_id is required")
+    owner_fingerprint = hashlib.sha256(normalized_owner.encode("utf-8")).hexdigest()[:16]
+    return f"src-agent-sessions-{slugify(normalized_client)[:32]}-{owner_fingerprint}"
 
 
 def agent_session_source_name(client: str) -> str:
@@ -85,28 +80,6 @@ def normalize_repo_identifier(repo: str | None) -> str | None:
         value = value[:-4]
     value = re.sub(r"/+", "/", value)
     return value.lower() or None
-
-
-# Reverse-lookup: given a per-client source id, return the originating client.
-# Used by /api/sources to attach `client` to each row so the UI can pick a brand.
-_AGENT_SESSION_ID_TO_CLIENT: dict[str, str] = {
-    source_id: client for client, source_id in _KNOWN_CLIENT_SOURCE_IDS.items()
-}
-_AGENT_SESSION_ID_PREFIX = "src-agent-sessions-"
-
-
-def agent_session_client_for_source_id(source_id: str) -> str | None:
-    """Return the client slug for an agent-session source id, or None.
-
-    Returns the whitelisted client for known ids; for unknown agent-session
-    sources prefixed with 'src-agent-sessions-' returns the trailing slug.
-    Returns None for any other source id (jira, local_markdown, etc.).
-    """
-    if source_id in _AGENT_SESSION_ID_TO_CLIENT:
-        return _AGENT_SESSION_ID_TO_CLIENT[source_id]
-    if source_id.startswith(_AGENT_SESSION_ID_PREFIX):
-        return source_id[len(_AGENT_SESSION_ID_PREFIX) :] or None
-    return None
 
 
 _SECRET_PATTERNS = [
@@ -476,6 +449,7 @@ def _truncate_middle(text: str, max_chars: int) -> str:
 
 def build_agent_session_doc_id(
     *,
+    owner_user_id: str,
     client: str,
     session_id: str,
     trigger: str,
@@ -492,8 +466,12 @@ def build_agent_session_doc_id(
     content-distinct so a window that reuses a range with different content gets
     a new id instead of overwriting the earlier one.
     """
+    normalized_owner = owner_user_id.strip()
+    if not normalized_owner:
+        raise ValueError("owner_user_id is required")
     identity = "|".join(
         [
+            normalized_owner,
             client.strip(),
             session_id.strip(),
             trigger.strip(),
@@ -607,16 +585,15 @@ async def ensure_agent_session_source(
     config: AppConfig,
     *,
     client: str,
+    owner_user_id: str,
     documents_dir: str | None = None,
 ) -> dict:
-    """Ensure the per-client agent-session source exists and return it."""
-    source_id = agent_session_source_id(client)
+    """Ensure the private source for one coding client and user exists."""
+    source_id = agent_session_source_id(client, owner_user_id)
     source_name = agent_session_source_name(client)
-    inbox = Path(documents_dir) if documents_dir else default_agent_session_documents_dir(config)
+    inbox_root = Path(documents_dir) if documents_dir else default_agent_session_documents_dir(config)
+    inbox = inbox_root / source_id
     inbox.mkdir(parents=True, exist_ok=True)
-    # The "client" key tells AgentSessionGene which packages in the shared
-    # documents_dir belong to this source. Without it the gene would rglob the
-    # entire inbox and stamp foreign clients' documents with this source id.
     source_config = {"documents_dir": str(inbox), "client": client}
     # Preserve any admin-attached project_binding across the idempotent
     # upsert so a binding configured through the admin API is not silently
@@ -628,7 +605,10 @@ async def ensure_agent_session_source(
         type=AGENT_SESSION_SOURCE_TYPE,
         name=source_name,
         config_json=json.dumps(source_config),
+        access_policy="private",
+        owner_user_id=owner_user_id,
         project_binding=existing_binding,
+        created_by_user_id=owner_user_id,
     )
     source = await db.get_source(source_id)
     assert source is not None
@@ -656,7 +636,7 @@ async def submit_agent_session_document(
     window_hash: str | None = None,
     submitted_at: str | None = None,
     source_updated_at: str | None = None,
-    user_id: str | None = None,
+    user_id: str,
 ) -> dict:
     """Store a generated session document package and receipt lineage."""
     if not client.strip():
@@ -670,7 +650,12 @@ async def submit_agent_session_document(
     if not document_markdown.strip():
         raise ValueError("document_markdown is required")
 
-    source = await ensure_agent_session_source(db, config, client=client)
+    source = await ensure_agent_session_source(
+        db,
+        config,
+        client=client,
+        owner_user_id=user_id,
+    )
     documents_dir = Path(source["config"]["documents_dir"])
 
     submitted_at = submitted_at or _now_iso()
@@ -678,6 +663,7 @@ async def submit_agent_session_document(
     redacted_markdown = redact_agent_session_markdown(document_markdown)
     document_hash = content_hash(redacted_markdown)
     doc_id = build_agent_session_doc_id(
+        owner_user_id=user_id,
         client=client,
         session_id=session_id,
         trigger=trigger,
@@ -687,7 +673,7 @@ async def submit_agent_session_document(
         history_window_end=history_window_end,
         window_hash=window_hash,
     )
-    per_client_source_id = agent_session_source_id(client)
+    per_client_source_id = agent_session_source_id(client, user_id)
     source_url = f"agent-session://{slugify(client)}/{slugify(session_id)}/{slugify(trigger)}/{doc_id}"
     doc_title = title or f"Agent Session: {client} {session_id} {trigger}"
     project = resolve_project_key(
@@ -777,6 +763,7 @@ async def submit_agent_session_document(
 async def _record_window_outcome(
     *,
     db: Database,
+    owner_user_id: str,
     client: str,
     session_id: str,
     trigger: str,
@@ -803,6 +790,7 @@ async def _record_window_outcome(
     and reason, keyed by the same window identity a stored package would use.
     """
     doc_id = build_agent_session_doc_id(
+        owner_user_id=owner_user_id,
         client=client,
         session_id=session_id,
         trigger=trigger,
@@ -818,11 +806,12 @@ async def _record_window_outcome(
         "window_hash": f"sha256:{window_hash}",
         "window_retention": "none",
         "receipt": receipt or {},
+        "user_id": owner_user_id,
     }
     stored_metadata.update(_receipt_metadata(metadata))
     receipt_record = AgentSessionReceipt(
         doc_id=doc_id,
-        source_id=agent_session_source_id(client),
+        source_id=agent_session_source_id(client, owner_user_id),
         client=client,
         session_id=session_id,
         trigger=trigger,
@@ -847,6 +836,7 @@ async def _record_window_outcome(
 async def _existing_window_result(
     *,
     db: Database,
+    owner_user_id: str,
     client: str,
     session_id: str,
     trigger: str,
@@ -857,6 +847,7 @@ async def _existing_window_result(
     window_hash: str,
 ) -> dict[str, Any] | None:
     doc_id = build_agent_session_doc_id(
+        owner_user_id=owner_user_id,
         client=client,
         session_id=session_id,
         trigger=trigger,
@@ -878,7 +869,7 @@ async def _existing_window_result(
         "window_hash": f"sha256:{window_hash}",
         "status": "processed",
         "result": outcome,
-        "source_id": agent_session_source_id(client),
+        "source_id": agent_session_source_id(client, owner_user_id),
         "source_type": AGENT_SESSION_SOURCE_TYPE,
         "process_now": False,
         "idempotent": True,
@@ -918,7 +909,7 @@ async def submit_agent_session_window(
     submitted_at: str | None = None,
     source_updated_at: str | None = None,
     process_now: bool = True,
-    user_id: str | None = None,
+    user_id: str,
 ) -> dict[str, Any]:
     """Patch private agent knowledge from an uploaded transcript window."""
     if not client.strip():
@@ -929,6 +920,9 @@ async def submit_agent_session_window(
         raise ValueError("trigger is required")
     if not workspace.strip():
         raise ValueError("workspace is required")
+    owner_user_id = user_id.strip()
+    if not owner_user_id:
+        raise ValueError("user_id is required")
     if retention != "none":
         raise ValueError("retention must be none")
 
@@ -954,6 +948,7 @@ async def submit_agent_session_window(
     window_start = history_window.get("start_event_id") or history_window.get("start")
     window_end = history_window.get("end_event_id") or history_window.get("end")
     outcome_identity = {
+        "owner_user_id": owner_user_id,
         "client": client,
         "session_id": session_id,
         "trigger": trigger,
@@ -971,6 +966,7 @@ async def submit_agent_session_window(
     }
     existing_result = await _existing_window_result(
         db=db,
+        owner_user_id=owner_user_id,
         client=client,
         session_id=session_id,
         trigger=trigger,
@@ -1005,7 +1001,6 @@ async def submit_agent_session_window(
         raise ValueError("agent session window summarization LLM unavailable")
 
     repo_identifier = normalize_repo_identifier(repo)
-    owner_user_id = user_id or "local"
     try:
         canonical_events = await _classify_agent_session_authority(
             structured_llm_client=structured_llm_client,
@@ -1089,7 +1084,7 @@ async def submit_agent_session_window(
         patch = await patch_service.apply_patch_proposal(
             proposal=proposal,
             owner_user_id=owner_user_id,
-            source_id=agent_session_source_id(client),
+            source_id=agent_session_source_id(client, owner_user_id),
             client=client,
             session_id=session_id,
             workspace=workspace,
@@ -1125,7 +1120,12 @@ async def submit_agent_session_window(
             "covered_claim_id": patch.covered_claim_id,
         }
 
-    source = await ensure_agent_session_source(db, config, client=client)
+    source = await ensure_agent_session_source(
+        db,
+        config,
+        client=client,
+        owner_user_id=owner_user_id,
+    )
     project = resolve_project_key(
         source.get("project_binding"),
         item_field_value=None,
@@ -1138,7 +1138,7 @@ async def submit_agent_session_window(
         patch = await patch_service.apply_patch_proposal(
             proposal=proposal,
             owner_user_id=owner_user_id,
-            source_id=agent_session_source_id(client),
+            source_id=agent_session_source_id(client, owner_user_id),
             client=client,
             session_id=session_id,
             workspace=workspace,
@@ -1200,7 +1200,7 @@ async def submit_agent_session_window(
         "concept_id": patch.concept_id,
         "claim_id": patch.claim_id,
         "memory_id": patch.memory_id,
-        "source_id": agent_session_source_id(client),
+        "source_id": agent_session_source_id(client, owner_user_id),
         "source_type": AGENT_SESSION_SOURCE_TYPE,
         "process_now": process_now,
     }

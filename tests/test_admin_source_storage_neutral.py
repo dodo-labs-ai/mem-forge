@@ -38,6 +38,9 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
                     "name": "Neutral Source",
                     "config": {"base_url": "https://wiki.example.test", "pat": "secret"},
                     "status": "active",
+                    "access_policy": "private",
+                    "access_state": "active",
+                    "owner_user_id": "dev",
                     "last_sync": None,
                     "doc_count": 99,
                     "created_at": "2026-06-13T00:00:00+00:00",
@@ -67,9 +70,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
             assert source == "src-neutral"
             return 3
 
-        async def get_sync_history(
-            self, source: str | None = None, limit: int = 20
-        ) -> list[dict]:
+        async def get_sync_history(self, source: str | None = None, limit: int = 20) -> list[dict]:
             assert source == "src-neutral"
             assert limit == 1
             return [
@@ -84,7 +85,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
                     "error_message": "one failed",
                     "failed_docs": [{"doc_id": "doc-1", "error": "boom"}],
                 }
-                ]
+            ]
 
         async def get_latest_source_sync_run(
             self,
@@ -96,6 +97,10 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
             assert workspace_id == "default"
             return None
 
+        async def get_active_source_access_transition(self, source_id: str):
+            assert source_id == "src-neutral"
+            return None
+
         async def is_source_enabled_for_user(self, source_id: str, user_id: str) -> bool:
             assert source_id == "src-neutral"
             return True
@@ -104,9 +109,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
             assert source_id == "src-neutral"
             return False
 
-        async def set_source_subscription(
-            self, source_id: str, user_id: str, enabled: bool
-        ) -> None:
+        async def set_source_subscription(self, source_id: str, user_id: str, enabled: bool) -> None:
             raise AssertionError("not used by source list")
 
         async def set_source_sync_schedule(
@@ -135,6 +138,8 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
     assert source["memory_count"] == 7
     assert source["pinned_for_me"] is False
     assert source["client"] is None
+    assert source["access_policy"] == "private"
+    assert source["owner_user_id"] == "dev"
     assert source["sync"] == {
         "status": "partial",
         "started_at": "2026-06-13T00:00:01+00:00",
@@ -176,7 +181,14 @@ def test_source_projects_route_uses_storage_neutral_admin_reader(tmp_path):
 
         async def get_source(self, source_id: str) -> dict | None:
             assert source_id == "src-neutral"
-            return {"id": source_id, "type": "confluence", "name": "Neutral Source"}
+            return {
+                "id": source_id,
+                "type": "confluence",
+                "name": "Neutral Source",
+                "access_policy": "private",
+                "access_state": "active",
+                "owner_user_id": "dev",
+            }
 
         async def list_source_projects(
             self,
@@ -250,6 +262,9 @@ def test_source_schedule_routes_use_storage_neutral_store(tmp_path):
                 "type": "confluence",
                 "name": "Neutral Source",
                 "created_by_user_id": "user-a",
+                "access_policy": "private",
+                "access_state": "active",
+                "owner_user_id": "user-a",
                 "sync_schedule": {
                     "enabled": False,
                     "interval_minutes": 1440,

@@ -135,15 +135,16 @@ export interface SyncProgressSnapshot {
 export type ViewerRole = "workspace_admin" | "member" | "viewer";
 
 /**
- * Relationship between the viewer and a particular source. "creator" is set
- * for the user who created the source, including a workspace admin who owns
+ * Relationship between the viewer and a particular source. "owner" is set
+ * for the user who owns the source, including a workspace admin who owns
  * the row. "workspace_admin" is used when an admin manages someone else's
  * source.
  */
-export type SourceViewerRelationship = ViewerRole | "creator";
+export type SourceViewerRelationship = ViewerRole | "owner";
 
 export interface SourceOwnership {
   created_by_user_id: string | null;
+  owner_user_id: string;
   execution_owner_user_id: string | null;
   viewer_role: ViewerRole;
   viewer_relationship: SourceViewerRelationship;
@@ -161,6 +162,31 @@ export interface SourceCapabilities {
   can_sync: boolean;
   can_force_resync: boolean;
   can_delete: boolean;
+  can_change_access: boolean;
+}
+
+export type SourceAccessPolicy = "private" | "workspace";
+export type SourceAccessState = "active" | "changing" | "orphaned_private";
+export type SourceAccessTransitionStatus =
+  | "queued"
+  | "running"
+  | "failed"
+  | "completed"
+  | "reverted";
+
+export interface SourceAccessTransition {
+  operation_id: string;
+  source_id: string;
+  previous_policy: SourceAccessPolicy;
+  target_policy: SourceAccessPolicy;
+  status: SourceAccessTransitionStatus;
+  total_memories: number;
+  processed_memories: number;
+  error_code?: string | null;
+  error_message?: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
 }
 
 /**
@@ -206,6 +232,9 @@ export interface Source {
    */
   config: Record<string, unknown>;
   status: "active" | "paused";
+  access_policy: SourceAccessPolicy;
+  access_state: SourceAccessState;
+  access_transition?: SourceAccessTransition | null;
   last_sync: string | null;
   doc_count: number;
   memory_count?: number;

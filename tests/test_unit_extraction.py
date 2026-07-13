@@ -93,9 +93,7 @@ async def test_extract_unit_memories_trusts_unit_anchor_as_boundary_contract():
 
     result = await extractor.extract_unit_memories(_context(), doc_type="reference")
 
-    assert [memory.content for memory in result.memories] == [
-        "Tracking uses UnifiedContextApi for explicit API calls."
-    ]
+    assert [memory.content for memory in result.memories] == ["Tracking uses UnifiedContextApi for explicit API calls."]
     assert result.memories[0].evidence_anchor == "unit"
     assert result.memories[0].extraction_context == "Tracking uses UnifiedContextApi for explicit API calls."
     assert "glossary_appendix" in client.calls[0]["prompt"]

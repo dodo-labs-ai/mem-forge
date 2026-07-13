@@ -78,19 +78,22 @@ class RepoApiClient(RecordingAsyncClient):
         if url.endswith("/api/v3/repos/org/repo"):
             return RepoApiResponse({"default_branch": "main"}, url=url)
         if url.endswith("/api/v3/repos/org/repo/git/trees/main?recursive=1"):
-            return RepoApiResponse({
-                "tree": [
-                    {
-                        "path": "docs/cloud-native-platform/process-tracking.md",
-                        "type": "blob",
-                        "sha": "blob-sha-123",
-                    }
-                ]
-            }, url=url)
-        if url.endswith("/api/v3/repos/org/repo/commits?sha=main&path=docs/cloud-native-platform/process-tracking.md&per_page=1"):
-            return RepoApiResponse([
-                {"commit": {"committer": {"date": "2026-05-26T14:51:21Z"}}}
-            ], url=url)
+            return RepoApiResponse(
+                {
+                    "tree": [
+                        {
+                            "path": "docs/cloud-native-platform/process-tracking.md",
+                            "type": "blob",
+                            "sha": "blob-sha-123",
+                        }
+                    ]
+                },
+                url=url,
+            )
+        if url.endswith(
+            "/api/v3/repos/org/repo/commits?sha=main&path=docs/cloud-native-platform/process-tracking.md&per_page=1"
+        ):
+            return RepoApiResponse([{"commit": {"committer": {"date": "2026-05-26T14:51:21Z"}}}], url=url)
         if url.endswith("/api/v3/repos/org/repo/contents/docs/cloud-native-platform/process-tracking.md?ref=main"):
             encoded = base64.b64encode(b"# Process Tracking\n\nUse `/api/` for REST clients.").decode()
             return RepoApiResponse({"content": encoded}, url=url)
@@ -103,35 +106,38 @@ class RunbooksRepoApiClient(RecordingAsyncClient):
         if url.endswith("/api/v3/repos/example-org/runbooks"):
             return RepoApiResponse({"default_branch": "main"}, url=url)
         if url.endswith("/api/v3/repos/example-org/runbooks/git/trees/main?recursive=1"):
-            return RepoApiResponse({
-                "tree": [
-                    {
-                        "path": "docs/runbooks/Process Tracking/stuck-lock.md",
-                        "type": "blob",
-                        "sha": "stuck-lock-sha",
-                    },
-                    {
-                        "path": "docs/runbooks/Process Tracking/timed-out-process-instance.md",
-                        "type": "blob",
-                        "sha": "timed-out-sha",
-                    },
-                    {
-                        "path": "docs/runbooks/Other Runbook/overview.md",
-                        "type": "blob",
-                        "sha": "other-sha",
-                    },
-                    {
-                        "path": "docs/runbooks/Process Tracking/assets/diagram.png",
-                        "type": "blob",
-                        "sha": "asset-sha",
-                    },
-                ]
-            }, url=url)
+            return RepoApiResponse(
+                {
+                    "tree": [
+                        {
+                            "path": "docs/runbooks/Process Tracking/stuck-lock.md",
+                            "type": "blob",
+                            "sha": "stuck-lock-sha",
+                        },
+                        {
+                            "path": "docs/runbooks/Process Tracking/timed-out-process-instance.md",
+                            "type": "blob",
+                            "sha": "timed-out-sha",
+                        },
+                        {
+                            "path": "docs/runbooks/Other Runbook/overview.md",
+                            "type": "blob",
+                            "sha": "other-sha",
+                        },
+                        {
+                            "path": "docs/runbooks/Process Tracking/assets/diagram.png",
+                            "type": "blob",
+                            "sha": "asset-sha",
+                        },
+                    ]
+                },
+                url=url,
+            )
         if "/api/v3/repos/example-org/runbooks/commits?sha=main&path=" in url:
-            return RepoApiResponse([
-                {"commit": {"committer": {"date": "2026-05-26T14:51:21Z"}}}
-            ], url=url)
-        if url.endswith("/api/v3/repos/example-org/runbooks/contents/docs/runbooks/Process%20Tracking/stuck-lock.md?ref=main"):
+            return RepoApiResponse([{"commit": {"committer": {"date": "2026-05-26T14:51:21Z"}}}], url=url)
+        if url.endswith(
+            "/api/v3/repos/example-org/runbooks/contents/docs/runbooks/Process%20Tracking/stuck-lock.md?ref=main"
+        ):
             encoded = base64.b64encode(b"# Stuck Lock\n\nUnlock the process.").decode()
             return RepoApiResponse({"content": encoded}, url=url)
         return await super().get(url, **_kwargs)
@@ -250,7 +256,9 @@ async def test_github_pat_discovers_and_fetches_repository_markdown_for_page_url
     raw = await gene.fetch(items[0])
     normalized = await gene.normalize(raw)
 
-    assert items[0].source_url == "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking"
+    assert (
+        items[0].source_url == "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking"
+    )
     assert items[0].extra["repo_path"] == "docs/cloud-native-platform/process-tracking.md"
     assert items[0].version == "blob-sha-123"
     assert raw.content_type == "text/markdown"

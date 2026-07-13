@@ -41,24 +41,26 @@ def _scope(repo: str | None = None) -> AccessScope:
 @pytest.mark.asyncio
 async def test_repo_affinity_boosts_same_repo_candidate():
     now = datetime(2026, 6, 17, tzinfo=timezone.utc)
-    engine = _engine({
-        "same-repo": {
-            "updated_at": now,
-            "project_key": "UNSORTED",
-            "repo_identifier": "github.tools.sap/hcm/memforge-cloud",
-            "memory_level": "atomic",
-            "curation_cluster_id": None,
-            "covered_memory_count": 0,
-        },
-        "other-repo": {
-            "updated_at": now,
-            "project_key": "UNSORTED",
-            "repo_identifier": "github.tools.sap/hcm/other",
-            "memory_level": "atomic",
-            "curation_cluster_id": None,
-            "covered_memory_count": 0,
-        },
-    })
+    engine = _engine(
+        {
+            "same-repo": {
+                "updated_at": now,
+                "project_key": "UNSORTED",
+                "repo_identifier": "github.tools.sap/hcm/memforge-cloud",
+                "memory_level": "atomic",
+                "curation_cluster_id": None,
+                "covered_memory_count": 0,
+            },
+            "other-repo": {
+                "updated_at": now,
+                "project_key": "UNSORTED",
+                "repo_identifier": "github.tools.sap/hcm/other",
+                "memory_level": "atomic",
+                "curation_cluster_id": None,
+                "covered_memory_count": 0,
+            },
+        }
+    )
 
     ranked = await engine._apply_ranking(
         [

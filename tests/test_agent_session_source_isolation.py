@@ -1,12 +1,8 @@
 """Regression test: per-client agent-session sources must not cross-pollinate.
 
-Every agent-session client (codex, claude-code, ...) gets its own source row
-keyed by ``agent_session_source_id(client)``. Today every per-client source is
-configured with the same shared ``documents_dir`` (the default at
-``default_agent_session_documents_dir(config)``), so each per-client
-``AgentSessionGene`` rglobs the entire shared directory and picks up every
-client's submitted package. Whichever sync runs last wins, so doc rows end up
-stamped with the wrong source.
+Every coding client and owner pair gets its own private source row. This test
+also keeps the gene-level client filter explicit for manually constructed
+package directories.
 
 The gene must instead filter by ``receipt.client`` so an
 ``AgentSessionGene`` bound to the codex source only discovers codex packages,
@@ -50,13 +46,10 @@ def _write_package(
         "last_modified": "2026-06-01T12:00:00+00:00",
         "space_or_project": repo,
         "version": "v1",
-        "markdown": (
-            "## Durable Findings\n"
-            f"- {client} session {session_id} produced a summary worth keeping.\n"
-        ),
+        "markdown": (f"## Durable Findings\n- {client} session {session_id} produced a summary worth keeping.\n"),
         "receipt": {
             "doc_id": doc_id,
-            "source_id": agent_session_source_id(client),
+            "source_id": agent_session_source_id(client, "user-owner"),
             "client": client,
             "session_id": session_id,
             "trigger": trigger,
@@ -108,7 +101,7 @@ async def test_agent_session_gene_only_discovers_its_own_clients_packages(tmp_pa
         repo="mem-forge",
     )
 
-    codex_source_id = agent_session_source_id("codex")
+    codex_source_id = agent_session_source_id("codex", "user-owner")
     gene = AgentSessionGene(
         config={
             "documents_dir": str(documents_dir),
@@ -122,9 +115,5 @@ async def test_agent_session_gene_only_discovers_its_own_clients_packages(tmp_pa
     discovered_ids = [item.item_id for item in items]
     discovered_clients = [item.author for item in items]
 
-    assert discovered_ids == [codex_doc_id], (
-        f"codex-bound gene leaked other clients' documents: {discovered_ids}"
-    )
-    assert discovered_clients == ["codex"], (
-        f"codex-bound gene picked up non-codex receipts: {discovered_clients}"
-    )
+    assert discovered_ids == [codex_doc_id], f"codex-bound gene leaked other clients' documents: {discovered_ids}"
+    assert discovered_clients == ["codex"], f"codex-bound gene picked up non-codex receipts: {discovered_clients}"

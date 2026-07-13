@@ -46,9 +46,7 @@ async def test_projects_table_has_full_schema(db):
 @pytest.mark.asyncio
 async def test_reserved_rows_are_seeded(db):
     rows: list[dict] = []
-    async with db.db.execute(
-        "SELECT id, key, name, is_shared FROM projects ORDER BY key"
-    ) as cur:
+    async with db.db.execute("SELECT id, key, name, is_shared FROM projects ORDER BY key") as cur:
         async for row in cur:
             rows.append(dict(row))
     by_key = {r["key"]: r for r in rows}
@@ -62,8 +60,7 @@ async def test_reserved_rows_are_seeded(db):
 async def test_key_is_unique(db):
     with pytest.raises(sqlite3.IntegrityError):
         await db.db.execute(
-            "INSERT INTO projects (id, key, name, is_shared, created_at) "
-            "VALUES (?, ?, ?, ?, datetime('now'))",
+            "INSERT INTO projects (id, key, name, is_shared, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
             ("proj-dup", SHARED_PROJECT_KEY, "Duplicate", 1),
         )
 

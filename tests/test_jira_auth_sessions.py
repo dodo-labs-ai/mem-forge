@@ -108,7 +108,9 @@ async def test_jira_auth_session_is_encrypted_redacted_and_shared_by_origin(db, 
     from memforge.source_secrets import decrypt_secret
 
     monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
-    service = JiraAuthSessionService(db, session_validator=lambda origin, cookie, tls_config=None: {"accountId": "user-123"})
+    service = JiraAuthSessionService(
+        db, session_validator=lambda origin, cookie, tls_config=None: {"accountId": "user-123"}
+    )
 
     await service.store_validated_session(
         base_url="https://jira.example.test/projects/PAY",
@@ -208,7 +210,9 @@ async def test_store_uploaded_session_failure_is_persisted_as_expired(db, monkey
 
     with pytest.raises(JiraAuthSessionError):
         await service.store_uploaded_session(
-            base_url="https://jira.example.test", cookie_header="SESSION=bad", browser="Chrome",
+            base_url="https://jira.example.test",
+            cookie_header="SESSION=bad",
+            browser="Chrome",
         )
 
     status = await service.get_status("https://jira.example.test")
@@ -225,7 +229,9 @@ async def test_jira_auth_session_refresh_resets_matching_sources_only_after_prin
     from memforge.auth.jira_auth import JiraAuthSessionService, JiraPrincipalChangedError
 
     monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
-    service = JiraAuthSessionService(db, session_validator=lambda origin, cookie, tls_config=None: {"accountId": "old-user"})
+    service = JiraAuthSessionService(
+        db, session_validator=lambda origin, cookie, tls_config=None: {"accountId": "old-user"}
+    )
     await service.store_validated_session(
         base_url="https://jira.example.test",
         cookie_header="JSESSIONID=old",
@@ -242,12 +248,16 @@ async def test_jira_auth_session_refresh_resets_matching_sources_only_after_prin
             id=source_id,
             type="jira",
             name=source_id,
-            config_json=json.dumps({
-                "base_url": base_url,
-                "projects": ["PAY"],
-                "auth_mode": "pat" if source_id == "src-pat" else "browser_cookie",
-                "pat_encrypted": "enc:v1:not-real" if source_id == "src-pat" else None,
-            }),
+            config_json=json.dumps(
+                {
+                    "base_url": base_url,
+                    "projects": ["PAY"],
+                    "auth_mode": "pat" if source_id == "src-pat" else "browser_cookie",
+                    "pat_encrypted": "enc:v1:not-real" if source_id == "src-pat" else None,
+                }
+            ),
+            access_policy="workspace",
+            owner_user_id="dev",
         )
         await db.upsert_sync_state(SyncState(source=source_id, last_sync_status="success"))
 
@@ -293,6 +303,7 @@ def test_admin_allows_jira_browser_session_source_without_source_cookie(tmp_path
             json={
                 "type": "jira",
                 "name": "Enterprise Jira",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://jira.example.test",
                     "projects": ["PAY"],
@@ -325,6 +336,7 @@ def test_admin_rejects_source_owned_jira_cookie(tmp_path, monkeypatch):
             json={
                 "type": "jira",
                 "name": "Enterprise Jira",
+                "access_policy": "private",
                 "config": {
                     "base_url": "https://jira.example.test",
                     "projects": ["PAY"],
@@ -399,7 +411,10 @@ async def test_runtime_resolves_jira_browser_session_without_persisting_cookie(d
     monkeypatch.setattr(
         bs,
         "_PROVIDERS",
-        {**bs._PROVIDERS, "jira": dataclasses.replace(bs.get_provider("jira"), service_factory=FakeJiraAuthSessionService)},
+        {
+            **bs._PROVIDERS,
+            "jira": dataclasses.replace(bs.get_provider("jira"), service_factory=FakeJiraAuthSessionService),
+        },
     )
 
     result = await runtime.run_source_sync(
@@ -469,7 +484,10 @@ async def test_runtime_keeps_legacy_jira_pat_source_in_pat_mode(db, tmp_path, mo
     monkeypatch.setattr(
         bs,
         "_PROVIDERS",
-        {**bs._PROVIDERS, "jira": dataclasses.replace(bs.get_provider("jira"), service_factory=FailingJiraAuthSessionService)},
+        {
+            **bs._PROVIDERS,
+            "jira": dataclasses.replace(bs.get_provider("jira"), service_factory=FailingJiraAuthSessionService),
+        },
     )
 
     await runtime.run_source_sync(
@@ -497,11 +515,15 @@ async def test_sync_service_marks_shared_jira_session_expired_when_sync_reports_
         id="src-expired",
         type="jira",
         name="Expired Jira",
-        config_json=json.dumps({
-            "base_url": "https://jira.example.test",
-            "projects": ["PAY"],
-            "auth_mode": "browser_cookie",
-        }),
+        config_json=json.dumps(
+            {
+                "base_url": "https://jira.example.test",
+                "projects": ["PAY"],
+                "auth_mode": "browser_cookie",
+            }
+        ),
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await JiraAuthSessionService(db).store_validated_session(
         base_url="https://jira.example.test",

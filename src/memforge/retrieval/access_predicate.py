@@ -85,6 +85,41 @@ def visible_sql(scope: AccessScope, alias: str) -> tuple[str, list[Any]]:
         params.append(scope.user_id)
 
     parts.append("(" + " OR ".join(branches) + ")")
+    parts.append(
+        f"""(
+            NOT EXISTS (
+                SELECT 1
+                FROM memory_sources source_access_support
+                WHERE source_access_support.memory_id = {alias}.id
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM memory_sources source_access_support
+                JOIN sources source_access_source
+                  ON source_access_source.id = source_access_support.source_id
+                LEFT JOIN source_subscriptions source_access_subscription
+                  ON source_access_subscription.source_id = source_access_source.id
+                 AND source_access_subscription.user_id = ?
+                WHERE source_access_support.memory_id = {alias}.id
+                  AND COALESCE(source_access_subscription.enabled, 1) = 1
+                  AND source_access_source.access_state <> 'orphaned_private'
+                  AND (
+                      (
+                          source_access_source.access_state = 'active'
+                          AND (
+                              source_access_source.access_policy = 'workspace'
+                              OR source_access_source.owner_user_id = ?
+                          )
+                      )
+                      OR (
+                          source_access_source.access_state = 'changing'
+                          AND source_access_source.owner_user_id = ?
+                      )
+                  )
+            )
+        )"""
+    )
+    params.extend([scope.user_id, scope.user_id, scope.user_id])
     return "(" + " AND ".join(parts) + ")", params
 
 

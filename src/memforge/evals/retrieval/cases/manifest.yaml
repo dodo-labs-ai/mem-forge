@@ -1,6 +1,6 @@
 case_schema_version: 1
 case_set_id: retrieval-core-v1
-case_set_sha: sha256:7602cd8fa8846a1c21a829519fb00e8ee13de0326079afbe8efda5ad4d0d2b97
+case_set_sha: sha256:49b6d107af86754b2e69a23926c2fce4bc75e1c72634616905c0504c08db1994
 case_files:
   - metadata_lexical.yaml
 fixtures:
@@ -14,10 +14,14 @@ fixtures:
         type: jira
         name: Payroll Jira
         status: active
+        access_policy: workspace
+        owner_user_id: eval-user
       - id: src-muted
         type: confluence
         name: Muted Source
         status: active
+        access_policy: workspace
+        owner_user_id: eval-user
     source_subscriptions:
       - user_id: eval-user
         source_id: src-payroll

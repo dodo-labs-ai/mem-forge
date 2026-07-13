@@ -44,8 +44,7 @@ def test_other_project_takes_full_penalty_in_project_first():
 
 def test_workspace_mode_no_penalty():
     assert _affinity_penalty("RISK", _scope(mode="workspace", active="PAY")) == 0.0
-    assert _affinity_penalty(UNSORTED_PROJECT_KEY,
-                             _scope(mode="workspace", active="PAY")) == 0.0
+    assert _affinity_penalty(UNSORTED_PROJECT_KEY, _scope(mode="workspace", active="PAY")) == 0.0
 
 
 def test_no_active_project_no_penalty():
@@ -70,6 +69,7 @@ def test_ranking_weights_form_a_valid_distribution():
     (0, 1) so a penalized candidate is never lifted above the unpenalized
     active-project candidate."""
     from math import isclose
+
     assert isclose(W_RRF_DEFAULT + W_RECENCY_DEFAULT, 1.0)
     assert 0.0 < CROSS_PROJECT_PENALTY < 1.0
 
@@ -98,12 +98,18 @@ async def test_project_mode_upstream_prunes_other_projects(tmp_path):
             ("m-shared", SHARED_PROJECT_KEY),
             ("m-unsorted", UNSORTED_PROJECT_KEY),
         ):
-            await db.insert_memory(Memory(
-                id=mid, memory_type="fact", content=mid,
-                content_hash=content_hash(mid),
-                visibility=Visibility.WORKSPACE.value, owner_user_id=None,
-                project_key=key, tags=[],
-            ))
+            await db.insert_memory(
+                Memory(
+                    id=mid,
+                    memory_type="fact",
+                    content=mid,
+                    content_hash=content_hash(mid),
+                    visibility=Visibility.WORKSPACE.value,
+                    owner_user_id=None,
+                    project_key=key,
+                    tags=[],
+                )
+            )
         adapters = build_sqlite_adapters(db, memory_collection=None)
         scope = _scope(mode="project", active="PAY")
         ids = ["m-pay", "m-risk", "m-shared", "m-unsorted"]
@@ -136,12 +142,18 @@ async def test_project_first_mode_keeps_all_projects_visible(tmp_path):
             ("m-shared", SHARED_PROJECT_KEY),
             ("m-unsorted", UNSORTED_PROJECT_KEY),
         ):
-            await db.insert_memory(Memory(
-                id=mid, memory_type="fact", content=mid,
-                content_hash=content_hash(mid),
-                visibility=Visibility.WORKSPACE.value, owner_user_id=None,
-                project_key=key, tags=[],
-            ))
+            await db.insert_memory(
+                Memory(
+                    id=mid,
+                    memory_type="fact",
+                    content=mid,
+                    content_hash=content_hash(mid),
+                    visibility=Visibility.WORKSPACE.value,
+                    owner_user_id=None,
+                    project_key=key,
+                    tags=[],
+                )
+            )
         adapters = build_sqlite_adapters(db, memory_collection=None)
         scope = _scope(mode="project-first", active="PAY")
         ids = ["m-pay", "m-risk", "m-shared", "m-unsorted"]
@@ -163,12 +175,18 @@ async def test_fetch_ranking_metadata_returns_updated_at_and_project_key(tmp_pat
     db = Database(str(tmp_path / "p4meta.db"))
     await db.connect()
     try:
-        await db.insert_memory(Memory(
-            id="m1", memory_type="fact", content="x",
-            content_hash=content_hash("x"),
-            visibility=Visibility.WORKSPACE.value, owner_user_id=None,
-            project_key="PAY", tags=[],
-        ))
+        await db.insert_memory(
+            Memory(
+                id="m1",
+                memory_type="fact",
+                content="x",
+                content_hash=content_hash("x"),
+                visibility=Visibility.WORKSPACE.value,
+                owner_user_id=None,
+                project_key="PAY",
+                tags=[],
+            )
+        )
         adapters = build_sqlite_adapters(db, memory_collection=None)
         meta = await adapters.relational.fetch_ranking_metadata(["m1", "missing"])
         assert "m1" in meta
@@ -202,12 +220,18 @@ async def test_project_first_visibility_survives_real_cross_project_rows(tmp_pat
         await db.create_project(key="PAY", name="Pay")
         await db.create_project(key="RISK", name="Risk")
         for mid, key in (("m-pay", "PAY"), ("m-risk", "RISK")):
-            await db.insert_memory(Memory(
-                id=mid, memory_type="fact", content=mid,
-                content_hash=content_hash(mid),
-                visibility=Visibility.WORKSPACE.value, owner_user_id=None,
-                project_key=key, tags=[],
-            ))
+            await db.insert_memory(
+                Memory(
+                    id=mid,
+                    memory_type="fact",
+                    content=mid,
+                    content_hash=content_hash(mid),
+                    visibility=Visibility.WORKSPACE.value,
+                    owner_user_id=None,
+                    project_key=key,
+                    tags=[],
+                )
+            )
         adapters = build_sqlite_adapters(db, memory_collection=None)
         # In project-first mode the workspace branch admits every workspace
         # row regardless of project_key; the ranker applies the affinity
@@ -220,7 +244,8 @@ async def test_project_first_visibility_survives_real_cross_project_rows(tmp_pat
             scope_mode="project-first",
         )
         visible = await adapters.relational.filter_visible_ids(
-            ["m-pay", "m-risk"], scope,
+            ["m-pay", "m-risk"],
+            scope,
         )
         assert visible == {"m-pay", "m-risk"}
     finally:
