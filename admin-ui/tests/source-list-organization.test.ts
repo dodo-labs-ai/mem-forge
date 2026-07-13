@@ -1,6 +1,20 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { organizeSourceGroups } from "../src/views/sources/sourceListOrganization.js";
+
+const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
+
+assert.match(
+  sourcesPageSource,
+  /aria-label="Search sources"[\s\S]*?className="h-7\b/,
+  "Source search should use the same compact height as the pinned filter button",
+);
+assert.match(
+  sourcesPageSource,
+  /<SelectTrigger aria-label="Sort sources" className="h-7\b/,
+  "Source sort should use the same compact height as the pinned filter button",
+);
 
 const groups = [
   {

@@ -576,14 +576,14 @@ export function SourcesPage() {
             </div>
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
               <label className="relative min-w-0 sm:w-64">
-                <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
                 <input
                   type="search"
                   value={sourceSearch}
                   onChange={(event) => setSourceSearch(event.target.value)}
                   placeholder="Search sources"
                   aria-label="Search sources"
-                  className="h-9 w-full rounded-md border bg-background pl-9 pr-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  className="h-7 w-full rounded-[min(var(--radius-md),12px)] border bg-background pl-8 pr-2.5 text-[0.8rem] outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 />
               </label>
               <Select<SourceListSortMode>
@@ -591,7 +591,7 @@ export function SourcesPage() {
                 disabled={sourceListPreferencesQuery.isLoading || setSourceListSort.isPending}
                 onValueChange={(value) => value && setSourceListSort.mutate(value)}
               >
-                <SelectTrigger aria-label="Sort sources" className="h-9 w-full sm:w-44">
+                <SelectTrigger aria-label="Sort sources" className="h-7 w-full text-[0.8rem] sm:w-44">
                   <SelectValue>
                     {sourceListPreferencesQuery.data?.sort_mode === "name"
                       ? "Name"
