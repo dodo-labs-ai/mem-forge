@@ -2246,6 +2246,19 @@ class Database:
                     )
                 continue
 
+            if (
+                str(source.get("type") or "") == "agent_session"
+                and not (
+                    str(source.get("created_by_user_id") or "").strip()
+                    or str(source.get("execution_owner_user_id") or "").strip()
+                )
+            ):
+                # Pre-access coding Sources were shared per client and may not
+                # have Source-level provenance. Migration 45 derives their
+                # owners from receipt and Memory provenance before partitioning
+                # them into private per-owner Sources.
+                continue
+
             async with self.db.execute(
                 """SELECT DISTINCT m.visibility, m.owner_user_id
                      FROM memories m
@@ -2304,37 +2317,54 @@ class Database:
                 client = str(client_row["client"] if client_row else "").strip()
             if not client:
                 client = _legacy_agent_session_client(source_id)
-            if not client or not source_owner:
+            if not client:
                 raise RuntimeError(
-                    f"cannot partition legacy agent-session source without client and owner: {source_id}"
+                    f"cannot partition legacy agent-session source without client: {source_id}"
                 )
-            expected_source_id = _agent_session_source_id_for_owner(client, source_owner)
-            if source_id == expected_source_id:
+            if source_owner and source_id == _agent_session_source_id_for_owner(
+                client, source_owner
+            ):
                 continue
 
             async with self.db.execute(
                 """SELECT d.doc_id,
-                          COALESCE(
-                              NULLIF(json_extract(r.metadata, '$.user_id'), ''),
-                              (
-                                  SELECT NULLIF(m.owner_user_id, '')
-                                  FROM memory_sources ms
-                                  JOIN memories m ON m.id = ms.memory_id
-                                  WHERE ms.doc_id = d.doc_id
-                                    AND m.owner_user_id IS NOT NULL
-                                  LIMIT 1
-                              ),
-                              ?
-                          ) AS owner_user_id
+                          NULLIF(json_extract(r.metadata, '$.user_id'), '') AS receipt_owner_user_id
                    FROM documents d
                    LEFT JOIN agent_session_receipts r ON r.doc_id = d.doc_id
                    WHERE d.source = ?""",
-                (source_owner, source_id),
+                (source_id,),
             ) as cursor:
-                document_owners = {
-                    str(row["doc_id"]): str(row["owner_user_id"]).strip()
-                    async for row in cursor
-                }
+                document_rows = [dict(row) async for row in cursor]
+
+            document_owners: dict[str, str] = {}
+            for document in document_rows:
+                doc_id = str(document["doc_id"])
+                owner = str(document.get("receipt_owner_user_id") or "").strip()
+                if not owner:
+                    async with self.db.execute(
+                        """SELECT DISTINCT m.owner_user_id
+                           FROM memory_sources ms
+                           JOIN memories m ON m.id = ms.memory_id
+                           WHERE ms.doc_id = ? AND m.owner_user_id IS NOT NULL""",
+                        (doc_id,),
+                    ) as cursor:
+                        memory_owners = {
+                            str(row["owner_user_id"] or "").strip()
+                            async for row in cursor
+                            if str(row["owner_user_id"] or "").strip()
+                        }
+                    if len(memory_owners) > 1:
+                        raise RuntimeError(
+                            "agent-session document has multiple owners during migration: "
+                            f"{doc_id}"
+                        )
+                    owner = next(iter(memory_owners), source_owner)
+                if not owner:
+                    raise RuntimeError(
+                        "cannot partition legacy agent-session document without an owner: "
+                        f"{doc_id}"
+                    )
+                document_owners[doc_id] = owner
 
             owners = {owner for owner in document_owners.values() if owner}
             async with self.db.execute(
@@ -2353,7 +2383,12 @@ class Database:
                     owner = str(row["owner_user_id"]).strip()
                     if owner:
                         owners.add(owner)
-            owners.add(source_owner)
+            if source_owner:
+                owners.add(source_owner)
+            if not owners:
+                raise RuntimeError(
+                    f"cannot partition legacy agent-session source without owner evidence: {source_id}"
+                )
 
             for owner in sorted(owners):
                 target_source_id = _agent_session_source_id_for_owner(client, owner)

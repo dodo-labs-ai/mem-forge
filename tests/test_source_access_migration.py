@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import aiosqlite
 import pytest
 
+from memforge.agent_sessions import agent_session_source_id
 from memforge.storage.database import Database, MIGRATIONS, SCHEMA
 
 
@@ -34,6 +36,9 @@ async def _legacy_database(
     *,
     creator: str | None = "creator",
     memory_access: tuple[tuple[str, str | None], ...] = (),
+    source_id: str = "src-legacy",
+    source_type: str = "confluence",
+    config: str = "{}",
 ) -> None:
     connection = await aiosqlite.connect(path)
     await connection.executescript(_LEGACY_SOURCES_SCHEMA)
@@ -48,8 +53,8 @@ async def _legacy_database(
     await connection.execute(
         """INSERT INTO sources (
                id, type, name, config, created_by_user_id, execution_owner_user_id
-           ) VALUES ('src-legacy', 'confluence', 'Legacy', '{}', ?, ?)""",
-        (creator, creator),
+           ) VALUES (?, ?, 'Legacy', ?, ?, ?)""",
+        (source_id, source_type, config, creator, creator),
     )
     for index, (visibility, owner_user_id) in enumerate(memory_access):
         memory_id = f"mem-{index}"
@@ -62,9 +67,9 @@ async def _legacy_database(
         )
         await connection.execute(
             """INSERT INTO memory_sources (
-                   memory_id, doc_id, source_id, source_type, support_kind
-               ) VALUES (?, ?, 'src-legacy', 'confluence', 'extracted')""",
-            (memory_id, f"doc-{index}"),
+               memory_id, doc_id, source_id, source_type, support_kind
+               ) VALUES (?, ?, ?, ?, 'extracted')""",
+            (memory_id, f"doc-{index}", source_id, source_type),
         )
     await connection.commit()
     await connection.close()
@@ -143,5 +148,75 @@ def test_source_access_migration_rejects_ambiguous_or_ownerless_sources(
         with pytest.raises(RuntimeError, match=message):
             await database.connect()
         await database.close()
+
+    asyncio.run(run())
+
+
+def test_source_access_migration_partitions_ownerless_agent_source_from_receipts(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        path = str(tmp_path / "ownerless-agent.db")
+        legacy_source_id = "src-agent-sessions-claude-code"
+        await _legacy_database(
+            path,
+            creator=None,
+            source_id=legacy_source_id,
+            source_type="agent_session",
+            config=json.dumps({"client": "claude-code"}),
+        )
+        connection = await aiosqlite.connect(path)
+        now = "2026-07-13T00:00:00+00:00"
+        for owner in ("alice", "bob"):
+            doc_id = f"doc-{owner}"
+            await connection.execute(
+                """INSERT INTO documents (
+                       doc_id, source, source_url, title, space_or_project, author,
+                       last_modified, labels, version, content_hash, last_synced
+                   ) VALUES (?, ?, ?, ?, 'workspace', 'claude-code', ?, '[]', 'v1', ?, ?)""",
+                (
+                    doc_id,
+                    legacy_source_id,
+                    f"agent-session://claude-code/session/{doc_id}",
+                    f"{owner} session",
+                    now,
+                    f"hash-{owner}",
+                    now,
+                ),
+            )
+            await connection.execute(
+                """INSERT INTO agent_session_receipts (
+                       doc_id, source_id, client, session_id, trigger, workspace,
+                       history_window_kind, submitted_at, document_hash, source_kind,
+                       document_uri, metadata, updated_at
+                   ) VALUES (?, ?, 'claude-code', ?, 'Stop', 'workspace', 'session',
+                             ?, ?, 'generated_agent_summary', '', ?, ?)""",
+                (
+                    doc_id,
+                    legacy_source_id,
+                    f"session-{owner}",
+                    now,
+                    f"hash-{owner}",
+                    json.dumps({"user_id": owner}),
+                    now,
+                ),
+            )
+        await connection.commit()
+        await connection.close()
+
+        database = Database(path)
+        await database.connect()
+        try:
+            assert await database.get_source(legacy_source_id) is None
+            for owner in ("alice", "bob"):
+                source_id = agent_session_source_id("claude-code", owner)
+                source = await database.get_source(source_id)
+                document = await database.get_document(f"doc-{owner}")
+                assert source is not None
+                assert source["owner_user_id"] == owner
+                assert source["access_policy"] == "private"
+                assert document is not None and document.source == source_id
+        finally:
+            await database.close()
 
     asyncio.run(run())
