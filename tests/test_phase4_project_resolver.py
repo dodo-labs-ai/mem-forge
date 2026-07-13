@@ -16,57 +16,55 @@ from memforge.storage.database import Database
 
 def test_fixed_returns_configured_key():
     binding = {"mode": "fixed", "project_key": "PAY"}
-    assert resolve_project_key(binding, item_field_value="anything",
-                                repo=None, workspace="/tmp") == "PAY"
+    assert resolve_project_key(binding, item_field_value="anything", repo=None, workspace="/tmp") == "PAY"
 
 
 def test_by_field_hit_returns_mapped_key():
     binding = {
-        "mode": "by_field", "field": "space_or_project",
+        "mode": "by_field",
+        "field": "space_or_project",
         "map": {"PAYSPACE": "PAY", "RISKSPACE": "RISK"},
         "default": "UNSORTED",
     }
-    assert resolve_project_key(binding, item_field_value="PAYSPACE",
-                                repo=None, workspace="/tmp") == "PAY"
+    assert resolve_project_key(binding, item_field_value="PAYSPACE", repo=None, workspace="/tmp") == "PAY"
 
 
 def test_by_field_miss_returns_default():
     binding = {
-        "mode": "by_field", "field": "space_or_project",
+        "mode": "by_field",
+        "field": "space_or_project",
         "map": {"PAYSPACE": "PAY"},
         "default": "UNSORTED",
     }
-    assert resolve_project_key(binding, item_field_value="UNKNOWN",
-                                repo=None, workspace="/tmp") == "UNSORTED"
+    assert resolve_project_key(binding, item_field_value="UNKNOWN", repo=None, workspace="/tmp") == "UNSORTED"
 
 
 def test_admin_set_default_can_be_shared():
     binding = {
-        "mode": "by_field", "field": "space_or_project",
+        "mode": "by_field",
+        "field": "space_or_project",
         "map": {},
         "default": "SHARED",
     }
-    assert resolve_project_key(binding, item_field_value="anything",
-                                repo=None, workspace="/tmp") == "SHARED"
+    assert resolve_project_key(binding, item_field_value="anything", repo=None, workspace="/tmp") == "SHARED"
 
 
 def test_agent_repo_absent_returns_default_not_workspace_basename():
     """Agent non-repo fallback: never mint Path(workspace).name as a key
     (would create junk like 'tmp', 'Desktop'). Resolves to default."""
     binding = {
-        "mode": "by_field", "field": "repo",
+        "mode": "by_field",
+        "field": "repo",
         "map": {"my-app": "APP"},
         "default": "UNSORTED",
     }
-    result = resolve_project_key(binding, item_field_value=None,
-                                  repo=None, workspace="/tmp/work")
+    result = resolve_project_key(binding, item_field_value=None, repo=None, workspace="/tmp/work")
     assert result == "UNSORTED"
 
 
 def test_no_binding_resolves_to_unsorted():
     """A source with no binding (legacy row) still resolves predictably."""
-    assert resolve_project_key(None, item_field_value="anything",
-                                repo=None, workspace="/tmp") == "UNSORTED"
+    assert resolve_project_key(None, item_field_value="anything", repo=None, workspace="/tmp") == "UNSORTED"
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +96,7 @@ async def test_agent_session_with_no_repo_lands_in_unsorted(db, tmp_path):
     result = await submit_agent_session_document(
         db=db,
         config=cfg,
+        user_id="user-owner",
         client="codex",
         session_id="sess-no-repo",
         trigger="Stop",
@@ -120,7 +119,12 @@ async def test_agent_session_by_field_repo_maps_to_configured_key(db, tmp_path):
     cfg = _config(tmp_path)
     # Seed the per-client agent-session source first so we can attach a
     # binding to it before the submit call resolves the project key.
-    source = await ensure_agent_session_source(db, cfg, client="codex")
+    source = await ensure_agent_session_source(
+        db,
+        cfg,
+        client="codex",
+        owner_user_id="user-owner",
+    )
     binding = {
         "mode": "by_field",
         "field": "repo",
@@ -136,6 +140,7 @@ async def test_agent_session_by_field_repo_maps_to_configured_key(db, tmp_path):
     result = await submit_agent_session_document(
         db=db,
         config=cfg,
+        user_id="user-owner",
         client="codex",
         session_id="sess-mapped",
         trigger="Stop",
@@ -163,11 +168,21 @@ async def test_sync_pipeline_resolves_project_key_via_binding(db):
     }
     await db.db.execute(
         "INSERT INTO sources (id, type, name, status, last_sync, doc_count, "
-        "config, project_binding, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        ("src-conf", "confluence", "Conf", "active", None, 0,
-         json.dumps({"spaces": ["PAYSPACE"]}),
-         json.dumps(binding)),
+        "config, project_binding, access_policy, access_state, owner_user_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+        (
+            "src-conf",
+            "confluence",
+            "Conf",
+            "active",
+            None,
+            0,
+            json.dumps({"spaces": ["PAYSPACE"]}),
+            json.dumps(binding),
+            "workspace",
+            "active",
+            "dev",
+        ),
     )
     await db.db.commit()
 
@@ -199,9 +214,9 @@ async def test_sync_pipeline_legacy_source_resolves_to_unsorted(db):
     """
     await db.db.execute(
         "INSERT INTO sources (id, type, name, status, last_sync, doc_count, "
-        "config, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        ("src-legacy", "jira", "Legacy", "active", None, 0, "{}"),
+        "config, access_policy, access_state, owner_user_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+        ("src-legacy", "jira", "Legacy", "active", None, 0, "{}", "workspace", "active", "dev"),
     )
     await db.db.commit()
 

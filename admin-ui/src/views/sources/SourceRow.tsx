@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
-import { Info, Loader2, Pause, Pin, Play, RefreshCw, SlidersHorizontal } from "lucide-react";
+import { AlertCircle, Info, Loader2, Lock, Pause, Pin, Play, RefreshCw, SlidersHorizontal, Users } from "lucide-react";
 import type { Source, SourceCapabilities, SourceOwnership, SyncStatus } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
 import { SourceSyncStatusCard } from "@/components/admin/SourceSyncStatusCard";
@@ -42,6 +42,7 @@ const DEFAULT_CAPABILITIES: SourceCapabilities = {
   can_sync: false,
   can_force_resync: false,
   can_delete: false,
+  can_change_access: false,
 };
 
 export function SourceRow({
@@ -65,6 +66,8 @@ export function SourceRow({
   highlighted = false,
   onUnpin,
   isPinPending = false,
+  onRetryAccess,
+  onRevertAccess,
 }: {
   source: Source;
   perGroupMemoryCount: number;
@@ -86,6 +89,8 @@ export function SourceRow({
   highlighted?: boolean;
   onUnpin?: () => void;
   isPinPending?: boolean;
+  onRetryAccess?: () => void;
+  onRevertAccess?: () => void;
 }) {
   const isPaused = source.status === "paused";
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
@@ -137,6 +142,7 @@ export function SourceRow({
                 </Button>
               )}
               <SourceLifecycleBadge status={source.status} />
+              <SourceAccessBadge source={source} />
               {showReadiness && (
                 <SourceReadinessBadge
                   localExecution={localExecution}
@@ -241,7 +247,7 @@ export function SourceRow({
         </div>
       </div>
 
-      {isPaused && capabilities.can_sync && !isManaged && (
+      {isPaused && source.access_state !== "changing" && capabilities.can_sync && !isManaged && (
         <div
           role="status"
           className="flex flex-col gap-2 rounded-md border border-amber-200 bg-amber-50/70 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-100 sm:flex-row sm:items-center sm:justify-between"
@@ -273,12 +279,110 @@ export function SourceRow({
         </div>
       )}
 
+      {source.access_state === "changing" && source.access_transition && (
+        <SourceAccessTransitionStatus
+          source={source}
+          onRetry={onRetryAccess}
+          onRevert={onRevertAccess}
+        />
+      )}
+
       <SourceSyncStatusCard
         activity={syncActivity}
         sourceName={sourceLabel.name}
         itemLabel={itemLabel}
         onRetry={isPaused || !capabilities.can_sync ? undefined : onSync}
       />
+    </div>
+  );
+}
+
+function SourceAccessBadge({ source }: { source: Source }) {
+  const failed = source.access_transition?.status === "failed";
+  if (source.access_state === "changing") {
+    return (
+      <Badge
+        variant="outline"
+        className={cn(
+          "gap-1",
+          failed
+            ? "border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200"
+            : "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200",
+        )}
+      >
+        {failed ? <AlertCircle className="size-3" /> : <Loader2 className="size-3 animate-spin" />}
+        {failed ? "Access change failed" : "Changing access"}
+      </Badge>
+    );
+  }
+  if (source.access_state === "orphaned_private") {
+    return (
+      <Badge variant="outline" className="gap-1 border-red-200 bg-red-50 text-red-700">
+        <AlertCircle className="size-3" /> Owner required
+      </Badge>
+    );
+  }
+  if (source.access_policy === "private") {
+    return <Badge variant="outline" className="gap-1"><Lock className="size-3" />Only me</Badge>;
+  }
+  return (
+    <Badge variant="outline" className="gap-1 border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-900 dark:bg-sky-950/40 dark:text-sky-200">
+      <Users className="size-3" />Shared with workspace
+    </Badge>
+  );
+}
+
+function SourceAccessTransitionStatus({
+  source,
+  onRetry,
+  onRevert,
+}: {
+  source: Source;
+  onRetry?: () => void;
+  onRevert?: () => void;
+}) {
+  const transition = source.access_transition;
+  if (!transition) return null;
+  const failed = transition.status === "failed";
+  const total = transition.total_memories;
+  const completed = Math.min(transition.processed_memories, total);
+  const percentage = total > 0 ? Math.round((completed / total) * 100) : null;
+  const target = transition.target_policy === "private" ? "Only me" : "workspace access";
+  return (
+    <div
+      role="status"
+      className={cn(
+        "space-y-2 rounded-md border px-3 py-2 text-sm",
+        failed
+          ? "border-red-200 bg-red-50/70 text-red-900 dark:border-red-900 dark:bg-red-950/30 dark:text-red-100"
+          : "border-amber-200 bg-amber-50/70 text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100",
+      )}
+    >
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <div className="font-medium">
+            {failed ? "Access change needs attention" : `Changing access to ${target}`}
+          </div>
+          <div className="mt-0.5 text-xs opacity-80">
+            {failed
+              ? transition.error_message || "Existing memories were not fully updated. The source remains owner-only."
+              : total > 0
+                ? `${completed} of ${total} memories updated`
+                : "Preparing existing memories"}
+          </div>
+        </div>
+        {failed && (onRetry || onRevert) && (
+          <div className="flex gap-2">
+            {onRevert && <Button type="button" size="sm" variant="outline" onClick={onRevert}>Revert</Button>}
+            {onRetry && <Button type="button" size="sm" onClick={onRetry}>Retry</Button>}
+          </div>
+        )}
+      </div>
+      {!failed && percentage !== null && (
+        <div className="h-1.5 overflow-hidden rounded-full bg-amber-200/60 dark:bg-amber-900">
+          <div className="h-full rounded-full bg-amber-700 transition-all" style={{ width: `${percentage}%` }} />
+        </div>
+      )}
     </div>
   );
 }
@@ -455,7 +559,7 @@ function SubscriptionToggle({
 function formatOwnership(ownership: SourceOwnership | undefined): string {
   if (!ownership) return "";
   const creator = ownership.created_by_user_id;
-  if (ownership.viewer_relationship === "creator") {
+  if (ownership.viewer_relationship === "owner") {
     return "Created by you";
   }
   if (ownership.viewer_relationship === "workspace_admin") {

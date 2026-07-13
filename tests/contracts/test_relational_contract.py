@@ -222,7 +222,9 @@ class RelationalStoreContract:
 
         assert matched == {"m-agent-target"}
 
-    async def test_filter_ids_by_source_and_time_supports_source_and_memory_dates(self, adapters: ContractAdapters) -> None:
+    async def test_filter_ids_by_source_and_time_supports_source_and_memory_dates(
+        self, adapters: ContractAdapters
+    ) -> None:
         store = adapters.relational
         await store.insert_memory(make_memory("m-source-fresh", updated_at=datetime(2026, 6, 1, tzinfo=timezone.utc)))
         await store.insert_memory(make_memory("m-source-stale", updated_at=datetime(2026, 6, 1, tzinfo=timezone.utc)))

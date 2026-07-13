@@ -113,15 +113,17 @@ def test_keychain_token_without_expiry_is_renewed_instead_of_treated_as_permanen
     monkeypatch.setattr(
         TeamsAuthenticator,
         "_load_keychain_token_data",
-        staticmethod(lambda: {
-            "tokens": {
-                CHAT_API_AUDIENCE: {
-                    "token": "token-without-expiry",
-                    "expiresAt": 0,
-                    "scopes": "Teams.AccessAsUser.All",
+        staticmethod(
+            lambda: {
+                "tokens": {
+                    CHAT_API_AUDIENCE: {
+                        "token": "token-without-expiry",
+                        "expiresAt": 0,
+                        "scopes": "Teams.AccessAsUser.All",
+                    }
                 }
             }
-        }),
+        ),
     )
     monkeypatch.setattr(TeamsAuthenticator, "_save_keychain_token_data", staticmethod(lambda _data: True))
 
@@ -231,11 +233,13 @@ def test_silent_session_renewal_captures_ic3_token_from_teams_request(monkeypatc
     from memforge.auth.teams_auth import CHAT_API_AUDIENCE, TeamsAuthenticator
     from memforge.auth.teams_browser_session import TeamsBrowserSession
 
-    token = _jwt({
-        "aud": CHAT_API_AUDIENCE,
-        "exp": 4_102_444_800,
-        "scp": "Teams.AccessAsUser.All",
-    })
+    token = _jwt(
+        {
+            "aud": CHAT_API_AUDIENCE,
+            "exp": 4_102_444_800,
+            "scp": "Teams.AccessAsUser.All",
+        }
+    )
 
     class Request:
         @staticmethod
@@ -312,15 +316,17 @@ def test_teams_access_token_near_expiry_is_renewed_before_collection(monkeypatch
     monkeypatch.setattr(
         TeamsAuthenticator,
         "_load_keychain_token_data",
-        staticmethod(lambda: {
-            "tokens": {
-                CHAT_API_AUDIENCE: {
-                    "token": "near-expiry-token",
-                    "expiresAt": near_expiry,
-                    "scopes": "Teams.AccessAsUser.All",
+        staticmethod(
+            lambda: {
+                "tokens": {
+                    CHAT_API_AUDIENCE: {
+                        "token": "near-expiry-token",
+                        "expiresAt": near_expiry,
+                        "scopes": "Teams.AccessAsUser.All",
+                    }
                 }
             }
-        }),
+        ),
     )
     monkeypatch.setattr(TeamsAuthenticator, "_save_keychain_token_data", staticmethod(lambda _data: True))
 
@@ -334,17 +340,21 @@ def test_rejected_teams_access_token_is_redeemed_silently_with_teams_web_session
     from memforge.auth.teams_auth import CHAT_API_AUDIENCE, TeamsAuthenticator
     from memforge.auth.teams_browser_session import TeamsBrowserSession, TeamsTokenRefresh
 
-    stale_token = _jwt({
-        "aud": CHAT_API_AUDIENCE,
-        "exp": 4_102_444_800,
-        "scp": "Teams.AccessAsUser.All",
-    })
-    fresh_token = _jwt({
-        "aud": CHAT_API_AUDIENCE,
-        "exp": 4_102_444_900,
-        "scp": "Teams.AccessAsUser.All",
-        "renewed": True,
-    })
+    stale_token = _jwt(
+        {
+            "aud": CHAT_API_AUDIENCE,
+            "exp": 4_102_444_800,
+            "scp": "Teams.AccessAsUser.All",
+        }
+    )
+    fresh_token = _jwt(
+        {
+            "aud": CHAT_API_AUDIENCE,
+            "exp": 4_102_444_900,
+            "scp": "Teams.AccessAsUser.All",
+            "renewed": True,
+        }
+    )
     persisted_refresh_tokens: list[str] = []
 
     class Request:
@@ -367,14 +377,18 @@ def test_rejected_teams_access_token_is_redeemed_silently_with_teams_web_session
 
         def evaluate(self, script, argument=None):
             if "Object.entries" in script:
-                return [[
-                    "teams-refresh-token",
-                    json.dumps({
-                        "credentialType": "RefreshToken",
-                        "clientId": "5e3ce6c0-2b1f-4285-8d4b-75ee78787346",
-                        "secret": "refresh-token-before-rotation",
-                    }),
-                ]]
+                return [
+                    [
+                        "teams-refresh-token",
+                        json.dumps(
+                            {
+                                "credentialType": "RefreshToken",
+                                "clientId": "5e3ce6c0-2b1f-4285-8d4b-75ee78787346",
+                                "secret": "refresh-token-before-rotation",
+                            }
+                        ),
+                    ]
+                ]
             if "setItem" in script:
                 persisted_refresh_tokens.append(argument["value"]["secret"])
                 return None
@@ -409,15 +423,17 @@ def test_rejected_teams_access_token_is_redeemed_silently_with_teams_web_session
     monkeypatch.setattr(
         TeamsAuthenticator,
         "_load_keychain_token_data",
-        staticmethod(lambda: {
-            "tokens": {
-                CHAT_API_AUDIENCE: {
-                    "token": stale_token,
-                    "expiresAt": 4_102_444_800,
-                    "scopes": "Teams.AccessAsUser.All",
+        staticmethod(
+            lambda: {
+                "tokens": {
+                    CHAT_API_AUDIENCE: {
+                        "token": stale_token,
+                        "expiresAt": 4_102_444_800,
+                        "scopes": "Teams.AccessAsUser.All",
+                    }
                 }
             }
-        }),
+        ),
     )
     monkeypatch.setattr(TeamsAuthenticator, "_save_keychain_token_data", staticmethod(lambda _data: True))
 

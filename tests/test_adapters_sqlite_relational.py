@@ -81,6 +81,27 @@ async def _document(db: Database, doc_id: str, *, source: str = "src-confluence"
 async def db(tmp_path):
     database = Database(str(tmp_path / "relational.db"))
     await database.connect()
+    for source_id in (
+        "src-confluence",
+        "src-target",
+        "src-other",
+        "src-enabled",
+        "src-disabled",
+        "src-payroll",
+        "src-exact",
+        "src-backfill",
+        "wiki",
+        "jira",
+    ):
+        await database.upsert_source(
+            source_id,
+            "test",
+            source_id,
+            "{}",
+            "workspace",
+            LOCAL_DEV_USER_ID,
+            created_by_user_id=LOCAL_DEV_USER_ID,
+        )
     yield database
     await database.close()
 
@@ -372,8 +393,10 @@ async def test_link_query_entities_alias_fts_honors_memory_types(db):
 async def test_link_query_entities_alias_fts_binds_query_before_source_count_params(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m-enabled"))
-    await db.upsert_source("src-enabled", "jira", "Enabled Jira", "{}")
-    await db.upsert_source("src-disabled", "jira", "Disabled Jira", "{}")
+    await db.upsert_source("src-enabled", "jira", "Enabled Jira", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source(
+        "src-disabled", "jira", "Disabled Jira", "{}", access_policy="workspace", owner_user_id="dev"
+    )
     await _document(db, "doc-enabled", source="src-enabled")
     entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
     await db.link_memory_entity("m-enabled", entity_id)
@@ -400,9 +423,7 @@ async def test_link_query_entities_alias_fts_refreshes_after_remove_alias(db):
     await db.insert_alias("PCC Engine", "pcc engine", entity_id, "admin_manual")
     await db.link_memory_entity("m1", entity_id)
 
-    assert (
-        await store.link_query_entities("pcc engine validation", scope=_scope(), limit=5)
-    ).candidates
+    assert (await store.link_query_entities("pcc engine validation", scope=_scope(), limit=5)).candidates
 
     await db.remove_entity_alias(entity_id=entity_id, alias_normalized="pcc engine")
 
@@ -415,8 +436,10 @@ async def test_link_query_entities_honors_disabled_sources(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m-disabled"))
     await store.insert_memory(_memory("m-enabled"))
-    await db.upsert_source("src-disabled", "jira", "Disabled Jira", "{}")
-    await db.upsert_source("src-enabled", "jira", "Enabled Jira", "{}")
+    await db.upsert_source(
+        "src-disabled", "jira", "Disabled Jira", "{}", access_policy="workspace", owner_user_id="dev"
+    )
+    await db.upsert_source("src-enabled", "jira", "Enabled Jira", "{}", access_policy="workspace", owner_user_id="dev")
     await _document(db, "doc-disabled", source="src-disabled")
     await _document(db, "doc-enabled", source="src-enabled")
     disabled_entity = await db.upsert_entity("disabled blocker", "Disabled Blocker", ["feature"])
@@ -442,8 +465,10 @@ async def test_link_query_entities_honors_disabled_sources(db):
 async def test_link_query_entities_visible_source_count_excludes_disabled_sources(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m-mixed"))
-    await db.upsert_source("src-enabled", "jira", "Enabled Jira", "{}")
-    await db.upsert_source("src-disabled", "jira", "Disabled Jira", "{}")
+    await db.upsert_source("src-enabled", "jira", "Enabled Jira", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source(
+        "src-disabled", "jira", "Disabled Jira", "{}", access_policy="workspace", owner_user_id="dev"
+    )
     await _document(db, "doc-enabled", source="src-enabled")
     await _document(db, "doc-disabled", source="src-disabled")
     entity_id = await db.upsert_entity("mixed blocker", "Mixed Blocker", ["feature"])
@@ -583,8 +608,10 @@ async def test_list_ids_by_source_and_time_excludes_user_disabled_sources(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m-disabled"))
     await store.insert_memory(_memory("m-enabled"))
-    await db.upsert_source("src-disabled", "jira", "Disabled Jira", "{}")
-    await db.upsert_source("src-enabled", "jira", "Enabled Jira", "{}")
+    await db.upsert_source(
+        "src-disabled", "jira", "Disabled Jira", "{}", access_policy="workspace", owner_user_id="dev"
+    )
+    await db.upsert_source("src-enabled", "jira", "Enabled Jira", "{}", access_policy="workspace", owner_user_id="dev")
     await _document(db, "doc-disabled", source="src-disabled")
     await _document(db, "doc-enabled", source="src-enabled")
     source_updated_at = datetime(2026, 6, 24, tzinfo=timezone.utc)

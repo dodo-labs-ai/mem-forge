@@ -1402,6 +1402,47 @@ class MemoryStore:
             )
             raise
 
+    async def reindex_memory_access(self, memory_id: str) -> None:
+        """Converge relational and vector search projections after an access move."""
+        memory = await self.db.get_memory(memory_id)
+        if memory is None:
+            return
+        context = self._operation_context()
+        await self.db.rebuild_memory_fts(
+            memory_id,
+            search_visible_statuses=set(allowed_search_statuses()),
+        )
+        if memory.status not in set(allowed_search_statuses()):
+            await self._remove_from_search_indexes(
+                memory_id,
+                label="source_access_transition",
+                context=context,
+            )
+            return
+        try:
+            embedding_text = await self._canonical_memory_embedding_text(memory)
+            embedding = await self._embed(embedding_text)
+            await self.vector.upsert(
+                ids=[memory.id],
+                embeddings=[embedding],
+                metadatas=[
+                    _memory_metadata(
+                        memory,
+                        embedding_text_hash=embedding_text_hash(embedding_text),
+                    )
+                ],
+            )
+        except Exception as exc:
+            await self._emit(
+                "index_operation_failed",
+                "failed",
+                context=context,
+                memory_id=memory.id,
+                error=str(exc),
+                payload={"index": "chroma", "operation": "source_access_transition"},
+            )
+            raise
+
     # -------------------------------------------------------------------
     # Soft delete
     # -------------------------------------------------------------------

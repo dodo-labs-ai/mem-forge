@@ -37,6 +37,34 @@ async def test_fresh_schema_has_visibility_columns_and_no_scope(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_agent_concept_rebuild_restores_foreign_key_enforcement(tmp_path):
+    db = Database(str(tmp_path / "foreign-keys.db"))
+    await db.connect()
+    try:
+        async with db.db.execute("PRAGMA foreign_keys") as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1
+
+        await db.upsert_source(
+            "src-cascade",
+            "confluence",
+            "Cascade Source",
+            "{}",
+            "workspace",
+            "dev",
+        )
+        run = await db.enqueue_source_sync_run(
+            source_id="src-cascade",
+            trigger="manual",
+        )
+        await db.delete_source_cascade("src-cascade")
+        assert await db.get_source_sync_run(run.run_id) is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_backfill_maps_legacy_scope_to_project_key(tmp_path):
     from memforge.models import SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY
 
@@ -90,8 +118,7 @@ async def test_upgrade_from_legacy_db_without_visibility(tmp_path):
         )
         await raw.execute("CREATE INDEX idx_memories_scope ON memories(scope)")
         await raw.execute(
-            "CREATE TABLE schema_migrations "
-            "(version INTEGER PRIMARY KEY, description TEXT, applied_at TEXT)"
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT, applied_at TEXT)"
         )
         for version in range(1, 14):
             await raw.execute(
@@ -114,11 +141,9 @@ async def test_upgrade_from_legacy_db_without_visibility(tmp_path):
         idx = await _indexes(db)
         assert "idx_memories_access" in idx
         assert "idx_memories_owner" in idx
-        async with db.db.execute(
-            "SELECT visibility, project_key FROM memories WHERE id = 'leg-1'"
-        ) as cur:
+        async with db.db.execute("SELECT visibility, project_key FROM memories WHERE id = 'leg-1'") as cur:
             row = await cur.fetchone()
         assert row[0] == "workspace"  # backfilled visibility
-        assert row[1] == "SHARED"     # legacy scope 'team' maps to SHARED
+        assert row[1] == "SHARED"  # legacy scope 'team' maps to SHARED
     finally:
         await db.close()

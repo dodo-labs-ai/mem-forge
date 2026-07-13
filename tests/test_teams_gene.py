@@ -23,6 +23,7 @@ from memforge.models import ConfigFieldType
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _msg(id: str, author: str, content: str, time: datetime, parent_id: str | None = None) -> dict:
     """Build a mock Teams message dict."""
     return {
@@ -55,6 +56,7 @@ class FakeDocumentStore:
 # ---------------------------------------------------------------------------
 # Gene metadata and config
 # ---------------------------------------------------------------------------
+
 
 class TestMetadata:
     def test_metadata_fields(self):
@@ -256,6 +258,7 @@ class TestMetadata:
 # Conversation block grouping
 # ---------------------------------------------------------------------------
 
+
 class TestBlockGrouping:
     def test_empty_messages(self):
         assert _group_into_blocks([], gap_minutes=180, max_messages=100) == []
@@ -291,10 +294,7 @@ class TestBlockGrouping:
 
     def test_max_messages_splits_block(self):
         # Create 10 messages 1 minute apart, max_messages=4
-        msgs = [
-            _msg(str(i), "Alice", f"Message {i}", NOW + timedelta(minutes=i))
-            for i in range(10)
-        ]
+        msgs = [_msg(str(i), "Alice", f"Message {i}", NOW + timedelta(minutes=i)) for i in range(10)]
         blocks = _group_into_blocks(msgs, gap_minutes=180, max_messages=4)
         assert len(blocks) >= 3
         for block in blocks:
@@ -462,21 +462,25 @@ class TestMessageParsing:
             value = MagicMock()
             value.json.return_value = {
                 "_metadata": {"backwardLink": backward_link},
-                "messages": [{
-                    "id": message_id,
-                    "conversationid": "19:conversation@thread.v2",
-                    "content": f"<p>{message_id}</p>",
-                    "messagetype": "RichText/Html",
-                    "composetime": NOW.isoformat(),
-                }],
+                "messages": [
+                    {
+                        "id": message_id,
+                        "conversationid": "19:conversation@thread.v2",
+                        "content": f"<p>{message_id}</p>",
+                        "messagetype": "RichText/Html",
+                        "composetime": NOW.isoformat(),
+                    }
+                ],
             }
             return value
 
-        client._request = AsyncMock(side_effect=[
-            response("newest", "https://teams.cloud.microsoft/page-2"),
-            response("older", "https://teams.cloud.microsoft/repeated-page"),
-            response("older", "https://teams.cloud.microsoft/repeated-page"),
-        ])
+        client._request = AsyncMock(
+            side_effect=[
+                response("newest", "https://teams.cloud.microsoft/page-2"),
+                response("older", "https://teams.cloud.microsoft/repeated-page"),
+                response("older", "https://teams.cloud.microsoft/repeated-page"),
+            ]
+        )
 
         messages = await client.get_messages_until(
             "19:conversation@thread.v2",
@@ -562,6 +566,7 @@ class TestMessageParsing:
 # Discovery
 # ---------------------------------------------------------------------------
 
+
 class TestDiscover:
     @pytest.fixture
     def gene(self):
@@ -575,12 +580,16 @@ class TestDiscover:
     @pytest.mark.asyncio
     async def test_skips_inactive_conversations(self, gene):
         """Conversations with no activity since last sync are skipped entirely."""
-        gene._client.list_conversations = AsyncMock(return_value=[{
-            "id": "19:abc@thread.tacv2",
-            "topic": "architecture",
-            "lastActivity": NOW - timedelta(hours=2),
-            "type": "channel",
-        }])
+        gene._client.list_conversations = AsyncMock(
+            return_value=[
+                {
+                    "id": "19:abc@thread.tacv2",
+                    "topic": "architecture",
+                    "lastActivity": NOW - timedelta(hours=2),
+                    "type": "channel",
+                }
+            ]
+        )
         gene._resolve_channel = AsyncMock(return_value="19:abc@thread.tacv2")
 
         since = NOW - timedelta(hours=1)
@@ -594,14 +603,18 @@ class TestDiscover:
     async def test_discovers_threads_from_channel(self, gene):
         """Messages with rootMessageId are grouped into threads."""
         conv_id = "19:abc@thread.tacv2"
-        gene._client.list_conversations = AsyncMock(return_value=[{
-            "id": conv_id,
-            "topic": "architecture",
-            "lastActivity": NOW,
-            "type": "channel",
-            "channel_name": "architecture",
-            "team_name": "Engineering",
-        }])
+        gene._client.list_conversations = AsyncMock(
+            return_value=[
+                {
+                    "id": conv_id,
+                    "topic": "architecture",
+                    "lastActivity": NOW,
+                    "type": "channel",
+                    "channel_name": "architecture",
+                    "team_name": "Engineering",
+                }
+            ]
+        )
         gene._resolve_channel = AsyncMock(return_value=conv_id)
 
         root = _msg("root1", "Alice", "Should we use gRPC?", NOW - timedelta(minutes=30))
@@ -626,14 +639,18 @@ class TestDiscover:
     async def test_discovers_blocks_from_flat_messages(self, gene):
         """Unthreaded messages are grouped into conversation blocks."""
         conv_id = "19:abc@thread.tacv2"
-        gene._client.list_conversations = AsyncMock(return_value=[{
-            "id": conv_id,
-            "topic": "architecture",
-            "lastActivity": NOW,
-            "type": "channel",
-            "channel_name": "architecture",
-            "team_name": "Engineering",
-        }])
+        gene._client.list_conversations = AsyncMock(
+            return_value=[
+                {
+                    "id": conv_id,
+                    "topic": "architecture",
+                    "lastActivity": NOW,
+                    "type": "channel",
+                    "channel_name": "architecture",
+                    "team_name": "Engineering",
+                }
+            ]
+        )
         gene._resolve_channel = AsyncMock(return_value=conv_id)
 
         msgs = [
@@ -657,12 +674,16 @@ class TestDiscover:
         conv_id = "19:abc@thread.tacv2"
         gene.config = {"group_chats": [conv_id]}
         gene._conversation_fetch_timeout_seconds = 1
-        gene._client.list_conversations = AsyncMock(return_value=[{
-            "id": conv_id,
-            "topic": "architecture",
-            "lastActivity": NOW,
-            "type": "group_chat",
-        }])
+        gene._client.list_conversations = AsyncMock(
+            return_value=[
+                {
+                    "id": conv_id,
+                    "topic": "architecture",
+                    "lastActivity": NOW,
+                    "type": "group_chat",
+                }
+            ]
+        )
         gene._client.mark_poll_complete = MagicMock()
 
         async def never_returns(conv_id, since):
@@ -686,20 +707,22 @@ class TestDiscover:
         ok_id = "19:ok@thread.v2"
         gene.config = {"group_chats": [stuck_id, ok_id]}
         gene._conversation_fetch_timeout_seconds = 1
-        gene._client.list_conversations = AsyncMock(return_value=[
-            {
-                "id": stuck_id,
-                "topic": "stuck",
-                "lastActivity": NOW,
-                "type": "group_chat",
-            },
-            {
-                "id": ok_id,
-                "topic": "ok",
-                "lastActivity": NOW,
-                "type": "group_chat",
-            },
-        ])
+        gene._client.list_conversations = AsyncMock(
+            return_value=[
+                {
+                    "id": stuck_id,
+                    "topic": "stuck",
+                    "lastActivity": NOW,
+                    "type": "group_chat",
+                },
+                {
+                    "id": ok_id,
+                    "topic": "ok",
+                    "lastActivity": NOW,
+                    "type": "group_chat",
+                },
+            ]
+        )
         gene._client.mark_poll_complete = MagicMock()
 
         async def fetch(conv_id, since):
@@ -731,12 +754,16 @@ class TestDiscover:
         }
         gene = TeamsGene(config=config, source_id="teams-test")
         gene._client = MagicMock(spec=_TeamsAPIClient)
-        gene._client.list_conversations = AsyncMock(return_value=[{
-            "id": conv_id,
-            "topic": "architecture",
-            "lastActivity": NOW,
-            "type": "group_chat",
-        }])
+        gene._client.list_conversations = AsyncMock(
+            return_value=[
+                {
+                    "id": conv_id,
+                    "topic": "architecture",
+                    "lastActivity": NOW,
+                    "type": "group_chat",
+                }
+            ]
+        )
 
         first_messages = [
             _msg("m2", "Alice", "Anchor", NOW),
@@ -766,6 +793,7 @@ class TestDiscover:
 # Fetch
 # ---------------------------------------------------------------------------
 
+
 class TestFetch:
     @pytest.mark.asyncio
     async def test_fetch_thread_returns_json(self):
@@ -779,6 +807,7 @@ class TestFetch:
         gene._client.get_thread_messages = AsyncMock(return_value=thread_msgs)
 
         from memforge.models import ContentItem
+
         item = ContentItem(
             item_id="teams-conv#root",
             title="Test thread",
@@ -805,6 +834,7 @@ class TestFetch:
 # Normalize
 # ---------------------------------------------------------------------------
 
+
 class TestNormalize:
     @pytest.mark.asyncio
     async def test_normalize_markdown_format(self):
@@ -819,8 +849,24 @@ class TestNormalize:
             "channel_name": "architecture",
             "team_name": "Engineering",
             "messages": [
-                {"id": "root", "from": "Alice", "content": "Should we use gRPC?", "time": "2026-03-15T10:23:00+00:00", "is_root": True, "mentions": [], "attachments": []},
-                {"id": "r1", "from": "Bob", "content": "Yes, gRPC fits our streaming needs", "time": "2026-03-15T10:45:00+00:00", "is_root": False, "mentions": [], "attachments": []},
+                {
+                    "id": "root",
+                    "from": "Alice",
+                    "content": "Should we use gRPC?",
+                    "time": "2026-03-15T10:23:00+00:00",
+                    "is_root": True,
+                    "mentions": [],
+                    "attachments": [],
+                },
+                {
+                    "id": "r1",
+                    "from": "Bob",
+                    "content": "Yes, gRPC fits our streaming needs",
+                    "time": "2026-03-15T10:45:00+00:00",
+                    "is_root": False,
+                    "mentions": [],
+                    "attachments": [],
+                },
             ],
             "participants": ["Alice", "Bob"],
             "first_message_time": "2026-03-15T10:23:00+00:00",
@@ -866,7 +912,15 @@ class TestNormalize:
             "channel_name": "general",
             "team_name": "PAY",
             "messages": [
-                {"id": "1", "from": "Alice", "content": "Hello https://example.com", "time": "2026-04-15T10:00:00+00:00", "is_root": True, "mentions": [], "attachments": []},
+                {
+                    "id": "1",
+                    "from": "Alice",
+                    "content": "Hello https://example.com",
+                    "time": "2026-04-15T10:00:00+00:00",
+                    "is_root": True,
+                    "mentions": [],
+                    "attachments": [],
+                },
             ],
             "participants": ["Alice"],
             "first_message_time": "2026-04-15T10:00:00+00:00",
@@ -940,6 +994,7 @@ class TestNormalize:
 # Content hash (unchanged thread = same normalized markdown = same hash)
 # ---------------------------------------------------------------------------
 
+
 class TestContentHash:
     @pytest.mark.asyncio
     async def test_same_messages_produce_same_markdown(self):
@@ -949,11 +1004,24 @@ class TestContentHash:
         from memforge.models import ContentItem, RawContent
 
         thread_data = {
-            "conversation_type": "channel", "title": "Test", "channel_name": "ch",
-            "team_name": "T", "participants": ["A"],
+            "conversation_type": "channel",
+            "title": "Test",
+            "channel_name": "ch",
+            "team_name": "T",
+            "participants": ["A"],
             "first_message_time": "2026-04-15T10:00:00+00:00",
             "last_message_time": "2026-04-15T10:00:00+00:00",
-            "messages": [{"id": "1", "from": "A", "content": "Hello", "time": "2026-04-15T10:00:00+00:00", "is_root": True, "mentions": [], "attachments": []}],
+            "messages": [
+                {
+                    "id": "1",
+                    "from": "A",
+                    "content": "Hello",
+                    "time": "2026-04-15T10:00:00+00:00",
+                    "is_root": True,
+                    "mentions": [],
+                    "attachments": [],
+                }
+            ],
         }
         item = ContentItem(item_id="test", title="Test", source_url="", last_modified=NOW)
         raw = RawContent(item=item, body=json.dumps(thread_data).encode(), content_type="application/json")

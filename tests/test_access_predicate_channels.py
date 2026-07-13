@@ -14,8 +14,9 @@ WORKSPACE = Visibility.WORKSPACE.value
 PRIVATE = Visibility.PRIVATE.value
 
 
-def _mem(mid: str, content: str, *, visibility=WORKSPACE, owner=None,
-         project_key=SHARED_PROJECT_KEY, status="active") -> Memory:
+def _mem(
+    mid: str, content: str, *, visibility=WORKSPACE, owner=None, project_key=SHARED_PROJECT_KEY, status="active"
+) -> Memory:
     return Memory(
         id=mid,
         memory_type="fact",
@@ -51,18 +52,19 @@ async def db(tmp_path):
 async def test_bm25_hides_other_users_private_memory(db):
     # Two memories with the same FTS-matchable token, one workspace, one U2 private.
     await db.insert_memory(_mem("m-shared", "deploy via argocd", visibility=WORKSPACE))
-    await db.insert_memory(_mem("m-priv", "deploy via argocd",
-                                 visibility=PRIVATE, owner="u-2"))
+    await db.insert_memory(_mem("m-priv", "deploy via argocd", visibility=PRIVATE, owner="u-2"))
     adapters = build_sqlite_adapters(db, memory_collection=None)
     # TEAM search by U1: must not return U2's private memory.
-    team = await adapters.keyword.search("argocd", _scope(user_id="u-1",
-                                                          include_private=False),
-                                          memory_types=None, limit=10)
+    team = await adapters.keyword.search(
+        "argocd", _scope(user_id="u-1", include_private=False), memory_types=None, limit=10
+    )
     assert {mid for mid, _ in team} == {"m-shared"}
     # PERSONALIZED search by U1: still must not return U2's private memory.
     personalized = await adapters.keyword.search(
-        "argocd", _scope(user_id="u-1", include_private=True),
-        memory_types=None, limit=10,
+        "argocd",
+        _scope(user_id="u-1", include_private=True),
+        memory_types=None,
+        limit=10,
     )
     assert {mid for mid, _ in personalized} == {"m-shared"}
 
@@ -72,13 +74,14 @@ async def test_graph_hides_other_users_private_memory(db):
     e1_id = await db.upsert_entity("argocd", "tool")
     await db.insert_memory(_mem("g-shared", "deploys via argocd"))
     await db.link_memory_entity("g-shared", e1_id)
-    await db.insert_memory(_mem("g-priv", "deploys via argocd",
-                                 visibility=PRIVATE, owner="u-2"))
+    await db.insert_memory(_mem("g-priv", "deploys via argocd", visibility=PRIVATE, owner="u-2"))
     await db.link_memory_entity("g-priv", e1_id)
     adapters = build_sqlite_adapters(db, memory_collection=None)
     hits = await adapters.relational.graph_search(
-        [e1_id], _scope(user_id="u-1", include_private=False),
-        memory_types=None, limit=10,
+        [e1_id],
+        _scope(user_id="u-1", include_private=False),
+        memory_types=None,
+        limit=10,
     )
     assert {mid for mid, _ in hits} == {"g-shared"}
 
@@ -91,8 +94,7 @@ class _Coll:
 
     def upsert(self, *, ids, embeddings, metadatas, **_):
         for i, mid in enumerate(ids):
-            self.items[mid] = {"embedding": embeddings[i],
-                                "metadata": dict(metadatas[i])}
+            self.items[mid] = {"embedding": embeddings[i], "metadata": dict(metadatas[i])}
 
     def query(self, *, query_embeddings, n_results, where=None, **_):
         # Trivial cosine-equal match: return all ids that satisfy where.
@@ -121,23 +123,36 @@ class _Coll:
 @pytest.mark.asyncio
 async def test_vector_hides_other_users_private_memory(db):
     from memforge.storage.adapters.sqlite.vector import SqliteVectorStore
+
     coll = _Coll()
     coll.upsert(
-        ids=["v-shared"], embeddings=[[0.1, 0.1, 0.1]],
-        metadatas=[{"status": "active", "visibility": WORKSPACE,
-                    "owner_user_id": "", "project_key": SHARED_PROJECT_KEY,
-                    "memory_type": "fact"}],
+        ids=["v-shared"],
+        embeddings=[[0.1, 0.1, 0.1]],
+        metadatas=[
+            {
+                "status": "active",
+                "visibility": WORKSPACE,
+                "owner_user_id": "",
+                "project_key": SHARED_PROJECT_KEY,
+                "memory_type": "fact",
+            }
+        ],
     )
     coll.upsert(
-        ids=["v-priv"], embeddings=[[0.1, 0.1, 0.1]],
-        metadatas=[{"status": "active", "visibility": PRIVATE,
-                    "owner_user_id": "u-2", "project_key": SHARED_PROJECT_KEY,
-                    "memory_type": "fact"}],
+        ids=["v-priv"],
+        embeddings=[[0.1, 0.1, 0.1]],
+        metadatas=[
+            {
+                "status": "active",
+                "visibility": PRIVATE,
+                "owner_user_id": "u-2",
+                "project_key": SHARED_PROJECT_KEY,
+                "memory_type": "fact",
+            }
+        ],
     )
     vs = SqliteVectorStore(coll)
-    hits = await vs.query([0.1, 0.1, 0.1],
-                          _scope(user_id="u-1", include_private=False),
-                          memory_types=None, limit=10)
+    hits = await vs.query([0.1, 0.1, 0.1], _scope(user_id="u-1", include_private=False), memory_types=None, limit=10)
     assert {mid for mid, _ in hits} == {"v-shared"}
 
 
@@ -147,17 +162,23 @@ async def test_vector_pre_filter_does_not_drop_workspace_memory_by_project_key(d
     # memory from any project remains a vector candidate; the relational
     # post-fusion re-check applies the authoritative access predicate.
     from memforge.storage.adapters.sqlite.vector import SqliteVectorStore
+
     coll = _Coll()
     coll.upsert(
-        ids=["v-dangling"], embeddings=[[0.1, 0.1, 0.1]],
-        metadatas=[{"status": "active", "visibility": WORKSPACE,
-                    "owner_user_id": "", "project_key": "DANGLING-X",
-                    "memory_type": "fact"}],
+        ids=["v-dangling"],
+        embeddings=[[0.1, 0.1, 0.1]],
+        metadatas=[
+            {
+                "status": "active",
+                "visibility": WORKSPACE,
+                "owner_user_id": "",
+                "project_key": "DANGLING-X",
+                "memory_type": "fact",
+            }
+        ],
     )
     vs = SqliteVectorStore(coll)
-    hits = await vs.query([0.1, 0.1, 0.1],
-                          _scope(user_id="u-1", include_private=False),
-                          memory_types=None, limit=10)
+    hits = await vs.query([0.1, 0.1, 0.1], _scope(user_id="u-1", include_private=False), memory_types=None, limit=10)
     assert {mid for mid, _ in hits} == {"v-dangling"}
 
 
@@ -170,20 +191,33 @@ async def test_search_engine_team_search_excludes_private(db, monkeypatch):
 
     coll = _Coll()
     coll.upsert(
-        ids=["se-shared"], embeddings=[[0.1, 0.1, 0.1]],
-        metadatas=[{"status": "active", "visibility": WORKSPACE,
-                    "owner_user_id": "", "project_key": SHARED_PROJECT_KEY,
-                    "memory_type": "fact"}],
+        ids=["se-shared"],
+        embeddings=[[0.1, 0.1, 0.1]],
+        metadatas=[
+            {
+                "status": "active",
+                "visibility": WORKSPACE,
+                "owner_user_id": "",
+                "project_key": SHARED_PROJECT_KEY,
+                "memory_type": "fact",
+            }
+        ],
     )
     coll.upsert(
-        ids=["se-priv"], embeddings=[[0.1, 0.1, 0.1]],
-        metadatas=[{"status": "active", "visibility": PRIVATE,
-                    "owner_user_id": "u-2", "project_key": SHARED_PROJECT_KEY,
-                    "memory_type": "fact"}],
+        ids=["se-priv"],
+        embeddings=[[0.1, 0.1, 0.1]],
+        metadatas=[
+            {
+                "status": "active",
+                "visibility": PRIVATE,
+                "owner_user_id": "u-2",
+                "project_key": SHARED_PROJECT_KEY,
+                "memory_type": "fact",
+            }
+        ],
     )
     await db.insert_memory(_mem("se-shared", "team thing", visibility=WORKSPACE))
-    await db.insert_memory(_mem("se-priv", "private thing",
-                                 visibility=PRIVATE, owner="u-2"))
+    await db.insert_memory(_mem("se-priv", "private thing", visibility=PRIVATE, owner="u-2"))
     adapters = build_sqlite_adapters(db, coll)
     engine = SearchEngine(
         relational=adapters.relational,
@@ -220,29 +254,47 @@ async def test_agent_hook_uses_personalized_predicate(db, monkeypatch):
 
     coll = _Coll()
     coll.upsert(
-        ids=["h-shared"], embeddings=[[0.1, 0.1, 0.1]],
-        metadatas=[{"status": "active", "visibility": WORKSPACE,
-                    "owner_user_id": "", "project_key": SHARED_PROJECT_KEY,
-                    "memory_type": "fact"}],
+        ids=["h-shared"],
+        embeddings=[[0.1, 0.1, 0.1]],
+        metadatas=[
+            {
+                "status": "active",
+                "visibility": WORKSPACE,
+                "owner_user_id": "",
+                "project_key": SHARED_PROJECT_KEY,
+                "memory_type": "fact",
+            }
+        ],
     )
     coll.upsert(
-        ids=["h-u1-priv"], embeddings=[[0.1, 0.1, 0.1]],
-        metadatas=[{"status": "active", "visibility": PRIVATE,
-                    "owner_user_id": "u-1", "project_key": SHARED_PROJECT_KEY,
-                    "memory_type": "fact"}],
+        ids=["h-u1-priv"],
+        embeddings=[[0.1, 0.1, 0.1]],
+        metadatas=[
+            {
+                "status": "active",
+                "visibility": PRIVATE,
+                "owner_user_id": "u-1",
+                "project_key": SHARED_PROJECT_KEY,
+                "memory_type": "fact",
+            }
+        ],
     )
     coll.upsert(
-        ids=["h-u2-priv"], embeddings=[[0.1, 0.1, 0.1]],
-        metadatas=[{"status": "active", "visibility": PRIVATE,
-                    "owner_user_id": "u-2", "project_key": SHARED_PROJECT_KEY,
-                    "memory_type": "fact"}],
+        ids=["h-u2-priv"],
+        embeddings=[[0.1, 0.1, 0.1]],
+        metadatas=[
+            {
+                "status": "active",
+                "visibility": PRIVATE,
+                "owner_user_id": "u-2",
+                "project_key": SHARED_PROJECT_KEY,
+                "memory_type": "fact",
+            }
+        ],
     )
-    await db.insert_memory(_mem("h-shared", "deploy decision",
-                                 visibility=WORKSPACE))
-    await db.insert_memory(_mem("h-u1-priv", "deploy decision",
-                                 visibility=PRIVATE, owner="u-1"))
-    await db.insert_memory(_mem("h-u2-priv", "deploy decision",
-                                 visibility=PRIVATE, owner="u-2"))
+    await db.insert_memory(_mem("h-shared", "deploy decision", visibility=WORKSPACE))
+    await db.insert_memory(_mem("h-u1-priv", "deploy decision", visibility=PRIVATE, owner="u-1"))
+    await db.insert_memory(_mem("h-u2-priv", "deploy decision", visibility=PRIVATE, owner="u-2"))
 
     adapters = build_sqlite_adapters(db, coll)
     engine = SearchEngine(
@@ -255,13 +307,21 @@ async def test_agent_hook_uses_personalized_predicate(db, monkeypatch):
     engine._get_or_compute_embedding = lambda query: [0.1, 0.1, 0.1]
 
     request = AgentHookContextRequest(
-        client="codex", hook="UserPromptSubmit",
-        workspace="ws", repo=None, branch=None,
-        prompt="why this deploy decision", touched_files=[],
-        include_recent_changes=False, max_memories=10,
+        client="codex",
+        hook="UserPromptSubmit",
+        workspace="ws",
+        repo=None,
+        branch=None,
+        prompt="why this deploy decision",
+        touched_files=[],
+        include_recent_changes=False,
+        max_memories=10,
     )
     ctx = await build_agent_hook_context(
-        db, request, principal_user_id="u-1", search_engine=engine,
+        db,
+        request,
+        principal_user_id="u-1",
+        search_engine=engine,
     )
     ids = {row["id"] for row in ctx.get("memories", [])}
     assert "h-u2-priv" not in ids
@@ -283,12 +343,15 @@ async def test_agent_hook_recent_changes_excludes_other_users_private(db):
     )
 
     await db.insert_memory(_mem("rc-shared", "team change", visibility=WORKSPACE))
-    await db.insert_memory(_mem("rc-priv", "private change",
-                                 visibility=PRIVATE, owner="u-2"))
+    await db.insert_memory(_mem("rc-priv", "private change", visibility=PRIVATE, owner="u-2"))
     request = AgentHookContextRequest(
-        client="codex", hook="SessionStart",
-        workspace="ws", repo=None, branch=None,
-        include_recent_changes=True, max_memories=5,
+        client="codex",
+        hook="SessionStart",
+        workspace="ws",
+        repo=None,
+        branch=None,
+        include_recent_changes=True,
+        max_memories=5,
     )
     ctx = await build_agent_hook_context(db, request, principal_user_id="u-1")
     ids = {row["id"] for row in ctx.get("recent_changes", [])}

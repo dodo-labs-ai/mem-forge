@@ -1050,10 +1050,10 @@ async def render_agent_knowledge_patch_prompt(
     events: list[dict],
     transcript_markdown: str,
 ) -> str:
-    """Build the semantic patch prompt for one private agent-session window."""
+    """Build the semantic patch prompt for one managed agent-session window."""
 
     concepts = await db.list_agent_concepts(
-        owner_user_id=owner_user_id,
+        viewer_user_id=owner_user_id,
         repo_identifier=repo_identifier,
         limit=20,
     )

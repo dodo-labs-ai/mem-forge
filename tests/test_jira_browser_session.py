@@ -72,10 +72,12 @@ class FakeCookieStore:
 def test_jira_browser_session_uses_origin_scoped_headless_profile(tmp_path: Path):
     from memforge.auth.jira_browser_session import JiraBrowserCaptureStatus, JiraBrowserSession
 
-    context = FakeContext([
-        {"name": "JSESSIONID", "value": "silent", "expires": -1},
-        {"name": "atlassian.xsrf.token", "value": "xsrf", "expires": -1},
-    ])
+    context = FakeContext(
+        [
+            {"name": "JSESSIONID", "value": "silent", "expires": -1},
+            {"name": "atlassian.xsrf.token", "value": "xsrf", "expires": -1},
+        ]
+    )
     launcher = FakeLauncher(context)
     cookie_store = FakeCookieStore()
     session = JiraBrowserSession(profile_root=tmp_path, browser_launcher=launcher, cookie_store=cookie_store)
@@ -97,10 +99,12 @@ def test_jira_browser_session_uses_origin_scoped_headless_profile(tmp_path: Path
     assert context.cookie_urls == [["https://jira.example.test/rest/api/2/myself"]]
     assert context.validation_urls == ["https://jira.example.test/rest/api/2/myself"]
     assert context.closed is True
-    assert cookie_store.saved == [(
-        "https://jira.example.test",
-        "JSESSIONID=silent; atlassian.xsrf.token=xsrf",
-    )]
+    assert cookie_store.saved == [
+        (
+            "https://jira.example.test",
+            "JSESSIONID=silent; atlassian.xsrf.token=xsrf",
+        )
+    ]
 
 
 def test_jira_browser_session_requests_interaction_when_silent_profile_has_no_session(tmp_path: Path):
@@ -162,18 +166,22 @@ def test_jira_browser_session_stores_validated_system_cookies_in_keychain_bounda
     )
 
     assert launcher.calls == []
-    assert cookie_store.saved == [(
-        "https://jira.example.test",
-        "JSESSIONID=valid; atlassian.xsrf.token=xsrf",
-    )]
+    assert cookie_store.saved == [
+        (
+            "https://jira.example.test",
+            "JSESSIONID=valid; atlassian.xsrf.token=xsrf",
+        )
+    ]
 
 
 def test_jira_browser_session_injects_keychain_cookie_into_headless_context(tmp_path: Path):
     from memforge.auth.jira_browser_session import JiraBrowserSession
 
-    context = FakeContext([
-        {"name": "JSESSIONID", "value": "stored", "expires": -1},
-    ])
+    context = FakeContext(
+        [
+            {"name": "JSESSIONID", "value": "stored", "expires": -1},
+        ]
+    )
     session = JiraBrowserSession(
         profile_root=tmp_path,
         browser_launcher=FakeLauncher(context),

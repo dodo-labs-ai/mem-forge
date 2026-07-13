@@ -9,6 +9,7 @@ import type {
   LocalAgentJobStatusResponse,
   ProjectBinding,
   Source,
+  SourceAccessPolicy,
   TeamsAuthStatus,
   TeamsBrowseData,
   TeamsChannel,
@@ -22,6 +23,11 @@ import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
 import { SourceSetupShell } from "./SourceSetupShell";
 import type { SourceSetupSection, SourceSetupSectionId } from "./SourceSetupShell";
+import {
+  SourceAccessSelection,
+  SourceAccessSummary,
+} from "./SourceAccessSection";
+import { sourceAccessSummary } from "./sourceAccess";
 import {
   buildDefaultTeamsSourceConfig,
   buildTeamsSourcePayload,
@@ -42,18 +48,23 @@ export function TeamsSourceSetup({
   onOpenChange,
   onSaved,
   initialFocus,
+  onRequestAccessChange,
 }: {
   source?: Source | null;
   schema: GeneConfigSchema;
   onOpenChange: (open: boolean) => void;
   onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" };
+  onRequestAccessChange?: (source: Source) => void;
 }) {
   const queryClient = useQueryClient();
   const isEdit = Boolean(source);
   const initial = useMemo(() => source ? editableTeamsSourceState(source) : null, [source]);
   const [config, setConfig] = useState<TeamsSourceConfig>(
     () => initial?.config ?? buildDefaultTeamsSourceConfig(),
+  );
+  const [accessPolicy, setAccessPolicy] = useState<SourceAccessPolicy | null>(
+    () => source?.access_policy ?? null,
   );
   const [selections, setSelections] = useState<Map<string, TeamsSelectionItem>>(
     () => new Map((initial?.conversationIds ?? []).map((id) => [id, existingTeamsSelection(id)])),
@@ -134,6 +145,7 @@ export function TeamsSourceSetup({
         : buildTeamsSourcePayload({ selections: selected, config });
       const payload = {
         ...sourcePayload,
+        ...(!source ? { access_policy: accessPolicy } : {}),
         project_binding: binding,
         sync_schedule: {
           enabled: scheduleEnabled,
@@ -163,6 +175,11 @@ export function TeamsSourceSetup({
     if (selections.size === 0) {
       setValidationMessage("Select at least one Teams conversation.");
       setFocusSection("content");
+      return;
+    }
+    if (!isEdit && accessPolicy === null) {
+      setValidationMessage("Choose who can use this source before saving.");
+      setFocusSection("access");
       return;
     }
     if (!projectBindingIsComplete(binding)) {
@@ -322,6 +339,41 @@ export function TeamsSourceSetup({
       ),
     },
     {
+      id: "access",
+      title: "Who can use this source?",
+      summary: sourceAccessSummary(accessPolicy),
+      state: accessPolicy === null ? "incomplete" : "complete",
+      content: source ? (
+        <div className="space-y-3">
+          <SourceAccessSummary policy={source.access_policy} />
+          {source.capabilities?.can_change_access
+            && source.access_state === "active"
+            && onRequestAccessChange && (
+            <div className="flex justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  onOpenChange(false);
+                  onRequestAccessChange(source);
+                }}
+              >
+                Change access
+              </Button>
+            </div>
+          )}
+        </div>
+      ) : (
+        <SourceAccessSelection
+          value={accessPolicy}
+          onChange={(next) => {
+            setValidationMessage(null);
+            setAccessPolicy(next);
+          }}
+        />
+      ),
+    },
+    {
       id: "project",
       title: "Save memories to",
       summary: binding ? binding.mode === "fixed" ? binding.project_key || "Choose a project" : "Mapped by conversation" : "Unmapped",
@@ -365,6 +417,7 @@ export function TeamsSourceSetup({
       error={saveSource.isError ? errorMessage(saveSource.error) : null}
       validationMessage={validationMessage}
       saving={saveSource.isPending}
+      saveDisabled={!isEdit && accessPolicy === null}
       onCancel={() => onOpenChange(false)}
       onSave={handleSave}
     />

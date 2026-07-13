@@ -6,8 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from memforge.agent_sessions import submit_agent_session_document
-from memforge.agent_sessions import submit_agent_hook_receipt
+from memforge.agent_sessions import (
+    agent_session_source_id,
+    ensure_agent_session_source,
+    submit_agent_hook_receipt,
+    submit_agent_session_document,
+)
 from memforge.config import AppConfig
 from memforge.genes import GENE_REGISTRY, create_gene
 from memforge.genes.agent_session_gene import AgentSessionGene
@@ -30,12 +34,72 @@ async def db(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_agent_session_sources_are_private_and_partitioned_by_owner(
+    db: Database,
+    tmp_path: Path,
+):
+    cfg = _config(tmp_path)
+
+    alice = await ensure_agent_session_source(
+        db,
+        cfg,
+        client="codex",
+        owner_user_id="alice",
+    )
+    bob = await ensure_agent_session_source(
+        db,
+        cfg,
+        client="codex",
+        owner_user_id="bob",
+    )
+
+    assert alice["id"] != bob["id"]
+    assert alice["owner_user_id"] == "alice"
+    assert bob["owner_user_id"] == "bob"
+    assert alice["access_policy"] == bob["access_policy"] == "private"
+    assert alice["config"]["documents_dir"] != bob["config"]["documents_dir"]
+    assert Path(alice["config"]["documents_dir"]).name == alice["id"]
+    assert Path(bob["config"]["documents_dir"]).name == bob["id"]
+
+
+@pytest.mark.asyncio
+async def test_same_agent_window_for_two_users_has_distinct_document_identity(
+    db: Database,
+    tmp_path: Path,
+):
+    cfg = _config(tmp_path)
+    payload = {
+        "db": db,
+        "config": cfg,
+        "client": "codex",
+        "session_id": "same-session",
+        "trigger": "Stop",
+        "document_markdown": "## Outcome\nA user-owned durable finding.",
+        "workspace": "/workspace/repo",
+    }
+
+    alice = await submit_agent_session_document(**payload, user_id="alice")
+    bob = await submit_agent_session_document(**payload, user_id="bob")
+
+    assert alice["doc_id"] != bob["doc_id"]
+    assert alice["source_id"] == agent_session_source_id("codex", "alice")
+    assert bob["source_id"] == agent_session_source_id("codex", "bob")
+    assert Path(alice["document_uri"]).is_relative_to(
+        Path((await db.get_source(alice["source_id"]))["config"]["documents_dir"])
+    )
+    assert Path(bob["document_uri"]).is_relative_to(
+        Path((await db.get_source(bob["source_id"]))["config"]["documents_dir"])
+    )
+
+
+@pytest.mark.asyncio
 async def test_submit_agent_session_document_records_receipt_and_source_package(db: Database, tmp_path: Path):
     cfg = _config(tmp_path)
 
     result = await submit_agent_session_document(
         db=db,
         config=cfg,
+        user_id="user-owner",
         client="codex",
         session_id="sess-123",
         trigger="Stop",
@@ -50,7 +114,7 @@ async def test_submit_agent_session_document_records_receipt_and_source_package(
         submitted_at="2026-05-21T11:30:00+00:00",
     )
 
-    source = await db.get_source("src-agent-sessions-codex")
+    source = await db.get_source(agent_session_source_id("codex", "user-owner"))
     receipt = await db.get_agent_session_receipt(result["doc_id"])
     package = json.loads(Path(result["document_uri"]).read_text(encoding="utf-8"))
 
@@ -83,6 +147,7 @@ async def test_submit_agent_session_document_records_explicit_source_updated_at(
     result = await submit_agent_session_document(
         db=db,
         config=cfg,
+        user_id="user-owner",
         client="codex",
         session_id="sess-observed-at",
         trigger="Stop",
@@ -108,6 +173,7 @@ async def test_agent_session_gene_discovers_and_normalizes_submitted_documents(d
     submitted = await submit_agent_session_document(
         db=db,
         config=cfg,
+        user_id="user-owner",
         client="claude-code",
         session_id="sess-456",
         trigger="PreCompact",
@@ -120,7 +186,7 @@ async def test_agent_session_gene_discovers_and_normalizes_submitted_documents(d
         history_window_start="2026-05-21T12:00:00+00:00",
         history_window_end="2026-05-21T12:30:00+00:00",
     )
-    source = await db.get_source("src-agent-sessions-claude-code")
+    source = await db.get_source(agent_session_source_id("claude-code", "user-owner"))
     gene = AgentSessionGene(config=source["config"], source_id=source["id"])
 
     items = [item async for item in gene.discover()]
@@ -149,6 +215,7 @@ async def test_agent_session_gene_normalize_exposes_explicit_source_updated_at(d
     submitted = await submit_agent_session_document(
         db=db,
         config=cfg,
+        user_id="user-owner",
         client="codex",
         session_id="sess-source-updated",
         trigger="Stop",
@@ -157,7 +224,7 @@ async def test_agent_session_gene_normalize_exposes_explicit_source_updated_at(d
         submitted_at="2026-06-23T22:00:00+00:00",
         source_updated_at="2026-06-20T04:23:51Z",
     )
-    source = await db.get_source("src-agent-sessions-codex")
+    source = await db.get_source(agent_session_source_id("codex", "user-owner"))
     gene = AgentSessionGene(config=source["config"], source_id=source["id"])
     [item] = [item async for item in gene.discover()]
 
@@ -176,6 +243,7 @@ async def test_agent_session_gene_ignores_receipt_metadata_source_updated_at(
     submitted = await submit_agent_session_document(
         db=db,
         config=cfg,
+        user_id="user-owner",
         client="codex",
         session_id="sess-stale-metadata-source-updated",
         trigger="Stop",
@@ -184,7 +252,7 @@ async def test_agent_session_gene_ignores_receipt_metadata_source_updated_at(
         submitted_at="2026-06-23T22:00:00+00:00",
         metadata={"source_updated_at": "2026-06-20T04:23:51Z"},
     )
-    source = await db.get_source("src-agent-sessions-codex")
+    source = await db.get_source(agent_session_source_id("codex", "user-owner"))
     receipt = await db.get_agent_session_receipt(submitted["doc_id"])
     gene = AgentSessionGene(config=source["config"], source_id=source["id"])
     [item] = [item async for item in gene.discover()]
@@ -202,6 +270,7 @@ async def test_agent_session_gene_incremental_discovery_uses_submitted_timestamp
     await submit_agent_session_document(
         db=db,
         config=cfg,
+        user_id="user-owner",
         client="codex",
         session_id="sess-789",
         trigger="Stop",
@@ -210,7 +279,7 @@ async def test_agent_session_gene_incremental_discovery_uses_submitted_timestamp
         history_window_kind="session",
         submitted_at="2026-05-21T09:00:00+00:00",
     )
-    source = await db.get_source("src-agent-sessions-codex")
+    source = await db.get_source(agent_session_source_id("codex", "user-owner"))
     gene = create_gene("agent_session", source["config"], source["id"])
 
     items = [
@@ -241,6 +310,7 @@ async def test_agent_session_gene_ignores_hook_receipts(db: Database, tmp_path: 
     await submit_agent_session_document(
         db=db,
         config=cfg,
+        user_id="user-owner",
         client="codex",
         session_id="sess-summary",
         trigger="TaskComplete",
@@ -248,7 +318,7 @@ async def test_agent_session_gene_ignores_hook_receipts(db: Database, tmp_path: 
         workspace="/workspace/mem-forge",
         repo="mem-forge",
     )
-    source = await db.get_source("src-agent-sessions-codex")
+    source = await db.get_source(agent_session_source_id("codex", "user-owner"))
     gene = create_gene("agent_session", source["config"], source["id"])
 
     items = [item async for item in gene.discover()]
@@ -299,6 +369,7 @@ async def test_agent_session_gene_skips_legacy_hook_capture_packages(db: Databas
     submitted = await submit_agent_session_document(
         db=db,
         config=cfg,
+        user_id="user-owner",
         client="codex",
         session_id="sess-valid-stop-summary",
         trigger="Stop",
@@ -306,7 +377,7 @@ async def test_agent_session_gene_skips_legacy_hook_capture_packages(db: Databas
         workspace="/workspace/mem-forge",
         repo="mem-forge",
     )
-    source = await db.get_source("src-agent-sessions-codex")
+    source = await db.get_source(agent_session_source_id("codex", "user-owner"))
     documents_dir = Path(source["config"]["documents_dir"])
     legacy_package = {
         "doc_id": "agent-session-codex-legacy-stop-hook-capture",
@@ -345,6 +416,7 @@ async def test_agent_session_gene_omits_receipt_metadata_from_normalized_markdow
     submitted = await submit_agent_session_document(
         db=db,
         config=cfg,
+        user_id="user-owner",
         client="codex",
         session_id="sess-pathsafe",
         trigger="TaskComplete",
@@ -357,7 +429,7 @@ async def test_agent_session_gene_omits_receipt_metadata_from_normalized_markdow
             "turn_id": "turn-1",
         },
     )
-    source = await db.get_source("src-agent-sessions-codex")
+    source = await db.get_source(agent_session_source_id("codex", "user-owner"))
     gene = create_gene("agent_session", source["config"], source["id"])
     items = [item async for item in gene.discover()]
     item = next(item for item in items if item.item_id == submitted["doc_id"])
@@ -381,6 +453,7 @@ async def test_agent_session_gene_keeps_operational_sections_out_of_extraction_m
     submitted = await submit_agent_session_document(
         db=db,
         config=cfg,
+        user_id="user-owner",
         client="codex",
         session_id="sess-quality",
         trigger="TaskComplete",
@@ -401,7 +474,7 @@ async def test_agent_session_gene_keeps_operational_sections_out_of_extraction_m
         workspace="/workspace/mem-forge",
         repo="mem-forge",
     )
-    source = await db.get_source("src-agent-sessions-codex")
+    source = await db.get_source(agent_session_source_id("codex", "user-owner"))
     gene = create_gene("agent_session", source["config"], source["id"])
     items = [item async for item in gene.discover()]
     item = next(item for item in items if item.item_id == submitted["doc_id"])

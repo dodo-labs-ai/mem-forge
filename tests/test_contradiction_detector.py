@@ -257,9 +257,15 @@ class TestGetCrossDocCandidates:
         await _insert_document(db, "doc-current", source="src-current")
         await _insert_document(db, "doc-enabled", source="src-enabled")
         await _insert_document(db, "doc-disabled", source="src-disabled")
-        await db.upsert_source("src-current", "confluence", "Current", "{}")
-        await db.upsert_source("src-enabled", "confluence", "Enabled", "{}")
-        await db.upsert_source("src-disabled", "confluence", "Disabled", "{}")
+        await db.upsert_source(
+            "src-current", "confluence", "Current", "{}", access_policy="workspace", owner_user_id="dev"
+        )
+        await db.upsert_source(
+            "src-enabled", "confluence", "Enabled", "{}", access_policy="workspace", owner_user_id="dev"
+        )
+        await db.upsert_source(
+            "src-disabled", "confluence", "Disabled", "{}", access_policy="workspace", owner_user_id="dev"
+        )
         await db.set_source_subscription("src-disabled", "alice@example.com", enabled=False)
         entity_id = await db.upsert_entity("payroll", display_name="Payroll", tags=["domain"])
 
@@ -886,9 +892,7 @@ class TestDetectCrossDocContradictions:
         )
 
         mock_client = AsyncMock()
-        mock_client.detect_contradictions = AsyncMock(
-            return_value=_mock_contradiction_response([])
-        )
+        mock_client.detect_contradictions = AsyncMock(return_value=_mock_contradiction_response([]))
 
         stats = await detect_cross_doc_contradictions(
             new_memory_ids=[mem_b.id],
@@ -959,9 +963,7 @@ class TestDetectCrossDocContradictions:
         )
 
         mock_client = AsyncMock()
-        mock_client.detect_contradictions = AsyncMock(
-            return_value=_mock_contradiction_response([])
-        )
+        mock_client.detect_contradictions = AsyncMock(return_value=_mock_contradiction_response([]))
 
         stats = await detect_cross_doc_contradictions(
             new_memory_ids=[mem_b.id, skipped.id],

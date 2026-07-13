@@ -47,11 +47,16 @@ async def engine_fixture(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_build_memory_stamps_workspace_visibility(engine_fixture):
+async def test_build_memory_stamps_resolved_source_access(engine_fixture):
     from memforge.models import Visibility
 
     raw = RawMemory(memory_type="fact", content="x", entity_refs=[], tags=[], confidence=0.8)
-    memory = engine_fixture._build_memory(raw, project_key="ACME", source_type="confluence")
+    memory = engine_fixture._build_memory(
+        raw,
+        project_key="ACME",
+        visibility=Visibility.WORKSPACE.value,
+        owner_user_id=None,
+    )
     assert memory.visibility == Visibility.WORKSPACE.value
     assert memory.owner_user_id is None
     assert memory.project_key == "ACME"

@@ -116,13 +116,15 @@ class RateLimitedThenSuccessClient:
         self.calls.append(url)
         if len(self.calls) == 1:
             return JsonResponse({}, status_code=429, headers={"Retry-After": "1"})
-        return JsonResponse({
-            "id": "123",
-            "title": "Root Page",
-            "space": {"key": "PAY"},
-            "version": {"number": 7, "when": "2026-05-24T00:00:00Z"},
-            "_links": {"webui": "/display/PAY/Root+Page"},
-        })
+        return JsonResponse(
+            {
+                "id": "123",
+                "title": "Root Page",
+                "space": {"key": "PAY"},
+                "version": {"number": 7, "when": "2026-05-24T00:00:00Z"},
+                "_links": {"webui": "/display/PAY/Root+Page"},
+            }
+        )
 
     async def get(self, url: str, **kwargs):
         return await self.request("GET", url, **kwargs)
@@ -149,13 +151,9 @@ class PageTreeClient:
         if url.endswith("/content/root"):
             return JsonResponse(_page("root", "Root", "2026-05-20T00:00:00Z"))
         if url.endswith("/content/root/child/page"):
-            return JsonResponse({
-                "results": [_page("parent", "Unchanged Parent", "2026-05-20T00:00:00Z")]
-            })
+            return JsonResponse({"results": [_page("parent", "Unchanged Parent", "2026-05-20T00:00:00Z")]})
         if url.endswith("/content/parent/child/page"):
-            return JsonResponse({
-                "results": [_page("target", "Changed Child", "2026-05-26T14:51:21Z")]
-            })
+            return JsonResponse({"results": [_page("target", "Changed Child", "2026-05-26T14:51:21Z")]})
         if url.endswith("/content/target/child/page"):
             return JsonResponse({"results": []})
         return JsonResponse({"results": []})
@@ -173,13 +171,15 @@ class PreviewLimitClient:
         if url.endswith("/content/root"):
             return JsonResponse(_page("root", "Root", "2026-05-20T00:00:00Z"))
         if url.endswith("/content/root/child/page"):
-            return JsonResponse({
-                "results": [
-                    _page("child-1", "Child 1", "2026-05-21T00:00:00Z"),
-                    _page("child-2", "Child 2", "2026-05-22T00:00:00Z"),
-                    _page("child-3", "Child 3", "2026-05-23T00:00:00Z"),
-                ],
-            })
+            return JsonResponse(
+                {
+                    "results": [
+                        _page("child-1", "Child 1", "2026-05-21T00:00:00Z"),
+                        _page("child-2", "Child 2", "2026-05-22T00:00:00Z"),
+                        _page("child-3", "Child 3", "2026-05-23T00:00:00Z"),
+                    ],
+                }
+            )
         return JsonResponse({"results": []})
 
     async def get(self, url: str, **kwargs):
@@ -439,9 +439,5 @@ async def test_page_tree_preview_limits_child_page_request_size():
     items = [item async for item in gene.discover(since=None)]
 
     assert [item.title for item in items] == ["Root", "Child 1", "Child 2"]
-    child_requests = [
-        params
-        for url, params in client.requests
-        if url.endswith("/content/root/child/page")
-    ]
+    child_requests = [params for url, params in client.requests if url.endswith("/content/root/child/page")]
     assert child_requests == [{"start": 0, "limit": 2, "expand": "version,metadata.labels"}]

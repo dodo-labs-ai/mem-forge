@@ -18,17 +18,19 @@ def test_local_agent_runner_exposes_only_server_job_execution(tmp_path):
     runner = LocalAgentRunner(
         state_store=LocalAgentStateStore(tmp_path / "state.json"),
         cloud_job_handler=lambda job: handled.append(job["job_id"]) or {"ok": True},
-        cloud_jobs_provider=lambda wait_seconds=0: lease_calls.append(wait_seconds)
-        or {
-            "jobs": [
-                {
-                    "job_id": "laj-1",
-                    "attempt_count": 1,
-                    "operation": "teams_sync",
-                    "source_id": "src-teams",
-                }
-            ]
-        },
+        cloud_jobs_provider=lambda wait_seconds=0: (
+            lease_calls.append(wait_seconds)
+            or {
+                "jobs": [
+                    {
+                        "job_id": "laj-1",
+                        "attempt_count": 1,
+                        "operation": "teams_sync",
+                        "source_id": "src-teams",
+                    }
+                ]
+            }
+        ),
         cloud_job_completer=lambda *args: {},
     )
 

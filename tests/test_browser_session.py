@@ -20,10 +20,16 @@ class _FakeService:
     async def cookie_header_for_sync(self, base_url, *, tls_config=None):
         return "DEMO-COOKIE=abc"
 
-    async def store_uploaded_session(self, *, base_url, cookie_header, browser=None,
-                                     tls_config=None, confirm_principal_change=False):
-        return {"provider": "demo", "origin": base_url, "status": "active",
-                "cookie_header": cookie_header, "browser": browser}
+    async def store_uploaded_session(
+        self, *, base_url, cookie_header, browser=None, tls_config=None, confirm_principal_change=False
+    ):
+        return {
+            "provider": "demo",
+            "origin": base_url,
+            "status": "active",
+            "cookie_header": cookie_header,
+            "browser": browser,
+        }
 
 
 def _demo_provider() -> bs.BrowserSessionProvider:
@@ -55,15 +61,31 @@ def test_list_origins_merges_sessions_and_sources(tmp_path):
     bs.register_provider(_demo_provider())
     db = _db(tmp_path)
     try:
-        asyncio.run(db.upsert_auth_session(
-            provider="demo", origin="https://demo.one", secret_encrypted="SECRET",
-            principal_id="u1", principal_name="Alice", principal_email=None, browser="Chrome",
-            status="active", captured_at="t", validated_at="t", last_error=None,
-        ))
-        asyncio.run(db.upsert_source(
-            id="src-demo1", type="demo", name="Demo Two",
-            config_json=json.dumps({"base_url": "https://demo.two/"}),
-        ))
+        asyncio.run(
+            db.upsert_auth_session(
+                provider="demo",
+                origin="https://demo.one",
+                secret_encrypted="SECRET",
+                principal_id="u1",
+                principal_name="Alice",
+                principal_email=None,
+                browser="Chrome",
+                status="active",
+                captured_at="t",
+                validated_at="t",
+                last_error=None,
+            )
+        )
+        asyncio.run(
+            db.upsert_source(
+                id="src-demo1",
+                type="demo",
+                name="Demo Two",
+                config_json=json.dumps({"base_url": "https://demo.two/"}),
+                access_policy="workspace",
+                owner_user_id="dev",
+            )
+        )
         origins = {o["origin"]: o for o in asyncio.run(bs.list_origins(db, "demo"))}
     finally:
         asyncio.run(db.close())
@@ -77,11 +99,21 @@ def test_forget_deletes(tmp_path):
     bs.register_provider(_demo_provider())
     db = _db(tmp_path)
     try:
-        asyncio.run(db.upsert_auth_session(
-            provider="demo", origin="https://demo.one", secret_encrypted="SECRET",
-            principal_id=None, principal_name=None, principal_email=None, browser=None,
-            status="active", captured_at="t", validated_at="t", last_error=None,
-        ))
+        asyncio.run(
+            db.upsert_auth_session(
+                provider="demo",
+                origin="https://demo.one",
+                secret_encrypted="SECRET",
+                principal_id=None,
+                principal_name=None,
+                principal_email=None,
+                browser=None,
+                status="active",
+                captured_at="t",
+                validated_at="t",
+                last_error=None,
+            )
+        )
         result = asyncio.run(bs.forget(db, "demo", "https://demo.one/"))
         remaining = asyncio.run(db.list_auth_sessions("demo"))
     finally:
@@ -112,9 +144,15 @@ def test_store_uploaded_dispatches_to_service(tmp_path):
     bs.register_provider(_demo_provider())
     db = _db(tmp_path)
     try:
-        result = asyncio.run(bs.store_uploaded(
-            db, "demo", base_url="https://demo.one", cookie_header="SESSION=x", browser="Chrome",
-        ))
+        result = asyncio.run(
+            bs.store_uploaded(
+                db,
+                "demo",
+                base_url="https://demo.one",
+                cookie_header="SESSION=x",
+                browser="Chrome",
+            )
+        )
     finally:
         asyncio.run(db.close())
     assert result["status"] == "active"

@@ -19,13 +19,10 @@ class RepairableCollection:
     def __init__(self, records: dict[str, dict[str, Any]] | None = None) -> None:
         self.records = records or {}
         self.embeddings: dict[str, list[float]] = {
-            record_id: record.get("embedding", [0.1, 0.2, 0.3])
-            for record_id, record in self.records.items()
+            record_id: record.get("embedding", [0.1, 0.2, 0.3]) for record_id, record in self.records.items()
         }
         self.documents: dict[str, str] = {
-            record_id: record.get("document", "")
-            for record_id, record in self.records.items()
-            if "document" in record
+            record_id: record.get("document", "") for record_id, record in self.records.items() if "document" in record
         }
         self.deleted: list[str] = []
 
@@ -127,23 +124,29 @@ async def test_repair_restores_memory_and_document_index_consistency(db: Databas
     )
     await db.db.commit()
     await _insert_doc(db, "doc-current", tmp_path, content="Document body")
-    await db.upsert_metadata(DocumentMetadata(
-        doc_id="doc-current",
-        summary="Current document summary",
-        tags=["current"],
-        entities=[],
-        doc_type="requirement",
-        complexity="medium",
-        enriched_at=datetime.now(timezone.utc),
-    ))
+    await db.upsert_metadata(
+        DocumentMetadata(
+            doc_id="doc-current",
+            summary="Current document summary",
+            tags=["current"],
+            entities=[],
+            doc_type="requirement",
+            complexity="medium",
+            enriched_at=datetime.now(timezone.utc),
+        )
+    )
 
-    memory_collection = RepairableCollection({
-        active.id: {"status": "active", "embedding": [0.1, 0.2, 0.3]},
-        retired.id: {"status": "active", "embedding": [0.4, 0.5, 0.6]},
-    })
-    document_collection = RepairableCollection({
-        "doc-current": {"embedding": [0.7, 0.8, 0.9], "document": "Document body"},
-    })
+    memory_collection = RepairableCollection(
+        {
+            active.id: {"status": "active", "embedding": [0.1, 0.2, 0.3]},
+            retired.id: {"status": "active", "embedding": [0.4, 0.5, 0.6]},
+        }
+    )
+    document_collection = RepairableCollection(
+        {
+            "doc-current": {"embedding": [0.7, 0.8, 0.9], "document": "Document body"},
+        }
+    )
     expected_memory_vector = [0.9, 0.8, 0.7]
     expected_document_vector = [0.6, 0.5, 0.4]
 
@@ -190,15 +193,17 @@ async def test_repair_restores_memory_and_document_index_consistency(db: Databas
 @pytest.mark.asyncio
 async def test_repair_recreates_document_vector_from_metadata_embedding_text(db: Database, tmp_path: Path):
     await _insert_doc(db, "doc-missing", tmp_path, content="Large document body that should not be embedded")
-    await db.upsert_metadata(DocumentMetadata(
-        doc_id="doc-missing",
-        summary="Short semantic summary",
-        tags=["payroll"],
-        entities=[],
-        doc_type="requirement",
-        complexity="medium",
-        enriched_at=datetime.now(timezone.utc),
-    ))
+    await db.upsert_metadata(
+        DocumentMetadata(
+            doc_id="doc-missing",
+            summary="Short semantic summary",
+            tags=["payroll"],
+            entities=[],
+            doc_type="requirement",
+            complexity="medium",
+            enriched_at=datetime.now(timezone.utc),
+        )
+    )
     document_collection = RepairableCollection({})
     captured: dict[str, str] = {}
     repairer = MemoryIndexRepairer(
@@ -244,15 +249,17 @@ async def test_repair_stamps_vector_hash_from_persisted_float32_payload(db: Data
     # Repairing a document vector must leave embedding_vector_hash describing the
     # vector the collection actually persisted (float32), not the pre-upsert list.
     await _insert_doc(db, "doc-f32", tmp_path, content="body")
-    await db.upsert_metadata(DocumentMetadata(
-        doc_id="doc-f32",
-        summary="Short semantic summary",
-        tags=["payroll"],
-        entities=[],
-        doc_type="requirement",
-        complexity="medium",
-        enriched_at=datetime.now(timezone.utc),
-    ))
+    await db.upsert_metadata(
+        DocumentMetadata(
+            doc_id="doc-f32",
+            summary="Short semantic summary",
+            tags=["payroll"],
+            entities=[],
+            doc_type="requirement",
+            complexity="medium",
+            enriched_at=datetime.now(timezone.utc),
+        )
+    )
     document_collection = Float32Collection({})
     repairer = MemoryIndexRepairer(
         db=db,
@@ -274,7 +281,6 @@ async def test_repair_stamps_vector_hash_from_persisted_float32_payload(db: Data
         document_collection=document_collection,
     ).check()
     vector_hash_mismatches = [
-        issue for issue in report.issues
-        if issue.kind == "document_chroma_embedding_vector_hash_mismatch"
+        issue for issue in report.issues if issue.kind == "document_chroma_embedding_vector_hash_mismatch"
     ]
     assert vector_hash_mismatches == []

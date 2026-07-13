@@ -12,6 +12,7 @@ import type {
   LocalAgentJobStatusResponse,
   ProjectBinding,
   Source,
+  SourceAccessPolicy,
 } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import {
@@ -40,6 +41,11 @@ import { projectBindingIsComplete } from "./projectBinding";
 import { SourceSetupShell } from "./SourceSetupShell";
 import type { SourceSetupSection, SourceSetupSectionId } from "./SourceSetupShell";
 import {
+  SourceAccessSelection,
+  SourceAccessSummary,
+} from "./SourceAccessSection";
+import { sourceAccessSummary } from "./sourceAccess";
+import {
   booleanValue,
   buildDefaultConfig,
   firstMissingRequiredField,
@@ -65,6 +71,7 @@ export function SchemaSourceSetup({
   source,
   onSaved,
   initialFocus,
+  onRequestAccessChange,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -72,6 +79,7 @@ export function SchemaSourceSetup({
   source?: Source | null;
   onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" };
+  onRequestAccessChange?: (source: Source) => void;
 }) {
   // Backend authority: an existing source the viewer cannot configure should
   // not open the form. Type-level managed sources (agent_session) are also
@@ -126,6 +134,7 @@ export function SchemaSourceSetup({
             onSaved={onSaved}
             initialFocus={initialFocus}
             canConfigureConnection={canConfigureConnection}
+            onRequestAccessChange={onRequestAccessChange}
           />
         )}
       </DialogContent>
@@ -141,6 +150,7 @@ function SourceConfigForm({
   onSaved,
   initialFocus,
   canConfigureConnection,
+  onRequestAccessChange,
 }: {
   sourceType: string;
   source?: Source | null;
@@ -149,11 +159,15 @@ function SourceConfigForm({
   onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" };
   canConfigureConnection: boolean;
+  onRequestAccessChange?: (source: Source) => void;
 }) {
   const queryClient = useQueryClient();
   const isEdit = Boolean(source);
   const adapter = sourceSetupAdapterFor(sourceType);
   const [name, setName] = useState(source?.name ?? "");
+  const [accessPolicy, setAccessPolicy] = useState<SourceAccessPolicy | null>(
+    () => source?.access_policy ?? null,
+  );
   const [config, setConfig] = useState<ConfigForm>(() => ({
     ...buildDefaultConfig(schema),
     ...adapter.normalizeInitialConfig((source?.config ?? {}) as ConfigForm),
@@ -214,6 +228,7 @@ function SourceConfigForm({
       }
       const response = await resourceClient.post("/sources", {
         type: sourceType,
+        access_policy: accessPolicy,
         ...payloadWithSchedule,
       });
       return { id: String(response.data.id) };
@@ -332,6 +347,11 @@ function SourceConfigForm({
       setValidationMessage(`Complete ${firstMissingField.label} before saving.`);
       const section = adapter.sectionForField(firstMissingField, config);
       setFocusSection(section === "connection" ? "connection" : "content");
+      return;
+    }
+    if (!isEdit && accessPolicy === null) {
+      setValidationMessage("Choose who can use this source before saving.");
+      setFocusSection("access");
       return;
     }
     if (!projectBindingIsComplete(binding)) {
@@ -482,6 +502,41 @@ function SourceConfigForm({
       content: contentBody,
     },
     {
+      id: "access",
+      title: "Who can use this source?",
+      summary: sourceAccessSummary(accessPolicy),
+      state: accessPolicy === null ? "incomplete" : "complete",
+      content: source ? (
+        <div className="space-y-3">
+          <SourceAccessSummary policy={source.access_policy} />
+          {source.capabilities?.can_change_access
+            && source.access_state === "active"
+            && onRequestAccessChange && (
+            <div className="flex justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  onOpenChange(false);
+                  onRequestAccessChange(source);
+                }}
+              >
+                Change access
+              </Button>
+            </div>
+          )}
+        </div>
+      ) : (
+        <SourceAccessSelection
+          value={accessPolicy}
+          onChange={(next) => {
+            setValidationMessage(null);
+            setAccessPolicy(next);
+          }}
+        />
+      ),
+    },
+    {
       id: "project",
       title: "Save memories to",
       summary: projectBindingSummary(binding),
@@ -560,6 +615,7 @@ function SourceConfigForm({
       error={saveSource.isError ? extractSaveError(saveSource.error) : null}
       validationMessage={validationMessage}
       saving={saveSource.isPending}
+      saveDisabled={!isEdit && accessPolicy === null}
       onCancel={() => onOpenChange(false)}
       onSave={handleSave}
     />

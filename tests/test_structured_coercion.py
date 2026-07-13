@@ -24,11 +24,7 @@ def test_native_array_is_unchanged():
 
 
 def test_nested_stringified_list_field_is_decoded():
-    payload = {
-        "memories": [
-            {"content": "x", "memory_type": "fact", "entity_refs": '["pay-api", "postgresql"]'}
-        ]
-    }
+    payload = {"memories": [{"content": "x", "memory_type": "fact", "entity_refs": '["pay-api", "postgresql"]'}]}
     parsed = MemoryExtractionResponse.model_validate(payload)
     assert parsed.memories[0].entity_refs == ["pay-api", "postgresql"]
 

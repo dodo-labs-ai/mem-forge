@@ -43,7 +43,7 @@ class BytesResponse:
     async def aiter_bytes(self, chunk_size: int | None = None):
         size = chunk_size or len(self.content)
         for index in range(0, len(self.content), size):
-            yield self.content[index:index + size]
+            yield self.content[index : index + size]
 
 
 class RecordingClient:
@@ -53,13 +53,9 @@ class RecordingClient:
     async def get(self, url: str, **kwargs):
         self.calls.append((url, kwargs))
         if url == "/wiki/rest/api/content/123":
-            return JsonResponse({
-                "body": {
-                    "export_view": {
-                        "value": '<p><img src="/wiki/download/attachments/123/chart.png"></p>'
-                    }
-                }
-            })
+            return JsonResponse(
+                {"body": {"export_view": {"value": '<p><img src="/wiki/download/attachments/123/chart.png"></p>'}}}
+            )
         if url == "https://wiki.example.test/wiki/download/attachments/123/chart.png":
             return BytesResponse(b"png-bytes")
         if url == "https://wiki.example.test/wiki/download/attachments/123/lazy.png":
@@ -124,13 +120,15 @@ async def test_export_confluence_page_pdf_rewrites_lazy_image_sources(tmp_path):
     async def get_with_lazy_image(url: str, **kwargs):
         client.calls.append((url, kwargs))
         if url == "/wiki/rest/api/content/123":
-            return JsonResponse({
-                "body": {
-                    "export_view": {
-                        "value": '<p><img data-image-src="/wiki/download/attachments/123/lazy.png" alt="Chart"></p>'
+            return JsonResponse(
+                {
+                    "body": {
+                        "export_view": {
+                            "value": '<p><img data-image-src="/wiki/download/attachments/123/lazy.png" alt="Chart"></p>'
+                        }
                     }
                 }
-            })
+            )
         if url == "https://wiki.example.test/wiki/download/attachments/123/lazy.png":
             return BytesResponse(b"lazy-png-bytes")
         raise AssertionError(f"unexpected URL: {url}")
@@ -165,16 +163,18 @@ async def test_export_confluence_page_pdf_prefers_attachment_over_data_placehold
     async def get_with_placeholder_image(url: str, **kwargs):
         client.calls.append((url, kwargs))
         if url == "/wiki/rest/api/content/123":
-            return JsonResponse({
-                "body": {
-                    "export_view": {
-                        "value": (
-                            '<p><img src="data:image/gif;base64,placeholder" '
-                            'data-image-src="/wiki/download/attachments/123/lazy.png" alt="Chart"></p>'
-                        )
+            return JsonResponse(
+                {
+                    "body": {
+                        "export_view": {
+                            "value": (
+                                '<p><img src="data:image/gif;base64,placeholder" '
+                                'data-image-src="/wiki/download/attachments/123/lazy.png" alt="Chart"></p>'
+                            )
+                        }
                     }
                 }
-            })
+            )
         if url == "https://wiki.example.test/wiki/download/attachments/123/lazy.png":
             return BytesResponse(b"lazy-png-bytes")
         raise AssertionError(f"unexpected URL: {url}")
@@ -211,28 +211,30 @@ async def test_export_confluence_page_pdf_blanks_unrewritten_image_sources(tmp_p
     async def get_with_unsafe_images(url: str, **kwargs):
         client.calls.append((url, kwargs))
         if url == "/wiki/rest/api/content/123":
-            return JsonResponse({
-                "body": {
-                    "export_view": {
-                        "value": (
-                            '<p><img src="file:///etc/passwd" srcset="file:///etc/shadow 1x">'
-                            '<img src="http://internal.service/secret.png">'
-                            '<img src="data:image/png;base64,placeholder">'
-                            '<iframe src="file:///etc/passwd"></iframe>'
-                            '<object data="http://internal.service/object"></object>'
-                            '<style>@import url("http://internal.service/style.css");</style>'
-                            '<picture><source srcset="http://internal.service/picture.png"></picture>'
-                            '<video poster="http://internal.service/poster.png"></video>'
-                            '<svg><image href="http://internal.service/svg.png"/></svg>'
-                            '<span style="background:url(http://internal.service/bg.png)" '
-                            'onclick="fetch(\'http://internal.service/click\')">text</span>'
-                            '<input type="image" src="http://internal.service/input.png">'
-                            '<bgsound src="http://internal.service/sound.wav">'
-                            '<script>fetch("http://internal.service/script")</script></p>'
-                        )
+            return JsonResponse(
+                {
+                    "body": {
+                        "export_view": {
+                            "value": (
+                                '<p><img src="file:///etc/passwd" srcset="file:///etc/shadow 1x">'
+                                '<img src="http://internal.service/secret.png">'
+                                '<img src="data:image/png;base64,placeholder">'
+                                '<iframe src="file:///etc/passwd"></iframe>'
+                                '<object data="http://internal.service/object"></object>'
+                                '<style>@import url("http://internal.service/style.css");</style>'
+                                '<picture><source srcset="http://internal.service/picture.png"></picture>'
+                                '<video poster="http://internal.service/poster.png"></video>'
+                                '<svg><image href="http://internal.service/svg.png"/></svg>'
+                                '<span style="background:url(http://internal.service/bg.png)" '
+                                "onclick=\"fetch('http://internal.service/click')\">text</span>"
+                                '<input type="image" src="http://internal.service/input.png">'
+                                '<bgsound src="http://internal.service/sound.wav">'
+                                '<script>fetch("http://internal.service/script")</script></p>'
+                            )
+                        }
                     }
                 }
-            })
+            )
         raise AssertionError(f"unexpected URL: {url}")
 
     client.get = get_with_unsafe_images
@@ -269,7 +271,9 @@ async def test_export_confluence_page_pdf_blanks_unrewritten_image_sources(tmp_p
     assert "data:image/png;base64,placeholder" not in captured_html["body"]
     soup = BeautifulSoup(captured_html["body"], "html.parser")
     assert [img.get("src") for img in soup.find_all("img")] == ["", "", ""]
-    assert not soup.body.find_all(["iframe", "object", "script", "style", "picture", "source", "video", "svg", "bgsound"])
+    assert not soup.body.find_all(
+        ["iframe", "object", "script", "style", "picture", "source", "video", "svg", "bgsound"]
+    )
     assert soup.find("span").attrs == {}
     assert soup.find("input").get("src") is None
 
@@ -282,13 +286,15 @@ async def test_export_confluence_page_pdf_rejects_plain_http_same_host_asset(tmp
     async def get_with_plain_http_image(url: str, **kwargs):
         client.calls.append((url, kwargs))
         if url == "/wiki/rest/api/content/123":
-            return JsonResponse({
-                "body": {
-                    "export_view": {
-                        "value": '<p><img src="http://wiki.example.test/wiki/download/attachments/123/chart.png"></p>'
+            return JsonResponse(
+                {
+                    "body": {
+                        "export_view": {
+                            "value": '<p><img src="http://wiki.example.test/wiki/download/attachments/123/chart.png"></p>'
+                        }
                     }
                 }
-            })
+            )
         raise AssertionError(f"unexpected URL: {url}")
 
     client.get = get_with_plain_http_image
@@ -323,13 +329,9 @@ async def test_export_confluence_page_pdf_stops_streaming_oversized_images(tmp_p
     async def get_page_only(url: str, **kwargs):
         client.calls.append((url, kwargs))
         if url == "/wiki/rest/api/content/123":
-            return JsonResponse({
-                "body": {
-                    "export_view": {
-                        "value": '<p><img src="/wiki/download/attachments/123/huge.png"></p>'
-                    }
-                }
-            })
+            return JsonResponse(
+                {"body": {"export_view": {"value": '<p><img src="/wiki/download/attachments/123/huge.png"></p>'}}}
+            )
         raise AssertionError(f"unexpected buffered URL: {url}")
 
     class OversizedImageResponse:
@@ -346,10 +348,12 @@ async def test_export_confluence_page_pdf_stops_streaming_oversized_images(tmp_p
 
     class OversizedImageStream:
         async def __aenter__(self):
-            client.calls.append((
-                "https://wiki.example.test/wiki/download/attachments/123/huge.png",
-                {"stream": True},
-            ))
+            client.calls.append(
+                (
+                    "https://wiki.example.test/wiki/download/attachments/123/huge.png",
+                    {"stream": True},
+                )
+            )
             return OversizedImageResponse()
 
         async def __aexit__(self, _exc_type, _exc, _tb):
@@ -394,16 +398,17 @@ async def test_export_confluence_page_pdf_downloads_images_with_bounded_concurre
     async def get_page_only(url: str, **kwargs):
         client.calls.append((url, kwargs))
         if url == "/wiki/rest/api/content/123":
-            return JsonResponse({
-                "body": {
-                    "export_view": {
-                        "value": "".join(
-                            f'<img src="/wiki/download/attachments/123/image-{index}.png">'
-                            for index in range(4)
-                        )
+            return JsonResponse(
+                {
+                    "body": {
+                        "export_view": {
+                            "value": "".join(
+                                f'<img src="/wiki/download/attachments/123/image-{index}.png">' for index in range(4)
+                            )
+                        }
                     }
                 }
-            })
+            )
         raise AssertionError(f"unexpected buffered URL: {url}")
 
     class SlowImageResponse:
@@ -499,6 +504,7 @@ async def test_export_confluence_page_pdf_returns_none_when_renderer_missing(tmp
     )
 
     assert pdf is None
+
 
 def test_default_pdf_renderer_uses_weasyprint(monkeypatch):
     async def fake_weasyprint(_html_path: Path) -> bytes:

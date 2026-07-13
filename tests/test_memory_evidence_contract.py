@@ -405,9 +405,7 @@ def test_candidate_universe_keeps_mandatory_candidates_beyond_recall_cap() -> No
         bucket=CandidateBucket.SAME_DOC_LINEAGE,
         bucket_rank=1,
         complete=True,
-        candidates=tuple(
-            _candidate(memory_id=f"mem-mandatory-{index}") for index in range(3)
-        ),
+        candidates=tuple(_candidate(memory_id=f"mem-mandatory-{index}") for index in range(3)),
     )
     recall = CandidateBucketResult(
         bucket=CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS,

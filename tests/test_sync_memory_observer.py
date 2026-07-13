@@ -28,11 +28,7 @@ class RecordingLogger:
 
 
 def test_process_memory_sampler_parses_proc_status_rss_and_hwm():
-    sample = ProcessMemorySampler._sample_from_proc_status(
-        "Name:\tpython\n"
-        "VmRSS:\t2048 kB\n"
-        "VmHWM:\t4096 kB\n"
-    )
+    sample = ProcessMemorySampler._sample_from_proc_status("Name:\tpython\nVmRSS:\t2048 kB\nVmHWM:\t4096 kB\n")
 
     assert sample == MemorySample(rss_mb=2.0, peak_rss_mb=4.0)
 

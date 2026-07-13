@@ -321,8 +321,7 @@ def test_local_agent_leases_heartbeats_and_completes_cloud_job(tmp_path):
     handled: list[str] = []
     runner = LocalAgentRunner(
         state_store=LocalAgentStateStore(tmp_path / "state.json"),
-        cloud_job_handler=lambda job: handled.append(job["job_id"])
-        or {"count": 1},
+        cloud_job_handler=lambda job: handled.append(job["job_id"]) or {"count": 1},
         cloud_jobs_provider=lambda: {
             "jobs": [
                 {
@@ -333,14 +332,12 @@ def test_local_agent_leases_heartbeats_and_completes_cloud_job(tmp_path):
                 }
             ]
         },
-        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: completed.append(
-            (job_id, attempt_count, status, result, error)
-        )
-        or {"ok": True},
-        cloud_job_heartbeat=lambda job_id, attempt_count, lease_seconds: heartbeats.append(
-            (job_id, attempt_count, lease_seconds)
-        )
-        or {"ok": True},
+        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: (
+            completed.append((job_id, attempt_count, status, result, error)) or {"ok": True}
+        ),
+        cloud_job_heartbeat=lambda job_id, attempt_count, lease_seconds: (
+            heartbeats.append((job_id, attempt_count, lease_seconds)) or {"ok": True}
+        ),
     )
 
     report = runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
@@ -369,10 +366,9 @@ def test_local_agent_forwards_retryable_handler_failure_to_broker(tmp_path):
                 }
             ]
         },
-        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: completed.append(
-            (job_id, attempt_count, status, result, error)
-        )
-        or {"ok": True},
+        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: (
+            completed.append((job_id, attempt_count, status, result, error)) or {"ok": True}
+        ),
     )
 
     runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
@@ -393,11 +389,13 @@ def test_local_agent_reports_handler_progress_through_heartbeat(tmp_path):
     completions: list[dict] = []
 
     def handle(job, *, report_progress):
-        report_progress({
-            "schema_version": 1,
-            "phase": "uploading",
-            "progress": {"completed": 7, "total": 16, "unit": "message"},
-        })
+        report_progress(
+            {
+                "schema_version": 1,
+                "phase": "uploading",
+                "progress": {"completed": 7, "total": 16, "unit": "message"},
+            }
+        )
         return {"count": 1}
 
     runner = LocalAgentRunner(
@@ -424,19 +422,24 @@ def test_local_agent_reports_handler_progress_through_heartbeat(tmp_path):
     report = runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
 
     assert report["counts"]["failed"] == 0
-    assert heartbeats == [None, {
-        "schema_version": 1,
-        "phase": "uploading",
-        "progress": {"completed": 7, "total": 16, "unit": "message"},
-    }]
-    assert completions == [{
-        "count": 1,
-        "progress": {
+    assert heartbeats == [
+        None,
+        {
             "schema_version": 1,
             "phase": "uploading",
             "progress": {"completed": 7, "total": 16, "unit": "message"},
         },
-    }]
+    ]
+    assert completions == [
+        {
+            "count": 1,
+            "progress": {
+                "schema_version": 1,
+                "phase": "uploading",
+                "progress": {"completed": 7, "total": 16, "unit": "message"},
+            },
+        }
+    ]
 
 
 def test_local_agent_flushes_dirty_progress_before_lease_heartbeat():
@@ -457,11 +460,13 @@ def test_local_agent_flushes_dirty_progress_before_lease_heartbeat():
         interval_seconds=20,
         progress_flush_seconds=1,
     ) as lease:
-        lease.report_progress({
-            "schema_version": 1,
-            "phase": "discovering",
-            "progress": {"completed": 3, "unit": "file"},
-        })
+        lease.report_progress(
+            {
+                "schema_version": 1,
+                "phase": "discovering",
+                "progress": {"completed": 3, "unit": "file"},
+            }
+        )
         assert flushed.wait(1.5)
 
 
@@ -498,9 +503,7 @@ def test_local_agent_rejects_job_without_attempt_count(tmp_path):
     runner = LocalAgentRunner(
         state_store=LocalAgentStateStore(tmp_path / "state.json"),
         cloud_job_handler=lambda job: {"job": job["job_id"]},
-        cloud_jobs_provider=lambda: {
-            "jobs": [{"job_id": "laj-1", "source_id": "src-1"}]
-        },
+        cloud_jobs_provider=lambda: {"jobs": [{"job_id": "laj-1", "source_id": "src-1"}]},
     )
 
     report = runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
@@ -562,9 +565,7 @@ def test_adapter_daemon_once_exits_nonzero_when_job_fails(monkeypatch):
             return {
                 "status": "ok",
                 "counts": {"total": 1, "success": 0, "failed": 1},
-                "results": [
-                    {"task_id": "cloud-job:laj-1", "status": "failed", "error": "push failed"}
-                ],
+                "results": [{"task_id": "cloud-job:laj-1", "status": "failed", "error": "push failed"}],
             }
 
     monkeypatch.setattr(main, "_build_local_agent_runner", lambda *args, **kwargs: FakeRunner())

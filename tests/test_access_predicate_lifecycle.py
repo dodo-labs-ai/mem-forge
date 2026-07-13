@@ -31,8 +31,7 @@ WORKSPACE = Visibility.WORKSPACE.value
 PRIVATE = Visibility.PRIVATE.value
 
 
-def _mem(mid: str, *, visibility=WORKSPACE, owner=None,
-         status="active") -> Memory:
+def _mem(mid: str, *, visibility=WORKSPACE, owner=None, status="active") -> Memory:
     return Memory(
         id=mid,
         memory_type="fact",
@@ -74,8 +73,7 @@ async def _seed(db: Database) -> None:
     await db.insert_memory(_mem("priv-u2-old", visibility=PRIVATE, owner="u-2"))
     now = datetime.now(timezone.utc).isoformat()
     await db.db.execute(
-        "UPDATE memories SET status = 'superseded', superseded_at = ? "
-        "WHERE id IN ('ws-old', 'priv-u2-old')",
+        "UPDATE memories SET status = 'superseded', superseded_at = ? WHERE id IN ('ws-old', 'priv-u2-old')",
         (now,),
     )
     await db.db.commit()
@@ -84,29 +82,35 @@ async def _seed(db: Database) -> None:
 def test_is_visible_lifecycle_orthogonal_to_access():
     # Workspace superseded row: hidden when status filter excludes superseded,
     # visible when it includes superseded.
-    ws_super = {"status": "superseded", "visibility": WORKSPACE,
-                "owner_user_id": None, "project_key": SHARED_PROJECT_KEY}
-    assert is_visible(ws_super, _scope(include_private=False,
-                                        include_superseded=False)) is False
-    assert is_visible(ws_super, _scope(include_private=False,
-                                        include_superseded=True)) is True
+    ws_super = {
+        "status": "superseded",
+        "visibility": WORKSPACE,
+        "owner_user_id": None,
+        "project_key": SHARED_PROJECT_KEY,
+    }
+    assert is_visible(ws_super, _scope(include_private=False, include_superseded=False)) is False
+    assert is_visible(ws_super, _scope(include_private=False, include_superseded=True)) is True
 
     # Other-user private superseded row: include_superseded MUST NOT widen
     # access. It stays hidden under TEAM and under PERSONALIZED for u-1.
-    priv_super = {"status": "superseded", "visibility": PRIVATE,
-                  "owner_user_id": "u-2", "project_key": SHARED_PROJECT_KEY}
-    assert is_visible(priv_super, _scope(include_private=False,
-                                          include_superseded=True)) is False
-    assert is_visible(priv_super, _scope(include_private=True,
-                                          include_superseded=True)) is False
+    priv_super = {
+        "status": "superseded",
+        "visibility": PRIVATE,
+        "owner_user_id": "u-2",
+        "project_key": SHARED_PROJECT_KEY,
+    }
+    assert is_visible(priv_super, _scope(include_private=False, include_superseded=True)) is False
+    assert is_visible(priv_super, _scope(include_private=True, include_superseded=True)) is False
 
     # The caller's own private superseded row IS surfaced when both are on.
-    own_super = {"status": "superseded", "visibility": PRIVATE,
-                 "owner_user_id": "u-1", "project_key": SHARED_PROJECT_KEY}
-    assert is_visible(own_super, _scope(include_private=True,
-                                         include_superseded=True)) is True
-    assert is_visible(own_super, _scope(include_private=True,
-                                         include_superseded=False)) is False
+    own_super = {
+        "status": "superseded",
+        "visibility": PRIVATE,
+        "owner_user_id": "u-1",
+        "project_key": SHARED_PROJECT_KEY,
+    }
+    assert is_visible(own_super, _scope(include_private=True, include_superseded=True)) is True
+    assert is_visible(own_super, _scope(include_private=True, include_superseded=False)) is False
 
 
 @pytest.mark.asyncio
@@ -118,7 +122,8 @@ async def test_keyword_channel_lifecycle_does_not_widen_access(db):
     hits = await adapters.keyword.search(
         "argocd",
         _scope(include_private=False, include_superseded=True),
-        memory_types=None, limit=10,
+        memory_types=None,
+        limit=10,
     )
     ids = {mid for mid, _ in hits}
     assert "ws-active" in ids
@@ -130,7 +135,8 @@ async def test_keyword_channel_lifecycle_does_not_widen_access(db):
     hits = await adapters.keyword.search(
         "argocd",
         _scope(include_private=True, include_superseded=True),
-        memory_types=None, limit=10,
+        memory_types=None,
+        limit=10,
     )
     ids = {mid for mid, _ in hits}
     assert "ws-active" in ids

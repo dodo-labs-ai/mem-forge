@@ -50,10 +50,12 @@ def test_upsert_with_stored_vector_hash_uses_chroma_round_tripped_embedding():
         collection,
         ids=["item-1"],
         embeddings=[attempted_embedding],
-        metadatas=[{
-            "embedding_vector_hash": embedding_vector_hash(attempted_embedding),
-            "content_hash": "content",
-        }],
+        metadatas=[
+            {
+                "embedding_vector_hash": embedding_vector_hash(attempted_embedding),
+                "content_hash": "content",
+            }
+        ],
         documents=["semantic text"],
     )
 
@@ -75,10 +77,12 @@ def test_upsert_with_stored_vector_hash_strips_attempted_vector_hash_before_init
         collection,
         ids=["item-1"],
         embeddings=[attempted_embedding],
-        metadatas=[{
-            "embedding_vector_hash": "caller-owned-wrong-hash",
-            "content_hash": "content",
-        }],
+        metadatas=[
+            {
+                "embedding_vector_hash": "caller-owned-wrong-hash",
+                "content_hash": "content",
+            }
+        ],
     )
 
     assert "embedding_vector_hash" not in collection.upserts[0]

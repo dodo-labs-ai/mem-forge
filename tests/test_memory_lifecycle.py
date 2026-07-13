@@ -184,7 +184,9 @@ class TestSupportAwareRetirement:
     @pytest.mark.asyncio
     async def test_source_cascade_removes_subscription_and_durable_sync_state(self, db):
         source_id = "src-reusable"
-        await db.upsert_source(source_id, "confluence", "Reusable Source", "{}")
+        await db.upsert_source(
+            source_id, "confluence", "Reusable Source", "{}", access_policy="workspace", owner_user_id="dev"
+        )
         await db.set_source_subscription(source_id, "user-1", False)
         await db.create_source_sync_input(
             source_id=source_id,
@@ -199,14 +201,18 @@ class TestSupportAwareRetirement:
         assert await db.get_latest_source_sync_run(source_id=source_id) is None
         assert await db.list_source_sync_inputs(source_id=source_id) == []
 
-        await db.upsert_source(source_id, "confluence", "Recreated Source", "{}")
+        await db.upsert_source(
+            source_id, "confluence", "Recreated Source", "{}", access_policy="workspace", owner_user_id="dev"
+        )
         assert await db.is_source_enabled_for_user(source_id, "user-1") is True
 
     @pytest.mark.asyncio
     async def test_source_cascade_durably_records_exact_artifacts_for_cleanup(self, db):
         source_id = "src-artifacts"
         now = datetime.now(timezone.utc)
-        await db.upsert_source(source_id, "confluence", "Artifact Source", "{}")
+        await db.upsert_source(
+            source_id, "confluence", "Artifact Source", "{}", access_policy="workspace", owner_user_id="dev"
+        )
         await db.upsert_document(
             DocumentRecord(
                 doc_id="doc-artifacts",
@@ -246,7 +252,9 @@ class TestSupportAwareRetirement:
         now = datetime.now(timezone.utc)
         document_store = LocalDocumentStore(str(tmp_path / "documents"))
         artifact_uri = document_store.store_normalized(source_id, "Architecture", "# Architecture")
-        await db.upsert_source(source_id, "confluence", "Cleanup Source", "{}")
+        await db.upsert_source(
+            source_id, "confluence", "Cleanup Source", "{}", access_policy="workspace", owner_user_id="dev"
+        )
         await db.upsert_document(
             DocumentRecord(
                 doc_id="doc-cleanup",
@@ -279,7 +287,9 @@ class TestSupportAwareRetirement:
     async def test_document_deletion_uses_the_same_artifact_cleanup_outbox(self, db):
         source_id = "src-document-cleanup"
         now = datetime.now(timezone.utc)
-        await db.upsert_source(source_id, "confluence", "Document Cleanup", "{}")
+        await db.upsert_source(
+            source_id, "confluence", "Document Cleanup", "{}", access_policy="workspace", owner_user_id="dev"
+        )
         await db.upsert_document(
             DocumentRecord(
                 doc_id="doc-document-cleanup",
@@ -312,7 +322,9 @@ class TestSupportAwareRetirement:
     async def test_source_deletion_fence_rejects_new_document_writes(self, db):
         source_id = "src-fenced"
         now = datetime.now(timezone.utc)
-        await db.upsert_source(source_id, "confluence", "Fenced Source", "{}")
+        await db.upsert_source(
+            source_id, "confluence", "Fenced Source", "{}", access_policy="workspace", owner_user_id="dev"
+        )
 
         await db.db.execute("UPDATE sources SET status = 'deleting' WHERE id = ?", (source_id,))
         await db.db.commit()

@@ -32,9 +32,7 @@ def test_load_case_set_validates_manifest_cases_and_scope_shape() -> None:
     )
 
     title_case = case_set.get_case("metadata_title_exact")
-    assert title_case.expected.required_channels["mem-access-review"] == (
-        "bm25_metadata_tokens",
-    )
+    assert title_case.expected.required_channels["mem-access-review"] == ("bm25_metadata_tokens",)
     assert set(title_case.scope.raw) == {field.name for field in fields(AccessScope)}
 
     access_scope = title_case.scope.to_access_scope()
@@ -79,7 +77,14 @@ def test_case_set_validation_rejects_missing_fixture_references() -> None:
                 "workspace_id": "ws-eval",
                 "tenant_id": "tenant-eval",
                 "users": ["eval-user"],
-                "sources": [{"id": "src-payroll", "status": "active"}],
+                "sources": [
+                    {
+                        "id": "src-payroll",
+                        "status": "active",
+                        "access_policy": "workspace",
+                        "owner_user_id": "eval-user",
+                    }
+                ],
                 "source_subscriptions": [
                     {
                         "user_id": "eval-user",
@@ -276,8 +281,18 @@ def test_case_set_validation_rejects_missing_source_subscription_rows() -> None:
                 "tenant_id": "tenant-eval",
                 "users": ["eval-user"],
                 "sources": [
-                    {"id": "src-payroll", "status": "active"},
-                    {"id": "src-muted", "status": "active"},
+                    {
+                        "id": "src-payroll",
+                        "status": "active",
+                        "access_policy": "workspace",
+                        "owner_user_id": "eval-user",
+                    },
+                    {
+                        "id": "src-muted",
+                        "status": "active",
+                        "access_policy": "workspace",
+                        "owner_user_id": "eval-user",
+                    },
                 ],
                 "source_subscriptions": [
                     {
@@ -369,7 +384,7 @@ fixtures:
     workspace_id: ws-eval
     tenant_id: tenant-eval
     users: [eval-user]
-    sources: [{id: src-payroll, status: active}]
+    sources: [{id: src-payroll, status: active, access_policy: workspace, owner_user_id: eval-user}]
     source_subscriptions:
       - {user_id: eval-user, source_id: src-payroll, enabled: true}
     documents: []
@@ -535,7 +550,14 @@ def _minimal_valid_case_set_data() -> tuple[dict, dict]:
                 "workspace_id": "ws-eval",
                 "tenant_id": "tenant-eval",
                 "users": ["eval-user"],
-                "sources": [{"id": "src-payroll", "status": "active"}],
+                "sources": [
+                    {
+                        "id": "src-payroll",
+                        "status": "active",
+                        "access_policy": "workspace",
+                        "owner_user_id": "eval-user",
+                    }
+                ],
                 "source_subscriptions": [
                     {
                         "user_id": "eval-user",

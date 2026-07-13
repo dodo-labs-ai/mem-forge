@@ -62,10 +62,12 @@ async def test_capture_uses_interactive_profile_only_after_silent_paths_fail():
     from memforge.auth import jira_capture
     from memforge.auth.jira_browser_session import JiraBrowserCapture
 
-    session = FakeBrowserSession([
-        JiraBrowserCapture.captured("SESSION=expired"),
-        JiraBrowserCapture.captured("SESSION=interactive"),
-    ])
+    session = FakeBrowserSession(
+        [
+            JiraBrowserCapture.captured("SESSION=expired"),
+            JiraBrowserCapture.captured("SESSION=interactive"),
+        ]
+    )
 
     async def validator(_origin, cookie, _tls_config=None):
         if cookie == "SESSION=expired":
@@ -89,10 +91,12 @@ async def test_capture_rejects_invalid_system_cookie_before_interactive_profile(
     from memforge.auth import jira_capture
     from memforge.auth.jira_browser_session import JiraBrowserCapture
 
-    session = FakeBrowserSession([
-        JiraBrowserCapture.interaction_required(),
-        JiraBrowserCapture.captured("SESSION=interactive"),
-    ])
+    session = FakeBrowserSession(
+        [
+            JiraBrowserCapture.interaction_required(),
+            JiraBrowserCapture.captured("SESSION=interactive"),
+        ]
+    )
 
     async def validator(_origin, cookie, _tls_config=None):
         if cookie == "SESSION=system-expired":

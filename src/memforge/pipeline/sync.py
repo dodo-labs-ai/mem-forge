@@ -48,7 +48,7 @@ from memforge.memory.index_payloads import (
 )
 from memforge.llm.providers import is_litellm_provider_model
 from memforge.memory.project_resolver import resolve_project_key
-from memforge.memory.visibility_policy import default_visibility
+from memforge.source_access import memory_visibility_for_document
 
 if TYPE_CHECKING:
     from memforge.genes.base import Gene
@@ -1452,11 +1452,8 @@ class GeneSyncOrchestrator:
             source_id=source_id,
             doc_id=doc_id,
         )
-        # The gene exposes the uploader as a write-time hint on source_semantics.
-        # The sync pipeline forwards it to the memory engine so the new memory
-        # carries the uploader's owner_user_id at persistence time. This stays a
-        # write-time signal only: read-time visibility is decided by the access
-        # predicate, never by this hint.
+        # The uploader remains audit actor context. Memory authorization is
+        # derived from the persisted Source policy, not from this document hint.
         uploader_user_id = normalized.source_semantics.get("uploader_user_id")
         repo_identifier = normalized.source_semantics.get("repo_identifier")
         source_updated_at = _source_updated_at_for_item(item, normalized.source_semantics)
@@ -1506,9 +1503,9 @@ class GeneSyncOrchestrator:
         )
 
         if not extraction_result.error_type and self.source_support_detector:
-            writer_visibility, writer_owner_user_id = default_visibility(
-                source_type,
-                user_id=uploader_user_id,
+            writer_visibility, writer_owner_user_id = await memory_visibility_for_document(
+                self.db,
+                doc_id=doc_id,
             )
             async with self._heavy_work_slot(source_id):
                 support_stats = await self.source_support_detector.detect_and_persist(

@@ -49,16 +49,18 @@ def set_native_schema_support(monkeypatch, supported: bool) -> None:
 
 
 def test_source_support_response_accepts_decision_list():
-    response = SourceSupportResponse.model_validate({
-        "decisions": [
-            {
-                "memory_id": "mem-1",
-                "supported": True,
-                "excerpt": "The document states the rule.",
-                "reason": "direct statement",
-            }
-        ]
-    })
+    response = SourceSupportResponse.model_validate(
+        {
+            "decisions": [
+                {
+                    "memory_id": "mem-1",
+                    "supported": True,
+                    "excerpt": "The document states the rule.",
+                    "reason": "direct statement",
+                }
+            ]
+        }
+    )
 
     assert response.decisions == [
         SourceSupportDecision(
@@ -72,9 +74,7 @@ def test_source_support_response_accepts_decision_list():
 
 def test_source_support_response_rejects_top_level_array():
     with pytest.raises(ValidationError):
-        SourceSupportResponse.model_validate([
-            {"memory_id": "mem-1", "supported": True}
-        ])
+        SourceSupportResponse.model_validate([{"memory_id": "mem-1", "supported": True}])
 
 
 def test_agent_session_authority_response_accepts_typed_decisions():
@@ -133,20 +133,22 @@ def test_agent_session_authority_response_rejects_contradictory_decisions():
 
 
 def test_memory_extraction_response_accepts_memory_list():
-    response = MemoryExtractionResponse.model_validate({
-        "memories": [
-            {
-                "content": "Service A uses PostgreSQL 16 for transactional storage.",
-                "memory_type": "fact",
-                "confidence": 0.9,
-                "entity_refs": ["Service A"],
-                "tags": ["database", "storage"],
-                "valid_from": None,
-                "valid_until": None,
-                "extraction_context": "Service A uses PostgreSQL 16",
-            }
-        ]
-    })
+    response = MemoryExtractionResponse.model_validate(
+        {
+            "memories": [
+                {
+                    "content": "Service A uses PostgreSQL 16 for transactional storage.",
+                    "memory_type": "fact",
+                    "confidence": 0.9,
+                    "entity_refs": ["Service A"],
+                    "tags": ["database", "storage"],
+                    "valid_from": None,
+                    "valid_until": None,
+                    "extraction_context": "Service A uses PostgreSQL 16",
+                }
+            ]
+        }
+    )
 
     assert response.memories == [
         MemoryCandidate(
@@ -164,9 +166,7 @@ def test_memory_extraction_response_accepts_memory_list():
 
 def test_memory_extraction_response_rejects_top_level_array():
     with pytest.raises(ValidationError):
-        MemoryExtractionResponse.model_validate([
-            {"content": "Fact", "memory_type": "fact"}
-        ])
+        MemoryExtractionResponse.model_validate([{"content": "Fact", "memory_type": "fact"}])
 
 
 def test_litellm_model_name_preserves_explicit_provider_prefix():
@@ -175,9 +175,7 @@ def test_litellm_model_name_preserves_explicit_provider_prefix():
 
 
 def test_litellm_model_name_defaults_to_anthropic_provider():
-    assert litellm_model_name("anthropic--claude-sonnet-latest") == (
-        "anthropic/anthropic--claude-sonnet-latest"
-    )
+    assert litellm_model_name("anthropic--claude-sonnet-latest") == ("anthropic/anthropic--claude-sonnet-latest")
 
 
 @pytest.mark.asyncio
@@ -338,9 +336,7 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
     assert "tools" not in calls[0]
     assert "tool_choice" not in calls[0]
     [fallback_log] = [
-        record
-        for record in caplog.records
-        if "does not advertise native response_schema support" in record.message
+        record for record in caplog.records if "does not advertise native response_schema support" in record.message
     ]
     assert fallback_log.levelno == logging.DEBUG
     assert "anthropic/anthropic--claude-sonnet-latest" in fallback_log.message
@@ -409,11 +405,15 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         calls.append(kwargs)
         schema = kwargs["response_format"]
         if schema is EnrichmentResponse:
-            return CompletionResponse('{"summary":"Summary","tags":["tag"],"entities":[],"relationships":[],"doc_type":"reference","complexity":"low"}')
+            return CompletionResponse(
+                '{"summary":"Summary","tags":["tag"],"entities":[],"relationships":[],"doc_type":"reference","complexity":"low"}'
+            )
         if schema is ReconciliationResponse:
             return CompletionResponse('{"decisions":[{"action":"ADD","index":0,"reason":"new"}]}')
         if schema is ContradictionResponse:
-            return CompletionResponse('{"decisions":[{"pair_index":0,"classification":"unrelated","reason":"different topic"}]}')
+            return CompletionResponse(
+                '{"decisions":[{"pair_index":0,"classification":"unrelated","reason":"different topic"}]}'
+            )
         if schema is EntityValidationResponse:
             return CompletionResponse('{"same_entity":true,"matched_id":7,"confidence":0.95}')
         if schema is RerankResponse:
@@ -479,9 +479,7 @@ async def test_litellm_structured_client_falls_back_once_to_json_text(monkeypatc
     assert calls[0]["response_format"] is MemoryExtractionResponse
     assert "response_format" not in calls[1]
     assert calls[1]["messages"][0]["content"].startswith("prompt\n\nReturn ONLY")
-    [fallback_log] = [
-        record for record in caplog.records if "retrying with JSON-text schema" in record.message
-    ]
+    [fallback_log] = [record for record in caplog.records if "retrying with JSON-text schema" in record.message]
     assert fallback_log.levelno == logging.WARNING
     assert fallback_log.exc_info is None
     assert "anthropic/anthropic--claude-sonnet-latest" in fallback_log.message

@@ -48,9 +48,7 @@ async def db(tmp_path):
 
 
 def test_local_agent_broker_has_its_own_forward_migration() -> None:
-    version, description, statements = next(
-        migration for migration in MIGRATIONS if migration[0] == 37
-    )
+    version, description, statements = next(migration for migration in MIGRATIONS if migration[0] == 37)
 
     assert version == 37
     assert description == "Add local agent job broker"
@@ -77,15 +75,11 @@ async def test_snapshot_migration_upgrades_database_that_already_recorded_migrat
     await upgraded.connect()
     try:
         columns = {
-            row["name"]
-            for row in await (
-                await upgraded.db.execute("PRAGMA table_info(source_sync_runs)")
-            ).fetchall()
+            row["name"] for row in await (await upgraded.db.execute("PRAGMA table_info(source_sync_runs)")).fetchall()
         }
         table = await (
             await upgraded.db.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type = 'table' AND name = 'source_sync_snapshot_items'"
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'source_sync_snapshot_items'"
             )
         ).fetchone()
     finally:
@@ -102,12 +96,16 @@ async def test_latest_source_sync_run_is_scoped_to_source_and_workspace(db: Data
         type="jira",
         name="Latest A",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.upsert_source(
         id="src-latest-b",
         type="jira",
         name="Latest B",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     first = await db.enqueue_source_sync_run(
         source_id="src-latest-a",
@@ -139,6 +137,8 @@ async def test_enqueue_source_sync_run_coalesces_by_workspace_and_source(db: Dat
         type="github_repo",
         name="Repo",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     first = await db.enqueue_source_sync_run(
@@ -170,6 +170,8 @@ async def test_enqueue_source_sync_run_promotes_force_intent_on_active_run(db: D
         type="github_repo",
         name="Repo",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     first = await db.enqueue_source_sync_run(
@@ -203,6 +205,8 @@ async def test_duplicate_manual_trigger_does_not_schedule_successor_for_running_
         type="confluence",
         name="Running manual",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     first = await db.enqueue_source_sync_run(
         source_id="src-running-manual",
@@ -229,7 +233,14 @@ async def test_duplicate_manual_trigger_does_not_schedule_successor_for_running_
 
 @pytest.mark.asyncio
 async def test_duplicate_snapshot_does_not_schedule_running_successor(db: Database):
-    await db.upsert_source(id="src-same-snapshot", type="github_repo", name="Repo", config_json="{}")
+    await db.upsert_source(
+        id="src-same-snapshot",
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
     first = await db.enqueue_source_sync_run(
         source_id="src-same-snapshot",
         input_snapshot_id="snapshot-a",
@@ -257,6 +268,8 @@ async def test_lease_next_source_sync_run_recovers_expired_run_without_new_run(d
         type="github_repo",
         name="Repo",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     enqueued = await db.enqueue_source_sync_run(
         source_id="src-lease-run",
@@ -310,17 +323,15 @@ async def test_source_sync_run_lease_is_compare_and_swap_across_connections(tmp_
             type="confluence",
             name="CAS Lease",
             config_json="{}",
+            access_policy="workspace",
+            owner_user_id="dev",
         )
         await first_db.enqueue_source_sync_run(source_id="src-cas-lease")
         now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
 
         leased = await asyncio.gather(
-            first_db.lease_next_source_sync_run(
-                worker_id="worker-a", lease_seconds=60, now=now
-            ),
-            second_db.lease_next_source_sync_run(
-                worker_id="worker-b", lease_seconds=60, now=now
-            ),
+            first_db.lease_next_source_sync_run(worker_id="worker-a", lease_seconds=60, now=now),
+            second_db.lease_next_source_sync_run(worker_id="worker-b", lease_seconds=60, now=now),
         )
 
         assert sum(run is not None for run in leased) == 1
@@ -337,6 +348,8 @@ async def test_heartbeat_source_sync_run_extends_only_current_worker_lease(db: D
         type="github_repo",
         name="Repo",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     enqueued = await db.enqueue_source_sync_run(
         source_id="src-heartbeat-run",
@@ -384,6 +397,8 @@ async def test_source_sync_run_progress_is_durable_and_fenced_by_current_lease(d
         type="confluence",
         name="Engineering Wiki",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     enqueued = await db.enqueue_source_sync_run(
         source_id="src-progress-run",
@@ -444,6 +459,8 @@ async def test_complete_source_sync_run_releases_active_slot_for_next_run(db: Da
         type="github_repo",
         name="Repo",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     enqueued = await db.enqueue_source_sync_run(
         source_id="src-complete-run",
@@ -496,6 +513,8 @@ async def test_terminal_source_sync_writes_require_current_lease(db: Database):
         type="github_repo",
         name="Repo",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     enqueued = await db.enqueue_source_sync_run(
         source_id="src-stale-terminal",
@@ -570,6 +589,8 @@ async def test_fail_source_sync_run_requeues_retryable_failure_after_backoff(db:
         type="github_repo",
         name="Repo",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     enqueued = await db.enqueue_source_sync_run(
         source_id="src-fail-run",
@@ -627,6 +648,8 @@ async def test_fail_source_sync_run_marks_terminal_after_retry_budget(db: Databa
         type="github_repo",
         name="Repo",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     enqueued = await db.enqueue_source_sync_run(
         source_id="src-fail-budget",
@@ -674,6 +697,8 @@ async def test_terminal_failure_preserves_coalesced_rerun(db: Database):
         type="teams",
         name="Teams",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     active = await db.enqueue_source_sync_run(
         source_id="src-terminal-rerun",
@@ -717,6 +742,8 @@ async def test_complete_source_sync_run_creates_successor_for_coalesced_request(
         type="github_repo",
         name="Repo",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     active = await db.enqueue_source_sync_run(
         source_id="src-successor",
@@ -777,6 +804,8 @@ async def test_source_sync_inputs_are_immutable_generations_per_workspace_source
         type="teams",
         name="Teams",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     first = await db.create_source_sync_input(
@@ -813,6 +842,8 @@ async def test_source_sync_inputs_are_idempotent_by_raw_hash(db: Database):
         type="teams",
         name="Teams",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     first = await db.create_source_sync_input(
@@ -844,7 +875,14 @@ async def test_source_sync_inputs_are_idempotent_by_raw_hash(db: Database):
 
 @pytest.mark.asyncio
 async def test_snapshot_input_uses_top_level_doc_id_and_rejects_missing_identity(db: Database):
-    await db.upsert_source(id="src-snapshot-doc", type="jira", name="Jira", config_json="{}")
+    await db.upsert_source(
+        id="src-snapshot-doc",
+        type="jira",
+        name="Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
     created = await db.create_source_sync_input(
         source_id="src-snapshot-doc",
         raw_uri="object://input.json",
@@ -876,6 +914,8 @@ async def test_source_sync_inputs_filter_by_current_snapshot_membership(db: Data
         type="local_markdown",
         name="Local",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     old = await db.create_source_sync_input(
@@ -1081,6 +1121,8 @@ async def test_shared_extraction_pool_caps_orchestrator_work_across_sources(db: 
             type="jira",
             name=f"Source {source_id}",
             config_json="{}",
+            access_policy="workspace",
+            owner_user_id="dev",
         )
 
     pool = ExtractionWorkPool(max_workers=4)
@@ -1134,6 +1176,8 @@ async def test_document_lifecycle_admission_caps_fetch_across_sources(db: Databa
             type="jira",
             name=f"Source {source_id}",
             config_json="{}",
+            access_policy="workspace",
+            owner_user_id="dev",
         )
 
     admission = DocumentLifecycleAdmission(max_active=1)
@@ -1361,6 +1405,8 @@ async def test_sync_gene_binds_document_store_at_pipeline_boundary(db: Database)
         type="teams",
         name="Teams",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     doc_store = StubDocumentStore()
     gene = EmptyGene()
@@ -1897,6 +1943,8 @@ async def _insert_source_and_doc(db: Database, source_id: str) -> None:
         type="confluence",
         name="Architecture",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     now = datetime.now(timezone.utc).isoformat()
     await db.db.execute(
@@ -1914,6 +1962,8 @@ async def _insert_source_with_docs(db: Database, source_id: str, doc_ids: list[s
         type="agent_session",
         name="Agent Session Summaries",
         config_json="{}",
+        access_policy="private",
+        owner_user_id="dev",
     )
     now = datetime.now(timezone.utc).isoformat()
     for doc_id in doc_ids:
@@ -1941,6 +1991,8 @@ async def _insert_document_with_metadata(
         type="jira",
         name="Jira Board",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     now = datetime.now(timezone.utc)
     await db.db.execute(
@@ -2004,6 +2056,8 @@ async def test_sync_memory_observer_records_discovery_and_document_stages(db: Da
         type="jira",
         name="Jira Board",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     release = asyncio.Event()
     release.set()
@@ -2065,6 +2119,8 @@ async def test_sync_memory_observer_records_pdf_export_stage(db: Database):
         type="confluence",
         name="Confluence Space",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     release = asyncio.Event()
     release.set()
@@ -2092,11 +2148,7 @@ async def test_sync_memory_observer_records_pdf_export_stage(db: Database):
     )
 
     assert state.last_sync_status == "success"
-    pdf_events = [
-        event
-        for _level, event in log.records
-        if event["stage"] == "after_pdf_export"
-    ]
+    pdf_events = [event for _level, event in log.records if event["stage"] == "after_pdf_export"]
     assert len(pdf_events) == 1
     assert pdf_events[0]["source_id"] == source_id
     assert pdf_events[0]["doc_id"] == "jira-0"
@@ -2106,7 +2158,9 @@ async def test_sync_memory_observer_records_pdf_export_stage(db: Database):
 @pytest.mark.asyncio
 async def test_sync_memory_observer_records_lifecycle_exit_when_document_fails(db: Database):
     source_id = "src-sync-memory-error"
-    await db.upsert_source(id=source_id, type="jira", name="Jira Board", config_json="{}")
+    await db.upsert_source(
+        id=source_id, type="jira", name="Jira Board", config_json="{}", access_policy="workspace", owner_user_id="dev"
+    )
     release = asyncio.Event()
     release.set()
     log = RecordingSyncMemoryLogger()
@@ -2122,7 +2176,9 @@ async def test_sync_memory_observer_records_lifecycle_exit_when_document_fails(d
         memory_observer=observer,
     )
 
-    state = await orchestrator.sync_gene(gene=BlockingFetchGene(1, release), source_name="Jira Board", source_id=source_id)
+    state = await orchestrator.sync_gene(
+        gene=BlockingFetchGene(1, release), source_name="Jira Board", source_id=source_id
+    )
 
     assert state.last_sync_status == "failed"
     exits = [event for _level, event in log.records if event["stage"] == "document_lifecycle_exit"]
@@ -2369,6 +2425,8 @@ async def test_document_last_modified_becomes_memory_source_updated_at(db: Datab
         type="confluence",
         name="Documents",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     memory_engine = RecordingMemoryEngine()
     orchestrator = GeneSyncOrchestrator(
@@ -2406,6 +2464,8 @@ async def test_explicit_source_updated_at_overrides_document_last_modified(db: D
         type="confluence",
         name="Documents",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     memory_engine = RecordingMemoryEngine()
     orchestrator = GeneSyncOrchestrator(
@@ -2467,6 +2527,8 @@ async def test_auth_failure_records_failed_sync_state_without_secondary_error(db
         type="jira",
         name="Auth Failure Source",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     orchestrator = GeneSyncOrchestrator(
         db=db,
@@ -2501,6 +2563,8 @@ async def test_run_all_active_sources_enqueues_durable_runs(db: Database):
         type="jira",
         name="Scheduled Source",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     service = SyncService(db, AppConfig())
 
@@ -2523,12 +2587,16 @@ async def test_source_sync_schedule_round_trips_and_claims_due_sources(db: Datab
         type="jira",
         name="Due Source",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.upsert_source(
         id="src-future",
         type="jira",
         name="Future Source",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.set_source_sync_schedule(
         "src-due",
@@ -2599,6 +2667,8 @@ async def test_enqueue_due_source_sync_runs_advances_schedule_with_run_acceptanc
         type="jira",
         name="Scheduled Due Source",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.set_source_sync_schedule(
         source_id,
@@ -2628,6 +2698,8 @@ async def test_advance_source_sync_schedule_uses_expected_due_timestamp(db: Data
         type="teams",
         name="Scheduled Teams",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.set_source_sync_schedule(
         source_id,
@@ -2671,6 +2743,8 @@ async def test_due_local_source_enqueues_owner_daemon_job_not_server_run(db: Dat
         ),
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
+        access_policy="workspace",
+        owner_user_id="owner-a",
     )
     await db.set_source_sync_schedule(
         source_id,
@@ -2710,6 +2784,8 @@ async def test_due_ownerless_local_source_advances_schedule_without_job(db: Data
         type="teams",
         name="Ownerless Scheduled Teams",
         config_json='{"conversation_ids":["19:conversation@example.test"]}',
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.set_source_sync_schedule(
         source_id,
@@ -2796,9 +2872,7 @@ async def test_queued_force_request_promotes_existing_local_agent_job(db: Databa
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
     )
-    jobs = await db.lease_local_agent_jobs(
-        user_id="owner-a", limit=5, lease_seconds=60
-    )
+    jobs = await db.lease_local_agent_jobs(user_id="owner-a", limit=5, lease_seconds=60)
 
     assert first_created is True
     assert promoted_created is False
@@ -2818,9 +2892,7 @@ async def test_leased_force_request_creates_serial_successor_job(db: Database):
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
     )
-    leased = await db.lease_local_agent_jobs(
-        user_id="owner-a", limit=1, lease_seconds=60
-    )
+    leased = await db.lease_local_agent_jobs(user_id="owner-a", limit=1, lease_seconds=60)
     promoted_id, created = await db.enqueue_local_agent_job(
         job_id="laj-leased-force",
         source_id="src-local",
@@ -2830,9 +2902,7 @@ async def test_leased_force_request_creates_serial_successor_job(db: Database):
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
     )
-    blocked = await db.lease_local_agent_jobs(
-        user_id="owner-a", limit=5, lease_seconds=60
-    )
+    blocked = await db.lease_local_agent_jobs(user_id="owner-a", limit=5, lease_seconds=60)
     await db.complete_local_agent_job(
         job_id=first_id,
         user_id="owner-a",
@@ -2842,9 +2912,7 @@ async def test_leased_force_request_creates_serial_successor_job(db: Database):
         error=None,
         retryable=False,
     )
-    successor = await db.lease_local_agent_jobs(
-        user_id="owner-a", limit=5, lease_seconds=60
-    )
+    successor = await db.lease_local_agent_jobs(user_id="owner-a", limit=5, lease_seconds=60)
 
     assert leased[0]["job_id"] == first_id
     assert promoted_id != first_id
@@ -2866,9 +2934,7 @@ async def test_expired_original_and_successor_are_not_released_in_same_batch(db:
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
     )
-    await db.lease_local_agent_jobs(
-        user_id="owner-a", limit=1, lease_seconds=60, now=now
-    )
+    await db.lease_local_agent_jobs(user_id="owner-a", limit=1, lease_seconds=60, now=now)
     successor_id, _ = await db.enqueue_local_agent_job(
         job_id="laj-expired-successor",
         source_id="src-local",
@@ -2903,6 +2969,8 @@ async def test_enqueue_due_source_sync_runs_rolls_back_schedule_when_run_enqueue
         type="jira",
         name="Scheduled Rollback Source",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.set_source_sync_schedule(
         source_id,
@@ -2933,6 +3001,8 @@ async def test_scheduler_enqueues_due_source_and_advances_next_run(db: Database)
         type="jira",
         name="Scheduled Due Source",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.set_source_sync_schedule(
         source_id,
@@ -2963,6 +3033,8 @@ async def test_scheduler_coalesces_active_due_source_and_advances_next_run(db: D
         type="jira",
         name="Scheduled Running Source",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.set_source_sync_schedule(
         source_id,
@@ -3012,6 +3084,8 @@ async def test_sync_service_enqueue_source_creates_durable_run_without_local_tas
         type="jira",
         name="Enqueue Service",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     service = SyncService(db, AppConfig())
 
@@ -3035,6 +3109,8 @@ async def test_sync_service_rejects_source_while_deletion_is_in_progress(db: Dat
         type="jira",
         name="Deleting Service",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.db.execute("UPDATE sources SET status = 'deleting' WHERE id = ?", (source_id,))
     await db.db.commit()
@@ -3051,6 +3127,8 @@ async def test_database_rejects_direct_enqueue_while_source_is_deleting(db: Data
         type="jira",
         name="Deleting Direct Enqueue",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.db.execute("UPDATE sources SET status = 'deleting' WHERE id = ?", (source_id,))
     await db.db.commit()
@@ -3069,6 +3147,8 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
         type="jira",
         name="Worker Run",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     class CapturingRuntimeProvider:
@@ -3134,6 +3214,8 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
         type="local_markdown",
         name="Snapshot Worker",
         config_json='{"documents_dir":"/server/inbox"}',
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     class CapturingRuntimeProvider:
@@ -3187,11 +3269,14 @@ async def test_source_sync_worker_marks_missing_source_terminal(db: Database, mo
         type="jira",
         name="Deleted Before Run",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     enqueued = await db.enqueue_source_sync_run(
         source_id="src-deleted-before-run",
         trigger="manual",
     )
+
     async def missing_source(source_id: str):
         del source_id
         return None
@@ -3223,6 +3308,8 @@ async def test_source_sync_worker_delays_retryable_failure(db: Database):
         type="jira",
         name="Worker Fail Backoff",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     class FailingRuntimeProvider:
@@ -3273,6 +3360,8 @@ async def test_source_sync_worker_retries_failed_final_state(db: Database):
         type="jira",
         name="Worker Final State Failed",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     class FailedStateRuntimeProvider:
@@ -3327,6 +3416,8 @@ async def test_source_sync_worker_retries_partial_final_state(db: Database):
         type="jira",
         name="Worker Partial State",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     class PartialStateRuntimeProvider:
@@ -3373,6 +3464,8 @@ async def test_source_sync_worker_heartbeats_while_run_is_active(db: Database):
         type="jira",
         name="Worker Heartbeat",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
 
@@ -3431,6 +3524,8 @@ async def test_source_sync_worker_persists_pipeline_progress_while_run_is_active
         type="confluence",
         name="Engineering Wiki",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
 
@@ -3487,6 +3582,8 @@ async def test_source_sync_worker_resumes_progress_from_an_expired_lease(db: Dat
         type="github_repo",
         name="Architecture Repo",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-worker-recovered-progress",
     )
     enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
     expired_at = datetime(2026, 7, 13, 7, 0, tzinfo=timezone.utc)
@@ -3627,6 +3724,8 @@ async def test_source_sync_worker_does_not_complete_after_losing_lease(db: Datab
         type="jira",
         name="Worker Lost Lease",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
 
@@ -3683,6 +3782,8 @@ async def test_source_sync_worker_run_forever_polls_until_cancelled(db: Database
         type="jira",
         name="Worker Loop",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     class InstantRuntimeProvider:
@@ -3736,6 +3837,8 @@ async def test_sync_service_passes_force_full_sync_to_source_task(db: Database, 
         type="jira",
         name="Force Service",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     service = SyncService(db, AppConfig())
     captured: dict[str, object] = {}
@@ -3762,12 +3865,16 @@ async def test_sync_service_limits_active_sources_without_rejecting_queued_sourc
         type="jira",
         name="Source A",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.upsert_source(
         id="src-b",
         type="jira",
         name="Source B",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     service = SyncService(
         db,
@@ -3813,6 +3920,8 @@ async def test_sync_service_queues_ten_requested_sources_with_two_active(
             type="jira",
             name=f"Source {source_id}",
             config_json="{}",
+            access_policy="workspace",
+            owner_user_id="dev",
         )
     service = SyncService(
         db,
@@ -3850,12 +3959,16 @@ async def test_cancel_queued_source_clears_progress(db: Database, monkeypatch):
         type="jira",
         name="Active Source",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await db.upsert_source(
         id="src-queued",
         type="jira",
         name="Queued Source",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     service = SyncService(
         db,
@@ -3929,6 +4042,8 @@ async def test_sync_service_passes_shared_extraction_pool_to_runtime_provider(db
         type="jira",
         name="Shared Pool Source",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     class CapturingRuntimeProvider:
@@ -3972,6 +4087,8 @@ async def test_sync_service_passes_shared_document_lifecycle_admission_to_runtim
         type="jira",
         name="Shared Document Admission Source",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
 
     class CapturingRuntimeProvider:
@@ -4026,6 +4143,8 @@ async def test_requested_sync_runs_after_active_source_sync_finishes(db: Databas
         type="jira",
         name="Queued Source",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     service = SyncService(db, AppConfig())
     first_release = asyncio.Event()
@@ -4065,6 +4184,8 @@ async def test_upsert_sync_state_updates_source_last_sync(db: Database):
         type="teams",
         name="Team Chat",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     sync_at = datetime.now(timezone.utc)
 
@@ -4090,6 +4211,8 @@ async def test_document_is_indexed_before_enrichment(db: Database):
         type="jira",
         name="Jira Board",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     release = asyncio.Event()
     release.set()
@@ -4122,6 +4245,8 @@ async def test_full_document_extraction_failure_is_audited(db: Database):
         type="docs",
         name="Docs",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     memory_store = _audited_memory_store(db)
     orchestrator = GeneSyncOrchestrator(
@@ -4355,6 +4480,8 @@ async def test_large_full_document_uses_deterministic_units(db: Database):
         type="github_pages",
         name="Documents",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     markdown = "# Design Doc\n\nIntro.\n\n" + "\n\n".join(
         f"## Section {index}\n\n" + ("Durable design detail. " * 900) for index in range(8)
@@ -4502,6 +4629,8 @@ async def test_item_processing_is_bounded_by_max_concurrent(db: Database):
         type="jira",
         name="Jira Board",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     release = asyncio.Event()
     gene = BlockingFetchGene(item_count=5, release=release)
@@ -4537,6 +4666,8 @@ async def test_running_progress_reports_extracted_memories(db: Database):
         type="jira",
         name="Jira Board",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     release = asyncio.Event()
     release.set()
@@ -4559,20 +4690,16 @@ async def test_running_progress_reports_extracted_memories(db: Database):
     )
 
     assert any(event.get("memories_extracted") == 3 for event in progress_events)
-    assert [
-        event["current"]
-        for event in progress_events
-        if event.get("phase") == "discovering"
-    ] == [0, 1]
-    reconciliation = [
-        event for event in progress_events if event.get("phase") == "detecting_deletions"
+    assert [event["current"] for event in progress_events if event.get("phase") == "discovering"] == [0, 1]
+    reconciliation = [event for event in progress_events if event.get("phase") == "detecting_deletions"]
+    assert reconciliation == [
+        {
+            "phase": "detecting_deletions",
+            "current": 0,
+            "total": 0,
+            "title": None,
+        }
     ]
-    assert reconciliation == [{
-        "phase": "detecting_deletions",
-        "current": 0,
-        "total": 0,
-        "title": None,
-    }]
 
 
 @pytest.mark.asyncio
@@ -4583,6 +4710,8 @@ async def test_document_vector_failure_happens_before_memory_mutations(db: Datab
         type="jira",
         name="Jira Board",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     release = asyncio.Event()
     release.set()
@@ -4627,6 +4756,8 @@ async def test_falsey_document_collection_still_receives_vector_upsert(db: Datab
         type="jira",
         name="Jira Board",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     release = asyncio.Event()
     release.set()
@@ -4668,6 +4799,8 @@ async def test_document_vector_text_is_independent_of_extracted_entity_names(db:
         type="jira",
         name="Jira Board",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     release = asyncio.Event()
     release.set()
@@ -5080,6 +5213,8 @@ async def test_embedding_connection_failure_is_reported_as_provider_unreachable(
         type="jira",
         name="Jira Board",
         config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     release = asyncio.Event()
     release.set()

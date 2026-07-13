@@ -23,8 +23,7 @@ class InspectableCollection:
         result: dict[str, Any] = {"ids": ids}
         if "metadatas" in include:
             result["metadatas"] = [
-                {k: v for k, v in self.records[record_id].items() if k != "embedding"}
-                for record_id in ids
+                {k: v for k, v in self.records[record_id].items() if k != "embedding"} for record_id in ids
             ]
         if "embeddings" in include:
             result["embeddings"] = [self.records[record_id].get("embedding") for record_id in ids]
@@ -124,9 +123,7 @@ async def test_health_reports_stale_fts_content(db: Database):
 
     report = await checker.check()
 
-    assert ("fts_content_mismatch", active.id) in {
-        (issue.kind, issue.memory_id) for issue in report.issues
-    }
+    assert ("fts_content_mismatch", active.id) in {(issue.kind, issue.memory_id) for issue in report.issues}
 
 
 @pytest.mark.asyncio
@@ -142,9 +139,7 @@ async def test_health_reports_duplicate_fts_rows(db: Database):
 
     report = await checker.check()
 
-    assert ("fts_duplicate", active.id) in {
-        (issue.kind, issue.memory_id) for issue in report.issues
-    }
+    assert ("fts_duplicate", active.id) in {(issue.kind, issue.memory_id) for issue in report.issues}
 
 
 @pytest.mark.asyncio
@@ -158,9 +153,7 @@ async def test_health_reports_fts_orphan(db: Database):
 
     report = await checker.check()
 
-    assert ("fts_orphan", "mem-orphan-fts") in {
-        (issue.kind, issue.memory_id) for issue in report.issues
-    }
+    assert ("fts_orphan", "mem-orphan-fts") in {(issue.kind, issue.memory_id) for issue in report.issues}
 
 
 @pytest.mark.asyncio
@@ -183,16 +176,16 @@ async def test_health_reports_memory_chroma_content_hash_mismatch(db: Database):
     await db.insert_memory(active)
     checker = MemoryIndexHealthChecker(
         db=db,
-        memory_collection=InspectableCollection({
-            active.id: {"status": "active", "content_hash": "old-hash"},
-        }),
+        memory_collection=InspectableCollection(
+            {
+                active.id: {"status": "active", "content_hash": "old-hash"},
+            }
+        ),
     )
 
     report = await checker.check()
 
-    assert ("chroma_content_hash_mismatch", active.id) in {
-        (issue.kind, issue.memory_id) for issue in report.issues
-    }
+    assert ("chroma_content_hash_mismatch", active.id) in {(issue.kind, issue.memory_id) for issue in report.issues}
 
 
 @pytest.mark.asyncio
@@ -201,16 +194,16 @@ async def test_health_reports_memory_chroma_missing_content_hash(db: Database):
     await db.insert_memory(active)
     checker = MemoryIndexHealthChecker(
         db=db,
-        memory_collection=InspectableCollection({
-            active.id: {"status": "active"},
-        }),
+        memory_collection=InspectableCollection(
+            {
+                active.id: {"status": "active"},
+            }
+        ),
     )
 
     report = await checker.check()
 
-    assert ("chroma_content_hash_missing", active.id) in {
-        (issue.kind, issue.memory_id) for issue in report.issues
-    }
+    assert ("chroma_content_hash_missing", active.id) in {(issue.kind, issue.memory_id) for issue in report.issues}
 
 
 @pytest.mark.asyncio
@@ -219,16 +212,16 @@ async def test_health_reports_memory_chroma_missing_status(db: Database):
     await db.insert_memory(active)
     checker = MemoryIndexHealthChecker(
         db=db,
-        memory_collection=InspectableCollection({
-            active.id: {"content_hash": active.content_hash},
-        }),
+        memory_collection=InspectableCollection(
+            {
+                active.id: {"content_hash": active.content_hash},
+            }
+        ),
     )
 
     report = await checker.check()
 
-    assert ("chroma_status_missing", active.id) in {
-        (issue.kind, issue.memory_id) for issue in report.issues
-    }
+    assert ("chroma_status_missing", active.id) in {(issue.kind, issue.memory_id) for issue in report.issues}
 
 
 @pytest.mark.asyncio
@@ -237,9 +230,11 @@ async def test_health_reports_memory_chroma_embedding_text_hash_missing(db: Data
     await db.insert_memory(active)
     checker = MemoryIndexHealthChecker(
         db=db,
-        memory_collection=InspectableCollection({
-            active.id: {"status": "active", "content_hash": active.content_hash},
-        }),
+        memory_collection=InspectableCollection(
+            {
+                active.id: {"status": "active", "content_hash": active.content_hash},
+            }
+        ),
     )
 
     report = await checker.check()
@@ -255,14 +250,16 @@ async def test_health_reports_memory_chroma_embedding_vector_hash_mismatch(db: D
     await db.insert_memory(active)
     checker = MemoryIndexHealthChecker(
         db=db,
-        memory_collection=InspectableCollection({
-            active.id: {
-                "status": "active",
-                "content_hash": active.content_hash,
-                "embedding": [0.1, 0.2, 0.3],
-                "embedding_vector_hash": embedding_vector_hash([0.3, 0.2, 0.1]),
-            },
-        }),
+        memory_collection=InspectableCollection(
+            {
+                active.id: {
+                    "status": "active",
+                    "content_hash": active.content_hash,
+                    "embedding": [0.1, 0.2, 0.3],
+                    "embedding_vector_hash": embedding_vector_hash([0.3, 0.2, 0.1]),
+                },
+            }
+        ),
     )
 
     report = await checker.check()
@@ -299,9 +296,7 @@ async def test_health_reports_document_missing_from_chroma(db: Database):
 
     report = await checker.check()
 
-    assert ("document_missing_chroma", "doc-active") in {
-        (issue.kind, issue.memory_id) for issue in report.issues
-    }
+    assert ("document_missing_chroma", "doc-active") in {(issue.kind, issue.memory_id) for issue in report.issues}
 
 
 @pytest.mark.asyncio
@@ -314,9 +309,7 @@ async def test_health_reports_document_chroma_orphan(db: Database):
 
     report = await checker.check()
 
-    assert ("document_chroma_orphan", "doc-stale") in {
-        (issue.kind, issue.memory_id) for issue in report.issues
-    }
+    assert ("document_chroma_orphan", "doc-stale") in {(issue.kind, issue.memory_id) for issue in report.issues}
 
 
 @pytest.mark.asyncio
@@ -332,9 +325,11 @@ async def test_health_reports_document_chroma_content_hash_mismatch(db: Database
     checker = MemoryIndexHealthChecker(
         db=db,
         memory_collection=InspectableCollection({}),
-        document_collection=InspectableCollection({
-            "doc-current": {"content_hash": "hash-old", "version": "v1"},
-        }),
+        document_collection=InspectableCollection(
+            {
+                "doc-current": {"content_hash": "hash-old", "version": "v1"},
+            }
+        ),
     )
 
     report = await checker.check()
@@ -384,9 +379,11 @@ async def test_health_reports_document_chroma_missing_embedding_text_hash(db: Da
     checker = MemoryIndexHealthChecker(
         db=db,
         memory_collection=InspectableCollection({}),
-        document_collection=InspectableCollection({
-            "doc-no-embedding-hash": {"content_hash": "hash-current", "version": "v2"},
-        }),
+        document_collection=InspectableCollection(
+            {
+                "doc-no-embedding-hash": {"content_hash": "hash-current", "version": "v2"},
+            }
+        ),
     )
 
     report = await checker.check()
@@ -409,13 +406,15 @@ async def test_health_reports_document_chroma_embedding_vector_hash_missing(db: 
     checker = MemoryIndexHealthChecker(
         db=db,
         memory_collection=InspectableCollection({}),
-        document_collection=InspectableCollection({
-            "doc-no-vector-hash": {
-                "content_hash": "hash-current",
-                "version": "v2",
-                "embedding": [0.1, 0.2, 0.3],
-            },
-        }),
+        document_collection=InspectableCollection(
+            {
+                "doc-no-vector-hash": {
+                    "content_hash": "hash-current",
+                    "version": "v2",
+                    "embedding": [0.1, 0.2, 0.3],
+                },
+            }
+        ),
     )
 
     report = await checker.check()
@@ -435,15 +434,15 @@ async def test_health_reports_document_chroma_unavailable(db: Database):
 
     report = await checker.check()
 
-    assert ("document_chroma_unavailable", None) in {
-        (issue.kind, issue.memory_id) for issue in report.issues
-    }
+    assert ("document_chroma_unavailable", None) in {(issue.kind, issue.memory_id) for issue in report.issues}
 
 
 @pytest.mark.asyncio
 async def test_health_reports_confluence_document_missing_pdf_uri(db: Database):
     now = datetime.now(timezone.utc).isoformat()
-    await db.upsert_source("src-conf", "confluence", "Architecture", "{}")
+    await db.upsert_source(
+        "src-conf", "confluence", "Architecture", "{}", access_policy="workspace", owner_user_id="dev"
+    )
     await db.db.execute(
         """INSERT INTO documents
            (doc_id, source, source_url, title, space_or_project, last_modified, version,

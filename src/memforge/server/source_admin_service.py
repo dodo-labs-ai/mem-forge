@@ -10,6 +10,12 @@ from memforge.local_agent.source_contract import (
     is_local_agent_backed_source,
     source_execution_descriptor,
 )
+from memforge.source_access import (
+    SourceAccessPolicy,
+    source_access_policy,
+    source_is_discoverable,
+    source_owner_user_id,
+)
 from memforge.sync_progress import source_progress_unit, source_sync_progress_from_pipeline
 from memforge.storage.admin_source import SourceAdminReader
 
@@ -32,8 +38,8 @@ def _is_managed_source_type(source_type: str) -> bool:
 def source_viewer_relationship(
     source: dict[str, Any], *, viewer_id: str, viewer_role: str
 ) -> str:
-    if str(source.get("created_by_user_id") or "") == viewer_id:
-        return "creator"
+    if source_owner_user_id(source) == viewer_id:
+        return "owner"
     if viewer_role == WORKSPACE_ADMIN_ROLE:
         return WORKSPACE_ADMIN_ROLE
     return normalize_workspace_role(viewer_role)
@@ -42,14 +48,14 @@ def source_viewer_relationship(
 def can_manage_source(
     source: dict[str, Any], *, viewer_id: str, viewer_role: str
 ) -> bool:
-    if _is_managed_source_type(str(source.get("type") or "")):
+    if not source_is_discoverable(source, viewer_id=viewer_id):
         return False
-    if viewer_role == WORKSPACE_ADMIN_ROLE:
+    if source_owner_user_id(source) == viewer_id:
         return True
-    created_by = source.get("created_by_user_id")
-    if not created_by:
-        return False
-    return viewer_role == MEMBER_ROLE and str(created_by) == viewer_id
+    return (
+        source_access_policy(source) is SourceAccessPolicy.WORKSPACE
+        and viewer_role == WORKSPACE_ADMIN_ROLE
+    )
 
 
 def source_ownership_and_capabilities(
@@ -59,22 +65,31 @@ def source_ownership_and_capabilities(
         source, viewer_id=viewer_id, viewer_role=viewer_role
     )
     can_manage = can_manage_source(source, viewer_id=viewer_id, viewer_role=viewer_role)
+    managed_source = _is_managed_source_type(str(source.get("type") or ""))
     local_agent_backed = is_local_agent_backed_source(source)
     execution_owner = execution_owner_user_id(source)
     can_execute_locally = execution_owner is not None and execution_owner == viewer_id
     ownership = {
         "created_by_user_id": source.get("created_by_user_id"),
+        "owner_user_id": source_owner_user_id(source),
         "execution_owner_user_id": execution_owner,
         "viewer_role": viewer_role,
         "viewer_relationship": relationship,
     }
     capabilities = {
         "can_subscribe": True,
-        "can_configure": can_manage,
-        "can_configure_connection": can_execute_locally if local_agent_backed else can_manage,
-        "can_sync": can_execute_locally if local_agent_backed else can_manage,
-        "can_force_resync": can_execute_locally if local_agent_backed else can_manage,
-        "can_delete": can_manage,
+        "can_configure": can_manage and not managed_source,
+        "can_configure_connection": (
+            can_execute_locally if local_agent_backed else can_manage and not managed_source
+        ),
+        "can_sync": (
+            can_execute_locally if local_agent_backed else can_manage and not managed_source
+        ),
+        "can_force_resync": (
+            can_execute_locally if local_agent_backed else can_manage and not managed_source
+        ),
+        "can_delete": can_manage and not managed_source,
+        "can_change_access": can_manage,
     }
     return ownership, capabilities
 
@@ -122,6 +137,8 @@ async def list_source_admin_rows(
     rows: list[dict[str, Any]] = []
     viewer_role = normalize_workspace_role(viewer_role)
     for source in await reader.list_sources():
+        if not source_is_discoverable(source, viewer_id=viewer_id):
+            continue
         row = dict(source)
         source_id = str(row.get("id") or "")
         ownership, capabilities = source_ownership_and_capabilities(
@@ -145,6 +162,9 @@ async def list_source_admin_rows(
             owner_user_id=viewer_id,
         )
         row["doc_count"] = await reader.count_documents(source=source_id)
+        row["access_transition"] = await reader.get_active_source_access_transition(
+            source_id
+        )
         row.setdefault("client", None)
         durable_run = await reader.get_latest_source_sync_run(source_id=source_id)
         if durable_run is not None and durable_run.status in {"pending", "running"}:

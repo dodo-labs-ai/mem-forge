@@ -17,10 +17,12 @@ def test_missing_or_expired_browser_session_requires_authentication():
 
 
 def test_principal_conflict_takes_precedence_over_authentication_status():
-    assert connection_status_from_browser_session({
-        "status": "active",
-        "principal_changed": True,
-    }) == {
+    assert connection_status_from_browser_session(
+        {
+            "status": "active",
+            "principal_changed": True,
+        }
+    ) == {
         "state": "action_required",
         "reason": "identity_conflict",
     }

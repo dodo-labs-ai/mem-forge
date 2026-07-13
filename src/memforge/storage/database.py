@@ -8,6 +8,7 @@ FTS5 rows must be manually synced on insert/update/delete of memories.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
@@ -49,6 +50,7 @@ from memforge.models import (
     UNSORTED_PROJECT_KEY,
     Visibility,
     canonicalize_entity_name,
+    slugify,
     source_artifact_cleanup_task_id,
 )
 from memforge.memory.evidence import (
@@ -73,6 +75,7 @@ from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
 from memforge.retrieval.access_predicate import visible_sql
 from memforge.retrieval.metadata_text import metadata_alias_text, metadata_compact_text
+from memforge.source_access import infer_legacy_source_access
 from memforge.storage.admin_memory import (
     MemoryAdminListFilters,
     MemoryAdminQueryPage,
@@ -87,6 +90,25 @@ from memforge.storage.admin_source import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _agent_session_source_id_for_owner(client: str, owner_user_id: str) -> str:
+    owner_fingerprint = hashlib.sha256(owner_user_id.encode("utf-8")).hexdigest()[:16]
+    return f"src-agent-sessions-{slugify(client)[:32]}-{owner_fingerprint}"
+
+
+def _legacy_agent_session_client(source_id: str) -> str:
+    prefix = "src-agent-sessions-"
+    if source_id == "src-agent-sessions":
+        return ""
+    if not source_id.startswith(prefix):
+        return ""
+    suffix = source_id[len(prefix) :]
+    if suffix.startswith("claude-code"):
+        return "claude-code"
+    if suffix.startswith("codex"):
+        return "codex"
+    return suffix.rsplit("-", 1)[0]
 
 # The three current outcomes an uploaded agent-session window can record.
 # Knowledge completeness ("how much was kept vs dropped as no_output") is read
@@ -721,12 +743,47 @@ CREATE TABLE IF NOT EXISTS sources (
     doc_count       INTEGER DEFAULT 0,
     project_binding TEXT,                    -- JSON: {"mode": "fixed", ...} or {"mode": "by_field", ...}
     created_by_user_id TEXT,
+    owner_user_id   TEXT NOT NULL,
+    access_policy   TEXT NOT NULL CHECK (access_policy IN ('private', 'workspace')),
+    access_state    TEXT NOT NULL DEFAULT 'active'
+                    CHECK (access_state IN ('active', 'changing', 'orphaned_private')),
     execution_owner_user_id TEXT,
     sync_schedule_enabled INTEGER NOT NULL DEFAULT 0,
     sync_schedule_interval_minutes INTEGER NOT NULL DEFAULT 1440,
     sync_schedule_next_at TEXT,
     sync_schedule_updated_at TEXT,
     created_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS source_access_transitions (
+    operation_id          TEXT PRIMARY KEY,
+    source_id             TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    idempotency_key       TEXT NOT NULL,
+    actor_user_id         TEXT NOT NULL,
+    previous_policy       TEXT NOT NULL CHECK (previous_policy IN ('private', 'workspace')),
+    target_policy         TEXT NOT NULL CHECK (target_policy IN ('private', 'workspace')),
+    previous_source_status TEXT NOT NULL,
+    status                TEXT NOT NULL
+                          CHECK (status IN ('queued', 'running', 'failed', 'completed', 'reverted')),
+    total_memories        INTEGER NOT NULL DEFAULT 0,
+    processed_memories    INTEGER NOT NULL DEFAULT 0,
+    error_code            TEXT,
+    error_message         TEXT,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL,
+    completed_at          TEXT,
+    UNIQUE (source_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_source_access_transitions_status
+    ON source_access_transitions(status, updated_at);
+
+CREATE TABLE IF NOT EXISTS source_access_transition_memory_map (
+    operation_id       TEXT NOT NULL REFERENCES source_access_transitions(operation_id) ON DELETE CASCADE,
+    source_id          TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    original_memory_id TEXT NOT NULL,
+    target_memory_id   TEXT NOT NULL,
+    PRIMARY KEY (operation_id, original_memory_id),
+    UNIQUE (operation_id, target_memory_id)
 );
 
 CREATE TABLE IF NOT EXISTS source_subscriptions (
@@ -823,7 +880,7 @@ CREATE TABLE IF NOT EXISTS agent_concepts (
     created_at          TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
     last_observed_at    TEXT NOT NULL,
-    CHECK (visibility = 'private')
+    CHECK (visibility IN ('private', 'workspace'))
 );
 
 CREATE TABLE IF NOT EXISTS agent_claims (
@@ -1986,6 +2043,93 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                  AND json_type(config, '$.repo_path') IS NOT NULL""",
         ],
     ),
+    (
+        42,
+        "Materialize Source access policy and ownership",
+        [
+            "ALTER TABLE sources ADD COLUMN owner_user_id TEXT",
+            "ALTER TABLE sources ADD COLUMN access_policy TEXT",
+            "ALTER TABLE sources ADD COLUMN access_state TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_sources_access ON sources(access_policy, owner_user_id, access_state)",
+        ],
+    ),
+    (
+        43,
+        "Add durable Source access transitions",
+        [
+            """CREATE TABLE IF NOT EXISTS source_access_transitions (
+                operation_id          TEXT PRIMARY KEY,
+                source_id             TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                idempotency_key       TEXT NOT NULL,
+                actor_user_id         TEXT NOT NULL,
+                previous_policy       TEXT NOT NULL CHECK (previous_policy IN ('private', 'workspace')),
+                target_policy         TEXT NOT NULL CHECK (target_policy IN ('private', 'workspace')),
+                previous_source_status TEXT NOT NULL,
+                status                TEXT NOT NULL
+                                      CHECK (status IN ('queued', 'running', 'failed', 'completed', 'reverted')),
+                total_memories        INTEGER NOT NULL DEFAULT 0,
+                processed_memories    INTEGER NOT NULL DEFAULT 0,
+                error_code            TEXT,
+                error_message         TEXT,
+                created_at            TEXT NOT NULL,
+                updated_at            TEXT NOT NULL,
+                completed_at          TEXT,
+                UNIQUE (source_id, idempotency_key)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_source_access_transitions_status "
+            "ON source_access_transitions(status, updated_at)",
+        ],
+    ),
+    (
+        44,
+        "Allow managed-capture concepts to follow Source access",
+        [
+            "PRAGMA foreign_keys = OFF",
+            """CREATE TABLE agent_concepts_access_new (
+                id                  TEXT PRIMARY KEY,
+                source_id           TEXT NOT NULL,
+                owner_user_id       TEXT NOT NULL,
+                visibility          TEXT NOT NULL DEFAULT 'private',
+                workspace           TEXT NOT NULL,
+                repo_identifier     TEXT,
+                concept_type        TEXT NOT NULL,
+                concept_path        TEXT NOT NULL,
+                title               TEXT NOT NULL,
+                markdown_body       TEXT NOT NULL,
+                frontmatter_json    TEXT NOT NULL DEFAULT '{}',
+                created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+                last_observed_at    TEXT NOT NULL,
+                CHECK (visibility IN ('private', 'workspace'))
+            )""",
+            """INSERT INTO agent_concepts_access_new
+               SELECT * FROM agent_concepts""",
+            "DROP TABLE agent_concepts",
+            "ALTER TABLE agent_concepts_access_new RENAME TO agent_concepts",
+            "CREATE INDEX IF NOT EXISTS idx_agent_concepts_owner_repo "
+            "ON agent_concepts(owner_user_id, repo_identifier)",
+            "PRAGMA foreign_keys = ON",
+        ],
+    ),
+    (
+        45,
+        "Partition legacy coding-session sources by owner",
+        ["SELECT 1"],
+    ),
+    (
+        46,
+        "Persist reversible Source access memory splits",
+        [
+            """CREATE TABLE IF NOT EXISTS source_access_transition_memory_map (
+                operation_id       TEXT NOT NULL REFERENCES source_access_transitions(operation_id) ON DELETE CASCADE,
+                source_id          TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                original_memory_id TEXT NOT NULL,
+                target_memory_id   TEXT NOT NULL,
+                PRIMARY KEY (operation_id, original_memory_id),
+                UNIQUE (operation_id, target_memory_id)
+            )""",
+        ],
+    ),
 ]
 
 
@@ -2051,13 +2195,288 @@ class Database:
                 await self._backfill_relation_run_snapshot_audit()
             if version in (30, 31):
                 await self._rebuild_memory_metadata_fts_unlocked()
+            if version == 42:
+                await self._migrate_source_access_policy_unlocked()
+            if version == 45:
+                await self._partition_legacy_agent_session_sources_unlocked()
             await self.db.execute(
                 "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, _now_iso()),
             )
             await self.db.commit()
+            if version == 44:
+                # SQLite ignores attempts to enable foreign keys while a
+                # transaction is active. Migration 44 disables them before a
+                # table rebuild, so restore the connection invariant only
+                # after the migration transaction has committed.
+                await self.db.execute("PRAGMA foreign_keys = ON")
+                async with self.db.execute("PRAGMA foreign_keys") as cursor:
+                    foreign_keys = await cursor.fetchone()
+                if not foreign_keys or int(foreign_keys[0]) != 1:
+                    raise RuntimeError("failed to restore SQLite foreign key enforcement")
             logger.info("Applied migration %d: %s", version, description)
         await self._assert_memory_source_ids_resolved()
+
+    async def _migrate_source_access_policy_unlocked(self) -> None:
+        """Materialize legacy Source access without guessing.
+
+        Existing Memory visibility is the effective pre-migration policy. An
+        empty configured Source preserves the old workspace writer behavior.
+        Coding-session Sources are private here and are partitioned by owner in
+        migration 45. Missing ownership or mixed historical access stops the
+        migration so operators can repair the data explicitly.
+        """
+
+        async with self.db.execute("SELECT * FROM sources ORDER BY id") as cursor:
+            sources = [dict(row) async for row in cursor]
+
+        for source in sources:
+            source_id = str(source["id"])
+            explicit_owner = str(source.get("owner_user_id") or "").strip()
+            explicit_policy = str(source.get("access_policy") or "").strip()
+            explicit_state = str(source.get("access_state") or "").strip()
+            if explicit_policy or explicit_owner or explicit_state:
+                if (
+                    explicit_policy not in {"private", "workspace"}
+                    or not explicit_owner
+                    or explicit_state not in {"active", "changing", "orphaned_private"}
+                ):
+                    raise RuntimeError(
+                        f"source access metadata is incomplete or invalid: {source_id}"
+                    )
+                continue
+
+            async with self.db.execute(
+                """SELECT DISTINCT m.visibility, m.owner_user_id
+                     FROM memories m
+                     JOIN memory_sources ms ON ms.memory_id = m.id
+                    WHERE ms.source_id = ? AND m.status = 'active'""",
+                (source_id,),
+            ) as cursor:
+                access_rows = [dict(row) async for row in cursor]
+            try:
+                policy_value, owner_user_id = infer_legacy_source_access(
+                    source_id=source_id,
+                    source_type=str(source.get("type") or ""),
+                    provenance_owner_user_id=(
+                        source.get("created_by_user_id")
+                        or source.get("execution_owner_user_id")
+                    ),
+                    memory_access=(
+                        (str(row.get("visibility") or ""), row.get("owner_user_id"))
+                        for row in access_rows
+                    ),
+                )
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
+            policy = policy_value.value
+
+            await self.db.execute(
+                """UPDATE sources
+                      SET owner_user_id = ?, access_policy = ?, access_state = 'active'
+                    WHERE id = ?""",
+                (owner_user_id, policy, source_id),
+            )
+
+    async def _partition_legacy_agent_session_sources_unlocked(self) -> None:
+        """Split pre-access coding Sources into one private Source per owner.
+
+        This is an explicit one-time migration. Runtime reads never infer an owner
+        or fall back to a legacy shared Source.
+        """
+
+        async with self.db.execute(
+            "SELECT * FROM sources WHERE type = 'agent_session' ORDER BY id"
+        ) as cursor:
+            legacy_sources = [dict(row) async for row in cursor]
+
+        for source in legacy_sources:
+            source_id = str(source["id"])
+            source_owner = str(source.get("owner_user_id") or "").strip()
+            config = json.loads(source.get("config") or "{}")
+            client = str(config.get("client") or "").strip()
+            if not client:
+                async with self.db.execute(
+                    "SELECT client FROM documents WHERE source = ? AND client IS NOT NULL LIMIT 1",
+                    (source_id,),
+                ) as cursor:
+                    client_row = await cursor.fetchone()
+                client = str(client_row["client"] if client_row else "").strip()
+            if not client:
+                client = _legacy_agent_session_client(source_id)
+            if not client or not source_owner:
+                raise RuntimeError(
+                    f"cannot partition legacy agent-session source without client and owner: {source_id}"
+                )
+            expected_source_id = _agent_session_source_id_for_owner(client, source_owner)
+            if source_id == expected_source_id:
+                continue
+
+            async with self.db.execute(
+                """SELECT d.doc_id,
+                          COALESCE(
+                              NULLIF(json_extract(r.metadata, '$.user_id'), ''),
+                              (
+                                  SELECT NULLIF(m.owner_user_id, '')
+                                  FROM memory_sources ms
+                                  JOIN memories m ON m.id = ms.memory_id
+                                  WHERE ms.doc_id = d.doc_id
+                                    AND m.owner_user_id IS NOT NULL
+                                  LIMIT 1
+                              ),
+                              ?
+                          ) AS owner_user_id
+                   FROM documents d
+                   LEFT JOIN agent_session_receipts r ON r.doc_id = d.doc_id
+                   WHERE d.source = ?""",
+                (source_owner, source_id),
+            ) as cursor:
+                document_owners = {
+                    str(row["doc_id"]): str(row["owner_user_id"]).strip()
+                    async for row in cursor
+                }
+
+            owners = {owner for owner in document_owners.values() if owner}
+            async with self.db.execute(
+                "SELECT DISTINCT owner_user_id FROM agent_concepts WHERE source_id = ?",
+                (source_id,),
+            ) as cursor:
+                async for row in cursor:
+                    owner = str(row["owner_user_id"]).strip()
+                    if owner:
+                        owners.add(owner)
+            async with self.db.execute(
+                "SELECT DISTINCT owner_user_id FROM evidence_units WHERE source_id = ? AND owner_user_id IS NOT NULL",
+                (source_id,),
+            ) as cursor:
+                async for row in cursor:
+                    owner = str(row["owner_user_id"]).strip()
+                    if owner:
+                        owners.add(owner)
+            owners.add(source_owner)
+
+            for owner in sorted(owners):
+                target_source_id = _agent_session_source_id_for_owner(client, owner)
+                target_config = dict(config)
+                target_config["client"] = client
+                documents_dir = str(target_config.get("documents_dir") or "").strip()
+                if documents_dir:
+                    target_config["documents_dir"] = str(Path(documents_dir).parent / target_source_id)
+                await self.db.execute(
+                    """INSERT INTO sources (
+                           id, type, name, config, status, last_sync, doc_count,
+                           project_binding, created_by_user_id, owner_user_id,
+                           access_policy, access_state, execution_owner_user_id,
+                           sync_schedule_enabled, sync_schedule_interval_minutes,
+                           sync_schedule_next_at, sync_schedule_updated_at, created_at
+                       ) VALUES (?, 'agent_session', ?, ?, ?, ?, ?, ?, ?, ?,
+                                 'private', 'active', ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO NOTHING""",
+                    (
+                        target_source_id,
+                        source["name"],
+                        json.dumps(target_config, sort_keys=True),
+                        source["status"],
+                        source.get("last_sync"),
+                        source.get("doc_count", 0),
+                        source.get("project_binding"),
+                        owner,
+                        owner,
+                        owner,
+                        source.get("sync_schedule_enabled", 0),
+                        source.get("sync_schedule_interval_minutes", 1440),
+                        source.get("sync_schedule_next_at"),
+                        source.get("sync_schedule_updated_at"),
+                        source.get("created_at") or _now_iso(),
+                    ),
+                )
+                owned_doc_ids = [
+                    doc_id for doc_id, doc_owner in document_owners.items() if doc_owner == owner
+                ]
+                for doc_id in owned_doc_ids:
+                    await self.db.execute(
+                        "UPDATE documents SET source = ? WHERE doc_id = ?",
+                        (target_source_id, doc_id),
+                    )
+                    await self.db.execute(
+                        "UPDATE agent_session_receipts SET source_id = ? WHERE doc_id = ?",
+                        (target_source_id, doc_id),
+                    )
+                    await self.db.execute(
+                        "UPDATE memory_sources SET source_id = ? WHERE doc_id = ?",
+                        (target_source_id, doc_id),
+                    )
+                await self.db.execute(
+                    """UPDATE agent_concepts
+                       SET source_id = ?, visibility = 'private'
+                       WHERE source_id = ? AND owner_user_id = ?""",
+                    (target_source_id, source_id, owner),
+                )
+                await self.db.execute(
+                    """UPDATE evidence_units
+                       SET source_id = ?, visibility = 'private', owner_user_id = ?,
+                           access_context_hash = NULL
+                       WHERE source_id = ? AND owner_user_id = ?""",
+                    (target_source_id, owner, source_id, owner),
+                )
+                await self.db.execute(
+                    """UPDATE local_agent_jobs SET source_id = ?
+                       WHERE source_id = ? AND execution_owner_user_id = ?""",
+                    (target_source_id, source_id, owner),
+                )
+                await self.db.execute(
+                    """INSERT OR IGNORE INTO source_subscriptions
+                       SELECT ?, user_id, enabled, created_at, updated_at
+                       FROM source_subscriptions WHERE source_id = ? AND user_id = ?""",
+                    (target_source_id, source_id, owner),
+                )
+                await self.db.execute(
+                    """INSERT OR IGNORE INTO source_list_pins
+                       SELECT ?, user_id, pinned_at
+                       FROM source_list_pins WHERE source_id = ? AND user_id = ?""",
+                    (target_source_id, source_id, owner),
+                )
+                await self.db.execute(
+                    """UPDATE memories
+                       SET visibility = 'private', owner_user_id = ?
+                       WHERE id IN (
+                           SELECT ms.memory_id FROM memory_sources ms
+                           WHERE ms.source_id = ?
+                       )
+                         AND NOT EXISTS (
+                           SELECT 1
+                           FROM memory_sources other_ms
+                           JOIN sources other_s ON other_s.id = other_ms.source_id
+                           WHERE other_ms.memory_id = memories.id
+                             AND (
+                               other_s.access_policy = 'workspace'
+                               OR other_s.owner_user_id <> ?
+                             )
+                         )""",
+                    (owner, target_source_id, owner),
+                )
+
+            await self.db.execute(
+                "DELETE FROM source_subscriptions WHERE source_id = ?",
+                (source_id,),
+            )
+            await self.db.execute(
+                "DELETE FROM source_list_pins WHERE source_id = ?",
+                (source_id,),
+            )
+            async with self.db.execute(
+                """SELECT
+                       (SELECT COUNT(*) FROM documents WHERE source = ?) +
+                       (SELECT COUNT(*) FROM memory_sources WHERE source_id = ?) +
+                       (SELECT COUNT(*) FROM evidence_units WHERE source_id = ?) +
+                       (SELECT COUNT(*) FROM agent_concepts WHERE source_id = ?) +
+                       (SELECT COUNT(*) FROM local_agent_jobs WHERE source_id = ?) AS remaining""",
+                (source_id, source_id, source_id, source_id, source_id),
+            ) as cursor:
+                remaining_row = await cursor.fetchone()
+            if int(remaining_row["remaining"] if remaining_row else 0) != 0:
+                raise RuntimeError(f"legacy agent-session source was not fully partitioned: {source_id}")
+            await self.db.execute("DELETE FROM sources WHERE id = ?", (source_id,))
 
     async def _assert_memory_source_ids_resolved(self) -> None:
         """Fail startup when exact source-id provenance cannot be trusted."""
@@ -5256,17 +5675,27 @@ class Database:
         frontmatter: dict[str, Any],
         observed: str,
     ) -> None:
+        async with self.db.execute(
+            "SELECT access_policy, owner_user_id FROM sources WHERE id = ?",
+            (source_id,),
+        ) as cursor:
+            source_access = await cursor.fetchone()
+        if source_access is None:
+            raise ValueError(f"agent concept source does not exist: {source_id}")
+        if str(source_access["owner_user_id"]) != owner_user_id:
+            raise ValueError("agent concept owner must match source owner")
+        visibility = str(source_access["access_policy"])
         await self.db.execute(
             """INSERT INTO agent_concepts (
                 id, source_id, owner_user_id, visibility, workspace,
                 repo_identifier, concept_type, concept_path, title,
                 markdown_body, frontmatter_json, created_at, updated_at,
                 last_observed_at
-            ) VALUES (?, ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 source_id=excluded.source_id,
                 owner_user_id=excluded.owner_user_id,
-                visibility='private',
+                visibility=excluded.visibility,
                 workspace=excluded.workspace,
                 repo_identifier=excluded.repo_identifier,
                 concept_type=excluded.concept_type,
@@ -5280,6 +5709,7 @@ class Database:
                 concept_id,
                 source_id,
                 owner_user_id,
+                visibility,
                 workspace,
                 repo_identifier,
                 concept_type,
@@ -5304,19 +5734,26 @@ class Database:
     async def list_agent_concepts(
         self,
         *,
-        owner_user_id: str,
+        viewer_user_id: str,
         repo_identifier: str | None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         concepts: list[dict[str, Any]] = []
         async with self.db.execute(
-            """SELECT * FROM agent_concepts
-               WHERE visibility = 'private'
-                 AND owner_user_id = ?
-                 AND COALESCE(repo_identifier, '') = COALESCE(?, '')
-               ORDER BY updated_at DESC, id
+            """SELECT c.* FROM agent_concepts c
+               JOIN sources s ON s.id = c.source_id
+               LEFT JOIN source_subscriptions ss
+                 ON ss.source_id = s.id AND ss.user_id = ?
+               WHERE (
+                   (s.access_state = 'active'
+                    AND (s.access_policy = 'workspace' OR s.owner_user_id = ?))
+                   OR (s.access_state = 'changing' AND s.owner_user_id = ?)
+               )
+                 AND COALESCE(ss.enabled, 1) = 1
+                 AND COALESCE(c.repo_identifier, '') = COALESCE(?, '')
+               ORDER BY c.updated_at DESC, c.id
                LIMIT ?""",
-            (owner_user_id, repo_identifier, limit),
+            (viewer_user_id, viewer_user_id, viewer_user_id, repo_identifier, limit),
         ) as cursor:
             async for row in cursor:
                 concepts.append(dict(row))
@@ -6340,6 +6777,9 @@ class Database:
         type: str,
         name: str,
         config_json: str,
+        access_policy: str,
+        owner_user_id: str,
+        access_state: str = "active",
         status: str | None = None,
         project_binding: Mapping[str, Any] | None = None,
         created_by_user_id: str | None = None,
@@ -6351,14 +6791,24 @@ class Database:
         consults when memories are extracted from this source. `None`
         leaves the source unbound and resolves writes to `UNSORTED`.
         """
+        from memforge.source_access import memory_visibility_for_source
+
+        memory_visibility_for_source(
+            {
+                "access_policy": access_policy,
+                "owner_user_id": owner_user_id,
+                "access_state": access_state,
+            }
+        )
         binding_json = json.dumps(dict(project_binding)) if project_binding else None
         async with self._write_lock:
             await self.db.execute(
                 """INSERT INTO sources (
                        id, type, name, config, status, project_binding,
-                       created_by_user_id, execution_owner_user_id
+                       created_by_user_id, owner_user_id, access_policy,
+                       access_state, execution_owner_user_id
                    )
-                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?, ?, ?)
+                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                    type=excluded.type,
                    name=excluded.name,
@@ -6369,6 +6819,9 @@ class Database:
                    END,
                    project_binding=excluded.project_binding,
                    created_by_user_id=COALESCE(sources.created_by_user_id, excluded.created_by_user_id),
+                   owner_user_id=excluded.owner_user_id,
+                   access_policy=excluded.access_policy,
+                   access_state=excluded.access_state,
                    execution_owner_user_id=COALESCE(
                        sources.execution_owner_user_id,
                        excluded.execution_owner_user_id
@@ -6381,6 +6834,9 @@ class Database:
                     status,
                     binding_json,
                     created_by_user_id,
+                    owner_user_id,
+                    access_policy,
+                    access_state,
                     execution_owner_user_id,
                     status,
                 ),
@@ -6408,16 +6864,507 @@ class Database:
             d["sync_schedule"] = _source_schedule_from_row(d)
             return d
 
+    async def create_source_access_transition(
+        self,
+        *,
+        operation_id: str,
+        source_id: str,
+        idempotency_key: str,
+        actor_user_id: str,
+        target_policy: str,
+    ) -> dict[str, Any]:
+        """Start one fail-closed, idempotent Source access transition."""
+        from memforge.source_access import SourceAccessPolicy, source_access_policy
+
+        target = SourceAccessPolicy(target_policy)
+        now = _now_iso()
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    "SELECT * FROM source_access_transitions "
+                    "WHERE source_id = ? AND idempotency_key = ?",
+                    (source_id, idempotency_key),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if existing:
+                    transition = dict(existing)
+                    if transition["target_policy"] != target.value:
+                        raise ValueError("idempotency_key_reused_for_different_target")
+                    return transition
+
+                async with self.db.execute(
+                    "SELECT * FROM sources WHERE id = ?",
+                    (source_id,),
+                ) as cursor:
+                    source_row = await cursor.fetchone()
+                if source_row is None:
+                    raise LookupError("source_not_found")
+                source = dict(source_row)
+                previous = source_access_policy(source)
+                if previous is target:
+                    raise ValueError("source_access_policy_unchanged")
+                if source.get("access_state") != "active":
+                    raise RuntimeError("source_access_transition_already_active")
+                async with self.db.execute(
+                    "SELECT operation_id FROM source_access_transitions "
+                    "WHERE source_id = ? AND status IN ('queued', 'running', 'failed') LIMIT 1",
+                    (source_id,),
+                ) as cursor:
+                    active = await cursor.fetchone()
+                if active:
+                    raise RuntimeError("source_access_transition_already_active")
+
+                async with self.db.execute(
+                    "SELECT COUNT(DISTINCT memory_id) AS total "
+                    "FROM memory_sources WHERE source_id = ?",
+                    (source_id,),
+                ) as cursor:
+                    count_row = await cursor.fetchone()
+                total = int(count_row["total"] if count_row else 0)
+                await self.db.execute(
+                    """INSERT INTO source_access_transitions (
+                           operation_id, source_id, idempotency_key, actor_user_id,
+                           previous_policy, target_policy, previous_source_status,
+                           status, total_memories, processed_memories,
+                           created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, ?)""",
+                    (
+                        operation_id,
+                        source_id,
+                        idempotency_key,
+                        actor_user_id,
+                        previous.value,
+                        target.value,
+                        source["status"],
+                        total,
+                        now,
+                        now,
+                    ),
+                )
+                await self.db.execute(
+                    "UPDATE sources SET access_state = 'changing', status = 'paused' WHERE id = ?",
+                    (source_id,),
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        transition = await self.get_source_access_transition(operation_id)
+        assert transition is not None
+        return transition
+
+    async def get_source_access_transition(self, operation_id: str) -> dict[str, Any] | None:
+        async with self.db.execute(
+            "SELECT * FROM source_access_transitions WHERE operation_id = ?",
+            (operation_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_active_source_access_transition(self, source_id: str) -> dict[str, Any] | None:
+        async with self.db.execute(
+            """SELECT * FROM source_access_transitions
+               WHERE source_id = ? AND status IN ('queued', 'running', 'failed')
+               ORDER BY created_at DESC LIMIT 1""",
+            (source_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def mark_source_access_transition_running(self, operation_id: str) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                """UPDATE source_access_transitions
+                   SET status = 'running', error_code = NULL, error_message = NULL,
+                       updated_at = ?
+                   WHERE operation_id = ? AND status IN ('queued', 'failed', 'running')""",
+                (_now_iso(), operation_id),
+            )
+            await self.db.commit()
+
+    async def mark_source_access_transition_failed(
+        self,
+        operation_id: str,
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                """UPDATE source_access_transitions
+                   SET status = 'failed', error_code = ?, error_message = ?, updated_at = ?
+                   WHERE operation_id = ? AND status <> 'completed'""",
+                (error_code[:100], error_message[:500], _now_iso(), operation_id),
+            )
+            await self.db.commit()
+
+    async def advance_source_access_transition_progress(self, operation_id: str) -> None:
+        """Record one relational/vector access projection as converged."""
+        async with self._write_lock:
+            await self.db.execute(
+                """UPDATE source_access_transitions
+                   SET processed_memories = MIN(total_memories, processed_memories + 1),
+                       updated_at = ?
+                   WHERE operation_id = ? AND status = 'running'""",
+                (_now_iso(), operation_id),
+            )
+            await self.db.commit()
+
+    async def reconcile_source_memory_access(
+        self,
+        *,
+        operation_id: str,
+        source_id: str,
+        target_policy: str,
+        source_owner_user_id: str,
+    ) -> list[str]:
+        """Atomically move one Source's support into its target access context."""
+        from memforge.source_access import SourceAccessPolicy
+
+        target = SourceAccessPolicy(target_policy)
+        target_visibility = target.value
+        target_owner = source_owner_user_id if target is SourceAccessPolicy.PRIVATE else None
+        affected_ids: list[str] = []
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    "SELECT previous_policy FROM source_access_transitions WHERE operation_id = ?",
+                    (operation_id,),
+                ) as cursor:
+                    transition_row = await cursor.fetchone()
+                if transition_row is None:
+                    raise LookupError("source_access_transition_not_found")
+                reverting = str(transition_row["previous_policy"]) == target.value
+                async with self.db.execute(
+                    """SELECT original_memory_id, target_memory_id
+                       FROM source_access_transition_memory_map
+                       WHERE operation_id = ?""",
+                    (operation_id,),
+                ) as cursor:
+                    split_by_target = {
+                        str(row["target_memory_id"]): str(row["original_memory_id"])
+                        async for row in cursor
+                    }
+                target_by_original = {
+                    original_memory_id: target_memory_id
+                    for target_memory_id, original_memory_id in split_by_target.items()
+                }
+                async with self.db.execute(
+                    "SELECT DISTINCT memory_id FROM memory_sources WHERE source_id = ? ORDER BY memory_id",
+                    (source_id,),
+                ) as cursor:
+                    memory_ids = [str(row["memory_id"]) async for row in cursor]
+
+                for memory_id in memory_ids:
+                    memory = await self.get_memory(memory_id)
+                    if memory is None:
+                        continue
+                    original_memory_id = split_by_target.get(memory_id) if reverting else None
+                    if original_memory_id is not None:
+                        await self.db.execute(
+                            """INSERT OR IGNORE INTO memory_sources (
+                                   memory_id, doc_id, source_id, source_type, excerpt,
+                                   support_kind, added_at, source_updated_at
+                               )
+                               SELECT ?, doc_id, source_id, source_type, excerpt,
+                                      support_kind, added_at, source_updated_at
+                               FROM memory_sources
+                               WHERE memory_id = ? AND source_id = ?""",
+                            (original_memory_id, memory_id, source_id),
+                        )
+                        await self.db.execute(
+                            "DELETE FROM memory_sources WHERE memory_id = ? AND source_id = ?",
+                            (memory_id, source_id),
+                        )
+                        await self.db.execute(
+                            """INSERT OR REPLACE INTO evidence_relations (
+                                   evidence_unit_id, memory_id, relation_type,
+                                   authority_case, is_authoritative_support,
+                                   source_lineage_id, confidence, reason,
+                                   proposed_memory_content, excerpt, classifier_version,
+                                   relation_run_id, created_at
+                               )
+                               SELECT er.evidence_unit_id, ?, er.relation_type,
+                                      er.authority_case, er.is_authoritative_support,
+                                      er.source_lineage_id, er.confidence, er.reason,
+                                      er.proposed_memory_content, er.excerpt,
+                                      er.classifier_version, er.relation_run_id, er.created_at
+                               FROM evidence_relations er
+                               JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                               WHERE er.memory_id = ? AND eu.source_id = ?""",
+                            (original_memory_id, memory_id, source_id),
+                        )
+                        await self.db.execute(
+                            """DELETE FROM evidence_relations
+                               WHERE memory_id = ? AND evidence_unit_id IN (
+                                   SELECT id FROM evidence_units WHERE source_id = ?
+                               )""",
+                            (memory_id, source_id),
+                        )
+                        await self.db.execute(
+                            """UPDATE agent_claims SET memory_id = ?
+                               WHERE memory_id = ? AND concept_id IN (
+                                   SELECT id FROM agent_concepts WHERE source_id = ?
+                               )""",
+                            (original_memory_id, memory_id, source_id),
+                        )
+                        await self.db.execute(
+                            """UPDATE relation_runs SET result_memory_id = ?
+                               WHERE result_memory_id = ? AND evidence_unit_id IN (
+                                   SELECT id FROM evidence_units WHERE source_id = ?
+                               )""",
+                            (original_memory_id, memory_id, source_id),
+                        )
+                        await self._refresh_memory_support_state_unlocked(
+                            original_memory_id,
+                            retire_reason="source_access_transition_revert",
+                        )
+                        await self._refresh_memory_support_state_unlocked(
+                            memory_id,
+                            retire_reason="source_access_transition_revert",
+                        )
+                        affected_ids.extend([original_memory_id, memory_id])
+                        continue
+                    if reverting and memory_id in target_by_original:
+                        affected_ids.extend([memory_id, target_by_original[memory_id]])
+                        continue
+                    if not reverting and memory_id in split_by_target:
+                        affected_ids.extend([split_by_target[memory_id], memory_id])
+                        continue
+                    context_matches = (
+                        memory.visibility == target_visibility
+                        and memory.owner_user_id == target_owner
+                    )
+                    async with self.db.execute(
+                        "SELECT COUNT(*) AS total FROM memory_sources "
+                        "WHERE memory_id = ? AND source_id <> ?",
+                        (memory_id, source_id),
+                    ) as cursor:
+                        other_row = await cursor.fetchone()
+                    has_other_support = bool(other_row and int(other_row["total"]) > 0)
+
+                    target_memory_id = memory_id
+                    if not context_matches and has_other_support:
+                        target_memory_id = "mem-access-" + uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"{operation_id}:{source_id}:{memory_id}",
+                        ).hex[:24]
+                        if await self.get_memory(target_memory_id) is None:
+                            target_memory = replace(
+                                memory,
+                                id=target_memory_id,
+                                visibility=target_visibility,
+                                owner_user_id=target_owner,
+                                corroboration_count=1,
+                                created_at=datetime.now(timezone.utc),
+                                updated_at=datetime.now(timezone.utc),
+                            )
+                            await self._insert_memory_unlocked(target_memory)
+                            await self.db.execute(
+                                "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id) "
+                                "SELECT ?, entity_id FROM memory_entities WHERE memory_id = ?",
+                                (target_memory_id, memory_id),
+                            )
+                            await self.db.execute(
+                                """INSERT OR IGNORE INTO memory_derivations (
+                                       parent_memory_id, child_memory_id, relation, created_at
+                                   )
+                                   SELECT
+                                       CASE WHEN parent_memory_id = ? THEN ? ELSE parent_memory_id END,
+                                       CASE WHEN child_memory_id = ? THEN ? ELSE child_memory_id END,
+                                       relation, created_at
+                                   FROM memory_derivations
+                                   WHERE parent_memory_id = ? OR child_memory_id = ?""",
+                                (
+                                    memory_id,
+                                    target_memory_id,
+                                    memory_id,
+                                    target_memory_id,
+                                    memory_id,
+                                    memory_id,
+                                ),
+                            )
+                        await self.db.execute(
+                            """INSERT OR IGNORE INTO source_access_transition_memory_map (
+                                   operation_id, source_id, original_memory_id, target_memory_id
+                               ) VALUES (?, ?, ?, ?)""",
+                            (operation_id, source_id, memory_id, target_memory_id),
+                        )
+                        await self.db.execute(
+                            "UPDATE memory_sources SET memory_id = ? "
+                            "WHERE memory_id = ? AND source_id = ?",
+                            (target_memory_id, memory_id, source_id),
+                        )
+                        await self.db.execute(
+                            """INSERT OR REPLACE INTO evidence_relations (
+                                   evidence_unit_id, memory_id, relation_type,
+                                   authority_case, is_authoritative_support,
+                                   source_lineage_id, confidence, reason,
+                                   proposed_memory_content, excerpt, classifier_version,
+                                   relation_run_id, created_at
+                               )
+                               SELECT er.evidence_unit_id, ?, er.relation_type,
+                                      er.authority_case, er.is_authoritative_support,
+                                      er.source_lineage_id, er.confidence, er.reason,
+                                      er.proposed_memory_content, er.excerpt,
+                                      er.classifier_version, er.relation_run_id, er.created_at
+                               FROM evidence_relations er
+                               JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                               WHERE er.memory_id = ? AND eu.source_id = ?""",
+                            (target_memory_id, memory_id, source_id),
+                        )
+                        await self.db.execute(
+                            """DELETE FROM evidence_relations
+                               WHERE memory_id = ? AND evidence_unit_id IN (
+                                   SELECT id FROM evidence_units WHERE source_id = ?
+                               )""",
+                            (memory_id, source_id),
+                        )
+                        await self.db.execute(
+                            """UPDATE agent_claims SET memory_id = ?
+                               WHERE memory_id = ? AND concept_id IN (
+                                   SELECT id FROM agent_concepts WHERE source_id = ?
+                               )""",
+                            (target_memory_id, memory_id, source_id),
+                        )
+                        await self.db.execute(
+                            """UPDATE relation_runs SET result_memory_id = ?
+                               WHERE result_memory_id = ? AND evidence_unit_id IN (
+                                   SELECT id FROM evidence_units WHERE source_id = ?
+                               )""",
+                            (target_memory_id, memory_id, source_id),
+                        )
+                        await self._refresh_memory_support_state_unlocked(
+                            memory_id,
+                            retire_reason="source_access_transition",
+                        )
+                    elif not context_matches:
+                        await self.db.execute(
+                            """UPDATE memories
+                               SET visibility = ?, owner_user_id = ?, updated_at = ?
+                               WHERE id = ?""",
+                            (target_visibility, target_owner, _now_iso(), memory_id),
+                        )
+
+                    await self._refresh_memory_support_state_unlocked(
+                        target_memory_id,
+                        retire_reason="source_access_transition",
+                    )
+                    affected_ids.extend([memory_id, target_memory_id])
+
+                await self.db.execute(
+                    """UPDATE evidence_units
+                       SET visibility = ?, owner_user_id = ?, access_context_hash = NULL,
+                           updated_at = ?
+                       WHERE source_id = ?""",
+                    (target_visibility, target_owner, _now_iso(), source_id),
+                )
+                await self.db.execute(
+                    """UPDATE agent_concepts
+                       SET visibility = ?, updated_at = ?
+                       WHERE source_id = ?""",
+                    (target_visibility, _now_iso(), source_id),
+                )
+                unique_ids = list(dict.fromkeys(affected_ids))
+                for affected_id in unique_ids:
+                    await self._rebuild_memory_fts_unlocked(
+                        affected_id,
+                        search_visible_statuses=set(allowed_search_statuses()),
+                    )
+                await self.db.execute(
+                    """UPDATE source_access_transitions
+                       SET total_memories = ?, processed_memories = 0, updated_at = ?
+                       WHERE operation_id = ?""",
+                    (len(unique_ids), _now_iso(), operation_id),
+                )
+                await self.db.commit()
+                return unique_ids
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def complete_source_access_transition(self, operation_id: str) -> None:
+        """Activate a fully reconciled transition and restore Source sync state."""
+        now = _now_iso()
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    "SELECT * FROM source_access_transitions WHERE operation_id = ?",
+                    (operation_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if row is None:
+                    raise LookupError("source_access_transition_not_found")
+                transition = dict(row)
+                if transition["status"] == "completed":
+                    return
+                await self.db.execute(
+                    """UPDATE sources
+                       SET access_policy = ?, access_state = 'active', status = ?
+                       WHERE id = ?""",
+                    (
+                        transition["target_policy"],
+                        transition["previous_source_status"],
+                        transition["source_id"],
+                    ),
+                )
+                await self.db.execute(
+                    """UPDATE source_access_transitions
+                       SET status = 'completed', error_code = NULL, error_message = NULL,
+                           updated_at = ?, completed_at = ?
+                       WHERE operation_id = ?""",
+                    (now, now, operation_id),
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def mark_source_access_transition_reverted(self, operation_id: str) -> None:
+        now = _now_iso()
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    "SELECT * FROM source_access_transitions WHERE operation_id = ?",
+                    (operation_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if row is None:
+                    raise LookupError("source_access_transition_not_found")
+                transition = dict(row)
+                await self.db.execute(
+                    """UPDATE sources
+                       SET access_policy = ?, access_state = 'active', status = ?
+                       WHERE id = ?""",
+                    (
+                        transition["previous_policy"],
+                        transition["previous_source_status"],
+                        transition["source_id"],
+                    ),
+                )
+                await self.db.execute(
+                    """UPDATE source_access_transitions
+                       SET status = 'reverted', error_code = NULL, error_message = NULL,
+                           updated_at = ?, completed_at = ?
+                       WHERE operation_id = ?""",
+                    (now, now, operation_id),
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
     async def restore_source_snapshot(self, source: dict) -> None:
         """Restore one source row from a captured snapshot."""
         async with self._write_lock:
             await self.db.execute(
                 """INSERT INTO sources
                    (id, type, name, config, status, last_sync, doc_count, project_binding,
-                    created_by_user_id, execution_owner_user_id, sync_schedule_enabled,
+                    created_by_user_id, owner_user_id, access_policy, access_state,
+                    execution_owner_user_id, sync_schedule_enabled,
                     sync_schedule_interval_minutes, sync_schedule_next_at,
                     sync_schedule_updated_at, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                    type=excluded.type,
                    name=excluded.name,
@@ -6427,6 +7374,9 @@ class Database:
                    doc_count=excluded.doc_count,
                    project_binding=excluded.project_binding,
                    created_by_user_id=excluded.created_by_user_id,
+                   owner_user_id=excluded.owner_user_id,
+                   access_policy=excluded.access_policy,
+                   access_state=excluded.access_state,
                    execution_owner_user_id=excluded.execution_owner_user_id,
                    sync_schedule_enabled=excluded.sync_schedule_enabled,
                    sync_schedule_interval_minutes=excluded.sync_schedule_interval_minutes,
@@ -6443,6 +7393,9 @@ class Database:
                     source["doc_count"],
                     (json.dumps(source["project_binding"]) if source.get("project_binding") else None),
                     source.get("created_by_user_id"),
+                    source["owner_user_id"],
+                    source["access_policy"],
+                    source["access_state"],
                     source.get("execution_owner_user_id"),
                     int((source.get("sync_schedule") or {}).get("enabled") or 0),
                     int((source.get("sync_schedule") or {}).get("interval_minutes") or 1440),

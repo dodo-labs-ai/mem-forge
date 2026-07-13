@@ -12,6 +12,7 @@ export type SourceSetupSectionId =
   | "basics"
   | "connection"
   | "content"
+  | "access"
   | "project"
   | "schedule";
 
@@ -67,7 +68,7 @@ export function SourceSetupShell({
           <div className="min-w-0">
             <DialogTitle>{isEdit ? `Configure ${sourceLabel}` : `Add ${sourceLabel} source`}</DialogTitle>
             <p className="mt-1 text-xs text-muted-foreground">
-              Connection, content, project, and sync frequency
+              Connection, content, access, destination, and sync frequency
             </p>
             <div className="mt-2 flex flex-wrap gap-1.5">
               <ConnectionBadge mode={connection.mode}>{connection.label}</ConnectionBadge>
