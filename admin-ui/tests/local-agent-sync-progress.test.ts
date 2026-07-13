@@ -68,7 +68,7 @@ assert.deepEqual(
   ),
   {
     message: "Creating memories from pages",
-    detail: "31 of 86 pages · 104 memories found",
+    detail: "31 of 86 pages · 104 new memories saved",
     completed: 31,
     total: 86,
   },

@@ -37,7 +37,7 @@ from memforge.retrieval.embeddings import get_chroma_collection
 from memforge.source_secrets import decrypt_source_config_for_runtime, source_secret_fields
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
-from memforge.sync_progress import source_sync_progress_from_pipeline
+from memforge.sync_progress import SourceSyncProgressAccumulator, source_sync_progress_from_pipeline
 
 if TYPE_CHECKING:
     from memforge.storage.database import Database
@@ -700,12 +700,15 @@ class SourceSyncWorker:
         stop = asyncio.Event()
         lease_lost = asyncio.Event()
         source_type = str(kwargs.get("source", {}).get("type") or "")
+        previous_attempt_progress = run.progress if run.lease_attempt_count > 1 else None
+        progress_accumulator = SourceSyncProgressAccumulator(previous_attempt_progress)
         latest_progress: dict[str, Any] = {"revision": 0, "flushed_revision": 0, "snapshot": None}
 
         def report_progress(value: dict[str, Any]) -> None:
             snapshot = source_sync_progress_from_pipeline(value, source_type=source_type)
             if snapshot is None:
                 return
+            snapshot = progress_accumulator.update(snapshot)
             latest_progress["revision"] = int(latest_progress["revision"]) + 1
             latest_progress["snapshot"] = snapshot
 

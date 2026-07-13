@@ -3477,6 +3477,81 @@ async def test_source_sync_worker_persists_pipeline_progress_while_run_is_active
     }
 
 
+@pytest.mark.asyncio
+async def test_source_sync_worker_resumes_progress_from_an_expired_lease(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-recovered-progress"
+    await db.upsert_source(
+        id=source_id,
+        type="github_repo",
+        name="Architecture Repo",
+        config_json="{}",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    expired_at = datetime(2026, 7, 13, 7, 0, tzinfo=timezone.utc)
+    first_attempt = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        lease_seconds=1,
+        now=expired_at,
+    )
+    assert first_attempt is not None
+    assert await db.report_source_sync_run_progress(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=first_attempt.lease_attempt_count,
+        progress={
+            "schema_version": 1,
+            "phase": "processing",
+            "progress": {"completed": 29, "total": 58, "unit": "file"},
+            "counts": {"changed": 11, "memories_created": 101},
+        },
+        now=expired_at,
+    )
+
+    class RecoveredProgressRuntimeProvider:
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            kwargs["progress_callback"](
+                {
+                    "phase": "processing",
+                    "current": 2,
+                    "total": 58,
+                    "docs_updated": 1,
+                    "memories_extracted": 3,
+                }
+            )
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
+
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=RecoveredProgressRuntimeProvider(),
+        worker_id="worker-b",
+        progress_flush_seconds=0.01,
+    )
+
+    await worker.run_once()
+    completed = await db.get_source_sync_run(enqueued.run_id)
+
+    assert completed is not None
+    assert completed.status == "success"
+    assert completed.recovery_count == 1
+    assert completed.progress == {
+        "schema_version": 1,
+        "phase": "processing",
+        "progress": {"completed": 29, "total": 58, "unit": "file"},
+        "counts": {"changed": 12, "memories_created": 104},
+    }
+
+
 def test_reconciliation_without_measurable_work_is_indeterminate():
     from memforge.sync_progress import source_sync_progress_from_pipeline
 
@@ -3484,6 +3559,62 @@ def test_reconciliation_without_measurable_work_is_indeterminate():
         {"phase": "detecting_deletions", "current": 0, "total": 0},
         source_type="confluence",
     ) == {"schema_version": 1, "phase": "reconciling"}
+
+
+def test_recovered_source_sync_progress_preserves_run_level_work():
+    from memforge.sync_progress import SourceSyncProgressAccumulator
+
+    progress = SourceSyncProgressAccumulator({
+        "schema_version": 1,
+        "phase": "processing",
+        "progress": {"completed": 29, "total": 58, "unit": "file"},
+        "counts": {"changed": 11, "failed": 1, "memories_created": 101},
+    })
+
+    assert progress.update({
+        "schema_version": 1,
+        "phase": "processing",
+        "progress": {"completed": 2, "total": 58, "unit": "file"},
+        "counts": {"changed": 1, "failed": 0, "memories_created": 3},
+    }) == {
+        "schema_version": 1,
+        "phase": "processing",
+        "progress": {"completed": 29, "total": 58, "unit": "file"},
+        "counts": {"changed": 12, "failed": 0, "memories_created": 104},
+    }
+
+
+def test_recovered_source_sync_progress_does_not_reuse_a_changed_workset():
+    from memforge.sync_progress import SourceSyncProgressAccumulator
+
+    progress = SourceSyncProgressAccumulator({
+        "schema_version": 1,
+        "phase": "processing",
+        "progress": {"completed": 29, "total": 58, "unit": "file"},
+    })
+
+    assert progress.update({
+        "schema_version": 1,
+        "phase": "processing",
+        "progress": {"completed": 2, "total": 60, "unit": "file"},
+    })["progress"] == {"completed": 2, "total": 60, "unit": "file"}
+
+
+def test_source_sync_progress_preserves_attempt_counts_between_phases():
+    from memforge.sync_progress import SourceSyncProgressAccumulator
+
+    progress = SourceSyncProgressAccumulator()
+    progress.update({
+        "schema_version": 1,
+        "phase": "processing",
+        "progress": {"completed": 29, "total": 58, "unit": "file"},
+        "counts": {"changed": 11, "memories_created": 101},
+    })
+
+    assert progress.update({
+        "schema_version": 1,
+        "phase": "reconciling",
+    })["counts"] == {"changed": 11, "memories_created": 101}
 
 
 @pytest.mark.asyncio

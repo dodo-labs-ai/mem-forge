@@ -68,6 +68,69 @@ def source_sync_progress_from_pipeline(
     return normalize_sync_progress_snapshot(snapshot)
 
 
+class SourceSyncProgressAccumulator:
+    """Translate attempt-local counters into durable run-level progress."""
+
+    _CUMULATIVE_FIELDS = ("changed", "memories_created")
+
+    def __init__(self, previous_attempt: Mapping[str, Any] | None = None) -> None:
+        self._previous_attempt = (
+            normalize_sync_progress_snapshot(previous_attempt)
+            if previous_attempt is not None
+            else None
+        )
+        self._attempt_counts: dict[str, int] = {}
+
+    def update(self, current: Mapping[str, Any]) -> dict[str, Any]:
+        """Merge one cumulative pipeline snapshot into this worker attempt."""
+        current_snapshot = normalize_sync_progress_snapshot(current)
+        resumed = dict(current_snapshot)
+        current_counts = current_snapshot.get("counts")
+        if isinstance(current_counts, Mapping):
+            self._attempt_counts.update(
+                {field: int(value) for field, value in current_counts.items()}
+            )
+
+        previous_counts = (
+            self._previous_attempt.get("counts", {})
+            if self._previous_attempt is not None
+            else {}
+        )
+        counts = dict(self._attempt_counts)
+        for field in self._CUMULATIVE_FIELDS:
+            if field in previous_counts or field in self._attempt_counts:
+                counts[field] = int(previous_counts.get(field, 0)) + int(
+                    self._attempt_counts.get(field, 0)
+                )
+        if counts:
+            resumed["counts"] = counts
+
+        current_progress = current_snapshot.get("progress")
+        previous_progress = (
+            self._previous_attempt.get("progress")
+            if self._previous_attempt is not None
+            else None
+        )
+        if (
+            current_snapshot["phase"] == "processing"
+            and self._previous_attempt is not None
+            and self._previous_attempt["phase"] == "processing"
+            and isinstance(current_progress, Mapping)
+            and isinstance(previous_progress, Mapping)
+            and current_progress.get("unit") == previous_progress.get("unit")
+            and current_progress.get("total") == previous_progress.get("total")
+        ):
+            resumed["progress"] = {
+                **current_progress,
+                "completed": max(
+                    int(current_progress["completed"]),
+                    int(previous_progress["completed"]),
+                ),
+            }
+
+        return normalize_sync_progress_snapshot(resumed)
+
+
 def normalize_sync_progress_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and canonicalize the public source-progress contract."""
     allowed = {"schema_version", "phase", "progress", "source_time_range", "counts"}
