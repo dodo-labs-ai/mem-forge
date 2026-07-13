@@ -12,9 +12,32 @@ export function updateRepoPathSelection(current: string[], path: string, selecte
   const normalized = normalizeRepoPickerPath(path);
   if (!normalized) return [...current];
   const next = new Set(current.map(normalizeRepoPickerPath).filter(Boolean));
-  if (selected) next.add(normalized);
+  if (selected) {
+    for (const existing of next) {
+      if (existing === normalized || existing.startsWith(`${normalized}/`)) next.delete(existing);
+    }
+    if (![...next].some((existing) => normalized.startsWith(`${existing}/`))) next.add(normalized);
+  }
   else next.delete(normalized);
   return [...next].sort((a, b) => a.localeCompare(b));
+}
+
+export function pathIsCoveredBySelection(path: string, selections: string[]): boolean {
+  const normalized = normalizeRepoPickerPath(path);
+  return selections.some((selection) => {
+    const scope = normalizeRepoPickerPath(selection);
+    return normalized === scope || normalized.startsWith(`${scope}/`);
+  });
+}
+
+export function repoEffectiveFileCount(
+  items: RepoPickerItem[],
+  includePaths: string[],
+  excludePaths: string[],
+): number {
+  return items.filter((item) => item.type === "blob"
+    && (includePaths.length === 0 || pathIsCoveredBySelection(item.path, includePaths))
+    && !pathIsCoveredBySelection(item.path, excludePaths)).length;
 }
 
 export function repoPickerItemsFromFilePaths(paths: string[]): RepoPickerItem[] {

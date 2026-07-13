@@ -41,17 +41,21 @@ assert.equal(confluence.sectionForField(field({ key: "exclude_labels" }), {}), "
 
 const github = sourceSetupAdapterFor("github_repo");
 assert.equal(
-  github.sectionForField(field({ key: "repo_path" }), { connection_mode: "cloud_pull" }),
-  "hidden",
-);
-assert.equal(
-  github.sectionForField(field({ key: "repo_path" }), { connection_mode: "local_push" }),
-  "connection",
-);
-assert.equal(
   github.sectionForField(field({ key: "include_paths" }), { connection_mode: "cloud_pull" }),
   "hidden",
   "repository paths are owned by the tree picker instead of a second text field",
+);
+assert.equal(
+  github.sectionForField(field({ key: "exclude_paths" }), { connection_mode: "local_push" }),
+  "hidden",
+  "repository exclusions are owned by the shared tree picker",
+);
+assert.equal(
+  github.connectionSummary({
+    connection_mode: "local_push",
+    repo_url: "https://github.wdf.sap.corp/org/repo",
+  }),
+  "Local sync · github.wdf.sap.corp",
 );
 
 const pages = sourceSetupAdapterFor("github_pages");

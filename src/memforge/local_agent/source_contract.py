@@ -30,8 +30,8 @@ _LOCAL_AGENT_JOB_CONFIG_FIELDS_BY_SOURCE_TYPE = {
         {
             "repo_url",
             "ref",
-            "repo_path",
             "include_paths",
+            "exclude_paths",
             "include_extensions",
         }
     ),

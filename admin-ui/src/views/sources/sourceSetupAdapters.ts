@@ -35,7 +35,7 @@ export interface SourceSetupAdapter {
 const CONNECTION_FIELDS: Record<SchemaSourceType, ReadonlySet<string>> = {
   confluence: new Set(["base_url", "pat"]),
   github_pages: new Set(["auth_mode", "pat"]),
-  github_repo: new Set(["connection_mode", "repo_url", "pat", "repo_path"]),
+  github_repo: new Set(["connection_mode", "repo_url", "pat"]),
   jira: new Set(["base_url", "auth_mode", "sync_mode", "pat"]),
   local_markdown: new Set(["root"]),
 };
@@ -80,12 +80,20 @@ const ADAPTERS: Record<SchemaSourceType, SourceSetupAdapter> = {
     connection: { mode: "choice", label: "Cloud or local sync" },
     visible: githubRepoFieldVisible,
     required: githubRepoFieldRequired,
-    connectionSummary: (config) => stringValue(config.connection_mode) === "local_push"
-      ? "Local sync · repository folder selected"
-      : hostSummary(config.repo_url, "Repository not configured"),
-    contentSummary: (config) => listValue(config.include_paths).length > 0
-      ? `${listValue(config.include_paths).length} selected path${listValue(config.include_paths).length === 1 ? "" : "s"}`
-      : "Whole repository",
+    connectionSummary: (config) => {
+      const host = hostSummary(config.repo_url, "Repository not configured");
+      return stringValue(config.connection_mode) === "local_push" ? `Local sync · ${host}` : host;
+    },
+    contentSummary: (config) => {
+      const includeCount = listValue(config.include_paths).length;
+      const excludeCount = listValue(config.exclude_paths).length;
+      const base = includeCount > 0
+        ? `${includeCount} selected path${includeCount === 1 ? "" : "s"}`
+        : "Whole repository";
+      return excludeCount > 0
+        ? `${base} · ${excludeCount} exclusion${excludeCount === 1 ? "" : "s"}`
+        : base;
+    },
   }),
   jira: createAdapter({
     sourceType: "jira",
@@ -268,13 +276,12 @@ function githubPagesContentSummary(config: ConfigForm): string {
 function githubRepoFieldVisible(field: ConfigField, config: ConfigForm): boolean {
   const mode = stringValue(config.connection_mode) || "cloud_pull";
   if (field.key === "pat") return mode === "cloud_pull";
-  if (field.key === "repo_path") return mode === "local_push";
-  return field.key !== "include_paths";
+  if (["include_paths", "exclude_paths"].includes(field.key)) return false;
+  return true;
 }
 
-function githubRepoFieldRequired(field: ConfigField, config: ConfigForm): boolean {
-  if (field.key === "pat" || field.key === "include_paths") return false;
-  if (field.key === "repo_path") return stringValue(config.connection_mode) === "local_push";
+function githubRepoFieldRequired(field: ConfigField): boolean {
+  if (field.key === "pat" || ["include_paths", "exclude_paths"].includes(field.key)) return false;
   return field.required;
 }
 

@@ -77,6 +77,7 @@ def _create_github_repo_source(
     name: str = "Matterhorn Architecture",
     connection_mode: str = "local_push",
     max_files: int = 500,
+    exclude_paths: list[str] | None = None,
 ) -> dict:
     response = client.post(
         "/api/sources",
@@ -88,6 +89,7 @@ def _create_github_repo_source(
                 "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                 "ref": "main",
                 "include_paths": ["Payroll Processing/"],
+                "exclude_paths": exclude_paths or [],
                 "include_extensions": ["md"],
                 "max_files": max_files,
             },
@@ -698,7 +700,10 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
     try:
         app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
         with LeaseAwareTestClient(app) as client:
-            source_id = _create_github_repo_source(client)["id"]
+            source_id = _create_github_repo_source(
+                client,
+                exclude_paths=["Payroll Processing/archived"],
+            )["id"]
             wrong_ref = client.post(
                 f"/api/sources/{source_id}/adapter/packages",
                 json={
@@ -729,12 +734,24 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
                     "process_now": False,
                 },
             )
+            excluded_path = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": "Payroll Processing/archived/README.md",
+                    "markdown_body": "# Archived",
+                    "process_now": False,
+                },
+            )
         assert wrong_ref.status_code == 400
         assert "configured ref" in wrong_ref.json()["detail"]
         assert wrong_path.status_code == 400
-        assert "include_paths" in wrong_path.json()["detail"]
+        assert "repository scope" in wrong_path.json()["detail"]
         assert wrong_extension.status_code == 400
         assert "include_extensions" in wrong_extension.json()["detail"]
+        assert excluded_path.status_code == 400
+        assert "repository scope" in excluded_path.json()["detail"]
     finally:
         asyncio.run(database.close())
 

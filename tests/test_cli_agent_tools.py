@@ -1,3 +1,4 @@
+import base64
 import json
 import subprocess
 from pathlib import Path
@@ -764,57 +765,30 @@ def test_adapter_list_includes_markdown_kb_capability():
     assert {"type": "kb", "kind": "markdown"} in payload["data"]
 
 
-def _init_github_local_clone(
-    tmp_path: Path,
-    *,
-    remote_url: str = "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture.git",
-) -> Path:
-    repo = tmp_path / "architecture"
-    (repo / "Payroll Processing V2" / "images").mkdir(parents=True)
-    (repo / "Flexible Payroll").mkdir(parents=True)
-    (repo / "Payroll Processing V2" / "README.md").write_text("# Payroll Processing V2\n\nBody", encoding="utf-8")
-    (repo / "Payroll Processing V2" / "Überblick.md").write_text("# Überblick\n", encoding="utf-8")
-    (repo / "Payroll Processing V2" / "images" / "Flow.puml").write_text("@startuml\n@enduml\n", encoding="utf-8")
-    (repo / "Payroll Processing V2" / "images" / "ignored.png").write_bytes(b"png")
-    (repo / "Flexible Payroll" / "README.md").write_text("# Flexible Payroll\n", encoding="utf-8")
-    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True, text=True)
-    subprocess.run(
-        ["git", "remote", "add", "origin", remote_url],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True, text=True)
-    subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.name=MemForge Test",
-            "-c",
-            "user.email=memforge@example.test",
-            "commit",
-            "-m",
-            "seed architecture docs",
-        ],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return repo
+def _fake_github_remote_run(cmd, *args, **kwargs):
+    assert cmd[:2] == ["gh", "api"]
+    assert kwargs["env"]["GH_HOST"] == "github.wdf.sap.corp"
+    endpoint = cmd[2]
+    if "/git/trees/" in endpoint:
+        payload = {
+            "tree": [
+                {"path": "Payroll Processing V2/README.md", "type": "blob", "sha": "readme", "size": 30},
+                {"path": "Payroll Processing V2/Überblick.md", "type": "blob", "sha": "overview", "size": 20},
+                {"path": "Payroll Processing V2/images/Flow.puml", "type": "blob", "sha": "flow", "size": 10},
+                {"path": "Payroll Processing V2/images/ignored.png", "type": "blob", "sha": "png", "size": 5},
+                {"path": "Flexible Payroll/README.md", "type": "blob", "sha": "flex", "size": 25},
+            ]
+        }
+    elif "/contents/" in endpoint:
+        raw = b"# Payroll Processing V2\n\nBody"
+        payload = {"content": base64.b64encode(raw).decode(), "encoding": "base64", "size": len(raw)}
+    else:
+        raise AssertionError(f"unexpected gh endpoint: {endpoint}")
+    return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
 
 
-def test_local_agent_cloud_github_preview_uses_job_payload_without_profile(monkeypatch, tmp_path: Path):
-    repo = _init_github_local_clone(tmp_path)
-    original_run = main.subprocess.run
-
-    def fake_run(cmd, *args, **kwargs):
-        if cmd[:2] == ["gh", "api"]:
-            raise AssertionError("cloud local-agent preview should use the job repo_path, not a local profile or gh api")
-        return original_run(cmd, *args, **kwargs)
-
-    monkeypatch.setattr(main.subprocess, "run", fake_run)
+def test_local_agent_cloud_github_preview_tree_ignores_saved_scope(monkeypatch):
+    monkeypatch.setattr(main.subprocess, "run", _fake_github_remote_run)
 
     payload = main._run_cloud_local_agent_job(
         {
@@ -823,9 +797,9 @@ def test_local_agent_cloud_github_preview_uses_job_payload_without_profile(monke
             "source_id": "src-gh",
             "payload": {
                 "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
-                "repo_path": str(repo),
                 "ref": "main",
                 "include_paths": ["Payroll Processing V2"],
+                "exclude_paths": ["Payroll Processing V2/Überblick.md"],
                 "include_extensions": ["md"],
                 "limit": 10,
             },
@@ -835,25 +809,18 @@ def test_local_agent_cloud_github_preview_uses_job_payload_without_profile(monke
 
     assert payload["operation"] == "github_repo_preview_tree"
     assert payload["source_id"] == "src-gh"
-    assert payload["counts"] == {"included": 2, "ignored": 3}
+    assert payload["counts"] == {"included": 3, "ignored": 2}
     assert [item["relative_path"] for item in payload["items"]] == [
         "Payroll Processing V2/README.md",
         "Payroll Processing V2/Überblick.md",
+        "Flexible Payroll/README.md",
     ]
 
 
-def test_local_agent_cloud_github_sync_pushes_job_source_and_snapshot(monkeypatch, tmp_path: Path):
-    repo = _init_github_local_clone(tmp_path)
+def test_local_agent_cloud_github_sync_pushes_remote_gh_scope(monkeypatch):
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
     FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
-    original_run = main.subprocess.run
-
-    def fake_run(cmd, *args, **kwargs):
-        if cmd[:2] == ["gh", "api"]:
-            raise AssertionError("cloud local-agent sync should use the job repo_path, not gh api")
-        return original_run(cmd, *args, **kwargs)
-
-    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    monkeypatch.setattr(main.subprocess, "run", _fake_github_remote_run)
 
     payload = main._run_cloud_local_agent_job(
         {
@@ -864,9 +831,9 @@ def test_local_agent_cloud_github_sync_pushes_job_source_and_snapshot(monkeypatc
             "source_id": "src-from-cloud",
             "payload": {
                 "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
-                "repo_path": str(repo),
                 "ref": "main",
                 "include_paths": ["Payroll Processing V2"],
+                "exclude_paths": ["Payroll Processing V2/Überblick.md"],
                 "include_extensions": ["md"],
                 "limit": 1,
             },
@@ -876,9 +843,9 @@ def test_local_agent_cloud_github_sync_pushes_job_source_and_snapshot(monkeypatc
 
     assert payload["operation"] == "github_repo_sync"
     assert payload["source_id"] == "src-from-cloud"
-    assert payload["counts"] == {"selected": 2, "pushed": 2, "failed": 0}
+    assert payload["counts"] == {"selected": 1, "pushed": 1, "failed": 0}
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
-    assert len(push_calls) == 2
+    assert len(push_calls) == 1
     kwargs = push_calls[0][1]
     assert kwargs["workspace_id"] == "ws-from-job-payload"
     assert kwargs["source_id"] == "src-from-cloud"
@@ -893,8 +860,7 @@ def test_local_agent_cloud_github_sync_pushes_job_source_and_snapshot(monkeypatc
     assert process_calls[0][1]["sync_snapshot_id"] == "laj-sync:attempt:1"
 
 
-def test_local_agent_cloud_github_sync_requires_job_workspace(monkeypatch, tmp_path: Path):
-    repo = _init_github_local_clone(tmp_path)
+def test_local_agent_cloud_github_sync_requires_job_workspace(monkeypatch):
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
     FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
 
@@ -905,7 +871,6 @@ def test_local_agent_cloud_github_sync_requires_job_workspace(monkeypatch, tmp_p
             "source_id": "src-from-cloud",
             "payload": {
                 "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
-                "repo_path": str(repo),
                 "ref": "main",
                 "include_paths": ["Payroll Processing V2"],
                 "include_extensions": ["md"],
@@ -978,26 +943,6 @@ def test_local_agent_cloud_local_markdown_pick_root_uses_local_picker(monkeypatc
         "root": str(selected),
     }
     assert calls == [{"title": "Choose folder to sync", "initial_directory": str(tmp_path)}]
-
-
-def test_local_agent_cloud_github_pick_root_uses_local_picker(monkeypatch, tmp_path: Path):
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    monkeypatch.setattr(main, "pick_folder", lambda **kwargs: str(repository))
-
-    payload = main._run_cloud_local_agent_job(
-        {
-            "job_id": "laj-github-pick-root",
-            "operation": "github_repo_pick_root",
-            "payload": {"title": "Choose repository"},
-        },
-        _cloud_test_client(),
-    )
-
-    assert payload == {
-        "operation": "github_repo_pick_root",
-        "root": str(repository),
-    }
 
 
 def test_local_agent_cloud_local_markdown_pick_root_reports_cancellation(monkeypatch):

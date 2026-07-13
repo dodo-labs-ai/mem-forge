@@ -28,6 +28,7 @@ from memforge.genes.local_markdown_gene import (
 )
 from memforge.github_repo_utils import (
     build_github_repo_doc_id,
+    github_exclude_paths,
     github_extension_allowed,
     github_include_extensions,
     github_include_paths,
@@ -404,8 +405,9 @@ async def submit_github_repo_document(
     if ref != configured_ref:
         raise ValueError(f"repo_ref {ref!r} does not match the source's configured ref {configured_ref!r}")
     include_paths = github_include_paths(source_config)
-    if not github_path_in_scope(relative, include_paths):
-        raise ValueError("relative_path is outside the source's configured include_paths")
+    exclude_paths = github_exclude_paths(source_config)
+    if not github_path_in_scope(relative, include_paths, exclude_paths):
+        raise ValueError("relative_path is outside the source's configured repository scope")
     include_extensions = github_include_extensions(source_config)
     if not github_extension_allowed(relative, include_extensions):
         raise ValueError("relative_path extension is outside the source's configured include_extensions")
@@ -807,7 +809,11 @@ def _github_package_count(inbox: Path, config: dict[str, Any]) -> int:
             if (
                 repo_matches
                 and ref_matches
-                and github_path_in_scope(path, github_include_paths(config))
+                and github_path_in_scope(
+                    path,
+                    github_include_paths(config),
+                    github_exclude_paths(config),
+                )
                 and github_extension_allowed(path, github_include_extensions(config))
             ):
                 count += 1

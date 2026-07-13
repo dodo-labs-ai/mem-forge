@@ -1976,6 +1976,16 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             )""",
         ],
     ),
+    (
+        41,
+        "Remove obsolete GitHub repository clone paths",
+        [
+            """UPDATE sources
+               SET config = json_remove(config, '$.repo_path')
+               WHERE type = 'github_repo'
+                 AND json_type(config, '$.repo_path') IS NOT NULL""",
+        ],
+    ),
 ]
 
 

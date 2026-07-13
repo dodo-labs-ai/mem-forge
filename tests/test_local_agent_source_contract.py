@@ -187,14 +187,15 @@ def test_execution_owner_normalizes_missing_and_blank_values() -> None:
                 "ref": "main",
                 "repo_path": "/Users/me/repo",
                 "include_paths": ["docs/"],
+                "exclude_paths": ["docs/archived/"],
                 "documents_dir": "/server/private",
                 "api_token": "secret",
             },
             {
                 "repo_url": "https://github.example.test/org/repo",
                 "ref": "main",
-                "repo_path": "/Users/me/repo",
                 "include_paths": ["docs/"],
+                "exclude_paths": ["docs/archived/"],
             },
         ),
         (

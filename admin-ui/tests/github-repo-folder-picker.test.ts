@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 
 import {
   normalizeRepoPickerPath,
+  pathIsCoveredBySelection,
+  repoEffectiveFileCount,
   repoPickerItemsFromFilePaths,
   type RepoPickerItem,
   updateRepoPathSelection,
@@ -36,6 +38,23 @@ assert.deepEqual(
   ["Flexible Payroll", "Payroll Processing"],
 );
 assert.deepEqual(updateRepoPathSelection(["Payroll Processing"], "Payroll Processing", false), []);
+assert.deepEqual(
+  updateRepoPathSelection(["Payroll Processing/V2"], "Payroll Processing", true),
+  ["Payroll Processing"],
+  "selecting a parent should collapse redundant descendants",
+);
+assert.equal(pathIsCoveredBySelection("docs/archive/old.md", ["docs/archive"]), true);
+assert.equal(pathIsCoveredBySelection("docs/current.md", ["docs/archive"]), false);
+assert.equal(
+  repoEffectiveFileCount(items, [], ["Payroll Processing/V2"]),
+  2,
+  "whole-repository preview should subtract excluded files",
+);
+assert.equal(
+  repoEffectiveFileCount(items, ["Payroll Processing"], ["Payroll Processing/V2"]),
+  1,
+  "selected-only preview should apply exclusions after includes",
+);
 
 const pickerSource = readFileSync("src/views/sources/GitHubRepoFolderPicker.tsx", "utf8");
 assert.match(
@@ -63,3 +82,8 @@ assert.match(
   /const LOCAL_AGENT_POLL_ATTEMPTS = 180;/,
   "Folder browsing should tolerate daemon startup and one missed polling tick",
 );
+assert.match(pickerSource, /Sync all supported files in this repository/);
+assert.match(pickerSource, /Choose exclusions/);
+assert.match(pickerSource, /Sync only selected folders instead/);
+assert.match(pickerSource, /Enter a valid HTTPS Repository URL before browsing/);
+assert.doesNotMatch(pickerSource, /Choose local repository clone|github_repo_pick_root/);

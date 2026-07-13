@@ -284,38 +284,6 @@ function SourceConfigForm({
       setConfig((current) => ({ ...current, root }));
     },
   });
-  const pickGitHubRepoPath = useMutation<string | null, unknown, void>({
-    mutationFn: async () => {
-      const created = await createLocalAgentJob({
-        sourceId: source?.id ?? "",
-        sourceType: "github_repo",
-        operation: "github_repo_pick_root",
-        payload: {
-          title: "Choose local repository clone",
-          initial_directory: stringValue(config.repo_path).trim() || undefined,
-        },
-      });
-      const status = await pollLocalAgentPreviewJob(created.job_id);
-      if (status.status === "failed") {
-        throw new Error(status.last_error || "Local daemon could not open the folder picker.");
-      }
-      const result = status.result as { cancelled?: unknown; root?: unknown } | null;
-      if (result?.cancelled === true) {
-        return null;
-      }
-      const root = typeof result?.root === "string" ? result.root.trim() : "";
-      if (!root) {
-        throw new Error("Local daemon did not return a folder path.");
-      }
-      return root;
-    },
-    onSuccess: (repoPath) => {
-      if (repoPath === null) return;
-      setValidationMessage(null);
-      setConfig((current) => ({ ...current, repo_path: repoPath }));
-    },
-  });
-
   const sortedFields = useMemo(
     () => [...schema.fields].sort((a, b) => a.order - b.order),
     [schema.fields],
@@ -389,19 +357,6 @@ function SourceConfigForm({
         />
       );
     }
-    if (sourceType === "github_repo" && field.key === "repo_path") {
-      return (
-        <FolderSelectionField
-          key={field.key}
-          label="Local repository clone"
-          path={stringValue(config.repo_path)}
-          emptyLabel="No folder selected"
-          isPending={pickGitHubRepoPath.isPending}
-          error={pickGitHubRepoPath.isError ? pickGitHubRepoPath.error : null}
-          onChoose={() => pickGitHubRepoPath.mutate()}
-        />
-      );
-    }
     return (
       <div key={field.key} className="space-y-3">
         <ConfigFieldInput
@@ -432,11 +387,17 @@ function SourceConfigForm({
         {sourceType === "github_repo" && field.key === "ref" && (
           <GitHubRepoFolderPicker
             connectionMode={githubConnectionMode}
+            sourceId={source?.id}
             config={githubPickerConfig}
-            value={listValue(config.include_paths)}
-            onChange={(paths) => {
+            includePaths={listValue(config.include_paths)}
+            excludePaths={listValue(config.exclude_paths)}
+            onIncludePathsChange={(paths) => {
               setValidationMessage(null);
               setConfig((current) => ({ ...current, include_paths: paths }));
+            }}
+            onExcludePathsChange={(paths) => {
+              setValidationMessage(null);
+              setConfig((current) => ({ ...current, exclude_paths: paths }));
             }}
           />
         )}
