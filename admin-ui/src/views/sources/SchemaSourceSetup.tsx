@@ -33,6 +33,7 @@ import {
 } from "./confluenceConfig";
 import type { ParsedConfluenceWikiUrl } from "./confluenceConfig";
 import { GitHubRepoFolderPicker } from "./GitHubRepoFolderPicker";
+import type { RepoPickerItem } from "./githubRepoFolderPickerUtils";
 import { isImmutableExecutionModeField } from "./localAgentSources";
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
@@ -167,6 +168,7 @@ function SourceConfigForm({
     () => String(source?.sync_schedule?.interval_minutes ?? 1440),
   );
   const [validationMessage, setValidationMessage] = useState<string | null>(null);
+  const [githubRepoTreeItems, setGitHubRepoTreeItems] = useState<RepoPickerItem[]>([]);
   const [focusSection, setFocusSection] = useState<SourceSetupSectionId>(
     initialFocus?.step === "project" ? "project" : isEdit ? "basics" : "basics",
   );
@@ -311,6 +313,12 @@ function SourceConfigForm({
 
   const updateField = (field: ConfigField, value: ConfigValue) => {
     setValidationMessage(null);
+    if (
+      sourceType === "github_repo"
+      && ["connection_mode", "repo_url", "ref"].includes(field.key)
+    ) {
+      setGitHubRepoTreeItems([]);
+    }
     setConfig((current) => adapter.normalizeFieldChange(field, value, current));
   };
 
@@ -389,8 +397,10 @@ function SourceConfigForm({
             connectionMode={githubConnectionMode}
             sourceId={source?.id}
             config={githubPickerConfig}
+            items={githubRepoTreeItems}
             includePaths={listValue(config.include_paths)}
             excludePaths={listValue(config.exclude_paths)}
+            onItemsChange={setGitHubRepoTreeItems}
             onIncludePathsChange={(paths) => {
               setValidationMessage(null);
               setConfig((current) => ({ ...current, include_paths: paths }));

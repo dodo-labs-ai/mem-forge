@@ -44,20 +44,23 @@ export function GitHubRepoFolderPicker({
   connectionMode,
   sourceId,
   config,
+  items,
   includePaths,
   excludePaths,
+  onItemsChange,
   onIncludePathsChange,
   onExcludePathsChange,
 }: {
   connectionMode: string;
   sourceId?: string;
   config: Record<string, ConfigValue | undefined>;
+  items: RepoPickerItem[];
   includePaths: string[];
   excludePaths: string[];
+  onItemsChange: (items: RepoPickerItem[]) => void;
   onIncludePathsChange: (paths: string[]) => void;
   onExcludePathsChange: (paths: string[]) => void;
 }) {
-  const [items, setItems] = useState<RepoPickerItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [editorMode, setEditorMode] = useState<ScopeMode | null>(null);
@@ -89,7 +92,7 @@ export function GitHubRepoFolderPicker({
   );
 
   const applyTreeItems = (nextItems: RepoPickerItem[]) => {
-    setItems(nextItems);
+    onItemsChange(nextItems);
     setExpandedPaths(new Set(
       repoPickerTreeRows(nextItems, new Set(), "")
         .filter((row) => row.depth === 0 && row.item.type === "tree")
