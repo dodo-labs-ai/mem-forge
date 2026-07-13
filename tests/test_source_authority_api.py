@@ -213,6 +213,99 @@ def test_source_creator_can_manage_and_receives_redacted_config(tmp_path):
         asyncio.run(database.close())
 
 
+def test_member_can_pin_source_only_for_their_own_source_list(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/sources",
+                headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
+                json=_confluence_payload(),
+            )
+            assert created.status_code == 200, created.text
+            source_id = created.json()["id"]
+
+            pinned = client.put(
+                f"/api/sources/{source_id}/pin",
+                headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
+            )
+            pinned_again = client.put(
+                f"/api/sources/{source_id}/pin",
+                headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
+            )
+            other_list = client.get(
+                "/api/sources",
+                headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
+            )
+            owner_list = client.get(
+                "/api/sources",
+                headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
+            )
+            unpinned = client.delete(
+                f"/api/sources/{source_id}/pin",
+                headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
+            )
+            unpinned_again = client.delete(
+                f"/api/sources/{source_id}/pin",
+                headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
+            )
+
+        assert pinned.status_code == 200, pinned.text
+        assert pinned.json() == {"source_id": source_id, "pinned": True}
+        assert pinned_again.status_code == 200, pinned_again.text
+        assert other_list.json()["data"][0]["pinned_for_me"] is True
+        assert owner_list.json()["data"][0]["pinned_for_me"] is False
+        assert unpinned.json() == {"source_id": source_id, "pinned": False}
+        assert unpinned_again.json() == {"source_id": source_id, "pinned": False}
+        assert asyncio.run(database.is_source_pinned_for_user(source_id, "other-user")) is False
+
+        asyncio.run(database.set_source_pinned_for_user(source_id, "other-user", True))
+        asyncio.run(database.delete_source_cascade(source_id))
+        assert asyncio.run(database.is_source_pinned_for_user(source_id, "other-user")) is False
+    finally:
+        asyncio.run(database.close())
+
+
+def test_source_list_sort_preference_is_personal_and_validated(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            default_response = client.get(
+                "/api/source-list/preferences",
+                headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
+            )
+            updated = client.put(
+                "/api/source-list/preferences",
+                headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
+                json={"sort_mode": "name"},
+            )
+            other_response = client.get(
+                "/api/source-list/preferences",
+                headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
+            )
+            owner_response = client.get(
+                "/api/source-list/preferences",
+                headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
+            )
+            invalid = client.put(
+                "/api/source-list/preferences",
+                headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
+                json={"sort_mode": "manual"},
+            )
+
+        assert default_response.status_code == 200
+        assert default_response.json() == {"sort_mode": "newest"}
+        assert updated.status_code == 200
+        assert updated.json() == {"sort_mode": "name"}
+        assert other_response.json() == {"sort_mode": "name"}
+        assert owner_response.json() == {"sort_mode": "newest"}
+        assert invalid.status_code == 422
+    finally:
+        asyncio.run(database.close())
+
+
 def test_non_owner_member_cannot_manage_source(tmp_path):
     database = _connect_database(tmp_path)
     try:

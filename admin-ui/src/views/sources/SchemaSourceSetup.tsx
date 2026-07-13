@@ -69,7 +69,7 @@ export function SchemaSourceSetup({
   onOpenChange: (open: boolean) => void;
   sourceType: string | null;
   source?: Source | null;
-  onSaved?: () => void;
+  onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" };
 }) {
   // Backend authority: an existing source the viewer cannot configure should
@@ -145,7 +145,7 @@ function SourceConfigForm({
   source?: Source | null;
   schema: GeneConfigSchema;
   onOpenChange: (open: boolean) => void;
-  onSaved?: () => void;
+  onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" };
   canConfigureConnection: boolean;
 }) {
@@ -216,11 +216,11 @@ function SourceConfigForm({
       });
       return { id: String(response.data.id) };
     },
-    onSuccess: () => {
+    onSuccess: ({ id }) => {
       queryClient.invalidateQueries({ queryKey: ["sources"] });
       queryClient.invalidateQueries({ queryKey: ["projects"] });
       queryClient.invalidateQueries({ queryKey: ["stats"] });
-      onSaved?.();
+      onSaved?.(id);
       onOpenChange(false);
     },
   });

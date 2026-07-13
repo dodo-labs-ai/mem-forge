@@ -127,6 +127,7 @@ from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES,
     SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
     SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES,
+    SourceListSortMode,
 )
 from memforge.storage.database import Database
 
@@ -908,6 +909,10 @@ class LocalAgentJobCompleteRequest(BaseModel):
 
 class SourceSubscriptionRequest(BaseModel):
     enabled: bool
+
+
+class SourceListPreferenceRequest(BaseModel):
+    sort_mode: SourceListSortMode
 
 
 class UpdateSourceRequest(BaseModel):
@@ -2630,6 +2635,7 @@ def create_admin_app(
     entity_router = APIRouter(prefix="/api/entities", tags=["entities"])
     gene_router = APIRouter(prefix="/api/genes", tags=["genes"])
     source_router = APIRouter(prefix="/api/sources", tags=["sources"])
+    source_list_router = APIRouter(prefix="/api/source-list", tags=["sources"])
     agent_session_router = APIRouter(prefix="/api/agent-sessions", tags=["agent-sessions"])
     hook_router = APIRouter(prefix="/api/hooks", tags=["hooks"])
     recent_change_router = APIRouter(prefix="/api/recent-changes", tags=["recent-changes"])
@@ -3668,6 +3674,64 @@ def create_admin_app(
             "source_id": source_id,
             "subscription": {"enabled": req.enabled},
         }
+
+    @source_router.put("/{source_id}/pin")
+    async def pin_source_for_viewer(
+        request: Request,
+        source_id: str,
+        db: Database = Depends(get_db),
+    ):
+        """Pin one source in the authenticated viewer's Source List."""
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        await db.set_source_pinned_for_user(
+            source_id,
+            resolve_request_principal(request),
+            True,
+        )
+        return {"source_id": source_id, "pinned": True}
+
+    @source_router.delete("/{source_id}/pin")
+    async def unpin_source_for_viewer(
+        request: Request,
+        source_id: str,
+        db: Database = Depends(get_db),
+    ):
+        """Unpin one source in the authenticated viewer's Source List."""
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        await db.set_source_pinned_for_user(
+            source_id,
+            resolve_request_principal(request),
+            False,
+        )
+        return {"source_id": source_id, "pinned": False}
+
+    @source_list_router.get("/preferences")
+    async def get_source_list_preferences(
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Return the authenticated viewer's Source List preferences."""
+        sort_mode = await db.get_source_list_sort_mode(
+            resolve_request_principal(request)
+        )
+        return {"sort_mode": sort_mode}
+
+    @source_list_router.put("/preferences")
+    async def set_source_list_preferences(
+        request: Request,
+        req: SourceListPreferenceRequest,
+        db: Database = Depends(get_db),
+    ):
+        """Persist the authenticated viewer's Source List sort mode."""
+        await db.set_source_list_sort_mode(
+            resolve_request_principal(request),
+            req.sort_mode,
+        )
+        return {"sort_mode": req.sort_mode}
 
     # ===================================================================
     # 4c. Recent Changes
@@ -5139,6 +5203,7 @@ def create_admin_app(
     app.include_router(entity_router)
     app.include_router(gene_router)
     app.include_router(source_router)
+    app.include_router(source_list_router)
     app.include_router(agent_session_router)
     app.include_router(hook_router)
     app.include_router(recent_change_router)

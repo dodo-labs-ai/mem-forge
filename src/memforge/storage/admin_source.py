@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES = 1440
 SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES = 5
 SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES = 10080
+SourceListSortMode = Literal["newest", "name", "recently_synced"]
+SOURCE_LIST_DEFAULT_SORT_MODE: SourceListSortMode = "newest"
+SOURCE_LIST_SORT_MODES = frozenset({"newest", "name", "recently_synced"})
+
+
+def validate_source_list_sort_mode(value: str) -> SourceListSortMode:
+    if value not in SOURCE_LIST_SORT_MODES:
+        raise ValueError(f"Unsupported source-list sort mode: {value}")
+    return cast(SourceListSortMode, value)
 
 
 @runtime_checkable
@@ -61,6 +70,18 @@ class SourceAdminReader(Protocol):
 
     async def set_source_subscription(
         self, source_id: str, user_id: str, enabled: bool
+    ) -> None: ...
+
+    async def is_source_pinned_for_user(self, source_id: str, user_id: str) -> bool: ...
+
+    async def set_source_pinned_for_user(
+        self, source_id: str, user_id: str, pinned: bool
+    ) -> None: ...
+
+    async def get_source_list_sort_mode(self, user_id: str) -> SourceListSortMode: ...
+
+    async def set_source_list_sort_mode(
+        self, user_id: str, sort_mode: SourceListSortMode
     ) -> None: ...
 
     async def set_source_sync_schedule(

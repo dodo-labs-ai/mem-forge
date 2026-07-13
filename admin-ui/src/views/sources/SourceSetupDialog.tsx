@@ -21,7 +21,7 @@ export function SourceSetupDialog({
   onOpenChange: (open: boolean) => void;
   sourceType: string | null;
   source?: Source | null;
-  onSaved?: () => void;
+  onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" };
 }) {
   if (!sourceType) return null;
@@ -61,7 +61,7 @@ function TeamsSetupDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   source?: Source | null;
-  onSaved?: () => void;
+  onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" };
 }) {
   const canConfigure = source ? source.capabilities?.can_configure === true : true;

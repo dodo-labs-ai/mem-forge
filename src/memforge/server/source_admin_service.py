@@ -136,6 +136,9 @@ async def list_source_admin_rows(
         enabled_for_me = await reader.is_source_enabled_for_user(source_id, viewer_id)
         row["subscription"] = {"enabled": enabled_for_me}
         row["enabled_for_me"] = enabled_for_me
+        row["pinned_for_me"] = await reader.is_source_pinned_for_user(
+            source_id, viewer_id
+        )
         row["memory_count"] = await reader.count_source_memories(
             source_id,
             include_private=True,
