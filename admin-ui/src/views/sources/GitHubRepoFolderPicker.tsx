@@ -1,9 +1,12 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   FileText,
+  Folder,
+  FolderOpen,
   FolderTree,
   Loader2,
   RefreshCw,
@@ -15,11 +18,17 @@ import { createLocalAgentJob, getLocalAgentJob } from "@/api/localAgentJobs";
 import type { GitHubRepoTreeResponse, LocalAgentJobStatusResponse } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
 import {
   normalizeRepoPickerPath,
-  repoEffectiveFileCount,
+  repoEffectiveFiles,
   repoPickerItemsFromFilePaths,
+  repoPickerSelectionState,
+  repoPickerTreeRows,
+  repoScopeSummary,
   type RepoPickerItem,
+  type RepoPickerSelectionState,
+  type RepoPickerTreeRow,
   updateRepoPathSelection,
 } from "./githubRepoFolderPickerUtils";
 
@@ -54,12 +63,14 @@ export function GitHubRepoFolderPicker({
   const [editorMode, setEditorMode] = useState<ScopeMode | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(includePaths.length > 0);
   const [query, setQuery] = useState("");
+  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
+  const [previewOpen, setPreviewOpen] = useState(false);
   const isLocalPush = connectionMode === "local_push";
   const selectedPaths = editorMode === "include" ? includePaths : excludePaths;
-  const filteredItems = useMemo(() => {
-    const needle = query.trim().toLocaleLowerCase();
-    return needle ? items.filter((item) => item.path.toLocaleLowerCase().includes(needle)) : items;
-  }, [items, query]);
+  const visibleTreeRows = useMemo(
+    () => repoPickerTreeRows(items, expandedPaths, query),
+    [expandedPaths, items, query],
+  );
   const suggestedExclusions = useMemo(
     () => items
       .filter((item) => item.type === "tree" && EXCLUSION_SUGGESTION_PATTERN.test(item.path))
@@ -68,10 +79,24 @@ export function GitHubRepoFolderPicker({
       .slice(0, 5),
     [excludePaths, items],
   );
-  const effectiveFileCount = useMemo(
-    () => repoEffectiveFileCount(items, includePaths, excludePaths),
+  const effectiveFiles = useMemo(
+    () => repoEffectiveFiles(items, includePaths, excludePaths),
     [excludePaths, includePaths, items],
   );
+  const scopeSummary = useMemo(
+    () => repoScopeSummary(items, includePaths, excludePaths),
+    [excludePaths, includePaths, items],
+  );
+
+  const applyTreeItems = (nextItems: RepoPickerItem[]) => {
+    setItems(nextItems);
+    setExpandedPaths(new Set(
+      repoPickerTreeRows(nextItems, new Set(), "")
+        .filter((row) => row.depth === 0 && row.item.type === "tree")
+        .map((row) => row.item.path),
+    ));
+    setPreviewOpen(false);
+  };
 
   const browseTree = async () => {
     setLoading(true);
@@ -95,7 +120,7 @@ export function GitHubRepoFolderPicker({
           return;
         }
         const paths = localAgentJobPaths(status);
-        setItems(repoPickerItemsFromFilePaths(paths));
+        applyTreeItems(repoPickerItemsFromFilePaths(paths));
         if (status.result?.truncated || paths.length >= LOCAL_SCAN_LIMIT) {
           setMessage("Repository tree is large. Search for a folder or file to narrow the list.");
         }
@@ -105,7 +130,7 @@ export function GitHubRepoFolderPicker({
           config,
           limit: LOCAL_SCAN_LIMIT,
         });
-        setItems(response.data.items);
+        applyTreeItems(response.data.items);
         if (response.data.truncated) {
           setMessage("Repository tree is large. Search for a folder or file to narrow the list.");
         }
@@ -135,6 +160,15 @@ export function GitHubRepoFolderPicker({
     }
   };
 
+  const toggleExpanded = (path: string) => {
+    setExpandedPaths((current) => {
+      const next = new Set(current);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
   return (
     <div className="space-y-3 rounded-xl border p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -158,7 +192,7 @@ export function GitHubRepoFolderPicker({
         </Button>
       </div>
 
-      <PathChips paths={excludePaths} label="Excluded" onRemove={(path) => (
+      <PathChips tone="exclude" paths={excludePaths} label="Excluded" onRemove={(path) => (
         onExcludePathsChange(updateRepoPathSelection(excludePaths, path, false))
       )} />
 
@@ -186,7 +220,7 @@ export function GitHubRepoFolderPicker({
               </Button>
             )}
           </div>
-          <PathChips paths={includePaths} label="Included" onRemove={(path) => (
+          <PathChips tone="include" paths={includePaths} label="Included" onRemove={(path) => (
             onIncludePathsChange(updateRepoPathSelection(includePaths, path, false))
           )} />
         </div>
@@ -244,31 +278,56 @@ export function GitHubRepoFolderPicker({
                 <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search repository paths" className="pl-8" />
               </div>
-              <div className="mt-3 max-h-64 overflow-y-auto rounded-md border">
-                {filteredItems.map((item) => (
-                  <label key={`${item.type}:${item.path}`} className="flex min-w-0 items-center gap-2 border-b px-2.5 py-2 text-sm last:border-b-0">
-                    <input
-                      type="checkbox"
-                      className="size-4 shrink-0"
-                      checked={selectedPaths.includes(item.path)}
-                      onChange={(event) => updateSelection(item.path, event.target.checked)}
-                    />
-                    {item.type === "tree" ? (
-                      <FolderTree className="size-3.5 shrink-0 text-muted-foreground" />
-                    ) : (
-                      <FileText className="size-3.5 shrink-0 text-muted-foreground" />
-                    )}
-                    <span className="min-w-0 truncate font-mono text-xs">{item.path}</span>
-                  </label>
+              <div role="tree" aria-label="Repository paths" className="mt-3 max-h-72 overflow-y-auto rounded-md border">
+                {visibleTreeRows.map((row) => (
+                  <RepositoryTreeRow
+                    key={`${row.item.type}:${row.item.path}`}
+                    row={row}
+                    mode={editorMode}
+                    selectionState={repoPickerSelectionState(row.item.path, selectedPaths)}
+                    expanded={query.trim().length > 0 || expandedPaths.has(row.item.path)}
+                    onToggle={() => toggleExpanded(row.item.path)}
+                    onSelected={(selected) => updateSelection(row.item.path, selected)}
+                  />
                 ))}
-                {filteredItems.length === 0 && (
+                {visibleTreeRows.length === 0 && (
                   <p className="px-3 py-6 text-center text-sm text-muted-foreground">No matching paths.</p>
                 )}
               </div>
-              <p className="mt-2 text-xs text-muted-foreground">
-                {effectiveFileCount} supported file{effectiveFileCount === 1 ? "" : "s"} currently in scope.
-              </p>
             </>
+          )}
+        </div>
+      )}
+
+      {items.length > 0 && (
+        <div className="rounded-xl border border-emerald-200 bg-emerald-50/60 p-3.5 dark:border-emerald-900/70 dark:bg-emerald-950/20">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="font-semibold text-emerald-950 dark:text-emerald-100">{scopeSummary.readyLabel}</p>
+              <p className="mt-0.5 text-xs text-emerald-800/80 dark:text-emerald-200/80">{scopeSummary.detailLabel}</p>
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              aria-expanded={previewOpen}
+              onClick={() => setPreviewOpen((open) => !open)}
+            >
+              {previewOpen ? "Hide preview" : "Preview files"}
+            </Button>
+          </div>
+          {previewOpen && (
+            <div className="mt-3 max-h-48 overflow-y-auto rounded-lg border border-emerald-200 bg-background" aria-label="Files ready to sync">
+              {effectiveFiles.map((item) => (
+                <div key={item.path} className="flex items-center gap-2 border-b px-3 py-2 text-xs last:border-b-0">
+                  <FileText className="size-3.5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 truncate font-mono" title={item.path}>{item.path}</span>
+                </div>
+              ))}
+              {effectiveFiles.length === 0 && (
+                <p className="px-3 py-5 text-center text-sm text-muted-foreground">No supported files match this scope.</p>
+              )}
+            </div>
           )}
         </div>
       )}
@@ -276,7 +335,129 @@ export function GitHubRepoFolderPicker({
   );
 }
 
-function PathChips({ paths, label, onRemove }: { paths: string[]; label: string; onRemove: (path: string) => void }) {
+function RepositoryTreeRow({
+  row,
+  mode,
+  selectionState,
+  expanded,
+  onToggle,
+  onSelected,
+}: {
+  row: RepoPickerTreeRow;
+  mode: ScopeMode;
+  selectionState: RepoPickerSelectionState;
+  expanded: boolean;
+  onToggle: () => void;
+  onSelected: (selected: boolean) => void;
+}) {
+  const isFolder = row.item.type === "tree";
+  const isCovered = selectionState === "selected" || selectionState === "inherited";
+  const statusLabel = mode === "exclude" ? "Excluded" : "Included";
+  return (
+    <div
+      role="treeitem"
+      aria-level={row.depth + 1}
+      aria-expanded={isFolder && row.hasChildren ? expanded : undefined}
+      className={cn(
+        "flex min-w-0 items-center gap-2 border-b py-2 pr-2.5 text-sm last:border-b-0",
+        isCovered && (mode === "exclude" ? "bg-red-50/60 dark:bg-red-950/20" : "bg-emerald-50/60 dark:bg-emerald-950/20"),
+      )}
+      style={{ paddingLeft: `${10 + row.depth * 22}px` }}
+    >
+      {isFolder && row.hasChildren ? (
+        <button
+          type="button"
+          className="grid size-5 shrink-0 place-items-center rounded hover:bg-muted"
+          aria-label={`${expanded ? "Collapse" : "Expand"} ${row.item.path}`}
+          aria-expanded={expanded}
+          onClick={onToggle}
+        >
+          {expanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+        </button>
+      ) : <span className="size-5 shrink-0" />}
+      <TreeSelectionCheckbox
+        path={row.item.path}
+        mode={mode}
+        state={selectionState}
+        onSelected={onSelected}
+      />
+      {isFolder ? (
+        expanded
+          ? <FolderOpen className="size-4 shrink-0 text-muted-foreground" />
+          : <Folder className="size-4 shrink-0 text-muted-foreground" />
+      ) : (
+        <FileText className="size-4 shrink-0 text-muted-foreground" />
+      )}
+      <div className="min-w-0 flex-1">
+        <p className="truncate font-mono text-xs font-medium" title={row.item.path}>{row.name}</p>
+        <p className="text-[11px] text-muted-foreground">
+          {isFolder ? `${row.fileCount} file${row.fileCount === 1 ? "" : "s"}` : "File"}
+        </p>
+      </div>
+      {isCovered && (
+        <span
+          className={cn(
+            "shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold",
+            mode === "exclude"
+              ? "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-200"
+              : "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-200",
+          )}
+          title={selectionState === "inherited" ? `${statusLabel} by a selected parent folder` : undefined}
+        >
+          {statusLabel}
+        </span>
+      )}
+      {selectionState === "partial" && (
+        <span className="shrink-0 rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800 dark:bg-amber-950/60 dark:text-amber-200">
+          Partial
+        </span>
+      )}
+    </div>
+  );
+}
+
+function TreeSelectionCheckbox({
+  path,
+  mode,
+  state,
+  onSelected,
+}: {
+  path: string;
+  mode: ScopeMode;
+  state: RepoPickerSelectionState;
+  onSelected: (selected: boolean) => void;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  const inherited = state === "inherited";
+  useEffect(() => {
+    if (ref.current) ref.current.indeterminate = state === "partial";
+  }, [state]);
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      className={cn("size-4 shrink-0", mode === "exclude" ? "accent-red-600" : "accent-emerald-600")}
+      aria-label={path}
+      aria-checked={state === "partial" ? "mixed" : state === "selected" || inherited}
+      checked={state === "selected" || inherited}
+      disabled={inherited}
+      title={inherited ? "Selected by a parent folder" : undefined}
+      onChange={(event) => onSelected(event.target.checked)}
+    />
+  );
+}
+
+function PathChips({
+  paths,
+  label,
+  tone,
+  onRemove,
+}: {
+  paths: string[];
+  label: string;
+  tone: ScopeMode;
+  onRemove: (path: string) => void;
+}) {
   if (paths.length === 0) return null;
   return (
     <div className="flex flex-wrap items-center gap-2">
@@ -285,7 +466,12 @@ function PathChips({ paths, label, onRemove }: { paths: string[]; label: string;
         <button
           key={path}
           type="button"
-          className="flex max-w-full items-center gap-1 rounded-full border bg-muted/60 px-2.5 py-1 font-mono text-xs"
+          className={cn(
+            "flex max-w-full items-center gap-1 rounded-full border px-2.5 py-1 font-mono text-xs",
+            tone === "exclude"
+              ? "border-red-200 bg-red-50 text-red-700 hover:bg-red-100 dark:border-red-900/70 dark:bg-red-950/40 dark:text-red-200"
+              : "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:border-emerald-900/70 dark:bg-emerald-950/40 dark:text-emerald-200",
+          )}
           onClick={() => onRemove(path)}
           title={`Remove ${path}`}
         >
