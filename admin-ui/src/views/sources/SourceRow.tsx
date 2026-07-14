@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
-import { AlertCircle, Info, Loader2, Lock, Pause, Pin, Play, RefreshCw, SlidersHorizontal, Users } from "lucide-react";
-import type { Source, SourceCapabilities, SourceOwnership, SyncStatus } from "@/api/types";
+import { AlertCircle, Info, Loader2, Lock, Pause, Pin, Play, RefreshCw, SlidersHorizontal } from "lucide-react";
+import type { Source, SourceCapabilities, SyncStatus } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
 import { SourceSyncStatusCard } from "@/components/admin/SourceSyncStatusCard";
 import { Badge } from "@/components/ui/badge";
@@ -11,7 +11,7 @@ import { SourceIcon } from "@/components/sources/SourceIcon";
 import { cn } from "@/lib/utils";
 import { formatDuration, timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
-import { SourceReadinessIndicator } from "./SourceReadinessIndicator";
+import { SourceReadinessAlert } from "./SourceReadinessAlert";
 import { isLocalAgentBackedSource } from "./localAgentSources";
 import type { SourceSyncActivity } from "./sourceSyncActivity";
 import { teamsConversationCount } from "./teamsSourceConfig";
@@ -96,11 +96,10 @@ export function SourceRow({
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
   const localExecution = isLocalAgentBackedSource(source);
   const connectionRequiresAction = source.connection_status?.state === "action_required";
-  const showReadiness = !isPaused
+  const showReadinessAlert = !isPaused
     && capabilities.can_sync
     && (localExecution || connectionRequiresAction);
   const pausedSyncHint = "Source is paused. Resume the source to sync again.";
-  const ownershipText = formatOwnership(source.ownership);
   const configuredTeamsConversations = source.type === "teams"
     ? teamsConversationCount(source.config)
     : null;
@@ -146,23 +145,16 @@ export function SourceRow({
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
               {sourceLabel.name}
-              {sourceLabel.subtitle ? ` · ${sourceLabel.subtitle}` : ""}
             </p>
-            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-              {ownershipText && <span>{ownershipText}</span>}
+            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground empty:hidden">
               <SourceAccessLabel source={source} />
-              {showReadiness && (
-                <SourceReadinessIndicator
+              {showReadinessAlert && (
+                <SourceReadinessAlert
                   localExecution={localExecution}
                   connectionStatus={source.connection_status}
                 />
               )}
             </div>
-            {source.type === "agent_session" && (
-              <p className="mt-1 text-xs text-muted-foreground">
-                Populated automatically by the plugin. No manual sync needed.
-              </p>
-            )}
             <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-sm text-muted-foreground">
               {displayedItemCount !== null && (
                 <span>
@@ -330,18 +322,11 @@ function SourceAccessLabel({ source }: { source: Source }) {
   if (source.access_state === "changing" || source.access_state === "orphaned_private") {
     return null;
   }
-  if (source.access_policy === "private") {
-    return (
-      <span className="inline-flex items-center gap-1 font-medium text-foreground">
-        <Lock className="size-3" aria-hidden="true" />
-        Only me
-      </span>
-    );
-  }
+  if (source.access_policy !== "private") return null;
   return (
-    <span className="inline-flex items-center gap-1">
-      <Users className="size-3" aria-hidden="true" />
-      Shared with workspace
+    <span className="inline-flex items-center gap-1 font-medium text-foreground">
+      <Lock className="size-3" aria-hidden="true" />
+      Only me
     </span>
   );
 }
@@ -565,18 +550,4 @@ function SubscriptionToggle({
       {pending && <Loader2 className="size-3 animate-spin" aria-hidden="true" />}
     </label>
   );
-}
-
-function formatOwnership(ownership: SourceOwnership | undefined): string {
-  if (!ownership) return "";
-  const creator = ownership.created_by_user_id;
-  if (ownership.viewer_relationship === "owner") {
-    return "Created by you";
-  }
-  if (ownership.viewer_relationship === "workspace_admin") {
-    if (!creator) return "You manage as workspace admin";
-    return `Created by ${creator} · You manage as workspace admin`;
-  }
-  if (creator) return `Created by ${creator}`;
-  return "";
 }

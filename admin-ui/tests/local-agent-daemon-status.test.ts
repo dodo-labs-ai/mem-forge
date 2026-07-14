@@ -8,6 +8,10 @@ const componentSource = readFileSync(
 const querySource = readFileSync("src/views/sources/localAgentDaemonStatusQuery.ts", "utf8");
 const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf8");
 const sourceRowSource = readFileSync("src/views/sources/SourceRow.tsx", "utf8");
+const readinessAlertSource = readFileSync(
+  "src/views/sources/SourceReadinessAlert.tsx",
+  "utf8",
+);
 const schemaSourceSetupSource = readFileSync(
   "src/views/sources/SchemaSourceSetup.tsx",
   "utf8",
@@ -134,18 +138,28 @@ assert.equal(
 
 assert.match(
   sourceRowSource,
-  /SourceReadinessIndicator/,
-  "Source rows should use the shared local source readiness presenter",
+  /SourceReadinessAlert/,
+  "Source rows should use the shared local source readiness alert presenter",
 );
 assert.match(
   sourceRowSource,
-  /const localExecution = isLocalAgentBackedSource\(source\);[\s\S]*const showReadiness = !isPaused[\s\S]*capabilities\.can_sync/,
+  /const localExecution = isLocalAgentBackedSource\(source\);[\s\S]*const showReadinessAlert = !isPaused[\s\S]*capabilities\.can_sync/,
   "Paused lifecycle and execution ownership should gate source readiness",
 );
 assert.match(
   sourceRowSource,
-  /<SourceLifecycleIndicator status=\{source\.status\} \/>[\s\S]*showReadiness &&/,
+  /<SourceLifecycleIndicator status=\{source\.status\} \/>[\s\S]*showReadinessAlert &&/,
   "Source lifecycle should remain visible independently of local readiness",
+);
+assert.doesNotMatch(
+  readinessAlertSource,
+  /Local sync ready|Checking local sync/,
+  "Healthy and transient local-sync states should not add noise to source rows",
+);
+assert.match(
+  readinessAlertSource,
+  /Local sync unavailable[\s\S]*Sign in required[\s\S]*Finish setup[\s\S]*Account mismatch/,
+  "Source rows should retain readiness states that require user action",
 );
 
 // --- Configure dialog ----------------------------------------------------
