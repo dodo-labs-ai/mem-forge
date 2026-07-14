@@ -1,7 +1,7 @@
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Files, Info, Loader2, LockKeyhole, MoreHorizontal, Pause, Pin, PinOff, Play, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
+import { Files, Info, Loader2, LockKeyhole, MoreHorizontal, Pause, Pin, Play, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { resourceClient } from "@/api/client";
 import { createLocalAgentJob, getCurrentLocalAgentJobs, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
@@ -806,13 +806,6 @@ export function SourcesPage() {
                                   status: source.status === "paused" ? "active" : "paused",
                                 });
                               }}
-                              onTogglePin={() => {
-                                setOpenMenuSourceId(null);
-                                setSourcePin.mutate({
-                                  sourceId: source.id,
-                                  pinned: !source.pinned_for_me,
-                                });
-                              }}
                               onChangeAccess={() => {
                                 setOpenMenuSourceId(null);
                                 setAccessSource(source);
@@ -823,7 +816,10 @@ export function SourcesPage() {
                           />
                         }
                         highlighted={newSourceId === source.id}
-                        onUnpin={() => setSourcePin.mutate({ sourceId: source.id, pinned: false })}
+                        onTogglePin={() => setSourcePin.mutate({
+                          sourceId: source.id,
+                          pinned: !source.pinned_for_me,
+                        })}
                         isPinPending={
                           setSourcePin.isPending && setSourcePin.variables?.sourceId === source.id
                         }
@@ -915,7 +911,6 @@ function SourceActionsMenu({
   onDelete,
   onForceResync,
   onToggleStatus,
-  onTogglePin,
   onChangeAccess,
   disableForceResync,
   disableToggleStatus,
@@ -928,7 +923,6 @@ function SourceActionsMenu({
   onDelete: () => void;
   onForceResync: () => void;
   onToggleStatus: () => void;
-  onTogglePin: () => void;
   onChangeAccess: () => void;
   disableForceResync: boolean;
   disableToggleStatus: boolean;
@@ -945,7 +939,6 @@ function SourceActionsMenu({
   const canForceResync = capabilities.can_force_resync;
   const canDelete = capabilities.can_delete;
   const canChangeAccess = capabilities.can_change_access && source.access_state === "active";
-  const isPinned = Boolean(source.pinned_for_me);
   const toggleStatusLabel = isPaused ? "Resume source" : "Pause source";
   const ToggleStatusIcon = isPaused ? Play : Pause;
   const forceResyncDisabledHint = isPaused
@@ -987,6 +980,10 @@ function SourceActionsMenu({
     };
   }, [open, onOpenChange]);
 
+  if (!canToggleStatus && !canForceResync && !canChangeAccess && !canDelete) {
+    return null;
+  }
+
   return (
     <div className="relative">
       <Button
@@ -1006,7 +1003,7 @@ function SourceActionsMenu({
               triggerBottom: rect.bottom,
               viewportWidth: window.innerWidth,
               viewportHeight: window.innerHeight,
-              menuHeight: canDelete ? 288 : 180,
+              menuHeight: canDelete ? 224 : 160,
             }));
           }
           onOpenChange(!open);
@@ -1022,23 +1019,6 @@ function SourceActionsMenu({
           className="z-50 rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg"
           style={menuStyle}
         >
-          <button
-            type="button"
-            role="menuitem"
-            className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm hover:bg-muted"
-            onClick={onTogglePin}
-          >
-            {isPinned ? <PinOff className="mt-0.5 size-4" /> : <Pin className="mt-0.5 size-4" />}
-            <span>
-              <span className="block font-medium text-foreground">
-                {isPinned ? "Unpin source" : "Pin source"}
-              </span>
-              <span className="mt-0.5 block text-xs">
-                {isPinned ? "Return it to the selected sort order." : "Show it first wherever it appears."}
-              </span>
-            </span>
-          </button>
-          {(canToggleStatus || canForceResync || canChangeAccess || canDelete) && <div className="my-1 h-px bg-border" />}
           {canChangeAccess && (
             <button
               type="button"
