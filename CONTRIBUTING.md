@@ -36,6 +36,19 @@ For agent-session changes, also run the focused Python tests:
 uv run pytest tests/test_hook_adapter.py tests/test_agent_session_api.py tests/test_agent_session_gene.py -q
 ```
 
+### MCP proxy integration copies
+
+Edit only `src/memforge/plugin_mcp_proxy.py`. The Codex and Claude Code plugin
+copies are generated delivery artifacts so each marketplace package can start
+standalone with system Python. Refresh both copies after a canonical change:
+
+```bash
+make sync-plugin-mcp
+```
+
+`make lint` and CI run the same `--check` validation and fail if either
+generated copy differs from the canonical source.
+
 ## Design Principles
 
 - Keep client adapters thin. They translate hook payloads, redact obvious

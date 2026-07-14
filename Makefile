@@ -1,10 +1,16 @@
-.PHONY: install lint test ui-install ui-lint ui-test ui-build check
+.PHONY: install sync-plugin-mcp check-plugin-mcp lint test ui-install ui-lint ui-test ui-build check
 
 install:
 	uv sync --extra dev
 
-lint:
-	uv run ruff check src tests
+sync-plugin-mcp:
+	uv run python scripts/sync_plugin_mcp_proxy.py
+
+check-plugin-mcp:
+	uv run python scripts/sync_plugin_mcp_proxy.py --check
+
+lint: check-plugin-mcp
+	uv run ruff check src tests scripts/sync_plugin_mcp_proxy.py
 
 test:
 	uv run pytest -q
