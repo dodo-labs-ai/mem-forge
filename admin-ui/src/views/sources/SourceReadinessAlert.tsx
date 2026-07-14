@@ -1,6 +1,5 @@
 import {
   CircleAlert,
-  Loader2,
   LogIn,
   MonitorCheck,
   TriangleAlert,
@@ -15,26 +14,16 @@ import {
   type SourceReadiness,
 } from "./sourceReadiness";
 
-interface SourceReadinessBadgeProps {
+interface SourceReadinessAlertProps {
   localExecution: boolean;
   connectionStatus?: SourceConnectionStatus | null;
 }
 
-const PRESENTATION: Record<SourceReadiness, {
+const ALERT_PRESENTATION: Partial<Record<SourceReadiness, {
   label: string;
   icon: typeof MonitorCheck;
   className: string;
-}> = {
-  checking_local_sync: {
-    label: "Checking local sync",
-    icon: Loader2,
-    className: "text-muted-foreground",
-  },
-  local_sync_ready: {
-    label: "Local sync ready",
-    icon: MonitorCheck,
-    className: "bg-secondary text-secondary-foreground",
-  },
+}>> = {
   local_sync_unavailable: {
     label: "Local sync unavailable",
     icon: CircleAlert,
@@ -57,10 +46,10 @@ const PRESENTATION: Record<SourceReadiness, {
   },
 };
 
-export function SourceReadinessBadge({
+export function SourceReadinessAlert({
   localExecution,
   connectionStatus,
-}: SourceReadinessBadgeProps) {
+}: SourceReadinessAlertProps) {
   const query = useLocalAgentDaemonStatus(localExecution);
   const daemon: LocalDaemonReadiness | undefined = localExecution
     ? query.isPending
@@ -70,17 +59,13 @@ export function SourceReadinessBadge({
         : "ready"
     : undefined;
   const readiness = resolveSourceReadiness({ localExecution, daemon, connectionStatus });
-  if (readiness === null) return null;
+  const presentation = readiness === null ? undefined : ALERT_PRESENTATION[readiness];
+  if (!presentation) return null;
 
-  const presentation = PRESENTATION[readiness];
   const Icon = presentation.icon;
-
   return (
     <Badge variant="outline" className={cn("gap-1.5", presentation.className)}>
-      <Icon
-        className={cn("size-3", readiness === "checking_local_sync" && "animate-spin")}
-        aria-hidden="true"
-      />
+      <Icon className="size-3" aria-hidden="true" />
       {presentation.label}
     </Badge>
   );
