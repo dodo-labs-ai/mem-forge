@@ -180,7 +180,7 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
-  /connectionRequiresAction = source\.connection_status\?\.state === "action_required";[\s\S]*showReadiness\s*=\s*!isPaused[\s\S]*capabilities\.can_sync[\s\S]*localExecution \|\| connectionRequiresAction/,
+  /connectionRequiresAction = source\.connection_status\?\.state === "action_required";[\s\S]*showReadinessAlert\s*=\s*!isPaused[\s\S]*capabilities\.can_sync[\s\S]*localExecution \|\| connectionRequiresAction/,
   "Only the execution owner should see local or connection readiness",
 );
 assert.match(
@@ -230,13 +230,28 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
-  /ownershipText[\s\S]*<SourceAccessLabel source=\{source\} \/>[\s\S]*<SourceReadinessIndicator/,
-  "Steady access and healthy readiness should live in the source metadata line",
+  /empty:hidden[\s\S]*<SourceAccessLabel source=\{source\} \/>[\s\S]*<SourceReadinessAlert/,
+  "Source rows should reserve their optional metadata line for private access and readiness alerts",
 );
 assert.doesNotMatch(
   sourceRowSource,
-  /Shared with workspace[\s\S]{0,160}<\/Badge>/,
-  "Workspace access should be readable metadata instead of a high-emphasis badge",
+  /Shared with workspace/,
+  "Default workspace access should not add noise to every source row",
+);
+assert.doesNotMatch(
+  sourceRowSource,
+  /Created by you|You manage as workspace admin/,
+  "Default ownership details should not add noise to source rows",
+);
+assert.doesNotMatch(
+  sourceRowSource,
+  /sourceLabel\.subtitle|Populated automatically by the plugin/,
+  "Redundant source category and managed-source helper copy should not add noise to rows",
+);
+assert.match(
+  sourceRowSource,
+  /source\.access_policy !== "private"\) return null;[\s\S]*Only me/,
+  "Private access should remain visible because it changes who can query the source",
 );
 assert.match(
   sourceRowSource,
