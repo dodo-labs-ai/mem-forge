@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Stdlib-only MCP proxy used by MemForge agent-client plugins."""
+"""Stdlib-only MCP proxy used by MemForge agent-client plugins.
+
+The canonical source is ``src/memforge/plugin_mcp_proxy.py``. Packaged
+integration copies are generated with ``scripts/sync_plugin_mcp_proxy.py`` and
+must not be edited independently.
+"""
 
 from __future__ import annotations
 
@@ -38,7 +43,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.27"
+SERVER_VERSION = "0.1.28"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 WORKSPACE_ROOT_ENV_VARS = ("CODEX_WORKSPACE_ROOT",)
@@ -77,22 +82,12 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "search",
         "description": (
-            "Search memories visible to the current principal. If the user names a configured "
-            "source such as a Jira/Confluence source, call list_sources first and pass exact "
-            "source_ids here; never guess source ids from the name. Query may be omitted only "
-            "for deterministic listing with source_filter or time_range. Convert phrases like "
-            "'last week' into explicit YYYY-MM-DD start_date/end_date before calling. For "
-            "complete-list, enumeration, or inventory requests, use list_sources, then queryless deterministic "
-            "listing; if total_candidates is greater than returned results, the answer is not a "
-            "complete list until you request the next page with offset. Set each next offset to "
-            "the previous offset plus the number of results returned. Stop when results is empty "
-            "or the next offset is greater than or equal to total_candidates. For complete-list "
-            "inventory tasks, choose a larger top_k page size up to 50 instead of assuming the default 10 is "
-            "enough. Queried/ranked search uses candidate_count_kind=windowed; in that mode "
-            "has_more means more results inside the current ranking window, not an exhaustive "
-            "corpus count. A result may include follow_up with suggested_tool and reason. Search results "
-            "do not include source links or artifact URLs; call get_memory for provenance, source "
-            "titles, exact links, quotes, and lifecycle details before relying on source evidence."
+            "Search memories visible to the current principal. For source-specific requests, "
+            "call list_sources first and pass its exact source_ids. For broad or cross-source "
+            "requests, omit source_filter; use time_range only when explicitly requested. Never "
+            "guess source IDs. Omit query only for deterministic source/time listings, and "
+            "paginate those with total_candidates and offset. Ranked queries are not exhaustive. "
+            "Call get_memory for provenance and source evidence."
         ),
         "inputSchema": {
             "type": "object",
@@ -203,10 +198,9 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "list_sources",
         "description": (
-            "List search-eligible memory sources in the current workspace for the current "
-            "principal. Use this before search when the user names a source, system, project, "
-            "or configured connector such as a Jira or Confluence source. Returns safe metadata "
-            "only: source_id, name, type, status, counts, and last_synced_at."
+            "List search-eligible memory sources visible to the current principal. Use before "
+            "source-specific search to resolve exact source_ids; skip for broad or cross-source "
+            "requests. Returns source_id, name, type, status, counts, and last_synced_at."
         ),
         "inputSchema": {
             "type": "object",

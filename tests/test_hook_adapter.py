@@ -893,6 +893,29 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
+def test_packaged_plugin_version_0_1_28_is_consistent():
+    root = Path(__file__).resolve().parents[1]
+    version = "0.1.28"
+    canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
+    canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
+
+    assert f'SERVER_VERSION = "{version}"' in canonical_mcp
+    assert f'PLUGIN_VERSION = "{version}"' in canonical_hook
+
+    for client, manifest_dir in (
+        ("codex", ".codex-plugin"),
+        ("claude-code", ".claude-plugin"),
+    ):
+        plugin_root = root / "integrations" / client / "memforge-memory"
+        manifest = json.loads((plugin_root / manifest_dir / "plugin.json").read_text())
+        assert manifest["version"] == version
+        assert f"version is `{version}`" in (plugin_root / "README.md").read_text()
+        assert f'SERVER_VERSION = "{version}"' in (plugin_root / "scripts" / "memforge_mcp.py").read_text()
+        assert f'PLUGIN_VERSION = "{version}"' in (
+            plugin_root / "scripts" / "memforge_hook_adapter.py"
+        ).read_text()
+
+
 @pytest.mark.parametrize(
     ("plugin_path", "home_cache", "env_root"),
     [
@@ -1755,12 +1778,6 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "agent-selected entity hints" in properties["entities"]["description"]
     assert "keeping query unchanged" in properties["entities"]["description"]
     assert "not filters or authority" in properties["entities"]["description"]
-    assert "total_candidates" in tools["search"]["description"]
-    assert "complete list" in tools["search"]["description"]
-    assert "enumeration" in tools["search"]["description"]
-    assert "previous offset plus the number of results returned" in tools["search"]["description"]
-    assert "Stop when results is empty" in tools["search"]["description"]
-    assert "larger top_k" in tools["search"]["description"]
     assert "backlog" not in tools["search"]["description"].lower()
     assert "not a hard cap" in properties["top_k"]["description"]
     assert "up to 50" in properties["top_k"]["description"]
@@ -1783,9 +1800,6 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "status" not in properties
     assert "memory_types" not in properties
     assert "active_repo_identifier" not in properties
-    assert "follow_up" in tools["search"]["description"]
-    assert "call get_memory" in tools["search"]["description"]
-    assert "do not include source links" in tools["search"]["description"]
     assert "search -> get_memory -> get_resource" in tools["get_resource"]["description"]
 
     create_schema = tools["create_memory"]["inputSchema"]
@@ -1826,6 +1840,30 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     resolve_schema = tools["resolve_memory_review"]["inputSchema"]
     assert resolve_schema["properties"]["decision"]["enum"] == ["approve", "reject", "refresh"]
     assert "required when decision is reject" in resolve_schema["properties"]["note"]["description"]
+
+
+def test_mcp_proxy_source_selection_descriptions_guide_scoped_and_global_search():
+    proxy = _load_plugin_mcp_proxy()
+    tools = {tool["name"]: tool for tool in proxy.TOOLS}
+
+    search_description = tools["search"]["description"]
+    list_sources_description = tools["list_sources"]["description"]
+
+    assert "call list_sources first" in search_description
+    assert "exact source_ids" in search_description
+    assert "omit source_filter" in search_description
+    assert "time_range only when explicitly requested" in search_description
+    assert "deterministic source/time listings" in search_description
+    assert "total_candidates and offset" in search_description
+    assert "Ranked queries are not exhaustive" in search_description
+    assert "Call get_memory for provenance" in search_description
+    assert len(search_description) <= 500
+
+    assert "Use before source-specific search" in list_sources_description
+    assert "exact source_ids" in list_sources_description
+    assert "skip for broad or cross-source requests" in list_sources_description
+    assert "Returns source_id, name, type, status, counts, and last_synced_at" in list_sources_description
+    assert len(list_sources_description) <= 260
 
 
 def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
