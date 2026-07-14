@@ -258,20 +258,55 @@ assert.match(
   /disabled=\{isSyncing \|\| isDeleting \|\| isPaused\}/,
   "Paused sources should not expose an enabled primary Sync button",
 );
-assert.match(
+assert.doesNotMatch(
   sourceRowSource,
   /<span>Include memories<\/span>/,
-  "The subscription toggle should describe the memories it includes for the current user",
+  "The subscription switch should not repeat a visible Include memories label on every row",
 );
 assert.match(
   sourceRowSource,
-  /className="inline-flex min-h-8 cursor-pointer items-center gap-2 px-1 text-xs/,
-  "The inline source preference should not look like a third bordered action button",
+  /title=\{`Include memories from "\$\{sourceName\}" in your searches and memory views`\}/,
+  "The compact subscription switch should retain its explanatory hover text",
 );
 assert.match(
   sourceRowSource,
   /pending && <Loader2 className="size-3 animate-spin"/,
   "Saving a personal visibility preference should not replace the stable toggle label",
+);
+assert.match(
+  sourceRowSource,
+  /<h3[^>]*>\{source\.name\}<\/h3>[\s\S]*\{sourceLabel\.name\}[\s\S]*<SourceLifecycleIndicator/,
+  "The source type should share the title line instead of consuming a second row",
+);
+assert.doesNotMatch(
+  sourceRowSource,
+  /<p className="mt-1 text-xs text-muted-foreground">[\s\S]*\{sourceLabel\.name\}[\s\S]*<\/p>/,
+  "The source type should not render as a standalone metadata line",
+);
+assert.match(
+  sourceRowSource,
+  /group\/source-row[\s\S]*\[@media\(hover:hover\)\]:opacity-0[\s\S]*group-hover\/source-row:opacity-100/,
+  "An unpinned source should reveal its pin action when the row is hovered",
+);
+assert.match(
+  sourceRowSource,
+  /<h3 className="max-w-full break-words text-sm font-medium">\{source\.name\}<\/h3>/,
+  "Long source names should wrap instead of being clipped on the shared title line",
+);
+assert.match(
+  sourceRowSource,
+  /aria-label=\{`\$\{source\.pinned_for_me \? "Unpin" : "Pin"\} \$\{source\.name\}`\}/,
+  "The hover pin action should remain source-specific and accessible",
+);
+assert.doesNotMatch(
+  sourcesPageSource,
+  /Show it first wherever it appears\.|Return it to the selected sort order\./,
+  "Pinning should not remain in the overflow actions menu",
+);
+assert.doesNotMatch(
+  sourcesPageSource,
+  /<SourceActionsMenu(?:(?!\/>)[\s\S])*onTogglePin/,
+  "The overflow menu should not receive a pin toggle action",
 );
 assert.match(
   sourceRowSource,

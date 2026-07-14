@@ -64,7 +64,7 @@ export function SourceRow({
   onSubscriptionChange,
   actionsMenu,
   highlighted = false,
-  onUnpin,
+  onTogglePin,
   isPinPending = false,
   onRetryAccess,
   onRevertAccess,
@@ -87,7 +87,7 @@ export function SourceRow({
   onSubscriptionChange: (enabled: boolean) => void;
   actionsMenu: ReactNode;
   highlighted?: boolean;
-  onUnpin?: () => void;
+  onTogglePin?: () => void;
   isPinPending?: boolean;
   onRetryAccess?: () => void;
   onRevertAccess?: () => void;
@@ -116,7 +116,7 @@ export function SourceRow({
       id={`source-row-${source.id}`}
       tabIndex={-1}
       className={cn(
-        "space-y-3 p-4 transition-colors duration-700 focus:outline-none",
+        "group/source-row space-y-3 p-4 transition-colors duration-700 focus:outline-none",
         highlighted && "bg-primary/5 ring-2 ring-inset ring-primary/30",
       )}
     >
@@ -125,27 +125,11 @@ export function SourceRow({
           <SourceIcon type={source.type} client={source.client} className="mt-0.5 size-5" />
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
-              <h3 className="truncate text-sm font-medium">{source.name}</h3>
-              {source.pinned_for_me && onUnpin && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  disabled={isPinPending}
-                  aria-label={`Unpin ${source.name}`}
-                  title="Unpin source"
-                  className="-m-1 text-muted-foreground hover:text-foreground"
-                  onClick={onUnpin}
-                >
-                  <Pin className="size-3.5 fill-current" />
-                </Button>
-              )}
+              <h3 className="max-w-full break-words text-sm font-medium">{source.name}</h3>
+              <span className="text-xs text-muted-foreground">{sourceLabel.name}</span>
               <SourceLifecycleIndicator status={source.status} />
               <SourceAccessAlertBadge source={source} />
             </div>
-            <p className="mt-1 text-xs text-muted-foreground">
-              {sourceLabel.name}
-            </p>
             <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground empty:hidden">
               <SourceAccessLabel source={source} />
               {showReadinessAlert && (
@@ -182,6 +166,29 @@ export function SourceRow({
         </div>
 
         <div className="ml-8 flex flex-wrap items-center justify-start gap-2 sm:ml-0 sm:shrink-0 sm:justify-end">
+          {onTogglePin && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              disabled={isPinPending}
+              aria-label={`${source.pinned_for_me ? "Unpin" : "Pin"} ${source.name}`}
+              title={source.pinned_for_me ? "Unpin source" : "Pin source"}
+              className={cn(
+                "text-muted-foreground transition-opacity hover:text-foreground focus-visible:opacity-100",
+                source.pinned_for_me || isPinPending
+                  ? "opacity-100"
+                  : "opacity-100 [@media(hover:hover)]:opacity-0 group-hover/source-row:opacity-100 group-focus-within/source-row:opacity-100",
+              )}
+              onClick={onTogglePin}
+            >
+              {isPinPending ? (
+                <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+              ) : (
+                <Pin className={cn("size-4", source.pinned_for_me && "fill-current")} />
+              )}
+            </Button>
+          )}
           {capabilities.can_subscribe && (
             <SubscriptionToggle
               sourceName={source.name}
@@ -537,7 +544,7 @@ function SubscriptionToggle({
 }) {
   return (
     <label
-      className="inline-flex min-h-8 cursor-pointer items-center gap-2 px-1 text-xs text-muted-foreground transition-colors hover:text-foreground has-data-[disabled]:cursor-not-allowed has-data-[disabled]:opacity-60"
+      className="inline-flex min-h-8 cursor-pointer items-center gap-1.5 px-1 text-muted-foreground transition-colors hover:text-foreground has-data-[disabled]:cursor-not-allowed has-data-[disabled]:opacity-60"
       title={`Include memories from "${sourceName}" in your searches and memory views`}
     >
       <Switch
@@ -546,7 +553,6 @@ function SubscriptionToggle({
         disabled={pending}
         onCheckedChange={onChange}
       />
-      <span>Include memories</span>
       {pending && <Loader2 className="size-3 animate-spin" aria-hidden="true" />}
     </label>
   );
