@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
-import { AlertCircle, Info, Loader2, Lock, Pause, Pin, Play, RefreshCw, SlidersHorizontal, Users } from "lucide-react";
-import type { Source, SourceCapabilities, SourceOwnership, SyncStatus } from "@/api/types";
+import { AlertCircle, Info, Loader2, Lock, Pause, Pin, Play, RefreshCw, SlidersHorizontal } from "lucide-react";
+import type { Source, SourceCapabilities, SyncStatus } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
 import { SourceSyncStatusCard } from "@/components/admin/SourceSyncStatusCard";
 import { Badge } from "@/components/ui/badge";
@@ -11,7 +11,7 @@ import { SourceIcon } from "@/components/sources/SourceIcon";
 import { cn } from "@/lib/utils";
 import { formatDuration, timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
-import { SourceReadinessBadge } from "./SourceReadinessBadge";
+import { SourceReadinessAlert } from "./SourceReadinessAlert";
 import { isLocalAgentBackedSource } from "./localAgentSources";
 import type { SourceSyncActivity } from "./sourceSyncActivity";
 import { teamsConversationCount } from "./teamsSourceConfig";
@@ -96,11 +96,10 @@ export function SourceRow({
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
   const localExecution = isLocalAgentBackedSource(source);
   const connectionRequiresAction = source.connection_status?.state === "action_required";
-  const showReadiness = !isPaused
+  const showReadinessAlert = !isPaused
     && capabilities.can_sync
     && (localExecution || connectionRequiresAction);
   const pausedSyncHint = "Source is paused. Resume the source to sync again.";
-  const ownershipText = formatOwnership(source.ownership);
   const configuredTeamsConversations = source.type === "teams"
     ? teamsConversationCount(source.config)
     : null;
@@ -141,27 +140,21 @@ export function SourceRow({
                   <Pin className="size-3.5 fill-current" />
                 </Button>
               )}
-              <SourceLifecycleBadge status={source.status} />
-              <SourceAccessBadge source={source} />
-              {showReadiness && (
-                <SourceReadinessBadge
+              <SourceLifecycleIndicator status={source.status} />
+              <SourceAccessAlertBadge source={source} />
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {sourceLabel.name}
+            </p>
+            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground empty:hidden">
+              <SourceAccessLabel source={source} />
+              {showReadinessAlert && (
+                <SourceReadinessAlert
                   localExecution={localExecution}
                   connectionStatus={source.connection_status}
                 />
               )}
             </div>
-            <p className="mt-1 text-xs text-muted-foreground">
-              {sourceLabel.name}
-              {sourceLabel.subtitle ? ` · ${sourceLabel.subtitle}` : ""}
-            </p>
-            {ownershipText && (
-              <p className="mt-1 text-xs text-muted-foreground">{ownershipText}</p>
-            )}
-            {source.type === "agent_session" && (
-              <p className="mt-1 text-xs text-muted-foreground">
-                Populated automatically by the plugin. No manual sync needed.
-              </p>
-            )}
             <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-sm text-muted-foreground">
               {displayedItemCount !== null && (
                 <span>
@@ -297,7 +290,7 @@ export function SourceRow({
   );
 }
 
-function SourceAccessBadge({ source }: { source: Source }) {
+function SourceAccessAlertBadge({ source }: { source: Source }) {
   const failed = source.access_transition?.status === "failed";
   if (source.access_state === "changing") {
     return (
@@ -322,13 +315,19 @@ function SourceAccessBadge({ source }: { source: Source }) {
       </Badge>
     );
   }
-  if (source.access_policy === "private") {
-    return <Badge variant="outline" className="gap-1"><Lock className="size-3" />Only me</Badge>;
+  return null;
+}
+
+function SourceAccessLabel({ source }: { source: Source }) {
+  if (source.access_state === "changing" || source.access_state === "orphaned_private") {
+    return null;
   }
+  if (source.access_policy !== "private") return null;
   return (
-    <Badge variant="outline" className="gap-1 border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-900 dark:bg-sky-950/40 dark:text-sky-200">
-      <Users className="size-3" />Shared with workspace
-    </Badge>
+    <span className="inline-flex items-center gap-1 font-medium text-foreground">
+      <Lock className="size-3" aria-hidden="true" />
+      Only me
+    </span>
   );
 }
 
@@ -387,23 +386,20 @@ function SourceAccessTransitionStatus({
   );
 }
 
-function SourceLifecycleBadge({ status }: { status: Source["status"] }) {
+function SourceLifecycleIndicator({ status }: { status: Source["status"] }) {
+  if (status === "active") {
+    return <StatusDot status={status} />;
+  }
   const isPaused = status === "paused";
   return (
-    <>
-      <StatusDot
-        status={status}
-        className={isPaused ? "bg-amber-500" : undefined}
-      />
-      <Badge
-        variant={isPaused ? "outline" : status === "active" ? "secondary" : "outline"}
-        className={cn(
-          isPaused && "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-900/30 dark:text-amber-200",
-        )}
-      >
-        {status}
-      </Badge>
-    </>
+    <Badge
+      variant="outline"
+      className={cn(
+        isPaused && "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-900/30 dark:text-amber-200",
+      )}
+    >
+      {status}
+    </Badge>
   );
 }
 
@@ -554,18 +550,4 @@ function SubscriptionToggle({
       {pending && <Loader2 className="size-3 animate-spin" aria-hidden="true" />}
     </label>
   );
-}
-
-function formatOwnership(ownership: SourceOwnership | undefined): string {
-  if (!ownership) return "";
-  const creator = ownership.created_by_user_id;
-  if (ownership.viewer_relationship === "owner") {
-    return "Created by you";
-  }
-  if (ownership.viewer_relationship === "workspace_admin") {
-    if (!creator) return "You manage as workspace admin";
-    return `Created by ${creator} · You manage as workspace admin`;
-  }
-  if (creator) return `Created by ${creator}`;
-  return "";
 }
