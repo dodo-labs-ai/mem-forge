@@ -225,6 +225,21 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
+  /status === "active"[\s\S]*return <StatusDot status=\{status\}/,
+  "Active sources should use the status dot without a redundant active badge",
+);
+assert.match(
+  sourceRowSource,
+  /ownershipText[\s\S]*<SourceAccessLabel source=\{source\} \/>[\s\S]*<SourceReadinessIndicator/,
+  "Steady access and healthy readiness should live in the source metadata line",
+);
+assert.doesNotMatch(
+  sourceRowSource,
+  /Shared with workspace[\s\S]{0,160}<\/Badge>/,
+  "Workspace access should be readable metadata instead of a high-emphasis badge",
+);
+assert.match(
+  sourceRowSource,
   /disabled=\{isSyncing \|\| isDeleting \|\| isPaused\}/,
   "Paused sources should not expose an enabled primary Sync button",
 );

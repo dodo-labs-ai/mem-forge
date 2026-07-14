@@ -134,7 +134,7 @@ assert.equal(
 
 assert.match(
   sourceRowSource,
-  /SourceReadinessBadge/,
+  /SourceReadinessIndicator/,
   "Source rows should use the shared local source readiness presenter",
 );
 assert.match(
@@ -144,7 +144,7 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
-  /<SourceLifecycleBadge status=\{source\.status\} \/>[\s\S]*showReadiness &&/,
+  /<SourceLifecycleIndicator status=\{source\.status\} \/>[\s\S]*showReadiness &&/,
   "Source lifecycle should remain visible independently of local readiness",
 );
 
