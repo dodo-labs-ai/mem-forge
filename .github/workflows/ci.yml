@@ -17,11 +17,11 @@ jobs:
       - run: uv sync --extra dev
       - run: uv run python scripts/sync_plugin_mcp_proxy.py --check
       - run: uv run ruff check src tests scripts/sync_plugin_mcp_proxy.py
-      # Temporary hang probe: stream db fixture boundaries without changing
-      # test verbosity so the contaminating startup-runtime test is visible.
+      # Temporary regression probe: rerun the minimal quiet-mode reproduction
+      # against pytest-asyncio 1.4.0.
       - run: |
-          for attempt in 1 2 3; do
-            uv run pytest -q -s tests/test_startup_runtime.py -o faulthandler_timeout=30
+          for attempt in 1 2 3 4 5; do
+            uv run pytest -q tests/test_startup_runtime.py -o faulthandler_timeout=30
           done
 
   admin-ui:
