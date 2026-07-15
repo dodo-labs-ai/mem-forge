@@ -309,6 +309,9 @@ def _parse_decisions(
                 valid_from=raw.valid_from,
                 valid_until=raw.valid_until,
                 extraction_context=raw.extraction_context,
+                evidence_quote=raw.evidence_quote,
+                evidence_anchor=raw.evidence_anchor,
+                source_observation_id=raw.source_observation_id,
             )
             ops.append(
                 ReconcileOperation(

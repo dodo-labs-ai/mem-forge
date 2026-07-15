@@ -3766,7 +3766,9 @@ def create_admin_app(
                         exc,
                     )
 
-        async def reextract_documents(document_ids: frozenset[str]) -> None:
+        async def repair_source_projections(document_ids: frozenset[str]) -> None:
+            from memforge.pipeline.sync import SourceSyncMode
+
             latest_run = (
                 await db.get_latest_source_sync_run(source_id=source_id)
                 if hasattr(db, "get_latest_source_sync_run")
@@ -3782,6 +3784,7 @@ def create_admin_app(
                 source=source,
                 force_full_sync=True,
                 reprocess_doc_ids=document_ids,
+                execution_mode=SourceSyncMode.PROJECTION_REPAIR,
             )
             if state.last_sync_status != "success":
                 raise RuntimeError(
@@ -3799,8 +3802,8 @@ def create_admin_app(
                 # historical canonical content is reconstructed above; the
                 # Gene directory is ephemeral in Cloud Foundry and is not a
                 # valid recovery source for records that predate artifacts.
-                reextract_documents=(
-                    None if str(source["type"]) == "agent_session" else reextract_documents
+                repair_projections=(
+                    None if str(source["type"]) == "agent_session" else repair_source_projections
                 ),
             )
         except Exception:

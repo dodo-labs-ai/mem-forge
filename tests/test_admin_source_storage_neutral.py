@@ -16,6 +16,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleGate,
     LifecycleGateState,
 )
+from memforge.pipeline.sync import SourceSyncMode
 from memforge.server.admin_api import create_admin_app
 
 
@@ -418,9 +419,11 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path, m
     class FakeRuntimeProvider:
         def __init__(self) -> None:
             self.reprocessed_document_ids: frozenset[str] | None = None
+            self.execution_mode: SourceSyncMode | None = None
 
         async def run_source_sync(self, **kwargs):
             self.reprocessed_document_ids = kwargs["reprocess_doc_ids"]
+            self.execution_mode = kwargs["execution_mode"]
             return SimpleNamespace(last_sync_status="success", error_message=None)
 
     async def fake_recovery_job(
@@ -429,12 +432,12 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path, m
         *,
         job_id: str,
         reconstruct_documents,
-        reextract_documents,
+        repair_projections,
     ):
         assert source_id == "src-neutral"
         assert callable(reconstruct_documents)
         await db.start_lifecycle_backfill_job(job_id)
-        await reextract_documents(frozenset({"doc-1"}))
+        await repair_projections(frozenset({"doc-1"}))
         await db.enable_lifecycle_gate(source_id)
         return await db.complete_lifecycle_backfill_job(
             job_id,
@@ -471,6 +474,7 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path, m
     assert payload["reviews"] == []
     assert payload["vector_outbox"] == []
     assert runtime_provider.reprocessed_document_ids == frozenset({"doc-1"})
+    assert runtime_provider.execution_mode is SourceSyncMode.PROJECTION_REPAIR
 
 
 def test_source_lifecycle_finding_repair_returns_exact_lineage_and_gate_state(

@@ -23,6 +23,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import tiktoken
@@ -82,11 +83,19 @@ __all__ = [
     "DocumentLifecycleAdmission",
     "ExtractionWorkPool",
     "GeneSyncOrchestrator",
+    "SourceSyncMode",
     "SyncMemoryObserver",
     "get_process_document_lifecycle_admission",
 ]
 
 DEFAULT_INCREMENTAL_SYNC_OVERLAP = timedelta(minutes=10)
+
+
+class SourceSyncMode(str, Enum):
+    """Execution contract for one Gene discovery run."""
+
+    NORMAL = "normal"
+    PROJECTION_REPAIR = "projection_repair"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -523,6 +532,7 @@ class GeneSyncOrchestrator:
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
         reprocess_doc_ids: frozenset[str] | None = None,
+        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
     ) -> SyncState:
         """Run the full sync pipeline for a gene.
 
@@ -546,6 +556,11 @@ class GeneSyncOrchestrator:
         reprocess_doc_ids:
             Optional document identifiers that should be re-extracted during a
             full discovery. Other unchanged documents remain skipped.
+        execution_mode:
+            ``projection_repair`` establishes the current provider-neutral
+            projection baseline for explicitly requested documents without
+            running enrichment, Memory lifecycle, vector writes, deletion
+            detection, or advancing the ordinary source sync cursor.
 
         Returns
         -------
@@ -553,6 +568,9 @@ class GeneSyncOrchestrator:
             Final sync result with counts and error details.
         """
         run_id = uuid.uuid4().hex[:12]
+        projection_repair = execution_mode is SourceSyncMode.PROJECTION_REPAIR
+        if projection_repair and not reprocess_doc_ids:
+            raise ValueError("projection repair requires explicit document identifiers")
         started_at = datetime.now(timezone.utc)
         bind_document_store = getattr(gene, "bind_document_store", None)
         if callable(bind_document_store):
@@ -585,7 +603,9 @@ class GeneSyncOrchestrator:
             "access_policy": str((configured_source or {}).get("access_policy") or "workspace"),
             "owner_user_id": (configured_source or {}).get("owner_user_id"),
         }
-        scope_transition = await self.db.get_open_projection_scope_transition(source_id)
+        scope_transition = None
+        if not projection_repair:
+            scope_transition = await self.db.get_open_projection_scope_transition(source_id)
         transition_started = False
         run_coverage = ProjectionCoverage.PARTIAL_PROJECTION
 
@@ -621,7 +641,7 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             last_sync_time = (
                 None
-                if force_full_sync or authoritative_snapshot or scope_transition is not None
+                if projection_repair or force_full_sync or authoritative_snapshot or scope_transition is not None
                 else (existing_state.last_sync_at if existing_state else None)
             )
             if last_sync_time and hasattr(gene, "fetch_pdf"):
@@ -645,10 +665,14 @@ class GeneSyncOrchestrator:
             elif last_sync_time:
                 last_sync_time = last_sync_time - DEFAULT_INCREMENTAL_SYNC_OVERLAP
 
-            run_coverage = source_run_projection_coverage(
-                source_type=configured_source_type,
-                incremental=last_sync_time is not None,
-                authoritative_snapshot=authoritative_snapshot,
+            run_coverage = (
+                ProjectionCoverage.PARTIAL_PROJECTION
+                if projection_repair
+                else source_run_projection_coverage(
+                    source_type=configured_source_type,
+                    incremental=last_sync_time is not None,
+                    authoritative_snapshot=authoritative_snapshot,
+                )
             )
 
             # ----------------------------------------------------------
@@ -677,6 +701,24 @@ class GeneSyncOrchestrator:
                             "title": None,
                         }
                     )
+
+            if projection_repair:
+                requested_doc_ids = set(reprocess_doc_ids or ())
+                discovered_by_id = {item.item_id: item for item in items}
+                items = [
+                    discovered_by_id[doc_id]
+                    for doc_id in sorted(requested_doc_ids)
+                    if doc_id in discovered_by_id
+                ]
+                for missing_doc_id in sorted(requested_doc_ids - discovered_by_id.keys()):
+                    failed_docs.append(
+                        FailedDoc(
+                            doc_id=missing_doc_id,
+                            title=missing_doc_id,
+                            error="requested document was not returned by provider discovery",
+                        )
+                    )
+                    docs_failed += 1
 
             logger.info(
                 "Discovered %d content items from %s (since=%s)",
@@ -771,6 +813,7 @@ class GeneSyncOrchestrator:
                                     else None
                                 ),
                                 projection_access_context=configured_access_context,
+                                execution_mode=execution_mode,
                             )
                             stats["processed"] = True
                             stats["updated"] = item_stats.get("updated", False)
@@ -866,7 +909,9 @@ class GeneSyncOrchestrator:
             # Pages not returned aren't deleted — they're just unchanged.
             # Only run deletion detection on full syncs (since=None).
             deleted_count = 0
-            absence_is_authoritative = run_coverage.proves_absence and docs_failed == 0
+            absence_is_authoritative = (
+                not projection_repair and run_coverage.proves_absence and docs_failed == 0
+            )
 
             if absence_is_authoritative:
                 if progress_callback:
@@ -995,30 +1040,32 @@ class GeneSyncOrchestrator:
             failed_docs=failed_docs,
         )
 
-        try:
-            await self.db.upsert_sync_state(sync_state)
-        except Exception as e:
-            logger.error("Failed to upsert sync state: %s", e)
+        if not projection_repair:
+            try:
+                await self.db.upsert_sync_state(sync_state)
+            except Exception as e:
+                logger.error("Failed to upsert sync state: %s", e)
 
         # Record in sync_history for audit trail
-        try:
-            await self.db.insert_sync_history(
-                source=source_id,
-                status=status,
-                docs_processed=docs_processed,
-                docs_updated=docs_updated,
-                docs_failed=docs_failed,
-                memories_extracted=memories_extracted,
-                error_message=error_message,
-                failed_docs=[{"doc_id": fd.doc_id, "title": fd.title, "error": fd.error} for fd in failed_docs]
-                if failed_docs
-                else None,
-                started_at=started_at.isoformat(),
-                finished_at=finished_at.isoformat(),
-                run_id=run_id,
-            )
-        except Exception as e:
-            logger.error("Failed to insert sync history: %s", e)
+        if not projection_repair:
+            try:
+                await self.db.insert_sync_history(
+                    source=source_id,
+                    status=status,
+                    docs_processed=docs_processed,
+                    docs_updated=docs_updated,
+                    docs_failed=docs_failed,
+                    memories_extracted=memories_extracted,
+                    error_message=error_message,
+                    failed_docs=[{"doc_id": fd.doc_id, "title": fd.title, "error": fd.error} for fd in failed_docs]
+                    if failed_docs
+                    else None,
+                    started_at=started_at.isoformat(),
+                    finished_at=finished_at.isoformat(),
+                    run_id=run_id,
+                )
+            except Exception as e:
+                logger.error("Failed to insert sync history: %s", e)
 
         if progress_callback:
             progress_callback(
@@ -1076,6 +1123,7 @@ class GeneSyncOrchestrator:
         projection_scope: dict[str, object] | None = None,
         scope_transition: dict[str, object] | None = None,
         projection_access_context: dict[str, object] | None = None,
+        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
     ) -> dict:
         doc_id = item.item_id
         self._memory_sample("document_wait_start", source_id=source_id, run_id=run_id, doc_id=doc_id)
@@ -1095,6 +1143,7 @@ class GeneSyncOrchestrator:
                     projection_scope=projection_scope,
                     scope_transition=scope_transition,
                     projection_access_context=projection_access_context,
+                    execution_mode=execution_mode,
                 )
                 lifecycle_ok = True
                 return result
@@ -1123,6 +1172,7 @@ class GeneSyncOrchestrator:
         projection_scope: dict[str, object] | None = None,
         scope_transition: dict[str, object] | None = None,
         projection_access_context: dict[str, object] | None = None,
+        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
     ) -> dict:
         """Process a single content item through the full pipeline.
 
@@ -1334,8 +1384,14 @@ class GeneSyncOrchestrator:
         # 3b. Export PDF (if gene supports it)
         # ------------------------------------------------------------------
         pdf_uri = existing_doc.pdf_content_uri if unchanged and existing_doc else None
-        should_fetch_pdf = hasattr(gene, "fetch_pdf") and (
-            projection_requires_extraction or requires_pdf_uri or not pdf_uri
+        should_fetch_pdf = (
+            execution_mode is not SourceSyncMode.PROJECTION_REPAIR
+            and hasattr(gene, "fetch_pdf")
+            and (
+                projection_requires_extraction
+                or requires_pdf_uri
+                or not pdf_uri
+            )
         )
         if should_fetch_pdf:
             try:
@@ -1364,11 +1420,13 @@ class GeneSyncOrchestrator:
                 pdf_bytes=len(pdf_bytes) if pdf_bytes else 0,
             )
 
-        vector_current = await self._document_vector_is_current(
-            doc_id=doc_id,
-            content_hash=new_hash,
-            version=item.version,
-        )
+        vector_current = False
+        if execution_mode is not SourceSyncMode.PROJECTION_REPAIR:
+            vector_current = await self._document_vector_is_current(
+                doc_id=doc_id,
+                content_hash=new_hash,
+                version=item.version,
+            )
 
         token_count = _count_tokens(markdown_body)
         now = datetime.now(timezone.utc)
@@ -1401,6 +1459,26 @@ class GeneSyncOrchestrator:
             last_synced=now,
             client=normalized.source_semantics.get("client") or None,
         )
+
+        if execution_mode is SourceSyncMode.PROJECTION_REPAIR:
+            stats["updated"] = existing_doc is None or not content_unchanged
+            async with self._db_lock:
+                await self.db.upsert_document(doc_record)
+                await self.db.record_source_projection(projection)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "processing",
+                        "event": "document_processed",
+                        "title": item.title,
+                    }
+                )
+            logger.info(
+                "Repaired Source Projection baseline for %s (%s) without Memory lifecycle",
+                item.title,
+                doc_id,
+            )
+            return stats
 
         if unchanged:
             stats["updated"] = not content_unchanged

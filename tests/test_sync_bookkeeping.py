@@ -34,6 +34,7 @@ from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
     ExtractionWorkPool,
     GeneSyncOrchestrator,
+    SourceSyncMode,
     summarize_failed_documents,
 )
 from memforge.runtime import SyncService
@@ -4497,6 +4498,124 @@ async def test_document_is_indexed_before_enrichment(db: Database):
 
     assert state.last_sync_status == "success"
     assert await db.count_documents(source=source_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_projection_repair_targets_only_requested_documents_without_semantic_work_or_cursor_advance(
+    db: Database,
+):
+    source_id = "src-jira-projection-repair"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Repair",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    prior_sync_at = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_sync_state(
+        SyncState(
+            source=source_id,
+            last_sync_at=prior_sync_at,
+            last_sync_status="success",
+            docs_processed=0,
+            docs_updated=0,
+        )
+    )
+
+    class SemanticWorkMustNotRun:
+        async def enrich_document(self, **kwargs):
+            raise AssertionError("projection repair must not enrich")
+
+        async def extract_memories(self, **kwargs):
+            raise AssertionError("projection repair must not extract")
+
+        async def process_enrichment(self, **kwargs):
+            raise AssertionError("projection repair must not process enrichment")
+
+        async def apply_projected_lifecycle(self, **kwargs):
+            raise AssertionError("projection repair must not apply lifecycle")
+
+    release = asyncio.Event()
+    release.set()
+    semantic_guard = SemanticWorkMustNotRun()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=semantic_guard,
+        memory_extractor=semantic_guard,
+        memory_engine=semantic_guard,
+        memory_store=None,
+        vector_store=FailingVectorStore(),
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=BlockingFetchGene(item_count=2, release=release),
+        source_name="Jira Repair",
+        source_id=source_id,
+        force_full_sync=True,
+        reprocess_doc_ids=frozenset({"jira-1"}),
+        execution_mode=SourceSyncMode.PROJECTION_REPAIR,
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_processed == 1
+    assert await db.get_document("jira-0") is None
+    assert await db.get_document("jira-1") is not None
+    projection_rows = await db.db.execute_fetchall(
+        "SELECT id FROM source_units WHERE source_id = ?",
+        (source_id,),
+    )
+    assert len(projection_rows) == 1
+    persisted_state = await db.get_sync_state(source_id)
+    assert persisted_state is not None
+    assert persisted_state.last_sync_at == prior_sync_at
+    history_rows = await db.db.execute_fetchall(
+        "SELECT id FROM sync_history WHERE source = ?",
+        (source_id,),
+    )
+    assert history_rows == []
+
+
+@pytest.mark.asyncio
+async def test_projection_repair_fails_when_requested_document_is_not_discovered(db: Database):
+    source_id = "src-jira-projection-missing"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Missing",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=BlockingFetchGene(item_count=1, release=release),
+        source_name="Jira Missing",
+        source_id=source_id,
+        force_full_sync=True,
+        reprocess_doc_ids=frozenset({"jira-absent"}),
+        execution_mode=SourceSyncMode.PROJECTION_REPAIR,
+    )
+
+    assert state.last_sync_status == "failed"
+    assert state.docs_processed == 0
+    assert state.docs_failed == 1
+    assert state.failed_docs[0].doc_id == "jira-absent"
+    assert "not returned by provider discovery" in state.failed_docs[0].error
+    assert await db.get_sync_state(source_id) is None
 
 
 @pytest.mark.asyncio
