@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -315,7 +316,7 @@ def test_source_schedule_routes_use_storage_neutral_store(tmp_path):
     assert reader.updated == ("src-neutral", True, 60)
 
 
-def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path):
+def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path, monkeypatch):
     class FakeLifecycleStore:
         def __init__(self) -> None:
             self.jobs: dict[str, LifecycleBackfillJob] = {}
@@ -397,14 +398,57 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path):
             assert source_id == "src-neutral"
             return []
 
+        async def get_latest_source_sync_run(
+            self,
+            *,
+            source_id: str,
+            workspace_id: str = "default",
+        ):
+            assert source_id == "src-neutral"
+            assert workspace_id == "default"
+            return None
+
         async def enable_lifecycle_gate(self, source_id: str) -> LifecycleGate:
             self.gate = LifecycleGate(source_id=source_id, state=LifecycleGateState.ENABLED)
             return self.gate
 
+    class FakeRuntimeProvider:
+        def __init__(self) -> None:
+            self.reprocessed_document_ids: frozenset[str] | None = None
+
+        async def run_source_sync(self, **kwargs):
+            self.reprocessed_document_ids = kwargs["reprocess_doc_ids"]
+            return SimpleNamespace(last_sync_status="success", error_message=None)
+
+    async def fake_recovery_job(
+        db,
+        source_id: str,
+        *,
+        job_id: str,
+        reextract_documents,
+    ):
+        assert source_id == "src-neutral"
+        await db.start_lifecycle_backfill_job(job_id)
+        await reextract_documents(frozenset({"doc-1"}))
+        await db.enable_lifecycle_gate(source_id)
+        return await db.complete_lifecycle_backfill_job(
+            job_id,
+            scanned_memories=1,
+            mapped_memories=1,
+            finding_count=0,
+        )
+
+    monkeypatch.setattr(
+        "memforge.memory.cutover.run_source_lifecycle_recovery_job",
+        fake_recovery_job,
+    )
+
     store = FakeLifecycleStore()
+    runtime_provider = FakeRuntimeProvider()
     app = create_admin_app(
         db=store,
         config=_config(tmp_path),
+        runtime_provider=runtime_provider,
         principal_resolver=lambda request: "user-a",
     )
 
@@ -421,3 +465,4 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path):
     assert payload["findings"] == []
     assert payload["reviews"] == []
     assert payload["vector_outbox"] == []
+    assert runtime_provider.reprocessed_document_ids == frozenset({"doc-1"})

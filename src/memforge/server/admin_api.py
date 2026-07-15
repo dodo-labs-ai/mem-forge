@@ -3741,7 +3741,7 @@ def create_admin_app(
 
         async def reextract_documents(document_ids: frozenset[str]) -> None:
             latest_run = (
-                await db.get_latest_source_sync_run(source_id)
+                await db.get_latest_source_sync_run(source_id=source_id)
                 if hasattr(db, "get_latest_source_sync_run")
                 else None
             )
