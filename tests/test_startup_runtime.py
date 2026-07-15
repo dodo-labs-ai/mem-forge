@@ -2696,7 +2696,7 @@ async def test_admin_app_starts_embedded_source_sync_worker_by_default(db, tmp_p
     config.sync.worker_poll_seconds = 60
     app = create_admin_app(db=db, config=config)
 
-    with TestClient(app):
+    async with app.router.lifespan_context(app):
         worker_task = app.state.sync_worker_task
         assert app.state.sync_worker is not None
         assert worker_task is not None
