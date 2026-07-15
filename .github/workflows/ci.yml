@@ -17,12 +17,13 @@ jobs:
       - run: uv sync --extra dev
       - run: uv run python scripts/sync_plugin_mcp_proxy.py --check
       - run: uv run ruff check src tests scripts/sync_plugin_mcp_proxy.py
-      # Temporary hang probe: stress the modules immediately after the 81%
-      # boundary while preserving quiet-mode timing on the Linux runner.
+      # Temporary hang probe: stress the exact test whose async fixture teardown
+      # blocked in the narrowed Linux run.
       - run: |
-          for attempt in 1 2 3 4 5; do
-            uv run pytest -q tests/test_source_support_detector.py tests/test_startup_runtime.py \
-              -o faulthandler_timeout=30
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            uv run pytest -q \
+              tests/test_startup_runtime.py::test_run_source_sync_decrypts_gene_declared_secret_fields \
+              -o faulthandler_timeout=15
           done
 
   admin-ui:
