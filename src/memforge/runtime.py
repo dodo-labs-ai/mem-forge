@@ -167,6 +167,7 @@ class RuntimeProvider(Protocol):
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
+        reprocess_doc_ids: frozenset[str] | None = None,
     ) -> SyncState: ...
 
 
@@ -222,6 +223,7 @@ class DefaultRuntimeProvider:
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
+        reprocess_doc_ids: frozenset[str] | None = None,
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -231,6 +233,7 @@ class DefaultRuntimeProvider:
             progress_callback=progress_callback,
             force_full_sync=force_full_sync,
             authoritative_snapshot=authoritative_snapshot,
+            reprocess_doc_ids=reprocess_doc_ids,
         )
 
 
@@ -582,6 +585,7 @@ async def run_source_sync(
     progress_callback: Callable[[dict], None] | None = None,
     force_full_sync: bool = False,
     authoritative_snapshot: bool = False,
+    reprocess_doc_ids: frozenset[str] | None = None,
 ) -> SyncState:
     runtime = runtime or await build_sync_runtime(db, config)
     secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
@@ -599,6 +603,7 @@ async def run_source_sync(
         progress_callback=progress_callback,
         force_full_sync=force_full_sync,
         authoritative_snapshot=authoritative_snapshot,
+        reprocess_doc_ids=reprocess_doc_ids,
     )
 
 

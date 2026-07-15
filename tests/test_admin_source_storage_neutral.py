@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
+from memforge.memory.lifecycle_plan import (
+    LifecycleBackfillJob,
+    LifecycleBackfillJobStatus,
+    LifecycleGate,
+    LifecycleGateState,
+)
 from memforge.server.admin_api import create_admin_app
 
 
@@ -306,3 +313,111 @@ def test_source_schedule_routes_use_storage_neutral_store(tmp_path):
     }
     assert put_response.status_code == 200, put_response.text
     assert reader.updated == ("src-neutral", True, 60)
+
+
+def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path):
+    class FakeLifecycleStore:
+        def __init__(self) -> None:
+            self.jobs: dict[str, LifecycleBackfillJob] = {}
+            self.gate = LifecycleGate(
+                source_id="src-neutral",
+                state=LifecycleGateState.GATED,
+                reason="audit pending",
+            )
+
+        async def get_schedule_config(self) -> dict:
+            return {"enabled": False}
+
+        async def claim_due_scheduled_sources(self, **kwargs) -> list[dict]:
+            return []
+
+        async def get_source(self, source_id: str) -> dict | None:
+            assert source_id == "src-neutral"
+            return {
+                "id": source_id,
+                "type": "confluence",
+                "name": "Neutral Source",
+                "created_by_user_id": "user-a",
+                "access_policy": "private",
+                "access_state": "active",
+                "owner_user_id": "user-a",
+            }
+
+        async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate:
+            assert source_id == "src-neutral"
+            return self.gate
+
+        async def list_lifecycle_cutover_findings(self, source_id: str, **kwargs) -> list:
+            assert source_id == "src-neutral"
+            return []
+
+        async def list_lifecycle_backfill_jobs(self, source_id: str, **kwargs) -> list[LifecycleBackfillJob]:
+            assert source_id == "src-neutral"
+            return list(self.jobs.values())
+
+        async def list_lifecycle_reviews(self, source_id: str, **kwargs) -> list:
+            assert source_id == "src-neutral"
+            return []
+
+        async def list_lifecycle_vector_tasks(self, **kwargs) -> list:
+            assert kwargs.get("source_id") == "src-neutral"
+            return []
+
+        async def list_projection_scope_transitions(self, source_id: str, **kwargs) -> list:
+            assert source_id == "src-neutral"
+            return []
+
+        async def create_lifecycle_backfill_job(self, job: LifecycleBackfillJob) -> LifecycleBackfillJob:
+            return self.jobs.setdefault(job.id, job)
+
+        async def start_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob:
+            job = replace(self.jobs[job_id], status=LifecycleBackfillJobStatus.RUNNING)
+            self.jobs[job_id] = job
+            return job
+
+        async def complete_lifecycle_backfill_job(self, job_id: str, **counts) -> LifecycleBackfillJob:
+            job = replace(
+                self.jobs[job_id],
+                status=LifecycleBackfillJobStatus.COMPLETED,
+                **counts,
+            )
+            self.jobs[job_id] = job
+            return job
+
+        async def fail_lifecycle_backfill_job(self, job_id: str, *, error: str) -> LifecycleBackfillJob:
+            job = replace(
+                self.jobs[job_id],
+                status=LifecycleBackfillJobStatus.FAILED,
+                error=error,
+            )
+            self.jobs[job_id] = job
+            return job
+
+        async def list_legacy_memory_provenance(self, source_id: str) -> list:
+            assert source_id == "src-neutral"
+            return []
+
+        async def enable_lifecycle_gate(self, source_id: str) -> LifecycleGate:
+            self.gate = LifecycleGate(source_id=source_id, state=LifecycleGateState.ENABLED)
+            return self.gate
+
+    store = FakeLifecycleStore()
+    app = create_admin_app(
+        db=store,
+        config=_config(tmp_path),
+        principal_resolver=lambda request: "user-a",
+    )
+
+    with TestClient(app) as client:
+        queued = client.post("/api/sources/src-neutral/memory-lifecycle/backfill")
+        status = client.get("/api/sources/src-neutral/memory-lifecycle")
+
+    assert queued.status_code == 202, queued.text
+    assert status.status_code == 200, status.text
+    payload = status.json()
+    assert payload["gate"]["state"] == "enabled"
+    assert payload["jobs"][0]["status"] == "completed"
+    assert payload["jobs"][0]["finding_count"] == 0
+    assert payload["findings"] == []
+    assert payload["reviews"] == []
+    assert payload["vector_outbox"] == []

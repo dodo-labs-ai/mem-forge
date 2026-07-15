@@ -72,11 +72,6 @@ class MemoryStatus(str, Enum):
 ReplacementKind = Literal["revision", "supersession"]
 
 
-class MemoryLevel(str, Enum):
-    ATOMIC = "atomic"
-    CONSOLIDATED = "consolidated"
-
-
 class Visibility(str, Enum):
     """Per-row access tier within one datastore. 'org' is reserved (strict silos)."""
 
@@ -192,8 +187,6 @@ class Memory:
     replacement_reason: str | None = None
     replacement_kind: ReplacementKind | None = None
     extraction_context: str | None = None
-    memory_level: str = MemoryLevel.ATOMIC.value
-    curation_cluster_id: str | None = None
 
 
 @dataclass
@@ -222,34 +215,6 @@ class MemorySource:
     support_kind: str = "extracted"
     added_at: datetime | None = None
     source_updated_at: datetime | None = None
-
-
-@dataclass
-class MemoryDerivation:
-    """Lineage edge from a consolidated memory to an atomic child memory."""
-
-    parent_memory_id: str
-    child_memory_id: str
-    relation: str = "summarizes"
-    created_at: datetime | None = None
-
-
-@dataclass
-class MemoryCurationRun:
-    """Audit record for one Curator execution."""
-
-    id: str
-    policy_id: str
-    source_type: str
-    client: str | None
-    repo_identifier: str | None
-    project_key: str | None
-    candidate_count: int
-    created_memory_count: int
-    skipped_reason: str | None
-    error: str | None
-    started_at: datetime
-    completed_at: datetime | None = None
 
 
 @dataclass
@@ -632,9 +597,6 @@ class SearchResult:
     freshness: str = "current"  # current | stale | unverified
     contradiction_warning: str | None = None
     status: str = "active"
-    memory_level: str = MemoryLevel.ATOMIC.value
-    curation_cluster_id: str | None = None
-    covered_memory_count: int = 0
     repo_identifier: str | None = None
     follow_up: dict[str, str] | None = None
     retrieval_evidence: dict[str, Any] | None = None
@@ -663,6 +625,7 @@ class ReviewStatus(str, Enum):
 
 class ReviewKind(str, Enum):
     SUPERSEDE = "supersede"
+    CROSS_SOURCE_CONFLICT = "cross_source_conflict"
 
 
 def generate_review_id() -> str:

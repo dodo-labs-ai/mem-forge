@@ -1701,7 +1701,7 @@ async def test_jira_auth_mode_change_resets_sync_cursor(db, tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_source_base_url_update_releases_old_atlassian_limiter(db, tmp_path, monkeypatch):
+async def test_source_provider_namespace_update_is_rejected(db, tmp_path, monkeypatch):
     from memforge.server import admin_api
     from memforge.server.admin_api import create_admin_app
     from memforge.source_secrets import prepare_source_config_for_storage
@@ -1748,8 +1748,11 @@ async def test_source_base_url_update_releases_old_atlassian_limiter(db, tmp_pat
             },
         )
 
-    assert response.status_code == 200
-    assert released == [("https://old-jira.example.test", source_id)]
+    assert response.status_code == 409
+    assert response.json()["detail"] == "source_provider_namespace_immutable"
+    assert released == []
+    stored = await db.get_source(source_id)
+    assert stored["config"]["base_url"] == "https://old-jira.example.test"
 
 
 @pytest.mark.asyncio
@@ -1829,8 +1832,9 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(monkeypatch
             progress_callback=None,
             force_full_sync=False,
             authoritative_snapshot=False,
+            reprocess_doc_ids=None,
         ):
-            del authoritative_snapshot
+            del authoritative_snapshot, reprocess_doc_ids
             await gene.authenticate()
             return SyncState(source=source_id, last_sync_status="success")
 
@@ -1919,8 +1923,9 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(monkeypatch,
             progress_callback=None,
             force_full_sync=False,
             authoritative_snapshot=False,
+            reprocess_doc_ids=None,
         ):
-            del authoritative_snapshot
+            del authoritative_snapshot, reprocess_doc_ids
             self.gene = gene
             return SyncState(source=source_id, last_sync_status="success")
 
@@ -2286,6 +2291,10 @@ async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path,
     assert updated["last_sync"] is None
     source_payload = next(s for s in sources_response.json()["data"] if s["id"] == source_id)
     assert source_payload["sync"] is None
+    transition = await db.get_open_projection_scope_transition(source_id)
+    assert transition is not None
+    assert transition.previous_scope["jql_filter"] == "updated >= -180d"
+    assert transition.target_scope["jql_filter"] == "updated >= -90d"
 
 
 @pytest.mark.asyncio
@@ -2363,6 +2372,10 @@ async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path
     assert response.status_code == 200
     assert fake_sync_service.cancelled == [source_id]
     assert await db.get_sync_state(source_id) is None
+    transition = await db.get_open_projection_scope_transition(source_id)
+    assert transition is not None
+    assert transition.previous_scope["page_tree_root"] == "5695886009"
+    assert transition.target_scope["page_tree_root"] == "5625394036"
 
 
 @pytest.mark.asyncio

@@ -88,6 +88,15 @@ class ReviewService:
     ) -> ResolvedReview:
         review = await self._load_pending(review_id)
         incumbent, challenger = await self._load_pair(review)
+        if review.kind == ReviewKind.CROSS_SOURCE_CONFLICT.value:
+            return await self._resolve_cross_source_finding(
+                review,
+                incumbent=incumbent,
+                challenger=challenger,
+                status=ReviewStatus.APPROVED,
+                reviewer=reviewer,
+                note=note,
+            )
         related_challengers = await self._load_related_challengers(review)
         self._guard_supersede(review, incumbent, challenger)
         await self._guard_fresh(review, incumbent, challenger)
@@ -191,6 +200,15 @@ class ReviewService:
         if not note or not note.strip():
             raise ReviewError("A note is required when rejecting a review")
         incumbent, challenger = await self._load_pair(review)
+        if review.kind == ReviewKind.CROSS_SOURCE_CONFLICT.value:
+            return await self._resolve_cross_source_finding(
+                review,
+                incumbent=incumbent,
+                challenger=challenger,
+                status=ReviewStatus.REJECTED,
+                reviewer=reviewer,
+                note=note,
+            )
         related_challengers = await self._load_related_challengers(review)
         self._guard_supersede(review, incumbent, challenger)
         await self._guard_fresh(review, incumbent, challenger)
@@ -276,6 +294,43 @@ class ReviewService:
         )
         return ResolvedReview(
             review=await self.db.get_memory_review(review_id),  # type: ignore[arg-type]
+            incumbent=await self.db.get_memory(incumbent.id),
+            challenger=await self.db.get_memory(challenger.id),
+        )
+
+    async def _resolve_cross_source_finding(
+        self,
+        review: MemoryReview,
+        *,
+        incumbent: Memory,
+        challenger: Memory,
+        status: ReviewStatus,
+        reviewer: str | None,
+        note: str | None,
+    ) -> ResolvedReview:
+        """Acknowledge or dismiss a cross-source finding without lifecycle mutation."""
+        await self._guard_fresh(review, incumbent, challenger)
+        await self.db.resolve_memory_review(
+            review.id,
+            status=status.value,
+            reviewer=reviewer,
+            review_note=note,
+        )
+        await self.memory_store.record_review_decision(
+            "cross_source_review_resolved",
+            memory_id=challenger.id,
+            review_id=review.id,
+            reviewer=reviewer,
+            reason=review.reason,
+            context=self.memory_store.operation_context(),
+            payload={
+                "incumbent_memory_id": incumbent.id,
+                "resolution": status.value,
+                "destructive_action": False,
+            },
+        )
+        return ResolvedReview(
+            review=await self.db.get_memory_review(review.id),  # type: ignore[arg-type]
             incumbent=await self.db.get_memory(incumbent.id),
             challenger=await self.db.get_memory(challenger.id),
         )

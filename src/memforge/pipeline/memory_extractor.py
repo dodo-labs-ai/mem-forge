@@ -13,6 +13,7 @@ from memforge.config import DEFAULT_ENRICHMENT_MAX_TOKENS
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError
 from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.document_units import ExtractionContext
+from memforge.pipeline.projection_context import ProjectionExtractionBatch
 
 if TYPE_CHECKING:
     from memforge.models import Memory
@@ -38,6 +39,7 @@ EXISTING_MEMORIES_WINDOW_CHANGE = 50
 DOCUMENT_OUTLINE_CHAR_CAP = 8_000
 GLOSSARY_APPENDIX_CHAR_CAP = 2_000
 UNIT_MARKDOWN_CHAR_CAP = 80_000
+PROJECTION_CONTEXT_CHAR_CAP = 20_000
 
 # ---------------------------------------------------------------------------
 # Memory extraction prompt (Call 2)
@@ -222,6 +224,30 @@ Standard rules:
 Return ONLY a JSON object with a "memories" array. Use {{"memories": []}} when there are no memories."""
 
 
+PROJECTION_BATCH_EXTRACTION_PROMPT = """You are extracting durable atomic knowledge from changed source observations.
+
+<source_type>{source_type}</source_type>
+<doc_type>{doc_type}</doc_type>
+<entities_found>{entities_found}</entities_found>
+<existing_memories_for_this_source_unit>
+{existing_memories}
+</existing_memories_for_this_source_unit>
+
+Only PRIMARY observations grant extraction authority:
+<primary_observations>
+{primary_observations}
+</primary_observations>
+
+The following observations are CONTEXT only. Use them to resolve references and chronology, but do not extract a claim stated only here:
+<context_observations>
+{context_observations}
+</context_observations>
+
+Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Prefer an empty memories array over weak or transient claims. Do not emit source metadata, routine status, questions, or secrets. Preserve conditions and source language.
+
+Return ONLY a JSON object with a "memories" array."""
+
+
 # ---------------------------------------------------------------------------
 # MemoryExtractor class
 # ---------------------------------------------------------------------------
@@ -290,7 +316,7 @@ class MemoryExtractor:
         # Format existing memories
         if existing_memories:
             existing_str = "\n".join(
-                f"- [{m.memory_type}] {m.content}"
+                f"- [{m.id}] [{m.memory_type}] {m.content}"
                 for m in existing_memories[:EXISTING_MEMORIES_WINDOW]
             )
         else:
@@ -368,7 +394,7 @@ class MemoryExtractor:
         entities_str = ", ".join(context.entities) if context.entities else "(none found)"
         if existing_memories:
             existing_str = "\n".join(
-                f"- [{m.memory_type}] {m.content}"
+                f"- [{m.id}] [{m.memory_type}] {m.content}"
                 for m in existing_memories[:EXISTING_MEMORIES_WINDOW]
             )
         else:
@@ -401,6 +427,52 @@ class MemoryExtractor:
             memory.evidence_quote = evidence_quote
             memory.evidence_anchor = "unit"
             memory.extraction_context = evidence_quote[:EXTRACTION_QUOTE_MAX_CHARS]
+            kept.append(memory)
+        return MemoryExtractionResult(memories=kept)
+
+    async def extract_projection_batch_memories(
+        self,
+        batch: ProjectionExtractionBatch,
+        *,
+        source_type: str,
+        doc_type: str = "unknown",
+        entities: list[str] | None = None,
+        existing_memories: list[Memory] | None = None,
+    ) -> MemoryExtractionResult:
+        """Extract from Primary observations while treating neighbors as context."""
+
+        if not self.structured_llm_client:
+            return MemoryExtractionResult(
+                error_type="llm_client_unavailable",
+                error="No LLM client configured for memory extraction",
+            )
+        entities_str = ", ".join(entities) if entities else "(none found)"
+        existing_str = (
+            "\n".join(
+                f"- [{memory.id}] [{memory.memory_type}] {memory.content}"
+                for memory in (existing_memories or [])[:EXISTING_MEMORIES_WINDOW]
+            )
+            or "(no existing memories for this source unit)"
+        )
+        prompt = PROJECTION_BATCH_EXTRACTION_PROMPT.format(
+            source_type=source_type,
+            doc_type=doc_type,
+            entities_found=entities_str,
+            existing_memories=existing_str,
+            primary_observations=batch.primary_markdown[:UNIT_MARKDOWN_CHAR_CAP],
+            context_observations=batch.context_markdown[:PROJECTION_CONTEXT_CHAR_CAP],
+        )
+        result = await self._extract_with_schema(prompt, label="projection batch extraction")
+        if result.error_type:
+            return result
+        kept = []
+        for memory in result.memories:
+            quote = (memory.evidence_quote or memory.extraction_context or "").strip()
+            if not quote or quote not in batch.primary_markdown:
+                continue
+            memory.evidence_quote = quote
+            memory.evidence_anchor = "projection_batch"
+            memory.extraction_context = quote[:EXTRACTION_QUOTE_MAX_CHARS]
             kept.append(memory)
         return MemoryExtractionResult(memories=kept)
 

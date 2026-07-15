@@ -224,6 +224,7 @@ def _issue_content_item(issue: dict, base_url: str) -> ContentItem:
         author=assignee.get("displayName") if assignee else None,
         labels=fields.get("labels") or [],
         extra={
+            "issue_id": str(issue.get("id") or ""),
             "issue_key": key,
             "status": (fields.get("status") or {}).get("name", ""),
             "priority": (fields.get("priority") or {}).get("name", ""),

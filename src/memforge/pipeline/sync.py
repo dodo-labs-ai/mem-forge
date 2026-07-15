@@ -21,6 +21,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -42,13 +43,27 @@ from memforge.pipeline.sync_memory import SyncMemoryObserver
 
 from memforge.pipeline.document_units import ExtractionContextPacker, UnitizationPolicy, unitize_markdown
 from memforge.pipeline.document_update import DocumentUpdatePlan, plan_document_update
+from memforge.pipeline.source_projection_adapters import (
+    DEFAULT_SOURCE_PROJECTION_ADAPTER,
+    project_source_unit_tombstone,
+    source_run_projection_coverage,
+)
+from memforge.pipeline.projection_context import plan_projection_extraction_batches
 from memforge.memory.index_payloads import (
     document_embedding_text,
     embedding_text_hash,
 )
 from memforge.llm.providers import is_litellm_provider_model
 from memforge.memory.project_resolver import resolve_project_key
-from memforge.source_access import memory_visibility_for_document
+from memforge.source_projection import (
+    ProjectionCoverage,
+    ProjectionEnvelope,
+    ProjectionRequest,
+    ProjectionRunMode,
+    SourceProjection,
+    SourceProjectionAdapter,
+)
+from memforge.source_projection_config import canonical_projection_scope
 
 if TYPE_CHECKING:
     from memforge.genes.base import Gene
@@ -382,13 +397,10 @@ class GeneSyncOrchestrator:
         orchestrator = GeneSyncOrchestrator(db, doc_store, enricher, ...)
         state = await orchestrator.sync_gene(gene, source_name, source_id)
 
-    Each content item discovered by the gene flows through:
-        1. fetch -> normalize -> store on disk
-        2. content hash comparison (skip if unchanged)
-        3. Call 1: enricher.enrich_document() -> entity resolution
-        4. Call 2: memory_extractor.extract_memories() -> dedup + persist
-        5. Document record + embedding upsert
-        6. Changelog entry
+    Each content item discovered by the Gene flows through one provider-neutral
+    Source Projection, bounded extraction batches, revision-pinned Evidence,
+    and one complete atomic Lifecycle Plan. Provider-specific semantics stop at
+    the injected Source Projection Adapter.
 
     Concurrency is bounded by a semaphore (for LLM/embedding API calls)
     and a lock (for SQLite write serialization).
@@ -409,6 +421,7 @@ class GeneSyncOrchestrator:
         extraction_pool: ExtractionWorkPool | None = None,
         document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
         memory_observer: SyncMemoryObserver | None = None,
+        source_projection_adapter: SourceProjectionAdapter | None = None,
     ) -> None:
         self.db = db
         self.doc_store = doc_store
@@ -424,6 +437,7 @@ class GeneSyncOrchestrator:
         self.extraction_pool = extraction_pool
         self.document_lifecycle_admission = document_lifecycle_admission
         self.memory_observer = memory_observer
+        self.source_projection_adapter = source_projection_adapter or DEFAULT_SOURCE_PROJECTION_ADAPTER
 
         self._llm_semaphore = asyncio.Semaphore(self.max_concurrent)
         self._db_lock = asyncio.Lock()
@@ -508,6 +522,7 @@ class GeneSyncOrchestrator:
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
+        reprocess_doc_ids: frozenset[str] | None = None,
     ) -> SyncState:
         """Run the full sync pipeline for a gene.
 
@@ -528,6 +543,9 @@ class GeneSyncOrchestrator:
         authoritative_snapshot:
             When true, discover the complete submitted snapshot so removals can
             be reconciled, while still skipping documents whose content is unchanged.
+        reprocess_doc_ids:
+            Optional document identifiers that should be re-extracted during a
+            full discovery. Other unchanged documents remain skipped.
 
         Returns
         -------
@@ -557,6 +575,19 @@ class GeneSyncOrchestrator:
         error_message: str | None = None
         crawled_doc_ids: set[str] = set()
         existing_state = await self.db.get_sync_state(source_id)
+        configured_source = await self.db.get_source(source_id)
+        configured_source_type = str((configured_source or {}).get("type") or "unknown")
+        configured_projection_scope = canonical_projection_scope(
+            configured_source_type,
+            (configured_source or {}).get("config") or {},
+        )
+        configured_access_context = {
+            "access_policy": str((configured_source or {}).get("access_policy") or "workspace"),
+            "owner_user_id": (configured_source or {}).get("owner_user_id"),
+        }
+        scope_transition = await self.db.get_open_projection_scope_transition(source_id)
+        transition_started = False
+        run_coverage = ProjectionCoverage.PARTIAL_PROJECTION
 
         try:
             # ----------------------------------------------------------
@@ -564,6 +595,16 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             await gene.authenticate()
             logger.info("Gene %s authenticated successfully", source_name)
+            if scope_transition is not None:
+                if dict(scope_transition.target_scope) != configured_projection_scope:
+                    raise RuntimeError(
+                        "open Projection Scope transition does not match configured target scope"
+                    )
+                scope_transition = await self.db.start_projection_scope_transition(
+                    scope_transition.id,
+                    run_id=run_id,
+                )
+                transition_started = True
 
             # ----------------------------------------------------------
             # Step 1: Get indexed doc_ids for deletion detection
@@ -580,7 +621,7 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             last_sync_time = (
                 None
-                if force_full_sync or authoritative_snapshot
+                if force_full_sync or authoritative_snapshot or scope_transition is not None
                 else (existing_state.last_sync_at if existing_state else None)
             )
             if last_sync_time and hasattr(gene, "fetch_pdf"):
@@ -603,6 +644,12 @@ class GeneSyncOrchestrator:
                 last_sync_time = None
             elif last_sync_time:
                 last_sync_time = last_sync_time - DEFAULT_INCREMENTAL_SYNC_OVERLAP
+
+            run_coverage = source_run_projection_coverage(
+                source_type=configured_source_type,
+                incremental=last_sync_time is not None,
+                authoritative_snapshot=authoritative_snapshot,
+            )
 
             # ----------------------------------------------------------
             # Step 3: Discover content items
@@ -644,6 +691,7 @@ class GeneSyncOrchestrator:
                 item_count=len(items),
                 indexed_doc_count=len(indexed_doc_ids),
                 full_sync=last_sync_time is None,
+                projection_coverage=run_coverage.value,
             )
 
             if progress_callback:
@@ -709,7 +757,20 @@ class GeneSyncOrchestrator:
                                 source_id=source_id,
                                 run_id=run_id,
                                 progress_callback=on_item_progress,
-                                force_reprocess=force_full_sync,
+                                force_reprocess=(
+                                    force_full_sync and (not reprocess_doc_ids or item.item_id in reprocess_doc_ids)
+                                ),
+                                projection_scope=configured_projection_scope,
+                                scope_transition=(
+                                    {
+                                        "id": scope_transition.id,
+                                        "previous_scope": dict(scope_transition.previous_scope),
+                                        "target_scope": dict(scope_transition.target_scope),
+                                    }
+                                    if scope_transition is not None
+                                    else None
+                                ),
+                                projection_access_context=configured_access_context,
                             )
                             stats["processed"] = True
                             stats["updated"] = item_stats.get("updated", False)
@@ -805,9 +866,9 @@ class GeneSyncOrchestrator:
             # Pages not returned aren't deleted — they're just unchanged.
             # Only run deletion detection on full syncs (since=None).
             deleted_count = 0
-            is_full_sync = last_sync_time is None
+            absence_is_authoritative = run_coverage.proves_absence and docs_failed == 0
 
-            if is_full_sync:
+            if absence_is_authoritative:
                 if progress_callback:
                     progress_callback(
                         {
@@ -820,7 +881,9 @@ class GeneSyncOrchestrator:
 
                 deleted_count, deletion_failures = await self._detect_deletions(
                     source_id=source_id,
+                    source_type=configured_source_type,
                     source_name=source_name,
+                    run_id=run_id,
                     indexed_doc_ids=indexed_doc_ids,
                     crawled_doc_ids=crawled_doc_ids,
                     source_filter_summary=_source_filter_summary(gene, last_sync_time),
@@ -835,10 +898,32 @@ class GeneSyncOrchestrator:
                     )
             else:
                 logger.debug(
-                    "Skipping deletion detection for incremental sync: returned %d changed docs from %d indexed docs",
+                    "Skipping deletion detection without authoritative coverage: "
+                    "coverage=%s failed_docs=%d returned=%d indexed=%d",
+                    run_coverage.value,
+                    docs_failed,
                     len(crawled_doc_ids),
                     len(indexed_doc_ids),
                 )
+
+            if scope_transition is not None:
+                if absence_is_authoritative and docs_failed == 0:
+                    scope_transition = await self.db.complete_projection_scope_transition(
+                        scope_transition.id,
+                        run_id=run_id,
+                        coverage=run_coverage,
+                    )
+                else:
+                    scope_transition = await self.db.fail_projection_scope_transition(
+                        scope_transition.id,
+                        run_id=run_id,
+                        coverage=run_coverage,
+                        error=(
+                            "target scope did not produce a complete successful snapshot: "
+                            f"coverage={run_coverage.value}, failed_docs={docs_failed}"
+                        ),
+                    )
+                transition_started = False
 
             # ----------------------------------------------------------
             # Step 6: Update source doc_count
@@ -866,6 +951,19 @@ class GeneSyncOrchestrator:
             )
             status = "failed"
             error_message = str(e)
+            if scope_transition is not None and transition_started:
+                try:
+                    await self.db.fail_projection_scope_transition(
+                        scope_transition.id,
+                        run_id=run_id,
+                        coverage=run_coverage,
+                        error=error_message,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to persist Projection Scope transition failure for %s",
+                        scope_transition.id,
+                    )
 
         # ------------------------------------------------------------------
         # Step 7: Record SyncState and sync_history
@@ -975,6 +1073,9 @@ class GeneSyncOrchestrator:
         run_id: str | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         force_reprocess: bool = False,
+        projection_scope: dict[str, object] | None = None,
+        scope_transition: dict[str, object] | None = None,
+        projection_access_context: dict[str, object] | None = None,
     ) -> dict:
         doc_id = item.item_id
         self._memory_sample("document_wait_start", source_id=source_id, run_id=run_id, doc_id=doc_id)
@@ -991,6 +1092,9 @@ class GeneSyncOrchestrator:
                     run_id=run_id,
                     progress_callback=progress_callback,
                     force_reprocess=force_reprocess,
+                    projection_scope=projection_scope,
+                    scope_transition=scope_transition,
+                    projection_access_context=projection_access_context,
                 )
                 lifecycle_ok = True
                 return result
@@ -1016,6 +1120,9 @@ class GeneSyncOrchestrator:
         run_id: str | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         force_reprocess: bool = False,
+        projection_scope: dict[str, object] | None = None,
+        scope_transition: dict[str, object] | None = None,
+        projection_access_context: dict[str, object] | None = None,
     ) -> dict:
         """Process a single content item through the full pipeline.
 
@@ -1077,29 +1184,119 @@ class GeneSyncOrchestrator:
             return stats
 
         # ------------------------------------------------------------------
-        # 4. Content hash
+        # 3. Project provider-native content into stable source lineage.
+        #
+        # A first in-memory projection gives us the stable Source Unit ID. We
+        # then load that unit's current revisions and build the authoritative
+        # delta before persisting the projection. No lifecycle decision is
+        # allowed to infer deletion from the enclosing sync's item list.
         # ------------------------------------------------------------------
-        new_hash = compute_content_hash(markdown_body)
+        source_metadata = gene.metadata()
+        source_type = source_metadata.name
+        source_shape = source_metadata.data_shape
+        projection_probe = await self.source_projection_adapter.project(
+            ProjectionEnvelope(
+                request=ProjectionRequest(
+                    run_id="projection-probe",
+                    source_id=source_id,
+                    source_type=source_type,
+                    scope={
+                        "configured_scope": dict(projection_scope or {}),
+                        "document_id": item.item_id,
+                    },
+                    run_mode=ProjectionRunMode.FULL_SNAPSHOT,
+                    scope_transition=scope_transition,
+                    access_context=dict(projection_access_context or {}),
+                ),
+                item=item,
+                raw=raw,
+                normalized=normalized,
+            )
+        )
+        source_unit = projection_probe.source_units[0]
 
+        projection_run_id = f"{run_id or 'direct'}:{source_unit.id}:{projection_probe.source_unit_revisions[0].id}"
+        async with self._db_lock:
+            projection = await self.db.get_source_projection(projection_run_id)
+            if projection is None:
+                prior_unit_revision = await self.db.get_current_source_unit_revision(source_unit.id)
+                prior_observation_revisions = await self.db.get_current_source_observation_revisions(source_unit.id)
+                projection = await self.source_projection_adapter.project(
+                    ProjectionEnvelope(
+                        request=ProjectionRequest(
+                            run_id=projection_run_id,
+                            source_id=source_id,
+                            source_type=source_type,
+                            scope={
+                                "configured_scope": dict(projection_scope or {}),
+                                "source_unit_id": source_unit.id,
+                            },
+                            run_mode=(
+                                ProjectionRunMode.DELTA
+                                if prior_unit_revision is not None
+                                else ProjectionRunMode.FULL_SNAPSHOT
+                            ),
+                            scope_transition=scope_transition,
+                            access_context=dict(projection_access_context or {}),
+                        ),
+                        item=item,
+                        raw=raw,
+                        normalized=normalized,
+                        prior_unit_revision=prior_unit_revision,
+                        prior_observation_revisions=prior_observation_revisions,
+                    )
+                )
+
+            projection_requires_extraction = projection.deltas[0].requires_extraction
+            if not projection_requires_extraction:
+                # Location/access-only and idempotent observations carry no
+                # Memory mutation, so their lineage can advance independently.
+                await self.db.record_source_projection(projection)
+
+            lineage_document_ids = await self.db.list_source_unit_document_ids(source_unit.id)
+
+        lineage_predecessor_docs: list[DocumentRecord] = []
+        for lineage_doc_id in lineage_document_ids:
+            if lineage_doc_id == doc_id:
+                continue
+            predecessor = await self.db.get_document(lineage_doc_id)
+            if predecessor is not None:
+                lineage_predecessor_docs.append(predecessor)
+
+        # Document artifacts retain their existing normalized-content hash
+        # contract. The projection delta independently controls semantic work.
+        # This keeps vector/document freshness compatible while ensuring a
+        # provider revision or location-only move does not trigger extraction.
+        new_hash = compute_content_hash(markdown_body)
         async with self._db_lock:
             existing_hash = await self.db.get_content_hash(doc_id)
             existing_doc = await self.db.get_document(doc_id)
-            existing_metadata = await self.db.get_metadata(doc_id) if existing_hash == new_hash else None
+            if existing_doc is None and lineage_predecessor_docs:
+                existing_doc = lineage_predecessor_docs[0]
+                existing_hash = existing_doc.content_hash
+            existing_metadata = (
+                await self.db.get_metadata(existing_doc.doc_id)
+                if existing_doc is not None
+                else None
+            )
 
-        unchanged = existing_hash == new_hash and existing_metadata is not None and not force_reprocess
+        content_unchanged = existing_hash == new_hash
+        unchanged = (
+            (content_unchanged or not projection_requires_extraction)
+            and existing_metadata is not None
+            and not force_reprocess
+        )
         previous_markdown = (
             self._read_previous_normalized_content(existing_doc)
             if existing_hash is not None and existing_hash != new_hash
             else None
         )
 
-        source_type = gene.metadata().name
-        source_shape = gene.metadata().data_shape
         requires_pdf_uri = gene.requires_pdf_artifact(
             item=item,
             existing_doc=existing_doc,
             existing_hash=existing_hash,
-            new_hash=new_hash,
+            new_hash=(existing_hash if not projection_requires_extraction else new_hash),
         )
 
         # ------------------------------------------------------------------
@@ -1108,7 +1305,7 @@ class GeneSyncOrchestrator:
         raw_uri = existing_doc.raw_content_uri if unchanged and existing_doc else None
         norm_uri = existing_doc.normalized_content_uri if unchanged and existing_doc else None
         stored_content_artifact = False
-        if not unchanged or not raw_uri:
+        if not content_unchanged or not raw_uri:
             raw_uri = self.doc_store.store_raw(
                 source_id=source_id,
                 title=item.title,
@@ -1116,7 +1313,7 @@ class GeneSyncOrchestrator:
                 content_type=raw.content_type,
             )
             stored_content_artifact = True
-        if not unchanged or not norm_uri:
+        if not content_unchanged or not norm_uri:
             norm_uri = self.doc_store.store_normalized(
                 source_id=source_id,
                 title=item.title,
@@ -1138,7 +1335,7 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         pdf_uri = existing_doc.pdf_content_uri if unchanged and existing_doc else None
         should_fetch_pdf = hasattr(gene, "fetch_pdf") and (
-            not unchanged or requires_pdf_uri or not pdf_uri
+            projection_requires_extraction or requires_pdf_uri or not pdf_uri
         )
         if should_fetch_pdf:
             try:
@@ -1197,7 +1394,7 @@ class GeneSyncOrchestrator:
             token_count=token_count,
             raw_content_uri=raw_uri,
             raw_content_type=(
-                existing_doc.raw_content_type if unchanged and existing_doc else raw.content_type
+                existing_doc.raw_content_type if content_unchanged and existing_doc else raw.content_type
             ),
             normalized_content_uri=norm_uri,
             pdf_content_uri=pdf_uri,
@@ -1206,9 +1403,21 @@ class GeneSyncOrchestrator:
         )
 
         if unchanged:
+            stats["updated"] = not content_unchanged
+            if self.memory_store is not None and hasattr(
+                self.memory_store,
+                "drain_lifecycle_vector_outbox",
+            ):
+                await self.memory_store.drain_lifecycle_vector_outbox()
             if vector_current:
                 async with self._db_lock:
                     await self.db.upsert_document(doc_record)
+                await self._finalize_projected_document_moves(
+                    predecessor_docs=lineage_predecessor_docs,
+                    current_doc_id=doc_id,
+                    metadata=existing_metadata,
+                    source_unit_id=source_unit.id,
+                )
                 logger.debug("Skipping %s (content unchanged)", doc_id)
                 return stats
 
@@ -1238,6 +1447,13 @@ class GeneSyncOrchestrator:
                     else:
                         await self.db.delete_document(doc_id)
                 raise
+
+            await self._finalize_projected_document_moves(
+                predecessor_docs=lineage_predecessor_docs,
+                current_doc_id=doc_id,
+                metadata=existing_metadata,
+                source_unit_id=source_unit.id,
+            )
 
             if progress_callback:
                 progress_callback(
@@ -1384,6 +1600,7 @@ class GeneSyncOrchestrator:
         # 7. Call 2: Extract memories (under semaphore)
         # ------------------------------------------------------------------
         extraction_result = await self._extract_for_document_update(
+            projection=projection,
             update_plan=update_plan,
             markdown_body=markdown_body,
             source_type=source_type,
@@ -1445,23 +1662,20 @@ class GeneSyncOrchestrator:
         )
 
         # ------------------------------------------------------------------
-        # 8. Process memories: reconcile (updates) or insert (new docs)
+        # 8. Bind claims to revision-pinned evidence and apply one complete,
+        # stale-guarded Lifecycle Plan for this Source Unit.
         # ------------------------------------------------------------------
-        memory_context = self._memory_store_context(
-            run_id=run_id,
-            source_id=source_id,
-            doc_id=doc_id,
-        )
-        # The uploader remains audit actor context. Memory authorization is
-        # derived from the persisted Source policy, not from this document hint.
-        uploader_user_id = normalized.source_semantics.get("uploader_user_id")
         repo_identifier = normalized.source_semantics.get("repo_identifier")
         source_updated_at = _source_updated_at_for_item(item, normalized.source_semantics)
-        if change_type == "updated":
-            memory_stats = await self.memory_engine.reconcile_and_persist(
+        uploader_user_id = normalized.source_semantics.get("uploader_user_id")
+        actor_user_id = (
+            str(uploader_user_id).strip() if isinstance(uploader_user_id, str) and uploader_user_id.strip() else None
+        )
+        try:
+            memory_stats = await self.memory_engine.apply_projected_lifecycle(
+                projection=projection,
                 doc_id=doc_id,
                 raw_memories=raw_memories,
-                source_type=source_type,
                 doc_type=enrichment.doc_type,
                 project_key=project_key,
                 repo_identifier=repo_identifier,
@@ -1470,26 +1684,25 @@ class GeneSyncOrchestrator:
                 update_mode=update_plan.mode if update_plan else "full_document",
                 changed_hunks=update_plan.changed_hunks if update_plan else None,
                 update_plan_stats=self._document_update_plan_stats(update_plan),
-                audit_context=memory_context,
-                user_id=uploader_user_id,
                 source_updated_at=source_updated_at,
+                user_id=actor_user_id,
             )
-            stats["memories_extracted"] = memory_stats.get("added", 0)
-            stats["memories_corroborated"] = memory_stats.get("updated", 0)
-        else:
-            memory_stats = await self.memory_engine.process_memories(
+        except Exception:
+            # Projection and lifecycle state roll back together in the engine;
+            # keep the document/vector snapshot on the same prior revision so
+            # an ordinary retry still observes the semantic delta.
+            await self._restore_document_processing_snapshot(
                 doc_id=doc_id,
-                raw_memories=raw_memories,
-                source_type=source_type,
-                project_key=project_key,
-                repo_identifier=repo_identifier,
-                entity_ids=entity_ids,
-                audit_context=memory_context,
-                user_id=uploader_user_id,
-                source_updated_at=source_updated_at,
+                existing_doc=existing_doc,
+                document_vector_snapshot=document_vector_snapshot,
             )
-            stats["memories_extracted"] = memory_stats.get("inserted", 0)
-            stats["memories_corroborated"] = memory_stats.get("corroborated", 0)
+            raise
+        # The production engine commits this projection with its Lifecycle
+        # Plan. The idempotent write also keeps narrow test/custom engines on
+        # the same success-only projection contract.
+        await self.db.record_source_projection(projection)
+        stats["memories_extracted"] = memory_stats.get("added", 0)
+        stats["memories_corroborated"] = memory_stats.get("updated", 0)
 
         self._memory_sample(
             "after_memory_engine",
@@ -1501,39 +1714,6 @@ class GeneSyncOrchestrator:
             memories_corroborated=stats["memories_corroborated"],
             entity_count=len(entity_ids),
         )
-
-        if not extraction_result.error_type and self.source_support_detector:
-            writer_visibility, writer_owner_user_id = await memory_visibility_for_document(
-                self.db,
-                doc_id=doc_id,
-            )
-            async with self._heavy_work_slot(source_id):
-                support_stats = await self.source_support_detector.detect_and_persist(
-                    doc_id=doc_id,
-                    source_type=source_type,
-                    document=markdown_body,
-                    entity_ids=entity_ids,
-                    project_key=project_key,
-                    db=self.db,
-                    memory_store=self.memory_store,
-                    writer_visibility=writer_visibility,
-                    writer_owner_user_id=writer_owner_user_id,
-                    writer_project_key=project_key,
-                    source_updated_at=source_updated_at,
-                )
-            stats["memory_supports_added"] = support_stats.get("added", 0)
-            stats["memory_supports_updated"] = support_stats.get("updated", 0)
-            stats["memory_supports_removed"] = support_stats.get("removed_stale", 0)
-            self._memory_sample(
-                "after_source_support",
-                source_id=source_id,
-                run_id=run_id,
-                doc_id=doc_id,
-                memory_supports_added=stats["memory_supports_added"],
-                memory_supports_updated=stats["memory_supports_updated"],
-                memory_supports_removed=stats["memory_supports_removed"],
-                entity_count=len(entity_ids),
-            )
 
         async with self._db_lock:
             await self.db.upsert_metadata(doc_metadata)
@@ -1561,6 +1741,13 @@ class GeneSyncOrchestrator:
         async with self._db_lock:
             await self._insert_changelog(changelog_entry)
 
+        await self._finalize_projected_document_moves(
+            predecessor_docs=lineage_predecessor_docs,
+            current_doc_id=doc_id,
+            metadata=doc_metadata,
+            source_unit_id=source_unit.id,
+        )
+
         if progress_callback:
             progress_callback(
                 {
@@ -1585,6 +1772,7 @@ class GeneSyncOrchestrator:
     async def _extract_for_document_update(
         self,
         *,
+        projection: SourceProjection,
         update_plan: DocumentUpdatePlan | None,
         markdown_body: str,
         source_type: str,
@@ -1598,6 +1786,31 @@ class GeneSyncOrchestrator:
         document_url: str,
     ) -> MemoryExtractionResult:
         """Run full extraction or diff-guided extraction for a document."""
+        projection_batches = plan_projection_extraction_batches(projection)
+        if (
+            (len(projection.observations) > 1 or len(projection_batches) > 1)
+            and projection_batches
+            and hasattr(self.memory_extractor, "extract_projection_batch_memories")
+        ):
+            result = await self._extract_projection_batches(
+                projection_batches=projection_batches,
+                source_type=source_type,
+                doc_type=doc_type,
+                entity_names=entity_names,
+                existing_memories=existing_memories,
+                source_id=source_id,
+            )
+            await self._record_memory_extraction_result(
+                mode="projection_batches",
+                plan=update_plan,
+                doc_id=doc_id,
+                source_id=source_id,
+                run_id=run_id,
+                result=result,
+                extraction_metadata=result.metadata,
+            )
+            return result
+
         if (
             update_plan
             and update_plan.mode == "diff_guided"
@@ -1700,6 +1913,56 @@ class GeneSyncOrchestrator:
             result=result,
         )
         return result
+
+    async def _extract_projection_batches(
+        self,
+        *,
+        projection_batches,
+        source_type: str,
+        doc_type: str,
+        entity_names: list[str],
+        existing_memories: list[Memory],
+        source_id: str,
+    ) -> MemoryExtractionResult:
+        """Execute all transient Observation batches as one extraction outcome."""
+
+        batch_semaphore = asyncio.Semaphore(self._source_parallelism_limit())
+
+        async def extract_one(batch):
+            async with batch_semaphore:
+                async with self._heavy_work_slot(source_id):
+                    return await self.memory_extractor.extract_projection_batch_memories(
+                        batch,
+                        source_type=source_type,
+                        doc_type=doc_type,
+                        entities=entity_names,
+                        existing_memories=existing_memories,
+                    )
+
+        results = await asyncio.gather(*(extract_one(batch) for batch in projection_batches))
+        memories = []
+        failures = [result for result in results if result.error_type]
+        for result in results:
+            if not result.error_type:
+                memories.extend(result.memories)
+        if failures:
+            first = failures[0]
+            return MemoryExtractionResult(
+                error_type="projection_batch_failure",
+                error=first.error or first.error_type,
+                metadata={
+                    "batch_count": len(projection_batches),
+                    "failed_batch_count": len(failures),
+                    "extracted_count_before_failure": len(memories),
+                },
+            )
+        return MemoryExtractionResult(
+            memories=memories,
+            metadata={
+                "batch_count": len(projection_batches),
+                "failed_batch_count": 0,
+            },
+        )
 
     async def _extract_full_document_units(
         self,
@@ -1971,6 +2234,40 @@ class GeneSyncOrchestrator:
             )
         return None
 
+    async def _finalize_projected_document_moves(
+        self,
+        *,
+        predecessor_docs: list[DocumentRecord],
+        current_doc_id: str,
+        metadata: DocumentMetadata | None,
+        source_unit_id: str,
+    ) -> None:
+        """Atomically rebind provenance, then remove obsolete document aliases."""
+        if not predecessor_docs:
+            return
+        if metadata is not None and metadata.doc_id != current_doc_id:
+            await self.db.upsert_metadata(replace(metadata, doc_id=current_doc_id))
+        for predecessor in predecessor_docs:
+            if predecessor.doc_id == current_doc_id:
+                continue
+            await self.db.rebind_projected_document_support(
+                predecessor.doc_id,
+                current_doc_id,
+            )
+            deletion_context = {
+                "deletion_kind": "source_unit_move",
+                "reason": "stable Source Unit moved to a new document locator",
+                "source_unit_id": source_unit_id,
+                "successor_doc_id": current_doc_id,
+            }
+            if self.memory_store is not None:
+                await self.memory_store.delete_projected_document(
+                    predecessor.doc_id,
+                    deletion_context=deletion_context,
+                )
+            else:
+                await self.db.delete_projected_document(predecessor.doc_id)
+
     # ==================================================================
     # Private: deletion detection
     # ==================================================================
@@ -1978,17 +2275,18 @@ class GeneSyncOrchestrator:
     async def _detect_deletions(
         self,
         source_id: str,
+        source_type: str,
         source_name: str,
+        run_id: str,
         indexed_doc_ids: set[str],
         crawled_doc_ids: set[str],
         source_filter_summary: str | None,
     ) -> tuple[int, list[FailedDoc]]:
         """Detect and handle documents deleted from the source.
 
-        For each deleted document:
-        - Retire memories that were sourced only from that document
-        - Record a changelog entry
-        - Delete the document record and its files
+        For each deleted document, persist an explicit Source Unit tombstone,
+        apply a gate-checked complete lifecycle ledger, and only then remove
+        document storage when no review is required.
 
         Returns the count of successfully handled deletions plus failures.
         """
@@ -2009,6 +2307,42 @@ class GeneSyncOrchestrator:
             try:
                 # Get existing document info before deletion
                 existing_doc = await self.db.get_document(doc_id)
+                if existing_doc is None:
+                    logger.info(
+                        "Document %s was already removed by a completed Source Unit move",
+                        doc_id,
+                    )
+                    deleted_count += 1
+                    continue
+
+                source_unit = await self.db.find_source_unit_by_document_id(source_id, doc_id)
+                if source_unit is None:
+                    raise RuntimeError("source absence cannot be reconciled without persisted Source Unit lineage")
+                lineage_document_ids = await self.db.list_source_unit_document_ids(source_unit.id)
+                current_document_id = lineage_document_ids[0] if lineage_document_ids else doc_id
+                if current_document_id != doc_id:
+                    current_document = await self.db.get_document(current_document_id)
+                    if current_document is not None:
+                        await self.db.rebind_projected_document_support(
+                            doc_id,
+                            current_document_id,
+                        )
+                        await self.memory_store.delete_projected_document(
+                            doc_id,
+                            deletion_context={
+                                "deletion_kind": "source_unit_move",
+                                "reason": "historical document locator is no longer current",
+                                "source_unit_id": source_unit.id,
+                                "successor_doc_id": current_document_id,
+                            },
+                        )
+                        logger.info(
+                            "Removed historical document locator %s after move to %s",
+                            doc_id,
+                            current_document_id,
+                        )
+                        deleted_count += 1
+                        continue
 
                 # Record deletion in changelog
                 now = datetime.now(timezone.utc)
@@ -2028,17 +2362,44 @@ class GeneSyncOrchestrator:
                 async with self._db_lock:
                     await self._insert_changelog(changelog_entry)
 
-                # Delete the document record and hide memories left without support.
-                await self.memory_store.delete_document(
-                    doc_id,
-                    deletion_context={
-                        "deletion_kind": "source_absence",
-                        "reason": "not_returned_by_latest_successful_crawl",
-                        "source_filter_summary": source_filter_summary,
-                    },
+                prior_unit_revision = await self.db.get_current_source_unit_revision(source_unit.id)
+                if prior_unit_revision is None:
+                    raise RuntimeError("source absence cannot be reconciled without a current Source Unit revision")
+                prior_observation_revisions = await self.db.get_current_source_observation_revisions(source_unit.id)
+                tombstone = project_source_unit_tombstone(
+                    source_type=source_type,
+                    run_id=(f"{run_id}:tombstone:{uuid.uuid5(uuid.NAMESPACE_URL, f'{source_id}:{doc_id}').hex}"),
+                    source_unit=source_unit,
+                    prior_unit_revision=prior_unit_revision,
+                    prior_observation_revisions=prior_observation_revisions,
+                    reason="not_returned_by_authoritative_snapshot",
                 )
+                target_revision = tombstone.source_unit_revisions[0]
+                lifecycle_result = await self.memory_engine.apply_projected_tombstone(
+                    projection=tombstone,
+                    doc_id=doc_id,
+                    reason="source Unit removed by authoritative discovery",
+                )
+                await self.db.record_source_projection(tombstone)
+                if lifecycle_result["can_delete_document"]:
+                    await self.memory_store.delete_projected_document(
+                        doc_id,
+                        deletion_context={
+                            "deletion_kind": "source_absence",
+                            "reason": "not_returned_by_latest_successful_crawl",
+                            "source_filter_summary": source_filter_summary,
+                            "source_unit_id": source_unit.id,
+                            "target_unit_revision_id": target_revision.id,
+                        },
+                    )
+                else:
+                    logger.warning(
+                        "Retained removed document %s while %d lifecycle review(s) are pending",
+                        doc_id,
+                        lifecycle_result["pending_review"],
+                    )
 
-                logger.info("Deleted document %s (%s)", doc_id, title)
+                logger.info("Reconciled removed document %s (%s)", doc_id, title)
                 deleted_count += 1
 
             except Exception as e:

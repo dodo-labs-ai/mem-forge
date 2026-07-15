@@ -13,6 +13,8 @@ import json
 import logging
 import sqlite3
 import uuid
+from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -34,8 +36,6 @@ from memforge.models import (
     Entity,
     EntityAlias,
     Memory,
-    MemoryCurationRun,
-    MemoryDerivation,
     MemoryReview,
     MemoryReviewRelatedChallenger,
     MemorySource,
@@ -50,6 +50,7 @@ from memforge.models import (
     UNSORTED_PROJECT_KEY,
     Visibility,
     canonicalize_entity_name,
+    content_hash,
     slugify,
     source_artifact_cleanup_task_id,
 )
@@ -59,23 +60,57 @@ from memforge.memory.evidence import (
     CandidateMemory,
     CandidatePage,
     EvidenceContentProvenance,
+    EvidenceReference,
+    EvidenceRole,
     EvidenceRelationRecord,
     EvidenceUnit,
     LifecycleAction,
+    MemorySupportAssertion,
     RelationCandidateRecord,
     RelationOutcomeBundle,
     RelationRunRecord,
     RelationType,
     ReviewCase,
     evidence_relation_retry_identity,
+    evidence_reference_id_for,
     relation_bundle_snapshot_audit,
     relation_candidate_retry_identity,
+    validate_evidence_references,
+)
+from memforge.memory.lifecycle_plan import (
+    CutoverFindingReason,
+    CutoverFindingStatus,
+    LifecycleCutoverFinding,
+    LifecycleBackfillJob,
+    LifecycleBackfillJobStatus,
+    LegacyMemoryProvenance,
+    LifecycleGate,
+    LifecycleGateState,
+    LifecycleMutationType,
+    LifecyclePlan,
+    LifecycleReview,
+    LifecycleReviewStatus,
+    LifecycleVectorOperation,
+    LifecycleVectorTask,
+    LifecycleVectorTaskStatus,
+    lifecycle_plan_to_payload,
 )
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
 from memforge.retrieval.access_predicate import visible_sql
 from memforge.retrieval.metadata_text import metadata_alias_text, metadata_compact_text
 from memforge.source_access import infer_legacy_source_access
+from memforge.source_projection import (
+    ProjectionCoverage,
+    ProjectionScopeTransition,
+    ProjectionScopeTransitionStatus,
+    SourceObservationRevision,
+    SourceProjection,
+    SourceUnit,
+    SourceUnitRevision,
+    source_projection_from_payload,
+    source_projection_to_payload,
+)
 from memforge.storage.admin_memory import (
     MemoryAdminListFilters,
     MemoryAdminQueryPage,
@@ -236,6 +271,21 @@ def _utc_iso(dt: datetime | None) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("datetime values must include timezone information")
     return value.astimezone(timezone.utc).isoformat()
+
+
+def _lifecycle_memory_version(row: Any | None) -> str:
+    if row is None:
+        return ""
+    digest = hashlib.sha256(
+        "\x1f".join(
+            (
+                str(row["status"] or ""),
+                str(row["content_hash"] or ""),
+                str(row["updated_at"] or ""),
+            )
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"memory-version-{digest}"
 
 
 def _non_empty_string(value: object) -> str | None:
@@ -521,8 +571,6 @@ CREATE TABLE IF NOT EXISTS memories (
     owner_user_id       TEXT,
     project_key         TEXT,
     repo_identifier     TEXT,
-    memory_level        TEXT NOT NULL DEFAULT 'atomic',
-    curation_cluster_id TEXT,
     confidence          REAL NOT NULL DEFAULT 0.7,
     corroboration_count INTEGER NOT NULL DEFAULT 1,
     contradiction_count INTEGER NOT NULL DEFAULT 0,
@@ -552,29 +600,6 @@ CREATE TABLE IF NOT EXISTS memory_sources (
     added_at    TEXT NOT NULL DEFAULT (datetime('now')),
     source_updated_at TEXT,
     PRIMARY KEY (memory_id, doc_id)
-);
-
-CREATE TABLE IF NOT EXISTS memory_derivations (
-    parent_memory_id TEXT NOT NULL REFERENCES memories(id),
-    child_memory_id  TEXT NOT NULL REFERENCES memories(id),
-    relation         TEXT NOT NULL DEFAULT 'summarizes',
-    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (parent_memory_id, child_memory_id, relation)
-);
-
-CREATE TABLE IF NOT EXISTS memory_curation_runs (
-    id                   TEXT PRIMARY KEY,
-    policy_id            TEXT NOT NULL,
-    source_type          TEXT NOT NULL,
-    client               TEXT,
-    repo_identifier      TEXT,
-    project_key          TEXT,
-    candidate_count      INTEGER NOT NULL,
-    created_memory_count INTEGER NOT NULL,
-    skipped_reason       TEXT,
-    error                TEXT,
-    started_at           TEXT NOT NULL,
-    completed_at         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS source_artifact_cleanup_tasks (
@@ -785,6 +810,221 @@ CREATE TABLE IF NOT EXISTS source_access_transition_memory_map (
     PRIMARY KEY (operation_id, original_memory_id),
     UNIQUE (operation_id, target_memory_id)
 );
+
+CREATE TABLE IF NOT EXISTS source_projection_runs (
+    id              TEXT PRIMARY KEY,
+    source_id       TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    source_type     TEXT NOT NULL,
+    coverage        TEXT NOT NULL,
+    scope_json      TEXT NOT NULL,
+    checkpoint_json TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    payload_hash    TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_source_projection_runs_source
+    ON source_projection_runs(source_id, created_at);
+
+CREATE TABLE IF NOT EXISTS projection_scope_transitions (
+    id                  TEXT PRIMARY KEY,
+    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    previous_scope_json TEXT NOT NULL,
+    target_scope_json   TEXT NOT NULL,
+    status              TEXT NOT NULL CHECK (status IN ('pending', 'running', 'applied', 'failed')),
+    run_id              TEXT,
+    coverage            TEXT,
+    error               TEXT,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    completed_at        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_projection_scope_transitions_source
+    ON projection_scope_transitions(source_id, created_at);
+
+CREATE TABLE IF NOT EXISTS source_units (
+    id                  TEXT PRIMARY KEY,
+    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    unit_type           TEXT NOT NULL,
+    provider_key        TEXT NOT NULL,
+    locator_json        TEXT NOT NULL DEFAULT '{}',
+    current_revision_id TEXT,
+    updated_at          TEXT NOT NULL,
+    UNIQUE (source_id, provider_key)
+);
+
+CREATE TABLE IF NOT EXISTS source_unit_document_lineage (
+    source_id      TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    document_id    TEXT NOT NULL,
+    source_unit_id TEXT NOT NULL REFERENCES source_units(id) ON DELETE CASCADE,
+    is_current     INTEGER NOT NULL DEFAULT 1,
+    first_seen_at  TEXT NOT NULL,
+    last_seen_at   TEXT NOT NULL,
+    PRIMARY KEY (source_id, document_id)
+);
+CREATE INDEX IF NOT EXISTS idx_source_unit_document_lineage_unit
+    ON source_unit_document_lineage(source_unit_id, is_current, last_seen_at);
+
+CREATE TABLE IF NOT EXISTS source_observations (
+    id                  TEXT PRIMARY KEY,
+    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    source_unit_id      TEXT NOT NULL REFERENCES source_units(id) ON DELETE CASCADE,
+    observation_type    TEXT NOT NULL,
+    provider_key        TEXT NOT NULL,
+    locator_json        TEXT NOT NULL DEFAULT '{}',
+    current_revision_id TEXT,
+    updated_at          TEXT NOT NULL,
+    UNIQUE (source_unit_id, provider_key)
+);
+
+CREATE TABLE IF NOT EXISTS source_observation_revisions (
+    id              TEXT PRIMARY KEY,
+    observation_id  TEXT NOT NULL REFERENCES source_observations(id) ON DELETE CASCADE,
+    semantic_hash   TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    metadata_json   TEXT NOT NULL DEFAULT '{}',
+    observed_at     TEXT,
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS source_unit_revisions (
+    id                            TEXT PRIMARY KEY,
+    source_unit_id                TEXT NOT NULL REFERENCES source_units(id) ON DELETE CASCADE,
+    semantic_hash                 TEXT NOT NULL,
+    location_hash                 TEXT,
+    membership_hash               TEXT,
+    access_hash                   TEXT,
+    observation_revision_ids_json TEXT NOT NULL,
+    observed_at                   TEXT,
+    created_at                    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS source_projection_relations (
+    projection_run_id    TEXT NOT NULL REFERENCES source_projection_runs(id) ON DELETE CASCADE,
+    relation_index       INTEGER NOT NULL,
+    relation_type        TEXT NOT NULL,
+    from_id              TEXT NOT NULL,
+    to_id                TEXT NOT NULL,
+    provider_relation_id TEXT,
+    metadata_json        TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (projection_run_id, relation_index)
+);
+
+CREATE TABLE IF NOT EXISTS source_revision_deltas (
+    projection_run_id TEXT NOT NULL REFERENCES source_projection_runs(id) ON DELETE CASCADE,
+    delta_index       INTEGER NOT NULL,
+    source_unit_id    TEXT NOT NULL,
+    payload_json      TEXT NOT NULL,
+    PRIMARY KEY (projection_run_id, delta_index)
+);
+
+CREATE TABLE IF NOT EXISTS source_lifecycle_gates (
+    source_id   TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+    state       TEXT NOT NULL CHECK (state IN ('gated', 'enabled')),
+    reason      TEXT,
+    audited_at  TEXT,
+    enabled_at  TEXT,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS lifecycle_cutover_findings (
+    id                        TEXT PRIMARY KEY,
+    source_id                 TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    memory_id                 TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    reason                    TEXT NOT NULL,
+    status                    TEXT NOT NULL CHECK (status IN ('open', 'resolved')),
+    available_provenance_json TEXT NOT NULL DEFAULT '{}',
+    mapping_attempt_json      TEXT NOT NULL DEFAULT '{}',
+    observation_id            TEXT,
+    source_unit_id            TEXT,
+    created_at                TEXT NOT NULL,
+    updated_at                TEXT NOT NULL,
+    resolved_at               TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cutover_findings_source_status
+    ON lifecycle_cutover_findings(source_id, status);
+
+CREATE TABLE IF NOT EXISTS lifecycle_backfill_jobs (
+    id               TEXT PRIMARY KEY,
+    source_id        TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    status           TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed')),
+    scanned_memories INTEGER NOT NULL DEFAULT 0,
+    mapped_memories  INTEGER NOT NULL DEFAULT 0,
+    finding_count    INTEGER NOT NULL DEFAULT 0,
+    error            TEXT,
+    created_at       TEXT NOT NULL,
+    started_at       TEXT,
+    completed_at     TEXT,
+    updated_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_backfill_jobs_source
+    ON lifecycle_backfill_jobs(source_id, created_at);
+
+CREATE TABLE IF NOT EXISTS evidence_references (
+    id                          TEXT PRIMARY KEY,
+    evidence_unit_id            TEXT NOT NULL REFERENCES evidence_units(id) ON DELETE CASCADE,
+    role                        TEXT NOT NULL CHECK (role IN ('primary', 'required', 'context')),
+    anchor_kind                 TEXT NOT NULL,
+    observation_id              TEXT NOT NULL REFERENCES source_observations(id) ON DELETE CASCADE,
+    observation_revision_id     TEXT NOT NULL REFERENCES source_observation_revisions(id),
+    fragment_id                 TEXT,
+    range_start                 INTEGER,
+    range_end                   INTEGER,
+    created_at                  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_support_assertions (
+    id                    TEXT PRIMARY KEY,
+    memory_id             TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    evidence_reference_id TEXT NOT NULL REFERENCES evidence_references(id) ON DELETE CASCADE,
+    source_id             TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    access_context_hash   TEXT NOT NULL,
+    active                INTEGER NOT NULL DEFAULT 1,
+    created_at            TEXT NOT NULL,
+    removed_at            TEXT,
+    UNIQUE (memory_id, evidence_reference_id)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_support_assertions_active
+    ON memory_support_assertions(memory_id, active);
+
+CREATE TABLE IF NOT EXISTS lifecycle_plans (
+    id                TEXT PRIMARY KEY,
+    reconciliation_scope_id TEXT NOT NULL,
+    source_id         TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    source_unit_id    TEXT NOT NULL,
+    target_unit_revision_id TEXT,
+    status            TEXT NOT NULL CHECK (status IN ('staged', 'applied', 'rejected', 'stale')),
+    payload_json      TEXT NOT NULL,
+    payload_hash      TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    applied_at        TEXT,
+    error             TEXT
+);
+
+CREATE TABLE IF NOT EXISTS lifecycle_reviews (
+    id                  TEXT PRIMARY KEY,
+    lifecycle_plan_id   TEXT NOT NULL REFERENCES lifecycle_plans(id) ON DELETE CASCADE,
+    incumbent_memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    status              TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'stale')),
+    staged_evidence_json TEXT NOT NULL DEFAULT '{}',
+    reason              TEXT,
+    created_at          TEXT NOT NULL,
+    resolved_at         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS lifecycle_vector_outbox (
+    id                TEXT PRIMARY KEY,
+    lifecycle_plan_id TEXT NOT NULL REFERENCES lifecycle_plans(id) ON DELETE CASCADE,
+    memory_id         TEXT NOT NULL,
+    operation         TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
+    status            TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    error             TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    UNIQUE (lifecycle_plan_id, memory_id, operation)
+);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_vector_outbox_status
+    ON lifecycle_vector_outbox(status, created_at);
 
 CREATE TABLE IF NOT EXISTS source_subscriptions (
     source_id   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
@@ -1089,13 +1329,11 @@ CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(canonical_name);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
 CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_key);
--- Indexes for columns added after the initial schema, including visibility and
--- curation metadata, are created by their migrations. SCHEMA runs before
+-- Indexes for columns added after the initial schema, including visibility,
+-- are created by their migrations. SCHEMA runs before
 -- migrations, so upgrading databases may not have those columns here yet.
 CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash);
 CREATE INDEX IF NOT EXISTS idx_memory_sources_doc ON memory_sources(doc_id);
-CREATE INDEX IF NOT EXISTS idx_memory_derivations_child ON memory_derivations(child_memory_id);
-CREATE INDEX IF NOT EXISTS idx_memory_curation_runs_scope ON memory_curation_runs(source_type, client, repo_identifier, project_key);
 CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_id);
 CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized ON entity_aliases(alias_normalized);
 CREATE INDEX IF NOT EXISTS idx_entity_aliases_compact ON entity_aliases(REPLACE(alias_normalized, ' ', ''));
@@ -2130,6 +2368,267 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             )""",
         ],
     ),
+    (
+        47,
+        "Add durable Source Projection lineage",
+        [
+            """CREATE TABLE IF NOT EXISTS source_projection_runs (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                source_type TEXT NOT NULL,
+                coverage TEXT NOT NULL,
+                scope_json TEXT NOT NULL,
+                checkpoint_json TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_source_projection_runs_source ON source_projection_runs(source_id, created_at)",
+            """CREATE TABLE IF NOT EXISTS source_units (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                unit_type TEXT NOT NULL,
+                provider_key TEXT NOT NULL,
+                locator_json TEXT NOT NULL DEFAULT '{}',
+                current_revision_id TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE (source_id, provider_key)
+            )""",
+            """CREATE TABLE IF NOT EXISTS source_observations (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                source_unit_id TEXT NOT NULL REFERENCES source_units(id) ON DELETE CASCADE,
+                observation_type TEXT NOT NULL,
+                provider_key TEXT NOT NULL,
+                locator_json TEXT NOT NULL DEFAULT '{}',
+                current_revision_id TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE (source_unit_id, provider_key)
+            )""",
+            """CREATE TABLE IF NOT EXISTS source_observation_revisions (
+                id TEXT PRIMARY KEY,
+                observation_id TEXT NOT NULL REFERENCES source_observations(id) ON DELETE CASCADE,
+                semantic_hash TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                observed_at TEXT,
+                created_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS source_unit_revisions (
+                id TEXT PRIMARY KEY,
+                source_unit_id TEXT NOT NULL REFERENCES source_units(id) ON DELETE CASCADE,
+                semantic_hash TEXT NOT NULL,
+                location_hash TEXT,
+                membership_hash TEXT,
+                access_hash TEXT,
+                observation_revision_ids_json TEXT NOT NULL,
+                observed_at TEXT,
+                created_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS source_projection_relations (
+                projection_run_id TEXT NOT NULL REFERENCES source_projection_runs(id) ON DELETE CASCADE,
+                relation_index INTEGER NOT NULL,
+                relation_type TEXT NOT NULL,
+                from_id TEXT NOT NULL,
+                to_id TEXT NOT NULL,
+                provider_relation_id TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (projection_run_id, relation_index)
+            )""",
+            """CREATE TABLE IF NOT EXISTS source_revision_deltas (
+                projection_run_id TEXT NOT NULL REFERENCES source_projection_runs(id) ON DELETE CASCADE,
+                delta_index INTEGER NOT NULL,
+                source_unit_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (projection_run_id, delta_index)
+            )""",
+        ],
+    ),
+    (
+        48,
+        "Add lifecycle cutover gates findings and support assertions",
+        [
+            """CREATE TABLE IF NOT EXISTS source_lifecycle_gates (
+                source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+                state TEXT NOT NULL CHECK (state IN ('gated', 'enabled')),
+                reason TEXT,
+                audited_at TEXT,
+                enabled_at TEXT,
+                updated_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS lifecycle_cutover_findings (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('open', 'resolved')),
+                available_provenance_json TEXT NOT NULL DEFAULT '{}',
+                mapping_attempt_json TEXT NOT NULL DEFAULT '{}',
+                observation_id TEXT,
+                source_unit_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                resolved_at TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_cutover_findings_source_status ON lifecycle_cutover_findings(source_id, status)",
+            """CREATE TABLE IF NOT EXISTS evidence_references (
+                id TEXT PRIMARY KEY,
+                evidence_unit_id TEXT NOT NULL REFERENCES evidence_units(id) ON DELETE CASCADE,
+                role TEXT NOT NULL CHECK (role IN ('primary', 'required', 'context')),
+                anchor_kind TEXT NOT NULL,
+                observation_id TEXT NOT NULL REFERENCES source_observations(id) ON DELETE CASCADE,
+                observation_revision_id TEXT NOT NULL REFERENCES source_observation_revisions(id),
+                fragment_id TEXT,
+                range_start INTEGER,
+                range_end INTEGER,
+                created_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS memory_support_assertions (
+                id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                evidence_reference_id TEXT NOT NULL REFERENCES evidence_references(id) ON DELETE CASCADE,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                access_context_hash TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                removed_at TEXT,
+                UNIQUE (memory_id, evidence_reference_id)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_memory_support_assertions_active ON memory_support_assertions(memory_id, active)",
+        ],
+    ),
+    (
+        49,
+        "Add atomic lifecycle plans and reviews",
+        [
+            """CREATE TABLE IF NOT EXISTS lifecycle_plans (
+                id TEXT PRIMARY KEY,
+                reconciliation_scope_id TEXT NOT NULL,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                source_unit_id TEXT NOT NULL,
+                target_unit_revision_id TEXT,
+                status TEXT NOT NULL CHECK (status IN ('staged', 'applied', 'rejected', 'stale')),
+                payload_json TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                applied_at TEXT,
+                error TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS lifecycle_reviews (
+                id TEXT PRIMARY KEY,
+                lifecycle_plan_id TEXT NOT NULL REFERENCES lifecycle_plans(id) ON DELETE CASCADE,
+                incumbent_memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'stale')),
+                staged_evidence_json TEXT NOT NULL DEFAULT '{}',
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT
+            )""",
+        ],
+    ),
+    (
+        50,
+        "Add durable lifecycle vector outbox",
+        [
+            """CREATE TABLE IF NOT EXISTS lifecycle_vector_outbox (
+                id TEXT PRIMARY KEY,
+                lifecycle_plan_id TEXT NOT NULL REFERENCES lifecycle_plans(id) ON DELETE CASCADE,
+                memory_id TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
+                status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (lifecycle_plan_id, memory_id, operation)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_lifecycle_vector_outbox_status "
+            "ON lifecycle_vector_outbox(status, created_at)",
+        ],
+    ),
+    (
+        51,
+        "Add durable lifecycle backfill jobs",
+        [
+            """CREATE TABLE IF NOT EXISTS lifecycle_backfill_jobs (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed')),
+                scanned_memories INTEGER NOT NULL DEFAULT 0,
+                mapped_memories INTEGER NOT NULL DEFAULT 0,
+                finding_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                updated_at TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_lifecycle_backfill_jobs_source "
+            "ON lifecycle_backfill_jobs(source_id, created_at)",
+        ],
+    ),
+    (
+        52,
+        "Add durable Projection Scope transitions",
+        [
+            """CREATE TABLE IF NOT EXISTS projection_scope_transitions (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                previous_scope_json TEXT NOT NULL,
+                target_scope_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'applied', 'failed')),
+                run_id TEXT,
+                coverage TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_projection_scope_transitions_source "
+            "ON projection_scope_transitions(source_id, created_at)",
+        ],
+    ),
+    (
+        53,
+        "Remove consolidated memory persistence",
+        [
+            "DROP INDEX IF EXISTS idx_memories_curation_cluster",
+            "DROP INDEX IF EXISTS idx_memory_derivations_child",
+            "DROP INDEX IF EXISTS idx_memory_curation_runs_scope",
+            "DROP TABLE IF EXISTS memory_derivations",
+            "DROP TABLE IF EXISTS memory_curation_runs",
+        ],
+    ),
+    (
+        54,
+        "Track Source Unit document lineage across moves",
+        [
+            """CREATE TABLE IF NOT EXISTS source_unit_document_lineage (
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                document_id TEXT NOT NULL,
+                source_unit_id TEXT NOT NULL REFERENCES source_units(id) ON DELETE CASCADE,
+                is_current INTEGER NOT NULL DEFAULT 1,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (source_id, document_id)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_source_unit_document_lineage_unit "
+            "ON source_unit_document_lineage(source_unit_id, is_current, last_seen_at)",
+            """INSERT OR IGNORE INTO source_unit_document_lineage (
+                   source_id, document_id, source_unit_id, is_current,
+                   first_seen_at, last_seen_at
+               )
+               SELECT source_id,
+                      json_extract(locator_json, '$.document_id'),
+                      id,
+                      1,
+                      updated_at,
+                      updated_at
+               FROM source_units
+               WHERE json_extract(locator_json, '$.document_id') IS NOT NULL
+                 AND json_extract(locator_json, '$.document_id') != ''""",
+        ],
+    ),
 ]
 
 
@@ -2177,6 +2676,16 @@ class Database:
         for version, description, statements in MIGRATIONS:
             if version in applied:
                 continue
+            if version == 53:
+                async with self.db.execute("PRAGMA table_info(memories)") as cursor:
+                    memory_columns = {str(row[1]) async for row in cursor}
+                if "memory_level" in memory_columns:
+                    async with self.db.execute(
+                        "SELECT id FROM memories WHERE memory_level = 'consolidated'"
+                    ) as cursor:
+                        consolidated_memory_ids = [str(row[0]) async for row in cursor]
+                    for memory_id in consolidated_memory_ids:
+                        await self.purge_memory(memory_id)
             for sql in statements:
                 try:
                     await self.db.execute(sql)
@@ -2191,6 +2700,14 @@ class Database:
                         )
                     else:
                         raise
+            if version == 53:
+                async with self.db.execute("PRAGMA table_info(memories)") as cursor:
+                    memory_columns = {str(row[1]) async for row in cursor}
+                for column_name in ("curation_cluster_id", "memory_level"):
+                    if column_name in memory_columns:
+                        await self.db.execute(
+                            f"ALTER TABLE memories DROP COLUMN {column_name}"
+                        )
             if version == 26:
                 await self._backfill_relation_run_snapshot_audit()
             if version in (30, 31):
@@ -3226,6 +3743,128 @@ class Database:
                 await self.db.rollback()
                 raise
 
+    async def delete_projected_document(self, doc_id: str) -> None:
+        """Delete document artifacts after an applied projected lifecycle plan.
+
+        Unlike the legacy deletion path, this method never infers Memory
+        lifecycle and never deletes Source Projection or Evidence lineage. The
+        caller must first apply a gate-checked Lifecycle Plan that removes every
+        document support edge; the invariant is checked again in this
+        transaction before the document record is removed.
+        """
+
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    "SELECT 1 FROM memory_sources WHERE doc_id = ? LIMIT 1",
+                    (doc_id,),
+                ) as cursor:
+                    if await cursor.fetchone() is not None:
+                        raise ValueError("active document support remains after lifecycle plan")
+                async with self.db.execute(
+                    "SELECT source, raw_content_uri, normalized_content_uri, pdf_content_uri "
+                    "FROM documents WHERE doc_id = ?",
+                    (doc_id,),
+                ) as cursor:
+                    document_row = await cursor.fetchone()
+                if document_row is None:
+                    return
+                source_id = str(document_row["source"])
+                for artifact_uri in dict.fromkeys(
+                    str(uri)
+                    for uri in (
+                        document_row["raw_content_uri"],
+                        document_row["normalized_content_uri"],
+                        document_row["pdf_content_uri"],
+                    )
+                    if uri
+                ):
+                    async with self.db.execute(
+                        """SELECT 1 FROM documents
+                           WHERE doc_id != ?
+                             AND (raw_content_uri = ? OR normalized_content_uri = ? OR pdf_content_uri = ?)
+                           LIMIT 1""",
+                        (doc_id, artifact_uri, artifact_uri, artifact_uri),
+                    ) as cursor:
+                        if await cursor.fetchone() is not None:
+                            continue
+                    await self.db.execute(
+                        "INSERT OR IGNORE INTO source_artifact_cleanup_tasks "
+                        "(task_id, source_id, artifact_uri) VALUES (?, ?, ?)",
+                        (
+                            source_artifact_cleanup_task_id(source_id, artifact_uri),
+                            source_id,
+                            artifact_uri,
+                        ),
+                    )
+                await self.db.execute("DELETE FROM memory_search_metadata_fts WHERE doc_id = ?", (doc_id,))
+                await self.db.execute(
+                    "DELETE FROM memory_search_metadata_alias_fts WHERE doc_id = ?",
+                    (doc_id,),
+                )
+                await self.db.execute(
+                    "DELETE FROM memory_search_metadata_trigram WHERE doc_id = ?",
+                    (doc_id,),
+                )
+                await self.db.execute("DELETE FROM document_metadata WHERE doc_id = ?", (doc_id,))
+                await self.db.execute(
+                    "DELETE FROM document_relationships WHERE source_doc_id = ? OR target_doc_id = ?",
+                    (doc_id, doc_id),
+                )
+                await self.db.execute("DELETE FROM changelog WHERE doc_id = ?", (doc_id,))
+                await self.db.execute("DELETE FROM agent_session_receipts WHERE doc_id = ?", (doc_id,))
+                await self.db.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def rebind_projected_document_support(
+        self,
+        old_doc_id: str,
+        new_doc_id: str,
+    ) -> None:
+        """Move legacy document provenance after a stable Source Unit rename.
+
+        Source Projection and Evidence lineage remain pinned to immutable old
+        revisions. Only the compatibility ``memory_sources`` edge follows the
+        current document locator.
+        """
+        if old_doc_id == new_doc_id:
+            return
+        async with self._write_lock:
+            try:
+                rows = await self.db.execute_fetchall(
+                    "SELECT doc_id, source FROM documents WHERE doc_id IN (?, ?)",
+                    (old_doc_id, new_doc_id),
+                )
+                sources = {str(row["doc_id"]): str(row["source"]) for row in rows}
+                if new_doc_id not in sources:
+                    raise ValueError("target document must exist before provenance rebind")
+                if old_doc_id not in sources:
+                    return
+                if sources[old_doc_id] != sources[new_doc_id]:
+                    raise ValueError("document lineage cannot cross configured Sources")
+                await self.db.execute(
+                    """DELETE FROM memory_sources AS old_support
+                       WHERE old_support.doc_id = ?
+                         AND EXISTS (
+                             SELECT 1 FROM memory_sources AS new_support
+                             WHERE new_support.memory_id = old_support.memory_id
+                               AND new_support.doc_id = ?
+                         )""",
+                    (old_doc_id, new_doc_id),
+                )
+                await self.db.execute(
+                    "UPDATE memory_sources SET doc_id = ? WHERE doc_id = ?",
+                    (new_doc_id, old_doc_id),
+                )
+                await self._refresh_metadata_fts_for_doc_unlocked(new_doc_id)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
     async def upsert_metadata(self, meta: DocumentMetadata) -> None:
         async with self._write_lock:
             entities_json = json.dumps([{"name": e.canonical_name, "tags": e.tags} for e in meta.entities])
@@ -3274,6 +3913,1671 @@ class Database:
                 complexity=d["complexity"],
                 enriched_at=_parse_dt(d["enriched_at"]),
             )
+
+    # ==================================================================
+    # Source Projection lineage
+    # ==================================================================
+
+    async def record_source_projection(
+        self,
+        projection: SourceProjection,
+        *,
+        _manage_transaction: bool = True,
+    ) -> None:
+        """Persist one complete provider-neutral projection atomically.
+
+        Observation and unit revisions are immutable. Stable observations and
+        units may update their locator/current-revision pointers without changing
+        provider identity. Reusing a run id for a different payload is rejected.
+        """
+
+        payload = source_projection_to_payload(projection)
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        now = _now_iso()
+        transaction_lock = self._write_lock if _manage_transaction else nullcontext()
+        async with transaction_lock:
+            try:
+                async with self.db.execute(
+                    "SELECT payload_hash FROM source_projection_runs WHERE id = ?",
+                    (projection.run_id,),
+                ) as cursor:
+                    existing_run = await cursor.fetchone()
+                if existing_run is not None:
+                    if existing_run["payload_hash"] != payload_hash:
+                        raise ValueError("projection retry payload mismatch")
+                    return
+
+                await self.db.execute(
+                    """INSERT INTO source_projection_runs (
+                        id, source_id, source_type, coverage, scope_json,
+                        checkpoint_json, payload_json, payload_hash, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        projection.run_id,
+                        projection.source_id,
+                        projection.source_type,
+                        projection.coverage.value,
+                        json.dumps(dict(projection.scope), sort_keys=True),
+                        json.dumps(dict(projection.checkpoint), sort_keys=True),
+                        payload_json,
+                        payload_hash,
+                        now,
+                    ),
+                )
+
+                for unit in projection.source_units:
+                    await self.db.execute(
+                        """INSERT OR IGNORE INTO source_units (
+                            id, source_id, unit_type, provider_key, locator_json,
+                            current_revision_id, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, NULL, ?)""",
+                        (
+                            unit.id,
+                            unit.source_id,
+                            unit.unit_type,
+                            unit.provider_key,
+                            json.dumps(dict(unit.locator), sort_keys=True),
+                            now,
+                        ),
+                    )
+                    await self._assert_projection_identity_unlocked(
+                        table="source_units",
+                        row_id=unit.id,
+                        expected={
+                            "source_id": unit.source_id,
+                            "unit_type": unit.unit_type,
+                            "provider_key": unit.provider_key,
+                        },
+                    )
+                    document_id = str(unit.locator.get("document_id") or "").strip()
+                    if document_id:
+                        async with self.db.execute(
+                            """SELECT source_unit_id
+                               FROM source_unit_document_lineage
+                               WHERE source_id = ? AND document_id = ?""",
+                            (unit.source_id, document_id),
+                        ) as cursor:
+                            existing_document_lineage = await cursor.fetchone()
+                        if (
+                            existing_document_lineage is not None
+                            and existing_document_lineage["source_unit_id"] != unit.id
+                        ):
+                            raise ValueError(
+                                "immutable document lineage mismatch: "
+                                f"{unit.source_id}:{document_id}"
+                            )
+                        await self.db.execute(
+                            """UPDATE source_unit_document_lineage
+                               SET is_current = 0
+                               WHERE source_unit_id = ? AND document_id != ?""",
+                            (unit.id, document_id),
+                        )
+                        await self.db.execute(
+                            """INSERT INTO source_unit_document_lineage (
+                                   source_id, document_id, source_unit_id, is_current,
+                                   first_seen_at, last_seen_at
+                               ) VALUES (?, ?, ?, 1, ?, ?)
+                               ON CONFLICT(source_id, document_id) DO UPDATE SET
+                                   is_current = 1,
+                                   last_seen_at = excluded.last_seen_at""",
+                            (unit.source_id, document_id, unit.id, now, now),
+                        )
+                    await self.db.execute(
+                        "UPDATE source_units SET locator_json = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(dict(unit.locator), sort_keys=True), now, unit.id),
+                    )
+
+                for observation in projection.observations:
+                    await self.db.execute(
+                        """INSERT OR IGNORE INTO source_observations (
+                            id, source_id, source_unit_id, observation_type,
+                            provider_key, locator_json, current_revision_id, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)""",
+                        (
+                            observation.id,
+                            observation.source_id,
+                            observation.source_unit_id,
+                            observation.observation_type,
+                            observation.provider_key,
+                            json.dumps(dict(observation.locator), sort_keys=True),
+                            now,
+                        ),
+                    )
+                    await self._assert_projection_identity_unlocked(
+                        table="source_observations",
+                        row_id=observation.id,
+                        expected={
+                            "source_id": observation.source_id,
+                            "source_unit_id": observation.source_unit_id,
+                            "observation_type": observation.observation_type,
+                            "provider_key": observation.provider_key,
+                        },
+                    )
+                    await self.db.execute(
+                        "UPDATE source_observations SET locator_json = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(dict(observation.locator), sort_keys=True), now, observation.id),
+                    )
+
+                for revision in projection.observation_revisions:
+                    metadata_json = json.dumps(dict(revision.metadata), sort_keys=True)
+                    await self.db.execute(
+                        """INSERT OR IGNORE INTO source_observation_revisions (
+                            id, observation_id, semantic_hash, content, metadata_json,
+                            observed_at, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            revision.id,
+                            revision.observation_id,
+                            revision.semantic_hash,
+                            revision.content,
+                            metadata_json,
+                            revision.observed_at,
+                            now,
+                        ),
+                    )
+                    await self._assert_projection_identity_unlocked(
+                        table="source_observation_revisions",
+                        row_id=revision.id,
+                        expected={
+                            "observation_id": revision.observation_id,
+                            "semantic_hash": revision.semantic_hash,
+                            "content": revision.content,
+                            "metadata_json": metadata_json,
+                        },
+                    )
+                    await self.db.execute(
+                        "UPDATE source_observations SET current_revision_id = ?, updated_at = ? WHERE id = ?",
+                        (revision.id, now, revision.observation_id),
+                    )
+
+                for revision in projection.source_unit_revisions:
+                    revision_ids_json = json.dumps(list(revision.observation_revision_ids))
+                    await self.db.execute(
+                        """INSERT OR IGNORE INTO source_unit_revisions (
+                            id, source_unit_id, semantic_hash, location_hash,
+                            membership_hash, access_hash,
+                            observation_revision_ids_json, observed_at, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            revision.id,
+                            revision.source_unit_id,
+                            revision.semantic_hash,
+                            revision.location_hash,
+                            revision.membership_hash,
+                            revision.access_hash,
+                            revision_ids_json,
+                            revision.observed_at,
+                            now,
+                        ),
+                    )
+                    await self._assert_projection_identity_unlocked(
+                        table="source_unit_revisions",
+                        row_id=revision.id,
+                        expected={
+                            "source_unit_id": revision.source_unit_id,
+                            "semantic_hash": revision.semantic_hash,
+                            "location_hash": revision.location_hash,
+                            "membership_hash": revision.membership_hash,
+                            "access_hash": revision.access_hash,
+                            "observation_revision_ids_json": revision_ids_json,
+                        },
+                    )
+                    await self.db.execute(
+                        "UPDATE source_units SET current_revision_id = ?, updated_at = ? WHERE id = ?",
+                        (revision.id, now, revision.source_unit_id),
+                    )
+
+                for index, relation in enumerate(projection.relations):
+                    await self.db.execute(
+                        """INSERT INTO source_projection_relations (
+                            projection_run_id, relation_index, relation_type,
+                            from_id, to_id, provider_relation_id, metadata_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            projection.run_id,
+                            index,
+                            relation.relation_type.value,
+                            relation.from_id,
+                            relation.to_id,
+                            relation.provider_relation_id,
+                            json.dumps(dict(relation.metadata), sort_keys=True),
+                        ),
+                    )
+                delta_payloads = payload["deltas"]
+                assert isinstance(delta_payloads, list)
+                for index, delta in enumerate(projection.deltas):
+                    await self.db.execute(
+                        """INSERT INTO source_revision_deltas (
+                            projection_run_id, delta_index, source_unit_id, payload_json
+                        ) VALUES (?, ?, ?, ?)""",
+                        (
+                            projection.run_id,
+                            index,
+                            delta.source_unit_id,
+                            json.dumps(delta_payloads[index], sort_keys=True, separators=(",", ":")),
+                        ),
+                    )
+                    if delta.removed_observation_ids and delta.coverage.proves_absence:
+                        placeholders = ", ".join("?" for _ in delta.removed_observation_ids)
+                        await self.db.execute(
+                            f"""UPDATE source_observations
+                                SET current_revision_id = NULL, updated_at = ?
+                                WHERE source_unit_id = ? AND id IN ({placeholders})""",
+                            (now, delta.source_unit_id, *delta.removed_observation_ids),
+                        )
+                if _manage_transaction:
+                    await self.db.commit()
+            except Exception:
+                if _manage_transaction:
+                    await self.db.rollback()
+                raise
+
+    async def _assert_projection_identity_unlocked(
+        self,
+        *,
+        table: str,
+        row_id: str,
+        expected: Mapping[str, object],
+    ) -> None:
+        allowed_tables = {
+            "source_units",
+            "source_observations",
+            "source_observation_revisions",
+            "source_unit_revisions",
+        }
+        if table not in allowed_tables:
+            raise ValueError("unsupported projection identity table")
+        async with self.db.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)) as cursor:
+            row = await cursor.fetchone()
+        if row is None or any(row[key] != value for key, value in expected.items()):
+            raise ValueError(f"immutable projection identity mismatch: {table}:{row_id}")
+
+    async def get_source_projection(self, run_id: str) -> SourceProjection | None:
+        async with self.db.execute(
+            "SELECT payload_json FROM source_projection_runs WHERE id = ?",
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return source_projection_from_payload(json.loads(row["payload_json"]))
+
+    async def create_projection_scope_transition(
+        self,
+        transition: ProjectionScopeTransition,
+    ) -> ProjectionScopeTransition:
+        if transition.status is not ProjectionScopeTransitionStatus.PENDING:
+            raise ValueError("new projection scope transition must be pending")
+        now = _now_iso()
+        previous_json = json.dumps(dict(transition.previous_scope), sort_keys=True, separators=(",", ":"))
+        target_json = json.dumps(dict(transition.target_scope), sort_keys=True, separators=(",", ":"))
+        async with self._write_lock:
+            try:
+                await self.db.execute(
+                    """INSERT OR IGNORE INTO projection_scope_transitions (
+                        id, source_id, previous_scope_json, target_scope_json, status,
+                        run_id, coverage, error, created_at, updated_at, completed_at
+                    ) VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, ?, NULL)""",
+                    (
+                        transition.id,
+                        transition.source_id,
+                        previous_json,
+                        target_json,
+                        transition.created_at or now,
+                        now,
+                    ),
+                )
+                async with self.db.execute(
+                    "SELECT * FROM projection_scope_transitions WHERE id = ?",
+                    (transition.id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if (
+                    row is None
+                    or row["source_id"] != transition.source_id
+                    or row["previous_scope_json"] != previous_json
+                    or row["target_scope_json"] != target_json
+                ):
+                    raise ValueError("projection scope transition retry identity mismatch")
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return self._row_to_projection_scope_transition(row)
+
+    async def get_open_projection_scope_transition(
+        self,
+        source_id: str,
+    ) -> ProjectionScopeTransition | None:
+        async with self.db.execute(
+            """SELECT * FROM projection_scope_transitions
+               WHERE source_id = ? AND status IN ('pending', 'running', 'failed')
+               ORDER BY created_at, id LIMIT 1""",
+            (source_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_projection_scope_transition(row) if row is not None else None
+
+    async def list_projection_scope_transitions(
+        self,
+        source_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[ProjectionScopeTransition]:
+        rows = await self.db.execute_fetchall(
+            """SELECT * FROM projection_scope_transitions
+               WHERE source_id = ? ORDER BY created_at DESC, id DESC LIMIT ?""",
+            (source_id, limit),
+        )
+        return [self._row_to_projection_scope_transition(row) for row in rows]
+
+    async def start_projection_scope_transition(
+        self,
+        transition_id: str,
+        *,
+        run_id: str,
+    ) -> ProjectionScopeTransition:
+        now = _now_iso()
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE projection_scope_transitions
+                   SET status = 'running', run_id = ?, coverage = NULL, error = NULL,
+                       updated_at = ?, completed_at = NULL
+                   WHERE id = ? AND status IN ('pending', 'failed', 'running')
+                     AND (status != 'running' OR run_id = ?)""",
+                (run_id, now, transition_id, run_id),
+            )
+            if cursor.rowcount != 1:
+                await self.db.rollback()
+                raise ValueError("projection scope transition is not startable")
+            await self.db.commit()
+        stored = await self._get_projection_scope_transition(transition_id)
+        assert stored is not None
+        return stored
+
+    async def complete_projection_scope_transition(
+        self,
+        transition_id: str,
+        *,
+        run_id: str,
+        coverage: ProjectionCoverage,
+    ) -> ProjectionScopeTransition:
+        if not coverage.proves_absence:
+            raise ValueError("scope transition requires complete snapshot coverage")
+        now = _now_iso()
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE projection_scope_transitions
+                   SET status = 'applied', coverage = ?, error = NULL,
+                       updated_at = ?, completed_at = ?
+                   WHERE id = ? AND status = 'running' AND run_id = ?""",
+                (coverage.value, now, now, transition_id, run_id),
+            )
+            if cursor.rowcount != 1:
+                await self.db.rollback()
+                raise ValueError("projection scope transition completion stale guard failed")
+            await self.db.commit()
+        stored = await self._get_projection_scope_transition(transition_id)
+        assert stored is not None
+        return stored
+
+    async def fail_projection_scope_transition(
+        self,
+        transition_id: str,
+        *,
+        run_id: str,
+        coverage: ProjectionCoverage,
+        error: str,
+    ) -> ProjectionScopeTransition:
+        now = _now_iso()
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE projection_scope_transitions
+                   SET status = 'failed', coverage = ?, error = ?, updated_at = ?
+                   WHERE id = ? AND status = 'running' AND run_id = ?""",
+                (coverage.value, error, now, transition_id, run_id),
+            )
+            if cursor.rowcount != 1:
+                await self.db.rollback()
+                raise ValueError("projection scope transition failure stale guard failed")
+            await self.db.commit()
+        stored = await self._get_projection_scope_transition(transition_id)
+        assert stored is not None
+        return stored
+
+    async def _get_projection_scope_transition(
+        self,
+        transition_id: str,
+    ) -> ProjectionScopeTransition | None:
+        async with self.db.execute(
+            "SELECT * FROM projection_scope_transitions WHERE id = ?",
+            (transition_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_projection_scope_transition(row) if row is not None else None
+
+    async def get_current_source_unit_revision(
+        self,
+        source_unit_id: str,
+    ) -> SourceUnitRevision | None:
+        async with self.db.execute(
+            """SELECT sur.*
+               FROM source_units su
+               JOIN source_unit_revisions sur ON sur.id = su.current_revision_id
+               WHERE su.id = ?""",
+            (source_unit_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return SourceUnitRevision(
+            id=row["id"],
+            source_unit_id=row["source_unit_id"],
+            semantic_hash=row["semantic_hash"],
+            observation_revision_ids=tuple(json.loads(row["observation_revision_ids_json"])),
+            location_hash=row["location_hash"],
+            membership_hash=row["membership_hash"],
+            access_hash=row["access_hash"],
+            observed_at=row["observed_at"],
+        )
+
+    async def get_current_source_observation_revisions(
+        self,
+        source_unit_id: str,
+    ) -> Mapping[str, SourceObservationRevision]:
+        revisions: dict[str, SourceObservationRevision] = {}
+        async with self.db.execute(
+            """SELECT so.id AS source_observation_id, sor.*
+               FROM source_observations so
+               JOIN source_observation_revisions sor ON sor.id = so.current_revision_id
+               WHERE so.source_unit_id = ?
+               ORDER BY so.id""",
+            (source_unit_id,),
+        ) as cursor:
+            async for row in cursor:
+                revisions[row["source_observation_id"]] = SourceObservationRevision(
+                    id=row["id"],
+                    observation_id=row["observation_id"],
+                    semantic_hash=row["semantic_hash"],
+                    content=row["content"],
+                    observed_at=row["observed_at"],
+                    metadata=json.loads(row["metadata_json"] or "{}"),
+                )
+        return revisions
+
+    async def find_source_unit_by_document_id(
+        self,
+        source_id: str,
+        document_id: str,
+    ) -> SourceUnit | None:
+        async with self.db.execute(
+            """SELECT su.*
+               FROM source_unit_document_lineage lineage
+               JOIN source_units su ON su.id = lineage.source_unit_id
+               WHERE lineage.source_id = ? AND lineage.document_id = ?
+               ORDER BY lineage.is_current DESC, lineage.last_seen_at DESC, su.id
+               LIMIT 1""",
+            (source_id, document_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return SourceUnit(
+            id=row["id"],
+            source_id=row["source_id"],
+            unit_type=row["unit_type"],
+            provider_key=row["provider_key"],
+            locator=json.loads(row["locator_json"] or "{}"),
+        )
+
+    async def list_source_unit_document_ids(
+        self,
+        source_unit_id: str,
+    ) -> tuple[str, ...]:
+        rows = await self.db.execute_fetchall(
+            """SELECT document_id
+               FROM source_unit_document_lineage
+               WHERE source_unit_id = ?
+               ORDER BY is_current DESC, last_seen_at DESC, document_id""",
+            (source_unit_id,),
+        )
+        return tuple(str(row["document_id"]) for row in rows)
+
+    async def list_legacy_memory_provenance(
+        self,
+        source_id: str,
+    ) -> list[LegacyMemoryProvenance]:
+        rows = await self.db.execute_fetchall(
+            """SELECT DISTINCT
+                   m.id AS memory_id, ms.doc_id, ms.source_id, ms.source_type,
+                   m.content, ms.excerpt, m.visibility, m.owner_user_id,
+                   m.project_key, m.repo_identifier
+               FROM memory_sources ms
+               JOIN memories m ON m.id = ms.memory_id
+               WHERE ms.source_id = ? AND m.status = 'active'
+               ORDER BY m.id, ms.doc_id""",
+            (source_id,),
+        )
+        return [
+            LegacyMemoryProvenance(
+                memory_id=row["memory_id"],
+                doc_id=row["doc_id"],
+                source_id=row["source_id"],
+                source_type=row["source_type"],
+                content=row["content"],
+                excerpt=row["excerpt"],
+                visibility=row["visibility"],
+                owner_user_id=row["owner_user_id"],
+                project_key=row["project_key"],
+                repo_identifier=row["repo_identifier"],
+            )
+            for row in rows
+        ]
+
+    async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate:
+        async with self.db.execute(
+            "SELECT * FROM source_lifecycle_gates WHERE source_id = ?",
+            (source_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return LifecycleGate(
+                source_id=source_id,
+                state=LifecycleGateState.GATED,
+                reason="lifecycle cutover audit has not completed",
+            )
+        return LifecycleGate(
+            source_id=row["source_id"],
+            state=LifecycleGateState(row["state"]),
+            reason=row["reason"],
+            enabled_at=row["enabled_at"],
+            audited_at=row["audited_at"],
+        )
+
+    async def enable_lifecycle_gate(self, source_id: str) -> LifecycleGate:
+        """Enable destructive lifecycle only after the durable audit closes."""
+
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    """SELECT COUNT(*) AS count
+                       FROM lifecycle_cutover_findings
+                       WHERE source_id = ? AND status = 'open'""",
+                    (source_id,),
+                ) as cursor:
+                    finding_count = int((await cursor.fetchone())["count"])
+                if finding_count:
+                    raise ValueError("open lifecycle cutover findings block the lifecycle gate")
+                async with self.db.execute(
+                    """SELECT DISTINCT ms.memory_id
+                       FROM memory_sources ms
+                       WHERE ms.source_id = ?
+                         AND NOT EXISTS (
+                             SELECT 1 FROM memory_support_assertions msa
+                             WHERE msa.memory_id = ms.memory_id
+                               AND msa.source_id = ms.source_id
+                               AND msa.active = 1
+                         )
+                       LIMIT 1""",
+                    (source_id,),
+                ) as cursor:
+                    missing_lineage = await cursor.fetchone()
+                if missing_lineage is not None:
+                    raise ValueError("source-backed Memory lacks validated support lineage")
+                now = _now_iso()
+                await self.db.execute(
+                    """INSERT INTO source_lifecycle_gates (
+                        source_id, state, reason, audited_at, enabled_at, updated_at
+                    ) VALUES (?, 'enabled', NULL, ?, ?, ?)
+                    ON CONFLICT(source_id) DO UPDATE SET
+                        state='enabled', reason=NULL, audited_at=excluded.audited_at,
+                        enabled_at=COALESCE(source_lifecycle_gates.enabled_at, excluded.enabled_at),
+                        updated_at=excluded.updated_at""",
+                    (source_id, now, now, now),
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return await self.get_lifecycle_gate(source_id)
+
+    async def gate_destructive_lifecycle(self, source_id: str, *, reason: str) -> LifecycleGate:
+        now = _now_iso()
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT INTO source_lifecycle_gates (
+                    source_id, state, reason, audited_at, enabled_at, updated_at
+                ) VALUES (?, 'gated', ?, ?, NULL, ?)
+                ON CONFLICT(source_id) DO UPDATE SET
+                    state='gated', reason=excluded.reason,
+                    audited_at=excluded.audited_at, updated_at=excluded.updated_at""",
+                (source_id, reason, now, now),
+            )
+            await self.db.commit()
+        return await self.get_lifecycle_gate(source_id)
+
+    async def upsert_lifecycle_cutover_finding(
+        self,
+        finding: LifecycleCutoverFinding,
+    ) -> None:
+        now = _now_iso()
+        created_at = finding.created_at or now
+        async with self._write_lock:
+            try:
+                await self.db.execute(
+                    """INSERT INTO lifecycle_cutover_findings (
+                        id, source_id, memory_id, reason, status,
+                        available_provenance_json, mapping_attempt_json,
+                        observation_id, source_unit_id, created_at, updated_at, resolved_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        available_provenance_json=excluded.available_provenance_json,
+                        mapping_attempt_json=excluded.mapping_attempt_json,
+                        updated_at=excluded.updated_at
+                    WHERE lifecycle_cutover_findings.status = 'open'""",
+                    (
+                        finding.id,
+                        finding.source_id,
+                        finding.memory_id,
+                        finding.reason.value,
+                        finding.status.value,
+                        json.dumps(dict(finding.available_provenance), sort_keys=True),
+                        json.dumps(dict(finding.mapping_attempt), sort_keys=True),
+                        finding.observation_id,
+                        finding.source_unit_id,
+                        created_at,
+                        finding.updated_at or now,
+                        finding.resolved_at,
+                    ),
+                )
+                await self.db.execute(
+                    """INSERT INTO source_lifecycle_gates (
+                        source_id, state, reason, audited_at, enabled_at, updated_at
+                    ) VALUES (?, 'gated', 'open lifecycle cutover finding', ?, NULL, ?)
+                    ON CONFLICT(source_id) DO UPDATE SET
+                        state='gated', reason=excluded.reason,
+                        audited_at=excluded.audited_at, updated_at=excluded.updated_at""",
+                    (finding.source_id, now, now),
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def get_lifecycle_cutover_finding(
+        self,
+        finding_id: str,
+    ) -> LifecycleCutoverFinding | None:
+        async with self.db.execute(
+            "SELECT * FROM lifecycle_cutover_findings WHERE id = ?",
+            (finding_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_lifecycle_cutover_finding(row) if row is not None else None
+
+    async def list_lifecycle_cutover_findings(
+        self,
+        source_id: str,
+        *,
+        status: CutoverFindingStatus | None = None,
+    ) -> list[LifecycleCutoverFinding]:
+        params: list[object] = [source_id]
+        status_clause = ""
+        if status is not None:
+            status_clause = " AND status = ?"
+            params.append(status.value)
+        rows = await self.db.execute_fetchall(
+            "SELECT * FROM lifecycle_cutover_findings WHERE source_id = ?"
+            + status_clause
+            + " ORDER BY created_at, id",
+            tuple(params),
+        )
+        return [self._row_to_lifecycle_cutover_finding(row) for row in rows]
+
+    async def create_lifecycle_backfill_job(
+        self,
+        job: LifecycleBackfillJob,
+    ) -> LifecycleBackfillJob:
+        if job.status is not LifecycleBackfillJobStatus.QUEUED:
+            raise ValueError("new lifecycle backfill job must be queued")
+        now = _now_iso()
+        async with self._write_lock:
+            try:
+                await self.db.execute(
+                    """INSERT OR IGNORE INTO lifecycle_backfill_jobs (
+                        id, source_id, status, scanned_memories, mapped_memories,
+                        finding_count, error, created_at, started_at, completed_at, updated_at
+                    ) VALUES (?, ?, 'queued', 0, 0, 0, NULL, ?, NULL, NULL, ?)""",
+                    (job.id, job.source_id, job.created_at or now, now),
+                )
+                async with self.db.execute(
+                    "SELECT source_id FROM lifecycle_backfill_jobs WHERE id = ?",
+                    (job.id,),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if existing is None or existing["source_id"] != job.source_id:
+                    raise ValueError("lifecycle backfill job retry identity mismatch")
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        stored = await self.get_lifecycle_backfill_job(job.id)
+        assert stored is not None
+        return stored
+
+    async def start_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob:
+        now = _now_iso()
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE lifecycle_backfill_jobs
+                   SET status = 'running', started_at = ?, updated_at = ?, error = NULL
+                   WHERE id = ? AND status = 'queued'""",
+                (now, now, job_id),
+            )
+            if cursor.rowcount != 1:
+                await self.db.rollback()
+                raise ValueError("lifecycle backfill job is not queued")
+            await self.db.commit()
+        stored = await self.get_lifecycle_backfill_job(job_id)
+        assert stored is not None
+        return stored
+
+    async def complete_lifecycle_backfill_job(
+        self,
+        job_id: str,
+        *,
+        scanned_memories: int,
+        mapped_memories: int,
+        finding_count: int,
+    ) -> LifecycleBackfillJob:
+        now = _now_iso()
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE lifecycle_backfill_jobs
+                   SET status = 'completed', scanned_memories = ?, mapped_memories = ?,
+                       finding_count = ?, error = NULL, completed_at = ?, updated_at = ?
+                   WHERE id = ? AND status = 'running'""",
+                (scanned_memories, mapped_memories, finding_count, now, now, job_id),
+            )
+            if cursor.rowcount != 1:
+                await self.db.rollback()
+                raise ValueError("lifecycle backfill job is not running")
+            await self.db.commit()
+        stored = await self.get_lifecycle_backfill_job(job_id)
+        assert stored is not None
+        return stored
+
+    async def fail_lifecycle_backfill_job(
+        self,
+        job_id: str,
+        *,
+        error: str,
+    ) -> LifecycleBackfillJob:
+        now = _now_iso()
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE lifecycle_backfill_jobs
+                   SET status = 'failed', error = ?, completed_at = ?, updated_at = ?
+                   WHERE id = ? AND status IN ('queued', 'running')""",
+                (error, now, now, job_id),
+            )
+            if cursor.rowcount != 1:
+                await self.db.rollback()
+                raise ValueError("lifecycle backfill job cannot fail from its current state")
+            await self.db.commit()
+        stored = await self.get_lifecycle_backfill_job(job_id)
+        assert stored is not None
+        return stored
+
+    async def get_lifecycle_backfill_job(
+        self,
+        job_id: str,
+    ) -> LifecycleBackfillJob | None:
+        async with self.db.execute(
+            "SELECT * FROM lifecycle_backfill_jobs WHERE id = ?",
+            (job_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_lifecycle_backfill_job(row) if row is not None else None
+
+    async def list_lifecycle_backfill_jobs(
+        self,
+        source_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[LifecycleBackfillJob]:
+        rows = await self.db.execute_fetchall(
+            """SELECT * FROM lifecycle_backfill_jobs
+               WHERE source_id = ? ORDER BY created_at DESC, id DESC LIMIT ?""",
+            (source_id, limit),
+        )
+        return [self._row_to_lifecycle_backfill_job(row) for row in rows]
+
+    async def resolve_lifecycle_cutover_finding(
+        self,
+        finding_id: str,
+        *,
+        observation_id: str,
+        source_unit_id: str,
+    ) -> LifecycleCutoverFinding:
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    "SELECT * FROM lifecycle_cutover_findings WHERE id = ?",
+                    (finding_id,),
+                ) as cursor:
+                    finding = await cursor.fetchone()
+                if finding is None:
+                    raise LookupError(f"unknown lifecycle cutover finding: {finding_id}")
+                async with self.db.execute(
+                    """SELECT 1
+                       FROM memory_support_assertions msa
+                       JOIN evidence_references er ON er.id = msa.evidence_reference_id
+                       JOIN source_observations so ON so.id = er.observation_id
+                       WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1
+                         AND er.observation_id = ? AND so.source_unit_id = ?
+                       LIMIT 1""",
+                    (
+                        finding["memory_id"],
+                        finding["source_id"],
+                        observation_id,
+                        source_unit_id,
+                    ),
+                ) as cursor:
+                    lineage = await cursor.fetchone()
+                if lineage is None:
+                    raise ValueError("finding requires validated support lineage before resolution")
+                now = _now_iso()
+                await self.db.execute(
+                    """UPDATE lifecycle_cutover_findings
+                       SET status = 'resolved', observation_id = ?, source_unit_id = ?,
+                           updated_at = ?, resolved_at = ?
+                       WHERE id = ? AND status = 'open'""",
+                    (observation_id, source_unit_id, now, now, finding_id),
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        resolved = await self.get_lifecycle_cutover_finding(finding_id)
+        assert resolved is not None
+        return resolved
+
+    async def record_evidence_references(
+        self,
+        evidence_unit_id: str,
+        references: Sequence[EvidenceReference],
+    ) -> tuple[EvidenceReference, ...]:
+        revision_ids = {item.anchor.observation_revision_id for item in references}
+        if revision_ids:
+            placeholders = ", ".join("?" for _ in revision_ids)
+            async with self.db.execute(
+                f"SELECT id FROM source_observation_revisions WHERE id IN ({placeholders})",
+                tuple(revision_ids),
+            ) as cursor:
+                available = {row["id"] async for row in cursor}
+        else:
+            available = set()
+        validated = validate_evidence_references(tuple(references), available_revision_ids=available)
+        persisted = tuple(
+            EvidenceReference(
+                id=item.id or evidence_reference_id_for(evidence_unit_id, item),
+                evidence_unit_id=evidence_unit_id,
+                role=item.role,
+                anchor=item.anchor,
+            )
+            for item in validated
+        )
+        async with self._write_lock:
+            try:
+                for item in persisted:
+                    anchor = item.anchor
+                    await self.db.execute(
+                        """INSERT OR IGNORE INTO evidence_references (
+                            id, evidence_unit_id, role, anchor_kind, observation_id,
+                            observation_revision_id, fragment_id, range_start, range_end, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            item.id,
+                            evidence_unit_id,
+                            item.role.value,
+                            anchor.kind.value,
+                            anchor.observation_id,
+                            anchor.observation_revision_id,
+                            anchor.fragment_id,
+                            anchor.range_start,
+                            anchor.range_end,
+                            _now_iso(),
+                        ),
+                    )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return persisted
+
+    async def upsert_memory_support_assertion(self, assertion: MemorySupportAssertion) -> None:
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    """SELECT er.role, eu.source_id AS evidence_source_id
+                       FROM evidence_references er
+                       JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                       WHERE er.id = ?""",
+                    (assertion.evidence_reference_id,),
+                ) as cursor:
+                    reference = await cursor.fetchone()
+                if reference is None:
+                    raise ValueError("support assertion references unknown evidence")
+                if EvidenceRole(reference["role"]) is EvidenceRole.CONTEXT:
+                    raise ValueError("context evidence cannot grant Memory support")
+                if reference["evidence_source_id"] != assertion.source_id:
+                    raise ValueError("support assertion source does not match evidence source")
+                now = _now_iso()
+                await self.db.execute(
+                    """INSERT INTO memory_support_assertions (
+                        id, memory_id, evidence_reference_id, source_id,
+                        access_context_hash, active, created_at, removed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(memory_id, evidence_reference_id) DO UPDATE SET
+                        access_context_hash=excluded.access_context_hash,
+                        active=excluded.active,
+                        removed_at=excluded.removed_at""",
+                    (
+                        assertion.id,
+                        assertion.memory_id,
+                        assertion.evidence_reference_id,
+                        assertion.source_id,
+                        assertion.access_context_hash,
+                        1 if assertion.active else 0,
+                        assertion.created_at or now,
+                        assertion.removed_at,
+                    ),
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def get_memory_support_set_hash(self, memory_id: str) -> str:
+        return await self._memory_support_set_hash_unlocked(memory_id)
+
+    async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]:
+        rows = await self.db.execute_fetchall(
+            """SELECT evidence_reference_id
+               FROM memory_support_assertions
+               WHERE memory_id = ? AND active = 1
+               ORDER BY evidence_reference_id""",
+            (memory_id,),
+        )
+        return tuple(row["evidence_reference_id"] for row in rows)
+
+    async def get_source_unit_support_reference_ids(
+        self,
+        source_unit_id: str,
+    ) -> Mapping[str, tuple[str, ...]]:
+        rows = await self.db.execute_fetchall(
+            """SELECT msa.memory_id, msa.evidence_reference_id
+               FROM memory_support_assertions msa
+               JOIN evidence_references er ON er.id = msa.evidence_reference_id
+               JOIN source_observations so ON so.id = er.observation_id
+               WHERE so.source_unit_id = ? AND msa.active = 1
+               ORDER BY msa.memory_id, msa.evidence_reference_id""",
+            (source_unit_id,),
+        )
+        values: dict[str, list[str]] = defaultdict(list)
+        for row in rows:
+            values[row["memory_id"]].append(row["evidence_reference_id"])
+        return {memory_id: tuple(reference_ids) for memory_id, reference_ids in values.items()}
+
+    async def _memory_support_set_hash_unlocked(self, memory_id: str) -> str:
+        values: list[tuple[str, str, str]] = []
+        async with self.db.execute(
+            """SELECT evidence_reference_id, source_id, access_context_hash
+               FROM memory_support_assertions
+               WHERE memory_id = ? AND active = 1
+               ORDER BY evidence_reference_id, source_id, access_context_hash""",
+            (memory_id,),
+        ) as cursor:
+            async for row in cursor:
+                values.append(
+                    (
+                        row["evidence_reference_id"],
+                        row["source_id"],
+                        row["access_context_hash"],
+                    )
+                )
+        payload = json.dumps(values, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    async def get_lifecycle_plan_status(self, plan_id: str) -> str | None:
+        async with self.db.execute(
+            "SELECT status FROM lifecycle_plans WHERE id = ?",
+            (plan_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row["status"] if row is not None else None
+
+    async def apply_source_projection_lifecycle(
+        self,
+        projection: SourceProjection,
+        plan: LifecyclePlan,
+    ) -> None:
+        """Advance Source Projection and Memory lifecycle in one transaction."""
+
+        if projection.source_id != plan.scope.source_id:
+            raise ValueError("projection and lifecycle plan belong to different sources")
+        if len(projection.deltas) != 1:
+            raise ValueError("atomic projected lifecycle requires exactly one Revision Delta")
+        delta = projection.deltas[0]
+        if (
+            delta.source_unit_id != plan.scope.source_unit_id
+            or delta.current_unit_revision_id != plan.scope.target_unit_revision_id
+        ):
+            raise ValueError("projection and lifecycle plan target different Source Unit revisions")
+        async with self._write_lock:
+            try:
+                await self.record_source_projection(
+                    projection,
+                    _manage_transaction=False,
+                )
+                await self.apply_lifecycle_plan(
+                    plan,
+                    _manage_transaction=False,
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def apply_lifecycle_plan(
+        self,
+        plan: LifecyclePlan,
+        *,
+        _manage_transaction: bool = True,
+    ) -> None:
+        """Validate stale guards and commit the complete lifecycle plan once."""
+
+        plan.validate()
+        payload = lifecycle_plan_to_payload(plan)
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        transaction_lock = self._write_lock if _manage_transaction else nullcontext()
+        async with transaction_lock:
+            try:
+                async with self.db.execute(
+                    "SELECT payload_hash, status FROM lifecycle_plans WHERE id = ?",
+                    (plan.id,),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if existing is not None:
+                    if existing["payload_hash"] != payload_hash:
+                        raise ValueError("lifecycle plan retry payload mismatch")
+                    if existing["status"] == "applied":
+                        return
+                    raise ValueError(f"lifecycle plan is already {existing['status']}")
+
+                async with self.db.execute(
+                    "SELECT state FROM source_lifecycle_gates WHERE source_id = ?",
+                    (plan.scope.source_id,),
+                ) as cursor:
+                    gate_row = await cursor.fetchone()
+                gate_state = LifecycleGateState(gate_row["state"]) if gate_row else LifecycleGateState.GATED
+                if gate_state is not plan.gate_state:
+                    raise ValueError("lifecycle plan gate stale guard failed")
+                async with self.db.execute(
+                    "SELECT current_revision_id FROM source_units WHERE id = ?",
+                    (plan.scope.source_unit_id,),
+                ) as cursor:
+                    unit = await cursor.fetchone()
+                current_unit_revision = unit["current_revision_id"] if unit is not None else None
+                if current_unit_revision != plan.scope.target_unit_revision_id:
+                    raise ValueError("lifecycle plan Source Unit revision stale guard failed")
+                if plan.stale_guard.observation_revision_ids:
+                    placeholders = ", ".join("?" for _ in plan.stale_guard.observation_revision_ids)
+                    async with self.db.execute(
+                        f"""SELECT COUNT(*) AS count FROM source_observations
+                            WHERE current_revision_id IN ({placeholders})""",
+                        tuple(plan.stale_guard.observation_revision_ids),
+                    ) as cursor:
+                        current_count = int((await cursor.fetchone())["count"])
+                    if current_count != len(set(plan.stale_guard.observation_revision_ids)):
+                        raise ValueError("lifecycle plan observation revision stale guard failed")
+                for memory_id, expected_hash in plan.stale_guard.support_set_hashes.items():
+                    actual_hash = await self._memory_support_set_hash_unlocked(memory_id)
+                    if actual_hash != expected_hash:
+                        raise ValueError(f"lifecycle plan support stale guard failed: {memory_id}")
+                for memory_id, expected_version in plan.stale_guard.memory_versions.items():
+                    async with self.db.execute(
+                        "SELECT status, content_hash, updated_at FROM memories WHERE id = ?",
+                        (memory_id,),
+                    ) as cursor:
+                        memory_row = await cursor.fetchone()
+                    actual_version = _lifecycle_memory_version(memory_row)
+                    if actual_version != expected_version:
+                        raise ValueError(f"lifecycle plan Memory stale guard failed: {memory_id}")
+
+                now = _now_iso()
+                await self.db.execute(
+                    """INSERT INTO lifecycle_plans (
+                        id, reconciliation_scope_id, source_id, source_unit_id,
+                        target_unit_revision_id, status, payload_json, payload_hash,
+                        created_at, applied_at, error
+                    ) VALUES (?, ?, ?, ?, ?, 'staged', ?, ?, ?, NULL, NULL)""",
+                    (
+                        plan.id,
+                        plan.scope.id,
+                        plan.scope.source_id,
+                        plan.scope.source_unit_id,
+                        plan.scope.target_unit_revision_id,
+                        payload_json,
+                        payload_hash,
+                        now,
+                    ),
+                )
+                await self._stage_lifecycle_evidence_unlocked(plan, now=now)
+                for mutation in plan.mutations:
+                    await self._apply_lifecycle_mutation_unlocked(plan.id, mutation, now=now)
+                await self.db.execute(
+                    "UPDATE lifecycle_plans SET status = 'applied', applied_at = ? WHERE id = ?",
+                    (now, plan.id),
+                )
+                if _manage_transaction:
+                    await self.db.commit()
+            except Exception:
+                if _manage_transaction:
+                    await self.db.rollback()
+                raise
+
+    async def _stage_lifecycle_evidence_unlocked(
+        self,
+        plan: LifecyclePlan,
+        *,
+        now: str,
+    ) -> None:
+        """Stage revision-pinned Evidence inside the Lifecycle Plan transaction."""
+
+        for unit in plan.evidence_units:
+            await self.db.execute(
+                """INSERT INTO evidence_units (
+                    id, source_id, doc_id, doc_revision_id, source_type, client,
+                    repo_identifier, source_anchor, source_lineage_id,
+                    source_metadata_json, project_key, visibility, owner_user_id,
+                    observed_at, extractor_run_id, access_context_hash, content,
+                    excerpt, evidence_provenance, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    observed_at=excluded.observed_at,
+                    extractor_run_id=excluded.extractor_run_id,
+                    access_context_hash=excluded.access_context_hash,
+                    updated_at=excluded.updated_at""",
+                (
+                    unit.id,
+                    unit.source_id,
+                    unit.doc_id,
+                    unit.doc_revision_id,
+                    unit.source_type,
+                    unit.client,
+                    unit.repo_identifier,
+                    unit.source_anchor,
+                    unit.source_lineage_id,
+                    json.dumps(dict(unit.source_metadata), sort_keys=True),
+                    _normalize_project_key(unit.project_key),
+                    unit.visibility,
+                    unit.owner_user_id,
+                    unit.observed_at,
+                    unit.extractor_run_id,
+                    unit.access_context_hash,
+                    unit.content,
+                    unit.excerpt,
+                    unit.evidence_provenance.value,
+                    now,
+                    now,
+                ),
+            )
+        for reference in plan.evidence_references:
+            anchor = reference.anchor
+            await self.db.execute(
+                """INSERT OR IGNORE INTO evidence_references (
+                    id, evidence_unit_id, role, anchor_kind, observation_id,
+                    observation_revision_id, fragment_id, range_start, range_end, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    reference.id,
+                    reference.evidence_unit_id,
+                    reference.role.value,
+                    anchor.kind.value,
+                    anchor.observation_id,
+                    anchor.observation_revision_id,
+                    anchor.fragment_id,
+                    anchor.range_start,
+                    anchor.range_end,
+                    now,
+                ),
+            )
+
+    async def _apply_lifecycle_mutation_unlocked(self, plan_id: str, mutation, *, now: str) -> None:
+        mutation_type = mutation.mutation_type
+        if mutation_type is LifecycleMutationType.CREATE_MEMORY:
+            raw = mutation.payload.get("memory")
+            if not isinstance(raw, Mapping):
+                raise ValueError("create_memory mutation requires memory payload")
+            content = str(raw.get("content") or "")
+            memory = Memory(
+                id=mutation.memory_id,
+                memory_type=str(raw.get("memory_type") or "fact"),
+                content=content,
+                content_hash=str(raw.get("content_hash") or content_hash(content)),
+                visibility=str(raw.get("visibility") or "workspace"),
+                owner_user_id=raw.get("owner_user_id") if isinstance(raw.get("owner_user_id"), str) else None,
+                project_key=raw.get("project_key") if isinstance(raw.get("project_key"), str) else None,
+                repo_identifier=raw.get("repo_identifier") if isinstance(raw.get("repo_identifier"), str) else None,
+                entity_refs=[str(value) for value in raw.get("entity_refs", [])],
+                tags=[str(value) for value in raw.get("tags", [])],
+                confidence=float(raw.get("confidence", 0.7)),
+                extraction_context=(
+                    str(raw.get("extraction_context"))
+                    if raw.get("extraction_context") is not None
+                    else None
+                ),
+            )
+            await self._insert_memory_unlocked(memory)
+            await self._link_memory_entities_unlocked(
+                memory.id,
+                [int(value) for value in raw.get("entity_ids", [])],
+            )
+            document_source = raw.get("document_source")
+            if isinstance(document_source, Mapping):
+                doc_id = document_source.get("doc_id")
+                source_type = document_source.get("source_type")
+                if not isinstance(doc_id, str) or not doc_id:
+                    raise ValueError("create_memory document_source requires doc_id")
+                if not isinstance(source_type, str) or not source_type:
+                    raise ValueError("create_memory document_source requires source_type")
+                await self._add_memory_source_unlocked(
+                    memory.id,
+                    doc_id,
+                    source_type,
+                    (
+                        str(document_source.get("excerpt"))
+                        if document_source.get("excerpt") is not None
+                        else None
+                    ),
+                    source_updated_at=_parse_dt(document_source.get("source_updated_at")),
+                )
+            await self._enqueue_lifecycle_vector_task_unlocked(
+                plan_id,
+                memory.id,
+                LifecycleVectorOperation.UPSERT,
+                now=now,
+            )
+            return
+        if mutation_type is LifecycleMutationType.ATTACH_SUPPORT:
+            access_hash = mutation.payload.get("access_context_hash")
+            if not isinstance(access_hash, str) or not access_hash:
+                raise ValueError("attach_support mutation requires access_context_hash")
+            for reference_id in mutation.evidence_reference_ids:
+                async with self.db.execute(
+                    """SELECT er.role, eu.source_id
+                       FROM evidence_references er
+                       JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                       WHERE er.id = ?""",
+                    (reference_id,),
+                ) as cursor:
+                    reference = await cursor.fetchone()
+                if reference is None or EvidenceRole(reference["role"]) is EvidenceRole.CONTEXT:
+                    raise ValueError("attach_support requires support-granting evidence")
+                if reference["source_id"] != mutation.source_id:
+                    raise ValueError("attach_support evidence belongs to another source")
+                support_id = "support-" + hashlib.sha256(
+                    f"{mutation.memory_id}\x1f{reference_id}".encode("utf-8")
+                ).hexdigest()[:20]
+                await self.db.execute(
+                    """INSERT INTO memory_support_assertions (
+                        id, memory_id, evidence_reference_id, source_id,
+                        access_context_hash, active, created_at, removed_at
+                    ) VALUES (?, ?, ?, ?, ?, 1, ?, NULL)
+                    ON CONFLICT(memory_id, evidence_reference_id) DO UPDATE SET
+                        access_context_hash=excluded.access_context_hash,
+                        active=1, removed_at=NULL""",
+                    (
+                        support_id,
+                        mutation.memory_id,
+                        reference_id,
+                        mutation.source_id,
+                        access_hash,
+                        now,
+                    ),
+                )
+            return
+        if mutation_type is LifecycleMutationType.REMOVE_SUPPORT:
+            placeholders = ", ".join("?" for _ in mutation.evidence_reference_ids)
+            cursor = await self.db.execute(
+                f"""UPDATE memory_support_assertions
+                    SET active = 0, removed_at = ?
+                    WHERE memory_id = ? AND source_id = ? AND active = 1
+                      AND evidence_reference_id IN ({placeholders})""",
+                (now, mutation.memory_id, mutation.source_id, *mutation.evidence_reference_ids),
+            )
+            if cursor.rowcount != len(set(mutation.evidence_reference_ids)):
+                raise ValueError("remove_support mutation did not match complete active support set")
+            document_id = mutation.payload.get("document_id")
+            if isinstance(document_id, str) and document_id:
+                await self.db.execute(
+                    "DELETE FROM memory_sources WHERE memory_id = ? AND doc_id = ? AND source_id = ?",
+                    (mutation.memory_id, document_id, mutation.source_id),
+                )
+                await self.db.execute(
+                    "DELETE FROM memory_search_metadata_fts WHERE memory_id = ? AND doc_id = ?",
+                    (mutation.memory_id, document_id),
+                )
+                await self.db.execute(
+                    "DELETE FROM memory_search_metadata_alias_fts WHERE memory_id = ? AND doc_id = ?",
+                    (mutation.memory_id, document_id),
+                )
+                await self.db.execute(
+                    "DELETE FROM memory_search_metadata_trigram WHERE memory_id = ? AND doc_id = ?",
+                    (mutation.memory_id, document_id),
+                )
+            return
+        if mutation_type is LifecycleMutationType.SUPERSEDE_MEMORY:
+            assert mutation.replacement_memory_id is not None
+            async with self.db.execute(
+                """SELECT 1 FROM memory_support_assertions
+                   WHERE memory_id = ? AND active = 1 LIMIT 1""",
+                (mutation.memory_id,),
+            ) as cursor:
+                if await cursor.fetchone() is not None:
+                    raise ValueError("cannot supersede Memory while active support remains")
+            async with self.db.execute(
+                "SELECT 1 FROM memories WHERE id = ?",
+                (mutation.replacement_memory_id,),
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    raise ValueError("supersede replacement Memory does not exist in plan")
+            cursor = await self.db.execute(
+                """UPDATE memories SET status = 'superseded', superseded_by = ?,
+                    valid_until = ?, superseded_at = ?, replacement_reason = ?,
+                    replacement_kind = 'supersession', updated_at = ?
+                    WHERE id = ? AND status = 'active'""",
+                (
+                    mutation.replacement_memory_id,
+                    _today_iso(),
+                    now,
+                    str(mutation.payload.get("reason") or "authoritative source replacement"),
+                    now,
+                    mutation.memory_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("supersede Memory stale guard failed")
+            await self._rebuild_memory_fts_unlocked(
+                mutation.memory_id,
+                search_visible_statuses=set(allowed_search_statuses()),
+            )
+            await self._enqueue_lifecycle_vector_task_unlocked(
+                plan_id,
+                mutation.memory_id,
+                LifecycleVectorOperation.DELETE,
+                now=now,
+            )
+            return
+        if mutation_type is LifecycleMutationType.RETIRE_MEMORY:
+            async with self.db.execute(
+                """SELECT 1 FROM memory_support_assertions
+                   WHERE memory_id = ? AND active = 1 LIMIT 1""",
+                (mutation.memory_id,),
+            ) as cursor:
+                if await cursor.fetchone() is not None:
+                    raise ValueError("cannot retire Memory while active support remains")
+            cursor = await self.db.execute(
+                """UPDATE memories SET status = 'retired', retirement_reason = ?,
+                    retired_at = ?, valid_until = ?, updated_at = ?
+                    WHERE id = ? AND status = 'active'""",
+                (
+                    str(mutation.payload.get("reason") or "support_removed"),
+                    now,
+                    _today_iso(),
+                    now,
+                    mutation.memory_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("retire Memory stale guard failed")
+            await self._rebuild_memory_fts_unlocked(
+                mutation.memory_id,
+                search_visible_statuses=set(allowed_search_statuses()),
+            )
+            await self._enqueue_lifecycle_vector_task_unlocked(
+                plan_id,
+                mutation.memory_id,
+                LifecycleVectorOperation.DELETE,
+                now=now,
+            )
+            return
+        if mutation_type is LifecycleMutationType.CREATE_REVIEW:
+            review_id = str(mutation.payload.get("review_id") or f"review-{plan_id}-{mutation.memory_id}")
+            await self.db.execute(
+                """INSERT INTO lifecycle_reviews (
+                    id, lifecycle_plan_id, incumbent_memory_id, status,
+                    staged_evidence_json, reason, created_at, resolved_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, NULL)""",
+                (
+                    review_id,
+                    plan_id,
+                    mutation.memory_id,
+                    json.dumps(mutation.payload.get("staged_evidence", {}), sort_keys=True),
+                    str(mutation.payload.get("reason") or "lifecycle review required"),
+                    now,
+                ),
+            )
+            return
+        if mutation_type is LifecycleMutationType.RESOLVE_REVIEW:
+            review_id = mutation.payload.get("review_id")
+            status = mutation.payload.get("status")
+            if not isinstance(review_id, str) or not review_id:
+                raise ValueError("resolve_review mutation requires review_id")
+            if status != LifecycleReviewStatus.APPROVED.value:
+                raise ValueError("atomic lifecycle review resolution only supports approval")
+            cursor = await self.db.execute(
+                "UPDATE lifecycle_reviews SET status = 'approved', resolved_at = ? "
+                "WHERE id = ? AND incumbent_memory_id = ? AND status = 'pending'",
+                (now, review_id, mutation.memory_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("lifecycle review approval stale guard failed")
+            return
+        if mutation_type is LifecycleMutationType.REFRESH_MEMORY_INDEX:
+            async with self.db.execute(
+                "SELECT 1 FROM memories WHERE id = ? AND status = 'active'",
+                (mutation.memory_id,),
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    raise ValueError("refresh_memory_index requires an active Memory")
+            await self._enqueue_lifecycle_vector_task_unlocked(
+                plan_id,
+                mutation.memory_id,
+                LifecycleVectorOperation.UPSERT,
+                now=now,
+            )
+            return
+        raise ValueError(f"unsupported lifecycle mutation: {mutation_type.value}")
+
+    async def _enqueue_lifecycle_vector_task_unlocked(
+        self,
+        plan_id: str,
+        memory_id: str,
+        operation: LifecycleVectorOperation,
+        *,
+        now: str,
+    ) -> None:
+        task_id = "lvout-" + hashlib.sha256(
+            f"{plan_id}\x1f{memory_id}\x1f{operation.value}".encode("utf-8")
+        ).hexdigest()[:20]
+        await self.db.execute(
+            """INSERT OR IGNORE INTO lifecycle_vector_outbox (
+                   id, lifecycle_plan_id, memory_id, operation, status,
+                   attempts, error, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, 'pending', 0, NULL, ?, ?)""",
+            (task_id, plan_id, memory_id, operation.value, now, now),
+        )
+
+    async def get_lifecycle_plan_payload(self, lifecycle_plan_id: str) -> Mapping[str, object] | None:
+        async with self.db.execute(
+            "SELECT payload_json FROM lifecycle_plans WHERE id = ?", (lifecycle_plan_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return json.loads(row["payload_json"]) if row is not None else None
+
+    async def get_lifecycle_review(self, review_id: str) -> LifecycleReview | None:
+        async with self.db.execute(
+            "SELECT * FROM lifecycle_reviews WHERE id = ?", (review_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_lifecycle_review(row) if row is not None else None
+
+    async def list_lifecycle_reviews(
+        self,
+        source_id: str,
+        *,
+        status: LifecycleReviewStatus | None = None,
+    ) -> list[LifecycleReview]:
+        params: list[object] = [source_id]
+        status_clause = ""
+        if status is not None:
+            status_clause = " AND lr.status = ?"
+            params.append(status.value)
+        rows = await self.db.execute_fetchall(
+            "SELECT lr.* FROM lifecycle_reviews lr "
+            "JOIN lifecycle_plans lp ON lp.id = lr.lifecycle_plan_id "
+            "WHERE lp.source_id = ?" + status_clause + " ORDER BY lr.created_at, lr.id",
+            tuple(params),
+        )
+        return [self._row_to_lifecycle_review(row) for row in rows]
+
+    async def resolve_lifecycle_review(
+        self,
+        review_id: str,
+        status: LifecycleReviewStatus,
+    ) -> LifecycleReview:
+        if status not in {LifecycleReviewStatus.REJECTED, LifecycleReviewStatus.STALE}:
+            raise ValueError("direct lifecycle review resolution must be rejected or stale")
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                "UPDATE lifecycle_reviews SET status = ?, resolved_at = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (status.value, _now_iso(), review_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("lifecycle review is not pending")
+            await self.db.commit()
+        review = await self.get_lifecycle_review(review_id)
+        assert review is not None
+        return review
+
+    async def list_lifecycle_vector_tasks(
+        self,
+        *,
+        source_id: str | None = None,
+        lifecycle_plan_id: str | None = None,
+        limit: int = 100,
+    ) -> list[LifecycleVectorTask]:
+        conditions = "WHERE lvo.status IN ('pending', 'failed')"
+        params: list[object] = []
+        if source_id is not None:
+            conditions += " AND lp.source_id = ?"
+            params.append(source_id)
+        if lifecycle_plan_id is not None:
+            conditions += " AND lvo.lifecycle_plan_id = ?"
+            params.append(lifecycle_plan_id)
+        params.append(limit)
+        rows = await self.db.execute_fetchall(
+            f"""SELECT lvo.* FROM lifecycle_vector_outbox lvo
+                JOIN lifecycle_plans lp ON lp.id = lvo.lifecycle_plan_id
+                {conditions} ORDER BY lvo.created_at, lvo.id LIMIT ?""",
+            tuple(params),
+        )
+        return [
+            LifecycleVectorTask(
+                id=row["id"],
+                lifecycle_plan_id=row["lifecycle_plan_id"],
+                memory_id=row["memory_id"],
+                operation=LifecycleVectorOperation(row["operation"]),
+                status=LifecycleVectorTaskStatus(row["status"]),
+                attempts=int(row["attempts"]),
+                error=row["error"],
+            )
+            for row in rows
+        ]
+
+    async def complete_lifecycle_vector_task(self, task_id: str) -> None:
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE lifecycle_vector_outbox
+                   SET status = 'completed', attempts = attempts + 1,
+                       error = NULL, updated_at = ?
+                   WHERE id = ? AND status IN ('pending', 'failed')""",
+                (_now_iso(), task_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("lifecycle vector task is not pending")
+            await self.db.commit()
+
+    async def fail_lifecycle_vector_task(self, task_id: str, error: str) -> None:
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE lifecycle_vector_outbox
+                   SET status = 'failed', attempts = attempts + 1,
+                       error = ?, updated_at = ?
+                   WHERE id = ? AND status IN ('pending', 'failed')""",
+                (error[:4000], _now_iso(), task_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("lifecycle vector task is not pending")
+            await self.db.commit()
+
+    def _row_to_lifecycle_cutover_finding(self, row) -> LifecycleCutoverFinding:
+        return LifecycleCutoverFinding(
+            id=row["id"],
+            source_id=row["source_id"],
+            memory_id=row["memory_id"],
+            reason=CutoverFindingReason(row["reason"]),
+            status=CutoverFindingStatus(row["status"]),
+            available_provenance=json.loads(row["available_provenance_json"] or "{}"),
+            mapping_attempt=json.loads(row["mapping_attempt_json"] or "{}"),
+            observation_id=row["observation_id"],
+            source_unit_id=row["source_unit_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            resolved_at=row["resolved_at"],
+        )
+
+    def _row_to_lifecycle_review(self, row) -> LifecycleReview:
+        return LifecycleReview(
+            id=row["id"],
+            lifecycle_plan_id=row["lifecycle_plan_id"],
+            incumbent_memory_id=row["incumbent_memory_id"],
+            status=LifecycleReviewStatus(row["status"]),
+            staged_evidence=json.loads(row["staged_evidence_json"] or "{}"),
+            reason=row["reason"],
+            created_at=row["created_at"],
+            resolved_at=row["resolved_at"],
+        )
+
+    def _row_to_lifecycle_backfill_job(self, row) -> LifecycleBackfillJob:
+        return LifecycleBackfillJob(
+            id=row["id"],
+            source_id=row["source_id"],
+            status=LifecycleBackfillJobStatus(row["status"]),
+            scanned_memories=int(row["scanned_memories"]),
+            mapped_memories=int(row["mapped_memories"]),
+            finding_count=int(row["finding_count"]),
+            error=row["error"],
+            created_at=row["created_at"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+        )
 
     # ==================================================================
     # Memories
@@ -4029,13 +6333,13 @@ class Database:
         await self.db.execute(
             """INSERT INTO memories (
                 id, memory_type, content, content_hash, tags, visibility, owner_user_id,
-                project_key, repo_identifier, memory_level, curation_cluster_id,
+                project_key, repo_identifier,
                 confidence, corroboration_count,
                 contradiction_count, valid_from, valid_until,
                 superseded_by, status, retirement_reason, retired_at,
                 superseded_at, replacement_reason, replacement_kind, extraction_context,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 mem.id,
                 mem.memory_type,
@@ -4046,8 +6350,6 @@ class Database:
                 mem.owner_user_id,
                 project_key,
                 mem.repo_identifier,
-                mem.memory_level,
-                mem.curation_cluster_id,
                 mem.confidence,
                 mem.corroboration_count,
                 mem.contradiction_count,
@@ -4081,13 +6383,13 @@ class Database:
         await self.db.execute(
             """INSERT INTO memories (
                 id, memory_type, content, content_hash, tags, visibility, owner_user_id,
-                project_key, repo_identifier, memory_level, curation_cluster_id,
+                project_key, repo_identifier,
                 confidence, corroboration_count,
                 contradiction_count, valid_from, valid_until,
                 superseded_by, status, retirement_reason, retired_at,
                 superseded_at, replacement_reason, replacement_kind, extraction_context,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 memory_type=excluded.memory_type,
                 content=excluded.content,
@@ -4097,8 +6399,6 @@ class Database:
                 owner_user_id=excluded.owner_user_id,
                 project_key=excluded.project_key,
                 repo_identifier=excluded.repo_identifier,
-                memory_level=excluded.memory_level,
-                curation_cluster_id=excluded.curation_cluster_id,
                 confidence=excluded.confidence,
                 corroboration_count=excluded.corroboration_count,
                 contradiction_count=excluded.contradiction_count,
@@ -4123,8 +6423,6 @@ class Database:
                 mem.owner_user_id,
                 project_key,
                 mem.repo_identifier,
-                mem.memory_level,
-                mem.curation_cluster_id,
                 mem.confidence,
                 mem.corroboration_count,
                 mem.contradiction_count,
@@ -4712,10 +7010,6 @@ class Database:
                 (memory_id,),
             )
             await self.db.execute(
-                "DELETE FROM memory_derivations WHERE parent_memory_id = ? OR child_memory_id = ?",
-                (memory_id, memory_id),
-            )
-            await self.db.execute(
                 "DELETE FROM memory_review_related_challengers WHERE challenger_memory_id = ?",
                 (memory_id,),
             )
@@ -4772,7 +7066,7 @@ class Database:
                 """UPDATE memories SET
                     memory_type = ?, content = ?, content_hash = ?, tags = ?,
                     visibility = ?, owner_user_id = ?, project_key = ?,
-                    repo_identifier = ?, memory_level = ?, curation_cluster_id = ?,
+                    repo_identifier = ?,
                     confidence = ?,
                     corroboration_count = ?, contradiction_count = ?,
                     valid_from = ?, valid_until = ?, superseded_by = ?,
@@ -4789,8 +7083,6 @@ class Database:
                     memory.owner_user_id,
                     project_key,
                     memory.repo_identifier,
-                    memory.memory_level,
-                    memory.curation_cluster_id,
                     memory.confidence,
                     memory.corroboration_count,
                     memory.contradiction_count,
@@ -5955,13 +8247,13 @@ class Database:
                 await self.db.execute(
                     """INSERT INTO memories (
                     id, memory_type, content, content_hash, tags, visibility, owner_user_id,
-                    project_key, repo_identifier, memory_level, curation_cluster_id,
+                    project_key, repo_identifier,
                     confidence, corroboration_count,
                     contradiction_count, valid_from, valid_until,
                     superseded_by, status, retirement_reason, retired_at,
                     superseded_at, replacement_reason, replacement_kind, extraction_context,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         new_memory.id,
                         new_memory.memory_type,
@@ -5972,8 +8264,6 @@ class Database:
                         new_memory.owner_user_id,
                         project_key,
                         new_memory.repo_identifier,
-                        new_memory.memory_level,
-                        new_memory.curation_cluster_id,
                         new_memory.confidence,
                         new_memory.corroboration_count,
                         new_memory.contradiction_count,
@@ -6162,92 +8452,6 @@ class Database:
         except (TypeError, json.JSONDecodeError):
             data["tags"] = []
         return data
-
-    async def add_memory_derivation(
-        self,
-        parent_memory_id: str,
-        child_memory_id: str,
-        *,
-        relation: str = "summarizes",
-    ) -> None:
-        async with self._write_lock:
-            await self.db.execute(
-                """INSERT OR IGNORE INTO memory_derivations (
-                    parent_memory_id, child_memory_id, relation, created_at
-                ) VALUES (?, ?, ?, ?)""",
-                (parent_memory_id, child_memory_id, relation, _now_iso()),
-            )
-            await self.db.commit()
-
-    async def get_memory_derivation_children(
-        self,
-        parent_memory_id: str,
-    ) -> list[MemoryDerivation]:
-        results: list[MemoryDerivation] = []
-        async with self.db.execute(
-            """SELECT parent_memory_id, child_memory_id, relation, created_at
-               FROM memory_derivations
-               WHERE parent_memory_id = ?
-               ORDER BY created_at, child_memory_id""",
-            (parent_memory_id,),
-        ) as cursor:
-            async for row in cursor:
-                results.append(
-                    MemoryDerivation(
-                        parent_memory_id=row["parent_memory_id"],
-                        child_memory_id=row["child_memory_id"],
-                        relation=row["relation"],
-                        created_at=_parse_dt(row["created_at"]),
-                    )
-                )
-        return results
-
-    async def record_memory_curation_run(self, run: MemoryCurationRun) -> None:
-        async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO memory_curation_runs (
-                    id, policy_id, source_type, client, repo_identifier,
-                    project_key, candidate_count, created_memory_count,
-                    skipped_reason, error, started_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    policy_id=excluded.policy_id,
-                    source_type=excluded.source_type,
-                    client=excluded.client,
-                    repo_identifier=excluded.repo_identifier,
-                    project_key=excluded.project_key,
-                    candidate_count=excluded.candidate_count,
-                    created_memory_count=excluded.created_memory_count,
-                    skipped_reason=excluded.skipped_reason,
-                    error=excluded.error,
-                    started_at=excluded.started_at,
-                    completed_at=excluded.completed_at""",
-                (
-                    run.id,
-                    run.policy_id,
-                    run.source_type,
-                    run.client,
-                    run.repo_identifier,
-                    run.project_key,
-                    run.candidate_count,
-                    run.created_memory_count,
-                    run.skipped_reason,
-                    run.error,
-                    _utc_iso(run.started_at),
-                    _utc_iso(run.completed_at) if run.completed_at else None,
-                ),
-            )
-            await self.db.commit()
-
-    async def get_memory_curation_run(self, run_id: str) -> MemoryCurationRun | None:
-        async with self.db.execute(
-            "SELECT * FROM memory_curation_runs WHERE id = ?",
-            (run_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row is None:
-            return None
-        return self._row_to_memory_curation_run(row)
 
     async def get_origin_source_pairs(
         self, memory_ids: list[str]
@@ -7199,25 +9403,6 @@ class Database:
                                 "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id) "
                                 "SELECT ?, entity_id FROM memory_entities WHERE memory_id = ?",
                                 (target_memory_id, memory_id),
-                            )
-                            await self.db.execute(
-                                """INSERT OR IGNORE INTO memory_derivations (
-                                       parent_memory_id, child_memory_id, relation, created_at
-                                   )
-                                   SELECT
-                                       CASE WHEN parent_memory_id = ? THEN ? ELSE parent_memory_id END,
-                                       CASE WHEN child_memory_id = ? THEN ? ELSE child_memory_id END,
-                                       relation, created_at
-                                   FROM memory_derivations
-                                   WHERE parent_memory_id = ? OR child_memory_id = ?""",
-                                (
-                                    memory_id,
-                                    target_memory_id,
-                                    memory_id,
-                                    target_memory_id,
-                                    memory_id,
-                                    memory_id,
-                                ),
                             )
                         await self.db.execute(
                             """INSERT OR IGNORE INTO source_access_transition_memory_map (
@@ -9522,6 +11707,66 @@ class Database:
             await self.db.commit()
         return review.id
 
+    async def record_memory_review_with_relation_outcome(
+        self,
+        review: MemoryReview,
+        relation_outcome: RelationOutcomeBundle,
+    ) -> str:
+        """Atomically record a review work item and its relation audit.
+
+        Unlike ``mark_memory_pending_review_with_case``, this operation never
+        changes either Memory's lifecycle status.  It is the persistence seam
+        for cross-source findings, where classification alone has no authority
+        to quarantine, supersede, or retire a Memory.
+        """
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    "SELECT status FROM memory_reviews WHERE id = ?",
+                    (review.id,),
+                ) as cursor:
+                    existing_review = await cursor.fetchone()
+                if existing_review is not None:
+                    if existing_review["status"] != "pending":
+                        raise RuntimeError(
+                            f"memory review {review.id} already exists with status "
+                            f"{existing_review['status']}"
+                        )
+                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                    await self.db.commit()
+                    return review.id
+
+                now = _now_iso()
+                await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                await self.db.execute(
+                    """INSERT INTO memory_reviews (
+                        id, kind, status, incumbent_memory_id, challenger_memory_id,
+                        reason, review_note, reviewer,
+                        expected_incumbent_updated_at, expected_challenger_updated_at,
+                        replacement_kind, created_at, resolved_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        review.id,
+                        review.kind,
+                        review.status,
+                        review.incumbent_memory_id,
+                        review.challenger_memory_id,
+                        review.reason,
+                        review.review_note,
+                        review.reviewer,
+                        review.expected_incumbent_updated_at,
+                        review.expected_challenger_updated_at,
+                        _validate_replacement_kind(review.replacement_kind),
+                        review.created_at.isoformat() if review.created_at else now,
+                        review.resolved_at.isoformat() if review.resolved_at else None,
+                    ),
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return review.id
+
     async def get_memory_review(self, review_id: str) -> MemoryReview | None:
         async with self.db.execute(
             "SELECT * FROM memory_reviews WHERE id = ?",
@@ -10040,8 +12285,6 @@ class Database:
             replacement_reason=d.get("replacement_reason"),
             replacement_kind=d.get("replacement_kind"),
             extraction_context=d.get("extraction_context"),
-            memory_level=d.get("memory_level") or "atomic",
-            curation_cluster_id=d.get("curation_cluster_id"),
             created_at=_parse_dt(d.get("created_at")),
             updated_at=_parse_dt(d.get("updated_at")),
         )
@@ -10065,24 +12308,21 @@ class Database:
             source_metadata=source_metadata,
         )
 
-    def _row_to_memory_curation_run(self, row) -> MemoryCurationRun:
+    def _row_to_projection_scope_transition(self, row) -> ProjectionScopeTransition:
         d = dict(row)
-        started_at = _parse_dt(d["started_at"])
-        if started_at is None:
-            started_at = datetime.now(timezone.utc)
-        return MemoryCurationRun(
+        coverage = d.get("coverage")
+        return ProjectionScopeTransition(
             id=d["id"],
-            policy_id=d["policy_id"],
-            source_type=d["source_type"],
-            client=d.get("client"),
-            repo_identifier=d.get("repo_identifier"),
-            project_key=d.get("project_key"),
-            candidate_count=d["candidate_count"],
-            created_memory_count=d["created_memory_count"],
-            skipped_reason=d.get("skipped_reason"),
+            source_id=d["source_id"],
+            previous_scope=json.loads(d["previous_scope_json"]),
+            target_scope=json.loads(d["target_scope_json"]),
+            status=ProjectionScopeTransitionStatus(d["status"]),
+            run_id=d.get("run_id"),
+            coverage=ProjectionCoverage(coverage) if coverage else None,
             error=d.get("error"),
-            started_at=started_at,
-            completed_at=_parse_dt(d.get("completed_at")),
+            created_at=d.get("created_at"),
+            updated_at=d.get("updated_at"),
+            completed_at=d.get("completed_at"),
         )
 
     def _row_to_agent_session_receipt(self, row) -> dict:

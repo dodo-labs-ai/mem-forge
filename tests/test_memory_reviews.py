@@ -251,6 +251,33 @@ async def _attach_related_challenger(
     return stored
 
 
+async def _seed_cross_source_review(
+    db: Database,
+    chroma: StubChromaCollection,
+) -> tuple[Memory, Memory, MemoryReview]:
+    incumbent = _memory("mem-cross-inc", "The service uses PostgreSQL 14")
+    challenger = _memory("mem-cross-new", "The service uses MySQL 8")
+    await db.insert_memory(incumbent)
+    await db.insert_memory(challenger)
+    chroma.upsert(
+        ids=[incumbent.id, challenger.id],
+        metadatas=[{"status": "active"}, {"status": "active"}],
+    )
+    review = MemoryReview(
+        id=generate_review_id(),
+        kind=ReviewKind.CROSS_SOURCE_CONFLICT.value,
+        status=ReviewStatus.PENDING.value,
+        incumbent_memory_id=incumbent.id,
+        challenger_memory_id=challenger.id,
+        reason="contradiction: database versions disagree",
+        expected_incumbent_updated_at=(await db.get_memory(incumbent.id)).updated_at.isoformat(),
+        expected_challenger_updated_at=(await db.get_memory(challenger.id)).updated_at.isoformat(),
+        created_at=datetime.now(timezone.utc),
+    )
+    await db.insert_memory_review(review)
+    return incumbent, challenger, review
+
+
 # ---------------------------------------------------------------------------
 # CRUD
 # ---------------------------------------------------------------------------
@@ -831,6 +858,47 @@ class TestReject:
 
         with pytest.raises(ReviewAlreadyResolved):
             await review_service.reject(review.id, reviewer="bob", note="again")
+
+
+# ---------------------------------------------------------------------------
+# Non-destructive cross-source finding resolution
+# ---------------------------------------------------------------------------
+
+
+class TestCrossSourceReviewResolution:
+    @pytest.mark.asyncio
+    async def test_approve_acknowledges_finding_without_mutating_memories(
+        self, db, chroma, review_service
+    ):
+        incumbent, challenger, review = await _seed_cross_source_review(db, chroma)
+
+        result = await review_service.approve(
+            review.id,
+            reviewer="alice",
+            note="confirmed conflict; no authority decision yet",
+        )
+
+        assert result.review.status == "approved"
+        assert (await db.get_memory(incumbent.id)).status == "active"
+        assert (await db.get_memory(challenger.id)).status == "active"
+        assert set(chroma.records) == {incumbent.id, challenger.id}
+
+    @pytest.mark.asyncio
+    async def test_reject_dismisses_finding_without_mutating_memories(
+        self, db, chroma, review_service
+    ):
+        incumbent, challenger, review = await _seed_cross_source_review(db, chroma)
+
+        result = await review_service.reject(
+            review.id,
+            reviewer="alice",
+            note="claims apply to different deployments",
+        )
+
+        assert result.review.status == "rejected"
+        assert (await db.get_memory(incumbent.id)).status == "active"
+        assert (await db.get_memory(challenger.id)).status == "active"
+        assert set(chroma.records) == {incumbent.id, challenger.id}
 
 
 # ---------------------------------------------------------------------------
