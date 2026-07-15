@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 import logging
+import os
 
 import pytest
 from rich.logging import RichHandler
@@ -45,11 +46,13 @@ def _config(tmp_path: Path) -> AppConfig:
 
 
 @pytest.fixture
-async def db(tmp_path):
+async def db(tmp_path, request):
     database = Database(str(tmp_path / "runtime.db"))
     await database.connect()
     yield database
+    os.write(2, f"[DEBUG-ci-hang] db-close-start: {request.node.nodeid}\n".encode())
     await database.close()
+    os.write(2, f"[DEBUG-ci-hang] db-close-end: {request.node.nodeid}\n".encode())
 
 
 @pytest.mark.asyncio
