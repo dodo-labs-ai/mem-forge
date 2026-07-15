@@ -920,6 +920,7 @@ class SourceSyncRequest(BaseModel):
 
 class LifecycleFindingRepairRequest(BaseModel):
     observation_id: str = Field(min_length=1)
+    evidence_quote: str | None = Field(default=None, min_length=1)
 
 
 class LocalAgentJobCreateRequest(BaseModel):
@@ -3868,6 +3869,8 @@ def create_admin_app(
                 source_id=source_id,
                 finding_id=finding_id,
                 observation_id=body.observation_id,
+                evidence_quote=body.evidence_quote,
+                operator_id=resolve_request_principal(request),
             )
             result = await run_source_lifecycle_backfill(db, source_id)
         except LookupError as exc:

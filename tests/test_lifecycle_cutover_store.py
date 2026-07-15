@@ -742,7 +742,7 @@ async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: D
         "mem-legacy",
         item.item_id,
         "teams",
-        "Repeated quote",
+        "Repeated quote…",
         source_updated_at=None,
     )
     result = await run_source_lifecycle_backfill(db, "src-1")
@@ -751,11 +751,20 @@ async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: D
     assert finding.reason is CutoverFindingReason.AMBIGUOUS_OBSERVATION
 
     selected_observation_id = projection.observations[0].id
+    with pytest.raises(ValueError, match="requires an exact evidence_quote"):
+        await repair_lifecycle_cutover_finding(
+            db,
+            source_id="src-1",
+            finding_id=finding.id,
+            observation_id=selected_observation_id,
+        )
     repaired = await repair_lifecycle_cutover_finding(
         db,
         source_id="src-1",
         finding_id=finding.id,
         observation_id=selected_observation_id,
+        evidence_quote="Repeated quote",
+        operator_id="operator-1",
     )
     final = await run_source_lifecycle_backfill(db, "src-1")
 
@@ -763,6 +772,14 @@ async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: D
     assert repaired.observation_id == selected_observation_id
     assert final.finding_count == 0
     assert final.gate_enabled is True
+    async with db.db.execute(
+        "SELECT source_metadata_json FROM evidence_units WHERE source_id = ?",
+        ("src-1",),
+    ) as cursor:
+        metadata = json.loads((await cursor.fetchone())["source_metadata_json"])
+    assert metadata["operator_selected_observation"] is True
+    assert metadata["operator_id"] == "operator-1"
+    assert metadata["legacy_excerpt_replaced"] is True
 
 
 @pytest.mark.asyncio
