@@ -49,11 +49,17 @@ def _config(tmp_path: Path) -> AppConfig:
 async def db(tmp_path, request):
     database = Database(str(tmp_path / "runtime.db"))
     await database.connect()
-    os.write(2, f"[DEBUG-ci-hang] db-open: {request.node.nodeid}\n".encode())
+    with open(os.environ.get("PYTEST_HANG_LOG", "/tmp/memforge-pytest-hang.log"), "a") as handle:
+        handle.write(f"DB OPEN {request.node.nodeid}\n")
+        handle.flush()
     yield database
-    os.write(2, f"[DEBUG-ci-hang] db-close-start: {request.node.nodeid}\n".encode())
+    with open(os.environ.get("PYTEST_HANG_LOG", "/tmp/memforge-pytest-hang.log"), "a") as handle:
+        handle.write(f"DB CLOSE START {request.node.nodeid}\n")
+        handle.flush()
     await database.close()
-    os.write(2, f"[DEBUG-ci-hang] db-close-end: {request.node.nodeid}\n".encode())
+    with open(os.environ.get("PYTEST_HANG_LOG", "/tmp/memforge-pytest-hang.log"), "a") as handle:
+        handle.write(f"DB CLOSE END {request.node.nodeid}\n")
+        handle.flush()
 
 @pytest.mark.asyncio
 async def test_sync_runtime_wires_structured_llm_client_into_memory_engine(db, tmp_path, monkeypatch):
