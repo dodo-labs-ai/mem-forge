@@ -6,7 +6,6 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 import logging
-import os
 
 import pytest
 from rich.logging import RichHandler
@@ -46,20 +45,12 @@ def _config(tmp_path: Path) -> AppConfig:
 
 
 @pytest.fixture
-async def db(tmp_path, request):
+async def db(tmp_path):
     database = Database(str(tmp_path / "runtime.db"))
     await database.connect()
-    with open(os.environ.get("PYTEST_HANG_LOG", "/tmp/memforge-pytest-hang.log"), "a") as handle:
-        handle.write(f"DB OPEN {request.node.nodeid}\n")
-        handle.flush()
     yield database
-    with open(os.environ.get("PYTEST_HANG_LOG", "/tmp/memforge-pytest-hang.log"), "a") as handle:
-        handle.write(f"DB CLOSE START {request.node.nodeid}\n")
-        handle.flush()
     await database.close()
-    with open(os.environ.get("PYTEST_HANG_LOG", "/tmp/memforge-pytest-hang.log"), "a") as handle:
-        handle.write(f"DB CLOSE END {request.node.nodeid}\n")
-        handle.flush()
+
 
 @pytest.mark.asyncio
 async def test_sync_runtime_wires_structured_llm_client_into_memory_engine(db, tmp_path, monkeypatch):
