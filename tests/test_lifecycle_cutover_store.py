@@ -33,6 +33,7 @@ from memforge.memory.lifecycle_plan import (
 )
 from memforge.memory.lifecycle_planner import NewMemoryDefaults, build_lifecycle_plan
 from memforge.memory.lifecycle_review import build_lifecycle_review_approval_plan
+from memforge.genes.local_markdown_gene import LocalMarkdownGene
 from memforge.memory.cutover import (
     reconstruct_historical_source_projection,
     repair_lifecycle_cutover_finding,
@@ -583,6 +584,110 @@ async def test_backfill_maps_exact_document_lineage_and_enables_gate(db: Databas
     assert result.finding_count == 0
     assert result.gate_enabled is True
     assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
+
+
+@pytest.mark.asyncio
+async def test_local_markdown_synthetic_canary_projects_and_closes_cutover(
+    db: Database,
+    tmp_path,
+) -> None:
+    source_id = "src-local-markdown-canary"
+    document_id = "local-markdown-vault-a-design-md"
+    memory_id = "mem-local-markdown-canary"
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id=source_id,
+        type="local_markdown",
+        name="Local Markdown Canary",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    await db.insert_memory(
+        Memory(
+            id=memory_id,
+            memory_type="decision",
+            content="Keep A7.",
+            content_hash=content_hash("Keep A7."),
+        )
+    )
+
+    packages_dir = tmp_path / "local-markdown-canary"
+    packages_dir.mkdir()
+    package_path = packages_dir / "design.json"
+    package_path.write_text(
+        json.dumps(
+            {
+                "package_kind": "local_markdown_document",
+                "doc_id": document_id,
+                "title": "Design",
+                "source_url": "file:///vault-a/design.md",
+                "last_modified": now.isoformat(),
+                "content_type": "text/markdown",
+                "space_or_project": "vault-a",
+                "version": "1",
+                "author": "Ada",
+                "vault_id": "vault-a",
+                "relative_path": "design.md",
+                "file_lineage_id": "file-77",
+                "markdown": "# Design\n\nKeep A7.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    gene = LocalMarkdownGene({"documents_dir": str(packages_dir)}, source_id)
+    await gene.authenticate()
+    items = [item async for item in gene.discover()]
+    assert len(items) == 1
+    raw = await gene.fetch(items[0])
+    normalized = await gene.normalize(raw)
+    projection = project_source_item(
+        source_id=source_id,
+        source_type="local_markdown",
+        run_id="local-markdown-canary-run",
+        item=items[0],
+        raw=raw,
+        normalized=normalized,
+    )
+    await db.record_source_projection(projection)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id=document_id,
+            source=source_id,
+            source_url=items[0].source_url,
+            title=items[0].title,
+            space_or_project=items[0].space_or_project,
+            author=items[0].author,
+            last_modified=now,
+            labels=items[0].labels,
+            version=items[0].version,
+            content_hash=content_hash(normalized.markdown_body),
+            token_count=4,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
+    await db.add_memory_source(
+        memory_id,
+        document_id,
+        "local_markdown",
+        "Keep A7.",
+        source_updated_at=now,
+    )
+
+    result = await run_source_lifecycle_backfill(db, source_id)
+
+    assert projection.source_units[0].unit_type == "local_file"
+    assert projection.source_units[0].provider_key == "vault-a:file-77"
+    assert projection.observations[0].observation_type == "file_content"
+    assert result.scanned_memories == 1
+    assert result.mapped_memories == 1
+    assert result.finding_count == 0
+    assert result.gate_enabled is True
+    assert (await db.get_lifecycle_gate(source_id)).state is LifecycleGateState.ENABLED
 
 
 @pytest.mark.asyncio
