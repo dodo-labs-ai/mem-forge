@@ -184,6 +184,7 @@ class MemoryCandidate(StructuredResponseModel):
     extraction_context: str | None = None
     evidence_quote: str | None = None
     evidence_anchor: Literal["unit", "glossary", "preamble", "outline", "document", "unknown"] = "unknown"
+    source_observation_id: str | None = None
 
 
 class MemoryExtractionResponse(StructuredResponseModel):

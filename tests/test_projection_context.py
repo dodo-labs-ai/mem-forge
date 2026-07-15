@@ -60,6 +60,35 @@ def _confluence_projection(body: str):
     )
 
 
+def _teams_projection():
+    item = ContentItem(
+        item_id="teams-window-1",
+        title="PCC Agent Dev",
+        source_url="https://teams.example.test/conversations/conv-1",
+        last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc),
+        version="2",
+        extra={
+            "conversation_id": "conv-1",
+            "window_id": "window-1",
+            "root_message_id": "msg-1",
+        },
+    )
+    import json
+
+    messages = {
+        "messages": [
+            {"id": "msg-1", "content": "Decision: keep A7", "time": "2026-07-15T10:00:00Z"},
+            {"id": "msg-2", "content": "Acknowledged: keep A7", "time": "2026-07-15T10:01:00Z"},
+        ]
+    }
+    return project_source_item(
+        source_id="src-teams",
+        source_type="teams",
+        run_id="run-teams",
+        item=item,
+        raw=RawContent(item=item, body=json.dumps(messages).encode(), content_type="application/json"),
+        normalized=NormalizedContent(item=item, markdown_body="normalized Teams window"),
+    )
 def test_jira_short_comments_are_batched_with_core_and_adjacent_context() -> None:
     projection = _jira_projection(3)
 
@@ -74,6 +103,9 @@ def test_jira_short_comments_are_batched_with_core_and_adjacent_context() -> Non
     assert "A7 processing context" in comment_batch.context_markdown
     assert "Reply 0: retain A7" in comment_batch.context_markdown
     assert "Reply 2: retain A7" in comment_batch.context_markdown
+    assert "Reply 1: retain A7" in dict(comment_batch.primary_content_by_observation_id)[
+        comment_batch.primary_observation_ids[0]
+    ]
 
 
 def test_many_messages_use_bounded_transient_batches_not_persisted_units() -> None:
@@ -151,3 +183,79 @@ async def test_projection_batch_extractor_rejects_claim_grounded_only_in_context
     )
 
     assert [memory.content for memory in result.memories] == ["A7 is retained."]
+    assert result.memories[0].source_observation_id == batch.primary_observation_ids[0]
+
+
+@pytest.mark.asyncio
+async def test_projection_batch_extractor_uses_explicit_observation_for_duplicate_quote() -> None:
+    projection = _jira_projection(2)
+    batches = plan_projection_extraction_batches(
+        projection,
+        max_primary_observations=3,
+    )
+    comment_batch = batches[0]
+    first_id, second_id = comment_batch.primary_observation_ids[-2:]
+    duplicate_quote = "retain A7"
+
+    class Client:
+        async def extract_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return MemoryExtractionResponse(
+                memories=[
+                    MemoryCandidate(
+                        content="The second reply retains A7.",
+                        memory_type="decision",
+                        evidence_quote=duplicate_quote,
+                        source_observation_id=second_id,
+                    ),
+                    MemoryCandidate(
+                        content="An unanchored duplicate must be skipped.",
+                        memory_type="decision",
+                        evidence_quote=duplicate_quote,
+                    ),
+                    MemoryCandidate(
+                        content="A mismatched explicit anchor must be skipped.",
+                        memory_type="decision",
+                        evidence_quote="Reply 0: retain A7",
+                        source_observation_id=second_id,
+                    ),
+                ]
+            )
+
+    result = await MemoryExtractor(structured_llm_client=Client()).extract_projection_batch_memories(
+        comment_batch,
+        source_type="jira",
+    )
+
+    assert [memory.content for memory in result.memories] == ["The second reply retains A7."]
+    assert result.memories[0].source_observation_id == second_id
+    assert first_id != second_id
+
+
+@pytest.mark.asyncio
+async def test_teams_batch_preserves_message_observation_anchor() -> None:
+    projection = _teams_projection()
+    batch = plan_projection_extraction_batches(projection)[0]
+    target_id = batch.primary_observation_ids[1]
+
+    class Client:
+        async def extract_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return MemoryExtractionResponse(
+                memories=[
+                    MemoryCandidate(
+                        content="A7 remains enabled.",
+                        memory_type="decision",
+                        evidence_quote="keep A7",
+                        source_observation_id=target_id,
+                    )
+                ]
+            )
+
+    result = await MemoryExtractor(structured_llm_client=Client()).extract_projection_batch_memories(
+        batch,
+        source_type="teams",
+    )
+
+    assert len(result.memories) == 1
+    assert result.memories[0].source_observation_id == target_id

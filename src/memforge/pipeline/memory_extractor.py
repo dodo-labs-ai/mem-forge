@@ -243,7 +243,7 @@ The following observations are CONTEXT only. Use them to resolve references and 
 {context_observations}
 </context_observations>
 
-Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Prefer an empty memories array over weak or transient claims. Do not emit source metadata, routine status, questions, or secrets. Preserve conditions and source language.
+Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. Prefer an empty memories array over weak or transient claims. Do not emit source metadata, routine status, questions, or secrets. Preserve conditions and source language.
 
 Return ONLY a JSON object with a "memories" array."""
 
@@ -466,13 +466,29 @@ class MemoryExtractor:
         if result.error_type:
             return result
         kept = []
+        primary_content = dict(batch.primary_content_by_observation_id)
         for memory in result.memories:
             quote = (memory.evidence_quote or memory.extraction_context or "").strip()
             if not quote or quote not in batch.primary_markdown:
                 continue
+            explicit_observation_id = memory.source_observation_id
+            if explicit_observation_id is not None:
+                if quote not in primary_content.get(explicit_observation_id, ""):
+                    continue
+                source_observation_id = explicit_observation_id
+            else:
+                matching_observations = [
+                    observation_id
+                    for observation_id, content in primary_content.items()
+                    if quote in content
+                ]
+                if len(matching_observations) != 1:
+                    continue
+                source_observation_id = matching_observations[0]
             memory.evidence_quote = quote
             memory.evidence_anchor = "projection_batch"
             memory.extraction_context = quote[:EXTRACTION_QUOTE_MAX_CHARS]
+            memory.source_observation_id = source_observation_id
             kept.append(memory)
         return MemoryExtractionResult(memories=kept)
 
@@ -495,6 +511,7 @@ class MemoryExtractor:
                     extraction_context=memory.extraction_context,
                     evidence_quote=memory.evidence_quote,
                     evidence_anchor=memory.evidence_anchor,
+                    source_observation_id=memory.source_observation_id,
                 )
                 for memory in response.memories
             ]
