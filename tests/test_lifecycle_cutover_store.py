@@ -582,7 +582,7 @@ async def test_recovery_reextracts_only_identifiable_documents_then_validates_li
         db,
         "src-1",
         job_id="backfill-recovery",
-        reextract_documents=reextract,
+        repair_projections=reextract,
     )
 
     assert requested == [frozenset({"legacy-doc"})]
@@ -675,7 +675,7 @@ async def test_cutover_reconstructs_historical_projection_from_exact_stored_arti
         "src-1",
         job_id="historical-reconstruction",
         reconstruct_documents=reconstruct,
-        reextract_documents=unexpected_reextract,
+        repair_projections=unexpected_reextract,
     )
 
     assert projections[0].checkpoint["cutover_repair"] is True

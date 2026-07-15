@@ -52,6 +52,36 @@ def test_parse_decisions_preserves_flag_for_review() -> None:
     assert operation.flag_for_review is True
 
 
+def test_parse_update_preserves_exact_source_observation_lineage() -> None:
+    raw = RawMemory(
+        content="The Jira discussion settled on option A.",
+        memory_type="decision",
+        evidence_quote="Proper message shows as expected",
+        evidence_anchor="projection_batch",
+        source_observation_id="obs-comment-42",
+    )
+    existing = [_memory("mem-old0001", "The Jira discussion preferred option B.")]
+
+    [operation] = _parse_decisions(
+        [
+            {
+                "index": 0,
+                "action": "UPDATE",
+                "memory_id": existing[0].id,
+                "updated_content": "The Jira discussion settled on option A.",
+                "reason": "The decision changed",
+            }
+        ],
+        [raw],
+        existing,
+    )
+
+    assert operation.memory is not None
+    assert operation.memory.evidence_quote == raw.evidence_quote
+    assert operation.memory.evidence_anchor == raw.evidence_anchor
+    assert operation.memory.source_observation_id == raw.source_observation_id
+
+
 @pytest.mark.parametrize("index", [None])
 def test_parse_decisions_can_remove_an_incumbent_without_a_new_candidate(index) -> None:
     existing = [_memory("mem-old0001", "PostgreSQL version is 14")]

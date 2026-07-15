@@ -30,6 +30,7 @@ from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
     ExtractionWorkPool,
     GeneSyncOrchestrator,
+    SourceSyncMode,
     get_process_document_lifecycle_admission,
 )
 from memforge.retrieval.document_index import DocumentVectorIndex
@@ -168,6 +169,7 @@ class RuntimeProvider(Protocol):
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
         reprocess_doc_ids: frozenset[str] | None = None,
+        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
     ) -> SyncState: ...
 
 
@@ -224,6 +226,7 @@ class DefaultRuntimeProvider:
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
         reprocess_doc_ids: frozenset[str] | None = None,
+        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -234,6 +237,7 @@ class DefaultRuntimeProvider:
             force_full_sync=force_full_sync,
             authoritative_snapshot=authoritative_snapshot,
             reprocess_doc_ids=reprocess_doc_ids,
+            execution_mode=execution_mode,
         )
 
 
@@ -586,6 +590,7 @@ async def run_source_sync(
     force_full_sync: bool = False,
     authoritative_snapshot: bool = False,
     reprocess_doc_ids: frozenset[str] | None = None,
+    execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
 ) -> SyncState:
     runtime = runtime or await build_sync_runtime(db, config)
     secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
@@ -596,15 +601,18 @@ async def run_source_sync(
         config=source_config,
         source_id=source["id"],
     )
-    return await runtime.orchestrator().sync_gene(
-        gene=gene,
-        source_name=source["name"],
-        source_id=source["id"],
-        progress_callback=progress_callback,
-        force_full_sync=force_full_sync,
-        authoritative_snapshot=authoritative_snapshot,
-        reprocess_doc_ids=reprocess_doc_ids,
-    )
+    sync_kwargs: dict[str, Any] = {
+        "gene": gene,
+        "source_name": source["name"],
+        "source_id": source["id"],
+        "progress_callback": progress_callback,
+        "force_full_sync": force_full_sync,
+        "authoritative_snapshot": authoritative_snapshot,
+        "reprocess_doc_ids": reprocess_doc_ids,
+    }
+    if execution_mode is not SourceSyncMode.NORMAL:
+        sync_kwargs["execution_mode"] = execution_mode
+    return await runtime.orchestrator().sync_gene(**sync_kwargs)
 
 
 class SourceSyncWorker:

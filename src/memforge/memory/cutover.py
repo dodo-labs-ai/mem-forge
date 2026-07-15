@@ -84,14 +84,16 @@ async def run_source_lifecycle_recovery_job(
     *,
     job_id: str,
     reconstruct_documents: Callable[[frozenset[str]], Awaitable[None]] | None = None,
-    reextract_documents: Callable[[frozenset[str]], Awaitable[None]] | None = None,
+    repair_projections: Callable[[frozenset[str]], Awaitable[None]] | None = None,
 ) -> LifecycleBackfillJob:
-    """Audit, selectively re-extract identifiable documents, then re-audit.
+    """Audit, selectively repair exact Source Projections, then re-audit.
 
     Similarity never establishes lineage.  The recovery callback receives only
     document identifiers already present in durable source provenance.  A
     successful callback is not enough to close a finding: the second audit
-    must persist and validate Source Unit/Observation support first.
+    must persist and validate Source Unit/Observation support first. Projection
+    repair is a baseline operation; it must not perform semantic extraction or
+    Memory lifecycle work.
     """
 
     job = await db.create_lifecycle_backfill_job(
@@ -113,10 +115,10 @@ async def run_source_lifecycle_recovery_job(
             if missing_projection_ids:
                 await reconstruct_documents(missing_projection_ids)
                 result = await run_source_lifecycle_backfill(db, source_id)
-        if result.finding_count and reextract_documents is not None:
+        if result.finding_count and repair_projections is not None:
             target_document_ids = await _identifiable_finding_document_ids(db, source_id)
             if target_document_ids:
-                await reextract_documents(target_document_ids)
+                await repair_projections(target_document_ids)
                 result = await run_source_lifecycle_backfill(db, source_id)
         return await db.complete_lifecycle_backfill_job(
             job.id,
