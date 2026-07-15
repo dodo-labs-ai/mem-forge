@@ -492,13 +492,23 @@ def test_source_lifecycle_finding_repair_returns_exact_lineage_and_gate_state(
                 "owner_user_id": "user-a",
             }
 
-    async def fake_repair(db, *, source_id: str, finding_id: str, observation_id: str):
+    async def fake_repair(
+        db,
+        *,
+        source_id: str,
+        finding_id: str,
+        observation_id: str,
+        evidence_quote: str | None,
+        operator_id: str | None,
+    ):
         assert isinstance(db, FakeRepairStore)
         assert (source_id, finding_id, observation_id) == (
             "src-neutral",
             "finding-1",
             "observation-2",
         )
+        assert evidence_quote == "exact source quote"
+        assert operator_id == "user-a"
         return LifecycleCutoverFinding(
             id=finding_id,
             source_id=source_id,
@@ -527,7 +537,10 @@ def test_source_lifecycle_finding_repair_returns_exact_lineage_and_gate_state(
     with TestClient(app) as client:
         response = client.post(
             "/api/sources/src-neutral/memory-lifecycle/findings/finding-1/repair",
-            json={"observation_id": "observation-2"},
+            json={
+                "observation_id": "observation-2",
+                "evidence_quote": "exact source quote",
+            },
         )
 
     assert response.status_code == 200, response.text

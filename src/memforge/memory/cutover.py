@@ -7,7 +7,7 @@ import json
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -220,6 +220,8 @@ async def repair_lifecycle_cutover_finding(
     source_id: str,
     finding_id: str,
     observation_id: str,
+    evidence_quote: str | None = None,
+    operator_id: str | None = None,
 ) -> LifecycleCutoverFinding:
     """Resolve an ambiguous finding using one explicitly selected Observation."""
 
@@ -253,14 +255,26 @@ async def repair_lifecycle_cutover_finding(
         for row in await db.list_legacy_memory_provenance(source_id)
         if row.memory_id == finding.memory_id and row.doc_id in lineage_document_ids
     ]
-    eligible = [
+    exact_legacy = [
         row
         for row in provenance_rows
         if row.excerpt and row.excerpt.strip() and row.excerpt.strip() in revision.content
     ]
+    quote = (evidence_quote or "").strip()
+    if quote:
+        if quote not in revision.content:
+            raise ValueError("evidence_quote is not an exact substring of the selected Observation")
+        eligible = provenance_rows
+    else:
+        eligible = exact_legacy
     if not eligible:
-        raise ValueError("selected Observation does not contain the finding's exact source excerpt")
+        raise ValueError(
+            "selected Observation requires an exact evidence_quote because the legacy excerpt is not reusable"
+        )
     provenance = sorted(eligible, key=lambda row: (row.doc_id, row.excerpt or ""))[0]
+    original_excerpt = (provenance.excerpt or "").strip()
+    if quote:
+        provenance = replace(provenance, excerpt=quote)
     await _persist_backfill_lineage(
         db,
         source_id=source_id,
@@ -269,6 +283,12 @@ async def repair_lifecycle_cutover_finding(
         source_unit_id=source_unit_id,
         observation_id=observation_id,
         revision=revision,
+        repair_metadata={
+            "operator_selected_observation": True,
+            "finding_id": finding_id,
+            "operator_id": operator_id,
+            "legacy_excerpt_replaced": bool(quote and quote != original_excerpt),
+        },
     )
     return await db.resolve_lifecycle_cutover_finding(
         finding_id,
@@ -432,6 +452,7 @@ async def _persist_backfill_lineage(
     source_unit_id: str,
     observation_id: str,
     revision: SourceObservationRevision,
+    repair_metadata: Mapping[str, object] | None = None,
 ) -> None:
     evidence_unit_id = _stable_id("eu-backfill", source_id, memory_id, revision.id)
     access_hash = _access_context_hash(provenance)
@@ -450,7 +471,11 @@ async def _persist_backfill_lineage(
         content=revision.content,
         excerpt=provenance.excerpt,
         evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
-        source_metadata={"backfill": True, "source_unit_id": source_unit_id},
+        source_metadata={
+            "backfill": True,
+            "source_unit_id": source_unit_id,
+            **dict(repair_metadata or {}),
+        },
         access_context_hash=access_hash,
     )
     await db.upsert_evidence_unit(unit)
