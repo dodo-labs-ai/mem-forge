@@ -56,6 +56,11 @@ async def db(tmp_path, request):
 
 
 @pytest.mark.asyncio
+async def test_debug_db_fixture_only(db):
+    assert db.db is not None
+
+
+@pytest.mark.asyncio
 async def test_sync_runtime_wires_structured_llm_client_into_memory_engine(db, tmp_path, monkeypatch):
     """Normal sync startup must enable structured reconciliation and contradiction detection."""
     from memforge import runtime
