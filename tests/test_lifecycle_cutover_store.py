@@ -686,6 +686,89 @@ async def test_cutover_reconstructs_historical_projection_from_exact_stored_arti
 
 
 @pytest.mark.asyncio
+async def test_cutover_reconstructs_agent_session_projection_from_canonical_concept(
+    db: Database,
+    tmp_path,
+) -> None:
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-agent",
+        type="agent_session",
+        name="Codex Session",
+        config_json="{}",
+        access_policy="private",
+        owner_user_id="owner-1",
+    )
+    markdown = "# Durable convention\n\nLegacy claim\n"
+    await db.upsert_agent_concept(
+        concept_id="akb-concept-1",
+        source_id="src-agent",
+        owner_user_id="owner-1",
+        workspace="workspace-1",
+        repo_identifier="repo-1",
+        concept_type="convention",
+        concept_path="conventions/durable-convention.md",
+        title="Durable convention",
+        markdown_body=markdown,
+        frontmatter={"source_type": "agent_session"},
+        observed_at=now,
+    )
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="akb-concept-1",
+            source="src-agent",
+            source_url="agent-knowledge://owner-1/akb-concept-1",
+            title="Durable convention",
+            space_or_project="workspace-1",
+            author="codex",
+            last_modified=now,
+            labels=["convention"],
+            version=content_hash(markdown),
+            content_hash=content_hash(markdown),
+            token_count=None,
+            raw_content_uri=None,
+            raw_content_type="text/markdown",
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+            client="codex",
+        )
+    )
+    await db.add_memory_source(
+        "mem-legacy",
+        "akb-concept-1",
+        "agent_session",
+        "Legacy claim",
+        source_updated_at=None,
+    )
+    assert (await run_source_lifecycle_backfill(db, "src-agent")).finding_count == 1
+
+    async def reconstruct(document_ids: frozenset[str]) -> None:
+        for document_id in document_ids:
+            await reconstruct_historical_source_projection(
+                db,
+                LocalDocumentStore(str(tmp_path / "missing-artifacts")),
+                source_id="src-agent",
+                source_type="agent_session",
+                document_id=document_id,
+            )
+
+    completed = await run_source_lifecycle_recovery_job(
+        db,
+        "src-agent",
+        job_id="agent-concept-reconstruction",
+        reconstruct_documents=reconstruct,
+    )
+
+    source_unit = await db.find_source_unit_by_document_id("src-agent", "akb-concept-1")
+    assert source_unit is not None
+    assert source_unit.unit_type == "agent_session_window"
+    assert completed.mapped_memories == 1
+    assert completed.finding_count == 0
+    assert (await db.get_lifecycle_gate("src-agent")).state is LifecycleGateState.ENABLED
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: Database) -> None:
     now = datetime(2026, 7, 15, tzinfo=timezone.utc)
     item = ContentItem(

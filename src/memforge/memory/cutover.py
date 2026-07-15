@@ -84,7 +84,7 @@ async def run_source_lifecycle_recovery_job(
     *,
     job_id: str,
     reconstruct_documents: Callable[[frozenset[str]], Awaitable[None]] | None = None,
-    reextract_documents: Callable[[frozenset[str]], Awaitable[None]],
+    reextract_documents: Callable[[frozenset[str]], Awaitable[None]] | None = None,
 ) -> LifecycleBackfillJob:
     """Audit, selectively re-extract identifiable documents, then re-audit.
 
@@ -113,7 +113,7 @@ async def run_source_lifecycle_recovery_job(
             if missing_projection_ids:
                 await reconstruct_documents(missing_projection_ids)
                 result = await run_source_lifecycle_backfill(db, source_id)
-        if result.finding_count:
+        if result.finding_count and reextract_documents is not None:
             target_document_ids = await _identifiable_finding_document_ids(db, source_id)
             if target_document_ids:
                 await reextract_documents(target_document_ids)
@@ -137,30 +137,52 @@ async def reconstruct_historical_source_projection(
     source_type: str,
     document_id: str,
 ) -> SourceProjection:
-    """Rebuild one missing projection from immutable source-scoped artifacts.
+    """Rebuild one missing projection from durable source-scoped content.
 
     This is a cutover repair, not a semantic re-extraction.  It requires the
-    original document row plus both raw and normalized artifacts, then runs the
-    same provider adapter used by normal sync.  No similarity or inferred
-    provider identity is accepted.
+    original document row plus either its archived artifacts or the canonical
+    Agent Knowledge concept record, then runs the same provider adapter used by
+    normal sync. No similarity or inferred provider identity is accepted.
     """
 
     document = await db.get_document(document_id)
     if document is None or document.source != source_id:
         raise ValueError("historical document is unavailable in the requested source")
-    if not document.raw_content_uri or not document.normalized_content_uri:
-        raise ValueError("historical document does not retain complete projection artifacts")
-    raw_body = document_store.read_artifact(document.raw_content_uri)
-    normalized_body = document_store.read_normalized(document.normalized_content_uri)
-    if normalized_body is None:
-        raise ValueError("historical normalized artifact is unreadable")
+    content_type = document.raw_content_type or "application/octet-stream"
+    if document.raw_content_uri and document.normalized_content_uri:
+        raw_body = document_store.read_artifact(document.raw_content_uri)
+        normalized_body = document_store.read_normalized(document.normalized_content_uri)
+        if normalized_body is None:
+            raise ValueError("historical normalized artifact is unreadable")
+    elif source_type == "agent_session":
+        concept = await db.get_agent_concept(document_id)
+        if concept is None or str(concept.get("source_id") or "") != source_id:
+            raise ValueError("historical Agent Knowledge concept is unavailable in the requested source")
+        normalized_body = str(concept.get("markdown_body") or "").strip()
+        if not normalized_body:
+            raise ValueError("historical Agent Knowledge concept has no canonical content")
+        content_type = "application/json"
+        raw_body = json.dumps(
+            {
+                "package_kind": "agent_knowledge_concept",
+                "doc_id": document_id,
+                "markdown": normalized_body,
+                "receipt": {
+                    "client": document.author,
+                    "history_window_kind": "agent_knowledge_concept",
+                },
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    else:
+        raise ValueError("historical document does not retain complete projection content")
 
     item = ContentItem(
         item_id=document.doc_id,
         title=document.title,
         source_url=document.source_url,
         last_modified=document.last_modified,
-        content_type=document.raw_content_type or "application/octet-stream",
+        content_type=content_type,
         space_or_project=document.space_or_project,
         version=document.version,
         author=document.author,
@@ -170,7 +192,7 @@ async def reconstruct_historical_source_projection(
     raw = RawContent(
         item=item,
         body=raw_body,
-        content_type=document.raw_content_type or "application/octet-stream",
+        content_type=content_type,
     )
     normalized = NormalizedContent(item=item, markdown_body=normalized_body)
     probe = project_source_item(
