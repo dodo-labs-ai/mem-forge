@@ -70,8 +70,11 @@ def build_projected_claim_evidence(
         quote = (raw.evidence_quote or raw.extraction_context or "").strip()
         explicit_observation_id = raw.source_observation_id
         if explicit_observation_id is not None:
-            if explicit_observation_id not in candidate_ids:
+            revalidated_noop = raw.evidence_anchor == "revalidated_noop"
+            if explicit_observation_id not in candidate_ids and not revalidated_noop:
                 raise ValueError("explicit source observation is outside the changed evidence scope")
+            if explicit_observation_id not in revisions_by_observation:
+                raise ValueError("explicit source observation is unavailable in the current revision")
             if not quote or quote not in revisions_by_observation[explicit_observation_id].content:
                 raise ValueError("explicit source observation does not contain the evidence quote")
             primary_id = explicit_observation_id
@@ -124,7 +127,17 @@ def build_projected_claim_evidence(
         )
         units_by_id.setdefault(unit.id, unit)
 
-        context_ids = _context_observation_ids(primary_id, ordered_observation_ids)
+        context_ids = _context_observation_ids(
+            primary_id,
+            ordered_observation_ids,
+            projection=projection,
+        )
+        required_ids = tuple(dict.fromkeys(raw.required_source_observation_ids))
+        if primary_id in required_ids:
+            raise ValueError("PRIMARY observation cannot also be REQUIRED")
+        if any(observation_id not in context_ids for observation_id in required_ids):
+            raise ValueError("required source observation is outside the extraction context")
+        required_set = set(required_ids)
         claim_references = [
             EvidenceReference(
                 role=EvidenceRole.PRIMARY,
@@ -138,6 +151,18 @@ def build_projected_claim_evidence(
         ]
         claim_references.extend(
             EvidenceReference(
+                role=EvidenceRole.REQUIRED,
+                anchor=SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id=observation_id,
+                    observation_revision_id=revisions_by_observation[observation_id].id,
+                ),
+                evidence_unit_id=unit.id,
+            )
+            for observation_id in required_ids
+        )
+        claim_references.extend(
+            EvidenceReference(
                 role=EvidenceRole.CONTEXT,
                 anchor=SourceAnchor(
                     kind=AnchorKind.WHOLE_OBSERVATION,
@@ -147,6 +172,7 @@ def build_projected_claim_evidence(
                 evidence_unit_id=unit.id,
             )
             for observation_id in context_ids
+            if observation_id not in required_set
         )
         persisted = tuple(
             EvidenceReference(
@@ -171,7 +197,12 @@ def build_projected_claim_evidence(
     )
 
 
-def _context_observation_ids(primary_id: str, ordered_ids: Sequence[str]) -> tuple[str, ...]:
+def _context_observation_ids(
+    primary_id: str,
+    ordered_ids: Sequence[str],
+    *,
+    projection: SourceProjection,
+) -> tuple[str, ...]:
     if primary_id not in ordered_ids:
         return ()
     index = ordered_ids.index(primary_id)
@@ -180,6 +211,11 @@ def _context_observation_ids(primary_id: str, ordered_ids: Sequence[str]) -> tup
         candidates.append(ordered_ids[index - 1])
     if index + 1 < len(ordered_ids):
         candidates.append(ordered_ids[index + 1])
+    for relation in projection.relations:
+        if relation.from_id == primary_id and relation.to_id in ordered_ids:
+            candidates.append(relation.to_id)
+        elif relation.to_id == primary_id and relation.from_id in ordered_ids:
+            candidates.append(relation.from_id)
     if ordered_ids and ordered_ids[0] != primary_id:
         candidates.append(ordered_ids[0])
     return tuple(dict.fromkeys(candidates))

@@ -44,6 +44,7 @@ from memforge.models import (
     SHARED_PROJECT_KEY,
     SourceArtifactCleanupTask,
     SourceDeletionResult,
+    SourceLifecycleResetResult,
     SourceSyncInput,
     SourceSyncRun,
     SyncState,
@@ -55,6 +56,7 @@ from memforge.models import (
     source_artifact_cleanup_task_id,
 )
 from memforge.memory.evidence import (
+    ActiveSupportEvidence,
     AuthorityCase,
     CandidateBucket,
     CandidateMemory,
@@ -101,10 +103,12 @@ from memforge.retrieval.access_predicate import visible_sql
 from memforge.retrieval.metadata_text import metadata_alias_text, metadata_compact_text
 from memforge.source_access import infer_legacy_source_access
 from memforge.source_projection import (
+    AnchorKind,
     ProjectionCoverage,
     ProjectionScopeTransition,
     ProjectionScopeTransitionStatus,
     SourceObservationRevision,
+    SourceAnchor,
     SourceProjection,
     SourceUnit,
     SourceUnitRevision,
@@ -852,17 +856,17 @@ CREATE TABLE IF NOT EXISTS source_units (
     UNIQUE (source_id, provider_key)
 );
 
-CREATE TABLE IF NOT EXISTS source_unit_document_lineage (
+CREATE TABLE IF NOT EXISTS source_unit_document_lineage_history (
     source_id      TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
     document_id    TEXT NOT NULL,
     source_unit_id TEXT NOT NULL REFERENCES source_units(id) ON DELETE CASCADE,
     is_current     INTEGER NOT NULL DEFAULT 1,
     first_seen_at  TEXT NOT NULL,
     last_seen_at   TEXT NOT NULL,
-    PRIMARY KEY (source_id, document_id)
+    PRIMARY KEY (source_id, document_id, source_unit_id)
 );
-CREATE INDEX IF NOT EXISTS idx_source_unit_document_lineage_unit
-    ON source_unit_document_lineage(source_unit_id, is_current, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_source_unit_document_history_unit
+    ON source_unit_document_lineage_history(source_unit_id, is_current, last_seen_at);
 
 CREATE TABLE IF NOT EXISTS source_observations (
     id                  TEXT PRIMARY KEY,
@@ -1025,6 +1029,19 @@ CREATE TABLE IF NOT EXISTS lifecycle_vector_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_lifecycle_vector_outbox_status
     ON lifecycle_vector_outbox(status, created_at);
+
+CREATE TABLE IF NOT EXISTS source_deletion_vector_outbox (
+    id          TEXT PRIMARY KEY,
+    source_id   TEXT NOT NULL,
+    memory_id   TEXT NOT NULL,
+    status      TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    error       TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_source_deletion_vector_outbox_status
+    ON source_deletion_vector_outbox(status, created_at);
 
 CREATE TABLE IF NOT EXISTS source_subscriptions (
     source_id   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
@@ -2629,6 +2646,50 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                  AND json_extract(locator_json, '$.document_id') != ''""",
         ],
     ),
+    (
+        55,
+        "Allow document locators to have multiple Source Unit incarnations",
+        [
+            """CREATE TABLE IF NOT EXISTS source_unit_document_lineage_history (
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                document_id TEXT NOT NULL,
+                source_unit_id TEXT NOT NULL REFERENCES source_units(id) ON DELETE CASCADE,
+                is_current INTEGER NOT NULL DEFAULT 1,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (source_id, document_id, source_unit_id)
+            )""",
+            """INSERT OR IGNORE INTO source_unit_document_lineage_history (
+                   source_id, document_id, source_unit_id, is_current,
+                   first_seen_at, last_seen_at
+               )
+               SELECT source_id, document_id, source_unit_id, is_current,
+                      first_seen_at, last_seen_at
+               FROM source_unit_document_lineage""",
+            "DROP INDEX IF EXISTS idx_source_unit_document_lineage_unit",
+            "DROP TABLE IF EXISTS source_unit_document_lineage",
+            "CREATE INDEX IF NOT EXISTS idx_source_unit_document_history_unit "
+            "ON source_unit_document_lineage_history(source_unit_id, is_current, last_seen_at)",
+        ],
+    ),
+    (
+        56,
+        "Add durable source-deletion vector cleanup outbox",
+        [
+            """CREATE TABLE IF NOT EXISTS source_deletion_vector_outbox (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_source_deletion_vector_outbox_status "
+            "ON source_deletion_vector_outbox(status, created_at)",
+        ],
+    ),
 ]
 
 
@@ -3087,17 +3148,48 @@ class Database:
     # Documents
     # ==================================================================
 
-    async def upsert_document(self, doc: DocumentRecord) -> None:
+    async def _assert_document_source_writable_unlocked(
+        self,
+        source_id: str,
+        *,
+        require_configured_source: bool,
+    ) -> None:
+        # A no-op write is intentional: it acquires SQLite's cross-process
+        # writer fence before source status is read and holds it until the
+        # caller commits the document mutation. A plain SELECT here would let
+        # another process delete the Source between validation and INSERT.
+        cursor = await self.db.execute(
+            "UPDATE sources SET status = status WHERE id = ?",
+            (source_id,),
+        )
+        source_exists = bool(cursor.rowcount)
+        async with self.db.execute(
+            "SELECT status FROM sources WHERE id = ?",
+            (source_id,),
+        ) as cursor:
+            source_row = await cursor.fetchone()
+        if not source_exists or source_row is None:
+            if require_configured_source:
+                await self.db.rollback()
+                raise ValueError(f"Source does not exist: {source_id}")
+            return
+        if source_row["status"] != "active":
+            await self.db.rollback()
+            if source_row["status"] == "deleting":
+                raise ValueError(f"Source is being deleted: {source_id}")
+            raise ValueError(f"Source is not active: {source_id}")
+
+    async def upsert_document(
+        self,
+        doc: DocumentRecord,
+        *,
+        require_configured_source: bool = False,
+    ) -> None:
         async with self._write_lock:
-            async with self.db.execute(
-                "SELECT status FROM sources WHERE id = ?",
-                (doc.source,),
-            ) as cursor:
-                source_row = await cursor.fetchone()
-            if source_row is not None and source_row["status"] != "active":
-                if source_row["status"] == "deleting":
-                    raise ValueError(f"Source is being deleted: {doc.source}")
-                raise ValueError(f"Source is not active: {doc.source}")
+            await self._assert_document_source_writable_unlocked(
+                doc.source,
+                require_configured_source=require_configured_source,
+            )
             await self.db.execute(
                 """INSERT INTO documents (
                     doc_id, source, source_url, title, space_or_project,
@@ -3150,9 +3242,18 @@ class Database:
                 return None
             return self._row_to_document(row)
 
-    async def restore_document_snapshot(self, doc: DocumentRecord) -> None:
+    async def restore_document_snapshot(
+        self,
+        doc: DocumentRecord,
+        *,
+        require_configured_source: bool = False,
+    ) -> None:
         """Restore one document row from a captured snapshot."""
         async with self._write_lock:
+            await self._assert_document_source_writable_unlocked(
+                doc.source,
+                require_configured_source=require_configured_source,
+            )
             await self.db.execute(
                 """INSERT INTO documents (
                     doc_id, source, source_url, title, space_or_project, author,
@@ -3938,6 +4039,12 @@ class Database:
         transaction_lock = self._write_lock if _manage_transaction else nullcontext()
         async with transaction_lock:
             try:
+                # First write acquires SQLite's cross-process writer fence for
+                # this transaction before any projection snapshot is read.
+                await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (projection.source_id,),
+                )
                 async with self.db.execute(
                     "SELECT payload_hash FROM source_projection_runs WHERE id = ?",
                     (projection.run_id,),
@@ -3946,6 +4053,8 @@ class Database:
                 if existing_run is not None:
                     if existing_run["payload_hash"] != payload_hash:
                         raise ValueError("projection retry payload mismatch")
+                    if _manage_transaction:
+                        await self.db.commit()
                     return
 
                 await self.db.execute(
@@ -3992,36 +4101,57 @@ class Database:
                     )
                     document_id = str(unit.locator.get("document_id") or "").strip()
                     if document_id:
+                        if projection.coverage is ProjectionCoverage.TOMBSTONED_DELTA:
+                            await self.db.execute(
+                                """UPDATE source_unit_document_lineage_history
+                                   SET is_current = 0, last_seen_at = ?
+                                   WHERE source_id = ? AND source_unit_id = ?""",
+                                (now, unit.source_id, unit.id),
+                            )
+                            await self.db.execute(
+                                "UPDATE source_units SET locator_json = ?, updated_at = ? WHERE id = ?",
+                                (json.dumps(dict(unit.locator), sort_keys=True), now, unit.id),
+                            )
+                            continue
                         async with self.db.execute(
-                            """SELECT source_unit_id
-                               FROM source_unit_document_lineage
-                               WHERE source_id = ? AND document_id = ?""",
-                            (unit.source_id, document_id),
+                            """SELECT first_seen_at
+                               FROM source_unit_document_lineage_history
+                               WHERE source_id = ? AND document_id = ?
+                                 AND source_unit_id = ?""",
+                            (unit.source_id, document_id, unit.id),
                         ) as cursor:
                             existing_document_lineage = await cursor.fetchone()
-                        if (
-                            existing_document_lineage is not None
-                            and existing_document_lineage["source_unit_id"] != unit.id
-                        ):
-                            raise ValueError(
-                                "immutable document lineage mismatch: "
-                                f"{unit.source_id}:{document_id}"
-                            )
                         await self.db.execute(
-                            """UPDATE source_unit_document_lineage
+                            """UPDATE source_unit_document_lineage_history
                                SET is_current = 0
-                               WHERE source_unit_id = ? AND document_id != ?""",
-                            (unit.id, document_id),
+                               WHERE source_id = ? AND (
+                                   source_unit_id = ? OR document_id = ?
+                               ) AND NOT (source_unit_id = ? AND document_id = ?)""",
+                            (
+                                unit.source_id,
+                                unit.id,
+                                document_id,
+                                unit.id,
+                                document_id,
+                            ),
                         )
                         await self.db.execute(
-                            """INSERT INTO source_unit_document_lineage (
+                            """INSERT INTO source_unit_document_lineage_history (
                                    source_id, document_id, source_unit_id, is_current,
                                    first_seen_at, last_seen_at
                                ) VALUES (?, ?, ?, 1, ?, ?)
-                               ON CONFLICT(source_id, document_id) DO UPDATE SET
+                               ON CONFLICT(source_id, document_id, source_unit_id) DO UPDATE SET
                                    is_current = 1,
                                    last_seen_at = excluded.last_seen_at""",
-                            (unit.source_id, document_id, unit.id, now, now),
+                            (
+                                unit.source_id,
+                                document_id,
+                                unit.id,
+                                str(existing_document_lineage["first_seen_at"])
+                                if existing_document_lineage is not None
+                                else now,
+                                now,
+                            ),
                         )
                     await self.db.execute(
                         "UPDATE source_units SET locator_json = ?, updated_at = ? WHERE id = ?",
@@ -4410,12 +4540,15 @@ class Database:
         self,
         source_id: str,
         document_id: str,
+        *,
+        current_only: bool = False,
     ) -> SourceUnit | None:
+        current_clause = " AND lineage.is_current = 1" if current_only else ""
         async with self.db.execute(
-            """SELECT su.*
-               FROM source_unit_document_lineage lineage
+            f"""SELECT su.*
+               FROM source_unit_document_lineage_history lineage
                JOIN source_units su ON su.id = lineage.source_unit_id
-               WHERE lineage.source_id = ? AND lineage.document_id = ?
+               WHERE lineage.source_id = ? AND lineage.document_id = ?{current_clause}
                ORDER BY lineage.is_current DESC, lineage.last_seen_at DESC, su.id
                LIMIT 1""",
             (source_id, document_id),
@@ -4437,7 +4570,7 @@ class Database:
     ) -> tuple[str, ...]:
         rows = await self.db.execute_fetchall(
             """SELECT document_id
-               FROM source_unit_document_lineage
+               FROM source_unit_document_lineage_history
                WHERE source_unit_id = ?
                ORDER BY is_current DESC, last_seen_at DESC, document_id""",
             (source_unit_id,),
@@ -4646,6 +4779,17 @@ class Database:
         now = _now_iso()
         async with self._write_lock:
             try:
+                async with self.db.execute(
+                    "SELECT id FROM lifecycle_backfill_jobs "
+                    "WHERE source_id = ? AND status IN ('queued', 'running') "
+                    "AND id <> ? LIMIT 1",
+                    (job.source_id, job.id),
+                ) as cursor:
+                    active = await cursor.fetchone()
+                if active is not None:
+                    raise ValueError(
+                        f"source lifecycle job already active: {active['id']}"
+                    )
                 await self.db.execute(
                     """INSERT OR IGNORE INTO lifecycle_backfill_jobs (
                         id, source_id, status, scanned_memories, mapped_memories,
@@ -4915,6 +5059,51 @@ class Database:
         )
         return tuple(row["evidence_reference_id"] for row in rows)
 
+    async def get_active_memory_support_evidence(
+        self,
+        memory_id: str,
+        *,
+        source_id: str | None = None,
+    ) -> tuple[ActiveSupportEvidence, ...]:
+        params: list[object] = [memory_id]
+        source_clause = ""
+        if source_id is not None:
+            source_clause = " AND msa.source_id = ?"
+            params.append(source_id)
+        rows = await self.db.execute_fetchall(
+            """SELECT msa.memory_id, msa.source_id,
+                      er.id AS reference_id, er.evidence_unit_id, er.role,
+                      er.anchor_kind, er.observation_id,
+                      er.observation_revision_id, er.fragment_id,
+                      er.range_start, er.range_end, eu.excerpt
+               FROM memory_support_assertions msa
+               JOIN evidence_references er ON er.id = msa.evidence_reference_id
+               JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+               WHERE msa.memory_id = ? AND msa.active = 1"""
+            + source_clause
+            + " ORDER BY msa.source_id, er.id",
+            tuple(params),
+        )
+        return tuple(
+            ActiveSupportEvidence(
+                memory_id=str(row["memory_id"]),
+                source_id=str(row["source_id"]),
+                reference_id=str(row["reference_id"]),
+                evidence_unit_id=str(row["evidence_unit_id"]),
+                role=EvidenceRole(str(row["role"])),
+                anchor=SourceAnchor(
+                    kind=AnchorKind(str(row["anchor_kind"])),
+                    observation_id=str(row["observation_id"]),
+                    observation_revision_id=str(row["observation_revision_id"]),
+                    fragment_id=row["fragment_id"],
+                    range_start=row["range_start"],
+                    range_end=row["range_end"],
+                ),
+                excerpt=row["excerpt"],
+            )
+            for row in rows
+        )
+
     async def get_source_unit_support_reference_ids(
         self,
         source_unit_id: str,
@@ -4993,6 +5182,96 @@ class Database:
                 await self.db.rollback()
                 raise
 
+    async def apply_agent_claim_source_projection_lifecycle(
+        self,
+        projection: SourceProjection,
+        plan: LifecyclePlan,
+        *,
+        memory_id: str,
+        relation_outcome: RelationOutcomeBundle | None,
+        claim_id: str,
+        concept_id: str,
+        display_anchor: str,
+        claim_text: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        observed_at: datetime,
+        citations: list[str] | None = None,
+        concept_projection: dict[str, Any] | None = None,
+        concept_markdown_body: str | None = None,
+    ) -> None:
+        """Commit projected Memory lifecycle and the Agent Knowledge view atomically."""
+
+        plan.validate()
+        if projection.source_id != plan.scope.source_id or len(projection.deltas) != 1:
+            raise ValueError("agent projection and lifecycle plan scope mismatch")
+        delta = projection.deltas[0]
+        if (
+            delta.source_unit_id != plan.scope.source_unit_id
+            or delta.current_unit_revision_id != plan.scope.target_unit_revision_id
+        ):
+            raise ValueError("agent projection and lifecycle plan revision mismatch")
+        created_memory_ids = {
+            mutation.memory_id
+            for mutation in plan.mutations
+            if mutation.mutation_type is LifecycleMutationType.CREATE_MEMORY
+        }
+        retired_memory_ids = {
+            mutation.memory_id
+            for mutation in plan.mutations
+            if mutation.mutation_type is LifecycleMutationType.RETIRE_MEMORY
+        }
+        if memory_id not in created_memory_ids | retired_memory_ids:
+            raise ValueError(
+                "agent claim must reference a Memory created or retired by its Lifecycle Plan"
+            )
+        observed = _utc_iso(observed_at)
+        async with self._write_lock:
+            try:
+                await self.record_source_projection(
+                    projection,
+                    _manage_transaction=False,
+                )
+                await self.apply_lifecycle_plan(
+                    plan,
+                    _manage_transaction=False,
+                )
+                if relation_outcome is not None:
+                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                if concept_projection is not None:
+                    await self._upsert_agent_concept_unlocked(
+                        **concept_projection,
+                        observed=observed,
+                    )
+                await self._upsert_agent_claim_unlocked(
+                    claim_id=claim_id,
+                    concept_id=concept_id,
+                    display_anchor=display_anchor,
+                    claim_text=claim_text,
+                    memory_type=memory_type,
+                    tags=tags,
+                    confidence=confidence,
+                    memory_id=memory_id,
+                    observed=observed,
+                )
+                for citation_url in citations or ():
+                    await self._add_agent_claim_citation_unlocked(
+                        claim_id=claim_id,
+                        citation_url=citation_url,
+                        observed=observed,
+                    )
+                if concept_markdown_body is not None:
+                    await self._update_agent_concept_markdown_unlocked(
+                        concept_id=concept_id,
+                        markdown_body=concept_markdown_body,
+                        observed=observed,
+                    )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
     async def apply_lifecycle_plan(
         self,
         plan: LifecyclePlan,
@@ -5008,6 +5287,10 @@ class Database:
         transaction_lock = self._write_lock if _manage_transaction else nullcontext()
         async with transaction_lock:
             try:
+                await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (plan.scope.source_id,),
+                )
                 async with self.db.execute(
                     "SELECT payload_hash, status FROM lifecycle_plans WHERE id = ?",
                     (plan.id,),
@@ -5017,6 +5300,8 @@ class Database:
                     if existing["payload_hash"] != payload_hash:
                         raise ValueError("lifecycle plan retry payload mismatch")
                     if existing["status"] == "applied":
+                        if _manage_transaction:
+                            await self.db.commit()
                         return
                     raise ValueError(f"lifecycle plan is already {existing['status']}")
 
@@ -5081,6 +5366,17 @@ class Database:
                 await self._stage_lifecycle_evidence_unlocked(plan, now=now)
                 for mutation in plan.mutations:
                     await self._apply_lifecycle_mutation_unlocked(plan.id, mutation, now=now)
+                for memory_id in {mutation.memory_id for mutation in plan.mutations}:
+                    async with self.db.execute(
+                        "SELECT COUNT(*) AS total FROM memory_sources WHERE memory_id = ?",
+                        (memory_id,),
+                    ) as cursor:
+                        source_count = await cursor.fetchone()
+                    await self.db.execute(
+                        "UPDATE memories SET corroboration_count = ? WHERE id = ?",
+                        (int(source_count["total"] or 0), memory_id),
+                    )
+                await self._validate_projected_support_invariant_unlocked(plan)
                 await self.db.execute(
                     "UPDATE lifecycle_plans SET status = 'applied', applied_at = ? WHERE id = ?",
                     (now, plan.id),
@@ -5091,6 +5387,76 @@ class Database:
                 if _manage_transaction:
                     await self.db.rollback()
                 raise
+
+    async def _validate_projected_support_invariant_unlocked(
+        self,
+        plan: LifecyclePlan,
+    ) -> None:
+        """Fail closed when committed source support is not current, stable lineage.
+
+        Review-only plans intentionally preserve the incumbent while a human
+        decides; their contested support is represented by the durable review.
+        Every applied non-review plan must leave each surviving same-source
+        assertion pinned to an Observation that is current in this Source Unit.
+        """
+
+        if any(
+            mutation.mutation_type is LifecycleMutationType.CREATE_REVIEW
+            for mutation in plan.mutations
+        ):
+            return
+        created_ids = {
+            mutation.memory_id
+            for mutation in plan.mutations
+            if mutation.mutation_type is LifecycleMutationType.CREATE_MEMORY
+        }
+        candidate_ids = (
+            set(plan.coverage_proof.mandatory_incumbent_ids)
+            | created_ids
+            | {
+                mutation.memory_id
+                for mutation in plan.mutations
+                if mutation.mutation_type is LifecycleMutationType.ATTACH_SUPPORT
+            }
+        )
+        for memory_id in sorted(candidate_ids):
+            async with self.db.execute(
+                "SELECT status FROM memories WHERE id = ?",
+                (memory_id,),
+            ) as cursor:
+                memory = await cursor.fetchone()
+            if memory is None or memory["status"] != "active":
+                continue
+            async with self.db.execute(
+                """SELECT COUNT(*) AS total,
+                          SUM(CASE
+                              WHEN eu.source_lineage_id = ?
+                               AND so.source_unit_id = ?
+                               AND er.observation_revision_id = so.current_revision_id
+                              THEN 0 ELSE 1 END) AS invalid
+                   FROM memory_support_assertions msa
+                   JOIN evidence_references er ON er.id = msa.evidence_reference_id
+                   JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                   JOIN source_observations so ON so.id = er.observation_id
+                   WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1""",
+                (
+                    plan.scope.source_unit_id,
+                    plan.scope.source_unit_id,
+                    memory_id,
+                    plan.scope.source_id,
+                ),
+            ) as cursor:
+                support = await cursor.fetchone()
+            total = int(support["total"] or 0)
+            invalid = int(support["invalid"] or 0)
+            if memory_id in created_ids and total == 0:
+                raise ValueError(
+                    f"projected lifecycle created active Memory without source support: {memory_id}"
+                )
+            if invalid:
+                raise ValueError(
+                    f"projected lifecycle left stale or ambiguous source support: {memory_id}"
+                )
 
     async def _stage_lifecycle_evidence_unlocked(
         self,
@@ -5221,7 +5587,8 @@ class Database:
                 raise ValueError("attach_support mutation requires access_context_hash")
             for reference_id in mutation.evidence_reference_ids:
                 async with self.db.execute(
-                    """SELECT er.role, eu.source_id
+                    """SELECT er.role, eu.source_id, eu.doc_id, eu.source_type,
+                              eu.excerpt, eu.observed_at
                        FROM evidence_references er
                        JOIN evidence_units eu ON eu.id = er.evidence_unit_id
                        WHERE er.id = ?""",
@@ -5251,6 +5618,14 @@ class Database:
                         access_hash,
                         now,
                     ),
+                )
+                await self._corroborate_memory_unlocked(
+                    mutation.memory_id,
+                    str(reference["doc_id"]),
+                    str(reference["source_type"]),
+                    reference["excerpt"],
+                    support_kind="corroborated",
+                    source_updated_at=_parse_dt(mutation.payload.get("source_updated_at")),
                 )
             return
         if mutation_type is LifecycleMutationType.REMOVE_SUPPORT:
@@ -5301,13 +5676,14 @@ class Database:
             cursor = await self.db.execute(
                 """UPDATE memories SET status = 'superseded', superseded_by = ?,
                     valid_until = ?, superseded_at = ?, replacement_reason = ?,
-                    replacement_kind = 'supersession', updated_at = ?
+                    replacement_kind = ?, updated_at = ?
                     WHERE id = ? AND status = 'active'""",
                 (
                     mutation.replacement_memory_id,
                     _today_iso(),
                     now,
                     str(mutation.payload.get("reason") or "authoritative source replacement"),
+                    str(mutation.payload.get("replacement_kind") or "supersession"),
                     now,
                     mutation.memory_id,
                 ),
@@ -5493,11 +5869,31 @@ class Database:
         if lifecycle_plan_id is not None:
             conditions += " AND lvo.lifecycle_plan_id = ?"
             params.append(lifecycle_plan_id)
+        selects = [
+            f"""SELECT lvo.id, lvo.lifecycle_plan_id, lvo.memory_id,
+                       lvo.operation, lvo.status, lvo.attempts, lvo.error,
+                       lvo.created_at, lvo.updated_at
+                  FROM lifecycle_vector_outbox lvo
+                  JOIN lifecycle_plans lp ON lp.id = lvo.lifecycle_plan_id
+                  {conditions}"""
+        ]
+        if lifecycle_plan_id is None:
+            deletion_conditions = "WHERE status IN ('pending', 'failed')"
+            if source_id is not None:
+                deletion_conditions += " AND source_id = ?"
+                params.append(source_id)
+            selects.append(
+                f"""SELECT id, 'source-delete:' || source_id AS lifecycle_plan_id,
+                           memory_id, 'delete' AS operation, status, attempts,
+                           error, created_at, updated_at
+                      FROM source_deletion_vector_outbox
+                      {deletion_conditions}"""
+            )
         params.append(limit)
         rows = await self.db.execute_fetchall(
-            f"""SELECT lvo.* FROM lifecycle_vector_outbox lvo
-                JOIN lifecycle_plans lp ON lp.id = lvo.lifecycle_plan_id
-                {conditions} ORDER BY lvo.created_at, lvo.id LIMIT ?""",
+            "SELECT * FROM (" + " UNION ALL ".join(selects) + ") "
+            "ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, "
+            "CASE status WHEN 'failed' THEN updated_at ELSE created_at END, id LIMIT ?",
             tuple(params),
         )
         return [
@@ -5523,6 +5919,14 @@ class Database:
                 (_now_iso(), task_id),
             )
             if cursor.rowcount != 1:
+                cursor = await self.db.execute(
+                    """UPDATE source_deletion_vector_outbox
+                       SET status = 'completed', attempts = attempts + 1,
+                           error = NULL, updated_at = ?
+                       WHERE id = ? AND status IN ('pending', 'failed')""",
+                    (_now_iso(), task_id),
+                )
+            if cursor.rowcount != 1:
                 raise ValueError("lifecycle vector task is not pending")
             await self.db.commit()
 
@@ -5535,6 +5939,14 @@ class Database:
                    WHERE id = ? AND status IN ('pending', 'failed')""",
                 (error[:4000], _now_iso(), task_id),
             )
+            if cursor.rowcount != 1:
+                cursor = await self.db.execute(
+                    """UPDATE source_deletion_vector_outbox
+                       SET status = 'failed', attempts = attempts + 1,
+                           error = ?, updated_at = ?
+                       WHERE id = ? AND status IN ('pending', 'failed')""",
+                    (error[:4000], _now_iso(), task_id),
+                )
             if cursor.rowcount != 1:
                 raise ValueError("lifecycle vector task is not pending")
             await self.db.commit()
@@ -6462,6 +6874,7 @@ class Database:
             raise ValueError("review and related_review_id are mutually exclusive")
         async with self._write_lock:
             try:
+                await self._assert_legacy_source_write_allowed_unlocked(doc_id)
                 await self._upsert_memory_preserving_created_at_unlocked(mem)
                 await self._add_memory_source_unlocked(
                     mem.id,
@@ -6574,6 +6987,7 @@ class Database:
         observed = _utc_iso(observed_at)
         async with self._write_lock:
             try:
+                await self._assert_legacy_source_write_allowed_unlocked(doc_id)
                 await self._upsert_memory_preserving_created_at_unlocked(mem)
                 await self.db.execute(
                     """INSERT INTO memory_sources (
@@ -6869,10 +7283,15 @@ class Database:
         async with self._write_lock:
             from memforge.models import content_hash
 
-            async with self.db.execute("SELECT confidence, tags FROM memories WHERE id = ?", (memory_id,)) as cursor:
+            async with self.db.execute(
+                "SELECT content_hash, confidence, tags FROM memories WHERE id = ?",
+                (memory_id,),
+            ) as cursor:
                 row = await cursor.fetchone()
             if not row:
                 return
+            if row["content_hash"] != content_hash(new_content):
+                await self._assert_no_active_source_support_unlocked(memory_id)
 
             confidence = new_confidence if new_confidence is not None else row["confidence"]
             tags = new_tags if new_tags is not None else json.loads(row["tags"] or "[]")
@@ -6939,6 +7358,8 @@ class Database:
         allowed_current_statuses: Sequence[str] | None = None,
     ) -> None:
         canonical = normalize_memory_status(status)
+        if canonical != "active":
+            await self._assert_no_active_source_support_unlocked(memory_id)
         now = _now_iso()
         guard_clause = ""
         guard_params: tuple[str, ...] = ()
@@ -7272,6 +7693,7 @@ class Database:
     ) -> None:
         if old_id == new_memory.id:
             raise ValueError("cannot supersede a memory with itself")
+        await self._assert_no_active_source_support_unlocked(old_id)
         replacement_kind = _validate_replacement_kind(replacement_kind)
         _validate_visibility(new_memory.visibility, new_memory.owner_user_id)
         now = _now_iso()
@@ -7295,6 +7717,33 @@ class Database:
             new_memory.id,
             search_visible_statuses=set(allowed_search_statuses()),
         )
+
+    async def _assert_no_active_source_support_unlocked(self, memory_id: str) -> None:
+        async with self.db.execute(
+            """SELECT 1 FROM memory_support_assertions
+               WHERE memory_id = ? AND active = 1 LIMIT 1""",
+            (memory_id,),
+        ) as cursor:
+            if await cursor.fetchone() is not None:
+                raise ValueError(
+                    "direct terminal Memory transition rejected while active source support remains; "
+                    "projected lifecycle required"
+                )
+
+    async def _assert_legacy_source_write_allowed_unlocked(self, doc_id: str) -> None:
+        async with self.db.execute(
+            """SELECT g.state
+               FROM documents d
+               JOIN source_lifecycle_gates g ON g.source_id = d.source
+               WHERE d.doc_id = ?""",
+            (doc_id,),
+        ) as cursor:
+            gate = await cursor.fetchone()
+        if gate is not None and gate["state"] == LifecycleGateState.ENABLED.value:
+            raise ValueError(
+                "direct configured-source Memory write rejected after cutover; "
+                "projected lifecycle required"
+            )
 
     async def supersede_memory_with_source_and_relation(
         self,
@@ -8672,6 +9121,10 @@ class Database:
                    WHERE id = ?""",
                 (total_count, now, memory_id),
             )
+        await self._rebuild_memory_fts_unlocked(
+            memory_id,
+            search_visible_statuses=set(allowed_search_statuses()),
+        )
         return retired
 
     async def _refresh_support_after_source_removal_unlocked(
@@ -10246,6 +10699,30 @@ class Database:
                         (task_id, source_id, artifact_uri),
                     )
 
+                # Agent Knowledge is a source-owned projection. These tables
+                # intentionally predate source foreign keys, so remove the
+                # claim view explicitly before deleting the source row.
+                await self.db.execute(
+                    """DELETE FROM agent_claim_citations
+                       WHERE claim_id IN (
+                           SELECT ac.id FROM agent_claims ac
+                           JOIN agent_concepts c ON c.id = ac.concept_id
+                           WHERE c.source_id = ?
+                       )""",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    """DELETE FROM agent_claims
+                       WHERE concept_id IN (
+                           SELECT id FROM agent_concepts WHERE source_id = ?
+                       )""",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    "DELETE FROM agent_concepts WHERE source_id = ?",
+                    (source_id,),
+                )
+
                 await self._delete_evidence_graph_for_source_id_unlocked(source_id)
                 for doc_id in doc_ids:
                     memory_ids: list[str] = []
@@ -10277,10 +10754,235 @@ class Database:
                 await self.db.execute("DELETE FROM sync_state WHERE source = ?", (source_id,))
                 await self.db.execute("DELETE FROM sync_history WHERE source = ?", (source_id,))
                 await self.db.execute("DELETE FROM source_list_pins WHERE source_id = ?", (source_id,))
+                now = _now_iso()
+                for memory_id in dict.fromkeys(retired_ids):
+                    await self.db.execute(
+                        """INSERT INTO source_deletion_vector_outbox (
+                               id, source_id, memory_id, status, created_at, updated_at
+                           ) VALUES (?, ?, ?, 'pending', ?, ?)""",
+                        (
+                            f"source-delete-vector-{uuid.uuid4().hex}",
+                            source_id,
+                            memory_id,
+                            now,
+                            now,
+                        ),
+                    )
                 await self.db.execute("DELETE FROM sources WHERE id = ?", (source_id,))
                 await self.db.commit()
                 return SourceDeletionResult(
                     retired_memory_ids=tuple(dict.fromkeys(retired_ids)),
+                    retired_search_cleanup_required=True,
+                )
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def rebaseline_source_lifecycle(self, source_id: str) -> SourceLifecycleResetResult:
+        """Reset derived source lifecycle while preserving source identity and content.
+
+        This is an explicit recovery operation for replayable sources. It keeps
+        configuration, access, subscriptions, documents, artifacts, and finding
+        history; removes derived Memory support and Source Projection state;
+        retires memories left unsupported; and closes the destructive gate until
+        a complete replay succeeds.
+        """
+
+        async with self._write_lock:
+            try:
+                await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (source_id,),
+                )
+                async with self.db.execute(
+                    "SELECT type FROM sources WHERE id = ?",
+                    (source_id,),
+                ) as cursor:
+                    source = await cursor.fetchone()
+                if source is None:
+                    raise LookupError(f"source {source_id!r} not found")
+                if str(source["type"]) == "agent_session":
+                    raise ValueError(
+                        "agent_session requires managed claim lineage repair, not source rebaseline"
+                    )
+                doc_ids: list[str] = []
+                async with self.db.execute(
+                    "SELECT doc_id FROM documents WHERE source = ?",
+                    (source_id,),
+                ) as cursor:
+                    doc_ids = [str(row[0]) async for row in cursor]
+                memory_ids: set[str] = set()
+                async with self.db.execute(
+                    "SELECT DISTINCT memory_id FROM memory_sources WHERE source_id = ?",
+                    (source_id,),
+                ) as cursor:
+                    async for row in cursor:
+                        memory_ids.add(str(row[0]))
+                async with self.db.execute(
+                    "SELECT DISTINCT memory_id FROM memory_support_assertions WHERE source_id = ?",
+                    (source_id,),
+                ) as cursor:
+                    async for row in cursor:
+                        memory_ids.add(str(row[0]))
+
+                now = _now_iso()
+                async with self.db.execute(
+                    """SELECT id, mapping_attempt_json
+                       FROM lifecycle_cutover_findings
+                       WHERE source_id = ? AND status = 'open'""",
+                    (source_id,),
+                ) as cursor:
+                    open_findings = [dict(row) async for row in cursor]
+                for finding in open_findings:
+                    attempt = json.loads(finding["mapping_attempt_json"] or "{}")
+                    attempt["resolution"] = "source_rebaseline"
+                    attempt["resolved_at"] = now
+                    await self.db.execute(
+                        """UPDATE lifecycle_cutover_findings
+                           SET status = 'resolved', mapping_attempt_json = ?,
+                               updated_at = ?, resolved_at = ?
+                           WHERE id = ?""",
+                        (json.dumps(attempt, sort_keys=True), now, now, finding["id"]),
+                    )
+
+                # Preserve prior source-rebaseline cleanup plans and their
+                # outbox tasks.  Chroma is external to SQLite, so a failed
+                # vector delete must remain retryable even when an operator
+                # starts the rebaseline again.
+                await self.db.execute(
+                    """DELETE FROM lifecycle_vector_outbox
+                       WHERE lifecycle_plan_id IN (
+                           SELECT id FROM lifecycle_plans
+                           WHERE source_id = ?
+                             AND reconciliation_scope_id <> 'source_rebaseline_cleanup'
+                       )""",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    """DELETE FROM lifecycle_reviews
+                       WHERE lifecycle_plan_id IN (
+                           SELECT id FROM lifecycle_plans WHERE source_id = ?
+                       )""",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    """DELETE FROM lifecycle_plans
+                       WHERE source_id = ?
+                         AND reconciliation_scope_id <> 'source_rebaseline_cleanup'""",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    "DELETE FROM memory_support_assertions WHERE source_id = ?",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    """DELETE FROM evidence_references
+                       WHERE evidence_unit_id IN (
+                           SELECT id FROM evidence_units WHERE source_id = ?
+                       )""",
+                    (source_id,),
+                )
+                await self._delete_evidence_graph_for_source_id_unlocked(source_id)
+                await self.db.execute(
+                    """DELETE FROM source_projection_relations
+                       WHERE projection_run_id IN (
+                           SELECT id FROM source_projection_runs WHERE source_id = ?
+                       )""",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    """DELETE FROM source_revision_deltas
+                       WHERE projection_run_id IN (
+                           SELECT id FROM source_projection_runs WHERE source_id = ?
+                       )""",
+                    (source_id,),
+                )
+                await self.db.execute("DELETE FROM source_projection_runs WHERE source_id = ?", (source_id,))
+                await self.db.execute(
+                    """DELETE FROM source_observation_revisions
+                       WHERE observation_id IN (
+                           SELECT id FROM source_observations WHERE source_id = ?
+                       )""",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    """DELETE FROM source_unit_revisions
+                       WHERE source_unit_id IN (
+                           SELECT id FROM source_units WHERE source_id = ?
+                       )""",
+                    (source_id,),
+                )
+                await self.db.execute("DELETE FROM source_observations WHERE source_id = ?", (source_id,))
+                await self.db.execute(
+                    "DELETE FROM source_unit_document_lineage_history WHERE source_id = ?",
+                    (source_id,),
+                )
+                await self.db.execute("DELETE FROM source_units WHERE source_id = ?", (source_id,))
+                await self.db.execute("DELETE FROM projection_scope_transitions WHERE source_id = ?", (source_id,))
+                await self.db.execute("DELETE FROM memory_sources WHERE source_id = ?", (source_id,))
+                for doc_id in doc_ids:
+                    await self.db.execute("DELETE FROM memory_search_metadata_fts WHERE doc_id = ?", (doc_id,))
+                    await self.db.execute("DELETE FROM memory_search_metadata_alias_fts WHERE doc_id = ?", (doc_id,))
+                    await self.db.execute("DELETE FROM memory_search_metadata_trigram WHERE doc_id = ?", (doc_id,))
+
+                retired_ids = await self._refresh_support_after_source_removal_unlocked(
+                    list(memory_ids),
+                    retire_reason="source_rebaseline",
+                )
+                if retired_ids:
+                    cleanup_plan_id = f"source-rebaseline-cleanup-{uuid.uuid4().hex}"
+                    cleanup_payload = {
+                        "operation": "source_rebaseline_vector_cleanup",
+                        "source_id": source_id,
+                        "retired_memory_ids": sorted(retired_ids),
+                    }
+                    cleanup_payload_json = json.dumps(cleanup_payload, sort_keys=True)
+                    await self.db.execute(
+                        """INSERT INTO lifecycle_plans (
+                               id, reconciliation_scope_id, source_id, source_unit_id,
+                               target_unit_revision_id, status, payload_json, payload_hash,
+                               created_at, applied_at, error
+                           ) VALUES (?, 'source_rebaseline_cleanup', ?, ?, NULL,
+                                     'applied', ?, ?, ?, ?, NULL)""",
+                        (
+                            cleanup_plan_id,
+                            source_id,
+                            f"source-rebaseline:{source_id}",
+                            cleanup_payload_json,
+                            hashlib.sha256(cleanup_payload_json.encode("utf-8")).hexdigest(),
+                            now,
+                            now,
+                        ),
+                    )
+                    for memory_id in retired_ids:
+                        await self._enqueue_lifecycle_vector_task_unlocked(
+                            cleanup_plan_id,
+                            memory_id,
+                            LifecycleVectorOperation.DELETE,
+                            now=now,
+                        )
+                await self.db.execute("DELETE FROM sync_state WHERE source = ?", (source_id,))
+                await self.db.execute(
+                    """INSERT INTO source_lifecycle_gates (
+                           source_id, state, reason, audited_at, enabled_at, updated_at
+                       ) VALUES (?, 'gated', ?, ?, NULL, ?)
+                       ON CONFLICT(source_id) DO UPDATE SET
+                           state='gated', reason=excluded.reason,
+                           audited_at=excluded.audited_at, updated_at=excluded.updated_at""",
+                    (
+                        source_id,
+                        "source rebaseline requires a complete successful replay",
+                        now,
+                        now,
+                    ),
+                )
+                await self.db.execute(
+                    "UPDATE sources SET last_sync = NULL WHERE id = ?",
+                    (source_id,),
+                )
+                await self.db.commit()
+                return SourceLifecycleResetResult(
+                    retired_memory_ids=tuple(sorted(retired_ids)),
                     retired_search_cleanup_required=True,
                 )
             except Exception:

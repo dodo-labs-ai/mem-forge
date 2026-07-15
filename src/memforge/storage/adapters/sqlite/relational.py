@@ -17,7 +17,12 @@ from typing import Any, Mapping, Sequence
 import aiosqlite
 
 from memforge.memory.audit import MemoryAuditLogger
-from memforge.memory.evidence import EvidenceReference, MemorySupportAssertion
+from memforge.memory.evidence import (
+    ActiveSupportEvidence,
+    EvidenceReference,
+    MemorySupportAssertion,
+    RelationOutcomeBundle,
+)
 from memforge.memory.lifecycle_plan import (
     LegacyMemoryProvenance,
     LifecycleCutoverFinding,
@@ -36,6 +41,7 @@ from memforge.models import (
     Memory,
     MemorySource,
     Project,
+    SourceLifecycleResetResult,
     Visibility,
     canonicalize_entity_name,
 )
@@ -347,14 +353,25 @@ class SqliteRelationalStore:
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]:
         return await self._db.get_memory_sources(memory_id)
 
-    async def upsert_document(self, doc: DocumentRecord) -> None:
-        await self._db.upsert_document(doc)
+    async def upsert_document(
+        self,
+        doc: DocumentRecord,
+        *,
+        require_configured_source: bool = False,
+    ) -> None:
+        await self._db.upsert_document(
+            doc,
+            require_configured_source=require_configured_source,
+        )
 
     async def get_document(self, doc_id: str) -> DocumentRecord | None:
         return await self._db.get_document(doc_id)
 
     async def delete_projected_document(self, doc_id: str) -> None:
         await self._db.delete_projected_document(doc_id)
+
+    async def rebaseline_source_lifecycle(self, source_id: str) -> SourceLifecycleResetResult:
+        return await self._db.rebaseline_source_lifecycle(source_id)
 
     async def rebind_projected_document_support(
         self,
@@ -411,8 +428,14 @@ class SqliteRelationalStore:
         self,
         source_id: str,
         document_id: str,
+        *,
+        current_only: bool = False,
     ) -> SourceUnit | None:
-        return await self._db.find_source_unit_by_document_id(source_id, document_id)
+        return await self._db.find_source_unit_by_document_id(
+            source_id,
+            document_id,
+            current_only=current_only,
+        )
 
     async def list_source_unit_document_ids(
         self,
@@ -524,6 +547,17 @@ class SqliteRelationalStore:
     async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]:
         return await self._db.get_active_memory_support_reference_ids(memory_id)
 
+    async def get_active_memory_support_evidence(
+        self,
+        memory_id: str,
+        *,
+        source_id: str | None = None,
+    ) -> tuple[ActiveSupportEvidence, ...]:
+        return await self._db.get_active_memory_support_evidence(
+            memory_id,
+            source_id=source_id,
+        )
+
     async def get_source_unit_support_reference_ids(
         self,
         source_unit_id: str,
@@ -536,6 +570,43 @@ class SqliteRelationalStore:
         plan: LifecyclePlan,
     ) -> None:
         await self._db.apply_source_projection_lifecycle(projection, plan)
+
+    async def apply_agent_claim_source_projection_lifecycle(
+        self,
+        projection: SourceProjection,
+        plan: LifecyclePlan,
+        *,
+        memory_id: str,
+        relation_outcome: RelationOutcomeBundle | None,
+        claim_id: str,
+        concept_id: str,
+        display_anchor: str,
+        claim_text: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        observed_at: datetime,
+        citations: list[str] | None = None,
+        concept_projection: Mapping[str, object] | None = None,
+        concept_markdown_body: str | None = None,
+    ) -> None:
+        await self._db.apply_agent_claim_source_projection_lifecycle(
+            projection,
+            plan,
+            memory_id=memory_id,
+            relation_outcome=relation_outcome,
+            claim_id=claim_id,
+            concept_id=concept_id,
+            display_anchor=display_anchor,
+            claim_text=claim_text,
+            memory_type=memory_type,
+            tags=tags,
+            confidence=confidence,
+            observed_at=observed_at,
+            citations=citations,
+            concept_projection=dict(concept_projection) if concept_projection is not None else None,
+            concept_markdown_body=concept_markdown_body,
+        )
 
     async def apply_lifecycle_plan(self, plan: LifecyclePlan) -> None:
         await self._db.apply_lifecycle_plan(plan)

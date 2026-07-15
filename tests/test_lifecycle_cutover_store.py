@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
@@ -20,6 +21,7 @@ from memforge.memory.lifecycle_plan import (
     CutoverFindingReason,
     CutoverFindingStatus,
     LifecycleCutoverFinding,
+    LifecycleBackfillJob,
     LifecycleGateState,
     LifecycleBackfillJobStatus,
     IncumbentDecision,
@@ -315,9 +317,25 @@ async def test_lifecycle_plan_applies_support_removal_and_retirement_atomically(
     reference = await _persist_support_lineage(db)
     await db.enable_lifecycle_gate("src-1")
     plan = _retirement_plan(reference, await db.get_memory_support_set_hash("mem-legacy"))
+    other = Database(db.db_path)
+    await other.connect()
 
-    await db.apply_lifecycle_plan(plan)
-    await db.apply_lifecycle_plan(plan)
+    try:
+        await db.apply_lifecycle_plan(plan)
+        await db.apply_lifecycle_plan(plan)
+        await asyncio.wait_for(
+            other.upsert_source(
+                id="src-after-plan-retry",
+                type="confluence",
+                name="Writer lock probe",
+                config_json="{}",
+                access_policy="workspace",
+                owner_user_id="owner-1",
+            ),
+            timeout=1,
+        )
+    finally:
+        await other.close()
 
     memory = await db.get_memory("mem-legacy")
     assert memory is not None and memory.status == "retired"
@@ -388,6 +406,40 @@ async def test_gated_review_approval_applies_proposal_and_resolves_review_atomic
     assert {(task.memory_id, task.operation.value) for task in tasks} == {
         (incumbent.id, "delete")
     }
+
+
+@pytest.mark.asyncio
+async def test_failed_vector_tasks_rotate_without_starving_new_pending_cleanup(
+    db: Database,
+) -> None:
+    for index in range(3):
+        await db.db.execute(
+            """INSERT INTO source_deletion_vector_outbox (
+                   id, source_id, memory_id, status, attempts, error,
+                   created_at, updated_at
+               ) VALUES (?, 'src-1', ?, 'failed', 1, 'poison', ?, ?)""",
+            (
+                f"failed-{index}",
+                f"mem-failed-{index}",
+                f"2026-07-15T00:00:0{index}Z",
+                f"2026-07-15T00:00:0{index}Z",
+            ),
+        )
+    await db.db.execute(
+        """INSERT INTO source_deletion_vector_outbox (
+               id, source_id, memory_id, status, created_at, updated_at
+           ) VALUES ('pending-new', 'src-1', 'mem-pending', 'pending',
+                     '2026-07-15T01:00:00Z', '2026-07-15T01:00:00Z')"""
+    )
+    await db.db.commit()
+
+    first = await db.list_lifecycle_vector_tasks(source_id="src-1", limit=2)
+    assert [task.id for task in first] == ["pending-new", "failed-0"]
+    await db.complete_lifecycle_vector_task("pending-new")
+    await db.fail_lifecycle_vector_task("failed-0", "still poison")
+
+    [next_retry] = await db.list_lifecycle_vector_tasks(source_id="src-1", limit=1)
+    assert next_retry.id == "failed-1"
 
 
 @pytest.mark.asyncio
@@ -1058,6 +1110,28 @@ async def test_backfill_job_records_completed_counts_and_is_idempotent(db: Datab
     assert completed.status is LifecycleBackfillJobStatus.COMPLETED
     assert retried == completed
     assert await db.list_lifecycle_backfill_jobs("src-1") == [completed]
+
+
+@pytest.mark.asyncio
+async def test_source_allows_only_one_active_lifecycle_job(db: Database) -> None:
+    first = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="source-rebaseline-first",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+
+    with pytest.raises(ValueError, match="source lifecycle job already active"):
+        await db.create_lifecycle_backfill_job(
+            LifecycleBackfillJob(
+                id="source-rebaseline-second",
+                source_id="src-1",
+                status=LifecycleBackfillJobStatus.QUEUED,
+            )
+        )
+
+    assert await db.create_lifecycle_backfill_job(first) == first
 
 
 @pytest.mark.asyncio

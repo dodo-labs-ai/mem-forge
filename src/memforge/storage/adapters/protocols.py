@@ -18,8 +18,14 @@ from memforge.models import (
     Memory,
     MemorySource,
     Project,
+    SourceLifecycleResetResult,
 )
-from memforge.memory.evidence import EvidenceReference, MemorySupportAssertion
+from memforge.memory.evidence import (
+    ActiveSupportEvidence,
+    EvidenceReference,
+    MemorySupportAssertion,
+    RelationOutcomeBundle,
+)
 from memforge.memory.lifecycle_plan import (
     LegacyMemoryProvenance,
     LifecycleCutoverFinding,
@@ -129,9 +135,15 @@ class RelationalStore(Protocol):
     async def insert_memory(self, memory: Memory) -> str: ...
     async def get_memory(self, memory_id: str) -> Memory | None: ...
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]: ...
-    async def upsert_document(self, doc: DocumentRecord) -> None: ...
+    async def upsert_document(
+        self,
+        doc: DocumentRecord,
+        *,
+        require_configured_source: bool = False,
+    ) -> None: ...
     async def get_document(self, doc_id: str) -> DocumentRecord | None: ...
     async def delete_projected_document(self, doc_id: str) -> None: ...
+    async def rebaseline_source_lifecycle(self, source_id: str) -> SourceLifecycleResetResult: ...
     async def rebind_projected_document_support(
         self,
         old_doc_id: str,
@@ -151,6 +163,8 @@ class RelationalStore(Protocol):
         self,
         source_id: str,
         document_id: str,
+        *,
+        current_only: bool = False,
     ) -> SourceUnit | None: ...
     async def list_source_unit_document_ids(
         self,
@@ -253,6 +267,12 @@ class RelationalStore(Protocol):
     async def upsert_memory_support_assertion(self, assertion: MemorySupportAssertion) -> None: ...
     async def get_memory_support_set_hash(self, memory_id: str) -> str: ...
     async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]: ...
+    async def get_active_memory_support_evidence(
+        self,
+        memory_id: str,
+        *,
+        source_id: str | None = None,
+    ) -> tuple[ActiveSupportEvidence, ...]: ...
     async def get_source_unit_support_reference_ids(
         self,
         source_unit_id: str,
@@ -261,6 +281,25 @@ class RelationalStore(Protocol):
         self,
         projection: SourceProjection,
         plan: LifecyclePlan,
+    ) -> None: ...
+    async def apply_agent_claim_source_projection_lifecycle(
+        self,
+        projection: SourceProjection,
+        plan: LifecyclePlan,
+        *,
+        memory_id: str,
+        relation_outcome: RelationOutcomeBundle | None,
+        claim_id: str,
+        concept_id: str,
+        display_anchor: str,
+        claim_text: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        observed_at: datetime,
+        citations: list[str] | None = None,
+        concept_projection: Mapping[str, object] | None = None,
+        concept_markdown_body: str | None = None,
     ) -> None: ...
     async def apply_lifecycle_plan(self, plan: LifecyclePlan) -> None: ...
     async def get_lifecycle_plan_payload(

@@ -8,6 +8,7 @@ scope, access context, staged evidence, lifecycle plan, and outbox work from one
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date, datetime, timezone
 from hashlib import sha256
@@ -17,6 +18,7 @@ from memforge.memory.entity_resolver import EntityResolver, insert_llm_alias, re
 from memforge.memory.evidence import (
     AuthorityCase,
     EvidenceContentProvenance,
+    EvidenceRole,
     EvidenceRelationRecord,
     EvidenceUnit,
     LifecycleAction,
@@ -28,7 +30,12 @@ from memforge.memory.evidence import (
     relation_run_id_for,
 )
 from memforge.memory.lifecycle_plan import ReconciliationScope
-from memforge.memory.lifecycle_planner import NewMemoryDefaults, build_lifecycle_plan
+from memforge.memory.lifecycle_planner import (
+    NewMemoryDefaults,
+    build_lifecycle_plan,
+    lifecycle_access_context_hash,
+    lifecycle_plan_id,
+)
 from memforge.memory.quality import classify_memory_candidate
 from memforge.source_access import memory_visibility_for_document
 from memforge.models import (
@@ -53,37 +60,24 @@ logger = logging.getLogger(__name__)
 __all__ = ["MemoryEngine"]
 
 
-def _lifecycle_access_context_hash(
-    *,
-    visibility: str,
-    owner_user_id: str | None,
-    project_key: str | None,
-    repo_identifier: str | None,
-) -> str:
-    return sha256(
-        "\x1f".join(
-            (
-                visibility,
-                owner_user_id or "",
-                project_key or "",
-                repo_identifier or "",
-            )
-        ).encode("utf-8")
-    ).hexdigest()
+MEMORY_EQUIVALENCE_PROMPT = """Decide whether two durable Memory claims have exactly the same truth conditions.
+Equivalent wording, language, or abbreviation is allowed. Return equivalent=false if either claim contradicts,
+narrows, broadens, conditions, updates, or adds any material fact relative to the other.
 
+<candidate_pair>
+{pair_json}
+</candidate_pair>
+"""
 
-def _lifecycle_plan_id(scope: ReconciliationScope) -> str:
-    digest = sha256(
-        "\x1f".join(
-            (
-                scope.id,
-                scope.source_id,
-                scope.source_unit_id,
-                scope.target_unit_revision_id or "",
-            )
-        ).encode("utf-8")
-    ).hexdigest()[:20]
-    return f"lplan-{digest}"
+MEMORY_SUPPORT_VALIDATION_PROMPT = """Determine whether the current evidence still supports the exact Memory claim.
+Return supported=true only when the claim's truth conditions remain entailed by the current
+Primary and every current Required observation. A change in scope, subject, condition,
+polarity, or applicability means supported=false.
+
+<case_json>
+{case_json}
+</case_json>
+"""
 
 
 class MemoryEngine:
@@ -377,6 +371,224 @@ class MemoryEngine:
                 incumbents_by_id.setdefault(memory.id, memory)
         return [incumbents_by_id[key] for key in sorted(incumbents_by_id)], unit_support
 
+    async def _rebind_noop_evidence_to_current_revision(
+        self,
+        *,
+        operations: tuple[ReconcileOperation, ...],
+        incumbents: dict[str, Memory],
+        projection: SourceProjection,
+    ) -> tuple[ReconcileOperation, ...]:
+        """Carry an exact, still-present claim forward without re-extracting it.
+
+        Incremental extraction intentionally sees only changed ranges. A NOOP
+        for an incumbent therefore may not contain a new candidate. If its
+        supporting Observation was revised, prove the old exact excerpt still
+        exists in that same stable Observation and stage a current-revision
+        reference. Missing or ambiguous evidence fails closed.
+        """
+
+        current_revisions = {
+            revision.observation_id: revision
+            for revision in projection.observation_revisions
+        }
+        rebound: list[ReconcileOperation] = []
+        for operation in operations:
+            if (
+                operation.action is not ReconcileAction.NOOP
+                or operation.memory_id is None
+                or operation.memory is not None
+            ):
+                rebound.append(operation)
+                continue
+            support = await self.db.get_active_memory_support_evidence(
+                operation.memory_id,
+                source_id=projection.source_id,
+            )
+            stale = [
+                item
+                for item in support
+                if item.anchor.observation_id in current_revisions
+                and current_revisions[item.anchor.observation_id].id
+                != item.anchor.observation_revision_id
+            ]
+            if not stale:
+                rebound.append(operation)
+                continue
+            missing_dependencies = [
+                item
+                for item in support
+                if item.anchor.observation_id not in current_revisions
+            ]
+            if missing_dependencies and projection.coverage.proves_absence:
+                raise RuntimeError(
+                    "NOOP incumbent has a removed evidence dependency: "
+                    f"{operation.memory_id}"
+                )
+            primary = [
+                item
+                for item in support
+                if item.role is EvidenceRole.PRIMARY
+            ]
+            if len(primary) != 1:
+                raise RuntimeError(
+                    "NOOP incumbent lacks exactly one PRIMARY dependency: "
+                    f"{operation.memory_id}"
+                )
+            selected = primary[0]
+            if (
+                selected in stale
+                and (
+                    not selected.excerpt
+                    or selected.excerpt
+                    not in current_revisions[selected.anchor.observation_id].content
+                )
+            ):
+                raise RuntimeError(
+                    "NOOP incumbent lacks exact current-revision PRIMARY evidence: "
+                    f"{operation.memory_id}"
+                )
+            required_observation_ids = sorted(
+                {
+                    item.anchor.observation_id
+                    for item in support
+                    if item.role is EvidenceRole.REQUIRED
+                }
+            )
+            incumbent = incumbents[operation.memory_id]
+            stale_required = [
+                item for item in stale if item.role is EvidenceRole.REQUIRED
+            ]
+            support_validation: dict[str, object] = {}
+            if stale_required:
+                validator = getattr(
+                    self.structured_llm_client,
+                    "validate_memory_support",
+                    None,
+                )
+                if validator is None:
+                    raise RuntimeError(
+                        "revised REQUIRED evidence needs structured semantic validation: "
+                        f"{operation.memory_id}"
+                    )
+                validation = await validator(
+                    MEMORY_SUPPORT_VALIDATION_PROMPT.format(
+                        case_json=json.dumps(
+                            {
+                                "memory_claim": incumbent.content,
+                                "primary": current_revisions[
+                                    selected.anchor.observation_id
+                                ].content,
+                                "required": [
+                                    current_revisions[item.anchor.observation_id].content
+                                    for item in stale_required
+                                ],
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                    ),
+                    max_tokens=512,
+                    model=self.llm_model,
+                )
+                support_validation = {
+                    "method": "structured_classifier",
+                    "model": self.llm_model,
+                    "supported": bool(validation.supported),
+                    "reason": validation.reason,
+                    "required_observation_ids": sorted(
+                        item.anchor.observation_id for item in stale_required
+                    ),
+                }
+                if not validation.supported:
+                    rebound.append(
+                        ReconcileOperation(
+                            action=ReconcileAction.DELETE,
+                            memory_id=operation.memory_id,
+                            reason=(
+                                "revised REQUIRED evidence no longer validates claim: "
+                                f"{validation.reason}"
+                            ),
+                            flag_for_review=True,
+                        )
+                    )
+                    continue
+            rebound.append(
+                ReconcileOperation(
+                    action=operation.action,
+                    memory_id=operation.memory_id,
+                    memory=RawMemory(
+                        content=incumbent.content,
+                        memory_type=incumbent.memory_type,
+                        confidence=incumbent.confidence,
+                        tags=list(incumbent.tags),
+                        extraction_context=selected.excerpt,
+                        evidence_quote=selected.excerpt,
+                        evidence_anchor="revalidated_noop",
+                        source_observation_id=selected.anchor.observation_id,
+                        required_source_observation_ids=required_observation_ids,
+                        support_validation=support_validation,
+                    ),
+                    reason=operation.reason,
+                    flag_for_review=operation.flag_for_review,
+                )
+            )
+        return tuple(rebound)
+
+    async def _claims_semantically_equivalent(
+        self,
+        candidate: Memory,
+        incumbent: Memory,
+    ) -> dict[str, object] | None:
+        """Return an auditable semantic proof for cross-source identity reuse."""
+
+        if (
+            candidate.content_hash == incumbent.content_hash
+            and candidate.content.strip() == incumbent.content.strip()
+        ):
+            return {
+                "method": "exact_content",
+                "candidate_content_hash": candidate.content_hash,
+                "incumbent_content_hash": incumbent.content_hash,
+            }
+        classifier = getattr(
+            self.structured_llm_client,
+            "classify_memory_equivalence",
+            None,
+        )
+        if classifier is None:
+            return None
+        prompt = MEMORY_EQUIVALENCE_PROMPT.format(
+            pair_json=json.dumps(
+                {
+                    "candidate": candidate.content,
+                    "incumbent": incumbent.content,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        try:
+            result = await classifier(
+                prompt,
+                max_tokens=512,
+                model=self.llm_model,
+            )
+        except Exception:
+            logger.warning(
+                "Semantic Memory equivalence classification failed; preserving separate identities",
+                exc_info=True,
+            )
+            return None
+        if not result.equivalent:
+            return None
+        return {
+            "method": "structured_classifier",
+            "model": self.llm_model or "default",
+            "reason": result.reason,
+            "candidate_content_hash": candidate.content_hash,
+            "incumbent_content_hash": incumbent.content_hash,
+        }
+
     async def apply_projected_lifecycle(
         self,
         *,
@@ -416,6 +628,7 @@ class MemoryEngine:
 
         stats = {
             "added": 0,
+            "corroborated": 0,
             "updated": 0,
             "superseded": 0,
             "deleted": 0,
@@ -466,6 +679,11 @@ class MemoryEngine:
                     f"{quality.skip_reason or 'quality_rejected'}"
                 )
         incumbents_by_id = {memory.id: memory for memory in incumbents}
+        operations = await self._rebind_noop_evidence_to_current_revision(
+            operations=operations,
+            incumbents=incumbents_by_id,
+            projection=projection,
+        )
         gate = await self.db.get_lifecycle_gate(scope.source_id)
         all_support = {
             memory_id: await self.db.get_active_memory_support_reference_ids(memory_id)
@@ -478,15 +696,73 @@ class MemoryEngine:
         visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
         if visibility == "private" and user_id is not None and user_id != owner_user_id:
             raise PermissionError("private projected lifecycle actor does not own the document")
-        access_context_hash = _lifecycle_access_context_hash(
+        access_context_hash = lifecycle_access_context_hash(
             visibility=visibility,
             owner_user_id=owner_user_id,
             project_key=project_key,
             repo_identifier=repo_identifier,
         )
+        corroboration_targets: dict[str, Memory] = {}
+        corroboration_proofs: dict[str, dict[str, object]] = {}
+        candidate_finder = getattr(
+            self.memory_store,
+            "find_access_compatible_equivalence_candidates",
+            None,
+        )
+        if candidate_finder is not None:
+            for operation in operations:
+                if operation.action is not ReconcileAction.ADD or operation.memory is None:
+                    continue
+                candidate = self._build_memory(
+                    operation.memory,
+                    project_key,
+                    visibility=visibility,
+                    owner_user_id=owner_user_id,
+                    repo_identifier=repo_identifier,
+                )
+                targets = await candidate_finder(
+                    candidate,
+                    excluded_memory_ids=frozenset(incumbents_by_id),
+                    excluded_source_id=scope.source_id,
+                )
+                target = None
+                for possible_target in targets:
+                    if lifecycle_access_context_hash(
+                        visibility=possible_target.visibility,
+                        owner_user_id=possible_target.owner_user_id,
+                        project_key=possible_target.project_key,
+                        repo_identifier=possible_target.repo_identifier,
+                    ) != lifecycle_access_context_hash(
+                        visibility=candidate.visibility,
+                        owner_user_id=candidate.owner_user_id,
+                        project_key=candidate.project_key,
+                        repo_identifier=candidate.repo_identifier,
+                    ):
+                        continue
+                    equivalence_proof = await self._claims_semantically_equivalent(
+                        candidate,
+                        possible_target,
+                    )
+                    if equivalence_proof is not None:
+                        target = possible_target
+                        break
+                if target is None:
+                    continue
+                claim_hash = content_hash(operation.memory.content.strip())
+                corroboration_targets[claim_hash] = target
+                corroboration_proofs[claim_hash] = equivalence_proof
+                all_support[target.id] = await self.db.get_active_memory_support_reference_ids(
+                    target.id
+                )
+                support_hashes[target.id] = await self.db.get_memory_support_set_hash(target.id)
+        evidence_memories = [
+            operation.memory
+            for operation in operations
+            if operation.memory is not None
+        ]
         projected_evidence = build_projected_claim_evidence(
             projection=projection,
-            raw_memories=filtered_memories,
+            raw_memories=evidence_memories,
             doc_id=doc_id,
             source_type=source_type,
             project_key=project_key,
@@ -499,7 +775,7 @@ class MemoryEngine:
                 source_updated_at.isoformat() if source_updated_at is not None else None
             ),
         )
-        plan_id = _lifecycle_plan_id(scope)
+        plan_id = lifecycle_plan_id(scope)
         plan = build_lifecycle_plan(
             plan_id=plan_id,
             scope=scope,
@@ -514,6 +790,8 @@ class MemoryEngine:
             evidence_reference_ids_by_claim_hash=(
                 projected_evidence.reference_ids_by_claim_hash
             ),
+            corroboration_targets_by_claim_hash=corroboration_targets,
+            corroboration_proofs_by_claim_hash=corroboration_proofs,
             defaults=NewMemoryDefaults(
                 visibility=visibility,
                 owner_user_id=owner_user_id,
@@ -561,6 +839,15 @@ class MemoryEngine:
                 stats["deleted"] += 1
             elif mutation.mutation_type.value == "create_review":
                 stats["pending_review"] += 1
+        stats["corroborated"] = len(
+            {
+                mutation.memory_id
+                for mutation in plan.mutations
+                if mutation.mutation_type.value == "attach_support"
+                and mutation.memory_id
+                in {target.id for target in corroboration_targets.values()}
+            }
+        )
         stats["noop"] = sum(
             decision.disposition.value == "keep"
             for decision in plan.coverage_proof.incumbent_decisions
@@ -617,7 +904,7 @@ class MemoryEngine:
         }
         visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
         plan = build_lifecycle_plan(
-            plan_id=_lifecycle_plan_id(scope),
+            plan_id=lifecycle_plan_id(scope),
             scope=scope,
             gate_state=gate.state,
             operations=operations,
@@ -634,7 +921,7 @@ class MemoryEngine:
                 repo_identifier=None,
                 doc_id=doc_id,
                 source_type=source_type,
-                access_context_hash=_lifecycle_access_context_hash(
+                access_context_hash=lifecycle_access_context_hash(
                     visibility=visibility,
                     owner_user_id=owner_user_id,
                     project_key=None,

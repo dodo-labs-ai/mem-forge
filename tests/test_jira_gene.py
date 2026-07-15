@@ -345,7 +345,7 @@ async def test_discover_hydrates_search_result_so_fetch_uses_no_per_issue_reques
                                     "total": 1,
                                 },
                             },
-                            "changelog": {"histories": []},
+                            "changelog": {"histories": [], "total": 3},
                         }
                     ],
                 }
@@ -369,7 +369,9 @@ async def test_discover_hydrates_search_result_so_fetch_uses_no_per_issue_reques
     assert search_body["expand"] == ["changelog", "renderedFields"]
     assert isinstance(search_body["fields"], list)
     assert "_search_issue" not in items[0].extra
-    assert json.loads(raw.body)["_comments"][0]["body"] == "Keep the low-request path."
+    raw_payload = json.loads(raw.body)
+    assert raw_payload["_comments"][0]["body"] == "Keep the low-request path."
+    assert raw_payload["_changelog_truncated"] == {"returned": 0, "total": 3}
     assert "Design context" in normalized.markdown_body
     assert "Keep the low-request path." in normalized.markdown_body
 

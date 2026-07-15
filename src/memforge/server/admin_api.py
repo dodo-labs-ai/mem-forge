@@ -918,6 +918,10 @@ class SourceSyncRequest(BaseModel):
     local_agent_attempt_count: int | None = Field(default=None, ge=1)
 
 
+class SourceRebaselineRequest(BaseModel):
+    confirm_source_id: str = Field(min_length=1)
+
+
 class LifecycleFindingRepairRequest(BaseModel):
     observation_id: str = Field(min_length=1)
     evidence_quote: str | None = Field(default=None, min_length=1)
@@ -3015,21 +3019,45 @@ def create_admin_app(
 
         if req.content is not None or req.confidence is not None:
             memory_store = await _build_memory_store(db, config, runtime_provider)
-            await memory_store.update_memory(
-                memory_id,
-                new_content=req.content or memory.content,
-                new_confidence=req.confidence,
-                new_tags=memory.tags,
-            )
+            try:
+                await memory_store.update_memory(
+                    memory_id,
+                    new_content=req.content or memory.content,
+                    new_confidence=req.confidence,
+                    new_tags=memory.tags,
+                )
+            except ValueError as exc:
+                if "active source support" in str(exc):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="source_backed_memory_requires_lifecycle_review",
+                    ) from exc
+                raise
         if req.status is not None:
             if req.status not in ("active", "superseded", "retired", "decayed", "pending_review"):
                 raise HTTPException(status_code=400, detail=f"Invalid status: {req.status}")
             status = normalize_memory_status(req.status)
             memory_store = await _build_memory_store(db, config, runtime_provider)
             if status == "retired":
-                await memory_store.retire_memory(memory_id, reason="admin_hidden")
+                try:
+                    await memory_store.retire_memory(memory_id, reason="admin_hidden")
+                except ValueError as exc:
+                    if "active source support" in str(exc):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="source_backed_memory_requires_lifecycle_review",
+                        ) from exc
+                    raise
             elif status == "pending_review":
-                await memory_store.mark_pending_review(memory_id, reason="admin_hidden")
+                try:
+                    await memory_store.mark_pending_review(memory_id, reason="admin_hidden")
+                except ValueError as exc:
+                    if "active source support" in str(exc):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="source_backed_memory_requires_lifecycle_review",
+                        ) from exc
+                    raise
             elif status == "active":
                 if memory.status != "active":
                     raise HTTPException(
@@ -3154,7 +3182,15 @@ def create_admin_app(
         if not memory:
             raise HTTPException(status_code=404, detail="Memory not found")
         memory_store = await _build_memory_store(db, config, runtime_provider)
-        await memory_store.retire_memory(memory_id, reason="admin_hidden")
+        try:
+            await memory_store.retire_memory(memory_id, reason="admin_hidden")
+        except ValueError as exc:
+            if "active source support" in str(exc):
+                raise HTTPException(
+                    status_code=409,
+                    detail="source_backed_memory_requires_lifecycle_review",
+                ) from exc
+            raise
         return {"status": "deleted", "memory_id": memory_id}
 
     @memory_router.delete("/{memory_id}/purge")
@@ -3848,13 +3884,18 @@ def create_admin_app(
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         _require_source_management(request, source)
-        job = await db.create_lifecycle_backfill_job(
-            LifecycleBackfillJob(
-                id=f"lifecycle-backfill-{uuid.uuid4().hex}",
-                source_id=source_id,
-                status=LifecycleBackfillJobStatus.QUEUED,
+        try:
+            job = await db.create_lifecycle_backfill_job(
+                LifecycleBackfillJob(
+                    id=f"lifecycle-backfill-{uuid.uuid4().hex}",
+                    source_id=source_id,
+                    status=LifecycleBackfillJobStatus.QUEUED,
+                )
             )
-        )
+        except ValueError as exc:
+            if "source lifecycle job already active" not in str(exc):
+                raise
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         background_tasks.add_task(
             _run_lifecycle_backfill_safely,
             db,
@@ -3869,6 +3910,111 @@ def create_admin_app(
             "source_id": source_id,
             "job_id": job.id,
             "status": job.status.value,
+        }
+
+    async def _run_source_rebaseline_safely(
+        db: Database,
+        source_id: str,
+        source: dict[str, Any],
+        job_id: str,
+        config: AppConfig,
+        runtime_provider: RuntimeProvider,
+    ) -> None:
+        """Reset, replay, audit, and only then reopen destructive lifecycle."""
+
+        from memforge.memory.cutover import run_source_lifecycle_backfill
+        from memforge.pipeline.sync import SourceSyncMode
+
+        try:
+            await db.start_lifecycle_backfill_job(job_id)
+            memory_store = await _build_memory_store(db, config, runtime_provider)
+            await memory_store.rebaseline_source_lifecycle(source_id)
+            state = await runtime_provider.run_source_sync(
+                db=db,
+                config=config,
+                source=source,
+                force_full_sync=True,
+                execution_mode=SourceSyncMode.NORMAL,
+            )
+            if state.last_sync_status != "success":
+                raise RuntimeError(
+                    "source rebaseline replay failed: "
+                    f"{state.last_sync_status}: {state.error_message or 'unknown error'}"
+                )
+            audit = await run_source_lifecycle_backfill(db, source_id)
+            if not audit.gate_enabled or audit.finding_count:
+                raise RuntimeError(
+                    f"source rebaseline audit left {audit.finding_count} open finding(s)"
+                )
+            await db.complete_lifecycle_backfill_job(
+                job_id,
+                scanned_memories=audit.scanned_memories,
+                mapped_memories=audit.mapped_memories,
+                finding_count=audit.finding_count,
+            )
+        except Exception as exc:
+            logger.exception("Source rebaseline job %s failed for source %s", job_id, source_id)
+            try:
+                await db.fail_lifecycle_backfill_job(job_id, error=str(exc))
+            except Exception:
+                logger.exception("Failed to persist rebaseline job failure for %s", job_id)
+
+    @source_router.post("/{source_id}/memory-lifecycle/rebaseline", status_code=202)
+    async def trigger_source_memory_lifecycle_rebaseline(
+        source_id: str,
+        body: SourceRebaselineRequest,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+        sync_service: SyncService = Depends(get_sync_service),
+    ):
+        """Destructively reset derived lifecycle and replay one source in place."""
+
+        from memforge.memory.lifecycle_plan import (
+            LifecycleBackfillJob,
+            LifecycleBackfillJobStatus,
+        )
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        if body.confirm_source_id != source_id:
+            raise HTTPException(status_code=409, detail="source_rebaseline_confirmation_mismatch")
+        if str(source["type"]) == "agent_session":
+            raise HTTPException(
+                status_code=409,
+                detail="agent_session_requires_managed_claim_lineage_repair",
+            )
+        await sync_service.cancel_source(source_id)
+        try:
+            job = await db.create_lifecycle_backfill_job(
+                LifecycleBackfillJob(
+                    id=f"source-rebaseline-{uuid.uuid4().hex}",
+                    source_id=source_id,
+                    status=LifecycleBackfillJobStatus.QUEUED,
+                )
+            )
+        except ValueError as exc:
+            if "source lifecycle job already active" not in str(exc):
+                raise
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        background_tasks.add_task(
+            _run_source_rebaseline_safely,
+            db,
+            source_id,
+            source,
+            job.id,
+            config,
+            runtime_provider,
+        )
+        return {
+            "source_id": source_id,
+            "job_id": job.id,
+            "status": job.status.value,
+            "operation": "source_rebaseline",
         }
 
     @source_router.post("/{source_id}/memory-lifecycle/findings/{finding_id}/repair")
@@ -4472,6 +4618,10 @@ def create_admin_app(
                 creator_user_id if is_local_agent_backed_source(source_for_classification) else None
             ),
         )
+        # A newly created source has no legacy rows to audit. Start it on the
+        # projected lifecycle contract immediately; only pre-cutover sources
+        # without this gate remain conservatively gated.
+        await db.enable_lifecycle_gate(source_id)
         if req.sync_schedule is not None:
             await db.set_source_sync_schedule(
                 source_id,

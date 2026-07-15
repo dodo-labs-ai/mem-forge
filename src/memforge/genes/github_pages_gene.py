@@ -405,6 +405,10 @@ class GitHubPagesGene(Gene):
         response = await self._client.get(f"{_repo_api_url(ref)}/git/trees/{branch}?recursive=1")
         response.raise_for_status()
         payload = response.json()
+        if payload.get("truncated") is True:
+            raise RuntimeError(
+                "GitHub tree response was truncated; narrow the Pages subtree or use explicit_list"
+            )
         tree = payload.get("tree")
         return tree if isinstance(tree, list) else []
 

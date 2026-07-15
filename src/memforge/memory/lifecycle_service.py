@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from memforge.agent_knowledge_markdown import render_agent_concept_markdown_with_patch
+from memforge.agent_knowledge import AgentKnowledgeBundleService
 from memforge.memory.store import MemoryStore
 from memforge.models import (
     DocumentRecord,
@@ -135,7 +135,27 @@ class MemoryLifecycleService:
         expected_content_hash: str,
     ) -> RetireMemoryResult:
         memory = await self._active_target(memory_id, expected_content_hash=expected_content_hash)
-        await self.memory_store.retire_memory(memory.id, reason=reason)
+        claim = await self.db.get_agent_claim_by_memory_id(memory.id)
+        if claim is not None:
+            await AgentKnowledgeBundleService(
+                db=self.db,
+                memory_store=self.memory_store,
+            ).retire_claim_from_user_request(
+                old_memory_id=memory.id,
+                reason=reason,
+                observed_at=datetime.now(timezone.utc),
+            )
+            return RetireMemoryResult(memory_id=memory.id, status="retired")
+        if await self.db.get_active_memory_support_reference_ids(memory.id):
+            raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review")
+        try:
+            await self.memory_store.retire_memory(memory.id, reason=reason)
+        except ValueError as exc:
+            if "active source support" in str(exc):
+                raise MemoryLifecycleConflict(
+                    "source_backed_memory_requires_lifecycle_review"
+                ) from exc
+            raise
         return RetireMemoryResult(memory_id=memory.id, status="retired")
 
     async def replace_memory(
@@ -177,36 +197,23 @@ class MemoryLifecycleService:
 
         claim = await self.db.get_agent_claim_by_memory_id(old.id)
         if claim is not None:
-            concept = await self.db.get_agent_concept(claim["concept_id"])
-            if concept is None:
-                raise MemoryLifecycleConflict("agent_claim_concept_missing")
-            concept_markdown_body = await render_agent_concept_markdown_with_patch(
-                self.db,
-                concept,
-                claim_id=claim["id"],
-                claim_text=replacement_content,
-                citations=[],
-            )
-            await self.memory_store.supersede_agent_claim_memory(
-                old.id,
-                new_memory,
-                claim["concept_id"],
-                "agent_session",
+            replacement_id = await AgentKnowledgeBundleService(
+                db=self.db,
+                memory_store=self.memory_store,
+            ).replace_claim_from_user_correction(
+                old_memory_id=old.id,
+                replacement_content=replacement_content,
+                provenance=provenance,
+                reason=reason,
                 replacement_kind=replacement_kind,
-                claim_id=claim["id"],
-                concept_id=claim["concept_id"],
-                display_anchor=claim["display_anchor"],
-                claim_text=replacement_content,
-                memory_type=new_memory.memory_type,
-                tags=list(new_memory.tags),
-                confidence=new_memory.confidence,
                 observed_at=now,
-                source_updated_at=now,
-                excerpt=replacement_content,
-                replacement_reason=reason,
-                concept_markdown_body=concept_markdown_body,
             )
+            new_memory.id = replacement_id
         else:
+            if await self.db.get_active_memory_support_reference_ids(old.id):
+                raise MemoryLifecycleConflict(
+                    "source_backed_memory_requires_lifecycle_review"
+                )
             correction_doc_id = f"correction-{new_memory.id}"
             await self._write_correction_document(
                 doc_id=correction_doc_id,
@@ -217,17 +224,28 @@ class MemoryLifecycleService:
                 replacement_kind=replacement_kind,
                 observed_at=now,
             )
-            await self.memory_store.supersede_memory(
-                old.id,
-                new_memory,
-                correction_doc_id,
-                "user_correction",
-                replacement_kind=replacement_kind,
-                replacement_reason=reason,
-                source_updated_at=now,
-                excerpt=replacement_content,
-                carry_revision_sources=False,
-            )
+            try:
+                await self.memory_store.supersede_memory(
+                    old.id,
+                    new_memory,
+                    correction_doc_id,
+                    "user_correction",
+                    replacement_kind=replacement_kind,
+                    replacement_reason=reason,
+                    source_updated_at=now,
+                    excerpt=replacement_content,
+                    carry_revision_sources=False,
+                )
+            except ValueError as exc:
+                # A concurrent projected write may attach support after the
+                # preflight.  Remove the not-yet-authoritative correction
+                # document and return the same explicit conflict.
+                await self.db.delete_document(correction_doc_id)
+                if "active source support" in str(exc):
+                    raise MemoryLifecycleConflict(
+                        "source_backed_memory_requires_lifecycle_review"
+                    ) from exc
+                raise
 
         return ReplaceMemoryResult(
             memory_id=old.id,

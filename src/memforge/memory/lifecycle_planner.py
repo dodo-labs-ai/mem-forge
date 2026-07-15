@@ -48,6 +48,8 @@ def build_lifecycle_plan(
     observation_revision_ids: tuple[str, ...],
     new_evidence_reference_ids: tuple[str, ...],
     evidence_reference_ids_by_claim_hash: Mapping[str, tuple[str, ...]] | None = None,
+    corroboration_targets_by_claim_hash: Mapping[str, Memory] | None = None,
+    corroboration_proofs_by_claim_hash: Mapping[str, Mapping[str, object]] | None = None,
     defaults: NewMemoryDefaults,
     evidence_units: Sequence[EvidenceUnit] = (),
     evidence_references: Sequence[EvidenceReference] = (),
@@ -105,7 +107,10 @@ def build_lifecycle_plan(
                     memory_id=memory_id,
                     source_id=scope.source_id,
                     evidence_reference_ids=evidence_reference_ids,
-                    payload={"access_context_hash": defaults.access_context_hash},
+                    payload={
+                        "access_context_hash": defaults.access_context_hash,
+                        "source_updated_at": defaults.source_updated_at,
+                    },
                 ),
             ),
         )
@@ -117,9 +122,43 @@ def build_lifecycle_plan(
             created_ids.add(memory_id)
         return memory_id
 
+    corroboration_targets = corroboration_targets_by_claim_hash or {}
+    corroboration_proofs = corroboration_proofs_by_claim_hash or {}
+    corroboration_targets_by_id = {
+        target.id: target for target in corroboration_targets.values()
+    }
+    attached_target_ids: set[str] = set()
     for operation in add_operations:
         assert operation.memory is not None
-        create_memory(operation.memory)
+        claim_hash = content_hash(operation.memory.content.strip())
+        target = corroboration_targets.get(claim_hash)
+        if target is None:
+            create_memory(operation.memory)
+            continue
+        evidence_reference_ids = references_for(operation.memory)
+        if not evidence_reference_ids:
+            raise ValueError("corroborated Memory candidate lacks support-granting evidence")
+        mutations.extend(
+            (
+                LifecycleMutation(
+                    LifecycleMutationType.ATTACH_SUPPORT,
+                    memory_id=target.id,
+                    source_id=scope.source_id,
+                    evidence_reference_ids=evidence_reference_ids,
+                    payload={
+                        "access_context_hash": defaults.access_context_hash,
+                        "source_updated_at": defaults.source_updated_at,
+                        "equivalence_proof": dict(corroboration_proofs.get(claim_hash, {})),
+                    },
+                ),
+                LifecycleMutation(
+                    LifecycleMutationType.REFRESH_MEMORY_INDEX,
+                    memory_id=target.id,
+                    source_id=scope.source_id,
+                ),
+            )
+        )
+        attached_target_ids.add(target.id)
 
     for memory_id in incumbent_ids:
         operation = by_incumbent[memory_id]
@@ -135,13 +174,26 @@ def build_lifecycle_plan(
                 references_for(operation.memory) if operation.memory is not None else ()
             )
             if evidence_reference_ids:
+                if current_source_support and set(evidence_reference_ids) != set(current_source_support):
+                    mutations.append(
+                        LifecycleMutation(
+                            LifecycleMutationType.REMOVE_SUPPORT,
+                            memory_id=memory_id,
+                            source_id=scope.source_id,
+                            evidence_reference_ids=current_source_support,
+                        )
+                    )
                 mutations.append(
-                    LifecycleMutation(
-                        LifecycleMutationType.ATTACH_SUPPORT,
-                        memory_id=memory_id,
-                        source_id=scope.source_id,
-                        evidence_reference_ids=evidence_reference_ids,
-                        payload={"access_context_hash": defaults.access_context_hash},
+                        LifecycleMutation(
+                            LifecycleMutationType.ATTACH_SUPPORT,
+                            memory_id=memory_id,
+                            source_id=scope.source_id,
+                            evidence_reference_ids=evidence_reference_ids,
+                            payload={
+                                "access_context_hash": defaults.access_context_hash,
+                                "source_updated_at": defaults.source_updated_at,
+                                "support_validation": dict(operation.memory.support_validation),
+                            },
                     )
                 )
             continue
@@ -149,7 +201,7 @@ def build_lifecycle_plan(
         if operation.action is ReconcileAction.DELETE:
             if not current_source_support:
                 raise ValueError(f"destructive incumbent lacks current-scope support: {memory_id}")
-            if gate_state is LifecycleGateState.GATED:
+            if gate_state is LifecycleGateState.GATED or operation.flag_for_review:
                 proposed_mutations = [
                     LifecycleMutation(
                         LifecycleMutationType.REMOVE_SUPPORT,
@@ -249,7 +301,14 @@ def build_lifecycle_plan(
                             memory_id=memory_id,
                             source_id=scope.source_id,
                             replacement_memory_id=replacement_id,
-                            payload={"reason": operation.reason or "authoritative replacement"},
+                            payload={
+                                "reason": operation.reason or "authoritative replacement",
+                                "replacement_kind": (
+                                    "revision"
+                                    if operation.action is ReconcileAction.UPDATE
+                                    else "supersession"
+                                ),
+                            },
                         )
                     )
                 else:
@@ -301,7 +360,14 @@ def build_lifecycle_plan(
                         memory_id=memory_id,
                         source_id=scope.source_id,
                         replacement_memory_id=replacement_id,
-                        payload={"reason": operation.reason or "authoritative replacement"},
+                        payload={
+                            "reason": operation.reason or "authoritative replacement",
+                            "replacement_kind": (
+                                "revision"
+                                if operation.action is ReconcileAction.UPDATE
+                                else "supersession"
+                            ),
+                        },
                     ),
                 )
             )
@@ -322,10 +388,16 @@ def build_lifecycle_plan(
         ),
         stale_guard=StaleGuard(
             observation_revision_ids=observation_revision_ids,
-            support_set_hashes={memory_id: support_set_hashes[memory_id] for memory_id in incumbent_ids},
+            support_set_hashes={
+                memory_id: support_set_hashes[memory_id]
+                for memory_id in (*incumbent_ids, *sorted(attached_target_ids))
+            },
             memory_versions={
-                memory_id: _memory_version(incumbents[memory_id])
-                for memory_id in incumbent_ids
+                memory_id: _memory_version(
+                    incumbents.get(memory_id)
+                    or corroboration_targets_by_id[memory_id]
+                )
+                for memory_id in (*incumbent_ids, *sorted(attached_target_ids))
             },
         ),
         mutations=tuple(mutations),
@@ -334,6 +406,50 @@ def build_lifecycle_plan(
     )
     plan.validate()
     return plan
+
+
+def lifecycle_access_context_hash(
+    *,
+    visibility: str,
+    owner_user_id: str | None,
+    project_key: str | None,
+    repo_identifier: str | None,
+) -> str:
+    """Return the canonical access identity shared by every lifecycle caller.
+
+    ``project_key`` is intentionally not part of the identity: projects tune
+    relevance and ownership routing, but do not create visibility boundaries.
+    The parameter remains explicit so callers cannot accidentally invent a
+    second access-hash contract.
+    """
+
+    del project_key
+
+    return hashlib.sha256(
+        "\x1f".join(
+            (
+                visibility,
+                owner_user_id or "",
+                repo_identifier or "",
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def lifecycle_plan_id(scope: ReconciliationScope) -> str:
+    """Return the deterministic plan identity for one reconciliation scope."""
+
+    digest = hashlib.sha256(
+        "\x1f".join(
+            (
+                scope.id,
+                scope.source_id,
+                scope.source_unit_id,
+                scope.target_unit_revision_id or "",
+            )
+        ).encode("utf-8")
+    ).hexdigest()[:20]
+    return f"lplan-{digest}"
 
 
 def _review_mutation(
