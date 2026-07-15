@@ -4512,7 +4512,9 @@ class Database:
                 async with self.db.execute(
                     """SELECT DISTINCT ms.memory_id
                        FROM memory_sources ms
+                       JOIN memories m ON m.id = ms.memory_id
                        WHERE ms.source_id = ?
+                         AND m.status = 'active'
                          AND NOT EXISTS (
                              SELECT 1 FROM memory_support_assertions msa
                              WHERE msa.memory_id = ms.memory_id

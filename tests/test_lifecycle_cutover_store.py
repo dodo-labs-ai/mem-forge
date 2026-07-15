@@ -193,6 +193,53 @@ async def test_finding_cannot_resolve_before_memory_lineage_is_persisted(db: Dat
         )
 
 
+async def _attach_legacy_source(db: Database) -> None:
+    now = "2026-07-15T00:00:00+00:00"
+    await db.db.execute(
+        """INSERT INTO documents (
+               doc_id, source, source_url, title, space_or_project, last_modified, version,
+               content_hash, last_synced
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "legacy-gate-doc",
+            "src-1",
+            "https://example.test/legacy-gate-doc",
+            "Legacy",
+            "ENG",
+            now,
+            "1",
+            "hash",
+            now,
+        ),
+    )
+    await db.add_memory_source(
+        "mem-legacy",
+        "legacy-gate-doc",
+        "confluence",
+        "Legacy claim",
+        source_updated_at=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_gate_requires_validated_support_for_active_source_backed_memory(db: Database) -> None:
+    await _attach_legacy_source(db)
+
+    with pytest.raises(ValueError, match="source-backed Memory lacks validated support lineage"):
+        await db.enable_lifecycle_gate("src-1")
+
+
+@pytest.mark.asyncio
+async def test_gate_ignores_inactive_historical_memory_without_support(db: Database) -> None:
+    await _attach_legacy_source(db)
+    await db.db.execute("UPDATE memories SET status = 'retired' WHERE id = ?", ("mem-legacy",))
+    await db.db.commit()
+
+    gate = await db.enable_lifecycle_gate("src-1")
+
+    assert gate.state is LifecycleGateState.ENABLED
+
+
 async def _persist_support_lineage(db: Database) -> EvidenceReference:
     unit = _unit()
     await db.upsert_evidence_unit(unit)
