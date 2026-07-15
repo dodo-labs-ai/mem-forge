@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import threading
 import time
 
@@ -12,6 +13,13 @@ import pytest
 _watchdog_stop = threading.Event()
 _current_test: tuple[str, float] | None = None
 _reported_test: str | None = None
+_hang_log = Path(os.environ.get("PYTEST_HANG_LOG", "/tmp/memforge-pytest-hang.log"))
+
+
+def _append_hang_log(message: str) -> None:
+    with _hang_log.open("a", encoding="utf-8") as handle:
+        handle.write(f"{time.monotonic():.6f} {message}\n")
+        handle.flush()
 
 
 def _watch_stalled_test() -> None:
@@ -29,6 +37,7 @@ def _watch_stalled_test() -> None:
 
 def pytest_sessionstart(session) -> None:
     del session
+    _append_hang_log("SESSION START")
     threading.Thread(target=_watch_stalled_test, daemon=True).start()
 
 
@@ -38,12 +47,15 @@ def pytest_runtest_protocol(item, nextitem):
     del nextitem
     _reported_test = None
     _current_test = (item.nodeid, time.monotonic())
+    _append_hang_log(f"TEST START {item.nodeid}")
     try:
         yield
     finally:
+        _append_hang_log(f"TEST END {item.nodeid}")
         _current_test = None
 
 
 def pytest_sessionfinish(session, exitstatus) -> None:
     del session, exitstatus
+    _append_hang_log("SESSION END")
     _watchdog_stop.set()

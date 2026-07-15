@@ -17,11 +17,18 @@ jobs:
       - run: uv sync --extra dev
       - run: uv run python scripts/sync_plugin_mcp_proxy.py --check
       - run: uv run ruff check src tests scripts/sync_plugin_mcp_proxy.py
-      # Temporary regression probe: rerun the minimal quiet-mode reproduction
-      # against pytest-asyncio 1.4.0.
+      # Temporary regression probe: preserve the last completed fixture phase
+      # outside pytest capture when the intermittent teardown race occurs.
       - run: |
           for attempt in 1 2 3 4 5; do
-            uv run pytest -q tests/test_startup_runtime.py -o faulthandler_timeout=30
+            export PYTEST_HANG_LOG="/tmp/memforge-pytest-hang-${attempt}.log"
+            status=0
+            timeout --signal=TERM --kill-after=10s 60s \
+              uv run pytest -q tests/test_startup_runtime.py -o faulthandler_timeout=30 || status=$?
+            cat "$PYTEST_HANG_LOG"
+            if [ "$status" -ne 0 ]; then
+              exit "$status"
+            fi
           done
 
   admin-ui:
