@@ -661,22 +661,22 @@ class TestDetectCrossDocContradictions:
         assert m_a.contradiction_count == 1
         assert m_b.contradiction_count == 1
         assert m_a.status == "active"
-        assert m_b.status == "pending_review"
-        assert chroma.deleted == [mem_b.id]
+        assert m_b.status == "active"
+        assert chroma.deleted == []
 
         async with db.db.execute(
             "SELECT memory_id FROM memories_fts WHERE memory_id = ?",
             (mem_b.id,),
         ) as cursor:
-            assert await cursor.fetchone() is None
+            assert await cursor.fetchone() is not None
 
         review = await db.get_pending_review_for_challenger(mem_b.id)
         assert review is not None
-        assert review.kind == "supersede"
+        assert review.kind == "cross_source_conflict"
         assert review.status == "pending"
         assert review.incumbent_memory_id == mem_a.id
         assert review.challenger_memory_id == mem_b.id
-        assert review.reason == "PostgreSQL 14 vs MySQL 8"
+        assert review.reason == "contradiction: PostgreSQL 14 vs MySQL 8"
 
         async with db.db.execute(
             """SELECT rr.*
@@ -695,7 +695,7 @@ class TestDetectCrossDocContradictions:
         assert evidence_unit.source_type == "confluence"
         assert evidence_unit.source_metadata["challenger_memory_id"] == mem_b.id
         assert review.id == generate_deterministic_review_id(
-            kind="supersede",
+            kind="cross_source_conflict",
             incumbent_memory_id=mem_a.id,
             challenger_memory_id=mem_b.id,
             relation_run_id=relation_runs[0]["id"],
@@ -764,7 +764,7 @@ class TestDetectCrossDocContradictions:
         async def fail_review_insert(*args, **kwargs):
             raise RuntimeError("review write failed")
 
-        monkeypatch.setattr(db, "mark_memory_pending_review_with_case", fail_review_insert)
+        monkeypatch.setattr(db, "record_memory_review_with_relation_outcome", fail_review_insert)
 
         stats = await detect_cross_doc_contradictions(
             new_memory_ids=[mem_b.id],
@@ -1034,8 +1034,8 @@ class TestDetectCrossDocContradictions:
         assert len(challenger_reviews) == 1
 
     @pytest.mark.asyncio
-    async def test_multiple_challengers_from_same_doc_share_one_visible_review(self, seeded_db, memory_store):
-        """One source document can extract several challengers for the same human decision."""
+    async def test_multiple_challengers_from_same_doc_get_independent_reviews(self, seeded_db, memory_store):
+        """Each active challenger keeps an independently resolvable review finding."""
         db, entity_id, mem_a, mem_b, _ = seeded_db
         mem_e = _make_memory("mem-eeee0001", "pay-api now uses PostgreSQL 16")
         await db.insert_memory(mem_e)
@@ -1069,12 +1069,12 @@ class TestDetectCrossDocContradictions:
 
         assert stats["contradictions"] == 2
         reviews = await db.list_memory_reviews(status="pending")
-        assert len(reviews) == 1
-        assert reviews[0].incumbent_memory_id == mem_a.id
-        assert reviews[0].challenger_memory_id == mem_b.id
-
-        related = await db.list_memory_review_related_challengers(reviews[0].id)
-        assert [item.challenger_memory_id for item in related] == [mem_e.id]
+        assert len(reviews) == 2
+        assert {review.incumbent_memory_id for review in reviews} == {mem_a.id}
+        assert {review.challenger_memory_id for review in reviews} == {mem_b.id, mem_e.id}
+        assert all(review.kind == "cross_source_conflict" for review in reviews)
+        assert (await db.get_memory(mem_b.id)).status == "active"
+        assert (await db.get_memory(mem_e.id)).status == "active"
 
     @pytest.mark.asyncio
     async def test_temporal_detected_not_contradiction(self, seeded_db, memory_store):

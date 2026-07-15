@@ -100,6 +100,8 @@ from memforge.source_secrets import (
     redact_source_config,
     source_secret_fields,
 )
+from memforge.source_projection import ProjectionScopeTransition
+from memforge.source_projection_config import projection_scope_transition_id
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
 from memforge.server.memory_admin_service import (
@@ -1441,57 +1443,19 @@ def _source_secret_fields(source_type: str) -> tuple[str, ...]:
 
 
 def _sync_scope_config(source_type: str, config: dict[str, Any]) -> dict[str, Any]:
-    """Return config fields that affect the document set discovered by sync."""
-    jira_auth_mode = _jira_auth_mode(config) if source_type == "jira" else None
-    scope = dict(config)
-    gene_cls = GENE_REGISTRY.get(source_type)
-    if gene_cls:
-        normalizer = getattr(gene_cls, "normalize_config", None)
-        if callable(normalizer):
-            normalizer(scope)
-    for field in _source_secret_fields(source_type):
-        scope.pop(field, None)
-        scope.pop(f"{field}_encrypted", None)
-        scope.pop(f"{field}_configured", None)
-        scope.pop(f"{field}_hint", None)
-        scope.pop(f"{field}_decrypt_failed", None)
-    scope.pop("tls_ca_bundle", None)
-    scope.pop("request_interval_ms", None)
-    if source_type == "jira":
-        scope["auth_mode"] = jira_auth_mode
-    if source_type == "confluence":
-        scope = _canonical_confluence_scope(scope)
-    return scope
+    """Return only config fields that affect projected membership."""
+
+    from memforge.source_projection_config import canonical_projection_scope
+
+    return canonical_projection_scope(source_type, config)
 
 
-def _canonical_confluence_scope(scope: dict[str, Any]) -> dict[str, Any]:
-    mode = str(scope.get("sync_mode") or "").strip().lower()
-    mode = (
-        mode
-        if mode in {"page_tree", "space"}
-        else ("page_tree" if str(scope.get("page_tree_root") or "").strip() else "space")
-    )
-    exclude_labels = _config_list_value(scope.get("exclude_labels"))
-    canonical: dict[str, Any] = {"sync_mode": mode}
-    api_prefix = str(scope.get("api_prefix") or "").strip()
-    if api_prefix:
-        canonical["api_prefix"] = api_prefix.rstrip("/")
-    if exclude_labels:
-        canonical["exclude_labels"] = exclude_labels
-    if mode == "page_tree":
-        canonical["page_tree_root"] = str(scope.get("page_tree_root") or "").strip()
-        canonical["include_children"] = _config_bool(scope.get("include_children"), default=True)
-    else:
-        canonical["spaces"] = _config_list_value(scope.get("spaces"))
-    return canonical
+def _provider_namespace_config(source_type: str, config: dict[str, Any]) -> dict[str, Any]:
+    """Return immutable identity-bearing fields for one Configured Source."""
 
+    from memforge.source_projection_config import canonical_provider_namespace
 
-def _config_list_value(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, str):
-        return [part.strip() for part in value.split(",") if part.strip()]
-    return []
+    return canonical_provider_namespace(source_type, config)
 
 
 def _config_bool(value: Any, *, default: bool) -> bool:
@@ -1790,6 +1754,8 @@ def _jira_auth_secret_changed(
     if source_type != "jira":
         return False
     auth_mode = _jira_auth_mode(config, existing_config)
+    if auth_mode != _jira_auth_mode(existing_config):
+        return True
     if auth_mode == "browser_cookie":
         return False
     field = "pat"
@@ -3665,6 +3631,301 @@ def create_admin_app(
         """List search-eligible sources for MCP/source-id discovery."""
         return {"data": await _searchable_source_rows(request, db, sync_service=sync_service)}
 
+    @source_router.get("/{source_id}/memory-lifecycle")
+    async def get_source_memory_lifecycle(
+        source_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Return independent scope, gate, job, finding, review, and delivery axes."""
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        gate = await db.get_lifecycle_gate(source_id)
+        jobs = await db.list_lifecycle_backfill_jobs(source_id)
+        findings = await db.list_lifecycle_cutover_findings(source_id)
+        reviews = await db.list_lifecycle_reviews(source_id)
+        vector_tasks = await db.list_lifecycle_vector_tasks(source_id=source_id, limit=200)
+        scope_transitions = await db.list_projection_scope_transitions(source_id)
+        return {
+            "source_id": source_id,
+            "scope_transitions": [
+                {
+                    "id": transition.id,
+                    "previous_scope": dict(transition.previous_scope),
+                    "target_scope": dict(transition.target_scope),
+                    "status": transition.status.value,
+                    "run_id": transition.run_id,
+                    "coverage": transition.coverage.value if transition.coverage else None,
+                    "error": transition.error,
+                    "created_at": transition.created_at,
+                    "updated_at": transition.updated_at,
+                    "completed_at": transition.completed_at,
+                }
+                for transition in scope_transitions
+            ],
+            "gate": {
+                "state": gate.state.value,
+                "reason": gate.reason,
+                "audited_at": gate.audited_at,
+                "enabled_at": gate.enabled_at,
+            },
+            "jobs": [
+                {
+                    "id": job.id,
+                    "status": job.status.value,
+                    "scanned_memories": job.scanned_memories,
+                    "mapped_memories": job.mapped_memories,
+                    "finding_count": job.finding_count,
+                    "error": job.error,
+                    "created_at": job.created_at,
+                    "started_at": job.started_at,
+                    "completed_at": job.completed_at,
+                }
+                for job in jobs
+            ],
+            "findings": [
+                {
+                    "id": finding.id,
+                    "memory_id": finding.memory_id,
+                    "reason": finding.reason.value,
+                    "status": finding.status.value,
+                    "available_provenance": dict(finding.available_provenance),
+                    "mapping_attempt": dict(finding.mapping_attempt),
+                    "observation_id": finding.observation_id,
+                    "source_unit_id": finding.source_unit_id,
+                    "created_at": finding.created_at,
+                    "updated_at": finding.updated_at,
+                    "resolved_at": finding.resolved_at,
+                }
+                for finding in findings
+            ],
+            "reviews": [
+                {
+                    "id": review.id,
+                    "lifecycle_plan_id": review.lifecycle_plan_id,
+                    "incumbent_memory_id": review.incumbent_memory_id,
+                    "status": review.status.value,
+                    "staged_evidence": dict(review.staged_evidence),
+                    "reason": review.reason,
+                    "created_at": review.created_at,
+                    "resolved_at": review.resolved_at,
+                }
+                for review in reviews
+            ],
+            "vector_outbox": [
+                {
+                    "id": task.id,
+                    "lifecycle_plan_id": task.lifecycle_plan_id,
+                    "memory_id": task.memory_id,
+                    "operation": task.operation.value,
+                    "status": task.status.value,
+                    "attempts": task.attempts,
+                    "error": task.error,
+                }
+                for task in vector_tasks
+            ],
+        }
+
+    async def _run_lifecycle_backfill_safely(
+        db: Database,
+        source_id: str,
+        job_id: str,
+        source: dict[str, Any],
+        config: AppConfig,
+        runtime_provider: RuntimeProvider,
+    ) -> None:
+        from memforge.memory.cutover import run_source_lifecycle_recovery_job
+
+        async def reextract_documents(document_ids: frozenset[str]) -> None:
+            latest_run = (
+                await db.get_latest_source_sync_run(source_id)
+                if hasattr(db, "get_latest_source_sync_run")
+                else None
+            )
+            if latest_run is not None and latest_run.status in {"queued", "leased"}:
+                raise RuntimeError(
+                    f"source sync {latest_run.run_id} is already {latest_run.status}; retry recovery later"
+                )
+            state = await runtime_provider.run_source_sync(
+                db=db,
+                config=config,
+                source=source,
+                force_full_sync=True,
+                reprocess_doc_ids=document_ids,
+            )
+            if state.last_sync_status != "success":
+                raise RuntimeError(
+                    "targeted lifecycle recovery sync did not complete successfully: "
+                    f"{state.last_sync_status}: {state.error_message or 'unknown error'}"
+                )
+
+        try:
+            await run_source_lifecycle_recovery_job(
+                db,
+                source_id,
+                job_id=job_id,
+                reextract_documents=reextract_documents,
+            )
+        except Exception:
+            logger.exception("Lifecycle backfill job %s failed for source %s", job_id, source_id)
+
+    @source_router.post("/{source_id}/memory-lifecycle/backfill", status_code=202)
+    async def trigger_source_memory_lifecycle_backfill(
+        source_id: str,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+    ):
+        """Queue a conservative exact-lineage cutover audit for one source."""
+
+        from memforge.memory.lifecycle_plan import (
+            LifecycleBackfillJob,
+            LifecycleBackfillJobStatus,
+        )
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        job = await db.create_lifecycle_backfill_job(
+            LifecycleBackfillJob(
+                id=f"lifecycle-backfill-{uuid.uuid4().hex}",
+                source_id=source_id,
+                status=LifecycleBackfillJobStatus.QUEUED,
+            )
+        )
+        background_tasks.add_task(
+            _run_lifecycle_backfill_safely,
+            db,
+            source_id,
+            job.id,
+            source,
+            config,
+            runtime_provider,
+        )
+        return {
+            "source_id": source_id,
+            "job_id": job.id,
+            "status": job.status.value,
+        }
+
+    @source_router.post("/{source_id}/memory-lifecycle/reviews/{review_id}/approve")
+    async def approve_source_lifecycle_review(
+        source_id: str,
+        review_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+    ):
+        """Atomically apply one reviewed proposal after gate and stale-guard checks."""
+
+        from memforge.memory.lifecycle_plan import LifecycleGateState, LifecycleReviewStatus
+        from memforge.memory.lifecycle_review import build_lifecycle_review_approval_plan
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        review = await db.get_lifecycle_review(review_id)
+        if review is None:
+            raise HTTPException(status_code=404, detail="Lifecycle review not found")
+        if review.status is LifecycleReviewStatus.APPROVED:
+            return {
+                "source_id": source_id,
+                "review_id": review_id,
+                "status": review.status.value,
+                "lifecycle_plan_id": f"lifecycle-review-approval-{review.id}",
+            }
+        if review.status is not LifecycleReviewStatus.PENDING:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Lifecycle review is already {review.status.value}",
+            )
+        payload = await db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
+        if payload is None or not isinstance(payload.get("scope"), dict):
+            raise HTTPException(status_code=409, detail="Lifecycle review plan is unavailable")
+        if payload["scope"].get("source_id") != source_id:
+            raise HTTPException(status_code=404, detail="Lifecycle review not found")
+        gate = await db.get_lifecycle_gate(source_id)
+        if gate.state is not LifecycleGateState.ENABLED:
+            raise HTTPException(status_code=409, detail="Source lifecycle gate is not enabled")
+        try:
+            plan = build_lifecycle_review_approval_plan(review, payload)
+            await db.apply_lifecycle_plan(plan)
+        except ValueError as exc:
+            if "stale guard" in str(exc) or "already" in str(exc):
+                try:
+                    await db.resolve_lifecycle_review(review_id, LifecycleReviewStatus.STALE)
+                except ValueError:
+                    pass
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        memory_store = await _build_memory_store(db, config, runtime_provider)
+        try:
+            await memory_store.drain_lifecycle_vector_outbox(plan.id)
+        except Exception:
+            logger.exception("Lifecycle review %s applied but vector delivery remains pending", review_id)
+        approved = await db.get_lifecycle_review(review_id)
+        assert approved is not None
+        return {
+            "source_id": source_id,
+            "review_id": review_id,
+            "status": approved.status.value,
+            "lifecycle_plan_id": plan.id,
+        }
+
+    @source_router.post("/{source_id}/memory-lifecycle/reviews/{review_id}/reject")
+    async def reject_source_lifecycle_review(
+        source_id: str,
+        review_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Reject a pending proposal without mutating the incumbent Memory."""
+
+        from memforge.memory.lifecycle_plan import LifecycleReviewStatus
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        review = await db.get_lifecycle_review(review_id)
+        if review is None:
+            raise HTTPException(status_code=404, detail="Lifecycle review not found")
+        if review.status is LifecycleReviewStatus.REJECTED:
+            return {
+                "source_id": source_id,
+                "review_id": review_id,
+                "status": review.status.value,
+            }
+        if review.status is not LifecycleReviewStatus.PENDING:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Lifecycle review is already {review.status.value}",
+            )
+        payload = await db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
+        if payload is None or not isinstance(payload.get("scope"), dict):
+            raise HTTPException(status_code=409, detail="Lifecycle review plan is unavailable")
+        if payload["scope"].get("source_id") != source_id:
+            raise HTTPException(status_code=404, detail="Lifecycle review not found")
+        try:
+            rejected = await db.resolve_lifecycle_review(
+                review_id,
+                LifecycleReviewStatus.REJECTED,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "source_id": source_id,
+            "review_id": review_id,
+            "status": rejected.status.value,
+        }
+
     @source_router.get("/{source_id}/projects", response_model=SourceProjectsResponse)
     async def list_source_projects(
         source_id: str,
@@ -4179,19 +4440,36 @@ def create_admin_app(
                 )
         else:
             src_config = existing["config"]
+        previous_projection_scope = _sync_scope_config(existing["type"], existing["config"])
+        target_projection_scope = _sync_scope_config(existing["type"], src_config)
         scope_changed = req.config is not None and (
-            _sync_scope_config(existing["type"], src_config) != _sync_scope_config(existing["type"], existing["config"])
+            target_projection_scope != previous_projection_scope
         )
+        namespace_changed = req.config is not None and (
+            _provider_namespace_config(existing["type"], src_config)
+            != _provider_namespace_config(existing["type"], existing["config"])
+        )
+        if namespace_changed:
+            raise HTTPException(
+                status_code=409,
+                detail="source_provider_namespace_immutable",
+            )
+        if scope_changed:
+            open_scope_transition = await db.get_open_projection_scope_transition(source_id)
+            if (
+                open_scope_transition is not None
+                and dict(open_scope_transition.target_scope) != target_projection_scope
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="projection_scope_transition_active",
+                )
         auth_secret_changed = req.config is not None and _jira_auth_secret_changed(
             existing["type"],
             req.config,
             existing["config"],
         )
-        old_base_url = str(existing["config"].get("base_url") or "")
-        new_base_url = str(src_config.get("base_url") or "")
-        base_url_changed = bool(old_base_url) and old_base_url != new_base_url
-
-        if scope_changed or auth_secret_changed or base_url_changed:
+        if scope_changed or auth_secret_changed:
             await sync_service.cancel_source(source_id)
 
         if _request_includes_field(req, "project_binding"):
@@ -4215,6 +4493,37 @@ def create_admin_app(
                 else existing.get("project_binding")
             ),
         )
+        if scope_changed:
+            transition = ProjectionScopeTransition(
+                id=projection_scope_transition_id(
+                    source_id,
+                    previous_projection_scope,
+                    target_projection_scope,
+                ),
+                source_id=source_id,
+                previous_scope=previous_projection_scope,
+                target_scope=target_projection_scope,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+            try:
+                await db.create_projection_scope_transition(transition)
+            except Exception:
+                # Do not leave a new scope active without the durable proof job
+                # that prevents incomplete discovery from removing old support.
+                await db.upsert_source(
+                    id=source_id,
+                    type=existing["type"],
+                    name=existing["name"],
+                    config_json=json.dumps(existing["config"]),
+                    access_policy=existing["access_policy"],
+                    owner_user_id=existing["owner_user_id"],
+                    access_state=existing["access_state"],
+                    status=existing["status"],
+                    project_binding=existing.get("project_binding"),
+                    created_by_user_id=existing.get("created_by_user_id"),
+                    execution_owner_user_id=existing.get("execution_owner_user_id"),
+                )
+                raise
         if _request_includes_field(req, "sync_schedule"):
             schedule = req.sync_schedule or SourceSyncScheduleRequest()
             await db.set_source_sync_schedule(
@@ -4222,8 +4531,6 @@ def create_admin_app(
                 enabled=schedule.enabled,
                 interval_minutes=schedule.interval_minutes,
             )
-        if base_url_changed:
-            release_atlassian_request_limiter(old_base_url, owner_id=source_id)
         if scope_changed or auth_secret_changed:
             await db.reset_source_sync_cursor(source_id)
         return {"ok": True, "id": source_id}

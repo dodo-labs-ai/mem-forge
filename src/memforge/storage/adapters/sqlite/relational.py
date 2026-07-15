@@ -12,18 +12,28 @@ import logging
 import math
 import sqlite3
 from datetime import datetime
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import aiosqlite
 
 from memforge.memory.audit import MemoryAuditLogger
+from memforge.memory.evidence import EvidenceReference, MemorySupportAssertion
+from memforge.memory.lifecycle_plan import (
+    LegacyMemoryProvenance,
+    LifecycleCutoverFinding,
+    LifecycleBackfillJob,
+    CutoverFindingStatus,
+    LifecycleGate,
+    LifecyclePlan,
+    LifecycleReview,
+    LifecycleReviewStatus,
+    LifecycleVectorTask,
+)
 from memforge.models import (
     DocumentRecord,
     Entity,
     EntityAlias,
     Memory,
-    MemoryCurationRun,
-    MemoryDerivation,
     MemorySource,
     Project,
     Visibility,
@@ -31,6 +41,7 @@ from memforge.models import (
 )
 from memforge.retrieval.access_predicate import visible_sql
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
+from memforge.source_projection import SourceObservationRevision, SourceProjection, SourceUnit, SourceUnitRevision
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope
 from memforge.storage.adapters.protocols import (
@@ -342,6 +353,236 @@ class SqliteRelationalStore:
     async def get_document(self, doc_id: str) -> DocumentRecord | None:
         return await self._db.get_document(doc_id)
 
+    async def delete_projected_document(self, doc_id: str) -> None:
+        await self._db.delete_projected_document(doc_id)
+
+    async def rebind_projected_document_support(
+        self,
+        old_doc_id: str,
+        new_doc_id: str,
+    ) -> None:
+        await self._db.rebind_projected_document_support(old_doc_id, new_doc_id)
+
+    async def record_source_projection(self, projection: SourceProjection) -> None:
+        await self._db.record_source_projection(projection)
+
+    async def get_source_projection(self, run_id: str) -> SourceProjection | None:
+        return await self._db.get_source_projection(run_id)
+
+    async def create_projection_scope_transition(self, transition):
+        return await self._db.create_projection_scope_transition(transition)
+
+    async def get_open_projection_scope_transition(self, source_id: str):
+        return await self._db.get_open_projection_scope_transition(source_id)
+
+    async def list_projection_scope_transitions(self, source_id: str, *, limit: int = 20):
+        return await self._db.list_projection_scope_transitions(source_id, limit=limit)
+
+    async def start_projection_scope_transition(self, transition_id: str, *, run_id: str):
+        return await self._db.start_projection_scope_transition(transition_id, run_id=run_id)
+
+    async def complete_projection_scope_transition(
+        self, transition_id: str, *, run_id: str, coverage
+    ):
+        return await self._db.complete_projection_scope_transition(
+            transition_id, run_id=run_id, coverage=coverage
+        )
+
+    async def fail_projection_scope_transition(
+        self, transition_id: str, *, run_id: str, coverage, error: str
+    ):
+        return await self._db.fail_projection_scope_transition(
+            transition_id, run_id=run_id, coverage=coverage, error=error
+        )
+
+    async def get_current_source_unit_revision(
+        self,
+        source_unit_id: str,
+    ) -> SourceUnitRevision | None:
+        return await self._db.get_current_source_unit_revision(source_unit_id)
+
+    async def get_current_source_observation_revisions(
+        self,
+        source_unit_id: str,
+    ) -> dict[str, SourceObservationRevision]:
+        return dict(await self._db.get_current_source_observation_revisions(source_unit_id))
+
+    async def find_source_unit_by_document_id(
+        self,
+        source_id: str,
+        document_id: str,
+    ) -> SourceUnit | None:
+        return await self._db.find_source_unit_by_document_id(source_id, document_id)
+
+    async def list_source_unit_document_ids(
+        self,
+        source_unit_id: str,
+    ) -> tuple[str, ...]:
+        return await self._db.list_source_unit_document_ids(source_unit_id)
+
+    async def list_legacy_memory_provenance(
+        self,
+        source_id: str,
+    ) -> list[LegacyMemoryProvenance]:
+        return await self._db.list_legacy_memory_provenance(source_id)
+
+    async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate:
+        return await self._db.get_lifecycle_gate(source_id)
+
+    async def enable_lifecycle_gate(self, source_id: str) -> LifecycleGate:
+        return await self._db.enable_lifecycle_gate(source_id)
+
+    async def gate_destructive_lifecycle(self, source_id: str, *, reason: str) -> LifecycleGate:
+        return await self._db.gate_destructive_lifecycle(source_id, reason=reason)
+
+    async def upsert_lifecycle_cutover_finding(self, finding: LifecycleCutoverFinding) -> None:
+        await self._db.upsert_lifecycle_cutover_finding(finding)
+
+    async def get_lifecycle_cutover_finding(
+        self,
+        finding_id: str,
+    ) -> LifecycleCutoverFinding | None:
+        return await self._db.get_lifecycle_cutover_finding(finding_id)
+
+    async def list_lifecycle_cutover_findings(
+        self,
+        source_id: str,
+        *,
+        status: CutoverFindingStatus | None = None,
+    ) -> list[LifecycleCutoverFinding]:
+        return await self._db.list_lifecycle_cutover_findings(source_id, status=status)
+
+    async def create_lifecycle_backfill_job(
+        self,
+        job: LifecycleBackfillJob,
+    ) -> LifecycleBackfillJob:
+        return await self._db.create_lifecycle_backfill_job(job)
+
+    async def start_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob:
+        return await self._db.start_lifecycle_backfill_job(job_id)
+
+    async def complete_lifecycle_backfill_job(
+        self,
+        job_id: str,
+        *,
+        scanned_memories: int,
+        mapped_memories: int,
+        finding_count: int,
+    ) -> LifecycleBackfillJob:
+        return await self._db.complete_lifecycle_backfill_job(
+            job_id,
+            scanned_memories=scanned_memories,
+            mapped_memories=mapped_memories,
+            finding_count=finding_count,
+        )
+
+    async def fail_lifecycle_backfill_job(
+        self,
+        job_id: str,
+        *,
+        error: str,
+    ) -> LifecycleBackfillJob:
+        return await self._db.fail_lifecycle_backfill_job(job_id, error=error)
+
+    async def get_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob | None:
+        return await self._db.get_lifecycle_backfill_job(job_id)
+
+    async def list_lifecycle_backfill_jobs(
+        self,
+        source_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[LifecycleBackfillJob]:
+        return await self._db.list_lifecycle_backfill_jobs(source_id, limit=limit)
+
+    async def resolve_lifecycle_cutover_finding(
+        self,
+        finding_id: str,
+        *,
+        observation_id: str,
+        source_unit_id: str,
+    ) -> LifecycleCutoverFinding:
+        return await self._db.resolve_lifecycle_cutover_finding(
+            finding_id,
+            observation_id=observation_id,
+            source_unit_id=source_unit_id,
+        )
+
+    async def record_evidence_references(
+        self,
+        evidence_unit_id: str,
+        references: Sequence[EvidenceReference],
+    ) -> tuple[EvidenceReference, ...]:
+        return await self._db.record_evidence_references(evidence_unit_id, references)
+
+    async def upsert_memory_support_assertion(self, assertion: MemorySupportAssertion) -> None:
+        await self._db.upsert_memory_support_assertion(assertion)
+
+    async def get_memory_support_set_hash(self, memory_id: str) -> str:
+        return await self._db.get_memory_support_set_hash(memory_id)
+
+    async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]:
+        return await self._db.get_active_memory_support_reference_ids(memory_id)
+
+    async def get_source_unit_support_reference_ids(
+        self,
+        source_unit_id: str,
+    ) -> dict[str, tuple[str, ...]]:
+        return dict(await self._db.get_source_unit_support_reference_ids(source_unit_id))
+
+    async def apply_source_projection_lifecycle(
+        self,
+        projection: SourceProjection,
+        plan: LifecyclePlan,
+    ) -> None:
+        await self._db.apply_source_projection_lifecycle(projection, plan)
+
+    async def apply_lifecycle_plan(self, plan: LifecyclePlan) -> None:
+        await self._db.apply_lifecycle_plan(plan)
+
+    async def get_lifecycle_plan_payload(
+        self,
+        lifecycle_plan_id: str,
+    ) -> Mapping[str, object] | None:
+        return await self._db.get_lifecycle_plan_payload(lifecycle_plan_id)
+
+    async def get_lifecycle_review(self, review_id: str) -> LifecycleReview | None:
+        return await self._db.get_lifecycle_review(review_id)
+
+    async def list_lifecycle_reviews(
+        self,
+        source_id: str,
+        *,
+        status: LifecycleReviewStatus | None = None,
+    ) -> list[LifecycleReview]:
+        return await self._db.list_lifecycle_reviews(source_id, status=status)
+
+    async def resolve_lifecycle_review(
+        self,
+        review_id: str,
+        status: LifecycleReviewStatus,
+    ) -> LifecycleReview:
+        return await self._db.resolve_lifecycle_review(review_id, status)
+
+    async def list_lifecycle_vector_tasks(
+        self,
+        *,
+        source_id: str | None = None,
+        lifecycle_plan_id: str | None = None,
+        limit: int = 100,
+    ) -> list[LifecycleVectorTask]:
+        return await self._db.list_lifecycle_vector_tasks(
+            source_id=source_id,
+            lifecycle_plan_id=lifecycle_plan_id,
+            limit=limit,
+        )
+
+    async def complete_lifecycle_vector_task(self, task_id: str) -> None:
+        await self._db.complete_lifecycle_vector_task(task_id)
+
+    async def fail_lifecycle_vector_task(self, task_id: str, error: str) -> None:
+        await self._db.fail_lifecycle_vector_task(task_id, error)
+
     async def get_aliases_for_entity(self, entity_id: int) -> list[EntityAlias]:
         return await self._db.get_aliases_for_entity(entity_id)
 
@@ -369,37 +610,6 @@ class SqliteRelationalStore:
             support_kind=support_kind,
             source_updated_at=source_updated_at,
         )
-
-    async def add_memory_derivation(
-        self,
-        parent_memory_id: str,
-        child_memory_id: str,
-        *,
-        relation: str = "summarizes",
-    ) -> None:
-        await self._db.add_memory_derivation(
-            parent_memory_id,
-            child_memory_id,
-            relation=relation,
-        )
-
-    async def get_memory_derivation_children(
-        self,
-        parent_memory_id: str,
-    ) -> list[MemoryDerivation]:
-        return await self._db.get_memory_derivation_children(parent_memory_id)
-
-    async def record_memory_curation_run(
-        self,
-        run: MemoryCurationRun,
-    ) -> None:
-        await self._db.record_memory_curation_run(run)
-
-    async def get_memory_curation_run(
-        self,
-        run_id: str,
-    ) -> MemoryCurationRun | None:
-        return await self._db.get_memory_curation_run(run_id)
 
     async def promote_to_workspace(
         self,
@@ -1048,12 +1258,7 @@ class SqliteRelationalStore:
         return kept
 
     async def fetch_ranking_metadata(self, ids: Sequence[str]) -> dict[str, dict[str, Any]]:
-        """Return ranking and curation metadata for each id in one read.
-
-        The fields feed recency, project affinity, repo affinity, and
-        lineage-aware result shaping, so a single batched ``SELECT`` keeps the
-        per-candidate roundtrip count at one regardless of channel count.
-        """
+        """Return recency and affinity metadata for each id in one read."""
         ranked: dict[str, dict[str, Any]] = {}
         memory_ids = list(ids)
         for start in range(0, len(memory_ids), _BATCH_SIZE):
@@ -1062,10 +1267,8 @@ class SqliteRelationalStore:
             try:
                 async with self._db.db.execute(
                     "SELECT m.id, m.updated_at, m.project_key, "
-                    "m.repo_identifier, m.memory_level, m.curation_cluster_id, "
-                    "COUNT(md.child_memory_id) AS covered_memory_count "
+                    "m.repo_identifier "
                     "FROM memories m "
-                    "LEFT JOIN memory_derivations md ON md.parent_memory_id = m.id "
                     f"WHERE m.id IN ({placeholders}) "
                     "GROUP BY m.id",
                     batch,
@@ -1082,9 +1285,6 @@ class SqliteRelationalStore:
                             "updated_at": parsed,
                             "project_key": row[2],
                             "repo_identifier": row[3],
-                            "memory_level": row[4],
-                            "curation_cluster_id": row[5],
-                            "covered_memory_count": int(row[6] or 0),
                         }
             except Exception:
                 logger.exception("Failed to fetch ranking metadata for memory ids")

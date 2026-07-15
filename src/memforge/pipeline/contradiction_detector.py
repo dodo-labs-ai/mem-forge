@@ -24,7 +24,6 @@ from memforge.memory.evidence import (
     EvidenceRelationRecord,
     EvidenceUnit,
     LifecycleAction,
-    MemoryRelationApplyService,
     RelationCandidateRecord,
     RelationDecision,
     RelationOutcomeBundle,
@@ -235,7 +234,7 @@ async def detect_cross_doc_contradictions(
         }
 
         decisions_by_pair: dict[int, dict] = {}
-        challengers_for_review: dict[str, tuple[Memory, Memory, str]] = {}
+        challengers_for_review: dict[str, tuple[Memory, Memory, str, str]] = {}
         contradictions_to_record: list[tuple[str, str, str, str]] = []
         temporal_to_record: list[tuple[str, str, str, str]] = []
         for dec in decisions:
@@ -254,7 +253,10 @@ async def detect_cross_doc_contradictions(
             }
 
             if classification == "contradiction":
-                challengers_for_review.setdefault(mem_a.id, (mem_a, mem_b, reason))
+                challengers_for_review.setdefault(
+                    mem_a.id,
+                    (mem_a, mem_b, reason, classification),
+                )
                 contradictions_to_record.append((mem_a.id, mem_b.id, "contradiction", reason))
                 logger.info(
                     "CONTRADICTION: %s vs %s — %s",
@@ -264,6 +266,10 @@ async def detect_cross_doc_contradictions(
                 )
 
             elif classification == "temporal":
+                challengers_for_review.setdefault(
+                    mem_a.id,
+                    (mem_a, mem_b, reason, classification),
+                )
                 temporal_to_record.append((mem_a.id, mem_b.id, "temporal", reason))
                 logger.info(
                     "TEMPORAL: %s vs %s — %s",
@@ -282,13 +288,13 @@ async def detect_cross_doc_contradictions(
         for challenger_id, bundle in relation_outcomes.items():
             review_target = challengers_for_review.get(challenger_id)
             if review_target is not None and bundle.relation_run.lifecycle_action is LifecycleAction.CREATE_REVIEW:
-                challenger, incumbent, reason = review_target
-                await _quarantine_challenger(
+                challenger, incumbent, reason, classification = review_target
+                await _record_cross_source_review(
                     challenger=challenger,
                     incumbent=incumbent,
                     reason=reason,
+                    classification=classification,
                     db=db,
-                    memory_store=memory_store,
                     relation_outcome=bundle,
                 )
                 for record in [item for item in contradictions_to_record if item[0] == challenger_id]:
@@ -364,6 +370,8 @@ async def _record_detection_completed(
     classifications: dict[str, int],
     reason: str | None = None,
 ) -> None:
+    if not hasattr(memory_store, "record_audit_event"):
+        return
     context = audit_context
     if context is None and hasattr(memory_store, "operation_context"):
         context = memory_store.operation_context(doc_id=doc_id)
@@ -398,6 +406,8 @@ async def _record_detection_failed(
     error: str,
     reason: str,
 ) -> None:
+    if not hasattr(memory_store, "record_audit_event"):
+        return
     context = audit_context
     if context is None and hasattr(memory_store, "operation_context"):
         context = memory_store.operation_context(doc_id=doc_id)
@@ -459,11 +469,16 @@ async def _build_cross_doc_relation_outcome_bundles(
                     reason="cross_doc_entity_overlap",
                 )
             )
-            if classification != "contradiction":
+            if classification not in {"contradiction", "temporal"}:
                 continue
+            relation_type = (
+                RelationType.CONTRADICTS
+                if classification == "contradiction"
+                else RelationType.REFINES
+            )
             decision = RelationDecision(
                 candidate_memory_id=incumbent.id,
-                relation_type=RelationType.CONTRADICTS,
+                relation_type=relation_type,
                 authority_case=AuthorityCase.CROSS_SOURCE_CONFLICT,
                 confidence=1.0,
                 reason=reason,
@@ -477,7 +492,7 @@ async def _build_cross_doc_relation_outcome_bundles(
                 EvidenceRelationRecord(
                     evidence_unit_id=unit.id,
                     memory_id=incumbent.id,
-                    relation_type=RelationType.CONTRADICTS,
+                    relation_type=relation_type,
                     authority_case=AuthorityCase.CROSS_SOURCE_CONFLICT,
                     is_authoritative_support=False,
                     source_lineage_id=unit.source_lineage_id,
@@ -491,9 +506,11 @@ async def _build_cross_doc_relation_outcome_bundles(
             )
 
         if decisions:
-            lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, decisions)
-            lifecycle_action = lifecycle.action
-            review_case = lifecycle.review_case
+            # Cross-source classification has no destructive authority.  Even a
+            # temporal relation is only a review finding until a human supplies
+            # an explicit source-authority decision.
+            lifecycle_action = LifecycleAction.CREATE_REVIEW
+            review_case = ReviewCase.CROSS_SOURCE_CONFLICT
         elif not bucket_complete:
             lifecycle_action = LifecycleAction.CREATE_REVIEW
             review_case = ReviewCase.MANDATORY_INCOMPLETE
@@ -651,39 +668,21 @@ def _cross_doc_relation_run_id(unit: EvidenceUnit, memory_id: str | None = None)
     )
 
 
-async def _quarantine_challenger(
+async def _record_cross_source_review(
     *,
     challenger: Memory,
     incumbent: Memory,
     reason: str | None,
+    classification: str,
     db: Database,
-    memory_store: MemoryStore,
     relation_outcome: RelationOutcomeBundle | None = None,
 ) -> None:
-    """Hold a conflicting challenger for the existing review workbench."""
-    existing = await db.get_pending_review_for_challenger(challenger.id)
-    if existing:
-        return
-
-    for source in await db.get_memory_sources(challenger.id):
-        existing_case = await db.get_open_review_for_incumbent_source_doc(
-            incumbent_memory_id=incumbent.id,
-            doc_id=source.doc_id,
-            kind=ReviewKind.SUPERSEDE.value,
-        )
-        if existing_case:
-            await memory_store.mark_pending_review_with_case(
-                challenger.id,
-                reason=reason,
-                relation_outcome=relation_outcome,
-                related_review_id=existing_case.id,
-            )
-            return
-
+    """Record a non-destructive cross-source review without changing Memory status."""
+    assert relation_outcome is not None
     latest_challenger = await db.get_memory(challenger.id)
     review = MemoryReview(
         id=generate_deterministic_review_id(
-            kind=ReviewKind.SUPERSEDE.value,
+            kind=ReviewKind.CROSS_SOURCE_CONFLICT.value,
             incumbent_memory_id=incumbent.id,
             challenger_memory_id=challenger.id,
             relation_run_id=relation_outcome.relation_run.id if relation_outcome else None,
@@ -694,20 +693,18 @@ async def _quarantine_challenger(
                 else None
             ),
         ),
-        kind=ReviewKind.SUPERSEDE.value,
+        kind=ReviewKind.CROSS_SOURCE_CONFLICT.value,
         status=ReviewStatus.PENDING.value,
         incumbent_memory_id=incumbent.id,
         challenger_memory_id=challenger.id,
-        reason=reason,
+        reason=f"{classification}: {reason}" if reason else classification,
         expected_incumbent_updated_at=(incumbent.updated_at.isoformat() if incumbent.updated_at else None),
         expected_challenger_updated_at=(
             latest_challenger.updated_at.isoformat() if latest_challenger and latest_challenger.updated_at else None
         ),
         created_at=datetime.now(timezone.utc),
     )
-    await memory_store.mark_pending_review_with_case(
-        challenger.id,
-        reason=reason,
-        relation_outcome=relation_outcome,
-        review=review,
+    await db.record_memory_review_with_relation_outcome(
+        review,
+        relation_outcome,
     )

@@ -33,6 +33,7 @@ from memforge.memory.index_payloads import (
     memory_embedding_text,
 )
 from memforge.memory.lifecycle import allowed_search_statuses
+from memforge.memory.lifecycle_plan import LifecycleVectorOperation
 from memforge.models import (
     Memory,
     MemoryReview,
@@ -150,8 +151,6 @@ def _memory_metadata(
         "memory_type": memory.memory_type,
         "project_key": memory.project_key or "",
         "repo_identifier": memory.repo_identifier or "",
-        "memory_level": memory.memory_level,
-        "curation_cluster_id": memory.curation_cluster_id or "",
         "visibility": memory.visibility,
         "owner_user_id": memory.owner_user_id or "",
         "confidence": memory.confidence,
@@ -177,8 +176,6 @@ def _normalize_snapshot_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     out.setdefault("owner_user_id", "")
     out.setdefault("project_key", "")
     out.setdefault("repo_identifier", "")
-    out.setdefault("memory_level", "atomic")
-    out.setdefault("curation_cluster_id", "")
     return out
 
 
@@ -292,6 +289,44 @@ class MemoryStore:
                         rollback_err,
                     )
             raise
+
+    async def drain_lifecycle_vector_outbox(self, lifecycle_plan_id: str | None = None) -> None:
+        """Deliver durable vector side effects for one committed Lifecycle Plan."""
+
+        tasks = await self.relational.list_lifecycle_vector_tasks(
+            lifecycle_plan_id=lifecycle_plan_id,
+        )
+        first_error: Exception | None = None
+        for task in tasks:
+            try:
+                if task.operation is LifecycleVectorOperation.DELETE:
+                    await self.vector.delete([task.memory_id])
+                else:
+                    memory = await self.relational.get_memory(task.memory_id)
+                    if memory is None or memory.status != MemoryStatus.ACTIVE.value:
+                        raise ValueError(f"active lifecycle Memory missing: {task.memory_id}")
+                    indexed_text = await self._canonical_memory_embedding_text(memory)
+                    indexed_embedding = await self._embed(indexed_text)
+                    sources = await self.relational.get_memory_sources(memory.id)
+                    await self.vector.upsert(
+                        ids=[memory.id],
+                        embeddings=[indexed_embedding],
+                        metadatas=[
+                            _memory_metadata(
+                                memory,
+                                embedding_text_hash=embedding_text_hash(indexed_text),
+                                extra={
+                                    "source_doc_id": sources[0].doc_id if sources else "",
+                                },
+                            )
+                        ],
+                    )
+                await self.relational.complete_lifecycle_vector_task(task.id)
+            except Exception as exc:
+                await self.relational.fail_lifecycle_vector_task(task.id, str(exc))
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
 
     # -------------------------------------------------------------------
     # Core: Deduplicate and Insert
@@ -1665,6 +1700,53 @@ class MemoryStore:
             },
         )
         return retired_ids
+
+    async def delete_projected_document(
+        self,
+        doc_id: str,
+        *,
+        deletion_context: dict[str, Any] | None = None,
+    ) -> None:
+        """Remove document storage after lifecycle was committed separately.
+
+        This path deliberately performs no Memory mutation. Source Projection
+        lineage and Evidence records remain durable for audit, while the
+        document vector and relational document artifacts are removed together
+        with rollback protection.
+        """
+
+        context = self._operation_context(doc_id=doc_id)
+        document_snapshot = await self.db.get_document(doc_id)
+        document_side_snapshot = await self.db.get_document_side_table_snapshots([doc_id])
+        document_vector_snapshot = self._document_vector_snapshot(doc_id)
+        try:
+            await self._remove_document_vector(doc_id, context=context)
+        except Exception:
+            await self._restore_document_vector_snapshot(
+                doc_id,
+                document_vector_snapshot,
+                context=context,
+            )
+            raise
+        try:
+            await self.db.delete_projected_document(doc_id)
+        except Exception:
+            if document_snapshot:
+                await self.db.restore_document_snapshot(document_snapshot)
+                await self.db.restore_document_side_table_snapshots(document_side_snapshot)
+            await self._restore_document_vector_snapshot(
+                doc_id,
+                document_vector_snapshot,
+                context=context,
+            )
+            raise
+        await self._emit(
+            "projected_document_delete_committed",
+            "committed",
+            context=context,
+            doc_id=doc_id,
+            payload=deletion_context or {},
+        )
 
     async def delete_source_cascade(self, source_id: str) -> list[str]:
         """Delete a source and remove newly retired memories from search indexes."""

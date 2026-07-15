@@ -1,8 +1,9 @@
-"""Memory Engine — orchestrates entity resolution, dedup, and storage.
+"""Memory extraction and projected-lifecycle orchestration.
 
-This is the bridge between the enrichment/extraction pipeline and the memory store.
-It processes enrichment results (Call 1) and extracted memories (Call 2) into
-persisted, deduplicated, entity-linked memories.
+The engine is the ownership boundary between source projection/extraction and
+durable memory state.  A projected lifecycle call derives its reconciliation
+scope, access context, staged evidence, lifecycle plan, and outbox work from one
+``SourceProjection`` so those records commit atomically.
 """
 
 from __future__ import annotations
@@ -14,39 +15,29 @@ from typing import TYPE_CHECKING, Any
 
 from memforge.memory.entity_resolver import EntityResolver, insert_llm_alias, resolve_entity
 from memforge.memory.evidence import (
-    AccessContext,
     AuthorityCase,
     EvidenceContentProvenance,
     EvidenceRelationRecord,
     EvidenceUnit,
     LifecycleAction,
-    LifecycleDecision,
     MemoryRelationApplyService,
     RelationCandidateRecord,
-    RelationDecision,
     RelationOutcomeBundle,
     RelationRunRecord,
     RelationType,
-    ReviewCase,
-    build_candidate_universe,
-    build_mandatory_candidate_bucket_results,
     relation_run_id_for,
 )
-from memforge.memory.lifecycle import requires_human_review
+from memforge.memory.lifecycle_plan import ReconciliationScope
+from memforge.memory.lifecycle_planner import NewMemoryDefaults, build_lifecycle_plan
 from memforge.memory.quality import classify_memory_candidate
 from memforge.source_access import memory_visibility_for_document
 from memforge.models import (
     Memory,
-    MemoryReview,
     RawMemory,
     ReconcileAction,
     ReconcileOperation,
-    ReplacementKind,
-    ReviewKind,
-    ReviewStatus,
     content_hash,
     generate_memory_id,
-    generate_deterministic_review_id,
 )
 
 from memforge.storage.adapters.protocols import RelationalStore, VectorStore
@@ -54,6 +45,7 @@ from memforge.storage.adapters.protocols import RelationalStore, VectorStore
 if TYPE_CHECKING:
     from memforge.memory.store import MemoryStore
     from memforge.models import EnrichmentResult
+    from memforge.source_projection import SourceProjection
     from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -61,12 +53,46 @@ logger = logging.getLogger(__name__)
 __all__ = ["MemoryEngine"]
 
 
+def _lifecycle_access_context_hash(
+    *,
+    visibility: str,
+    owner_user_id: str | None,
+    project_key: str | None,
+    repo_identifier: str | None,
+) -> str:
+    return sha256(
+        "\x1f".join(
+            (
+                visibility,
+                owner_user_id or "",
+                project_key or "",
+                repo_identifier or "",
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _lifecycle_plan_id(scope: ReconciliationScope) -> str:
+    digest = sha256(
+        "\x1f".join(
+            (
+                scope.id,
+                scope.source_id,
+                scope.source_unit_id,
+                scope.target_unit_revision_id or "",
+            )
+        ).encode("utf-8")
+    ).hexdigest()[:20]
+    return f"lplan-{digest}"
+
+
 class MemoryEngine:
-    """Orchestrates the flow from LLM extraction output to persisted memories.
+    """Turns enrichment and extracted claims into durable memory state.
 
     Responsibilities:
-    - Process Call 1 output: resolve entities, insert aliases
-    - Process Call 2 output: build Memory objects, deduplicate, insert/corroborate
+    - Resolve extracted entities and aliases.
+    - Build and apply an atomic lifecycle plan for a source projection.
+    - Support direct, non-projected memory ingestion where explicitly requested.
     """
 
     def __init__(
@@ -324,34 +350,69 @@ class MemoryEngine:
     # Process with reconciliation (for document UPDATES)
     # -------------------------------------------------------------------
 
-    async def reconcile_and_persist(
+    async def _active_projected_incumbents(
         self,
+        *,
+        doc_id: str,
+        source_unit_id: str,
+    ) -> tuple[list[Memory], dict[str, tuple[str, ...]]]:
+        """Load the complete active ledger by stable Unit, with a legacy fallback.
+
+        A provider-backed rename can change ``doc_id`` without changing the
+        Source Unit. Support Assertions are therefore authoritative for the
+        projected path; same-document extracted support is included only to
+        keep pre-cutover rows visible to the conservative lineage gate.
+        """
+        unit_support = await self.db.get_source_unit_support_reference_ids(source_unit_id)
+        incumbents_by_id: dict[str, Memory] = {}
+        for memory_id in sorted(unit_support):
+            memory = await self.db.get_memory(memory_id)
+            if memory is not None and memory.status == "active":
+                incumbents_by_id[memory.id] = memory
+        for memory in await self.db.get_memories_by_source_doc(
+            doc_id,
+            support_kind="extracted",
+        ):
+            if memory.status == "active":
+                incumbents_by_id.setdefault(memory.id, memory)
+        return [incumbents_by_id[key] for key in sorted(incumbents_by_id)], unit_support
+
+    async def apply_projected_lifecycle(
+        self,
+        *,
+        projection: SourceProjection,
         doc_id: str,
         raw_memories: list[RawMemory],
-        source_type: str,
         doc_type: str,
-        project_key: str | None = None,
-        repo_identifier: str | None = None,
-        entity_ids: list[int] | None = None,
-        document_content: str | None = None,
-        update_mode: str = "full_document",
-        changed_hunks: str | None = None,
-        update_plan_stats: dict[str, Any] | None = None,
-        *,
-        audit_context: Any | None = None,
-        user_id: str | None = None,
+        project_key: str | None,
+        repo_identifier: str | None,
+        entity_ids: list[int],
+        document_content: str,
+        update_mode: str,
+        changed_hunks: str | None,
+        update_plan_stats: dict[str, Any] | None,
         source_updated_at: datetime | None,
-    ) -> dict:
-        """Process memories with LLM reconciliation against existing memories.
+        user_id: str | None = None,
+    ) -> dict[str, int]:
+        """Reconcile a complete Source Unit ledger and atomically apply one plan."""
 
-        Called when a document is UPDATED (content hash changed). Compares
-        new extractions against existing memories from the same source document,
-        then executes ADD/UPDATE/SUPERSEDE/DELETE/NOOP operations.
-
-        Returns stats dict with operation counts.
-        """
         from memforge.pipeline.reconciler import reconcile_memories
-        from memforge.pipeline.entity_filter import filter_entities
+        from memforge.pipeline.projection_evidence import build_projected_claim_evidence
+
+        if len(projection.deltas) != 1:
+            raise ValueError("projected lifecycle requires exactly one Revision Delta")
+        delta = projection.deltas[0]
+        scope = ReconciliationScope(
+            id=f"scope:{projection.run_id}",
+            source_id=projection.source_id,
+            source_unit_id=delta.source_unit_id,
+            base_unit_revision_id=delta.previous_unit_revision_id,
+            target_unit_revision_id=delta.current_unit_revision_id,
+        )
+        observation_revision_ids = tuple(
+            revision.id for revision in projection.observation_revisions
+        )
+        source_type = projection.source_type
 
         stats = {
             "added": 0,
@@ -362,805 +423,238 @@ class MemoryEngine:
             "pending_review": 0,
             "skipped": 0,
         }
-
-        # Same-document reconciliation can mutate only memories extracted by this document.
-        existing = await self.db.get_memories_by_source_doc(doc_id, support_kind="extracted")
-        existing_active = [m for m in existing if m.status == "active"]
-
-        if not raw_memories and not existing_active:
-            return stats
-
-        # If no existing memories, skip reconciliation — just insert
-        if not existing_active:
-            result = await self.process_memories(
-                doc_id=doc_id,
-                raw_memories=raw_memories,
-                source_type=source_type,
-                project_key=project_key,
-                repo_identifier=repo_identifier,
-                entity_ids=entity_ids,
-                audit_context=audit_context,
-                user_id=user_id,
-                source_updated_at=source_updated_at,
-            )
-            stats["added"] = result.get("inserted", 0)
-            stats["skipped"] = result.get("skipped", 0)
-            return stats
-
-        # Filter entity_refs before reconciliation
-        filtered_memories = []
+        filtered_memories: list[RawMemory] = []
         for raw in raw_memories:
-            if not self._candidate_can_persist(raw, stats):
-                continue
-            ref_dicts = [{"name": name, "type": "unknown"} for name in raw.entity_refs]
-            filtered_refs, _ = filter_entities(ref_dicts)
-            raw.entity_refs = [d["name"] for d in filtered_refs]
-            filtered_memories.append(raw)
+            if self._candidate_can_persist(raw, stats):
+                filtered_memories.append(raw)
 
-        if not filtered_memories:
-            if not document_content and any(raw.content.strip() for raw in raw_memories):
-                await self._remove_filtered_document_support(existing_active, doc_id)
-            if not self.structured_llm_client or not document_content:
-                return stats
-
-        # Call 3: LLM reconciliation
-        if not self.structured_llm_client:
-            logger.warning("No LLM client for reconciliation — falling back to deduplicate_and_insert")
-            result = await self.process_memories(
-                doc_id=doc_id,
-                raw_memories=filtered_memories,
-                source_type=source_type,
-                project_key=project_key,
-                repo_identifier=repo_identifier,
-                entity_ids=entity_ids,
-                audit_context=audit_context,
-                user_id=user_id,
-                source_updated_at=source_updated_at,
-            )
-            stats["added"] = result.get("inserted", 0)
-            stats["skipped"] += result.get("skipped", 0)
-            return stats
-
-        llm_model = getattr(self, "llm_model", "claude-sonnet-4-20250514")
-        reconciliation_result = await reconcile_memories(
+        incumbents, unit_support = await self._active_projected_incumbents(
+            doc_id=doc_id,
+            source_unit_id=scope.source_unit_id,
+        )
+        if incumbents and not self.structured_llm_client:
+            raise RuntimeError("complete lifecycle reconciliation requires an LLM client")
+        result = await reconcile_memories(
             new_extractions=filtered_memories,
-            existing_memories=existing_active,
+            existing_memories=incumbents,
             doc_type=doc_type,
             structured_llm_client=self.structured_llm_client,
-            llm_model=llm_model,
+            llm_model=self.llm_model,
             updated_document=document_content,
             update_mode=update_mode,
             changed_hunks=changed_hunks,
             update_plan_stats=update_plan_stats,
             include_metadata=True,
         )
-        operations = getattr(reconciliation_result, "operations", reconciliation_result)
-        failure = getattr(reconciliation_result, "failure", None)
-        if failure:
-            await self._record_reconciliation_failed(
-                doc_id=doc_id,
-                update_mode=update_mode,
-                update_plan_stats=update_plan_stats,
-                new_extraction_count=len(filtered_memories),
-                existing_memory_count=len(existing_active),
-                error_type=failure.error_type,
-                error=failure.error,
+        failure = getattr(result, "failure", None)
+        if failure is not None:
+            raise RuntimeError(
+                f"complete lifecycle reconciliation failed: {failure.error_type}: {failure.error}"
             )
-            stats["skipped"] += len(filtered_memories)
-        existing_by_id = {m.id: m for m in existing_active}
-
-        # Execute operations
-        for op in operations:
-            try:
-                existing_memory = existing_by_id.get(op.memory_id or "")
-                await self._record_reconciliation_decision(
-                    op=op,
-                    doc_id=doc_id,
-                    update_mode=update_mode,
-                    update_plan_stats=update_plan_stats,
+        operations = tuple(getattr(result, "operations", result))
+        for operation in operations:
+            if operation.action not in {
+                ReconcileAction.ADD,
+                ReconcileAction.UPDATE,
+                ReconcileAction.SUPERSEDE,
+            } or operation.memory is None:
+                continue
+            quality = classify_memory_candidate(operation.memory)
+            if not quality.keep:
+                raise RuntimeError(
+                    "complete lifecycle reconciliation produced an unsafe Memory candidate: "
+                    f"{quality.skip_reason or 'quality_rejected'}"
                 )
+        incumbents_by_id = {memory.id: memory for memory in incumbents}
+        gate = await self.db.get_lifecycle_gate(scope.source_id)
+        all_support = {
+            memory_id: await self.db.get_active_memory_support_reference_ids(memory_id)
+            for memory_id in incumbents_by_id
+        }
+        support_hashes = {
+            memory_id: await self.db.get_memory_support_set_hash(memory_id)
+            for memory_id in incumbents_by_id
+        }
+        visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
+        if visibility == "private" and user_id is not None and user_id != owner_user_id:
+            raise PermissionError("private projected lifecycle actor does not own the document")
+        access_context_hash = _lifecycle_access_context_hash(
+            visibility=visibility,
+            owner_user_id=owner_user_id,
+            project_key=project_key,
+            repo_identifier=repo_identifier,
+        )
+        projected_evidence = build_projected_claim_evidence(
+            projection=projection,
+            raw_memories=filtered_memories,
+            doc_id=doc_id,
+            source_type=source_type,
+            project_key=project_key,
+            visibility=visibility,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            access_context_hash=access_context_hash,
+            extractor_run_id=projection.run_id,
+            observed_at=(
+                source_updated_at.isoformat() if source_updated_at is not None else None
+            ),
+        )
+        plan_id = _lifecycle_plan_id(scope)
+        plan = build_lifecycle_plan(
+            plan_id=plan_id,
+            scope=scope,
+            gate_state=gate.state,
+            operations=operations,
+            incumbents=incumbents_by_id,
+            source_support_reference_ids=unit_support,
+            all_active_support_reference_ids=all_support,
+            support_set_hashes=support_hashes,
+            observation_revision_ids=observation_revision_ids,
+            new_evidence_reference_ids=(),
+            evidence_reference_ids_by_claim_hash=(
+                projected_evidence.reference_ids_by_claim_hash
+            ),
+            defaults=NewMemoryDefaults(
+                visibility=visibility,
+                owner_user_id=owner_user_id,
+                project_key=project_key,
+                repo_identifier=repo_identifier,
+                doc_id=doc_id,
+                source_type=source_type,
+                access_context_hash=access_context_hash,
+                entity_ids=tuple(entity_ids),
+                source_updated_at=(
+                    source_updated_at.isoformat() if source_updated_at is not None else None
+                ),
+            ),
+            evidence_units=projected_evidence.units,
+            evidence_references=projected_evidence.references,
+        )
+        await self.db.apply_source_projection_lifecycle(projection, plan)
+        await self.memory_store.drain_lifecycle_vector_outbox(plan.id)
 
-                if await self._operation_lacks_document_authority(op, existing_memory):
-                    await self._record_reconciliation_authority_rejected(
-                        op=op,
-                        doc_id=doc_id,
-                        update_mode=update_mode,
-                        reason="Current document has no extracted support authority for this memory",
-                    )
-                    stats["skipped"] += 1
-                    logger.info(
-                        "RECONCILE AUTHORITY REJECTED: %s %s - current document has no extracted support",
-                        op.action,
-                        op.memory_id,
-                    )
-                    continue
-
-                shared_support_reason = await self._shared_support_review_reason(op, doc_id)
-                if shared_support_reason and existing_memory:
-                    await self._record_reconciliation_review_gated(
-                        op=op,
-                        doc_id=doc_id,
-                        update_mode=update_mode,
-                        reason=shared_support_reason,
-                    )
-                    if op.memory:
-                        if not await self._stage_replacement_review(
-                            op=op,
-                            existing_memory=existing_memory,
-                            doc_id=doc_id,
-                            source_type=source_type,
-                            source_updated_at=source_updated_at,
-                            project_key=project_key,
-                            stats=stats,
-                            user_id=user_id,
-                            repo_identifier=repo_identifier,
-                            audit_context=audit_context,
-                        ):
-                            continue
-                    else:
-                        await self.memory_store.mark_pending_review(
-                            op.memory_id,
-                            reason=shared_support_reason,
-                            relation_outcome=await self._pending_review_relation_outcome(
-                                op=op,
-                                existing_memory=existing_memory,
-                                doc_id=doc_id,
-                                source_type=source_type,
-                                project_key=project_key,
-                                repo_identifier=repo_identifier,
-                                user_id=user_id,
-                                reason=shared_support_reason,
-                                audit_context=audit_context,
-                            ),
-                        )
-                    stats["pending_review"] += 1
-                    logger.info(
-                        "RECONCILE REVIEW: %s %s - %s",
-                        op.action,
-                        op.memory_id,
-                        shared_support_reason,
-                    )
-                    continue
-
-                if op.action == ReconcileAction.DELETE and op.memory_id:
-                    if await self._delete_requires_review(op, doc_id, existing_memory):
-                        await self._record_reconciliation_review_gated(
-                            op=op,
-                            doc_id=doc_id,
-                            update_mode=update_mode,
-                            reason=op.reason,
-                        )
-                        await self.memory_store.mark_pending_review(
-                            op.memory_id,
-                            reason=op.reason,
-                            relation_outcome=await self._pending_review_relation_outcome(
-                                op=op,
-                                existing_memory=existing_memory,
-                                doc_id=doc_id,
-                                source_type=source_type,
-                                project_key=project_key,
-                                repo_identifier=repo_identifier,
-                                user_id=user_id,
-                                reason=op.reason,
-                                audit_context=audit_context,
-                            ),
-                        )
-                        stats["pending_review"] += 1
-                        logger.info(
-                            "RECONCILE REVIEW: %s %s - %s",
-                            op.action,
-                            op.memory_id,
-                            op.reason,
-                        )
-                        continue
-
-                    await self.memory_store.remove_source_support(op.memory_id, doc_id, reason="no_support")
-                    stats["deleted"] += 1
-                    logger.info("RECONCILE DELETE: %s - %s", op.memory_id, op.reason)
-                    continue
-
-                if requires_human_review(
-                    op,
-                    corroboration_count=existing_memory.corroboration_count if existing_memory else 0,
-                ):
-                    if (
-                        op.action in (ReconcileAction.UPDATE, ReconcileAction.SUPERSEDE)
-                        and op.memory
-                        and existing_memory
-                    ):
-                        if not await self._stage_replacement_review(
-                            op=op,
-                            existing_memory=existing_memory,
-                            doc_id=doc_id,
-                            source_type=source_type,
-                            source_updated_at=source_updated_at,
-                            project_key=project_key,
-                            stats=stats,
-                            user_id=user_id,
-                            repo_identifier=repo_identifier,
-                            audit_context=audit_context,
-                        ):
-                            continue
-                    elif op.memory_id and existing_memory:
-                        await self.memory_store.mark_pending_review(
-                            op.memory_id,
-                            reason=op.reason,
-                            relation_outcome=await self._pending_review_relation_outcome(
-                                op=op,
-                                existing_memory=existing_memory,
-                                doc_id=doc_id,
-                                source_type=source_type,
-                                project_key=project_key,
-                                repo_identifier=repo_identifier,
-                                user_id=user_id,
-                                reason=op.reason,
-                                audit_context=audit_context,
-                            ),
-                        )
-                    stats["pending_review"] += 1
-                    logger.info(
-                        "RECONCILE REVIEW: %s %s - %s",
-                        op.action,
-                        op.memory_id,
-                        op.reason,
-                    )
-                    continue
-
-                if op.action == ReconcileAction.ADD and op.memory:
-                    if not self._candidate_can_persist(op.memory, stats):
-                        continue
-                    unit = await self._document_evidence_unit(
-                        doc_id=doc_id,
-                        raw=op.memory,
-                        source_type=source_type,
-                        project_key=project_key,
-                        repo_identifier=repo_identifier,
-                        extractor_run_id=getattr(audit_context, "run_id", None),
-                    )
-                    if await self._evidence_unit_has_materialized_memory(unit):
-                        stats["noop"] += 1
-                        continue
-                    lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [])
-                    if lifecycle.action is not LifecycleAction.CREATE_MEMORY or not lifecycle.created_memory_id:
-                        await self._record_document_relation_outcome(
-                            unit=unit,
-                            relation_run_id=_document_relation_run_id(
-                                unit,
-                                LifecycleAction.CREATE_REVIEW,
-                                relation_type=RelationType.SUPPORTS,
-                            ),
-                            lifecycle_action=lifecycle.action,
-                            memory_id=None,
-                            status="review",
-                            review_case=lifecycle.review_case,
-                            audit={
-                                "source": "memory_engine.reconcile_and_persist",
-                                "reconcile_action": op.action.value,
-                                "review_case": lifecycle.review_case.value if lifecycle.review_case else None,
-                            },
-                        )
-                        stats["pending_review"] += 1
-                        continue
-                    memory = self._build_memory(
-                        op.memory,
-                        project_key,
-                        visibility=unit.visibility,
-                        owner_user_id=unit.owner_user_id,
-                        repo_identifier=repo_identifier,
-                        memory_id=lifecycle.created_memory_id,
-                    )
-                    memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
-                    result = await self.memory_store.deduplicate_and_insert(
-                        memory=memory,
-                        doc_id=doc_id,
-                        source_type=source_type,
-                        entity_ids=memory_entity_ids,
-                        excerpt=op.memory.extraction_context,
-                        source_updated_at=source_updated_at,
-                        relation_outcome=self._document_relation_outcome_bundle(
-                            unit=unit,
-                            relation_run_id=_document_relation_run_id(
-                                unit,
-                                LifecycleAction.CREATE_MEMORY,
-                                relation_type=RelationType.SUPPORTS,
-                            ),
-                            lifecycle_action=lifecycle.action,
-                            memory_id=memory.id,
-                            status="applied",
-                            review_case=lifecycle.review_case,
-                            audit={
-                                "source": "memory_engine.reconcile_and_persist",
-                                "reconcile_action": op.action.value,
-                            },
-                        ),
-                    )
-                    if result == "inserted":
-                        stats["added"] += 1
-                        stats.setdefault("_inserted_ids", []).append(memory.id)
-
-                elif op.action == ReconcileAction.UPDATE and op.memory_id and op.memory:
-                    if not self._candidate_can_persist(op.memory, stats):
-                        continue
-                    (
-                        unit,
-                        lifecycle,
-                        relation_run_id,
-                        candidates,
-                        incomplete_buckets,
-                        candidate_count,
-                    ) = await self._derive_document_replacement_lifecycle(
-                        op=op,
-                        doc_id=doc_id,
-                        source_type=source_type,
-                        project_key=project_key,
-                        repo_identifier=repo_identifier,
-                        user_id=user_id,
-                        replacement_relation=RelationType.REFINES,
-                        audit_context=audit_context,
-                    )
-                    if lifecycle.action is not LifecycleAction.SUPERSEDE_MEMORY:
-                        await self._record_document_relation_outcome(
-                            unit=unit,
-                            relation_run_id=relation_run_id,
-                            lifecycle_action=lifecycle.action,
-                            memory_id=None,
-                            status="review",
-                            review_case=lifecycle.review_case,
-                            audit={
-                                "source": "memory_engine.reconcile_and_persist",
-                                "reconcile_action": op.action.value,
-                                "target_memory_id": op.memory_id,
-                                "review_case": lifecycle.review_case.value if lifecycle.review_case else None,
-                            },
-                            candidates=candidates,
-                            incomplete_mandatory_buckets=incomplete_buckets,
-                            candidate_count=candidate_count,
-                        )
-                        stats["pending_review"] += 1
-                        continue
-                    new_memory = self._build_memory(
-                        op.memory,
-                        project_key,
-                        visibility=unit.visibility,
-                        owner_user_id=unit.owner_user_id,
-                        repo_identifier=repo_identifier,
-                    )
-                    memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
-                    await self.memory_store.supersede_memory(
-                        old_memory_id=op.memory_id,
-                        new_memory=new_memory,
-                        doc_id=doc_id,
-                        source_type=source_type,
-                        entity_ids=memory_entity_ids,
-                        excerpt=op.memory.extraction_context,
-                        replacement_reason=op.reason,
-                        replacement_kind="revision",
-                        source_updated_at=source_updated_at,
-                        relation_outcome=self._document_relation_outcome_bundle(
-                            unit=unit,
-                            relation_run_id=relation_run_id,
-                            lifecycle_action=lifecycle.action,
-                            memory_id=new_memory.id,
-                            status="applied",
-                            review_case=lifecycle.review_case,
-                            audit={
-                                "source": "memory_engine.reconcile_and_persist",
-                                "reconcile_action": op.action.value,
-                                "target_memory_id": op.memory_id,
-                            },
-                            candidates=candidates,
-                            incomplete_mandatory_buckets=incomplete_buckets,
-                            candidate_count=candidate_count,
-                        ),
-                    )
-                    stats["updated"] += 1
-                    logger.info("RECONCILE UPDATE: %s -> %s - %s", op.memory_id, new_memory.id, op.reason)
-
-                elif op.action == ReconcileAction.SUPERSEDE and op.memory_id and op.memory:
-                    if not self._candidate_can_persist(op.memory, stats):
-                        continue
-                    (
-                        unit,
-                        lifecycle,
-                        relation_run_id,
-                        candidates,
-                        incomplete_buckets,
-                        candidate_count,
-                    ) = await self._derive_document_replacement_lifecycle(
-                        op=op,
-                        doc_id=doc_id,
-                        source_type=source_type,
-                        project_key=project_key,
-                        repo_identifier=repo_identifier,
-                        user_id=user_id,
-                        replacement_relation=RelationType.CONTRADICTS,
-                        audit_context=audit_context,
-                    )
-                    if lifecycle.action is not LifecycleAction.SUPERSEDE_MEMORY:
-                        await self._record_document_relation_outcome(
-                            unit=unit,
-                            relation_run_id=relation_run_id,
-                            lifecycle_action=lifecycle.action,
-                            memory_id=None,
-                            status="review",
-                            review_case=lifecycle.review_case,
-                            audit={
-                                "source": "memory_engine.reconcile_and_persist",
-                                "reconcile_action": op.action.value,
-                                "target_memory_id": op.memory_id,
-                                "review_case": lifecycle.review_case.value if lifecycle.review_case else None,
-                            },
-                            candidates=candidates,
-                            incomplete_mandatory_buckets=incomplete_buckets,
-                            candidate_count=candidate_count,
-                        )
-                        stats["pending_review"] += 1
-                        continue
-                    new_memory = self._build_memory(
-                        op.memory,
-                        project_key,
-                        visibility=unit.visibility,
-                        owner_user_id=unit.owner_user_id,
-                        repo_identifier=repo_identifier,
-                    )
-                    memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
-                    await self.memory_store.supersede_memory(
-                        old_memory_id=op.memory_id,
-                        new_memory=new_memory,
-                        doc_id=doc_id,
-                        source_type=source_type,
-                        entity_ids=memory_entity_ids,
-                        excerpt=op.memory.extraction_context,
-                        replacement_reason=op.reason,
-                        replacement_kind="supersession",
-                        source_updated_at=source_updated_at,
-                        relation_outcome=self._document_relation_outcome_bundle(
-                            unit=unit,
-                            relation_run_id=relation_run_id,
-                            lifecycle_action=lifecycle.action,
-                            memory_id=new_memory.id,
-                            status="applied",
-                            review_case=lifecycle.review_case,
-                            audit={
-                                "source": "memory_engine.reconcile_and_persist",
-                                "reconcile_action": op.action.value,
-                                "target_memory_id": op.memory_id,
-                            },
-                            candidates=candidates,
-                            incomplete_mandatory_buckets=incomplete_buckets,
-                            candidate_count=candidate_count,
-                        ),
-                    )
-                    stats["superseded"] += 1
-                    logger.info("RECONCILE SUPERSEDE: %s -> %s - %s", op.memory_id, new_memory.id, op.reason)
-
-                else:
-                    stats["noop"] += 1
-
-            except Exception as e:
-                logger.error("Reconciliation action %s failed: %s", op.action, e)
-                await self.memory_store.record_audit_event(
-                    "reconciliation_action_failed",
-                    "failed",
-                    memory_id=op.memory_id,
-                    doc_id=doc_id,
-                    decision=op.action.value if hasattr(op.action, "value") else str(op.action),
-                    reason=op.reason,
-                    error=str(e),
-                    payload={"action": op.action.value if hasattr(op.action, "value") else str(op.action)},
-                )
-                stats["skipped"] += 1
-
-        # Cross-document contradiction detection for newly added memories
-        inserted_ids = stats.pop("_inserted_ids", [])
-        if inserted_ids and self.structured_llm_client:
+        created_memory_ids = [
+            mutation.memory_id
+            for mutation in plan.mutations
+            if mutation.mutation_type.value == "create_memory"
+        ]
+        if created_memory_ids and self.structured_llm_client:
             from memforge.pipeline.contradiction_detector import detect_cross_doc_contradictions
 
             contradiction_stats = await detect_cross_doc_contradictions(
-                new_memory_ids=inserted_ids,
+                new_memory_ids=created_memory_ids,
                 doc_id=doc_id,
                 db=self.db,
                 memory_store=self.memory_store,
                 structured_llm_client=self.structured_llm_client,
                 llm_model=self.llm_model,
-                audit_context=audit_context,
                 actor_user_id=user_id,
             )
             stats["contradictions_found"] = contradiction_stats.get("contradictions", 0)
 
-        logger.info(
-            "Reconciliation for %s: +%d added, ~%d updated, %d superseded, -%d deleted, =%d noop",
-            doc_id,
-            stats["added"],
-            stats["updated"],
-            stats["superseded"],
-            stats["deleted"],
-            stats["noop"],
+        for mutation in plan.mutations:
+            if mutation.mutation_type.value == "create_memory":
+                stats["added"] += 1
+            elif mutation.mutation_type.value == "supersede_memory":
+                stats["superseded"] += 1
+            elif mutation.mutation_type.value == "retire_memory":
+                stats["deleted"] += 1
+            elif mutation.mutation_type.value == "create_review":
+                stats["pending_review"] += 1
+        stats["noop"] = sum(
+            decision.disposition.value == "keep"
+            for decision in plan.coverage_proof.incumbent_decisions
         )
         return stats
 
-    # -------------------------------------------------------------------
-    # Helpers
-    # -------------------------------------------------------------------
-
-    async def _remove_filtered_document_support(
+    async def apply_projected_tombstone(
         self,
-        existing_active: list[Memory],
+        *,
+        projection: SourceProjection,
         doc_id: str,
-    ) -> None:
-        """Remove this document as support when its update produced no usable candidates."""
-        for memory in existing_active:
-            await self.memory_store.remove_source_support(memory.id, doc_id, reason="no_support")
+        reason: str,
+    ) -> dict[str, int | bool]:
+        """Apply an authoritative Source Unit tombstone without an LLM call.
 
-    async def _delete_requires_review(
-        self,
-        op: ReconcileOperation,
-        doc_id: str,
-        existing_memory: Memory | None,
-    ) -> bool:
-        """Review DELETE only when it is flagged or would retire a well-supported memory."""
-        if op.flag_for_review:
-            return True
-        if not existing_memory or existing_memory.corroboration_count < 3 or not op.memory_id:
-            return False
-
-        sources = await self.db.get_memory_sources(op.memory_id)
-        remaining_sources = [source for source in sources if source.doc_id != doc_id]
-        return not remaining_sources
-
-    async def _operation_lacks_document_authority(
-        self,
-        op: ReconcileOperation,
-        existing_memory: Memory | None,
-    ) -> bool:
-        """Reject model-proposed lifecycle writes outside current-doc extracted ownership."""
-        if op.action not in (ReconcileAction.UPDATE, ReconcileAction.SUPERSEDE, ReconcileAction.DELETE):
-            return False
-        return bool(op.memory_id and existing_memory is None)
-
-    async def _shared_support_review_reason(
-        self,
-        op: ReconcileOperation,
-        doc_id: str,
-    ) -> str | None:
-        """Route content mutations to review when other support edges exist.
-
-        Supporter verification can later prove compatibility and allow direct mutation.
-        Until then, the lifecycle path stays conservative.
+        Provider absence is already an explicit deterministic fact at this
+        boundary. Every active same-document incumbent therefore receives a
+        DELETE ledger entry, while the per-source lifecycle gate still decides
+        whether that becomes support removal/retirement or a durable review.
         """
-        if op.action not in (ReconcileAction.UPDATE, ReconcileAction.SUPERSEDE) or not op.memory_id:
-            return None
-        sources = await self.db.get_memory_sources(op.memory_id)
-        other_sources = [source for source in sources if source.doc_id != doc_id]
-        if not other_sources:
-            return None
-        kinds = sorted({source.support_kind for source in other_sources})
-        return (
-            "Content mutation requires review because other support edges still "
-            f"exist for this memory: {', '.join(kinds)}"
-        )
 
-    async def _stage_replacement_review(
-        self,
-        *,
-        op: ReconcileOperation,
-        existing_memory: Memory,
-        doc_id: str,
-        source_type: str,
-        source_updated_at: datetime | None,
-        project_key: str | None,
-        stats: dict,
-        user_id: str | None = None,
-        repo_identifier: str | None = None,
-        audit_context: Any | None = None,
-    ) -> bool:
-        """Insert a hidden challenger and create a review case for a replacement."""
-        if not op.memory or not self._candidate_can_persist(op.memory, stats):
-            return False
-        is_revision = op.action == ReconcileAction.UPDATE
-        replacement_relation = RelationType.REFINES if is_revision else RelationType.CONTRADICTS
-        replacement_kind: ReplacementKind = "revision" if is_revision else "supersession"
-        (
-            unit,
-            _lifecycle,
-            relation_run_id,
-            candidates,
-            incomplete_buckets,
-            candidate_count,
-        ) = await self._derive_document_replacement_lifecycle(
-            op=op,
+        if len(projection.deltas) != 1 or not projection.coverage.proves_absence:
+            raise ValueError("projected tombstone requires one absence-proving Revision Delta")
+        delta = projection.deltas[0]
+        scope = ReconciliationScope(
+            id=f"tombstone:{delta.source_unit_id}:{delta.current_unit_revision_id or 'removed'}",
+            source_id=projection.source_id,
+            source_unit_id=delta.source_unit_id,
+            base_unit_revision_id=delta.previous_unit_revision_id,
+            target_unit_revision_id=delta.current_unit_revision_id,
+        )
+        source_type = projection.source_type
+        incumbents, unit_support = await self._active_projected_incumbents(
             doc_id=doc_id,
-            source_type=source_type,
-            project_key=project_key,
-            repo_identifier=repo_identifier,
-            user_id=user_id,
-            replacement_relation=replacement_relation,
-            audit_context=audit_context,
-            lifecycle_action=LifecycleAction.CREATE_REVIEW,
+            source_unit_id=scope.source_unit_id,
         )
-        challenger = self._build_memory(
-            op.memory,
-            project_key,
-            visibility=unit.visibility,
-            owner_user_id=unit.owner_user_id,
-        )
-        challenger.status = "pending_review"
-        memory_entity_ids = await self._resolve_entity_refs(op.memory.entity_refs)
-        existing_case = await self.db.get_open_review_for_incumbent_source_doc(
-            incumbent_memory_id=existing_memory.id,
-            doc_id=doc_id,
-            kind=ReviewKind.SUPERSEDE.value,
-        )
-        review = None
-        related_review_id = existing_case.id if existing_case else None
-        if existing_case is None:
-            review = MemoryReview(
-                id=generate_deterministic_review_id(
-                    kind=ReviewKind.SUPERSEDE.value,
-                    incumbent_memory_id=existing_memory.id,
-                    challenger_memory_id=challenger.id,
-                ),
-                kind=ReviewKind.SUPERSEDE.value,
-                status=ReviewStatus.PENDING.value,
-                incumbent_memory_id=existing_memory.id,
-                challenger_memory_id=challenger.id,
-                reason=op.reason,
-                expected_incumbent_updated_at=(
-                    existing_memory.updated_at.isoformat() if existing_memory.updated_at else None
-                ),
-                expected_challenger_updated_at=(challenger.updated_at.isoformat() if challenger.updated_at else None),
-                replacement_kind=replacement_kind,
-                created_at=datetime.now(timezone.utc),
+        incumbents_by_id = {memory.id: memory for memory in incumbents}
+        operations = tuple(
+            ReconcileOperation(
+                action=ReconcileAction.DELETE,
+                memory_id=memory_id,
+                reason=reason,
             )
-        await self.memory_store.insert_memory(
-            memory=challenger,
-            doc_id=doc_id,
-            source_type=source_type,
-            entity_ids=memory_entity_ids,
-            excerpt=op.memory.extraction_context,
-            source_updated_at=source_updated_at,
-            relation_outcome=self._document_relation_outcome_bundle(
-                unit=unit,
-                relation_run_id=relation_run_id,
-                lifecycle_action=LifecycleAction.CREATE_REVIEW,
-                memory_id=challenger.id,
-                status="review",
-                review_case=ReviewCase.MANUAL_REVIEW_GATE,
-                audit={
-                    "source": "memory_engine.reconcile_and_persist",
-                    "reconcile_action": op.action.value,
-                    "target_memory_id": op.memory_id,
-                    "manual_gate_reason": op.reason,
-                },
-                candidates=candidates,
-                incomplete_mandatory_buckets=incomplete_buckets,
-                candidate_count=candidate_count,
+            for memory_id in sorted(incumbents_by_id)
+        )
+        gate = await self.db.get_lifecycle_gate(scope.source_id)
+        all_support = {
+            memory_id: await self.db.get_active_memory_support_reference_ids(memory_id)
+            for memory_id in incumbents_by_id
+        }
+        support_hashes = {
+            memory_id: await self.db.get_memory_support_set_hash(memory_id)
+            for memory_id in incumbents_by_id
+        }
+        visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
+        plan = build_lifecycle_plan(
+            plan_id=_lifecycle_plan_id(scope),
+            scope=scope,
+            gate_state=gate.state,
+            operations=operations,
+            incumbents=incumbents_by_id,
+            source_support_reference_ids=unit_support,
+            all_active_support_reference_ids=all_support,
+            support_set_hashes=support_hashes,
+            observation_revision_ids=(),
+            new_evidence_reference_ids=(),
+            defaults=NewMemoryDefaults(
+                visibility=visibility,
+                owner_user_id=owner_user_id,
+                project_key=None,
+                repo_identifier=None,
+                doc_id=doc_id,
+                source_type=source_type,
+                access_context_hash=_lifecycle_access_context_hash(
+                    visibility=visibility,
+                    owner_user_id=owner_user_id,
+                    project_key=None,
+                    repo_identifier=None,
+                ),
             ),
-            review=review,
-            related_review_id=related_review_id,
-            related_review_reason=op.reason,
         )
-        return True
-
-    async def _record_reconciliation_decision(
-        self,
-        *,
-        op: ReconcileOperation,
-        doc_id: str,
-        update_mode: str,
-        update_plan_stats: dict[str, Any] | None,
-    ) -> None:
-        """Audit the model's reconciliation decision before applying it."""
-        if not hasattr(self.memory_store, "record_audit_event"):
-            return
-        context = None
-        if hasattr(self.memory_store, "operation_context"):
-            context = self.memory_store.operation_context(doc_id=doc_id)
-        payload = {
-            "update_mode": update_mode,
-            "has_candidate": op.memory is not None,
+        await self.db.apply_source_projection_lifecycle(projection, plan)
+        await self.memory_store.drain_lifecycle_vector_outbox(plan.id)
+        pending_review = sum(
+            mutation.mutation_type.value == "create_review" for mutation in plan.mutations
+        )
+        retired = sum(
+            mutation.mutation_type.value == "retire_memory" for mutation in plan.mutations
+        )
+        return {
+            "retired": retired,
+            "pending_review": pending_review,
+            "can_delete_document": pending_review == 0,
         }
-        if update_plan_stats:
-            payload["update_plan_stats"] = update_plan_stats
-        await self.memory_store.record_audit_event(
-            "reconciliation_decision_returned",
-            "committed",
-            context=context,
-            doc_id=doc_id,
-            memory_id=op.memory_id,
-            decision=op.action.value if hasattr(op.action, "value") else str(op.action),
-            reason=op.reason,
-            support_kind="extracted",
-            payload=payload,
-        )
-
-    async def _record_reconciliation_failed(
-        self,
-        *,
-        doc_id: str,
-        update_mode: str,
-        update_plan_stats: dict[str, Any] | None,
-        new_extraction_count: int,
-        existing_memory_count: int,
-        error_type: str,
-        error: str,
-    ) -> None:
-        """Audit a reconciliation call that failed before lifecycle decisions were returned."""
-        if not hasattr(self.memory_store, "record_audit_event"):
-            return
-        context = None
-        if hasattr(self.memory_store, "operation_context"):
-            context = self.memory_store.operation_context(doc_id=doc_id)
-        payload = {
-            "update_mode": update_mode,
-            "new_extraction_count": new_extraction_count,
-            "existing_memory_count": existing_memory_count,
-        }
-        if update_plan_stats:
-            payload["update_plan_stats"] = update_plan_stats
-        await self.memory_store.record_audit_event(
-            "reconciliation_failed",
-            "failed",
-            context=context,
-            doc_id=doc_id,
-            decision="skip_mutations",
-            reason=error_type,
-            support_kind="extracted",
-            payload=payload,
-            error=error,
-        )
-
-    async def _record_reconciliation_authority_rejected(
-        self,
-        *,
-        op: ReconcileOperation,
-        doc_id: str,
-        update_mode: str,
-        reason: str,
-    ) -> None:
-        """Audit a model operation that tried to mutate outside document authority."""
-        if not hasattr(self.memory_store, "record_audit_event"):
-            return
-        context = None
-        if hasattr(self.memory_store, "operation_context"):
-            context = self.memory_store.operation_context(doc_id=doc_id)
-        await self.memory_store.record_audit_event(
-            "reconciliation_authority_rejected",
-            "committed",
-            context=context,
-            doc_id=doc_id,
-            memory_id=op.memory_id,
-            decision=op.action.value if hasattr(op.action, "value") else str(op.action),
-            reason=reason,
-            support_kind="extracted",
-            payload={"update_mode": update_mode, "has_candidate": op.memory is not None},
-        )
-
-    async def _record_reconciliation_review_gated(
-        self,
-        *,
-        op: ReconcileOperation,
-        doc_id: str,
-        update_mode: str,
-        reason: str,
-    ) -> None:
-        """Audit a reconciliation operation that was routed to human review."""
-        if not hasattr(self.memory_store, "record_audit_event"):
-            return
-        context = None
-        if hasattr(self.memory_store, "operation_context"):
-            context = self.memory_store.operation_context(doc_id=doc_id)
-        await self.memory_store.record_audit_event(
-            "reconciliation_review_gated",
-            "committed",
-            context=context,
-            doc_id=doc_id,
-            memory_id=op.memory_id,
-            decision=op.action.value if hasattr(op.action, "value") else str(op.action),
-            reason=reason,
-            support_kind="extracted",
-            payload={"update_mode": update_mode},
-        )
 
     def _candidate_can_persist(self, raw: RawMemory, stats: dict | None = None) -> bool:
         """Return whether a raw candidate should be persisted, updating stats when skipped."""
@@ -1279,79 +773,6 @@ class MemoryEngine:
     async def _evidence_unit_has_materialized_memory(self, unit: EvidenceUnit) -> bool:
         return await self.db.has_materialized_evidence_unit(unit.id)
 
-    async def _derive_document_replacement_lifecycle(
-        self,
-        *,
-        op: ReconcileOperation,
-        doc_id: str,
-        source_type: str,
-        project_key: str | None,
-        repo_identifier: str | None,
-        user_id: str | None,
-        replacement_relation: RelationType,
-        audit_context: Any | None,
-        lifecycle_action: LifecycleAction = LifecycleAction.SUPERSEDE_MEMORY,
-    ) -> tuple[EvidenceUnit, LifecycleDecision, str, list[RelationCandidateRecord], tuple[str, ...], int]:
-        assert op.memory is not None
-        assert op.memory_id is not None
-        unit = await self._document_evidence_unit(
-            doc_id=doc_id,
-            raw=op.memory,
-            source_type=source_type,
-            project_key=project_key,
-            repo_identifier=repo_identifier,
-            extractor_run_id=getattr(audit_context, "run_id", None),
-        )
-        relation_run_id = _document_relation_run_id(
-            unit,
-            lifecycle_action,
-            candidate_memory_id=op.memory_id,
-            relation_type=replacement_relation,
-            authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
-        )
-        buckets = await build_mandatory_candidate_bucket_results(
-            store=self.db,
-            unit=unit,
-            access_context=AccessContext(
-                actor_user_id=user_id,
-                source_subscriptions=(unit.source_id,),
-                repo_identifier=repo_identifier,
-                operation_type="document_replacement",
-            ),
-        )
-        universe = build_candidate_universe(
-            relation_run_id=relation_run_id,
-            evidence_unit_id=unit.id,
-            bucket_results=buckets,
-        )
-        target_candidate = next(
-            (candidate for candidate in universe.candidates if candidate.memory_id == op.memory_id),
-            None,
-        )
-        if target_candidate is None:
-            raise RuntimeError("document replacement target missing from mandatory candidate universe")
-        decision = RelationDecision(
-            candidate_memory_id=op.memory_id,
-            relation_type=replacement_relation,
-            authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
-            confidence=op.memory.confidence,
-            reason=op.reason,
-            proposed_memory_content=op.memory.content,
-            evidence_excerpt=op.memory.extraction_context,
-            matched_bucket=target_candidate.bucket,
-            matched_bucket_complete=target_candidate.bucket_complete,
-            classifier_batch_key=relation_run_id,
-        )
-        lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [decision])
-        return (
-            unit,
-            lifecycle,
-            relation_run_id,
-            list(universe.candidates),
-            universe.incomplete_mandatory_buckets,
-            universe.total_unique_candidates,
-        )
-
     async def _record_document_relation_outcome(
         self,
         *,
@@ -1435,110 +856,6 @@ class MemoryEngine:
             candidates=tuple(candidates),
             relations=relations,
         )
-
-    async def _pending_review_relation_outcome(
-        self,
-        *,
-        op: ReconcileOperation,
-        existing_memory: Memory,
-        doc_id: str,
-        source_type: str,
-        project_key: str | None,
-        repo_identifier: str | None,
-        user_id: str | None,
-        reason: str | None,
-        audit_context: Any | None,
-    ) -> RelationOutcomeBundle:
-        if op.memory_id is None:
-            raise RuntimeError("pending-review relation outcome requires a target memory id")
-
-        review_observation = (reason or f"Current document requires review for memory {op.memory_id}").strip()
-        raw = op.memory or RawMemory(
-            content=review_observation,
-            memory_type=existing_memory.memory_type,
-            confidence=existing_memory.confidence,
-            extraction_context=None,
-        )
-        unit = await self._document_evidence_unit(
-            doc_id=doc_id,
-            raw=raw,
-            source_type=source_type,
-            project_key=project_key,
-            repo_identifier=repo_identifier,
-            extractor_run_id=getattr(audit_context, "run_id", None),
-        )
-        relation_type = RelationType.REFINES if op.action == ReconcileAction.UPDATE else RelationType.CONTRADICTS
-        relation_run_id = _document_relation_run_id(
-            unit,
-            LifecycleAction.CREATE_REVIEW,
-            candidate_memory_id=op.memory_id,
-            relation_type=relation_type,
-            authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
-        )
-        buckets = await build_mandatory_candidate_bucket_results(
-            store=self.db,
-            unit=unit,
-            access_context=AccessContext(
-                actor_user_id=user_id,
-                source_subscriptions=(unit.source_id,),
-                repo_identifier=repo_identifier,
-                operation_type="document_review",
-            ),
-        )
-        universe = build_candidate_universe(
-            relation_run_id=relation_run_id,
-            evidence_unit_id=unit.id,
-            bucket_results=buckets,
-        )
-        target_candidate = next(
-            (candidate for candidate in universe.candidates if candidate.memory_id == op.memory_id),
-            None,
-        )
-        if target_candidate is None:
-            raise RuntimeError("pending-review target missing from mandatory candidate universe")
-
-        relation = EvidenceRelationRecord(
-            evidence_unit_id=unit.id,
-            memory_id=op.memory_id,
-            relation_type=relation_type,
-            authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
-            is_authoritative_support=True,
-            source_lineage_id=unit.source_lineage_id,
-            confidence=raw.confidence,
-            reason=reason,
-            proposed_memory_content=raw.content if op.memory else None,
-            excerpt=unit.excerpt,
-            classifier_version="memory-engine-v1",
-            relation_run_id=relation_run_id,
-            created_at=datetime.now(timezone.utc).isoformat(),
-        )
-        return RelationOutcomeBundle(
-            evidence_unit=unit,
-            relation_run=RelationRunRecord(
-                id=relation_run_id,
-                evidence_unit_id=unit.id,
-                access_context_hash=unit.access_context_hash,
-                candidate_count=universe.total_unique_candidates,
-                mandatory_candidate_count=universe.mandatory_candidate_count,
-                checked_candidate_count=universe.checked_candidate_count,
-                incomplete_mandatory_buckets=universe.incomplete_mandatory_buckets,
-                classifier_version="memory-engine-v1",
-                lifecycle_action=LifecycleAction.CREATE_REVIEW,
-                review_case=ReviewCase.MANUAL_REVIEW_GATE,
-                status="review",
-                result_memory_id=op.memory_id,
-                audit={
-                    "action": op.action.value,
-                    "reason": reason,
-                    "target_memory_id": op.memory_id,
-                    "relation_type": relation_type.value,
-                    "candidate_memory_ids": [candidate.memory_id for candidate in universe.candidates],
-                },
-            ),
-            candidates=tuple(universe.candidates),
-            relations=(relation,),
-        )
-
 
 def _document_evidence_unit_id(
     *,

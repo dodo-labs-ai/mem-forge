@@ -55,7 +55,6 @@ W_RECENCY_DEFAULT = 0.15
 # normalization and clamped at zero so a penalized candidate cannot go negative.
 CROSS_PROJECT_PENALTY = 0.20
 REPO_AFFINITY_BOOST = 0.05
-CURATION_CHILD_EXACT_MATCH_MARGIN = 0.15
 QUERY_ADAPTIVE_RRF_K = 60
 
 _PROFILE_WEIGHTS: dict[str, dict[str, float]] = {
@@ -140,9 +139,6 @@ class _RankedCandidate:
     updated_at: datetime | None = None
     project_key: str | None = None
     repo_identifier: str | None = None
-    memory_level: str | None = None
-    curation_cluster_id: str | None = None
-    covered_memory_count: int = 0
     retrieval_evidence: dict[str, Any] | None = None
 
 
@@ -746,7 +742,6 @@ class SearchEngine:
         ranked = await self._rerank_with_llm(query, ranked, top_k)
 
         # ----- 7. Collapse duplicate families and apply the requested page -----
-        ranked = self._collapse_curation_families(ranked)
         ranked_count = len(ranked)
         ranked = ranked[offset: offset + top_k]
 
@@ -1001,9 +996,6 @@ class SearchEngine:
             c.updated_at = meta.get("updated_at")
             c.project_key = meta.get("project_key")
             c.repo_identifier = meta.get("repo_identifier")
-            c.memory_level = meta.get("memory_level")
-            c.curation_cluster_id = meta.get("curation_cluster_id")
-            c.covered_memory_count = int(meta.get("covered_memory_count") or 0)
             rrf_norm = c.rrf_score / max_rrf
             age = _age_days(c.updated_at)
             recency = _recency_score(age, half_life)
@@ -1021,48 +1013,6 @@ class SearchEngine:
 
         candidates.sort(key=lambda c: c.final_score, reverse=True)
         return candidates
-
-    @staticmethod
-    def _collapse_curation_families(
-        candidates: list[_RankedCandidate],
-    ) -> list[_RankedCandidate]:
-        """Collapse near-duplicate curated families for default search output.
-
-        A consolidated memory represents the cluster by default. A strongly
-        higher-scoring atomic child can still surface for exact-error or
-        issue-specific queries, where the child likely carries details the
-        summary intentionally compressed.
-        """
-        by_cluster: dict[str, list[_RankedCandidate]] = {}
-        unclustered: list[_RankedCandidate] = []
-        for candidate in candidates:
-            if candidate.curation_cluster_id:
-                by_cluster.setdefault(candidate.curation_cluster_id, []).append(candidate)
-            else:
-                unclustered.append(candidate)
-
-        selected: list[_RankedCandidate] = list(unclustered)
-        for members in by_cluster.values():
-            consolidated = [
-                member for member in members
-                if member.memory_level == "consolidated"
-            ]
-            if not consolidated:
-                selected.extend(members)
-                continue
-
-            summary = max(consolidated, key=lambda item: item.final_score)
-            top = max(members, key=lambda item: item.final_score)
-            if (
-                top.memory_id != summary.memory_id
-                and top.final_score > summary.final_score + CURATION_CHILD_EXACT_MATCH_MARGIN
-            ):
-                selected.extend([top, summary])
-            else:
-                selected.append(summary)
-
-        selected.sort(key=lambda item: item.final_score, reverse=True)
-        return selected
 
     # ==================================================================
     # Cross-encoder reranking (config-gated)
@@ -1223,11 +1173,6 @@ class SearchEngine:
                 freshness=freshness,
                 contradiction_warning=contradiction_warning,
                 status=memory.status,
-                memory_level=candidate.memory_level or memory.memory_level,
-                curation_cluster_id=(
-                    candidate.curation_cluster_id or memory.curation_cluster_id
-                ),
-                covered_memory_count=candidate.covered_memory_count,
                 repo_identifier=candidate.repo_identifier or memory.repo_identifier,
                 follow_up=_search_follow_up_for_memory(
                     memory,

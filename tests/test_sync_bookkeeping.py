@@ -25,6 +25,11 @@ from memforge.models import (
     content_hash,
 )
 from memforge.pipeline.sync_memory import MemorySample, SyncMemoryObserver
+from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.source_projection import (
+    ProjectionScopeTransition,
+    ProjectionScopeTransitionStatus,
+)
 from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
     ExtractionWorkPool,
@@ -1436,8 +1441,23 @@ class NoopMemoryEngine:
     async def process_memories(self, **kwargs):
         return {"inserted": 0, "corroborated": 0, "skipped": 0}
 
-    async def reconcile_and_persist(self, **kwargs):
+    async def apply_projected_lifecycle(self, **kwargs):
+        is_update = (
+            kwargs["projection"].deltas[0].previous_unit_revision_id is not None
+        )
+        if not is_update:
+            result = await self.process_memories(**kwargs)
+            return {
+                "added": result.get("inserted", 0),
+                "updated": result.get("corroborated", 0),
+                "superseded": 0,
+                "deleted": 0,
+                "noop": 0,
+            }
         return {"added": 0, "updated": 0, "superseded": 0, "deleted": 0, "noop": 0}
+
+    async def apply_projected_tombstone(self, **kwargs):
+        return {"retired": 0, "pending_review": 0, "can_delete_document": True}
 
 
 class RecordingSourceSupportDetector:
@@ -1450,7 +1470,7 @@ class RecordingSourceSupportDetector:
 
 
 class FailingDocumentDeleteMemoryStore:
-    async def delete_document(self, doc_id: str, **kwargs):
+    async def delete_projected_document(self, doc_id: str, **kwargs):
         raise RuntimeError("delete document failed")
 
 
@@ -1471,16 +1491,20 @@ class CountingMemoryEngine(NoopMemoryEngine):
 
 class RecordingMemoryEngine(NoopMemoryEngine):
     def __init__(self) -> None:
-        self.process_memories_calls: list[dict] = []
-        self.reconcile_calls: list[dict] = []
+        self.projected_lifecycle_calls: list[dict] = []
 
-    async def process_memories(self, **kwargs):
-        self.process_memories_calls.append(kwargs)
-        return await super().process_memories(**kwargs)
+    async def apply_projected_lifecycle(self, **kwargs):
+        self.projected_lifecycle_calls.append(kwargs)
+        return await super().apply_projected_lifecycle(**kwargs)
 
-    async def reconcile_and_persist(self, **kwargs):
-        self.reconcile_calls.append(kwargs)
-        return await super().reconcile_and_persist(**kwargs)
+
+class FailingProjectedMemoryEngine(NoopMemoryEngine):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def apply_projected_lifecycle(self, **kwargs):
+        self.calls += 1
+        raise RuntimeError("lifecycle apply failed")
 
 
 class FailingVectorStore:
@@ -1574,6 +1598,17 @@ class RecordingMemoryExtractor(NoopMemoryExtractor):
 
     async def extract_unit_memories(self, context, **kwargs):
         self.unit_calls.append({"context": context, **kwargs})
+        return MemoryExtractionResult(memories=[])
+
+
+class ProjectionBatchRecordingExtractor(RecordingMemoryExtractor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection_calls: list[object] = []
+
+    async def extract_projection_batch_memories(self, batch, **kwargs):
+        del kwargs
+        self.projection_calls.append(batch)
         return MemoryExtractionResult(memories=[])
 
 
@@ -1834,6 +1869,59 @@ class UpdatingTicketGene(UpdatingDocumentGene):
         )
 
 
+class LargeConfluenceGene(UpdatingDocumentGene):
+    @classmethod
+    def metadata(cls):
+        return GeneMetadata(
+            name="confluence",
+            display_name="Confluence",
+            description="",
+            default_sync_interval_minutes=1440,
+            auth_method="pat",
+            data_shape="document",
+        )
+
+
+class MovingGithubFileGene(UpdatingDocumentGene):
+    def __init__(self, *, item_id: str, relative_path: str, previous_filename: str | None = None) -> None:
+        super().__init__("# Design\n\nKeep A7.", version=relative_path)
+        self.item_id = item_id
+        self.relative_path = relative_path
+        self.previous_filename = previous_filename
+
+    @classmethod
+    def metadata(cls):
+        return GeneMetadata(
+            name="github_repo",
+            display_name="GitHub Repository",
+            description="",
+            default_sync_interval_minutes=1440,
+            auth_method="pat",
+            data_shape="document",
+        )
+
+    async def discover(self, since=None):
+        extra = {
+            "relative_path": self.relative_path,
+            "file_lineage_id": "file-lineage-77",
+            "repo_owner": "acme",
+            "repo_name": "payroll",
+            "repo_ref": "main",
+        }
+        if self.previous_filename is not None:
+            extra["previous_filename"] = self.previous_filename
+        yield ContentItem(
+            item_id=self.item_id,
+            title="Design",
+            source_url=f"https://github.example/acme/payroll/{self.relative_path}",
+            last_modified=self.last_modified,
+            content_type="text/markdown",
+            space_or_project="payroll",
+            version=self.version,
+            extra=extra,
+        )
+
+
 class DocumentVisibleEnricher:
     def __init__(self, db: Database, source_id: str):
         self.db = db
@@ -2049,6 +2137,42 @@ def _audited_memory_store(db: Database) -> MemoryStore:
 
 
 @pytest.mark.asyncio
+async def test_large_single_observation_uses_bounded_projection_batches(db: Database) -> None:
+    source_id = "src-large-confluence"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Large Confluence",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    body = "\n".join(f"design-line-{index:05d}" for index in range(9_000))
+    extractor = ProjectionBatchRecordingExtractor()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=extractor,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=2,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=LargeConfluenceGene(body),
+        source_name="Large Confluence",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "success"
+    assert len(extractor.projection_calls) > 1
+    assert all(len(batch.primary_markdown) <= 60_000 for batch in extractor.projection_calls)
+    assert extractor.full_calls == []
+    assert extractor.unit_calls == []
+
+
+@pytest.mark.asyncio
 async def test_sync_memory_observer_records_discovery_and_document_stages(db: Database):
     source_id = "src-sync-memory"
     await db.upsert_source(
@@ -2098,17 +2222,13 @@ async def test_sync_memory_observer_records_discovery_and_document_stages(db: Da
     assert "after_enrich" in stages
     assert "after_extract" in stages
     assert "after_memory_engine" in stages
-    assert "after_source_support" in stages
     assert "document_lifecycle_exit" in stages
     assert "sync_run_end" in stages
     discovery = next(event for event in events if event["stage"] == "after_discovery")
     assert discovery["item_count"] == 1
     assert discovery["indexed_doc_count"] == 0
     assert discovery["full_sync"] is True
-    support = next(event for event in events if event["stage"] == "after_source_support")
-    assert support["memory_supports_added"] == 1
-    assert "title" not in support
-    assert "source_url" not in support
+    assert "after_source_support" not in stages
 
 
 @pytest.mark.asyncio
@@ -2368,6 +2488,81 @@ async def test_authoritative_snapshot_ignores_cursor_without_forcing_reprocessin
 
 
 @pytest.mark.asyncio
+async def test_complete_source_scope_transition_forces_snapshot_and_applies(db: Database):
+    source_id = "src-scope-transition-complete"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Architecture",
+        config_json=json.dumps({"spaces": ["NEW"]}),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await db.create_projection_scope_transition(
+        ProjectionScopeTransition(
+            id="scope-transition-complete",
+            source_id=source_id,
+            previous_scope={"sync_mode": "space", "spaces": ["OLD"]},
+            target_scope={"sync_mode": "space", "spaces": ["NEW"]},
+        )
+    )
+    gene = SinceRecordingEmptyGene()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=None,
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=None,
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(gene, "Architecture", source_id)
+    transition = (await db.list_projection_scope_transitions(source_id))[0]
+
+    assert state.last_sync_status == "success"
+    assert gene.seen_since is None
+    assert transition.status is ProjectionScopeTransitionStatus.APPLIED
+
+
+@pytest.mark.asyncio
+async def test_partial_conversation_scope_transition_preserves_old_membership(db: Database):
+    source_id = "src-scope-transition-partial"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Teams",
+        config_json=json.dumps({"conversation_ids": ["new-thread"]}),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await db.create_projection_scope_transition(
+        ProjectionScopeTransition(
+            id="scope-transition-partial",
+            source_id=source_id,
+            previous_scope={"conversation_ids": ["old-thread"]},
+            target_scope={"conversation_ids": ["new-thread"]},
+        )
+    )
+    gene = SinceRecordingEmptyGene()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=None,
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=None,
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(gene, "Teams", source_id)
+    transition = (await db.list_projection_scope_transitions(source_id))[0]
+
+    assert state.last_sync_status == "success"
+    assert transition.status is ProjectionScopeTransitionStatus.FAILED
+    assert transition.coverage.value == "partial_projection"
+    assert "complete successful snapshot" in (transition.error or "")
+
+
+@pytest.mark.asyncio
 async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_path):
     source_id = "src-force-reprocess"
     markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
@@ -2411,8 +2606,57 @@ async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_
     assert extractor.full_calls == []
     assert len(extractor.unit_calls) == 1
     assert extractor.change_calls == []
-    assert len(memory_engine.reconcile_calls) == 1
-    assert memory_engine.reconcile_calls[0]["update_mode"] == "full_document"
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    assert memory_engine.projected_lifecycle_calls[0]["update_mode"] == "full_document"
+
+
+@pytest.mark.asyncio
+async def test_targeted_recovery_skips_unchanged_documents_outside_finding_scope(
+    db: Database,
+) -> None:
+    source_id = "src-targeted-recovery"
+    markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
+    doc_store = StubDocumentStore()
+    normalized_content_uri = doc_store.store_normalized(
+        source_id=source_id,
+        title="Design Doc",
+        markdown=markdown,
+    )
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown=markdown,
+        version="2",
+        normalized_content_uri=normalized_content_uri,
+    )
+    extractor = RecordingMemoryExtractor()
+    memory_engine = RecordingMemoryEngine()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        enricher=DocumentVisibleEnricher(db, source_id),
+        memory_extractor=extractor,
+        memory_engine=memory_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=UpdatingDocumentGene(markdown, version="2"),
+        source_name="Documents",
+        source_id=source_id,
+        force_full_sync=True,
+        reprocess_doc_ids=frozenset({"another-doc"}),
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_processed == 1
+    assert state.docs_updated == 0
+    assert extractor.full_calls == []
+    assert extractor.unit_calls == []
+    assert memory_engine.projected_lifecycle_calls == []
 
 
 @pytest.mark.asyncio
@@ -2446,11 +2690,11 @@ async def test_document_last_modified_becomes_memory_source_updated_at(db: Datab
     )
 
     assert state.last_sync_status == "success"
-    assert len(memory_engine.reconcile_calls) == 0
+    assert len(memory_engine.projected_lifecycle_calls) == 1
     # No source-specific metadata was supplied; document last_modified is the
     # canonical source-side update time forwarded into memory provenance.
-    assert len(memory_engine.process_memories_calls) == 1
-    assert memory_engine.process_memories_calls[0]["source_updated_at"] == last_modified
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    assert memory_engine.projected_lifecycle_calls[0]["source_updated_at"] == last_modified
 
 
 @pytest.mark.asyncio
@@ -2489,20 +2733,38 @@ async def test_explicit_source_updated_at_overrides_document_last_modified(db: D
     )
 
     assert state.last_sync_status == "success"
-    assert len(memory_engine.process_memories_calls) == 1
-    assert memory_engine.process_memories_calls[0]["source_updated_at"].isoformat() == explicit_source_updated_at
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    assert memory_engine.projected_lifecycle_calls[0]["source_updated_at"].isoformat() == explicit_source_updated_at
 
 
 @pytest.mark.asyncio
 async def test_deletion_failure_marks_sync_failed(db: Database):
     source_id = "src-deletion-failure"
     await _insert_source_and_doc(db, source_id)
+    item = ContentItem(
+        item_id="doc-1",
+        title="Doc 1",
+        source_url="http://example/doc-1",
+        last_modified=datetime.now(timezone.utc),
+        version="1",
+        extra={"page_id": "doc-1", "space_key": "ARCH"},
+    )
+    raw = RawContent(item=item, body=b"Document body", content_type="text/html")
+    projection = project_source_item(
+        source_id=source_id,
+        source_type="confluence",
+        run_id="projection-before-delete-failure",
+        item=item,
+        raw=raw,
+        normalized=NormalizedContent(item=item, markdown_body="Document body"),
+    )
+    await db.record_source_projection(projection)
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
         enricher=None,
         memory_extractor=None,
-        memory_engine=None,
+        memory_engine=NoopMemoryEngine(),
         memory_store=FailingDocumentDeleteMemoryStore(),
     )
 
@@ -4238,6 +4500,69 @@ async def test_document_is_indexed_before_enrichment(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: Database):
+    source_id = "src-github-move"
+    await db.upsert_source(
+        id=source_id,
+        type="github_repo",
+        name="Payroll Repo",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    extractor = RecordingMemoryExtractor()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=extractor,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    first = await orchestrator.sync_gene(
+        gene=MovingGithubFileGene(
+            item_id="github-old-design",
+            relative_path="old/design.md",
+        ),
+        source_name="Payroll Repo",
+        source_id=source_id,
+    )
+    extraction_calls_after_first = (
+        len(extractor.full_calls) + len(extractor.change_calls) + len(extractor.unit_calls)
+    )
+    moved = await orchestrator.sync_gene(
+        gene=MovingGithubFileGene(
+            item_id="github-new-design",
+            relative_path="new/design.md",
+            previous_filename="old/design.md",
+        ),
+        source_name="Payroll Repo",
+        source_id=source_id,
+    )
+
+    assert first.last_sync_status == "success"
+    assert moved.last_sync_status == "success"
+    assert extraction_calls_after_first > 0
+    assert (
+        len(extractor.full_calls) + len(extractor.change_calls) + len(extractor.unit_calls)
+    ) == extraction_calls_after_first
+    assert await db.get_document("github-old-design") is None
+    assert await db.get_document("github-new-design") is not None
+    assert await db.get_metadata("github-new-design") is not None
+    unit_rows = await db.db.execute_fetchall(
+        "SELECT id FROM source_units WHERE source_id = ?",
+        (source_id,),
+    )
+    assert len(unit_rows) == 1
+    assert await db.list_source_unit_document_ids(str(unit_rows[0]["id"])) == (
+        "github-new-design",
+        "github-old-design",
+    )
+
+
+@pytest.mark.asyncio
 async def test_full_document_extraction_failure_is_audited(db: Database):
     source_id = "src-full-extraction-failure"
     await db.upsert_source(
@@ -4335,11 +4660,11 @@ async def test_document_update_uses_diff_guided_extraction_and_audits_strategy(
     assert "PostgreSQL 14" in extractor.change_calls[0]["changed_hunks"]
     assert "PostgreSQL 15" in extractor.change_calls[0]["changed_hunks"]
     assert extractor.change_calls[0]["updated_document"] == new_markdown
-    assert len(memory_engine.reconcile_calls) == 1
-    assert memory_engine.reconcile_calls[0]["update_mode"] == "diff_guided"
-    assert "PostgreSQL 15" in memory_engine.reconcile_calls[0]["changed_hunks"]
-    assert memory_engine.reconcile_calls[0]["update_plan_stats"]["reason"] == "small_diff"
-    assert memory_engine.reconcile_calls[0]["update_plan_stats"]["data_shape"] == "document"
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    assert memory_engine.projected_lifecycle_calls[0]["update_mode"] == "diff_guided"
+    assert "PostgreSQL 15" in memory_engine.projected_lifecycle_calls[0]["changed_hunks"]
+    assert memory_engine.projected_lifecycle_calls[0]["update_plan_stats"]["reason"] == "small_diff"
+    assert memory_engine.projected_lifecycle_calls[0]["update_plan_stats"]["data_shape"] == "document"
     assert len(audit_rows) == 1
     assert audit_rows[0].doc_id == "doc-1"
     assert audit_rows[0].source_id == source_id
@@ -4412,10 +4737,10 @@ async def test_structured_source_update_uses_diff_guided_extraction_and_audits_s
     assert "Status: In Progress" in extractor.change_calls[0]["changed_hunks"]
     assert "Status: Done" in extractor.change_calls[0]["changed_hunks"]
     assert extractor.change_calls[0]["source_type"] == "jira"
-    assert len(memory_engine.reconcile_calls) == 1
-    assert memory_engine.reconcile_calls[0]["update_mode"] == "diff_guided"
-    assert memory_engine.reconcile_calls[0]["update_plan_stats"]["reason"] == "small_diff"
-    assert memory_engine.reconcile_calls[0]["update_plan_stats"]["data_shape"] == "ticket"
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    assert memory_engine.projected_lifecycle_calls[0]["update_mode"] == "diff_guided"
+    assert memory_engine.projected_lifecycle_calls[0]["update_plan_stats"]["reason"] == "small_diff"
+    assert memory_engine.projected_lifecycle_calls[0]["update_plan_stats"]["data_shape"] == "ticket"
     assert len(audit_rows) == 1
     assert audit_rows[0].decision == "diff_guided"
     assert audit_rows[0].reason == "small_diff"
@@ -4614,11 +4939,90 @@ async def test_partial_unit_extraction_failure_skips_reconciliation(db: Database
     assert state.docs_failed == 1
     assert state.failed_docs
     assert "partial_unit_failure" in state.failed_docs[0].error
-    assert len(memory_engine.reconcile_calls) == 0
+    assert len(memory_engine.projected_lifecycle_calls) == 0
     assert len(audit_rows) == 3
     assert audit_rows[0].reason == "partial_unit_failure"
     assert audit_rows[0].payload["failed_unit_count"] == 1
     assert audit_rows[0].payload["extracted_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(db: Database):
+    source_id = "src-lifecycle-retry"
+    old_markdown = "# Design Doc\n\nThe service uses PostgreSQL 14."
+    new_markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Documents",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    doc_store = StubDocumentStore()
+
+    first = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        enricher=DocumentVisibleEnricher(db, source_id),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+    )
+    first_state = await first.sync_gene(
+        gene=UpdatingDocumentGene(old_markdown, version="1"),
+        source_name="Documents",
+        source_id=source_id,
+    )
+    source_unit = await db.find_source_unit_by_document_id(source_id, "doc-1")
+    assert first_state.last_sync_status == "success"
+    assert source_unit is not None
+    prior_revision = await db.get_current_source_unit_revision(source_unit.id)
+    prior_document = await db.get_document("doc-1")
+    assert prior_revision is not None and prior_document is not None
+
+    failing_engine = FailingProjectedMemoryEngine()
+    failed = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        enricher=DocumentVisibleEnricher(db, source_id),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=failing_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+    failed_state = await failed.sync_gene(
+        gene=UpdatingDocumentGene(new_markdown, version="2"),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    assert failed_state.last_sync_status == "failed"
+    assert failing_engine.calls == 3
+    assert (await db.get_current_source_unit_revision(source_unit.id)).id == prior_revision.id  # type: ignore[union-attr]
+    assert (await db.get_document("doc-1")).content_hash == prior_document.content_hash  # type: ignore[union-attr]
+
+    retry_engine = RecordingMemoryEngine()
+    retry = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        enricher=DocumentVisibleEnricher(db, source_id),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=retry_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+    retry_state = await retry.sync_gene(
+        gene=UpdatingDocumentGene(new_markdown, version="2"),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    assert retry_state.last_sync_status == "success"
+    assert len(retry_engine.projected_lifecycle_calls) == 1
+    current_revision = await db.get_current_source_unit_revision(source_unit.id)
+    assert current_revision is not None and current_revision.id != prior_revision.id
 
 
 @pytest.mark.asyncio

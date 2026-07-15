@@ -469,11 +469,17 @@ class ConfluenceGene(Gene):
         page_id = item.extra.get("page_id", item.item_id.replace("confluence-", ""))
         resp = await self._get(
             f"{self._api_prefix}/rest/api/content/{page_id}",
-            params={"expand": "body.storage,version"},
+            params={"expand": "body.storage,version,ancestors,space"},
         )
         data = self._json_response(resp, f"fetching page content {page_id}")
 
         body_html = data.get("body", {}).get("storage", {}).get("value", "")
+        ancestors = data.get("ancestors") if isinstance(data.get("ancestors"), list) else []
+        parent = ancestors[-1] if ancestors and isinstance(ancestors[-1], dict) else {}
+        item.extra["parent_page_id"] = str(parent.get("id") or "") or None
+        item.extra["space_key"] = str(
+            (data.get("space") or {}).get("key") or item.extra.get("space_key") or item.space_or_project
+        )
 
         return RawContent(
             item=item,
@@ -540,6 +546,9 @@ class ConfluenceGene(Gene):
             item=raw.item,
             markdown_body=full_markdown,
             source_semantics={
+                # Provider-neutral projection hashes this body rather than the
+                # display header, whose Last modified/author fields are operational.
+                "semantic_markdown": markdown,
                 "space_key": raw.item.space_or_project,
                 "labels": raw.item.labels,
                 "author": raw.item.author,
