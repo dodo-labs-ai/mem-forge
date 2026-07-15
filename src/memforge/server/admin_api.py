@@ -3787,9 +3787,27 @@ def create_admin_app(
                 execution_mode=SourceSyncMode.PROJECTION_REPAIR,
             )
             if state.last_sync_status != "success":
-                raise RuntimeError(
-                    "targeted lifecycle recovery sync did not complete successfully: "
-                    f"{state.last_sync_status}: {state.error_message or 'unknown error'}"
+                unavailable_error = "requested document was not returned by provider discovery"
+                unavailable_docs = [
+                    failed_doc
+                    for failed_doc in state.failed_docs
+                    if failed_doc.error == unavailable_error
+                ]
+                unexpected_failures = [
+                    failed_doc
+                    for failed_doc in state.failed_docs
+                    if failed_doc.error != unavailable_error
+                ]
+                if unexpected_failures or not unavailable_docs:
+                    raise RuntimeError(
+                        "targeted lifecycle projection repair did not complete safely: "
+                        f"{state.last_sync_status}: {state.error_message or 'unknown error'}"
+                    )
+                logger.warning(
+                    "Projection repair left %d unavailable document(s) for %s; "
+                    "their lifecycle findings remain open",
+                    len(unavailable_docs),
+                    source_id,
                 )
 
         try:

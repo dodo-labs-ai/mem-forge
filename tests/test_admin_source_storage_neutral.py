@@ -424,7 +424,15 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path, m
         async def run_source_sync(self, **kwargs):
             self.reprocessed_document_ids = kwargs["reprocess_doc_ids"]
             self.execution_mode = kwargs["execution_mode"]
-            return SimpleNamespace(last_sync_status="success", error_message=None)
+            return SimpleNamespace(
+                last_sync_status="partial",
+                error_message="1 document could not be synced",
+                failed_docs=[
+                    SimpleNamespace(
+                        error="requested document was not returned by provider discovery",
+                    )
+                ],
+            )
 
     async def fake_recovery_job(
         db,
