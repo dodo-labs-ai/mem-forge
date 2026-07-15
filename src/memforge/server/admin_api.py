@@ -3795,7 +3795,13 @@ def create_admin_app(
                 source_id,
                 job_id=job_id,
                 reconstruct_documents=reconstruct_documents,
-                reextract_documents=reextract_documents,
+                # Agent-session concepts are managed database records. Their
+                # historical canonical content is reconstructed above; the
+                # Gene directory is ephemeral in Cloud Foundry and is not a
+                # valid recovery source for records that predate artifacts.
+                reextract_documents=(
+                    None if str(source["type"]) == "agent_session" else reextract_documents
+                ),
             )
         except Exception:
             logger.exception("Lifecycle backfill job %s failed for source %s", job_id, source_id)
