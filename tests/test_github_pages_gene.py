@@ -143,6 +143,25 @@ class RunbooksRepoApiClient(RecordingAsyncClient):
         return await super().get(url, **_kwargs)
 
 
+class TruncatedRepoApiClient(RepoApiClient):
+    async def get(self, url: str, **_kwargs):
+        if url.endswith("/api/v3/repos/org/repo/git/trees/main?recursive=1"):
+            return RepoApiResponse(
+                {
+                    "truncated": True,
+                    "tree": [
+                        {
+                            "path": "docs/cloud-native-platform/process-tracking.md",
+                            "type": "blob",
+                            "sha": "blob-sha-123",
+                        }
+                    ],
+                },
+                url=url,
+            )
+        return await super().get(url, **_kwargs)
+
+
 class SitemapClient(RecordingAsyncClient):
     async def get(self, url: str, **_kwargs):
         self.calls.append(("GET", url))
@@ -321,6 +340,28 @@ async def test_github_pat_subtree_discovers_repository_markdown_without_crawling
     ]
     assert all(item.version.endswith("-sha") for item in items)
     assert not any("/sitemap.xml" in url for _, url in RunbooksRepoApiClient.instances[-1].calls)
+
+
+@pytest.mark.asyncio
+async def test_github_pat_subtree_fails_closed_when_recursive_tree_is_truncated(monkeypatch):
+    RecordingAsyncClient.instances.clear()
+    monkeypatch.setattr(
+        "memforge.genes.github_pages_gene._RequestsAsyncClient",
+        TruncatedRepoApiClient,
+    )
+    gene = GitHubPagesGene(
+        config={
+            "auth_mode": "github_pat",
+            "pat": "github-secret",
+            "sync_mode": "subtree",
+            "root_url": "https://github-pages.example.test/pages/org/repo/cloud-native-platform/",
+        },
+        source_id="src-pages",
+    )
+
+    await gene.authenticate()
+    with pytest.raises(RuntimeError, match="GitHub tree response was truncated"):
+        _ = [item async for item in gene.discover()]
 
 
 @pytest.mark.asyncio

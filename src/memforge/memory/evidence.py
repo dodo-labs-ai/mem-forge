@@ -84,6 +84,19 @@ class MemorySupportAssertion:
     removed_at: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ActiveSupportEvidence:
+    """The source excerpt and Anchor behind one active Support Assertion."""
+
+    memory_id: str
+    source_id: str
+    reference_id: str
+    evidence_unit_id: str
+    role: EvidenceRole
+    anchor: SourceAnchor
+    excerpt: str | None
+
+
 def validate_evidence_references(
     references: tuple[EvidenceReference, ...],
     *,

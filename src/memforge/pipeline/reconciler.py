@@ -312,6 +312,7 @@ def _parse_decisions(
                 evidence_quote=raw.evidence_quote,
                 evidence_anchor=raw.evidence_anchor,
                 source_observation_id=raw.source_observation_id,
+                required_source_observation_ids=list(raw.required_source_observation_ids),
             )
             ops.append(
                 ReconcileOperation(

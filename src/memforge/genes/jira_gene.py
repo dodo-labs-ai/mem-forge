@@ -194,7 +194,24 @@ def _issue_payload_from_search(issue: dict, config: dict) -> dict:
     else:
         payload["_comments"] = []
 
+    _mark_changelog_completeness(payload)
     return payload
+
+
+def _mark_changelog_completeness(payload: dict) -> None:
+    """Make Jira's embedded changelog pagination explicit to projection."""
+
+    changelog = payload.get("changelog")
+    if not isinstance(changelog, dict):
+        return
+    histories = changelog.get("histories")
+    returned = len(histories) if isinstance(histories, list) else 0
+    total = changelog.get("total")
+    if isinstance(total, int) and total > returned:
+        payload["_changelog_truncated"] = {
+            "returned": returned,
+            "total": total,
+        }
 
 
 def _issue_content_item(issue: dict, base_url: str) -> ContentItem:
@@ -504,6 +521,7 @@ class JiraGene(Gene):
             params={"expand": "changelog,renderedFields"},
         )
         data = resp.json()
+        _mark_changelog_completeness(data)
 
         # Fetch comments separately if configured
         include_comments = _bool_config(self.config, "include_comments", True)

@@ -270,11 +270,13 @@ class SourceProjection:
             raise ValueError("every observation must reference a projected source unit")
         if any(item.source_id != self.source_id for item in self.observations):
             raise ValueError("all observations must belong to the projection source")
-        if any(
-            item.observation_id not in observations_by_id
-            for item in self.observation_revisions
-        ):
-            raise ValueError("every Observation Revision must reference a projected Observation")
+        for item in self.observation_revisions:
+            if item.observation_id in observations_by_id:
+                continue
+            if not item.metadata.get("carried_forward"):
+                raise ValueError(
+                    "every Observation Revision must reference a projected Observation"
+                )
         for unit_revision in self.source_unit_revisions:
             if unit_revision.source_unit_id not in unit_ids:
                 raise ValueError("every Source Unit Revision must reference a projected Source Unit")
@@ -282,8 +284,15 @@ class SourceProjection:
                 observation_revision = observation_revisions_by_id.get(observation_revision_id)
                 if observation_revision is None:
                     raise ValueError("Source Unit Revision references an unknown Observation Revision")
-                observation = observations_by_id[observation_revision.observation_id]
-                if observation.source_unit_id != unit_revision.source_unit_id:
+                observation = observations_by_id.get(observation_revision.observation_id)
+                carried_unit_id = observation_revision.metadata.get("source_unit_id")
+                if (
+                    observation is not None
+                    and observation.source_unit_id != unit_revision.source_unit_id
+                ) or (
+                    observation is None
+                    and carried_unit_id != unit_revision.source_unit_id
+                ):
                     raise ValueError("Source Unit Revision references another unit's Observation")
         for delta in self.deltas:
             if delta.source_unit_id not in unit_ids:
@@ -337,6 +346,8 @@ class ProjectionStore(Protocol):
         self,
         source_id: str,
         document_id: str,
+        *,
+        current_only: bool = False,
     ) -> SourceUnit | None: ...
     async def list_source_unit_document_ids(
         self,

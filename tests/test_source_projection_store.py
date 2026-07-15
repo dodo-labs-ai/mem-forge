@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -154,11 +155,176 @@ async def test_source_projection_round_trips_as_one_atomic_record(db: Database) 
 
 
 @pytest.mark.asyncio
+async def test_document_write_rejects_deleted_or_missing_source(db: Database) -> None:
+    document = DocumentRecord(
+        doc_id="confluence-page-1",
+        source="src-1",
+        source_url="https://example.test/page-1",
+        title="Page 1",
+        space_or_project="ENG",
+        author=None,
+        last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc),
+        labels=[],
+        version="1",
+        content_hash="hash-1",
+        token_count=0,
+        raw_content_uri=None,
+        raw_content_type=None,
+        normalized_content_uri=None,
+        pdf_content_uri=None,
+        last_synced=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    await db.upsert_document(document, require_configured_source=True)
+    await db.db.execute("DELETE FROM sources WHERE id = ?", ("src-1",))
+    await db.db.commit()
+
+    with pytest.raises(ValueError, match="Source does not exist"):
+        await db.upsert_document(document, require_configured_source=True)
+    with pytest.raises(ValueError, match="Source does not exist"):
+        await db.restore_document_snapshot(
+            document,
+            require_configured_source=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_synthetic_document_write_does_not_require_configured_source(db: Database) -> None:
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    document = DocumentRecord(
+        doc_id="user-memory-1",
+        source="user_memory",
+        source_url="memforge://user-memory/user-memory-1",
+        title="User memory",
+        space_or_project="UNSORTED",
+        author="owner-1",
+        last_modified=now,
+        labels=["user_memory"],
+        version="1",
+        content_hash="user-memory-hash-1",
+        token_count=3,
+        raw_content_uri=None,
+        raw_content_type=None,
+        normalized_content_uri=None,
+        pdf_content_uri=None,
+        last_synced=now,
+    )
+
+    await db.upsert_document(document)
+
+    stored = await db.get_document(document.doc_id)
+    assert stored is not None
+    assert (stored.doc_id, stored.source, stored.content_hash) == (
+        document.doc_id,
+        document.source,
+        document.content_hash,
+    )
+
+
+@pytest.mark.asyncio
+async def test_configured_document_write_serializes_with_cross_process_source_delete(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = str(tmp_path / "source-write-race.db")
+    writer = Database(db_path)
+    deleter = Database(db_path)
+    await writer.connect()
+    await deleter.connect()
+    await writer.upsert_source(
+        id="src-race",
+        type="confluence",
+        name="Race source",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    document = DocumentRecord(
+        doc_id="doc-race",
+        source="src-race",
+        source_url="https://example.test/doc-race",
+        title="Race document",
+        space_or_project="ENG",
+        author=None,
+        last_modified=now,
+        labels=[],
+        version="1",
+        content_hash="race-hash-1",
+        token_count=3,
+        raw_content_uri=None,
+        raw_content_type=None,
+        normalized_content_uri=None,
+        pdf_content_uri=None,
+        last_synced=now,
+    )
+    source_fenced = asyncio.Event()
+    release_writer = asyncio.Event()
+    original_assert = writer._assert_document_source_writable_unlocked
+
+    async def assert_then_pause(
+        source_id: str,
+        *,
+        require_configured_source: bool,
+    ) -> None:
+        await original_assert(
+            source_id,
+            require_configured_source=require_configured_source,
+        )
+        source_fenced.set()
+        await release_writer.wait()
+
+    monkeypatch.setattr(
+        writer,
+        "_assert_document_source_writable_unlocked",
+        assert_then_pause,
+    )
+    try:
+        write_task = asyncio.create_task(
+            writer.upsert_document(
+                document,
+                require_configured_source=True,
+            )
+        )
+        await asyncio.wait_for(source_fenced.wait(), timeout=1)
+        delete_task = asyncio.create_task(deleter.delete_source_cascade("src-race"))
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(delete_task), timeout=0.05)
+
+        release_writer.set()
+        await write_task
+        await delete_task
+
+        assert await deleter.get_source("src-race") is None
+        assert await deleter.get_document("doc-race") is None
+    finally:
+        release_writer.set()
+        await writer.close()
+        await deleter.close()
+
+
+@pytest.mark.asyncio
 async def test_identical_projection_retry_is_idempotent(db: Database) -> None:
     projection = _projection()
+    other = Database(db.db_path)
+    await other.connect()
 
-    await db.record_source_projection(projection)
-    await db.record_source_projection(projection)
+    try:
+        await db.record_source_projection(projection)
+        await db.record_source_projection(projection)
+        await asyncio.wait_for(
+            other.upsert_source(
+                id="src-after-projection-retry",
+                type="confluence",
+                name="Writer lock probe",
+                config_json="{}",
+                access_policy="workspace",
+                owner_user_id="owner-1",
+            ),
+            timeout=1,
+        )
+    finally:
+        await other.close()
 
     assert await db.get_source_projection(projection.run_id) == projection
 
@@ -241,8 +407,14 @@ async def test_stable_unit_preserves_document_lineage_across_move(db: Database) 
         "src-1",
         "confluence-page-1",
     )
+    historical_current = await db.find_source_unit_by_document_id(
+        "src-1",
+        "confluence-page-1",
+        current_only=True,
+    )
     assert current == moved.source_units[0]
     assert historical == moved.source_units[0]
+    assert historical_current is None
 
 
 @pytest.mark.asyncio
@@ -330,6 +502,10 @@ async def test_tombstone_preserves_unit_history_and_clears_removed_observation_c
         observation_revision_ids=(),
         observed_at="2026-07-15T01:00:00Z",
     )
+    tombstone_unit = replace(
+        unit,
+        locator={**unit.locator, "tombstone_reason": "removed"},
+    )
     tombstone = SourceProjection(
         run_id="projection-run-tombstone",
         source_id=initial.source_id,
@@ -338,7 +514,7 @@ async def test_tombstone_preserves_unit_history_and_clears_removed_observation_c
         coverage=ProjectionCoverage.TOMBSTONED_DELTA,
         observations=(),
         observation_revisions=(),
-        source_units=(unit,),
+        source_units=(tombstone_unit,),
         source_unit_revisions=(tombstone_revision,),
         relations=(),
         deltas=(
@@ -361,6 +537,46 @@ async def test_tombstone_preserves_unit_history_and_clears_removed_observation_c
     assert await db.get_current_source_unit_revision(unit.id) == tombstone_revision
     assert await db.get_current_source_observation_revisions(unit.id) == {}
     assert await db.get_source_projection(initial.run_id) == initial
+    assert await db.find_source_unit_by_document_id(
+        initial.source_id,
+        str(unit.locator["document_id"]),
+        current_only=True,
+    ) is None
+    historical_tombstone = await db.find_source_unit_by_document_id(
+        initial.source_id,
+        str(unit.locator["document_id"]),
+    )
+    assert historical_tombstone == tombstone_unit
+
+    reincarnated = replace(
+        initial,
+        run_id="projection-run-after-recreate",
+        source_units=(
+            replace(unit, id="unit-page-1-recreated", provider_key="page-1#recreated"),
+        ),
+        observations=(),
+        observation_revisions=(),
+        source_unit_revisions=(
+            SourceUnitRevision(
+                id="unitrev-page-1-recreated",
+                source_unit_id="unit-page-1-recreated",
+                semantic_hash="recreated-hash",
+                observation_revision_ids=(),
+            ),
+        ),
+        deltas=(),
+        checkpoint={"recreated": True},
+    )
+    await db.record_source_projection(reincarnated)
+
+    current_recreated = await db.find_source_unit_by_document_id(
+        initial.source_id,
+        str(unit.locator["document_id"]),
+        current_only=True,
+    )
+    assert current_recreated is not None
+    assert current_recreated.id == "unit-page-1-recreated"
+    assert current_recreated.id != unit.id
 
 
 @pytest.mark.asyncio

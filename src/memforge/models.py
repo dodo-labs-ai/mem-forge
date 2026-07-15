@@ -50,6 +50,11 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# Provenance documents written by direct user lifecycle operations are virtual:
+# they intentionally do not correspond to a configured Source row.
+VIRTUAL_DOCUMENT_SOURCE_IDS = frozenset({"user_memory", "user_correction"})
+
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -203,6 +208,8 @@ class RawMemory:
     evidence_quote: str | None = None
     evidence_anchor: str | None = None
     source_observation_id: str | None = None
+    required_source_observation_ids: list[str] = field(default_factory=list)
+    support_validation: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -550,6 +557,14 @@ class SourceArtifactCleanupTask:
 
 @dataclass(frozen=True)
 class SourceDeletionResult:
+    retired_memory_ids: tuple[str, ...] = ()
+    retired_search_cleanup_required: bool = True
+
+
+@dataclass(frozen=True)
+class SourceLifecycleResetResult:
+    """Derived-state cleanup outcome for an in-place source rebaseline."""
+
     retired_memory_ids: tuple[str, ...] = ()
     retired_search_cleanup_required: bool = True
 

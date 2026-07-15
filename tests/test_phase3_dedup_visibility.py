@@ -47,7 +47,7 @@ def _mem(mid, content, *, visibility=WORKSPACE, owner=None, project_key=SHARED_P
         id=mid,
         memory_type="fact",
         content=content,
-        content_hash=content_hash(content + mid),
+        content_hash=content_hash(content),
         visibility=visibility,
         owner_user_id=owner,
         project_key=project_key,
@@ -208,3 +208,85 @@ async def test_private_write_does_not_corroborate_other_users_private(db, monkey
         source_updated_at=None,
     )
     assert result == "inserted"
+
+
+@pytest.mark.asyncio
+async def test_projected_equivalence_uses_exact_claim_not_vector_proximity(db, monkeypatch):
+    incumbent = _mem("m-incumbent", "A7 is retained.", project_key="RISK")
+    await db.insert_memory(incumbent)
+    adapters = build_sqlite_adapters(
+        db,
+        memory_collection=_FakeColl(seeded=[incumbent.id]),
+    )
+    store = MemoryStore(
+        adapters.relational,
+        adapters.keyword,
+        adapters.vector,
+        embed_cfg={},
+        dedup_threshold=0.08,
+    )
+
+    async def _stub_embed(_text):
+        return [0.1, 0.1, 0.1]
+
+    monkeypatch.setattr(store, "_embed", _stub_embed)
+
+    conflicting = _mem("m-conflict", "A7 is removed.", project_key="PAY")
+
+    assert [item.id for item in await store.find_access_compatible_equivalence_candidates(conflicting)] == [
+        incumbent.id
+    ]
+
+
+@pytest.mark.asyncio
+async def test_projected_equivalence_crosses_project_relevance_boundary(db, monkeypatch):
+    incumbent = _mem("m-incumbent", "A7 is retained.", project_key="RISK")
+    await db.insert_memory(incumbent)
+    adapters = build_sqlite_adapters(
+        db,
+        memory_collection=_FakeColl(seeded=[incumbent.id]),
+    )
+    store = MemoryStore(
+        adapters.relational,
+        adapters.keyword,
+        adapters.vector,
+        embed_cfg={},
+        dedup_threshold=0.08,
+    )
+
+    async def _stub_embed(_text):
+        return [0.1, 0.1, 0.1]
+
+    monkeypatch.setattr(store, "_embed", _stub_embed)
+
+    same_claim = _mem("m-equivalent", "A7 is retained.", project_key="PAY")
+    candidates = await store.find_access_compatible_equivalence_candidates(same_claim)
+
+    assert [item.id for item in candidates] == [incumbent.id]
+
+
+@pytest.mark.asyncio
+async def test_projected_equivalence_does_not_cross_repository_access_identity(db, monkeypatch):
+    incumbent = _mem("m-incumbent", "A7 is retained.", project_key="RISK")
+    incumbent.repo_identifier = "repo-a"
+    await db.insert_memory(incumbent)
+    adapters = build_sqlite_adapters(
+        db,
+        memory_collection=_FakeColl(seeded=[incumbent.id]),
+    )
+    store = MemoryStore(
+        adapters.relational,
+        adapters.keyword,
+        adapters.vector,
+        embed_cfg={},
+        dedup_threshold=0.08,
+    )
+
+    async def _stub_embed(_text):
+        return [0.1, 0.1, 0.1]
+
+    monkeypatch.setattr(store, "_embed", _stub_embed)
+    candidate = _mem("m-equivalent", "A7 is retained.", project_key="PAY")
+    candidate.repo_identifier = "repo-b"
+
+    assert await store.find_access_compatible_equivalence_candidates(candidate) == ()

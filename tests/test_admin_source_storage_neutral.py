@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
@@ -17,7 +18,9 @@ from memforge.memory.lifecycle_plan import (
     LifecycleGateState,
 )
 from memforge.pipeline.sync import SourceSyncMode
+from memforge.runtime import DefaultRuntimeProvider
 from memforge.server.admin_api import create_admin_app
+from memforge.storage.database import Database
 
 
 def _config(tmp_path) -> AppConfig:
@@ -483,6 +486,82 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path, m
     assert payload["vector_outbox"] == []
     assert runtime_provider.reprocessed_document_ids == frozenset({"doc-1"})
     assert runtime_provider.execution_mode is SourceSyncMode.PROJECTION_REPAIR
+
+
+def test_source_rebaseline_endpoint_is_confirmation_bound_and_completes_replay(tmp_path):
+    class SuccessfulReplayProvider(DefaultRuntimeProvider):
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def run_source_sync(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(last_sync_status="success", error_message=None)
+
+    database = Database(str(tmp_path / "rebaseline-api.db"))
+
+    async def setup() -> None:
+        await database.connect()
+        await database.upsert_source(
+            id="src-replayable",
+            type="confluence",
+            name="Replayable",
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="user-a",
+        )
+        await database.upsert_source(
+            id="src-agent",
+            type="agent_session",
+            name="Managed Agent Session",
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="user-a",
+        )
+
+    asyncio.run(setup())
+    provider = SuccessfulReplayProvider()
+    app = create_admin_app(
+        db=database,
+        config=_config(tmp_path),
+        runtime_provider=provider,
+        principal_resolver=lambda request: "user-a",
+    )
+    try:
+        with TestClient(app) as client:
+            mismatch = client.post(
+                "/api/sources/src-replayable/memory-lifecycle/rebaseline",
+                json={"confirm_source_id": "src-other"},
+            )
+            agent = client.post(
+                "/api/sources/src-agent/memory-lifecycle/rebaseline",
+                json={"confirm_source_id": "src-agent"},
+            )
+            accepted = client.post(
+                "/api/sources/src-replayable/memory-lifecycle/rebaseline",
+                json={"confirm_source_id": "src-replayable"},
+            )
+
+        assert mismatch.status_code == 409, mismatch.text
+        assert agent.status_code == 409, agent.text
+        assert accepted.status_code == 202, accepted.text
+        assert accepted.json()["operation"] == "source_rebaseline"
+
+        async def inspect():
+            return (
+                await database.list_lifecycle_backfill_jobs("src-replayable"),
+                await database.get_lifecycle_gate("src-replayable"),
+            )
+
+        jobs, gate = asyncio.run(inspect())
+        assert len(jobs) == 1
+        assert jobs[0].status is LifecycleBackfillJobStatus.COMPLETED
+        assert jobs[0].finding_count == 0
+        assert gate.state is LifecycleGateState.ENABLED
+        assert len(provider.calls) == 1
+        assert provider.calls[0]["force_full_sync"] is True
+        assert provider.calls[0]["execution_mode"] is SourceSyncMode.NORMAL
+    finally:
+        asyncio.run(database.close())
 
 
 def test_source_lifecycle_finding_repair_returns_exact_lineage_and_gate_state(

@@ -63,6 +63,7 @@ from memforge.source_projection import (
     ProjectionRunMode,
     SourceProjection,
     SourceProjectionAdapter,
+    SourceRelationType,
 )
 from memforge.source_projection_config import canonical_projection_scope
 
@@ -1244,16 +1245,49 @@ class GeneSyncOrchestrator:
         source_metadata = gene.metadata()
         source_type = source_metadata.name
         source_shape = source_metadata.data_shape
+        async with self._db_lock:
+            persisted_source_unit = await self.db.find_source_unit_by_document_id(
+                source_id,
+                item.item_id,
+                current_only=True,
+            )
+            historical_source_unit = (
+                None
+                if persisted_source_unit is not None
+                else await self.db.find_source_unit_by_document_id(
+                    source_id,
+                    item.item_id,
+                )
+            )
+        probe_scope: dict[str, object] = {
+            "configured_scope": dict(projection_scope or {}),
+            "document_id": item.item_id,
+        }
+        if persisted_source_unit is not None:
+            # Document lineage is the durable identity bridge after an
+            # authoritative rename.  Reuse both immutable Unit id and provider
+            # key on subsequent ordinary snapshots that no longer carry the
+            # one-time previous_filename signal.
+            probe_scope.update(
+                {
+                    "source_unit_id": persisted_source_unit.id,
+                    "source_unit_provider_key": persisted_source_unit.provider_key,
+                }
+            )
+        elif historical_source_unit is not None:
+            # Reusing a historical locator after its former Unit moved is a
+            # new incarnation, not a move back. Seed a distinct identity once;
+            # subsequent snapshots bind through the new current document row.
+            probe_scope["source_unit_incarnation"] = (
+                f"{historical_source_unit.id}:{item.version}"
+            )
         projection_probe = await self.source_projection_adapter.project(
             ProjectionEnvelope(
                 request=ProjectionRequest(
                     run_id="projection-probe",
                     source_id=source_id,
                     source_type=source_type,
-                    scope={
-                        "configured_scope": dict(projection_scope or {}),
-                        "document_id": item.item_id,
-                    },
+                    scope=probe_scope,
                     run_mode=ProjectionRunMode.FULL_SNAPSHOT,
                     scope_transition=scope_transition,
                     access_context=dict(projection_access_context or {}),
@@ -1263,6 +1297,46 @@ class GeneSyncOrchestrator:
                 normalized=normalized,
             )
         )
+        if persisted_source_unit is None:
+            predecessor_document_ids = {
+                str(relation.metadata.get("predecessor_document_id"))
+                for relation in projection_probe.relations
+                if relation.relation_type is SourceRelationType.RENAMED_FROM
+                and relation.metadata.get("predecessor_document_id")
+            }
+            for predecessor_document_id in sorted(predecessor_document_ids):
+                async with self._db_lock:
+                    predecessor_unit = await self.db.find_source_unit_by_document_id(
+                        source_id,
+                        predecessor_document_id,
+                        current_only=True,
+                    )
+                if predecessor_unit is None:
+                    continue
+                persisted_source_unit = predecessor_unit
+                probe_scope.update(
+                    {
+                        "source_unit_id": predecessor_unit.id,
+                        "source_unit_provider_key": predecessor_unit.provider_key,
+                    }
+                )
+                projection_probe = await self.source_projection_adapter.project(
+                    ProjectionEnvelope(
+                        request=ProjectionRequest(
+                            run_id="projection-probe",
+                            source_id=source_id,
+                            source_type=source_type,
+                            scope=probe_scope,
+                            run_mode=ProjectionRunMode.FULL_SNAPSHOT,
+                            scope_transition=scope_transition,
+                            access_context=dict(projection_access_context or {}),
+                        ),
+                        item=item,
+                        raw=raw,
+                        normalized=normalized,
+                    )
+                )
+                break
         source_unit = projection_probe.source_units[0]
 
         projection_run_id = f"{run_id or 'direct'}:{source_unit.id}:{projection_probe.source_unit_revisions[0].id}"
@@ -1280,6 +1354,7 @@ class GeneSyncOrchestrator:
                             scope={
                                 "configured_scope": dict(projection_scope or {}),
                                 "source_unit_id": source_unit.id,
+                                "source_unit_provider_key": source_unit.provider_key,
                             },
                             run_mode=(
                                 ProjectionRunMode.DELTA
@@ -1463,7 +1538,10 @@ class GeneSyncOrchestrator:
         if execution_mode is SourceSyncMode.PROJECTION_REPAIR:
             stats["updated"] = existing_doc is None or not content_unchanged
             async with self._db_lock:
-                await self.db.upsert_document(doc_record)
+                await self.db.upsert_document(
+                    doc_record,
+                    require_configured_source=True,
+                )
                 await self.db.record_source_projection(projection)
             if progress_callback:
                 progress_callback(
@@ -1489,7 +1567,10 @@ class GeneSyncOrchestrator:
                 await self.memory_store.drain_lifecycle_vector_outbox()
             if vector_current:
                 async with self._db_lock:
-                    await self.db.upsert_document(doc_record)
+                    await self.db.upsert_document(
+                        doc_record,
+                        require_configured_source=True,
+                    )
                 await self._finalize_projected_document_moves(
                     predecessor_docs=lineage_predecessor_docs,
                     current_doc_id=doc_id,
@@ -1503,7 +1584,10 @@ class GeneSyncOrchestrator:
                 raise RuntimeError(f"Cannot repair stale document vector for {doc_id}: embedding config is missing")
 
             async with self._db_lock:
-                await self.db.upsert_document(doc_record)
+                await self.db.upsert_document(
+                    doc_record,
+                    require_configured_source=True,
+                )
 
             document_vector_snapshot = await self._document_vector_snapshot(doc_id)
             try:
@@ -1521,7 +1605,10 @@ class GeneSyncOrchestrator:
                 await self._restore_document_vector_snapshot(doc_id, document_vector_snapshot)
                 async with self._db_lock:
                     if existing_doc:
-                        await self.db.restore_document_snapshot(existing_doc)
+                        await self.db.restore_document_snapshot(
+                            existing_doc,
+                            require_configured_source=True,
+                        )
                     else:
                         await self.db.delete_document(doc_id)
                 raise
@@ -1572,7 +1659,10 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         document_vector_snapshot = await self._document_vector_snapshot(doc_id)
         async with self._db_lock:
-            await self.db.upsert_document(doc_record)
+            await self.db.upsert_document(
+                doc_record,
+                require_configured_source=True,
+            )
 
         # ------------------------------------------------------------------
         # 6. Call 1: Enrich document (under semaphore)
@@ -1630,7 +1720,10 @@ class GeneSyncOrchestrator:
                 await self._restore_document_vector_snapshot(doc_id, document_vector_snapshot)
                 async with self._db_lock:
                     if existing_doc:
-                        await self.db.restore_document_snapshot(existing_doc)
+                        await self.db.restore_document_snapshot(
+                            existing_doc,
+                            require_configured_source=True,
+                        )
                     else:
                         await self.db.delete_document(doc_id)
                 raise
@@ -2699,7 +2792,10 @@ class GeneSyncOrchestrator:
         await self._restore_document_vector_snapshot(doc_id, document_vector_snapshot)
         async with self._db_lock:
             if existing_doc:
-                await self.db.restore_document_snapshot(existing_doc)
+                await self.db.restore_document_snapshot(
+                    existing_doc,
+                    require_configured_source=True,
+                )
             else:
                 await self.db.delete_document(doc_id)
 

@@ -243,7 +243,7 @@ The following observations are CONTEXT only. Use them to resolve references and 
 {context_observations}
 </context_observations>
 
-Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. Prefer an empty memories array over weak or transient claims. Do not emit source metadata, routine status, questions, or secrets. Preserve conditions and source language.
+Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required. Prefer an empty memories array over weak or transient claims. Do not emit source metadata, routine status, questions, or secrets. Preserve conditions and source language.
 
 Return ONLY a JSON object with a "memories" array."""
 
@@ -489,6 +489,13 @@ class MemoryExtractor:
             memory.evidence_anchor = "projection_batch"
             memory.extraction_context = quote[:EXTRACTION_QUOTE_MAX_CHARS]
             memory.source_observation_id = source_observation_id
+            required_ids = tuple(dict.fromkeys(memory.required_source_observation_ids))
+            if (
+                source_observation_id in required_ids
+                or any(item not in batch.context_observation_ids for item in required_ids)
+            ):
+                continue
+            memory.required_source_observation_ids = list(required_ids)
             kept.append(memory)
         return MemoryExtractionResult(memories=kept)
 
@@ -512,6 +519,7 @@ class MemoryExtractor:
                     evidence_quote=memory.evidence_quote,
                     evidence_anchor=memory.evidence_anchor,
                     source_observation_id=memory.source_observation_id,
+                    required_source_observation_ids=list(memory.required_source_observation_ids),
                 )
                 for memory in response.memories
             ]

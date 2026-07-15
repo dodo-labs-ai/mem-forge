@@ -1703,6 +1703,7 @@ class BlockingFetchGene:
                 content_type="application/json",
                 space_or_project="PAY",
                 version=str(idx),
+                extra={"issue_id": str(100000 + idx), "issue_key": f"PAY-{idx}"},
             )
 
     async def fetch(self, item):
@@ -1750,6 +1751,7 @@ class TrackedFetchGene(BlockingFetchGene):
             content_type="application/json",
             space_or_project="PAY",
             version=self.prefix,
+            extra={"issue_id": "200000", "issue_key": f"PAY-{self.prefix}"},
         )
 
     async def fetch(self, item):
@@ -1845,6 +1847,7 @@ class UpdatingDocumentGene:
             content_type="text/markdown",
             space_or_project="ARCH",
             version=self.version,
+            extra={"issue_id": "300001", "issue_key": "PAY-123"},
         )
 
     async def fetch(self, item):
@@ -1884,11 +1887,21 @@ class LargeConfluenceGene(UpdatingDocumentGene):
 
 
 class MovingGithubFileGene(UpdatingDocumentGene):
-    def __init__(self, *, item_id: str, relative_path: str, previous_filename: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        item_id: str,
+        relative_path: str,
+        previous_filename: str | None = None,
+        previous_document_id: str | None = None,
+        file_lineage_id: str | None = "file-lineage-77",
+    ) -> None:
         super().__init__("# Design\n\nKeep A7.", version=relative_path)
         self.item_id = item_id
         self.relative_path = relative_path
         self.previous_filename = previous_filename
+        self.previous_document_id = previous_document_id
+        self.file_lineage_id = file_lineage_id
 
     @classmethod
     def metadata(cls):
@@ -1904,13 +1917,16 @@ class MovingGithubFileGene(UpdatingDocumentGene):
     async def discover(self, since=None):
         extra = {
             "relative_path": self.relative_path,
-            "file_lineage_id": "file-lineage-77",
             "repo_owner": "acme",
             "repo_name": "payroll",
             "repo_ref": "main",
         }
+        if self.file_lineage_id is not None:
+            extra["file_lineage_id"] = self.file_lineage_id
         if self.previous_filename is not None:
             extra["previous_filename"] = self.previous_filename
+        if self.previous_document_id is not None:
+            extra["previous_document_id"] = self.previous_document_id
         yield ContentItem(
             item_id=self.item_id,
             title="Design",
@@ -4644,6 +4660,7 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
         gene=MovingGithubFileGene(
             item_id="github-old-design",
             relative_path="old/design.md",
+            file_lineage_id=None,
         ),
         source_name="Payroll Repo",
         source_id=source_id,
@@ -4656,6 +4673,28 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
             item_id="github-new-design",
             relative_path="new/design.md",
             previous_filename="old/design.md",
+            previous_document_id="github-old-design",
+            file_lineage_id=None,
+        ),
+        source_name="Payroll Repo",
+        source_id=source_id,
+    )
+    ordinary_after_move = await orchestrator.sync_gene(
+        gene=MovingGithubFileGene(
+            item_id="github-new-design",
+            relative_path="new/design.md",
+            file_lineage_id=None,
+        ),
+        source_name="Payroll Repo",
+        source_id=source_id,
+    )
+    moved_again = await orchestrator.sync_gene(
+        gene=MovingGithubFileGene(
+            item_id="github-final-design",
+            relative_path="final/design.md",
+            previous_filename="new/design.md",
+            previous_document_id="github-new-design",
+            file_lineage_id=None,
         ),
         source_name="Payroll Repo",
         source_id=source_id,
@@ -4663,22 +4702,51 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
 
     assert first.last_sync_status == "success"
     assert moved.last_sync_status == "success"
+    assert ordinary_after_move.last_sync_status == "success"
+    assert moved_again.last_sync_status == "success"
     assert extraction_calls_after_first > 0
     assert (
         len(extractor.full_calls) + len(extractor.change_calls) + len(extractor.unit_calls)
     ) == extraction_calls_after_first
     assert await db.get_document("github-old-design") is None
-    assert await db.get_document("github-new-design") is not None
-    assert await db.get_metadata("github-new-design") is not None
+    assert await db.get_document("github-new-design") is None
+    assert await db.get_document("github-final-design") is not None
+    assert await db.get_metadata("github-final-design") is not None
     unit_rows = await db.db.execute_fetchall(
         "SELECT id FROM source_units WHERE source_id = ?",
         (source_id,),
     )
     assert len(unit_rows) == 1
     assert await db.list_source_unit_document_ids(str(unit_rows[0]["id"])) == (
+        "github-final-design",
         "github-new-design",
         "github-old-design",
     )
+    moved_unit_id = str(unit_rows[0]["id"])
+
+    reused_old_path = await orchestrator.sync_gene(
+        gene=MovingGithubFileGene(
+            item_id="github-old-design",
+            relative_path="old/design.md",
+            file_lineage_id=None,
+        ),
+        source_name="Payroll Repo",
+        source_id=source_id,
+    )
+
+    assert reused_old_path.last_sync_status == "success"
+    current_reused = await db.find_source_unit_by_document_id(
+        source_id,
+        "github-old-design",
+        current_only=True,
+    )
+    assert current_reused is not None
+    assert current_reused.id != moved_unit_id
+    unit_rows = await db.db.execute_fetchall(
+        "SELECT id FROM source_units WHERE source_id = ?",
+        (source_id,),
+    )
+    assert len(unit_rows) == 2
 
 
 @pytest.mark.asyncio

@@ -108,6 +108,41 @@ async def test_short_jira_comment_is_primary_with_adjacent_context_only(db: Data
 
 
 @pytest.mark.asyncio
+async def test_jira_comment_can_promote_description_to_required_evidence(db: Database) -> None:
+    projection = _jira_projection()
+    primary_id = projection.observations[2].id
+    description_id = projection.observations[0].id
+    raw = RawMemory(
+        content="A7 is retained for this issue context.",
+        memory_type="decision",
+        evidence_quote="Correction: retain A7",
+        source_observation_id=primary_id,
+        required_source_observation_ids=[description_id],
+    )
+
+    staged = build_projected_claim_evidence(
+        projection=projection,
+        raw_memories=(raw,),
+        doc_id="jira-PAY-12",
+        source_type="jira",
+        project_key="PAY",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        access_context_hash="workspace-pay",
+        extractor_run_id="sync-required",
+    )
+
+    references = staged.references
+    assert [(item.role.value, item.anchor.observation_id) for item in references] == [
+        ("primary", primary_id),
+        ("required", description_id),
+        ("context", projection.observations[1].id),
+    ]
+    assert len(staged.reference_ids_by_claim_hash[content_hash(raw.content)]) == 2
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_multi_observation_claim_is_rejected(db: Database) -> None:
     projection = _jira_projection()
     await db.record_source_projection(projection)

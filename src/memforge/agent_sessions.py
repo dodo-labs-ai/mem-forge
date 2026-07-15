@@ -610,6 +610,8 @@ async def ensure_agent_session_source(
         project_binding=existing_binding,
         created_by_user_id=owner_user_id,
     )
+    if existing is None:
+        await db.enable_lifecycle_gate(source_id)
     source = await db.get_source(source_id)
     assert source is not None
     return source

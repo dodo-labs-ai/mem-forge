@@ -7,10 +7,12 @@ import pytest
 
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.source_projection_adapters import (
+    BUILTIN_SPECIALIZED_SOURCE_TYPES,
     project_source_item,
     project_source_unit_tombstone,
     source_run_projection_coverage,
 )
+from memforge.genes import GENE_REGISTRY
 from memforge.source_projection import DeltaAxis, ProjectionCoverage, SourceRelationType
 
 
@@ -221,6 +223,24 @@ def test_jira_numeric_issue_id_is_unit_and_comments_are_observations() -> None:
     assert all(item.source_unit_id == projection.source_units[0].id for item in projection.observations)
 
 
+def test_jira_projection_rejects_mutable_issue_key_as_unit_identity() -> None:
+    item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
+    raw, normalized = _inputs(
+        item,
+        {"key": "PAY-12", "fields": {"summary": "Payroll"}},
+    )
+
+    with pytest.raises(ValueError, match="immutable numeric issue id"):
+        project_source_item(
+            source_id="src-j",
+            source_type="jira",
+            run_id="run-j-missing-id",
+            item=item,
+            raw=raw,
+            normalized=normalized,
+        )
+
+
 def test_truncated_jira_comments_force_partial_coverage() -> None:
     item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
     raw, normalized = _inputs(
@@ -237,6 +257,116 @@ def test_truncated_jira_comments_force_partial_coverage() -> None:
         source_id="src-j",
         source_type="jira",
         run_id="run-j",
+        item=item,
+        raw=raw,
+        normalized=normalized,
+    )
+
+    assert projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
+
+
+def test_partial_jira_projection_carries_unreturned_prior_observations() -> None:
+    item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
+    first_raw, first_normalized = _inputs(
+        item,
+        {
+            "id": "10012",
+            "key": "PAY-12",
+            "fields": {"summary": "Payroll"},
+            "_comments": [{"id": "501", "body": "Keep A7"}],
+        },
+    )
+    first = project_source_item(
+        source_id="src-j",
+        source_type="jira",
+        run_id="run-j-full",
+        item=item,
+        raw=first_raw,
+        normalized=first_normalized,
+    )
+    partial_raw, partial_normalized = _inputs(
+        item,
+        {
+            "id": "10012",
+            "key": "PAY-12",
+            "fields": {"summary": "Payroll updated"},
+            "_comments": [],
+            "_comments_truncated": {"returned": 0, "total": 1},
+        },
+    )
+    partial = project_source_item(
+        source_id="src-j",
+        source_type="jira",
+        run_id="run-j-partial",
+        item=item,
+        raw=partial_raw,
+        normalized=partial_normalized,
+        prior_unit_revision=first.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+
+    prior_comment = next(
+        revision
+        for revision in first.observation_revisions
+        if revision.observation_id != first.observations[0].id
+    )
+    carried = next(
+        revision
+        for revision in partial.observation_revisions
+        if revision.observation_id == prior_comment.observation_id
+    )
+    assert partial.coverage is ProjectionCoverage.PARTIAL_PROJECTION
+    assert carried.id == prior_comment.id
+    assert carried.metadata["carried_forward"] is True
+    assert partial.deltas[0].removed_observation_ids == ()
+
+
+def test_incomplete_embedded_jira_changelog_forces_partial_coverage() -> None:
+    item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
+    raw, normalized = _inputs(
+        item,
+        {
+            "id": "10012",
+            "key": "PAY-12",
+            "fields": {"summary": "Payroll"},
+            "changelog": {"histories": [{"id": "1"}], "total": 2},
+        },
+    )
+
+    projection = project_source_item(
+        source_id="src-j",
+        source_type="jira",
+        run_id="run-j-changelog-partial",
+        item=item,
+        raw=raw,
+        normalized=normalized,
+    )
+
+    assert projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
+
+
+def test_incomplete_local_agent_jira_changelog_forces_partial_coverage() -> None:
+    item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
+    raw, normalized = _inputs(
+        item,
+        {
+            "package_kind": "jira_document",
+            "raw_payload": {
+                "id": "10012",
+                "key": "PAY-12",
+                "fields": {"summary": "Payroll"},
+                "changelog": {"histories": [{"id": "1"}], "total": 2},
+            },
+        },
+    )
+
+    projection = project_source_item(
+        source_id="src-j",
+        source_type="jira",
+        run_id="run-j-local-changelog-partial",
         item=item,
         raw=raw,
         normalized=normalized,
@@ -441,6 +571,89 @@ def test_file_move_with_provider_lineage_preserves_observation_identity(source_t
     assert moved.deltas[0].requires_extraction is False
 
 
+def test_github_compare_previous_filename_preserves_unit_without_daemon_lineage() -> None:
+    first_item = _item(
+        item_id="file-old",
+        extra={
+            "relative_path": "old/design.md",
+            "repo_owner": "acme",
+            "repo_name": "pay",
+            "repo_ref": "main",
+        },
+    )
+    first_raw, first_normalized = _inputs(first_item, b"Keep A7.", "Keep A7.")
+    first = project_source_item(
+        source_id="src-github_repo",
+        source_type="github_repo",
+        run_id="run-compare-1",
+        item=first_item,
+        raw=first_raw,
+        normalized=first_normalized,
+    )
+    moved_item = _item(
+        item_id="file-new",
+        extra={
+            "relative_path": "new/design.md",
+            "previous_filename": "old/design.md",
+            "repo_owner": "acme",
+            "repo_name": "pay",
+            "repo_ref": "main",
+        },
+    )
+    moved_raw, moved_normalized = _inputs(moved_item, b"Keep A7.", "Keep A7.")
+
+    moved = project_source_item(
+        source_id="src-github_repo",
+        source_type="github_repo",
+        run_id="run-compare-2",
+        item=moved_item,
+        raw=moved_raw,
+        normalized=moved_normalized,
+        prior_unit_revision=first.source_unit_revisions[0],
+        prior_observation_revisions={
+            first.observations[0].id: first.observation_revisions[0]
+        },
+    )
+
+    assert moved.source_units[0].id == first.source_units[0].id
+    assert moved.deltas[0].axes == frozenset({DeltaAxis.LOCATION})
+
+    ordinary_item = _item(
+        item_id="file-new",
+        extra={
+            "relative_path": "new/design.md",
+            "repo_owner": "acme",
+            "repo_name": "pay",
+            "repo_ref": "main",
+        },
+    )
+    ordinary_raw, ordinary_normalized = _inputs(
+        ordinary_item,
+        b"Keep A7.",
+        "Keep A7.",
+    )
+    ordinary = project_source_item(
+        source_id="src-github_repo",
+        source_type="github_repo",
+        run_id="run-compare-3",
+        item=ordinary_item,
+        raw=ordinary_raw,
+        normalized=ordinary_normalized,
+        scope={
+            "source_unit_id": moved.source_units[0].id,
+            "source_unit_provider_key": moved.source_units[0].provider_key,
+        },
+        prior_unit_revision=moved.source_unit_revisions[0],
+        prior_observation_revisions={
+            moved.observations[0].id: moved.observation_revisions[0]
+        },
+    )
+
+    assert ordinary.source_units[0].id == first.source_units[0].id
+    assert ordinary.source_units[0].provider_key == first.source_units[0].provider_key
+    assert ordinary.deltas[0].axes == frozenset()
+
+
 def test_teams_window_is_unit_and_native_messages_are_observations() -> None:
     item = _item(
         item_id="window-1",
@@ -536,3 +749,7 @@ def test_unit_tombstone_removes_all_prior_observations_with_explicit_coverage() 
     assert tombstone.deltas[0].removed_observation_ids == tuple(
         sorted(observation.id for observation in initial.observations)
     )
+
+
+def test_every_builtin_gene_has_an_explicit_projection_contract() -> None:
+    assert set(GENE_REGISTRY) == set(BUILTIN_SPECIALIZED_SOURCE_TYPES)

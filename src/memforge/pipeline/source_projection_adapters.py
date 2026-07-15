@@ -14,6 +14,7 @@ import json
 from dataclasses import dataclass
 from typing import Mapping
 
+from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.source_projection import (
     AnchorKind,
@@ -32,14 +33,20 @@ from memforge.source_projection import (
 )
 
 
-_AUTHORITATIVE_FULL_DISCOVERY_SOURCE_TYPES = frozenset(
+BUILTIN_SPECIALIZED_SOURCE_TYPES = frozenset(
     {
         "confluence",
         "jira",
         "github_repo",
         "github_pages",
         "local_markdown",
+        "teams",
+        "agent_session",
     }
+)
+
+_AUTHORITATIVE_FULL_DISCOVERY_SOURCE_TYPES = BUILTIN_SPECIALIZED_SOURCE_TYPES.difference(
+    {"teams", "agent_session"}
 )
 
 
@@ -117,12 +124,27 @@ def project_source_item(
     prior_observation_revisions = prior_observation_revisions or {}
     native = _native_payload(raw)
     unit_type, provider_key, observations_input, relations_input, coverage, locator = _project_native(
+        source_id=source_id,
         source_type=source_type,
         item=item,
         native=native,
         normalized=normalized,
     )
-    unit_id = _stable_id("unit", source_id, unit_type, provider_key)
+    projected_scope = dict(scope or {})
+    persisted_unit_id = projected_scope.get("source_unit_id")
+    persisted_provider_key = projected_scope.get("source_unit_provider_key")
+    incarnation = projected_scope.get("source_unit_incarnation")
+    if persisted_unit_id is not None and not persisted_provider_key:
+        raise ValueError("persisted Source Unit identity requires its provider key")
+    if persisted_provider_key is not None:
+        provider_key = str(persisted_provider_key)
+    elif incarnation is not None:
+        provider_key = f"{provider_key}#incarnation:{incarnation}"
+    unit_id = (
+        str(persisted_unit_id)
+        if persisted_unit_id is not None
+        else _stable_id("unit", source_id, unit_type, provider_key)
+    )
     unit = SourceUnit(
         id=unit_id,
         source_id=source_id,
@@ -156,10 +178,29 @@ def project_source_item(
                 metadata={"provider_key": value.provider_key},
             )
         )
+    if coverage is ProjectionCoverage.PARTIAL_PROJECTION:
+        projected_observation_ids = {item.observation_id for item in revisions}
+        for observation_id, revision in prior_observation_revisions.items():
+            if observation_id in projected_observation_ids:
+                continue
+            revisions.append(
+                SourceObservationRevision(
+                    id=revision.id,
+                    observation_id=revision.observation_id,
+                    semantic_hash=revision.semantic_hash,
+                    content=revision.content,
+                    observed_at=revision.observed_at,
+                    metadata={
+                        **dict(revision.metadata),
+                        "carried_forward": True,
+                        "source_unit_id": unit_id,
+                    },
+                )
+            )
     observation_hashes = sorted((item.observation_id, item.semantic_hash) for item in revisions)
     semantic_hash = _canonical_hash(observation_hashes)
     location_hash = _canonical_hash(unit.locator)
-    membership_hash = _canonical_hash(sorted(item.id for item in observations))
+    membership_hash = _canonical_hash(sorted(item.observation_id for item in revisions))
     access_hash = _canonical_hash(dict(access_context)) if access_context else None
     unit_revision_id = _stable_id(
         "unitrev",
@@ -252,7 +293,7 @@ def project_source_item(
         run_id=run_id,
         source_id=source_id,
         source_type=source_type,
-        scope={**dict(scope or {}), "source_unit_id": unit_id},
+        scope={**projected_scope, "source_unit_id": unit_id},
         coverage=coverage,
         observations=tuple(observations),
         observation_revisions=tuple(revisions),
@@ -320,6 +361,7 @@ def project_source_unit_tombstone(
 
 def _project_native(
     *,
+    source_id: str,
     source_type: str,
     item: ContentItem,
     native: object,
@@ -381,7 +423,10 @@ def _project_native(
         if data.get("package_kind") and isinstance(data.get("raw_payload"), dict):
             data = data["raw_payload"]
         fields = data.get("fields") if isinstance(data.get("fields"), dict) else {}
-        issue_id = str(data.get("id") or item.extra.get("issue_id") or item.extra.get("issue_key") or item.item_id)
+        raw_issue_id = data.get("id") or item.extra.get("issue_id")
+        issue_id = str(raw_issue_id or "").strip()
+        if not issue_id.isdigit():
+            raise ValueError("jira projection requires immutable numeric issue id")
         issue_key = str(data.get("key") or item.extra.get("issue_key") or item.item_id)
         core_value = {
             "summary": fields.get("summary"),
@@ -422,7 +467,8 @@ def _project_native(
             )
             relations.append((SourceRelationType.PRECEDES, previous_key, comment_id, None, {}))
             previous_key = comment_id
-        histories = data.get("changelog", {}).get("histories", []) if isinstance(data.get("changelog"), dict) else []
+        changelog = data.get("changelog") if isinstance(data.get("changelog"), dict) else {}
+        histories = changelog.get("histories", [])
         for history in histories if isinstance(histories, list) else []:
             if not isinstance(history, dict):
                 continue
@@ -437,9 +483,16 @@ def _project_native(
                     str(history.get("created") or "") or None,
                 )
             )
+        changelog_total = changelog.get("total")
+        changelog_incomplete = (
+            isinstance(changelog_total, int)
+            and changelog_total > len(histories if isinstance(histories, list) else [])
+        )
         coverage = (
             ProjectionCoverage.PARTIAL_PROJECTION
-            if data.get("_comments_truncated") or data.get("_changelog_truncated")
+            if data.get("_comments_truncated")
+            or data.get("_changelog_truncated")
+            or changelog_incomplete
             else ProjectionCoverage.COMPLETE_SNAPSHOT
         )
         return (
@@ -461,11 +514,51 @@ def _project_native(
             if value
         ) or str(item.extra.get("repo_url") or semantics.get("repo_url") or item.space_or_project)
         path = str(item.extra.get("relative_path") or semantics.get("relative_path") or item.item_id)
-        lineage = str(item.extra.get("file_lineage_id") or semantics.get("file_lineage_id") or path)
-        relations = ()
         previous = item.extra.get("previous_filename") or semantics.get("previous_filename")
+        explicit_lineage = item.extra.get("file_lineage_id") or semantics.get("file_lineage_id")
+        # GitHub compare payloads can prove a first rename with
+        # ``previous_filename`` even when a daemon has not supplied its own
+        # stable lineage key. Reuse the predecessor path as the Unit key so the
+        # move changes only location. Once committed, sync's durable document
+        # lineage supplies this Unit identity to later ordinary snapshots;
+        # explicit ``file_lineage_id`` remains the preferred provider key when
+        # it is available from the start.
+        lineage = str(explicit_lineage or previous or path)
+        relations = ()
         if previous:
-            relations = ((SourceRelationType.RENAMED_FROM, "$unit", f"github_file:{repo}:{previous}", None, {}),)
+            predecessor_document_id = item.extra.get(
+                "previous_document_id"
+            ) or semantics.get("previous_document_id")
+            repo_url = str(
+                item.extra.get("repo_url")
+                or semantics.get("repo_url")
+                or ""
+            )
+            repo_ref = str(
+                item.extra.get("repo_ref")
+                or semantics.get("repo_ref")
+                or ""
+            )
+            if not predecessor_document_id and repo_url and repo_ref:
+                predecessor_document_id = build_github_repo_doc_id(
+                    source_id=source_id,
+                    repo_url=repo_url,
+                    repo_ref=repo_ref,
+                    relative_path=str(previous),
+                )
+            relations = (
+                (
+                    SourceRelationType.RENAMED_FROM,
+                    "$unit",
+                    f"github_file:{repo}:{previous}",
+                    None,
+                    (
+                        {"predecessor_document_id": str(predecessor_document_id)}
+                        if predecessor_document_id
+                        else {}
+                    ),
+                ),
+            )
         return (
             "github_file",
             f"{repo}:{lineage}",

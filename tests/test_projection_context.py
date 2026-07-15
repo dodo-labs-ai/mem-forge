@@ -187,6 +187,48 @@ async def test_projection_batch_extractor_rejects_claim_grounded_only_in_context
 
 
 @pytest.mark.asyncio
+async def test_projection_batch_extractor_preserves_declared_required_context() -> None:
+    projection = _jira_projection(3)
+    batch = plan_projection_extraction_batches(
+        projection,
+        max_primary_observations=1,
+    )[2]
+    required_id = batch.context_observation_ids[0]
+
+    class Client:
+        async def extract_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return MemoryExtractionResponse(
+                memories=[
+                    MemoryCandidate(
+                        content="A7 is retained under the issue context.",
+                        memory_type="decision",
+                        evidence_quote="Reply 1: retain A7",
+                        source_observation_id=batch.primary_observation_ids[0],
+                        required_source_observation_ids=[required_id],
+                    ),
+                    MemoryCandidate(
+                        content="An invented dependency must be rejected.",
+                        memory_type="decision",
+                        evidence_quote="Reply 1: retain A7",
+                        source_observation_id=batch.primary_observation_ids[0],
+                        required_source_observation_ids=["obs-not-in-context"],
+                    ),
+                ]
+            )
+
+    result = await MemoryExtractor(structured_llm_client=Client()).extract_projection_batch_memories(
+        batch,
+        source_type="jira",
+    )
+
+    assert [item.content for item in result.memories] == [
+        "A7 is retained under the issue context."
+    ]
+    assert result.memories[0].required_source_observation_ids == [required_id]
+
+
+@pytest.mark.asyncio
 async def test_projection_batch_extractor_uses_explicit_observation_for_duplicate_quote() -> None:
     projection = _jira_projection(2)
     batches = plan_projection_extraction_batches(
