@@ -126,3 +126,59 @@ async def test_ambiguous_multi_observation_claim_is_rejected(db: Database) -> No
             access_context_hash="workspace-pay",
             extractor_run_id="sync-1",
         )
+
+
+@pytest.mark.asyncio
+async def test_explicit_source_observation_disambiguates_repeated_quote(db: Database) -> None:
+    projection = _jira_projection()
+    await db.record_source_projection(projection)
+    target_id = projection.observations[2].id
+    raw = RawMemory(
+        content="The correction retains A7.",
+        memory_type="decision",
+        evidence_quote="retain A7",
+        source_observation_id=target_id,
+    )
+
+    staged = build_projected_claim_evidence(
+        projection=projection,
+        raw_memories=(raw,),
+        doc_id="jira-PAY-12",
+        source_type="jira",
+        project_key="PAY",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        access_context_hash="workspace-pay",
+        extractor_run_id="sync-1",
+    )
+
+    primary = [item for item in staged.references if item.role.value == "primary"]
+    assert len(primary) == 1
+    assert primary[0].anchor.observation_id == target_id
+
+
+@pytest.mark.asyncio
+async def test_explicit_source_observation_must_contain_evidence_quote(db: Database) -> None:
+    projection = _jira_projection()
+    await db.record_source_projection(projection)
+    raw = RawMemory(
+        content="The correction retains A7.",
+        memory_type="decision",
+        evidence_quote="Correction: retain A7",
+        source_observation_id=projection.observations[1].id,
+    )
+
+    with pytest.raises(ValueError, match="does not contain the evidence quote"):
+        build_projected_claim_evidence(
+            projection=projection,
+            raw_memories=(raw,),
+            doc_id="jira-PAY-12",
+            source_type="jira",
+            project_key="PAY",
+            visibility="workspace",
+            owner_user_id=None,
+            repo_identifier=None,
+            access_context_hash="workspace-pay",
+            extractor_run_id="sync-1",
+        )

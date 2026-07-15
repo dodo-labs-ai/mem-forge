@@ -68,19 +68,27 @@ def build_projected_claim_evidence(
     reference_ids_by_claim_hash: dict[str, tuple[str, ...]] = {}
     for raw in raw_memories:
         quote = (raw.evidence_quote or raw.extraction_context or "").strip()
-        exact = [
-            observation_id
-            for observation_id in candidate_ids
-            if quote and quote in revisions_by_observation[observation_id].content
-        ]
-        if len(exact) == 1:
-            primary_id = exact[0]
-        elif len(candidate_ids) == 1:
-            primary_id = next(iter(candidate_ids))
+        explicit_observation_id = raw.source_observation_id
+        if explicit_observation_id is not None:
+            if explicit_observation_id not in candidate_ids:
+                raise ValueError("explicit source observation is outside the changed evidence scope")
+            if not quote or quote not in revisions_by_observation[explicit_observation_id].content:
+                raise ValueError("explicit source observation does not contain the evidence quote")
+            primary_id = explicit_observation_id
         else:
-            raise ValueError(
-                "extracted Memory cannot be localized to exactly one changed Source Observation"
-            )
+            exact = [
+                observation_id
+                for observation_id in candidate_ids
+                if quote and quote in revisions_by_observation[observation_id].content
+            ]
+            if len(exact) == 1:
+                primary_id = exact[0]
+            elif len(candidate_ids) == 1:
+                primary_id = next(iter(candidate_ids))
+            else:
+                raise ValueError(
+                    "extracted Memory cannot be localized to exactly one changed Source Observation"
+                )
 
         primary_revision = revisions_by_observation[primary_id]
         evidence_unit_id = _stable_id(

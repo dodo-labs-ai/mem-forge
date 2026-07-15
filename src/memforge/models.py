@@ -202,6 +202,7 @@ class RawMemory:
     extraction_context: str | None = None
     evidence_quote: str | None = None
     evidence_anchor: str | None = None
+    source_observation_id: str | None = None
 
 
 @dataclass

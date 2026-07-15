@@ -15,6 +15,7 @@ class ProjectionExtractionBatch:
     id: str
     source_unit_id: str
     primary_observation_ids: tuple[str, ...]
+    primary_content_by_observation_id: tuple[tuple[str, str], ...]
     context_observation_ids: tuple[str, ...]
     primary_markdown: str
     context_markdown: str
@@ -122,6 +123,17 @@ def plan_projection_extraction_batches(
             )
         )
         primary_markdown = "\n\n".join(segment.markdown for segment in group)
+        primary_content_by_observation_id = tuple(
+            (
+                observation_id,
+                "\n".join(
+                    revisions[observation_id].content[segment.start : segment.end]
+                    for segment in group
+                    if segment.observation_id == observation_id
+                ),
+            )
+            for observation_id in primary
+        )
         context_markdown = _observation_markdown(context, observations, revisions)[:max_context_chars]
         segment_identity = "|".join(
             f"{segment.observation_id}:{segment.start}:{segment.end}" for segment in group
@@ -134,6 +146,7 @@ def plan_projection_extraction_batches(
                 id=f"xbatch-{digest}",
                 source_unit_id=unit.id,
                 primary_observation_ids=primary,
+                primary_content_by_observation_id=primary_content_by_observation_id,
                 context_observation_ids=context,
                 primary_markdown=primary_markdown,
                 context_markdown=context_markdown,
