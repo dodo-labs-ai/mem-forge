@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
+import json
 
 import pytest
 import pytest_asyncio
@@ -32,13 +34,26 @@ from memforge.memory.lifecycle_plan import (
 from memforge.memory.lifecycle_planner import NewMemoryDefaults, build_lifecycle_plan
 from memforge.memory.lifecycle_review import build_lifecycle_review_approval_plan
 from memforge.memory.cutover import (
+    reconstruct_historical_source_projection,
+    repair_lifecycle_cutover_finding,
     run_source_lifecycle_backfill,
     run_source_lifecycle_backfill_job,
     run_source_lifecycle_recovery_job,
 )
-from memforge.models import Memory, ReconcileAction, ReconcileOperation, content_hash
+from memforge.models import (
+    ContentItem,
+    DocumentRecord,
+    Memory,
+    NormalizedContent,
+    RawContent,
+    ReconcileAction,
+    ReconcileOperation,
+    content_hash,
+)
+from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.storage.database import Database, MIGRATIONS
+from memforge.storage.document_store import LocalDocumentStore
 from tests.test_source_projection_store import _projection
 
 
@@ -577,6 +592,177 @@ async def test_recovery_reextracts_only_identifiable_documents_then_validates_li
     assert len(findings) == 1
     assert findings[0].status is CutoverFindingStatus.RESOLVED
     assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
+
+
+@pytest.mark.asyncio
+async def test_cutover_reconstructs_historical_projection_from_exact_stored_artifacts(
+    db: Database,
+    tmp_path,
+) -> None:
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    raw_payload = {
+        "conversation_type": "group_chat",
+        "messages": [
+            {
+                "id": "message-1",
+                "from": "Ada",
+                "content": "Legacy claim",
+                "time": now.isoformat(),
+                "attachments": [],
+            }
+        ],
+    }
+    store = LocalDocumentStore(str(tmp_path / "artifacts"))
+    raw_uri = store.store_raw(
+        "src-1",
+        "Historical Teams block",
+        json.dumps(raw_payload).encode(),
+        "application/json",
+    )
+    normalized_uri = store.store_normalized(
+        "src-1",
+        "Historical Teams block",
+        "# Historical Teams block\n\nLegacy claim",
+    )
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="teams-historical-window",
+            source="src-1",
+            source_url="https://teams.microsoft.com/l/message/conversation-1/message-1",
+            title="Historical Teams block",
+            space_or_project="PCC",
+            author="Ada",
+            last_modified=now,
+            labels=["group_chat"],
+            version="v1",
+            content_hash="historical-hash",
+            token_count=3,
+            raw_content_uri=raw_uri,
+            raw_content_type="application/json",
+            normalized_content_uri=normalized_uri,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
+    await db.add_memory_source(
+        "mem-legacy",
+        "teams-historical-window",
+        "teams",
+        "Legacy claim",
+        source_updated_at=None,
+    )
+    assert (await run_source_lifecycle_backfill(db, "src-1")).finding_count == 1
+
+    projections = []
+
+    async def reconstruct(document_ids: frozenset[str]) -> None:
+        for document_id in document_ids:
+            projections.append(
+                await reconstruct_historical_source_projection(
+                    db,
+                    store,
+                    source_id="src-1",
+                    source_type="teams",
+                    document_id=document_id,
+                )
+            )
+
+    async def unexpected_reextract(document_ids: frozenset[str]) -> None:
+        raise AssertionError(f"re-extraction should not run: {document_ids}")
+
+    completed = await run_source_lifecycle_recovery_job(
+        db,
+        "src-1",
+        job_id="historical-reconstruction",
+        reconstruct_documents=reconstruct,
+        reextract_documents=unexpected_reextract,
+    )
+
+    assert projections[0].checkpoint["cutover_repair"] is True
+    assert await db.find_source_unit_by_document_id("src-1", "teams-historical-window") is not None
+    assert completed.mapped_memories == 1
+    assert completed.finding_count == 0
+    assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: Database) -> None:
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    item = ContentItem(
+        item_id="teams-window-ambiguous",
+        title="Ambiguous Teams window",
+        source_url="https://teams.microsoft.com/l/message/conversation-1/message-1",
+        last_modified=now,
+        content_type="application/json",
+        version="v1",
+        extra={"window_id": "teams-window-ambiguous", "conversation_id": "conversation-1"},
+    )
+    raw = RawContent(
+        item=item,
+        body=json.dumps(
+            {
+                "messages": [
+                    {"id": "message-1", "content": "Repeated quote", "attachments": []},
+                    {"id": "message-2", "content": "Repeated quote", "attachments": []},
+                ]
+            }
+        ).encode(),
+        content_type="application/json",
+    )
+    projection = project_source_item(
+        source_id="src-1",
+        source_type="teams",
+        run_id="projection-ambiguous",
+        item=item,
+        raw=raw,
+        normalized=NormalizedContent(item=item, markdown_body="Repeated quote"),
+    )
+    await db.record_source_projection(projection)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id=item.item_id,
+            source="src-1",
+            source_url=item.source_url,
+            title=item.title,
+            space_or_project="PCC",
+            author=None,
+            last_modified=now,
+            labels=[],
+            version="v1",
+            content_hash="ambiguous-hash",
+            token_count=2,
+            raw_content_uri=None,
+            raw_content_type="application/json",
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
+    await db.add_memory_source(
+        "mem-legacy",
+        item.item_id,
+        "teams",
+        "Repeated quote",
+        source_updated_at=None,
+    )
+    result = await run_source_lifecycle_backfill(db, "src-1")
+    assert result.finding_count == 1
+    finding = (await db.list_lifecycle_cutover_findings("src-1"))[0]
+    assert finding.reason is CutoverFindingReason.AMBIGUOUS_OBSERVATION
+
+    selected_observation_id = projection.observations[0].id
+    repaired = await repair_lifecycle_cutover_finding(
+        db,
+        source_id="src-1",
+        finding_id=finding.id,
+        observation_id=selected_observation_id,
+    )
+    final = await run_source_lifecycle_backfill(db, "src-1")
+
+    assert repaired.status is CutoverFindingStatus.RESOLVED
+    assert repaired.observation_id == selected_observation_id
+    assert final.finding_count == 0
+    assert final.gate_enabled is True
 
 
 @pytest.mark.asyncio

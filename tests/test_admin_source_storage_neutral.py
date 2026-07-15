@@ -8,8 +8,11 @@ from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
 from memforge.memory.lifecycle_plan import (
+    CutoverFindingReason,
+    CutoverFindingStatus,
     LifecycleBackfillJob,
     LifecycleBackfillJobStatus,
+    LifecycleCutoverFinding,
     LifecycleGate,
     LifecycleGateState,
 )
@@ -425,9 +428,11 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path, m
         source_id: str,
         *,
         job_id: str,
+        reconstruct_documents,
         reextract_documents,
     ):
         assert source_id == "src-neutral"
+        assert callable(reconstruct_documents)
         await db.start_lifecycle_backfill_job(job_id)
         await reextract_documents(frozenset({"doc-1"}))
         await db.enable_lifecycle_gate(source_id)
@@ -466,3 +471,72 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path, m
     assert payload["reviews"] == []
     assert payload["vector_outbox"] == []
     assert runtime_provider.reprocessed_document_ids == frozenset({"doc-1"})
+
+
+def test_source_lifecycle_finding_repair_returns_exact_lineage_and_gate_state(
+    tmp_path,
+    monkeypatch,
+):
+    class FakeRepairStore:
+        async def get_schedule_config(self) -> dict:
+            return {"enabled": False}
+
+        async def get_source(self, source_id: str):
+            assert source_id == "src-neutral"
+            return {
+                "id": source_id,
+                "type": "teams",
+                "status": "active",
+                "access_policy": "workspace",
+                "access_state": "active",
+                "owner_user_id": "user-a",
+            }
+
+    async def fake_repair(db, *, source_id: str, finding_id: str, observation_id: str):
+        assert isinstance(db, FakeRepairStore)
+        assert (source_id, finding_id, observation_id) == (
+            "src-neutral",
+            "finding-1",
+            "observation-2",
+        )
+        return LifecycleCutoverFinding(
+            id=finding_id,
+            source_id=source_id,
+            memory_id="memory-1",
+            reason=CutoverFindingReason.AMBIGUOUS_OBSERVATION,
+            status=CutoverFindingStatus.RESOLVED,
+            available_provenance={},
+            mapping_attempt={},
+            observation_id=observation_id,
+            source_unit_id="unit-1",
+        )
+
+    async def fake_backfill(db, source_id: str):
+        assert isinstance(db, FakeRepairStore)
+        assert source_id == "src-neutral"
+        return SimpleNamespace(gate_enabled=True, finding_count=0)
+
+    monkeypatch.setattr("memforge.memory.cutover.repair_lifecycle_cutover_finding", fake_repair)
+    monkeypatch.setattr("memforge.memory.cutover.run_source_lifecycle_backfill", fake_backfill)
+    app = create_admin_app(
+        db=FakeRepairStore(),
+        config=_config(tmp_path),
+        principal_resolver=lambda request: "user-a",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/sources/src-neutral/memory-lifecycle/findings/finding-1/repair",
+            json={"observation_id": "observation-2"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "source_id": "src-neutral",
+        "finding_id": "finding-1",
+        "status": "resolved",
+        "observation_id": "observation-2",
+        "source_unit_id": "unit-1",
+        "gate_enabled": True,
+        "remaining_findings": 0,
+    }
