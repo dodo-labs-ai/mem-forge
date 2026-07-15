@@ -918,6 +918,10 @@ class SourceSyncRequest(BaseModel):
     local_agent_attempt_count: int | None = Field(default=None, ge=1)
 
 
+class LifecycleFindingRepairRequest(BaseModel):
+    observation_id: str = Field(min_length=1)
+
+
 class LocalAgentJobCreateRequest(BaseModel):
     workspace_id: str | None = None
     source_id: str = ""
@@ -3736,8 +3740,30 @@ def create_admin_app(
         source: dict[str, Any],
         config: AppConfig,
         runtime_provider: RuntimeProvider,
+        document_store: DocumentArtifactStore,
     ) -> None:
-        from memforge.memory.cutover import run_source_lifecycle_recovery_job
+        from memforge.memory.cutover import (
+            reconstruct_historical_source_projection,
+            run_source_lifecycle_recovery_job,
+        )
+
+        async def reconstruct_documents(document_ids: frozenset[str]) -> None:
+            for document_id in sorted(document_ids):
+                try:
+                    await reconstruct_historical_source_projection(
+                        db,
+                        document_store,
+                        source_id=source_id,
+                        source_type=str(source["type"]),
+                        document_id=document_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Historical projection reconstruction skipped for %s/%s: %s",
+                        source_id,
+                        document_id,
+                        exc,
+                    )
 
         async def reextract_documents(document_ids: frozenset[str]) -> None:
             latest_run = (
@@ -3767,6 +3793,7 @@ def create_admin_app(
                 db,
                 source_id,
                 job_id=job_id,
+                reconstruct_documents=reconstruct_documents,
                 reextract_documents=reextract_documents,
             )
         except Exception:
@@ -3780,6 +3807,7 @@ def create_admin_app(
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+        document_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         """Queue a conservative exact-lineage cutover audit for one source."""
 
@@ -3807,11 +3835,53 @@ def create_admin_app(
             source,
             config,
             runtime_provider,
+            document_store,
         )
         return {
             "source_id": source_id,
             "job_id": job.id,
             "status": job.status.value,
+        }
+
+    @source_router.post("/{source_id}/memory-lifecycle/findings/{finding_id}/repair")
+    async def repair_source_memory_lifecycle_finding(
+        source_id: str,
+        finding_id: str,
+        body: LifecycleFindingRepairRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Bind one open finding to an explicitly selected exact Observation."""
+
+        from memforge.memory.cutover import (
+            repair_lifecycle_cutover_finding,
+            run_source_lifecycle_backfill,
+        )
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        try:
+            finding = await repair_lifecycle_cutover_finding(
+                db,
+                source_id=source_id,
+                finding_id=finding_id,
+                observation_id=body.observation_id,
+            )
+            result = await run_source_lifecycle_backfill(db, source_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "source_id": source_id,
+            "finding_id": finding.id,
+            "status": finding.status.value,
+            "observation_id": finding.observation_id,
+            "source_unit_id": finding.source_unit_id,
+            "gate_enabled": result.gate_enabled,
+            "remaining_findings": result.finding_count,
         }
 
     @source_router.post("/{source_id}/memory-lifecycle/reviews/{review_id}/approve")
