@@ -17,9 +17,13 @@ jobs:
       - run: uv sync --extra dev
       - run: uv run python scripts/sync_plugin_mcp_proxy.py --check
       - run: uv run ruff check src tests scripts/sync_plugin_mcp_proxy.py
-      # Temporary hang probe: preserve quiet-mode timing and dump all threads
-      # if one test does not finish within 60 seconds on the Linux runner.
-      - run: uv run pytest -q -o faulthandler_timeout=60
+      # Temporary hang probe: stress the modules immediately after the 81%
+      # boundary while preserving quiet-mode timing on the Linux runner.
+      - run: |
+          for attempt in 1 2 3 4 5; do
+            uv run pytest -q tests/test_source_support_detector.py tests/test_startup_runtime.py \
+              -o faulthandler_timeout=30
+          done
 
   admin-ui:
     runs-on: ubuntu-latest
