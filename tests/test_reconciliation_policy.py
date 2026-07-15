@@ -223,3 +223,157 @@ async def test_any_incomplete_batch_invalidates_the_entire_ledger() -> None:
     assert result.operations == []
     assert result.failure is not None
     assert "missing incumbent decisions" in result.failure.error
+
+
+@pytest.mark.asyncio
+async def test_multiple_new_extractions_each_produce_one_merged_operation() -> None:
+    incumbent = _memory("mem-existing", "Service uses PostgreSQL 15.")
+
+    class CompleteClient:
+        async def reconcile_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return ReconciliationResponse(
+                decisions=[
+                    ReconciliationDecision(
+                        index=0,
+                        action="SUPERSEDE",
+                        memory_id=incumbent.id,
+                        reason="Version changed",
+                    ),
+                    ReconciliationDecision(index=1, action="ADD", reason="New backup policy"),
+                ]
+            )
+
+    result = await reconcile_memories(
+        new_extractions=[
+            RawMemory(content="Service uses PostgreSQL 16.", memory_type="fact"),
+            RawMemory(content="Backups run daily.", memory_type="procedure"),
+        ],
+        existing_memories=[incumbent],
+        doc_type="ticket",
+        structured_llm_client=CompleteClient(),
+        include_metadata=True,
+    )
+
+    assert result.failure is None
+    assert [operation.action for operation in result.operations] == [
+        ReconcileAction.SUPERSEDE,
+        ReconcileAction.ADD,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_compatible_duplicate_noops_normalize_to_one_incumbent_keep() -> None:
+    incumbent = _memory("mem-existing", "Retries use exponential backoff.")
+
+    class DuplicateNoopClient:
+        async def reconcile_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return ReconciliationResponse(
+                decisions=[
+                    ReconciliationDecision(
+                        index=0,
+                        action="NOOP",
+                        memory_id=incumbent.id,
+                        reason="Already captured",
+                    ),
+                    ReconciliationDecision(
+                        index=1,
+                        action="NOOP",
+                        memory_id=incumbent.id,
+                        reason="Same durable rule",
+                    ),
+                    ReconciliationDecision(
+                        action="NOOP",
+                        memory_id=incumbent.id,
+                        reason="Still supported",
+                    ),
+                ]
+            )
+
+    result = await reconcile_memories(
+        new_extractions=[
+            RawMemory(content="Retries back off exponentially.", memory_type="procedure"),
+            RawMemory(content="Retry delays increase after failures.", memory_type="fact"),
+        ],
+        existing_memories=[incumbent],
+        doc_type="ticket",
+        structured_llm_client=DuplicateNoopClient(),
+        include_metadata=True,
+    )
+
+    assert result.failure is None
+    incumbent_operations = [
+        operation for operation in result.operations if operation.memory_id == incumbent.id
+    ]
+    assert len(incumbent_operations) == 1
+    assert incumbent_operations[0].action is ReconcileAction.NOOP
+    assert len(result.operations) == 2
+    assert result.operations[1].action is ReconcileAction.NOOP
+    assert result.operations[1].memory_id is None
+
+
+@pytest.mark.asyncio
+async def test_conflicting_duplicate_incumbent_decisions_fail_closed() -> None:
+    incumbent = _memory("mem-existing", "Service uses PostgreSQL 15.")
+
+    class ConflictingClient:
+        async def reconcile_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return ReconciliationResponse(
+                decisions=[
+                    ReconciliationDecision(
+                        index=0,
+                        action="SUPERSEDE",
+                        memory_id=incumbent.id,
+                        reason="Version changed",
+                    ),
+                    ReconciliationDecision(
+                        action="NOOP",
+                        memory_id=incumbent.id,
+                        reason="Still supported",
+                    ),
+                ]
+            )
+
+    result = await reconcile_memories(
+        new_extractions=[RawMemory(content="Service uses PostgreSQL 16.", memory_type="fact")],
+        existing_memories=[incumbent],
+        doc_type="ticket",
+        structured_llm_client=ConflictingClient(),
+        include_metadata=True,
+    )
+
+    assert result.operations == []
+    assert result.failure is not None
+    assert "conflicting incumbent decisions" in result.failure.error
+
+
+@pytest.mark.asyncio
+async def test_missing_new_extraction_decision_invalidates_batch() -> None:
+    incumbent = _memory("mem-existing", "Stable claim")
+
+    class MissingCandidateClient:
+        async def reconcile_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return ReconciliationResponse(
+                decisions=[
+                    ReconciliationDecision(
+                        action="NOOP",
+                        memory_id=incumbent.id,
+                        reason="Still supported",
+                    )
+                ]
+            )
+
+    result = await reconcile_memories(
+        new_extractions=[RawMemory(content="New claim", memory_type="fact")],
+        existing_memories=[incumbent],
+        doc_type="ticket",
+        structured_llm_client=MissingCandidateClient(),
+        include_metadata=True,
+    )
+
+    assert result.operations == []
+    assert result.failure is not None
+    assert "missing new extraction decisions" in result.failure.error

@@ -69,6 +69,13 @@ You MUST return exactly one explicit decision for every existing memory ID:
 - UPDATE or SUPERSEDE, with a new-extraction index, when a candidate replaces it.
 Never omit an existing memory. Missing incumbent decisions invalidate the whole batch.
 
+A decision containing both an `index` and a `memory_id` closes both ledgers:
+it is the one decision for that new extraction and also the explicit decision
+for that incumbent. Do not emit a second incumbent-only row for the same final
+disposition. Multiple new extractions may each be NOOP because the same
+incumbent already covers them; this still means one final KEEP for that
+incumbent, not multiple incumbent lifecycle actions.
+
 When update_mode is diff_guided, use changed_hunks as the authority for what
 changed. Use the full updated document only to validate support and understand
 context. Do not update, supersede, or delete memories from other documents.
@@ -202,7 +209,11 @@ async def reconcile_memories(
                 model=llm_model,
             )
             batch_decisions = [decision.model_dump() for decision in response.decisions]
-            _validate_complete_incumbent_batch(batch_decisions, batch)
+            _validate_complete_reconciliation_batch(
+                batch_decisions,
+                batch,
+                new_extraction_count=len(new_extractions),
+            )
             decisions.extend(batch_decisions)
 
         return _return_result(
@@ -243,6 +254,8 @@ def _parse_decisions(
     decisions: list[dict],
     new_extractions: list[RawMemory],
     existing_memories: list[Memory],
+    *,
+    add_uncovered: bool = True,
 ) -> list[ReconcileOperation]:
     """Parse LLM decisions into ReconcileOperations."""
     ops: list[ReconcileOperation] = []
@@ -339,7 +352,7 @@ def _parse_decisions(
 
     # Any new extractions not covered by decisions → ADD
     for i, raw in enumerate(new_extractions):
-        if i not in seen_indices:
+        if add_uncovered and i not in seen_indices:
             ops.append(
                 ReconcileOperation(
                     action=ReconcileAction.ADD,
@@ -351,22 +364,62 @@ def _parse_decisions(
     return ops
 
 
-def _validate_complete_incumbent_batch(
+def _validate_complete_reconciliation_batch(
     decisions: list[dict],
     incumbents: list[Memory],
+    *,
+    new_extraction_count: int,
 ) -> None:
+    expected_indices = set(range(new_extraction_count))
+    indices = [
+        decision.get("index")
+        for decision in decisions
+        if isinstance(decision.get("index"), int)
+        and 0 <= int(decision["index"]) < new_extraction_count
+    ]
+    duplicate_indices = sorted({index for index in indices if indices.count(index) > 1})
+    if duplicate_indices:
+        raise ValueError(f"duplicate new extraction decisions: {duplicate_indices}")
+    missing_indices = sorted(expected_indices.difference(indices))
+    if missing_indices:
+        raise ValueError(f"missing new extraction decisions: {missing_indices}")
+
     expected = {memory.id for memory in incumbents}
-    seen: list[str] = [
+    seen = {
         str(decision["memory_id"])
         for decision in decisions
         if decision.get("memory_id") in expected
-    ]
-    duplicates = sorted({memory_id for memory_id in seen if seen.count(memory_id) > 1})
-    if duplicates:
-        raise ValueError(f"duplicate incumbent decisions: {duplicates}")
+    }
     missing = sorted(expected.difference(seen))
     if missing:
         raise ValueError(f"missing incumbent decisions: {missing}")
+
+    for memory_id in sorted(expected):
+        group = [item for item in decisions if item.get("memory_id") == memory_id]
+        dispositions = {_incumbent_disposition(item) for item in group}
+        if None in dispositions:
+            raise ValueError(f"invalid incumbent decision for {memory_id}")
+        if len(dispositions) > 1:
+            raise ValueError(f"conflicting incumbent decisions for {memory_id}")
+        replacements = [
+            item
+            for item in group
+            if isinstance(item.get("index"), int)
+            and str(item.get("action", "")).upper() in {"UPDATE", "SUPERSEDE"}
+        ]
+        if len(replacements) > 1:
+            raise ValueError(f"multiple replacement candidates for incumbent {memory_id}")
+
+
+def _incumbent_disposition(decision: dict) -> str | None:
+    action = str(decision.get("action", "")).upper()
+    if action == "NOOP":
+        return "keep"
+    if action in {"UPDATE", "SUPERSEDE"}:
+        return "replace"
+    if action == "DELETE":
+        return "remove"
+    return None
 
 
 def _merge_complete_batch_decisions(
@@ -378,11 +431,11 @@ def _merge_complete_batch_decisions(
 
     existing_ids = {memory.id for memory in existing_memories}
     by_index: dict[int, list[dict]] = {index: [] for index in range(len(new_extractions))}
-    by_incumbent: dict[str, dict] = {}
+    by_incumbent: dict[str, list[dict]] = {memory_id: [] for memory_id in existing_ids}
     for decision in decisions:
         memory_id = decision.get("memory_id")
         if memory_id in existing_ids:
-            by_incumbent[str(memory_id)] = decision
+            by_incumbent[str(memory_id)].append(decision)
         index = decision.get("index")
         if isinstance(index, int) and index in by_index:
             by_index[index].append(decision)
@@ -394,7 +447,7 @@ def _merge_complete_batch_decisions(
         destructive = [
             item
             for item in candidates
-            if str(item.get("action", "")).upper() in {"UPDATE", "SUPERSEDE"}
+            if str(item.get("action", "")).upper() in {"UPDATE", "SUPERSEDE", "DELETE"}
             and item.get("memory_id") in existing_ids
         ]
         destructive_targets = {str(item["memory_id"]) for item in destructive}
@@ -412,8 +465,34 @@ def _merge_complete_batch_decisions(
                 if str(item.get("action", "")).upper() == "NOOP"
                 and item.get("memory_id") in existing_ids
             ]
-            chosen = noop[0] if noop else {"index": index, "action": "ADD", "reason": "new claim"}
-        parsed = _parse_decisions([chosen], new_extractions, existing_memories)
+            chosen = (
+                sorted(noop, key=lambda item: str(item.get("memory_id")))[0]
+                if noop
+                else next(
+                    (
+                        item
+                        for item in candidates
+                        if str(item.get("action", "")).upper() in {"ADD", "NOOP"}
+                    ),
+                    {"index": index, "action": "ADD", "reason": "new claim"},
+                )
+            )
+        chosen = dict(chosen)
+        chosen_memory_id = chosen.get("memory_id")
+        if chosen_memory_id in consumed_incumbents:
+            if str(chosen.get("action", "")).upper() != "NOOP":
+                raise ValueError(
+                    f"incumbent {chosen_memory_id} matches multiple destructive new extractions"
+                )
+            # The candidate is explicitly a duplicate, but the incumbent's one
+            # lifecycle KEEP was already recorded by an earlier candidate.
+            chosen["memory_id"] = None
+        parsed = _parse_decisions(
+            [chosen],
+            new_extractions,
+            existing_memories,
+            add_uncovered=False,
+        )
         if len(parsed) != 1:
             raise ValueError(f"new extraction {index} did not produce exactly one decision")
         operations.extend(parsed)
@@ -423,13 +502,20 @@ def _merge_complete_batch_decisions(
     for memory in existing_memories:
         if memory.id in consumed_incumbents:
             continue
-        decision = by_incumbent[memory.id]
-        index = decision.get("index")
-        if isinstance(index, int):
-            # This incumbent proposed a candidate that the global merge did not
-            # select. Applying a competing lifecycle would be ambiguous.
-            raise ValueError(f"incumbent {memory.id} has an unmerged candidate decision")
-        parsed = _parse_decisions([decision], new_extractions, existing_memories)
+        group = by_incumbent[memory.id]
+        unindexed = [item for item in group if not isinstance(item.get("index"), int)]
+        decision = dict(unindexed[0] if unindexed else group[0])
+        # Indexed NOOP rows are also explicit incumbent KEEP decisions. If the
+        # candidate chose another compatible match, normalize this row to the
+        # one incumbent-only operation required by the Lifecycle Planner.
+        decision["index"] = None
+        decision["memory_id"] = memory.id
+        parsed = _parse_decisions(
+            [decision],
+            new_extractions,
+            existing_memories,
+            add_uncovered=False,
+        )
         if len(parsed) != 1:
             raise ValueError(f"incumbent {memory.id} did not produce exactly one decision")
         operations.extend(parsed)
