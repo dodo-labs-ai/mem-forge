@@ -6,6 +6,8 @@ import os
 import threading
 import time
 
+import pytest
+
 
 _watchdog_stop = threading.Event()
 _current_test: tuple[str, float] | None = None
@@ -30,17 +32,16 @@ def pytest_sessionstart(session) -> None:
     threading.Thread(target=_watch_stalled_test, daemon=True).start()
 
 
-def pytest_runtest_logstart(nodeid: str, location) -> None:
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
     global _current_test, _reported_test
-    del location
+    del nextitem
     _reported_test = None
-    _current_test = (nodeid, time.monotonic())
-
-
-def pytest_runtest_logfinish(nodeid: str, location) -> None:
-    global _current_test
-    del nodeid, location
-    _current_test = None
+    _current_test = (item.nodeid, time.monotonic())
+    try:
+        yield
+    finally:
+        _current_test = None
 
 
 def pytest_sessionfinish(session, exitstatus) -> None:
