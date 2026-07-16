@@ -698,14 +698,18 @@ class GeneSyncOrchestrator:
                         }
                     )
 
+            # Preflight remains non-mutating, but its provider-level discovery
+            # attestation still decides whether absent historical units are a
+            # proven scope removal or an incomplete replay.
+            discovery_coverage = source_run_projection_coverage(
+                incremental=last_sync_time is not None,
+                authoritative_snapshot=authoritative_snapshot,
+                discovery_complete=bool(getattr(gene, "discovery_complete", False)),
+            )
             run_coverage = (
                 ProjectionCoverage.PARTIAL_PROJECTION
                 if non_mutating_run
-                else source_run_projection_coverage(
-                    incremental=last_sync_time is not None,
-                    authoritative_snapshot=authoritative_snapshot,
-                    discovery_complete=bool(getattr(gene, "discovery_complete", False)),
-                )
+                else discovery_coverage
             )
 
             if projection_repair:
@@ -928,7 +932,7 @@ class GeneSyncOrchestrator:
                     for unit_id, observation_ids in current_units.items()
                     if set(observation_ids) - replayed_units.get(unit_id, frozenset())
                 }
-                if missing_units or missing_observations:
+                if (missing_units or missing_observations) and not discovery_coverage.proves_absence:
                     raise ValueError(
                         "source rebaseline replay closure is incomplete: "
                         f"missing_units={missing_units}, "

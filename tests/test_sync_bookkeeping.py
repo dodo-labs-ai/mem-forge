@@ -5999,6 +5999,62 @@ async def test_rebaseline_preflight_reads_full_provider_corpus_without_persistin
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("discovery_complete", "expected_status"),
+    [(True, "success"), (False, "failed")],
+)
+async def test_rebaseline_preflight_accepts_missing_units_only_with_complete_discovery(
+    db: Database,
+    discovery_complete: bool,
+    expected_status: str,
+) -> None:
+    source_id = f"src-rebaseline-absence-{discovery_complete}"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Rebaseline Absence",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+    )
+    assert (
+        await orchestrator.sync_gene(
+            gene=BlockingFetchGene(item_count=2, release=release),
+            source_name="Jira Rebaseline Absence",
+            source_id=source_id,
+        )
+    ).last_sync_status == "success"
+    current_units = await db.list_current_source_unit_observation_ids(source_id)
+    assert len(current_units) == 2
+
+    class ReplayGene(BlockingFetchGene):
+        pass
+
+    ReplayGene.discovery_complete = discovery_complete
+    state = await orchestrator.sync_gene(
+        gene=ReplayGene(item_count=1, release=release),
+        source_name="Jira Rebaseline Absence",
+        source_id=source_id,
+        execution_mode=SourceSyncMode.REBASELINE_PREFLIGHT,
+    )
+
+    assert state.last_sync_status == expected_status
+    if not discovery_complete:
+        assert "rebaseline replay closure is incomplete" in (state.error_message or "")
+    assert await db.list_current_source_unit_observation_ids(source_id) == current_units
+
+
+@pytest.mark.asyncio
 async def test_rebaseline_preflight_fails_closed_on_empty_normalized_content(
     db: Database,
 ) -> None:
@@ -6140,6 +6196,21 @@ async def test_rebaseline_preflight_rejects_truncated_jira_projection(
     assert state.last_sync_status == "failed"
     assert state.docs_failed == 1
     assert "coverage=partial_projection" in state.failed_docs[0].error
+    assert await db.list_current_source_unit_observation_ids(source_id) == current_units
+
+    complete_removal_payload = {
+        **full_payload,
+        "_comments": [],
+        "_comments_total": 0,
+    }
+    complete_state = await orchestrator.sync_gene(
+        gene=JiraPayloadGene(complete_removal_payload),
+        source_name="Jira Truncated Preflight",
+        source_id=source_id,
+        execution_mode=SourceSyncMode.REBASELINE_PREFLIGHT,
+    )
+
+    assert complete_state.last_sync_status == "success"
     assert await db.list_current_source_unit_observation_ids(source_id) == current_units
 
 
