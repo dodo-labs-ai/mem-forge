@@ -1,10 +1,7 @@
-"""Call 3: Memory Reconciliation.
+"""Classify a complete Source Unit incumbent ledger in bounded LLM batches.
 
-Compares newly extracted memories against existing memories from the same
-source document. Uses an LLM to decide: ADD, UPDATE, SUPERSEDE, DELETE, or NOOP.
-
-Only runs on document UPDATES (when content hash changed). New documents
-go through the normal deduplicate_and_insert path.
+This module produces decisions only. It never mutates Memory lifecycle state;
+the Lifecycle Planner validates the complete ledger and builds the atomic plan.
 """
 
 from __future__ import annotations
@@ -65,10 +62,19 @@ For each new extraction, decide ONE action:
 - DELETE: An existing memory is demonstrably false or was extracted in error.
 - NOOP: The new extraction adds nothing beyond what existing memories capture.
 
-Also audit existing memories from this same document against the updated
-document. If an existing memory is no longer supported by the updated document
-and no new extraction supersedes it, return a DELETE action with its memory_id.
-If an existing memory is still supported, you may omit it.
+Also audit EVERY existing memory in this batch against the updated document.
+You MUST return exactly one explicit decision for every existing memory ID:
+- NOOP when it remains supported or is disjoint from the changed evidence.
+- DELETE when this source unit no longer supports it and there is no replacement.
+- UPDATE or SUPERSEDE, with a new-extraction index, when a candidate replaces it.
+Never omit an existing memory. Missing incumbent decisions invalidate the whole batch.
+
+A decision containing both an `index` and a `memory_id` closes both ledgers:
+it is the one decision for that new extraction and also the explicit decision
+for that incumbent. Do not emit a second incumbent-only row for the same final
+disposition. Multiple new extractions may each be NOOP because the same
+incumbent already covers them; this still means one final KEEP for that
+incumbent, not multiple incumbent lifecycle actions.
 
 When update_mode is diff_guided, use changed_hunks as the authority for what
 changed. Use the full updated document only to validate support and understand
@@ -95,12 +101,13 @@ the updated document excerpt may be incomplete.
 
 Rules:
 1. Each new extraction gets EXACTLY ONE action.
-2. For UPDATE and SUPERSEDE, specify which existing memory ID is affected.
-3. For UPDATE, provide the merged current text as "updated_content".
-4. If uncertain between UPDATE and SUPERSEDE, prefer SUPERSEDE when the old meaning is materially wrong.
-5. If an existing memory has corroboration_count >= 3 and you want to SUPERSEDE it,
+2. Each existing memory ID gets EXACTLY ONE explicit action; use NOOP to keep it.
+3. For UPDATE and SUPERSEDE, specify which existing memory ID is affected.
+4. For UPDATE, provide the merged current text as "updated_content".
+5. If uncertain between UPDATE and SUPERSEDE, prefer SUPERSEDE when the old meaning is materially wrong.
+6. If an existing memory has corroboration_count >= 3 and you want to SUPERSEDE it,
    set "flag_for_review": true.
-6. For UPDATE updated_content and SUPERSEDE replacement memory content, write the
+7. For UPDATE updated_content and SUPERSEDE replacement memory content, write the
    canonical current memory, not the edit history. The replacement memory content must state the current durable fact as it should appear in search results.
    Do not write replacement content as edit history such as "no longer marked",
    "was removed", "the document changed", or "previously". Put that rationale in
@@ -126,6 +133,9 @@ Return a JSON object with a "decisions" array:
 Return ONLY the JSON object."""
 
 
+RECONCILIATION_INCUMBENT_BATCH_SIZE = 30
+
+
 async def reconcile_memories(
     new_extractions: list[RawMemory],
     existing_memories: list[Memory],
@@ -138,11 +148,7 @@ async def reconcile_memories(
     update_plan_stats: dict | None = None,
     include_metadata: bool = False,
 ) -> list[ReconcileOperation] | ReconciliationResult:
-    """Call 3: LLM reconciliation of new extractions against existing memories.
-
-    Returns a list of ReconcileOperations, one per new extraction.
-    Falls back to ADD for all if the LLM call fails.
-    """
+    """Classify new candidates and every incumbent, failing closed on ambiguity."""
     if not new_extractions and not existing_memories:
         return _return_result([], include_metadata=include_metadata)
 
@@ -153,7 +159,10 @@ async def reconcile_memories(
             include_metadata=include_metadata,
         )
 
-    # Format for the prompt
+    # Format for the prompt. Incumbents are processed in bounded model batches,
+    # but every batch must explicitly close its entire incumbent ledger. The
+    # merged result is rejected if a candidate destructively matches incumbents
+    # in more than one batch; that ambiguity belongs in review, not mutation.
     new_json = json.dumps(
         [
             {
@@ -168,40 +177,47 @@ async def reconcile_memories(
         indent=2,
     )
 
-    existing_json = json.dumps(
-        [
-            {
-                "id": mem.id,
-                "content": mem.content,
-                "memory_type": mem.memory_type,
-                "confidence": mem.confidence,
-                "corroboration_count": mem.corroboration_count,
-            }
-            for mem in existing_memories
-        ],
-        indent=2,
-    )
-
-    prompt = RECONCILIATION_PROMPT.format(
-        update_mode=update_mode,
-        diff_stats=json.dumps(update_plan_stats or {}, indent=2),
-        changed_hunks=(changed_hunks or "")[:40_000],
-        doc_type=doc_type,
-        updated_document=(updated_document or "")[:100_000],
-        new_extractions=new_json,
-        existing_memories=existing_json,
-    )
-
     try:
-        response = await structured_llm_client.reconcile_memories(
-            prompt,
-            max_tokens=4096,
-            model=llm_model,
-        )
-        decisions = [decision.model_dump() for decision in response.decisions]
+        decisions: list[dict] = []
+        for offset in range(0, len(existing_memories), RECONCILIATION_INCUMBENT_BATCH_SIZE):
+            batch = existing_memories[offset : offset + RECONCILIATION_INCUMBENT_BATCH_SIZE]
+            existing_json = json.dumps(
+                [
+                    {
+                        "id": mem.id,
+                        "content": mem.content,
+                        "memory_type": mem.memory_type,
+                        "confidence": mem.confidence,
+                        "corroboration_count": mem.corroboration_count,
+                    }
+                    for mem in batch
+                ],
+                indent=2,
+            )
+            prompt = RECONCILIATION_PROMPT.format(
+                update_mode=update_mode,
+                diff_stats=json.dumps(update_plan_stats or {}, indent=2),
+                changed_hunks=(changed_hunks or "")[:40_000],
+                doc_type=doc_type,
+                updated_document=(updated_document or "")[:100_000],
+                new_extractions=new_json,
+                existing_memories=existing_json,
+            )
+            response = await structured_llm_client.reconcile_memories(
+                prompt,
+                max_tokens=4096,
+                model=llm_model,
+            )
+            batch_decisions = [decision.model_dump() for decision in response.decisions]
+            _validate_complete_reconciliation_batch(
+                batch_decisions,
+                batch,
+                new_extraction_count=len(new_extractions),
+            )
+            decisions.extend(batch_decisions)
 
         return _return_result(
-            _parse_decisions(decisions, new_extractions, existing_memories),
+            _merge_complete_batch_decisions(decisions, new_extractions, existing_memories),
             include_metadata=include_metadata,
         )
 
@@ -238,6 +254,8 @@ def _parse_decisions(
     decisions: list[dict],
     new_extractions: list[RawMemory],
     existing_memories: list[Memory],
+    *,
+    add_uncovered: bool = True,
 ) -> list[ReconcileOperation]:
     """Parse LLM decisions into ReconcileOperations."""
     ops: list[ReconcileOperation] = []
@@ -291,6 +309,10 @@ def _parse_decisions(
                 valid_from=raw.valid_from,
                 valid_until=raw.valid_until,
                 extraction_context=raw.extraction_context,
+                evidence_quote=raw.evidence_quote,
+                evidence_anchor=raw.evidence_anchor,
+                source_observation_id=raw.source_observation_id,
+                required_source_observation_ids=list(raw.required_source_observation_ids),
             )
             ops.append(
                 ReconcileOperation(
@@ -316,6 +338,7 @@ def _parse_decisions(
                 ReconcileOperation(
                     action=action,
                     memory_id=memory_id,
+                    memory=raw,
                     reason=reason,
                     flag_for_review=bool(dec.get("flag_for_review")),
                 )
@@ -333,7 +356,7 @@ def _parse_decisions(
 
     # Any new extractions not covered by decisions → ADD
     for i, raw in enumerate(new_extractions):
-        if i not in seen_indices:
+        if add_uncovered and i not in seen_indices:
             ops.append(
                 ReconcileOperation(
                     action=ReconcileAction.ADD,
@@ -345,6 +368,165 @@ def _parse_decisions(
     return ops
 
 
+def _validate_complete_reconciliation_batch(
+    decisions: list[dict],
+    incumbents: list[Memory],
+    *,
+    new_extraction_count: int,
+) -> None:
+    expected_indices = set(range(new_extraction_count))
+    indices = [
+        decision.get("index")
+        for decision in decisions
+        if isinstance(decision.get("index"), int)
+        and 0 <= int(decision["index"]) < new_extraction_count
+    ]
+    duplicate_indices = sorted({index for index in indices if indices.count(index) > 1})
+    if duplicate_indices:
+        raise ValueError(f"duplicate new extraction decisions: {duplicate_indices}")
+    missing_indices = sorted(expected_indices.difference(indices))
+    if missing_indices:
+        raise ValueError(f"missing new extraction decisions: {missing_indices}")
+
+    expected = {memory.id for memory in incumbents}
+    seen = {
+        str(decision["memory_id"])
+        for decision in decisions
+        if decision.get("memory_id") in expected
+    }
+    missing = sorted(expected.difference(seen))
+    if missing:
+        raise ValueError(f"missing incumbent decisions: {missing}")
+
+    for memory_id in sorted(expected):
+        group = [item for item in decisions if item.get("memory_id") == memory_id]
+        dispositions = {_incumbent_disposition(item) for item in group}
+        if None in dispositions:
+            raise ValueError(f"invalid incumbent decision for {memory_id}")
+        if len(dispositions) > 1:
+            raise ValueError(f"conflicting incumbent decisions for {memory_id}")
+        replacements = [
+            item
+            for item in group
+            if isinstance(item.get("index"), int)
+            and str(item.get("action", "")).upper() in {"UPDATE", "SUPERSEDE"}
+        ]
+        if len(replacements) > 1:
+            raise ValueError(f"multiple replacement candidates for incumbent {memory_id}")
+
+
+def _incumbent_disposition(decision: dict) -> str | None:
+    action = str(decision.get("action", "")).upper()
+    if action == "NOOP":
+        return "keep"
+    if action in {"UPDATE", "SUPERSEDE"}:
+        return "replace"
+    if action == "DELETE":
+        return "remove"
+    return None
+
+
+def _merge_complete_batch_decisions(
+    decisions: list[dict],
+    new_extractions: list[RawMemory],
+    existing_memories: list[Memory],
+) -> list[ReconcileOperation]:
+    """Merge bounded incumbent batches into one unambiguous operation ledger."""
+
+    existing_ids = {memory.id for memory in existing_memories}
+    by_index: dict[int, list[dict]] = {index: [] for index in range(len(new_extractions))}
+    by_incumbent: dict[str, list[dict]] = {memory_id: [] for memory_id in existing_ids}
+    for decision in decisions:
+        memory_id = decision.get("memory_id")
+        if memory_id in existing_ids:
+            by_incumbent[str(memory_id)].append(decision)
+        index = decision.get("index")
+        if isinstance(index, int) and index in by_index:
+            by_index[index].append(decision)
+
+    operations: list[ReconcileOperation] = []
+    consumed_incumbents: set[str] = set()
+    for index, raw in enumerate(new_extractions):
+        candidates = by_index[index]
+        destructive = [
+            item
+            for item in candidates
+            if str(item.get("action", "")).upper() in {"UPDATE", "SUPERSEDE", "DELETE"}
+            and item.get("memory_id") in existing_ids
+        ]
+        destructive_targets = {str(item["memory_id"]) for item in destructive}
+        if len(destructive_targets) > 1:
+            raise ValueError(
+                f"new extraction {index} matches multiple destructive incumbents: "
+                f"{sorted(destructive_targets)}"
+            )
+        if destructive:
+            chosen = destructive[0]
+        else:
+            noop = [
+                item
+                for item in candidates
+                if str(item.get("action", "")).upper() == "NOOP"
+                and item.get("memory_id") in existing_ids
+            ]
+            chosen = (
+                sorted(noop, key=lambda item: str(item.get("memory_id")))[0]
+                if noop
+                else next(
+                    (
+                        item
+                        for item in candidates
+                        if str(item.get("action", "")).upper() in {"ADD", "NOOP"}
+                    ),
+                    {"index": index, "action": "ADD", "reason": "new claim"},
+                )
+            )
+        chosen = dict(chosen)
+        chosen_memory_id = chosen.get("memory_id")
+        if chosen_memory_id in consumed_incumbents:
+            if str(chosen.get("action", "")).upper() != "NOOP":
+                raise ValueError(
+                    f"incumbent {chosen_memory_id} matches multiple destructive new extractions"
+                )
+            # The candidate is explicitly a duplicate, but the incumbent's one
+            # lifecycle KEEP was already recorded by an earlier candidate.
+            chosen["memory_id"] = None
+        parsed = _parse_decisions(
+            [chosen],
+            new_extractions,
+            existing_memories,
+            add_uncovered=False,
+        )
+        if len(parsed) != 1:
+            raise ValueError(f"new extraction {index} did not produce exactly one decision")
+        operations.extend(parsed)
+        if chosen.get("memory_id") in existing_ids:
+            consumed_incumbents.add(str(chosen["memory_id"]))
+
+    for memory in existing_memories:
+        if memory.id in consumed_incumbents:
+            continue
+        group = by_incumbent[memory.id]
+        unindexed = [item for item in group if not isinstance(item.get("index"), int)]
+        decision = dict(unindexed[0] if unindexed else group[0])
+        # Indexed NOOP rows are also explicit incumbent KEEP decisions. If the
+        # candidate chose another compatible match, normalize this row to the
+        # one incumbent-only operation required by the Lifecycle Planner.
+        decision["index"] = None
+        decision["memory_id"] = memory.id
+        parsed = _parse_decisions(
+            [decision],
+            new_extractions,
+            existing_memories,
+            add_uncovered=False,
+        )
+        if len(parsed) != 1:
+            raise ValueError(f"incumbent {memory.id} did not produce exactly one decision")
+        operations.extend(parsed)
+
+    return operations
+
+
 def _fallback_add_all(new_extractions: list[RawMemory]) -> list[ReconcileOperation]:
-    """Fallback: treat everything as ADD (same as no reconciliation)."""
+    """Treat candidates as ADD only when no incumbent lifecycle is at risk."""
     return [ReconcileOperation(action=ReconcileAction.ADD, memory=raw) for raw in new_extractions]

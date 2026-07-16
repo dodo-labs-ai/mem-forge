@@ -16,6 +16,10 @@ DEFAULT_CLOUD_JOB_HEARTBEAT_INTERVAL_SECONDS = 20
 DEFAULT_CLOUD_JOB_PROGRESS_FLUSH_SECONDS = 2
 
 
+class CloudJobLeaseLost(RuntimeError):
+    """Raised when Cloud rejects the daemon's authority to execute a leased job."""
+
+
 class LocalAgentRunner:
     def __init__(
         self,
@@ -326,7 +330,7 @@ class _CloudJobLeaseHeartbeat:
     def __enter__(self) -> _CloudJobLeaseHeartbeat:
         if self._heartbeat is None:
             return self
-        self._send_heartbeat()
+        self._send_heartbeat(required=True)
         self._thread = threading.Thread(
             target=self._run,
             name=f"memforge-cloud-job-heartbeat-{self._job_id}",
@@ -366,7 +370,7 @@ class _CloudJobLeaseHeartbeat:
         with self._progress_lock:
             return dict(self._progress) if self._progress is not None else None
 
-    def _send_heartbeat(self) -> None:
+    def _send_heartbeat(self, *, required: bool = False) -> None:
         if self._heartbeat is None:
             return
         try:
@@ -381,15 +385,22 @@ class _CloudJobLeaseHeartbeat:
                 progress,
             )
             if isinstance(response, dict) and response.get("error"):
-                self.errors.append(_api_error_message(response))
+                error = _api_error_message(response)
+                self.errors.append(error)
+                if required:
+                    raise CloudJobLeaseLost(error)
             else:
                 with self._progress_lock:
                     self._sent_progress_revision = max(
                         self._sent_progress_revision,
                         progress_revision,
                     )
+        except CloudJobLeaseLost:
+            raise
         except Exception as exc:
             self.errors.append(str(exc))
+            if required:
+                raise CloudJobLeaseLost(str(exc)) from exc
 
 
 def _call_cloud_job_handler(

@@ -29,6 +29,7 @@ from memforge.genes.local_adapter_packages import (
     package_manifest,
     read_package_body,
 )
+from memforge.local_agent.jira_contract import validate_jira_observation_identities
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -179,22 +180,59 @@ def _parse_local_package_dt(value: str) -> datetime:
 def _issue_payload_from_search(issue: dict, config: dict) -> dict:
     """Build the issue payload used by normalization from the hydrated search result."""
     payload = dict(issue)
-    fields = payload.get("fields", {})
-    comments = fields.get("comment") if isinstance(fields, dict) else None
+    fields = payload.get("fields")
+    if not isinstance(fields, dict):
+        raise RuntimeError("Jira issue response is missing fields")
     include_comments = _bool_config(config, "include_comments", True)
 
-    if include_comments and isinstance(comments, dict):
-        payload["_comments"] = comments.get("comments", [])
+    if include_comments:
+        comments = fields.get("comment")
+        if not isinstance(comments, dict) or not isinstance(comments.get("comments"), list):
+            raise RuntimeError("Jira issue response is missing the comments collection")
+        if comments.get("startAt") != 0:
+            raise RuntimeError("Jira issue comments collection does not start at zero")
+        payload["_comments"] = comments["comments"]
         comment_total = comments.get("total")
-        if isinstance(comment_total, int) and comment_total > len(payload["_comments"]):
+        if (
+            not isinstance(comment_total, int)
+            or isinstance(comment_total, bool)
+            or comment_total < len(payload["_comments"])
+        ):
+            raise RuntimeError("Jira issue comments total is invalid")
+        if comment_total > len(payload["_comments"]):
             payload["_comments_truncated"] = {
                 "returned": len(payload["_comments"]),
                 "total": comment_total,
             }
+        payload["_comments_total"] = comment_total
     else:
         payload["_comments"] = []
+        payload["_comments_total"] = 0
+    payload["_comments_included"] = include_comments
 
+    _mark_changelog_completeness(payload)
+    validate_jira_observation_identities(payload)
     return payload
+
+
+def _mark_changelog_completeness(payload: dict) -> None:
+    """Make Jira's embedded changelog pagination explicit to projection."""
+
+    changelog = payload.get("changelog")
+    if not isinstance(changelog, dict):
+        raise RuntimeError("Jira issue response is missing changelog")
+    histories = changelog.get("histories")
+    if not isinstance(histories, list):
+        raise RuntimeError("Jira issue changelog histories are invalid")
+    returned = len(histories)
+    total = changelog.get("total")
+    if not isinstance(total, int) or isinstance(total, bool) or total < returned:
+        raise RuntimeError("Jira issue changelog total is invalid")
+    if total > returned:
+        payload["_changelog_truncated"] = {
+            "returned": returned,
+            "total": total,
+        }
 
 
 def _issue_content_item(issue: dict, base_url: str) -> ContentItem:
@@ -203,15 +241,15 @@ def _issue_content_item(issue: dict, base_url: str) -> ContentItem:
     Jira returns ``priority``/``assignee``/etc. as explicit ``null`` when unset,
     so ``fields.get(key, {})`` is not safe (the key exists with a None value).
     """
-    fields = issue.get("fields") or {}
-    key = issue.get("key", "")
-    updated_str = fields.get("updated", "")
+    fields = issue["fields"]
+    key = str(issue["key"])
+    updated_str = fields["updated"]
     try:
         last_modified = datetime.fromisoformat(updated_str.replace("Z", "+00:00"))
-        if last_modified.tzinfo is None or last_modified.utcoffset() is None:
-            last_modified = last_modified.replace(tzinfo=timezone.utc)
-    except (ValueError, AttributeError):
-        last_modified = datetime.now(timezone.utc)
+    except (ValueError, AttributeError) as exc:
+        raise RuntimeError(f"Jira issue {key} has an invalid updated timestamp") from exc
+    if last_modified.tzinfo is None or last_modified.utcoffset() is None:
+        raise RuntimeError(f"Jira issue {key} updated timestamp has no timezone")
     assignee = fields.get("assignee") or {}
     return ContentItem(
         item_id=f"jira-{key}",
@@ -224,6 +262,7 @@ def _issue_content_item(issue: dict, base_url: str) -> ContentItem:
         author=assignee.get("displayName") if assignee else None,
         labels=fields.get("labels") or [],
         extra={
+            "issue_id": str(issue["id"]),
             "issue_key": key,
             "status": (fields.get("status") or {}).get("name", ""),
             "priority": (fields.get("priority") or {}).get("name", ""),
@@ -413,6 +452,9 @@ class JiraGene(Gene):
         jql = _build_jql(self.config, since)
 
         self._hydrated_issues = {}
+        seen_issue_ids: set[str] = set()
+        seen_issue_keys: set[str] = set()
+        expected_total: int | None = None
         start_at = 0
         max_results = HYDRATED_SEARCH_MAX_RESULTS
 
@@ -434,19 +476,46 @@ class JiraGene(Gene):
                 logger.error("Jira search failed: %s", e)
                 raise RuntimeError(f"Jira search failed: {e}") from e
 
-            issues = data.get("issues", [])
+            if not isinstance(data, dict) or "issues" not in data or not isinstance(data.get("issues"), list):
+                raise RuntimeError("Jira search response is missing an issues list")
+            issues = data["issues"]
+            if any(not isinstance(issue, dict) for issue in issues):
+                raise RuntimeError("Jira search response contains an invalid issue record")
+            total = data.get("total")
+            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+                raise RuntimeError("Jira search response is missing a valid total")
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise RuntimeError("Jira search total changed during pagination")
+            response_start = data.get("startAt")
+            if not isinstance(response_start, int) or isinstance(response_start, bool) or response_start != start_at:
+                raise RuntimeError("Jira search response startAt does not match the requested page")
             if not issues:
+                if start_at < total:
+                    raise RuntimeError("Jira search ended before the declared total was reached")
                 break
 
             for issue in issues:
-                key = issue.get("key", "")
+                issue_id = str(issue.get("id") or "").strip()
+                key = str(issue.get("key") or "").strip()
+                fields = issue.get("fields")
+                if not issue_id.isdigit() or not key or not isinstance(fields, dict):
+                    raise RuntimeError("Jira search issue is missing a stable id, key, or fields")
+                if issue_id in seen_issue_ids or key in seen_issue_keys:
+                    raise RuntimeError("Jira search returned duplicate issue identity")
+                seen_issue_ids.add(issue_id)
+                seen_issue_keys.add(key)
                 self._hydrated_issues[key] = issue
                 yield _issue_content_item(issue, self._base_url)
 
             # Pagination
-            if start_at + len(issues) >= data.get("total", 0):
+            if start_at + len(issues) >= total:
                 break
-            start_at += max_results
+            start_at += len(issues)
+        if len(seen_issue_ids) != (expected_total or 0):
+            raise RuntimeError("Jira search unique issue count did not match total")
+        self.attest_discovery_complete("jira_search_total_exhausted")
 
     async def _request(
         self,
@@ -503,6 +572,11 @@ class JiraGene(Gene):
             params={"expand": "changelog,renderedFields"},
         )
         data = resp.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("Jira issue response must be an object")
+        if str(data.get("key") or "").strip() != str(key):
+            raise RuntimeError("Jira issue response identity mismatch")
+        _mark_changelog_completeness(data)
 
         # Fetch comments separately if configured
         include_comments = _bool_config(self.config, "include_comments", True)
@@ -512,7 +586,21 @@ class JiraGene(Gene):
                 f"/rest/api/2/issue/{key}/comment",
                 params={"maxResults": COMMENT_MAX_RESULTS},
             )
-            data["_comments"] = comments_resp.json().get("comments", [])
+            comment_data = comments_resp.json()
+            data["_comments"] = self._validated_comment_page(comment_data)
+            total = comment_data["total"]
+            data["_comments_total"] = total
+            data["_comments_included"] = True
+            if total > len(data["_comments"]):
+                data["_comments_truncated"] = {
+                    "returned": len(data["_comments"]),
+                    "total": total,
+                }
+        else:
+            data["_comments"] = []
+            data["_comments_total"] = 0
+            data["_comments_included"] = False
+        validate_jira_observation_identities(data)
 
         return RawContent(
             item=item,
@@ -527,10 +615,12 @@ class JiraGene(Gene):
             params={"maxResults": COMMENT_MAX_RESULTS},
         )
         comment_data = comments_resp.json()
-        comments = comment_data.get("comments", [])
+        comments = self._validated_comment_page(comment_data)
         payload["_comments"] = comments
-        total = comment_data.get("total")
-        if isinstance(total, int) and total > len(comments):
+        total = comment_data["total"]
+        payload["_comments_total"] = total
+        payload["_comments_included"] = True
+        if total > len(comments):
             payload["_comments_truncated"] = {
                 "returned": len(comments),
                 "total": total,
@@ -543,6 +633,21 @@ class JiraGene(Gene):
             )
         else:
             payload.pop("_comments_truncated", None)
+        validate_jira_observation_identities(payload)
+
+    @staticmethod
+    def _validated_comment_page(data: object) -> list[dict]:
+        if not isinstance(data, dict) or not isinstance(data.get("comments"), list):
+            raise RuntimeError("Jira comments response is missing a comments list")
+        comments = data["comments"]
+        if any(not isinstance(comment, dict) for comment in comments):
+            raise RuntimeError("Jira comments response contains an invalid record")
+        total = data.get("total")
+        if not isinstance(total, int) or isinstance(total, bool) or total < len(comments):
+            raise RuntimeError("Jira comments response total is invalid")
+        if data.get("startAt") != 0:
+            raise RuntimeError("Jira comments response does not start at zero")
+        return comments
 
     async def normalize(self, raw: RawContent) -> NormalizedContent:
         """Convert Jira issue JSON to comprehensive markdown.
@@ -719,6 +824,8 @@ class JiraGene(Gene):
                 extra={
                     "package_uri": package_uri,
                     "package_path": entry.get("package_path"),
+                    "package_sha256": entry.get("package_sha256"),
+                    "input_sha256": entry.get("input_sha256"),
                     "issue_key": issue_key,
                 },
             )

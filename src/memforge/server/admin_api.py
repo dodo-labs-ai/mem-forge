@@ -46,6 +46,7 @@ from memforge.genes.atlassian_auth import (
 from memforge.github_repo_utils import github_extension_allowed, github_include_extensions
 from memforge.memory.audit import AuditContext
 from memforge.memory.lifecycle import normalize_memory_status
+from memforge.memory.cutover import run_with_lifecycle_activity_heartbeat
 from memforge.memory.lifecycle_service import (
     MemoryLifecycleConflict,
     MemoryLifecycleNotFound,
@@ -89,6 +90,7 @@ from memforge.runtime import (
     RuntimeProvider,
     SourceSyncWorker,
     SyncService,
+    SourceLifecycleMaintenanceError,
     SourcePausedError,
 )
 from memforge.scheduler import SyncScheduler
@@ -100,6 +102,12 @@ from memforge.source_secrets import (
     redact_source_config,
     source_secret_fields,
 )
+from memforge.source_projection import (
+    ProjectionScopeTransition,
+    SourceUnitInventoryFilter,
+)
+from memforge.source_projection_config import projection_scope_transition_id
+from memforge.source_activity import SourceActivityConflict
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
 from memforge.server.memory_admin_service import (
@@ -122,11 +130,15 @@ from memforge.local_agent.source_contract import (
     execution_owner_user_id,
     is_local_agent_backed_source,
     local_agent_authoritative_snapshot_id,
-    local_agent_input_sha256,
+    local_agent_collection_is_authoritative,
+    local_agent_semantic_input_sha256,
     local_agent_completion_status,
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
     local_agent_sync_operation,
+    local_agent_sync_snapshot_id,
+    source_with_sync_inputs,
+    validate_local_agent_replay_package,
 )
 from memforge.storage.admin_memory import MemoryAdminListFilters
 from memforge.storage.admin_source import (
@@ -150,6 +162,7 @@ async def _run_source_access_background(
         await action(operation_id)
     except Exception:
         logger.exception("Background Source access operation failed: %s", operation_id)
+
 
 SEARCH_CLIENTS = ("claude-code", "codex")
 
@@ -338,14 +351,19 @@ async def _require_current_local_agent_lease(
             and job.get("source_id") == source_id
             and job.get("lease_owner_user_id") == resolve_request_principal(request)
             and int(job.get("attempt_count") or 0) == attempt_count
-            and (job.get("payload") or {}).get("source_config_revision")
-            == expected_config_revision
+            and (job.get("payload") or {}).get("source_config_revision") == expected_config_revision
+            and int((job.get("payload") or {}).get("source_activity_epoch", -1))
+            == int(source.get("activity_epoch") or 0)
             and leased_until is not None
             and leased_until > datetime.now(timezone.utc)
         )
     if not valid:
         raise HTTPException(status_code=409, detail="local_agent_lease_not_current")
-    return job_payload
+    return {
+        **job_payload,
+        "source_config_revision": expected_config_revision,
+        "source_activity_epoch": int(source.get("activity_epoch") or 0),
+    }
 
 
 async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
@@ -916,6 +934,15 @@ class SourceSyncRequest(BaseModel):
     local_agent_attempt_count: int | None = Field(default=None, ge=1)
 
 
+class SourceRebaselineRequest(BaseModel):
+    confirm_source_id: str = Field(min_length=1)
+
+
+class LifecycleFindingRepairRequest(BaseModel):
+    observation_id: str = Field(min_length=1)
+    evidence_quote: str | None = Field(default=None, min_length=1)
+
+
 class LocalAgentJobCreateRequest(BaseModel):
     workspace_id: str | None = None
     source_id: str = ""
@@ -1441,57 +1468,19 @@ def _source_secret_fields(source_type: str) -> tuple[str, ...]:
 
 
 def _sync_scope_config(source_type: str, config: dict[str, Any]) -> dict[str, Any]:
-    """Return config fields that affect the document set discovered by sync."""
-    jira_auth_mode = _jira_auth_mode(config) if source_type == "jira" else None
-    scope = dict(config)
-    gene_cls = GENE_REGISTRY.get(source_type)
-    if gene_cls:
-        normalizer = getattr(gene_cls, "normalize_config", None)
-        if callable(normalizer):
-            normalizer(scope)
-    for field in _source_secret_fields(source_type):
-        scope.pop(field, None)
-        scope.pop(f"{field}_encrypted", None)
-        scope.pop(f"{field}_configured", None)
-        scope.pop(f"{field}_hint", None)
-        scope.pop(f"{field}_decrypt_failed", None)
-    scope.pop("tls_ca_bundle", None)
-    scope.pop("request_interval_ms", None)
-    if source_type == "jira":
-        scope["auth_mode"] = jira_auth_mode
-    if source_type == "confluence":
-        scope = _canonical_confluence_scope(scope)
-    return scope
+    """Return only config fields that affect projected membership."""
+
+    from memforge.source_projection_config import canonical_projection_scope
+
+    return canonical_projection_scope(source_type, config)
 
 
-def _canonical_confluence_scope(scope: dict[str, Any]) -> dict[str, Any]:
-    mode = str(scope.get("sync_mode") or "").strip().lower()
-    mode = (
-        mode
-        if mode in {"page_tree", "space"}
-        else ("page_tree" if str(scope.get("page_tree_root") or "").strip() else "space")
-    )
-    exclude_labels = _config_list_value(scope.get("exclude_labels"))
-    canonical: dict[str, Any] = {"sync_mode": mode}
-    api_prefix = str(scope.get("api_prefix") or "").strip()
-    if api_prefix:
-        canonical["api_prefix"] = api_prefix.rstrip("/")
-    if exclude_labels:
-        canonical["exclude_labels"] = exclude_labels
-    if mode == "page_tree":
-        canonical["page_tree_root"] = str(scope.get("page_tree_root") or "").strip()
-        canonical["include_children"] = _config_bool(scope.get("include_children"), default=True)
-    else:
-        canonical["spaces"] = _config_list_value(scope.get("spaces"))
-    return canonical
+def _provider_namespace_config(source_type: str, config: dict[str, Any]) -> dict[str, Any]:
+    """Return immutable identity-bearing fields for one Configured Source."""
 
+    from memforge.source_projection_config import canonical_provider_namespace
 
-def _config_list_value(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, str):
-        return [part.strip() for part in value.split(",") if part.strip()]
-    return []
+    return canonical_provider_namespace(source_type, config)
 
 
 def _config_bool(value: Any, *, default: bool) -> bool:
@@ -1551,9 +1540,7 @@ def _validate_github_repo_config(
 ) -> None:
     existing_config = existing_config or {}
     if "repo_path" in config:
-        raise ValueError(
-            "GitHub Repository reads the configured remote repository; repo_path is not a supported field"
-        )
+        raise ValueError("GitHub Repository reads the configured remote repository; repo_path is not a supported field")
     repo_url = str(config.get("repo_url") or existing_config.get("repo_url") or "").strip()
     require_https_base_url(repo_url, "GitHub Repository")
     from urllib.parse import urlsplit
@@ -1562,9 +1549,9 @@ def _validate_github_repo_config(
     path_parts = [part for part in parts.path.split("/") if part]
     if len(path_parts) < 2:
         raise ValueError("GitHub Repository URL must include owner and repository")
-    connection_mode = str(
-        config.get("connection_mode") or existing_config.get("connection_mode") or "cloud_pull"
-    ).strip().lower()
+    connection_mode = (
+        str(config.get("connection_mode") or existing_config.get("connection_mode") or "cloud_pull").strip().lower()
+    )
     if connection_mode not in {"cloud_pull", "local_push"}:
         raise ValueError("GitHub Repository Access must be Public internet or Internal network / VPN")
     max_files = config.get("max_files", existing_config.get("max_files", 500))
@@ -1790,6 +1777,8 @@ def _jira_auth_secret_changed(
     if source_type != "jira":
         return False
     auth_mode = _jira_auth_mode(config, existing_config)
+    if auth_mode != _jira_auth_mode(existing_config):
+        return True
     if auth_mode == "browser_cookie":
         return False
     field = "pat"
@@ -2037,10 +2026,7 @@ def _github_repo_tree_items(
             folders.add("/".join(parts[:index]))
 
     items = [GitHubRepoTreeItemResponse(path=path, type="tree") for path in sorted(folders)]
-    items.extend(
-        GitHubRepoTreeItemResponse(path=path, type="blob", size=size)
-        for path, size in sorted(blobs.items())
-    )
+    items.extend(GitHubRepoTreeItemResponse(path=path, type="blob", size=size) for path, size in sorted(blobs.items()))
     return items[: limit + 1]
 
 
@@ -2510,11 +2496,7 @@ def create_admin_app(
     if db is not None:
         app.state.db = db
         app.state.sync_service = SyncService(db, config, runtime_provider=runtime_provider)
-        app.state.sync_scheduler = (
-            SyncScheduler(db, app.state.sync_service)
-            if config.sync.scheduler_enabled
-            else None
-        )
+        app.state.sync_scheduler = SyncScheduler(db, app.state.sync_service) if config.sync.scheduler_enabled else None
         app.state.sync_worker = None
         app.state.sync_worker_task = None
     app.state.config = config
@@ -3044,21 +3026,45 @@ def create_admin_app(
 
         if req.content is not None or req.confidence is not None:
             memory_store = await _build_memory_store(db, config, runtime_provider)
-            await memory_store.update_memory(
-                memory_id,
-                new_content=req.content or memory.content,
-                new_confidence=req.confidence,
-                new_tags=memory.tags,
-            )
+            try:
+                await memory_store.update_memory(
+                    memory_id,
+                    new_content=req.content or memory.content,
+                    new_confidence=req.confidence,
+                    new_tags=memory.tags,
+                )
+            except ValueError as exc:
+                if "active source support" in str(exc):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="source_backed_memory_requires_lifecycle_review",
+                    ) from exc
+                raise
         if req.status is not None:
             if req.status not in ("active", "superseded", "retired", "decayed", "pending_review"):
                 raise HTTPException(status_code=400, detail=f"Invalid status: {req.status}")
             status = normalize_memory_status(req.status)
             memory_store = await _build_memory_store(db, config, runtime_provider)
             if status == "retired":
-                await memory_store.retire_memory(memory_id, reason="admin_hidden")
+                try:
+                    await memory_store.retire_memory(memory_id, reason="admin_hidden")
+                except ValueError as exc:
+                    if "active source support" in str(exc):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="source_backed_memory_requires_lifecycle_review",
+                        ) from exc
+                    raise
             elif status == "pending_review":
-                await memory_store.mark_pending_review(memory_id, reason="admin_hidden")
+                try:
+                    await memory_store.mark_pending_review(memory_id, reason="admin_hidden")
+                except ValueError as exc:
+                    if "active source support" in str(exc):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="source_backed_memory_requires_lifecycle_review",
+                        ) from exc
+                    raise
             elif status == "active":
                 if memory.status != "active":
                     raise HTTPException(
@@ -3183,7 +3189,15 @@ def create_admin_app(
         if not memory:
             raise HTTPException(status_code=404, detail="Memory not found")
         memory_store = await _build_memory_store(db, config, runtime_provider)
-        await memory_store.retire_memory(memory_id, reason="admin_hidden")
+        try:
+            await memory_store.retire_memory(memory_id, reason="admin_hidden")
+        except ValueError as exc:
+            if "active source support" in str(exc):
+                raise HTTPException(
+                    status_code=409,
+                    detail="source_backed_memory_requires_lifecycle_review",
+                ) from exc
+            raise
         return {"status": "deleted", "memory_id": memory_id}
 
     @memory_router.delete("/{memory_id}/purge")
@@ -3614,9 +3628,7 @@ def create_admin_app(
                 and s.get("capabilities", {}).get("can_configure_connection")
             ):
                 try:
-                    session = await jira_auth_service.get_status(
-                        str(s.get("config", {}).get("base_url") or "")
-                    )
+                    session = await jira_auth_service.get_status(str(s.get("config", {}).get("base_url") or ""))
                     s["connection_status"] = connection_status_from_browser_session(session)
                 except ValueError:
                     s["connection_status"] = {
@@ -3664,6 +3676,779 @@ def create_admin_app(
     ):
         """List search-eligible sources for MCP/source-id discovery."""
         return {"data": await _searchable_source_rows(request, db, sync_service=sync_service)}
+
+    @source_router.get("/{source_id}/memory-lifecycle")
+    async def get_source_memory_lifecycle(
+        source_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Return independent scope, gate, job, finding, review, and delivery axes."""
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        gate = await db.get_lifecycle_gate(source_id)
+        jobs = await db.list_lifecycle_backfill_jobs(source_id)
+        findings = await db.list_lifecycle_cutover_findings(source_id)
+        reviews = await db.list_lifecycle_reviews(source_id)
+        vector_tasks = await db.list_lifecycle_vector_tasks(source_id=source_id, limit=200)
+        scope_transitions = await db.list_projection_scope_transitions(source_id)
+        return {
+            "source_id": source_id,
+            "scope_transitions": [
+                {
+                    "id": transition.id,
+                    "previous_scope": dict(transition.previous_scope),
+                    "target_scope": dict(transition.target_scope),
+                    "status": transition.status.value,
+                    "run_id": transition.run_id,
+                    "coverage": transition.coverage.value if transition.coverage else None,
+                    "error": transition.error,
+                    "created_at": transition.created_at,
+                    "updated_at": transition.updated_at,
+                    "completed_at": transition.completed_at,
+                }
+                for transition in scope_transitions
+            ],
+            "gate": {
+                "state": gate.state.value,
+                "reason": gate.reason,
+                "audited_at": gate.audited_at,
+                "enabled_at": gate.enabled_at,
+            },
+            "jobs": [
+                {
+                    "id": job.id,
+                    "status": job.status.value,
+                    "scanned_memories": job.scanned_memories,
+                    "mapped_memories": job.mapped_memories,
+                    "finding_count": job.finding_count,
+                    "error": job.error,
+                    "created_at": job.created_at,
+                    "started_at": job.started_at,
+                    "completed_at": job.completed_at,
+                }
+                for job in jobs
+            ],
+            "findings": [
+                {
+                    "id": finding.id,
+                    "memory_id": finding.memory_id,
+                    "reason": finding.reason.value,
+                    "status": finding.status.value,
+                    "available_provenance": dict(finding.available_provenance),
+                    "mapping_attempt": dict(finding.mapping_attempt),
+                    "observation_id": finding.observation_id,
+                    "source_unit_id": finding.source_unit_id,
+                    "created_at": finding.created_at,
+                    "updated_at": finding.updated_at,
+                    "resolved_at": finding.resolved_at,
+                }
+                for finding in findings
+            ],
+            "reviews": [
+                {
+                    "id": review.id,
+                    "lifecycle_plan_id": review.lifecycle_plan_id,
+                    "incumbent_memory_id": review.incumbent_memory_id,
+                    "status": review.status.value,
+                    "staged_evidence": dict(review.staged_evidence),
+                    "reason": review.reason,
+                    "created_at": review.created_at,
+                    "resolved_at": review.resolved_at,
+                }
+                for review in reviews
+            ],
+            "vector_outbox": [
+                {
+                    "id": task.id,
+                    "lifecycle_plan_id": task.lifecycle_plan_id,
+                    "memory_id": task.memory_id,
+                    "operation": task.operation.value,
+                    "status": task.status.value,
+                    "attempts": task.attempts,
+                    "error": task.error,
+                }
+                for task in vector_tasks
+            ],
+        }
+
+    @source_router.get("/{source_id}/projection-inventory")
+    async def get_source_projection_inventory(
+        request: Request,
+        source_id: str,
+        unit_type: str | None = None,
+        conversation_id: str | None = None,
+        observed_from_lte: str | None = None,
+        observed_to_gte: str | None = None,
+        observed_to_lt: str | None = None,
+        cursor: str | None = None,
+        limit: int = 200,
+        db: Database = Depends(get_db),
+    ):
+        """Return one filtered page of server-owned active Source Units."""
+
+        source = await db.get_source(source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_sync_execution(request, source)
+        try:
+            page = await db.list_current_source_units_page(
+                source_id,
+                filters=SourceUnitInventoryFilter(
+                    unit_type=unit_type,
+                    locator_equals=({"conversation_id": conversation_id} if conversation_id else {}),
+                    observed_from_lte=observed_from_lte,
+                    observed_to_gte=observed_to_gte,
+                    observed_to_lt=observed_to_lt,
+                ),
+                cursor=cursor,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        transition = await db.get_open_projection_scope_transition(source_id)
+        return {
+            "source_id": source_id,
+            "source_type": source["type"],
+            "next_cursor": page.next_cursor,
+            "projection_scope_transition": (
+                {
+                    "id": transition.id,
+                    "previous_scope": dict(transition.previous_scope),
+                    "target_scope": dict(transition.target_scope),
+                }
+                if transition is not None
+                else None
+            ),
+            "units": [
+                {
+                    "source_unit_id": unit.id,
+                    "unit_type": unit.unit_type,
+                    "provider_key": unit.provider_key,
+                    "locator": dict(unit.locator),
+                }
+                for unit in page.units
+            ],
+        }
+
+    async def _prepare_local_source_replay(
+        db: Database,
+        source: dict[str, Any],
+        document_store: DocumentArtifactStore,
+    ) -> tuple[dict[str, Any], bool]:
+        """Build an exact current-corpus replay for local collection sources."""
+
+        from memforge.local_agent.replay_adapter import (
+            get_local_source_replay_adapter,
+        )
+
+        source_id = str(source["id"])
+        if local_agent_sync_operation(source["type"], source.get("config")) is None:
+            return source, False
+        latest_run = await db.get_latest_source_sync_run(source_id=source_id)
+        if latest_run is None or latest_run.status != "success":
+            raise ValueError("source_lifecycle_successful_local_replay_required")
+        if latest_run.source_config_revision != local_agent_source_config_revision(source):
+            raise ValueError("source_lifecycle_local_replay_config_changed")
+        authoritative_collection = local_agent_collection_is_authoritative(source["type"])
+        inputs = await db.list_source_sync_inputs(
+            source_id=source_id,
+            workspace_id=latest_run.workspace_id,
+            input_snapshot_id=(latest_run.input_snapshot_id if authoritative_collection else None),
+        )
+        if not authoritative_collection:
+            if latest_run.input_generation_watermark is None:
+                raise ValueError("source_lifecycle_local_replay_inputs_unavailable")
+            inputs = [
+                source_input
+                for source_input in inputs
+                if source_input.input_generation <= latest_run.input_generation_watermark
+            ]
+        replay_source = source_with_sync_inputs(
+            source,
+            inputs,
+            authoritative_snapshot=True,
+            preserve_version_history=not authoritative_collection,
+        )
+        manifest = replay_source.get("config", {}).get("local_agent_package_manifest") or []
+        manifest_by_doc_version = {
+            (
+                str(entry.get("doc_id") or ""),
+                str(entry.get("version") or ""),
+            ): entry
+            for entry in manifest
+            if isinstance(entry, dict)
+            and str(entry.get("doc_id") or "")
+            and str(entry.get("version") or "")
+        }
+        manifest_doc_ids = {doc_id for doc_id, _version in manifest_by_doc_version}
+        current_document_versions = await db.list_indexed_document_versions(source_id)
+        current_doc_ids = set(current_document_versions)
+        if (
+            (not authoritative_collection and not current_doc_ids)
+            or (authoritative_collection and manifest_doc_ids != current_doc_ids)
+            or not current_doc_ids.issubset(manifest_doc_ids)
+        ):
+            raise ValueError("source_lifecycle_local_replay_inputs_unavailable")
+        try:
+            selected_manifest = [
+                manifest_by_doc_version[(doc_id, current_document_versions[doc_id])]
+                for doc_id in sorted(current_doc_ids)
+            ]
+        except KeyError as exc:
+            raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
+        replay_adapter = get_local_source_replay_adapter(str(source["type"]))
+        for entry in selected_manifest:
+            doc_id = str(entry["doc_id"])
+            if str(entry.get("version") or "") != current_document_versions[doc_id]:
+                raise ValueError("source_lifecycle_local_replay_artifact_invalid")
+            package_sha256 = str(entry.get("package_sha256") or "").strip()
+            if not package_sha256:
+                raise ValueError("source_lifecycle_local_replay_attestation_required")
+            try:
+                body = document_store.read_artifact(str(entry["package_uri"]))
+            except Exception as exc:
+                raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
+            package = validate_local_agent_replay_package(
+                str(source["type"]),
+                body,
+                expected_doc_id=doc_id,
+                expected_version=current_document_versions[doc_id],
+                expected_input_sha256=str(entry.get("input_sha256") or ""),
+                expected_package_sha256=package_sha256,
+            )
+            try:
+                derived_doc_id = replay_adapter.derive_document_id(
+                    source_id=source_id,
+                    package=package,
+                )
+            except ValueError as exc:
+                raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
+            if derived_doc_id != doc_id:
+                raise ValueError("source_lifecycle_local_replay_artifact_invalid")
+        replay_source["config"]["local_agent_package_manifest"] = selected_manifest
+        return replay_source, True
+
+    async def _run_lifecycle_backfill_safely(
+        db: Database,
+        source_id: str,
+        job_id: str,
+        source: dict[str, Any],
+        config: AppConfig,
+        runtime_provider: RuntimeProvider,
+        document_store: DocumentArtifactStore,
+    ) -> None:
+        from memforge.memory.cutover import (
+            reconstruct_historical_source_projection,
+            run_source_lifecycle_recovery_job,
+        )
+
+        async def reconstruct_documents(document_ids: frozenset[str]) -> None:
+            for document_id in sorted(document_ids):
+                try:
+                    await reconstruct_historical_source_projection(
+                        db,
+                        document_store,
+                        source_id=source_id,
+                        source_type=str(source["type"]),
+                        document_id=document_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Historical projection reconstruction skipped for %s/%s: %s",
+                        source_id,
+                        document_id,
+                        exc,
+                    )
+
+        async def repair_source_projections(document_ids: frozenset[str]) -> None:
+            from memforge.pipeline.sync import SourceSyncMode
+
+            latest_run = (
+                await db.get_latest_source_sync_run(source_id=source_id)
+                if hasattr(db, "get_latest_source_sync_run")
+                else None
+            )
+            if latest_run is not None and latest_run.status in {"pending", "running"}:
+                raise RuntimeError(
+                    f"source sync {latest_run.run_id} is already {latest_run.status}; retry recovery later"
+                )
+            replay_source, _ = await _prepare_local_source_replay(
+                db,
+                source,
+                document_store,
+            )
+            state = await runtime_provider.run_source_sync(
+                db=db,
+                config=config,
+                source=replay_source,
+                force_full_sync=True,
+                reprocess_doc_ids=document_ids,
+                execution_mode=SourceSyncMode.PROJECTION_REPAIR,
+                lifecycle_job_id=job_id,
+            )
+            if state.last_sync_status != "success":
+                unavailable_error = "requested document was not returned by provider discovery"
+                unavailable_docs = [
+                    failed_doc for failed_doc in state.failed_docs if failed_doc.error == unavailable_error
+                ]
+                unexpected_failures = [
+                    failed_doc for failed_doc in state.failed_docs if failed_doc.error != unavailable_error
+                ]
+                if unexpected_failures or not unavailable_docs:
+                    raise RuntimeError(
+                        "targeted lifecycle projection repair did not complete safely: "
+                        f"{state.last_sync_status}: {state.error_message or 'unknown error'}"
+                    )
+                logger.warning(
+                    "Projection repair left %d unavailable document(s) for %s; their lifecycle findings remain open",
+                    len(unavailable_docs),
+                    source_id,
+                )
+
+        async def run_recovery() -> None:
+            await run_source_lifecycle_recovery_job(
+                db,
+                source_id,
+                job_id=job_id,
+                reconstruct_documents=reconstruct_documents,
+                # Agent-session concepts are managed database records. Their
+                # historical canonical content is reconstructed above; the
+                # Gene directory is ephemeral in Cloud Foundry and is not a
+                # valid recovery source for records that predate artifacts.
+                repair_projections=(None if str(source["type"]) == "agent_session" else repair_source_projections),
+            )
+
+        try:
+            await run_with_lifecycle_activity_heartbeat(
+                db,
+                job_id,
+                run_recovery,
+            )
+        except Exception:
+            logger.exception("Lifecycle backfill job %s failed for source %s", job_id, source_id)
+
+    @source_router.post("/{source_id}/memory-lifecycle/backfill", status_code=202)
+    async def trigger_source_memory_lifecycle_backfill(
+        source_id: str,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+        document_store: DocumentArtifactStore = Depends(get_document_store),
+    ):
+        """Queue a conservative exact-lineage cutover audit for one source."""
+
+        from memforge.memory.lifecycle_plan import (
+            LifecycleBackfillJob,
+            LifecycleBackfillJobStatus,
+        )
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        try:
+            job = await db.create_lifecycle_backfill_job(
+                LifecycleBackfillJob(
+                    id=f"lifecycle-backfill-{uuid.uuid4().hex}",
+                    source_id=source_id,
+                    status=LifecycleBackfillJobStatus.QUEUED,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        fenced_source = await db.get_source(source_id)
+        if fenced_source is None:
+            await db.fail_lifecycle_backfill_job(
+                job.id,
+                error="Source disappeared after lifecycle maintenance fence acquisition",
+            )
+            raise HTTPException(status_code=409, detail="Source lifecycle changed")
+        background_tasks.add_task(
+            _run_lifecycle_backfill_safely,
+            db,
+            source_id,
+            job.id,
+            fenced_source,
+            config,
+            runtime_provider,
+            document_store,
+        )
+        return {
+            "source_id": source_id,
+            "job_id": job.id,
+            "status": job.status.value,
+        }
+
+    async def _run_source_rebaseline_safely(
+        db: Database,
+        source_id: str,
+        source: dict[str, Any],
+        authoritative_snapshot: bool,
+        job_id: str,
+        config: AppConfig,
+        runtime_provider: RuntimeProvider,
+    ) -> None:
+        """Reset, replay, audit, and only then reopen destructive lifecycle."""
+
+        from memforge.memory.cutover import run_source_lifecycle_backfill
+        from memforge.pipeline.sync import SourceSyncMode
+
+        async def run_rebaseline() -> None:
+            await db.start_lifecycle_backfill_job(job_id)
+            preflight = await runtime_provider.run_source_sync(
+                db=db,
+                config=config,
+                source=source,
+                force_full_sync=True,
+                authoritative_snapshot=authoritative_snapshot,
+                execution_mode=SourceSyncMode.REBASELINE_PREFLIGHT,
+                lifecycle_job_id=job_id,
+            )
+            if preflight.last_sync_status != "success":
+                raise RuntimeError(
+                    "source rebaseline preflight failed: "
+                    f"{preflight.last_sync_status}: "
+                    f"{preflight.error_message or 'unknown error'}"
+                )
+            memory_store = await _build_memory_store(db, config, runtime_provider)
+            await memory_store.rebaseline_source_lifecycle(source_id)
+            state = await runtime_provider.run_source_sync(
+                db=db,
+                config=config,
+                source=source,
+                force_full_sync=True,
+                authoritative_snapshot=authoritative_snapshot,
+                execution_mode=SourceSyncMode.REBASELINE_REPLAY,
+                lifecycle_job_id=job_id,
+            )
+            if state.last_sync_status != "success":
+                raise RuntimeError(
+                    "source rebaseline replay failed: "
+                    f"{state.last_sync_status}: {state.error_message or 'unknown error'}"
+                )
+            audit = await run_source_lifecycle_backfill(db, source_id)
+            if not audit.gate_enabled or audit.finding_count:
+                raise RuntimeError(f"source rebaseline audit left {audit.finding_count} open finding(s)")
+            await db.complete_lifecycle_backfill_job(
+                job_id,
+                scanned_memories=audit.scanned_memories,
+                mapped_memories=audit.mapped_memories,
+                finding_count=audit.finding_count,
+            )
+
+        try:
+            await run_with_lifecycle_activity_heartbeat(
+                db,
+                job_id,
+                run_rebaseline,
+            )
+        except Exception as exc:
+            logger.exception("Source rebaseline job %s failed for source %s", job_id, source_id)
+            try:
+                await db.fail_lifecycle_backfill_job(job_id, error=str(exc))
+            except Exception:
+                logger.exception("Failed to persist rebaseline job failure for %s", job_id)
+
+    @source_router.post("/{source_id}/memory-lifecycle/rebaseline", status_code=202)
+    async def trigger_source_memory_lifecycle_rebaseline(
+        source_id: str,
+        body: SourceRebaselineRequest,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+        sync_service: SyncService = Depends(get_sync_service),
+        document_store: DocumentArtifactStore = Depends(get_document_store),
+    ):
+        """Destructively reset derived lifecycle and replay one source in place."""
+
+        from memforge.memory.lifecycle_plan import (
+            LifecycleBackfillJob,
+            LifecycleBackfillJobStatus,
+        )
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        if body.confirm_source_id != source_id:
+            raise HTTPException(status_code=409, detail="source_rebaseline_confirmation_mismatch")
+        if str(source["type"]) == "agent_session":
+            raise HTTPException(
+                status_code=409,
+                detail="agent_session_requires_managed_claim_lineage_repair",
+            )
+        await sync_service.cancel_source(source_id)
+        try:
+            job = await db.create_lifecycle_backfill_job(
+                LifecycleBackfillJob(
+                    id=f"source-rebaseline-{uuid.uuid4().hex}",
+                    source_id=source_id,
+                    status=LifecycleBackfillJobStatus.QUEUED,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        fenced_source = await db.get_source(source_id)
+        if fenced_source is None:
+            await db.fail_lifecycle_backfill_job(
+                job.id,
+                error="Source disappeared after lifecycle maintenance fence acquisition",
+            )
+            raise HTTPException(status_code=409, detail="Source lifecycle changed")
+        try:
+            replay_source, authoritative_snapshot = await _prepare_local_source_replay(
+                db,
+                fenced_source,
+                document_store,
+            )
+        except Exception as exc:
+            try:
+                await db.fail_lifecycle_backfill_job(job.id, error=str(exc))
+            except Exception:
+                logger.exception(
+                    "Failed to persist rebaseline preflight failure for %s",
+                    job.id,
+                )
+            if isinstance(exc, ValueError):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            logger.exception(
+                "Source rebaseline preflight failed for %s",
+                source_id,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="source_rebaseline_preflight_failed",
+            ) from exc
+        background_tasks.add_task(
+            _run_source_rebaseline_safely,
+            db,
+            source_id,
+            replay_source,
+            authoritative_snapshot,
+            job.id,
+            config,
+            runtime_provider,
+        )
+        return {
+            "source_id": source_id,
+            "job_id": job.id,
+            "status": job.status.value,
+            "operation": "source_rebaseline",
+        }
+
+    @source_router.post("/{source_id}/memory-lifecycle/findings/{finding_id}/repair")
+    async def repair_source_memory_lifecycle_finding(
+        source_id: str,
+        finding_id: str,
+        body: LifecycleFindingRepairRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Bind one open finding to an explicitly selected exact Observation."""
+
+        from memforge.memory.cutover import (
+            repair_lifecycle_cutover_finding,
+            run_source_lifecycle_backfill,
+        )
+        from memforge.memory.lifecycle_plan import (
+            LifecycleBackfillJob,
+            LifecycleBackfillJobStatus,
+        )
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        try:
+            job = await db.create_lifecycle_backfill_job(
+                LifecycleBackfillJob(
+                    id=f"lifecycle-finding-repair-{uuid.uuid4().hex}",
+                    source_id=source_id,
+                    status=LifecycleBackfillJobStatus.QUEUED,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        try:
+            await db.start_lifecycle_backfill_job(job.id)
+        except Exception as exc:
+            try:
+                await db.fail_lifecycle_backfill_job(job.id, error=str(exc))
+            except Exception:
+                logger.exception(
+                    "Failed to persist lifecycle finding repair startup failure for %s",
+                    job.id,
+                )
+            if isinstance(exc, ValueError):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
+
+        async def run_finding_repair():
+            repaired_finding = await repair_lifecycle_cutover_finding(
+                db,
+                source_id=source_id,
+                finding_id=finding_id,
+                observation_id=body.observation_id,
+                evidence_quote=body.evidence_quote,
+                operator_id=resolve_request_principal(request),
+            )
+            backfill_result = await run_source_lifecycle_backfill(db, source_id)
+            await db.complete_lifecycle_backfill_job(
+                job.id,
+                scanned_memories=backfill_result.scanned_memories,
+                mapped_memories=backfill_result.mapped_memories,
+                finding_count=backfill_result.finding_count,
+            )
+            return repaired_finding, backfill_result
+
+        try:
+            finding, result = await run_with_lifecycle_activity_heartbeat(
+                db,
+                job.id,
+                run_finding_repair,
+            )
+        except Exception as exc:
+            try:
+                await db.fail_lifecycle_backfill_job(job.id, error=str(exc))
+            except Exception:
+                logger.exception(
+                    "Failed to persist lifecycle finding repair failure for %s",
+                    job.id,
+                )
+            if isinstance(exc, LookupError):
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            if isinstance(exc, ValueError):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
+        return {
+            "source_id": source_id,
+            "finding_id": finding.id,
+            "status": finding.status.value,
+            "observation_id": finding.observation_id,
+            "source_unit_id": finding.source_unit_id,
+            "gate_enabled": result.gate_enabled,
+            "remaining_findings": result.finding_count,
+        }
+
+    @source_router.post("/{source_id}/memory-lifecycle/reviews/{review_id}/approve")
+    async def approve_source_lifecycle_review(
+        source_id: str,
+        review_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+    ):
+        """Atomically apply one reviewed proposal after gate and stale-guard checks."""
+
+        from memforge.memory.lifecycle_plan import LifecycleGateState, LifecycleReviewStatus
+        from memforge.memory.lifecycle_review import build_lifecycle_review_approval_plan
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        review = await db.get_lifecycle_review(review_id)
+        if review is None:
+            raise HTTPException(status_code=404, detail="Lifecycle review not found")
+        if review.status is LifecycleReviewStatus.APPROVED:
+            return {
+                "source_id": source_id,
+                "review_id": review_id,
+                "status": review.status.value,
+                "lifecycle_plan_id": f"lifecycle-review-approval-{review.id}",
+            }
+        if review.status is not LifecycleReviewStatus.PENDING:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Lifecycle review is already {review.status.value}",
+            )
+        payload = await db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
+        if payload is None or not isinstance(payload.get("scope"), dict):
+            raise HTTPException(status_code=409, detail="Lifecycle review plan is unavailable")
+        if payload["scope"].get("source_id") != source_id:
+            raise HTTPException(status_code=404, detail="Lifecycle review not found")
+        gate = await db.get_lifecycle_gate(source_id)
+        if gate.state is not LifecycleGateState.ENABLED:
+            raise HTTPException(status_code=409, detail="Source lifecycle gate is not enabled")
+        try:
+            plan = build_lifecycle_review_approval_plan(review, payload)
+            await db.apply_lifecycle_plan(plan)
+        except ValueError as exc:
+            if "stale guard" in str(exc) or "already" in str(exc):
+                try:
+                    await db.resolve_lifecycle_review(review_id, LifecycleReviewStatus.STALE)
+                except ValueError:
+                    pass
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        memory_store = await _build_memory_store(db, config, runtime_provider)
+        try:
+            await memory_store.drain_lifecycle_vector_outbox(plan.id)
+        except Exception:
+            logger.exception("Lifecycle review %s applied but vector delivery remains pending", review_id)
+        approved = await db.get_lifecycle_review(review_id)
+        assert approved is not None
+        return {
+            "source_id": source_id,
+            "review_id": review_id,
+            "status": approved.status.value,
+            "lifecycle_plan_id": plan.id,
+        }
+
+    @source_router.post("/{source_id}/memory-lifecycle/reviews/{review_id}/reject")
+    async def reject_source_lifecycle_review(
+        source_id: str,
+        review_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Reject a pending proposal without mutating the incumbent Memory."""
+
+        from memforge.memory.lifecycle_plan import LifecycleReviewStatus
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        review = await db.get_lifecycle_review(review_id)
+        if review is None:
+            raise HTTPException(status_code=404, detail="Lifecycle review not found")
+        if review.status is LifecycleReviewStatus.REJECTED:
+            return {
+                "source_id": source_id,
+                "review_id": review_id,
+                "status": review.status.value,
+            }
+        if review.status is not LifecycleReviewStatus.PENDING:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Lifecycle review is already {review.status.value}",
+            )
+        payload = await db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
+        if payload is None or not isinstance(payload.get("scope"), dict):
+            raise HTTPException(status_code=409, detail="Lifecycle review plan is unavailable")
+        if payload["scope"].get("source_id") != source_id:
+            raise HTTPException(status_code=404, detail="Lifecycle review not found")
+        try:
+            rejected = await db.resolve_lifecycle_review(
+                review_id,
+                LifecycleReviewStatus.REJECTED,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "source_id": source_id,
+            "review_id": review_id,
+            "status": rejected.status.value,
+        }
 
     @source_router.get("/{source_id}/projects", response_model=SourceProjectsResponse)
     async def list_source_projects(
@@ -3890,9 +4675,7 @@ def create_admin_app(
         )
         try:
             if transition["status"] != "failed":
-                raise SourceAccessTransitionError(
-                    "source_access_transition_not_retryable"
-                )
+                raise SourceAccessTransitionError("source_access_transition_not_retryable")
         except SourceAccessTransitionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         background_tasks.add_task(
@@ -3947,9 +4730,7 @@ def create_admin_app(
         db: Database = Depends(get_db),
     ):
         """Return the authenticated viewer's Source List preferences."""
-        sort_mode = await db.get_source_list_sort_mode(
-            resolve_request_principal(request)
-        )
+        sort_mode = await db.get_source_list_sort_mode(resolve_request_principal(request))
         return {"sort_mode": sort_mode}
 
     @source_list_router.put("/preferences")
@@ -4076,9 +4857,7 @@ def create_admin_app(
         source_id = f"src-{uuid.uuid4().hex[:8]}"
         try:
             incoming_config = (
-                _ensure_local_markdown_vault_id(req.config, source_id)
-                if req.type == "local_markdown"
-                else req.config
+                _ensure_local_markdown_vault_id(req.config, source_id) if req.type == "local_markdown" else req.config
             )
             _validate_source_config(req.type, incoming_config)
             source_config = prepare_source_config_for_storage(
@@ -4111,6 +4890,10 @@ def create_admin_app(
                 creator_user_id if is_local_agent_backed_source(source_for_classification) else None
             ),
         )
+        # A newly created source has no legacy rows to audit. Start it on the
+        # projected lifecycle contract immediately; only pre-cutover sources
+        # without this gate remain conservatively gated.
+        await db.enable_lifecycle_gate(source_id)
         if req.sync_schedule is not None:
             await db.set_source_sync_schedule(
                 source_id,
@@ -4169,9 +4952,7 @@ def create_admin_app(
             except (SecretConfigurationError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             existing_is_local = is_local_agent_backed_source(existing)
-            updated_is_local = is_local_agent_backed_source(
-                {"type": existing["type"], "config": src_config}
-            )
+            updated_is_local = is_local_agent_backed_source({"type": existing["type"], "config": src_config})
             if existing_is_local != updated_is_local:
                 raise HTTPException(
                     status_code=409,
@@ -4179,19 +4960,34 @@ def create_admin_app(
                 )
         else:
             src_config = existing["config"]
-        scope_changed = req.config is not None and (
-            _sync_scope_config(existing["type"], src_config) != _sync_scope_config(existing["type"], existing["config"])
+        previous_projection_scope = _sync_scope_config(existing["type"], existing["config"])
+        target_projection_scope = _sync_scope_config(existing["type"], src_config)
+        scope_changed = req.config is not None and (target_projection_scope != previous_projection_scope)
+        namespace_changed = req.config is not None and (
+            _provider_namespace_config(existing["type"], src_config)
+            != _provider_namespace_config(existing["type"], existing["config"])
         )
+        if namespace_changed:
+            raise HTTPException(
+                status_code=409,
+                detail="source_provider_namespace_immutable",
+            )
+        if scope_changed:
+            open_scope_transition = await db.get_open_projection_scope_transition(source_id)
+            if (
+                open_scope_transition is not None
+                and dict(open_scope_transition.target_scope) != target_projection_scope
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="projection_scope_transition_active",
+                )
         auth_secret_changed = req.config is not None and _jira_auth_secret_changed(
             existing["type"],
             req.config,
             existing["config"],
         )
-        old_base_url = str(existing["config"].get("base_url") or "")
-        new_base_url = str(src_config.get("base_url") or "")
-        base_url_changed = bool(old_base_url) and old_base_url != new_base_url
-
-        if scope_changed or auth_secret_changed or base_url_changed:
+        if scope_changed or auth_secret_changed:
             await sync_service.cancel_source(source_id)
 
         if _request_includes_field(req, "project_binding"):
@@ -4200,21 +4996,40 @@ def create_admin_app(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        await db.upsert_source(
-            id=source_id,
-            type=existing["type"],
-            name=name,
-            config_json=json.dumps(src_config),
-            access_policy=existing["access_policy"],
-            owner_user_id=existing["owner_user_id"],
-            access_state=existing["access_state"],
-            status=req.status if _request_includes_field(req, "status") else None,
-            project_binding=(
-                req.project_binding
-                if _request_includes_field(req, "project_binding")
-                else existing.get("project_binding")
-            ),
+        scope_transition = (
+            ProjectionScopeTransition(
+                id=projection_scope_transition_id(
+                    source_id,
+                    previous_projection_scope,
+                    target_projection_scope,
+                ),
+                source_id=source_id,
+                previous_scope=previous_projection_scope,
+                target_scope=target_projection_scope,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+            if scope_changed
+            else None
         )
+        try:
+            await db.upsert_source(
+                id=source_id,
+                type=existing["type"],
+                name=name,
+                config_json=json.dumps(src_config),
+                access_policy=existing["access_policy"],
+                owner_user_id=existing["owner_user_id"],
+                access_state=existing["access_state"],
+                status=req.status if _request_includes_field(req, "status") else None,
+                project_binding=(
+                    req.project_binding
+                    if _request_includes_field(req, "project_binding")
+                    else existing.get("project_binding")
+                ),
+                projection_scope_transition=scope_transition,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if _request_includes_field(req, "sync_schedule"):
             schedule = req.sync_schedule or SourceSyncScheduleRequest()
             await db.set_source_sync_schedule(
@@ -4222,8 +5037,6 @@ def create_admin_app(
                 enabled=schedule.enabled,
                 interval_minutes=schedule.interval_minutes,
             )
-        if base_url_changed:
-            release_atlassian_request_limiter(old_base_url, owner_id=source_id)
         if scope_changed or auth_secret_changed:
             await db.reset_source_sync_cursor(source_id)
         return {"ok": True, "id": source_id}
@@ -4254,7 +5067,10 @@ def create_admin_app(
         )
 
         memory_store = await _build_memory_store(db, config, runtime_provider)
-        await memory_store.delete_source_cascade(source_id)
+        try:
+            await memory_store.delete_source_cascade(source_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         await SourceArtifactCleanupService(db, document_store).run_pending(limit=1000)
         return {"ok": True, "deleted_source": source_id}
 
@@ -4263,10 +5079,20 @@ def create_admin_app(
         db: Database,
         **job: Any,
     ) -> tuple[str, bool]:
+        source_id = str(job.get("source_id") or "")
+        lifecycle_job = await db.get_active_lifecycle_backfill_job(source_id)
+        if lifecycle_job is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"source lifecycle maintenance active: {lifecycle_job.id}",
+            )
         enqueuer = getattr(request.app.state, "local_agent_job_enqueuer", None)
-        if enqueuer is not None:
-            return await enqueuer(**job)
-        return await db.enqueue_local_agent_job(**job)
+        try:
+            if enqueuer is not None:
+                return await enqueuer(**job)
+            return await db.enqueue_local_agent_job(**job)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     async def _enqueue_local_source_collection_job(
         request: Request,
@@ -4285,6 +5111,17 @@ def create_admin_app(
                 detail="local_agent_sync_execution_owner_required",
             )
         job_id = f"laj-{uuid.uuid4().hex}"
+        payload = local_agent_sync_job_payload(
+            source,
+            {"force_full_sync": force_full_sync},
+        )
+        transition = await db.get_open_projection_scope_transition(source["id"])
+        if transition is not None:
+            payload["projection_scope_transition"] = {
+                "id": transition.id,
+                "previous_scope": dict(transition.previous_scope),
+                "target_scope": dict(transition.target_scope),
+            }
         job_id, created = await _enqueue_sync_local_agent_job(
             request,
             db,
@@ -4292,10 +5129,7 @@ def create_admin_app(
             source_id=source["id"],
             source_type=source["type"],
             operation=operation,
-            payload=local_agent_sync_job_payload(
-                source,
-                {"force_full_sync": force_full_sync},
-            ),
+            payload=payload,
             created_by_user_id=resolve_request_principal(request),
             execution_owner_user_id=owner,
         )
@@ -4339,6 +5173,8 @@ def create_admin_app(
             )
         except SourcePausedError:
             raise _source_paused_http_error()
+        except (SourceLifecycleMaintenanceError, SourceActivityConflict) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
             "ok": True,
             "message": "Sync enqueued",
@@ -4375,6 +5211,14 @@ def create_admin_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        input_snapshot_id = (
+            local_agent_sync_snapshot_id(
+                req.local_agent_job_id if req else None,
+                req.local_agent_attempt_count if req else None,
+            )
+            if current_source["type"] == "teams"
+            else snapshot_id
+        )
         current_source = await db.get_source(source_id)
         if current_source is None:
             raise HTTPException(status_code=404, detail="Source not found")
@@ -4394,10 +5238,13 @@ def create_admin_app(
                     if "force_full_sync" in lease_payload
                     else req and req.force_full_sync
                 ),
-                input_snapshot_id=snapshot_id,
+                input_snapshot_id=input_snapshot_id,
+                source_config_revision=str(lease_payload["source_config_revision"]),
             )
         except SourcePausedError:
             raise _source_paused_http_error()
+        except (SourceLifecycleMaintenanceError, SourceActivityConflict) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
             "ok": True,
             "source_id": source_id,
@@ -4436,6 +5283,8 @@ def create_admin_app(
             )
         except SourcePausedError:
             raise _source_paused_http_error()
+        except (SourceLifecycleMaintenanceError, SourceActivityConflict) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
             "ok": True,
             "message": "Sync enqueued",
@@ -4507,12 +5356,15 @@ def create_admin_app(
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         source_type = source.get("type")
-        if source_type not in {LOCAL_MARKDOWN_SOURCE_TYPE, GITHUB_REPO_SOURCE_TYPE, JIRA_SOURCE_TYPE, TEAMS_SOURCE_TYPE}:
+        if source_type not in {
+            LOCAL_MARKDOWN_SOURCE_TYPE,
+            GITHUB_REPO_SOURCE_TYPE,
+            JIRA_SOURCE_TYPE,
+            TEAMS_SOURCE_TYPE,
+        }:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"source {source_id} is type {source_type!r}, not a local adapter source"
-                ),
+                detail=(f"source {source_id} is type {source_type!r}, not a local adapter source"),
             )
         _require_source_sync_execution(request, source)
         await _require_current_local_agent_lease(
@@ -4524,6 +5376,30 @@ def create_admin_app(
         )
         if source.get("status") == SOURCE_PAUSED_STATUS:
             raise HTTPException(status_code=400, detail="Source is paused")
+        lifecycle_job = await db.get_active_lifecycle_backfill_job(source_id)
+        if lifecycle_job is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"source lifecycle maintenance active: {lifecycle_job.id}",
+            )
+        try:
+            snapshot_id = local_agent_authoritative_snapshot_id(
+                source_type,
+                req.local_agent_job_id,
+                req.local_agent_attempt_count,
+                req.sync_snapshot_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        input_snapshot_id = (
+            local_agent_sync_snapshot_id(
+                req.local_agent_job_id,
+                req.local_agent_attempt_count,
+            )
+            if source_type == TEAMS_SOURCE_TYPE
+            else snapshot_id
+        )
 
         try:
             if source_type == GITHUB_REPO_SOURCE_TYPE:
@@ -4542,6 +5418,7 @@ def create_admin_app(
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                     document_store=artifact_store,
+                    sync_snapshot_id=snapshot_id,
                 )
             elif source_type == JIRA_SOURCE_TYPE:
                 result = await submit_jira_package(
@@ -4575,6 +5452,7 @@ def create_admin_app(
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                     document_store=artifact_store,
+                    collection_attempt_id=input_snapshot_id,
                 )
             else:
                 result = await submit_local_markdown_document(
@@ -4595,52 +5473,79 @@ def create_admin_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         if result.get("package_uri"):
+            package_uri = str(result["package_uri"])
+
+            async def discard_unretained_package() -> None:
+                await db.enqueue_source_artifact_cleanup_task(
+                    source_id=source_id,
+                    artifact_uri=package_uri,
+                )
+                await SourceArtifactCleanupService(
+                    db,
+                    artifact_store,
+                ).run_pending(limit=100)
+
             try:
-                snapshot_id = local_agent_authoritative_snapshot_id(
-                    source_type,
-                    req.local_agent_job_id,
-                    req.local_agent_attempt_count,
-                    req.sync_snapshot_id,
+                current_source = await db.get_source(source_id)
+                if current_source is None:
+                    raise HTTPException(status_code=404, detail="Source not found")
+                lease_payload = await _require_current_local_agent_lease(
+                    request,
+                    db,
+                    source=current_source,
+                    job_id=req.local_agent_job_id,
+                    attempt_count=req.local_agent_attempt_count,
                 )
+                raw_sha256 = local_agent_semantic_input_sha256(
+                    result.get("doc_id"),
+                    result.get("document_hash"),
+                )
+                if not raw_sha256:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="local_agent_package_hash_missing",
+                    )
+                manifest_entry = result.get("package_manifest_entry")
+                package_sha256 = str(result.get("package_sha256") or "").strip()
+                if not package_sha256:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="local_agent_package_artifact_hash_missing",
+                    )
+                if isinstance(manifest_entry, dict):
+                    manifest_entry = {
+                        **manifest_entry,
+                        "package_sha256": package_sha256,
+                    }
+                retained_input = await db.create_source_sync_input(
+                    source_id=source_id,
+                    raw_uri=package_uri,
+                    raw_sha256=raw_sha256,
+                    raw_content_type="application/json",
+                    metadata={
+                        "doc_id": result.get("doc_id"),
+                        "source_type": source_type,
+                        "package_path": result.get("package_path"),
+                        "submitted_at": result.get("submitted_at"),
+                        "submitted_by": req.submitted_by,
+                        "package_sha256": package_sha256,
+                        "manifest_entry": (manifest_entry if isinstance(manifest_entry, dict) else {}),
+                    },
+                    sync_snapshot_id=input_snapshot_id,
+                    expected_activity_epoch=int(lease_payload["source_activity_epoch"]),
+                )
+            except HTTPException:
+                await discard_unretained_package()
+                raise
             except ValueError as exc:
+                await discard_unretained_package()
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-            current_source = await db.get_source(source_id)
-            if current_source is None:
-                raise HTTPException(status_code=404, detail="Source not found")
-            await _require_current_local_agent_lease(
-                request,
-                db,
-                source=current_source,
-                job_id=req.local_agent_job_id,
-                attempt_count=req.local_agent_attempt_count,
-            )
-            raw_sha256 = local_agent_input_sha256(
-                result.get("doc_id"),
-                result.get("document_hash"),
-            )
-            if not raw_sha256:
-                raise HTTPException(
-                    status_code=500,
-                    detail="local_agent_package_hash_missing",
-                )
-            manifest_entry = result.get("package_manifest_entry")
-            await db.create_source_sync_input(
-                source_id=source_id,
-                raw_uri=str(result["package_uri"]),
-                raw_sha256=raw_sha256,
-                raw_content_type="application/json",
-                metadata={
-                    "doc_id": result.get("doc_id"),
-                    "source_type": source_type,
-                    "package_path": result.get("package_path"),
-                    "submitted_at": result.get("submitted_at"),
-                    "submitted_by": req.submitted_by,
-                    "manifest_entry": (
-                        manifest_entry if isinstance(manifest_entry, dict) else {}
-                    ),
-                },
-                sync_snapshot_id=snapshot_id,
-            )
+            except Exception:
+                await discard_unretained_package()
+                raise
+            if retained_input.raw_uri != package_uri:
+                await discard_unretained_package()
+                result["package_uri"] = retained_input.raw_uri
 
         public_result = dict(result)
         public_result.pop("package_manifest_entry", None)
@@ -4724,6 +5629,8 @@ def create_admin_app(
                 process_now=req.process_now,
                 user_id=owner_user_id,
             )
+        except SourceActivityConflict as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
         except ValueError as e:
             detail = str(e)
             if "LLM unavailable" in detail:
@@ -5346,11 +6253,7 @@ def create_admin_app(
         db: Database = Depends(get_db),
     ):
         try:
-            progress = (
-                normalize_sync_progress_snapshot(req.progress)
-                if req.progress is not None
-                else None
-            )
+            progress = normalize_sync_progress_snapshot(req.progress) if req.progress is not None else None
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         wrote = await db.heartbeat_local_agent_job(
@@ -5418,9 +6321,7 @@ def create_admin_app(
     ):
         job = await db.get_local_agent_job(job_id)
         requester = resolve_request_principal(request)
-        if job is None or requester not in {
-            job["created_by_user_id"], job["execution_owner_user_id"]
-        }:
+        if job is None or requester not in {job["created_by_user_id"], job["execution_owner_user_id"]}:
             raise HTTPException(status_code=404, detail="local_agent_job_not_found")
         return _shape_local_agent_job(job)
 
@@ -5432,9 +6333,7 @@ def create_admin_app(
         now = datetime.now(timezone.utc)
         last_seen_at = await db.get_local_agent_heartbeat(resolve_request_principal(request))
         last_seen = datetime.fromisoformat(last_seen_at) if last_seen_at else None
-        online = bool(
-            last_seen and (now - last_seen).total_seconds() <= LOCAL_AGENT_STATUS_STALE_SECONDS
-        )
+        online = bool(last_seen and (now - last_seen).total_seconds() <= LOCAL_AGENT_STATUS_STALE_SECONDS)
         return {
             "status": "online" if online else "offline",
             "last_seen_at": last_seen_at,

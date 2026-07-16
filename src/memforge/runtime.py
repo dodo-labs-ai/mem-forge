@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -16,7 +17,12 @@ from memforge.auth import browser_session
 from memforge.genes import GENE_REGISTRY, create_gene
 from memforge.llm.providers import is_litellm_provider_model
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
-from memforge.local_agent.source_contract import source_with_sync_inputs
+from memforge.local_agent.source_contract import (
+    local_agent_collection_is_authoritative,
+    local_agent_source_config_revision,
+    local_agent_sync_operation,
+    source_with_sync_inputs,
+)
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.health import MemoryIndexHealthChecker, MemoryIndexHealthReport
@@ -30,11 +36,16 @@ from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
     ExtractionWorkPool,
     GeneSyncOrchestrator,
+    SourceSyncMode,
     get_process_document_lifecycle_admission,
 )
 from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.retrieval.embeddings import get_chroma_collection
 from memforge.source_secrets import decrypt_source_config_for_runtime, source_secret_fields
+from memforge.source_activity import (
+    SourceActivityConflict,
+    SourceActivityKind,
+)
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.sync_progress import SourceSyncProgressAccumulator, source_sync_progress_from_pipeline
@@ -59,6 +70,32 @@ class SourceNotActiveError(RuntimeError):
 
 class SourceSyncLeaseLost(RuntimeError):
     """Raised when a worker no longer owns the leased source-sync run."""
+
+
+class SourceSyncBoundaryError(RuntimeError):
+    """Raised when a durable run no longer matches its captured input boundary."""
+
+
+class SourceLifecycleMaintenanceError(SourceSyncBoundaryError, SourceActivityConflict):
+    """Raised when an ordinary sync overlaps durable lifecycle maintenance."""
+
+
+async def authorize_source_sync_maintenance(
+    db: Any,
+    source_id: str,
+    *,
+    lifecycle_job_id: str | None = None,
+) -> None:
+    """Require the exact active lifecycle job token, or no active maintenance."""
+    active = await db.get_active_lifecycle_backfill_job(source_id)
+    if active is None:
+        if lifecycle_job_id is not None:
+            raise SourceLifecycleMaintenanceError(
+                f"source lifecycle maintenance token is not active: {lifecycle_job_id}"
+            )
+        return
+    if lifecycle_job_id != active.id:
+        raise SourceLifecycleMaintenanceError(f"source lifecycle maintenance active: {active.id}")
 
 
 @dataclass
@@ -167,6 +204,9 @@ class RuntimeProvider(Protocol):
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
+        reprocess_doc_ids: frozenset[str] | None = None,
+        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
+        lifecycle_job_id: str | None = None,
     ) -> SyncState: ...
 
 
@@ -222,6 +262,9 @@ class DefaultRuntimeProvider:
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
+        reprocess_doc_ids: frozenset[str] | None = None,
+        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
+        lifecycle_job_id: str | None = None,
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -231,6 +274,9 @@ class DefaultRuntimeProvider:
             progress_callback=progress_callback,
             force_full_sync=force_full_sync,
             authoritative_snapshot=authoritative_snapshot,
+            reprocess_doc_ids=reprocess_doc_ids,
+            execution_mode=execution_mode,
+            lifecycle_job_id=lifecycle_job_id,
         )
 
 
@@ -416,9 +462,7 @@ def _dt_iso(value: Any) -> str | None:
 
 
 def _has_structured_llm_credentials(llm: EffectiveLlmConfig) -> bool:
-    return bool(llm.enrichment_api_key) or is_litellm_provider_model(
-        llm.enrichment_model
-    )
+    return bool(llm.enrichment_api_key) or is_litellm_provider_model(llm.enrichment_model)
 
 
 def _retrieval_config_for_llm(config: AppConfig, llm: EffectiveLlmConfig):
@@ -528,9 +572,7 @@ async def build_sync_runtime(
     adapters = build_sqlite_adapters(
         db,
         memory_collection,
-        audit_logger=MemoryAuditLogger(
-            db, default_context=AuditContext(actor_type="sync")
-        ),
+        audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="sync")),
     )
     memory_store = MemoryStore(
         relational=adapters.relational,
@@ -582,24 +624,81 @@ async def run_source_sync(
     progress_callback: Callable[[dict], None] | None = None,
     force_full_sync: bool = False,
     authoritative_snapshot: bool = False,
+    reprocess_doc_ids: frozenset[str] | None = None,
+    execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
+    lifecycle_job_id: str | None = None,
 ) -> SyncState:
-    runtime = runtime or await build_sync_runtime(db, config)
-    secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
-    source_config = decrypt_source_config_for_runtime(source["config"], secret_fields=secret_fields)
-    await browser_session.inject_cookie_for_source(db, source["type"], source_config)
-    gene = create_gene(
-        name=source["type"],
-        config=source_config,
-        source_id=source["id"],
+    await authorize_source_sync_maintenance(
+        db,
+        str(source["id"]),
+        lifecycle_job_id=lifecycle_job_id,
     )
-    return await runtime.orchestrator().sync_gene(
-        gene=gene,
-        source_name=source["name"],
-        source_id=source["id"],
-        progress_callback=progress_callback,
-        force_full_sync=force_full_sync,
-        authoritative_snapshot=authoritative_snapshot,
-    )
+    activity_id = None
+    heartbeat_task: asyncio.Task[None] | None = None
+    if lifecycle_job_id is None:
+        activity_id = f"source-sync-{uuid.uuid4().hex}"
+        try:
+            await db.acquire_source_activity(
+                activity_id=activity_id,
+                source_id=str(source["id"]),
+                kind=SourceActivityKind.SYNC,
+                lease_seconds=300,
+            )
+        except SourceActivityConflict as exc:
+            raise SourceLifecycleMaintenanceError(str(exc)) from exc
+
+        async def heartbeat_activity() -> None:
+            while True:
+                await asyncio.sleep(60)
+                await db.renew_source_activity(
+                    activity_id=activity_id,
+                    lease_seconds=300,
+                )
+
+        heartbeat_task = asyncio.create_task(heartbeat_activity())
+    try:
+        runtime = runtime or await build_sync_runtime(db, config)
+        secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
+        source_config = decrypt_source_config_for_runtime(source["config"], secret_fields=secret_fields)
+        await browser_session.inject_cookie_for_source(db, source["type"], source_config)
+        gene = create_gene(
+            name=source["type"],
+            config=source_config,
+            source_id=source["id"],
+        )
+        sync_kwargs: dict[str, Any] = {
+            "gene": gene,
+            "source_name": source["name"],
+            "source_id": source["id"],
+            "progress_callback": progress_callback,
+            "force_full_sync": force_full_sync,
+            "authoritative_snapshot": authoritative_snapshot,
+            "reprocess_doc_ids": reprocess_doc_ids,
+        }
+        if execution_mode is not SourceSyncMode.NORMAL:
+            sync_kwargs["execution_mode"] = execution_mode
+        sync_operation = runtime.orchestrator().sync_gene(**sync_kwargs)
+        if heartbeat_task is None:
+            return await sync_operation
+        sync_task = asyncio.create_task(sync_operation)
+        done, _ = await asyncio.wait(
+            {sync_task, heartbeat_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if heartbeat_task in done:
+            sync_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sync_task
+            await heartbeat_task
+            raise SourceLifecycleMaintenanceError(f"source activity heartbeat stopped: {activity_id}")
+        return await sync_task
+    finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+        if activity_id is not None:
+            await db.release_source_activity(activity_id=activity_id)
 
 
 class SourceSyncWorker:
@@ -630,11 +729,7 @@ class SourceSyncWorker:
         )
         self.progress_flush_seconds = max(0.001, float(progress_flush_seconds))
         max_extraction_workers = max(0, int(config.sync.max_extraction_workers))
-        self._extraction_pool = (
-            ExtractionWorkPool(max_extraction_workers)
-            if max_extraction_workers
-            else None
-        )
+        self._extraction_pool = ExtractionWorkPool(max_extraction_workers) if max_extraction_workers else None
         max_document_lifecycles = max(0, int(config.sync.max_document_lifecycles))
         self._document_lifecycle_admission = get_process_document_lifecycle_admission(max_document_lifecycles)
 
@@ -714,9 +809,7 @@ class SourceSyncWorker:
 
         kwargs["progress_callback"] = report_progress
         heartbeat_task = asyncio.create_task(self._heartbeat_until_stopped(run, stop, lease_lost))
-        progress_task = asyncio.create_task(
-            self._progress_until_stopped(run, stop, lease_lost, latest_progress)
-        )
+        progress_task = asyncio.create_task(self._progress_until_stopped(run, stop, lease_lost, latest_progress))
         sync_task = asyncio.create_task(self.runtime_provider.run_source_sync(**kwargs))
         try:
             done, _ = await asyncio.wait(
@@ -768,7 +861,7 @@ class SourceSyncWorker:
         exponent = max(0, run.lease_attempt_count - 1)
         delay = min(
             self.config.sync.worker_retry_max_seconds,
-            self.config.sync.worker_retry_base_seconds * (2 ** exponent),
+            self.config.sync.worker_retry_base_seconds * (2**exponent),
         )
         return failed_at + timedelta(seconds=delay)
 
@@ -811,15 +904,32 @@ class SourceSyncWorker:
                     )
                 return run
 
+            if (
+                run.source_config_revision is not None
+                and local_agent_source_config_revision(source) != run.source_config_revision
+            ):
+                raise SourceSyncBoundaryError("source config revision changed before sync execution")
+
             inputs = await self.db.list_source_sync_inputs(
                 source_id=run.source_id,
                 workspace_id=run.workspace_id,
                 input_snapshot_id=run.input_snapshot_id,
             )
+            local_operation = local_agent_sync_operation(source["type"], source.get("config"))
+            if run.input_snapshot_id is None:
+                if local_operation is not None and run.input_generation_watermark is None:
+                    raise SourceSyncBoundaryError("local-agent sync run is missing its input generation boundary")
+                if run.input_generation_watermark is not None:
+                    inputs = [
+                        source_input
+                        for source_input in inputs
+                        if source_input.input_generation <= run.input_generation_watermark
+                    ]
+            authoritative_collection = local_agent_collection_is_authoritative(source["type"])
             source = source_with_sync_inputs(
                 source,
                 inputs,
-                authoritative_snapshot=run.input_snapshot_id is not None,
+                authoritative_snapshot=authoritative_collection,
             )
 
             runtime = await self.runtime_provider.build_sync_runtime(
@@ -836,7 +946,7 @@ class SourceSyncWorker:
                 runtime=runtime,
                 progress_callback=None,
                 force_full_sync=run.force_full_sync,
-                authoritative_snapshot=run.input_snapshot_id is not None,
+                authoritative_snapshot=authoritative_collection,
             )
             if final_state is None:
                 final_state = SyncState(
@@ -860,9 +970,7 @@ class SourceSyncWorker:
                     next_attempt_at=next_attempt_at,
                 )
                 if not failed:
-                    raise SourceSyncLeaseLost(
-                        f"source sync lease lost before failure update for run {run.run_id}"
-                    )
+                    raise SourceSyncLeaseLost(f"source sync lease lost before failure update for run {run.run_id}")
                 return run
             completed = await self.db.complete_source_sync_run(
                 run.run_id,
@@ -871,9 +979,7 @@ class SourceSyncWorker:
                 final_state=final_state,
             )
             if not completed:
-                raise SourceSyncLeaseLost(
-                    f"source sync lease lost before completion for run {run.run_id}"
-                )
+                raise SourceSyncLeaseLost(f"source sync lease lost before completion for run {run.run_id}")
             return run
         except asyncio.CancelledError:
             raise
@@ -891,7 +997,13 @@ class SourceSyncWorker:
                 )
             failed_at = datetime.now(timezone.utc)
             next_attempt_at = self._next_retry_at(run, failed_at)
-            retryable = not isinstance(exc, (SourcePausedError, SourceNotActiveError)) and next_attempt_at is not None
+            retryable = (
+                not isinstance(
+                    exc,
+                    (SourcePausedError, SourceNotActiveError, SourceSyncBoundaryError),
+                )
+                and next_attempt_at is not None
+            )
             failed = await self.db.fail_source_sync_run(
                 run.run_id,
                 worker_id=self.worker_id,
@@ -927,15 +1039,9 @@ class SyncService:
         self.tasks: dict[str, asyncio.Task] = {}
         self.progress: dict[str, dict] = {}
         max_active_sources = max(0, int(config.sync.max_active_sources))
-        self._source_slots = (
-            asyncio.Semaphore(max_active_sources) if max_active_sources else None
-        )
+        self._source_slots = asyncio.Semaphore(max_active_sources) if max_active_sources else None
         max_extraction_workers = max(0, int(config.sync.max_extraction_workers))
-        self._extraction_pool = (
-            ExtractionWorkPool(max_extraction_workers)
-            if max_extraction_workers
-            else None
-        )
+        self._extraction_pool = ExtractionWorkPool(max_extraction_workers) if max_extraction_workers else None
         max_document_lifecycles = max(0, int(config.sync.max_document_lifecycles))
         self._document_lifecycle_admission = get_process_document_lifecycle_admission(max_document_lifecycles)
 
@@ -950,9 +1056,8 @@ class SyncService:
         if source.get("status") == "paused":
             raise SourcePausedError(f"Source is paused: {source_id}")
         if source.get("status") != "active":
-            raise SourceNotActiveError(
-                f"Source is not active: {source_id} ({source.get('status')})"
-            )
+            raise SourceNotActiveError(f"Source is not active: {source_id} ({source.get('status')})")
+        await authorize_source_sync_maintenance(self.db, source_id)
         return source
 
     async def enqueue_source(
@@ -963,14 +1068,24 @@ class SyncService:
         force_full_sync: bool = False,
         workspace_id: str = "default",
         input_snapshot_id: str | None = None,
+        source_config_revision: str | None = None,
     ) -> SourceSyncRun:
-        await self._ensure_source_can_sync(source_id)
+        source = await self._ensure_source_can_sync(source_id)
+        current_config_revision = (
+            local_agent_source_config_revision(source)
+            if local_agent_sync_operation(source["type"], source.get("config")) is not None
+            else None
+        )
+        if source_config_revision is not None and source_config_revision != current_config_revision:
+            raise ValueError("source config revision changed before sync enqueue")
+        effective_config_revision = source_config_revision or current_config_revision
         return await self.db.enqueue_source_sync_run(
             source_id=source_id,
             workspace_id=workspace_id,
             trigger=trigger,
             force_full_sync=force_full_sync,
             input_snapshot_id=input_snapshot_id,
+            source_config_revision=effective_config_revision,
         )
 
     async def start_source(self, source_id: str, *, force_full_sync: bool = False) -> asyncio.Task:

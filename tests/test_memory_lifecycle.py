@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from memforge.models import DocumentRecord, Memory, content_hash
+from memforge.models import DocumentRecord, Memory, SyncState, content_hash
 from memforge.storage.database import Database
 
 
@@ -194,7 +194,15 @@ class TestSupportAwareRetirement:
             raw_sha256="old-sha",
             raw_content_type="application/json",
         )
-        await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+        run = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+        leased = await db.lease_next_source_sync_run(worker_id="test-worker")
+        assert leased is not None and leased.run_id == run.run_id
+        assert await db.complete_source_sync_run(
+            run.run_id,
+            worker_id="test-worker",
+            lease_attempt_count=leased.lease_attempt_count,
+            final_state=SyncState(source=source_id, last_sync_status="success"),
+        )
 
         await db.delete_source_cascade(source_id)
 
@@ -233,6 +241,12 @@ class TestSupportAwareRetirement:
                 last_synced=now,
             )
         )
+        await db.create_source_sync_input(
+            source_id=source_id,
+            raw_uri="object-store://workspace/documents/src-artifacts/package.json",
+            raw_sha256="package-input-hash",
+            raw_content_type="application/json",
+        )
 
         await db.delete_source_cascade(source_id)
 
@@ -241,6 +255,7 @@ class TestSupportAwareRetirement:
             (source_id, "object-store://workspace/documents/src-artifacts/raw.html"),
             (source_id, "object-store://workspace/documents/src-artifacts/page.md"),
             (source_id, "object-store://workspace/documents/src-artifacts/page.pdf"),
+            (source_id, "object-store://workspace/documents/src-artifacts/package.json"),
         }
 
     @pytest.mark.asyncio

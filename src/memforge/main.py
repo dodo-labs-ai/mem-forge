@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import metadata
-from itertools import islice
+from itertools import chain, islice
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from typing import Any, Callable
@@ -45,7 +45,10 @@ from memforge.github_repo_utils import (
     parse_github_repo_url,
 )
 from memforge.local_agent.folder_picker import FolderPickerCancelled, FolderPickerUnavailable, pick_folder
-from memforge.local_agent.source_contract import local_agent_sync_snapshot_id
+from memforge.local_agent.source_contract import (
+    TEAMS_TOMBSTONE_REASONS,
+    local_agent_sync_snapshot_id,
+)
 from memforge.sync_progress import normalize_sync_progress_snapshot
 from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
@@ -61,12 +64,18 @@ DEFAULT_LOCAL_AGENT_LOCK_PATH = Path.home() / ".memforge" / "local-agent-daemon.
 DEFAULT_TEAMS_AUDIT_LOG_PATH = Path.home() / ".memforge" / "teams-sync-audit.jsonl"
 DEFAULT_TEAMS_LEDGER_STATE_PATH = Path.home() / ".memforge" / "teams-ledger-state.json"
 DEFAULT_KB_INCLUDE = [
-    "*.md", "**/*.md",
-    "*.markdown", "**/*.markdown",
-    "*.txt", "**/*.txt",
-    "*.json", "**/*.json",
-    "*.html", "**/*.html",
-    "*.htm", "**/*.htm",
+    "*.md",
+    "**/*.md",
+    "*.markdown",
+    "**/*.markdown",
+    "*.txt",
+    "**/*.txt",
+    "*.json",
+    "**/*.json",
+    "*.html",
+    "**/*.html",
+    "*.htm",
+    "**/*.htm",
 ]
 DEFAULT_KB_EXCLUDE = [".obsidian/**", ".trash/**", ".git/**", "**/.git/**"]
 LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
@@ -354,11 +363,13 @@ def _build_local_agent_runner(
             result=result,
             error=error,
         ),
-        cloud_job_heartbeat=lambda job_id, attempt_count, lease_seconds, progress=None: client.heartbeat_local_agent_job(
-            job_id,
-            attempt_count=attempt_count,
-            lease_seconds=lease_seconds,
-            progress=progress,
+        cloud_job_heartbeat=lambda job_id, attempt_count, lease_seconds, progress=None: (
+            client.heartbeat_local_agent_job(
+                job_id,
+                attempt_count=attempt_count,
+                lease_seconds=lease_seconds,
+                progress=progress,
+            )
         ),
     )
 
@@ -526,7 +537,10 @@ def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | 
 @click.group(invoke_without_command=True)
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging")
 @click.option(
-    "--config", "config_path", type=click.Path(exists=True, path_type=Path), default=None,
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
     help="Path to config.toml",
 )
 @click.pass_context
@@ -631,8 +645,7 @@ async def _run_retrieval_eval_cli(
     else:
         summary = payload["summary"]
         click.echo(
-            f"retrieval eval {case_set}: "
-            f"{summary['case_count']} cases, {summary['hard_failures']} hard failures"
+            f"retrieval eval {case_set}: {summary['case_count']} cases, {summary['hard_failures']} hard failures"
         )
         for failure in payload["hard_failures"]:
             click.echo(f"- {failure['case_id']}: {failure['message']}")
@@ -666,8 +679,7 @@ def _run_interactive_script() -> int:
     node_bin = shutil.which("node")
     if node_bin is None:
         log_console.print(
-            "[yellow]Interactive UI requires Node.js (>=18) on PATH.[/]\n"
-            "Install Node, then re-run [bold]memforge[/]."
+            "[yellow]Interactive UI requires Node.js (>=18) on PATH.[/]\nInstall Node, then re-run [bold]memforge[/]."
         )
         return 2
 
@@ -706,15 +718,11 @@ def _prepare_interactive_workspace(resource_dir: Path | None = None) -> Path:
 
 def _validate_interactive_resources(resource_dir: Path) -> None:
     missing = [
-        name
-        for name in ("index.mjs", "package.json", "package-lock.json")
-        if not (resource_dir / name).exists()
+        name for name in ("index.mjs", "package.json", "package-lock.json") if not (resource_dir / name).exists()
     ]
     if missing:
         raise RuntimeError(
-            "Interactive UI package is incomplete: missing "
-            + ", ".join(missing)
-            + f" under {resource_dir}."
+            "Interactive UI package is incomplete: missing " + ", ".join(missing) + f" under {resource_dir}."
         )
 
 
@@ -884,7 +892,9 @@ def target_list(ctx):
 @click.argument("name")
 @click.option("--api-url", required=True, help="MemForge API URL for this target.")
 @click.option("--workspace-id", default=None, help="Required workspace ID for Cloud targets.")
-@click.option("--token-env", default="MEMFORGE_API_TOKEN", show_default=True, help="Environment variable for the token.")
+@click.option(
+    "--token-env", default="MEMFORGE_API_TOKEN", show_default=True, help="Environment variable for the token."
+)
 @click.pass_context
 def target_add(ctx, name: str, api_url: str, workspace_id: str | None, token_env: str):
     """Add or update an API target and make it active."""
@@ -984,13 +994,14 @@ def sync(ctx, source: str | None):
                     source=src,
                     runtime=runtime,
                     progress_callback=lambda p: (
-                        console.print(f"  [dim]{p.get('status', '')}[/]")
-                        if p.get("status") else None
+                        console.print(f"  [dim]{p.get('status', '')}[/]") if p.get("status") else None
                     ),
                 )
                 status_color = (
-                    "green" if state.last_sync_status == "success"
-                    else "yellow" if state.last_sync_status == "partial"
+                    "green"
+                    if state.last_sync_status == "success"
+                    else "yellow"
+                    if state.last_sync_status == "partial"
                     else "red"
                 )
                 console.print(
@@ -1049,11 +1060,7 @@ def search(
 ):
     """Search MemForge using the same service path as the MCP search tool."""
     time_range = (
-        {
-            k: v
-            for k, v in {"date_type": date_type, "start_date": start_date, "end_date": end_date}.items()
-            if v
-        }
+        {k: v for k, v in {"date_type": date_type, "start_date": start_date, "end_date": end_date}.items() if v}
         if start_date or end_date
         else {}
     )
@@ -1148,11 +1155,7 @@ def memory_search(
 ):
     """Search MemForge memories."""
     time_range = (
-        {
-            k: v
-            for k, v in {"date_type": date_type, "start_date": start_date, "end_date": end_date}.items()
-            if v
-        }
+        {k: v for k, v in {"date_type": date_type, "start_date": start_date, "end_date": end_date}.items() if v}
         if start_date or end_date
         else {}
     )
@@ -1308,13 +1311,9 @@ def sources_searchable(ctx):
 def sources_schedule(ctx, source_id: str, every_minutes: int, disable: bool):
     """Configure automatic sync for one source over the active API target."""
     if every_minutes < SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES:
-        raise click.ClickException(
-            f"--every-minutes must be at least {SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES}."
-        )
+        raise click.ClickException(f"--every-minutes must be at least {SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES}.")
     if every_minutes > SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES:
-        raise click.ClickException(
-            f"--every-minutes must be at most {SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES}."
-        )
+        raise click.ClickException(f"--every-minutes must be at most {SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES}.")
     client = _tool_client(ctx)
     payload = client.update_source_schedule(
         source_id=source_id,
@@ -1345,7 +1344,9 @@ def memories():
 
 
 @memories.command("list")
-@click.option("--type", "memory_type", default=None, help="Filter by memory type (fact, decision, convention, procedure)")
+@click.option(
+    "--type", "memory_type", default=None, help="Filter by memory type (fact, decision, convention, procedure)"
+)
 @click.option("--entity", default=None, help="Filter by entity name")
 @click.option("--source", default=None, help="Filter by source name/ID")
 @click.option("--status", default="active", help="Filter by status (default: active)")
@@ -1654,9 +1655,7 @@ def _summarize_local_agent_state_tasks(tasks: dict[str, Any]) -> dict[str, Any]:
 
 def _recent_local_agent_tasks(tasks: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
     compact_tasks = [
-        _compact_local_agent_task(task_id, task)
-        for task_id, task in tasks.items()
-        if isinstance(task, dict)
+        _compact_local_agent_task(task_id, task) for task_id, task in tasks.items() if isinstance(task, dict)
     ]
     compact_tasks.sort(
         key=lambda task: (
@@ -1722,10 +1721,21 @@ def adapter_daemon_once(
 
 @adapter_daemon.command("run")
 @click.option("--browser", default=None, help="Browser to read Jira cookies from, for example chrome or edge.")
-@click.option("--interval-seconds", "poll_interval_seconds", default=10, show_default=True, type=int,
-              help="Seconds between server-job lease polls.")
-@click.option("--cloud-job-wait-seconds", default=25, show_default=True, type=int,
-              help="Long-poll wait for Cloud-triggered local-agent jobs.")
+@click.option(
+    "--interval-seconds",
+    "poll_interval_seconds",
+    default=10,
+    show_default=True,
+    type=int,
+    help="Seconds between server-job lease polls.",
+)
+@click.option(
+    "--cloud-job-wait-seconds",
+    default=25,
+    show_default=True,
+    type=int,
+    help="Long-poll wait for Cloud-triggered local-agent jobs.",
+)
 @click.pass_context
 def adapter_daemon_run(
     ctx,
@@ -1852,12 +1862,22 @@ def _push_github_profile_to_source(
             submitted_by=submitted_by,
         )
         if isinstance(response, dict) and response.get("error"):
-            failed.append({"relative_path": doc["relative_path"], "error": response.get("error"),
-                           "detail": response.get("detail"), "status_code": response.get("status_code")})
+            failed.append(
+                {
+                    "relative_path": doc["relative_path"],
+                    "error": response.get("error"),
+                    "detail": response.get("detail"),
+                    "status_code": response.get("status_code"),
+                }
+            )
         else:
-            pushed.append({"relative_path": doc["relative_path"],
-                           "doc_id": response.get("doc_id"),
-                           "document_hash": response.get("document_hash")})
+            pushed.append(
+                {
+                    "relative_path": doc["relative_path"],
+                    "doc_id": response.get("doc_id"),
+                    "document_hash": response.get("document_hash"),
+                }
+            )
         _report_local_agent_progress(
             report_progress,
             _sync_progress_snapshot(
@@ -1910,12 +1930,8 @@ def _run_cloud_local_agent_job(
         "github_repo_sync": lambda: _run_cloud_github_sync_job(job, client, report_progress=report_progress),
         "local_markdown_pick_root": lambda: _run_cloud_pick_root_job(job),
         "local_markdown_preview_tree": lambda: _run_cloud_local_markdown_preview_job(job),
-        "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(
-            job, client, report_progress=report_progress
-        ),
-        "jira_sync": lambda: _run_cloud_jira_sync_job(
-            job, client, browser=browser, report_progress=report_progress
-        ),
+        "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(job, client, report_progress=report_progress),
+        "jira_sync": lambda: _run_cloud_jira_sync_job(job, client, browser=browser, report_progress=report_progress),
         "teams_auth_check": lambda: _run_cloud_teams_auth_check_job(job),
         "teams_auth": lambda: _run_cloud_teams_auth_job(job),
         "teams_browse": lambda: _run_cloud_teams_browse_job(job),
@@ -1927,8 +1943,25 @@ def _run_cloud_local_agent_job(
     }
     handler = handlers.get(operation)
     if handler is None:
-        return {"operation": operation, "error": f"unsupported cloud local-agent job operation: {operation or '<empty>'}"}
+        return {
+            "operation": operation,
+            "error": f"unsupported cloud local-agent job operation: {operation or '<empty>'}",
+        }
     return handler()
+
+
+def _local_agent_lease_not_current(response: object) -> bool:
+    if not isinstance(response, dict) or response.get("status_code") != 409:
+        return False
+    detail = response.get("detail")
+    if isinstance(detail, str):
+        try:
+            parsed = json.loads(detail)
+        except json.JSONDecodeError:
+            return "local_agent_lease_not_current" in detail
+        if isinstance(parsed, dict):
+            return parsed.get("detail") == "local_agent_lease_not_current"
+    return detail == "local_agent_lease_not_current"
 
 
 def _run_cloud_github_preview_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -2119,12 +2152,22 @@ def _run_cloud_jira_sync_job(
             local_agent_attempt_count=int(job["attempt_count"]),
         )
         if isinstance(response, dict) and response.get("error"):
-            failed.append({"issue_key": doc["issue_key"], "error": response.get("error"),
-                           "detail": response.get("detail"), "status_code": response.get("status_code")})
+            failed.append(
+                {
+                    "issue_key": doc["issue_key"],
+                    "error": response.get("error"),
+                    "detail": response.get("detail"),
+                    "status_code": response.get("status_code"),
+                }
+            )
         else:
-            pushed.append({"issue_key": doc["issue_key"],
-                           "doc_id": response.get("doc_id"),
-                           "document_hash": response.get("document_hash")})
+            pushed.append(
+                {
+                    "issue_key": doc["issue_key"],
+                    "doc_id": response.get("doc_id"),
+                    "document_hash": response.get("document_hash"),
+                }
+            )
         _report_local_agent_progress(
             report_progress,
             _sync_progress_snapshot(
@@ -2309,7 +2352,6 @@ def _run_cloud_teams_sync_job(
     report_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     from memforge.local_agent.teams_audit import write_teams_audit_event
-    from memforge.local_agent.teams_ledger import TeamsLedgerStateStore
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
@@ -2320,8 +2362,6 @@ def _run_cloud_teams_sync_job(
 
     run_id = str(job.get("job_id") or f"teams-sync-{int(time.time())}")
     audit_path = Path(str(payload.get("audit_log_path") or DEFAULT_TEAMS_AUDIT_LOG_PATH))
-    ledger_state_path = Path(str(payload.get("ledger_state_path") or DEFAULT_TEAMS_LEDGER_STATE_PATH))
-    ledger_store = TeamsLedgerStateStore(ledger_state_path)
     limit = _cloud_job_limit(payload.get("limit"), default=0)
     _report_local_agent_progress(
         report_progress,
@@ -2387,6 +2427,41 @@ def _run_cloud_teams_sync_job(
             }
 
     documents, poll_audits = _teams_collection_documents_and_polls(collection)
+    try:
+        configured_conversation_ids = set(_teams_direct_rest_config_from_cloud_payload(payload)["conversation_ids"])
+        scope_attestation_documents = _teams_scope_attestation_documents(
+            source_id=source_id,
+            job=job,
+            poll_audits=poll_audits,
+            configured_conversation_ids=configured_conversation_ids,
+            scope_transition=(
+                payload.get("projection_scope_transition")
+                if isinstance(payload.get("projection_scope_transition"), dict)
+                else None
+            ),
+        )
+        inventory_documents = (
+            _iter_teams_inventory_tombstones(
+                client=client,
+                source_id=source_id,
+                current_documents=documents,
+                poll_audits=poll_audits,
+                configured_conversation_ids=configured_conversation_ids,
+                scope_transition=(
+                    payload.get("projection_scope_transition")
+                    if isinstance(payload.get("projection_scope_transition"), dict)
+                    else None
+                ),
+            )
+            if not limit
+            else iter(())
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        inventory_documents = iter(())
+        scope_attestation_documents = []
+        inventory_setup_error = str(exc)
+    else:
+        inventory_setup_error = None
     progress_summary = _teams_progress_summary(documents, poll_audits)
     for poll in poll_audits:
         event = {"event": "teams_conversation_poll", "run_id": run_id, "source_id": source_id, **poll}
@@ -2395,13 +2470,24 @@ def _run_cloud_teams_sync_job(
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     skipped_existing: list[dict[str, Any]] = []
-    pending_receipts: list[dict[str, str | None]] = []
     scoped_client = client
     submitted_by = str(payload.get("submitted_by") or "memforge-local-agent")
     sync_started = False
+    inventory_error = inventory_setup_error
+    lease_lost = False
 
     processed_messages = 0
-    for doc in documents:
+    selected_count = 0
+    document_iterator = iter(chain(inventory_documents, documents, scope_attestation_documents))
+    while inventory_error is None:
+        try:
+            doc = next(document_iterator)
+        except StopIteration:
+            break
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            inventory_error = str(exc)
+            break
+        selected_count += 1
         current_source_time = doc.get("date_from") or doc.get("date_to") or doc.get("last_modified")
         _report_local_agent_progress(
             report_progress,
@@ -2419,25 +2505,6 @@ def _run_cloud_teams_sync_job(
         window_id = str(doc["window_id"])
         revision_hash = str(doc["revision_hash"])
         window_id_hash = hashlib.sha256(window_id.encode("utf-8")).hexdigest()
-        if ledger_store.has_receipt(source_id=source_id, window_id=window_id, revision_hash=revision_hash):
-            skipped_existing.append({"window_id": window_id, "revision_hash": revision_hash})
-            write_teams_audit_event(
-                audit_path,
-                {
-                    "event": "teams_window_projection",
-                    "run_id": run_id,
-                    "source_id": source_id,
-                    "raw_conversation_id": doc.get("conversation_id"),
-                    "raw_root_message_id": doc.get("root_message_id"),
-                    "window_id_hash": window_id_hash,
-                    "window_type": doc.get("window_type"),
-                    "revision_hash": revision_hash,
-                    "receipt_status": "existing",
-                    "receipt_skip_reason": "receipt_exists",
-                    "message_count": doc.get("message_count"),
-                },
-            )
-            continue
         write_teams_audit_event(
             audit_path,
             {
@@ -2469,13 +2536,15 @@ def _run_cloud_teams_sync_job(
             local_agent_attempt_count=int(job["attempt_count"]),
         )
         if isinstance(response, dict) and response.get("error"):
-            failed.append({
-                "window_id": window_id,
-                "revision_hash": revision_hash,
-                "error": response.get("error"),
-                "detail": response.get("detail"),
-                "status_code": response.get("status_code"),
-            })
+            failed.append(
+                {
+                    "window_id": window_id,
+                    "revision_hash": revision_hash,
+                    "error": response.get("error"),
+                    "detail": response.get("detail"),
+                    "status_code": response.get("status_code"),
+                }
+            )
             write_teams_audit_event(
                 audit_path,
                 {
@@ -2494,18 +2563,18 @@ def _run_cloud_teams_sync_job(
                     "claim_rejected_ambiguous": 0,
                 },
             )
+            if _local_agent_lease_not_current(response):
+                lease_lost = True
+                break
             continue
-        pushed.append({
-            "window_id": window_id,
-            "revision_hash": revision_hash,
-            "doc_id": response.get("doc_id") if isinstance(response, dict) else None,
-            "document_hash": response.get("document_hash") if isinstance(response, dict) else None,
-        })
-        pending_receipts.append({
-            "window_id": window_id,
-            "revision_hash": revision_hash,
-            "document_hash": response.get("document_hash") if isinstance(response, dict) else None,
-        })
+        pushed.append(
+            {
+                "window_id": window_id,
+                "revision_hash": revision_hash,
+                "doc_id": response.get("doc_id") if isinstance(response, dict) else None,
+                "document_hash": response.get("document_hash") if isinstance(response, dict) else None,
+            }
+        )
         write_teams_audit_event(
             audit_path,
             {
@@ -2538,7 +2607,7 @@ def _run_cloud_teams_sync_job(
     )
 
     sync_result = None
-    if pushed:
+    if pushed and inventory_error is None and not lease_lost:
         # Teams is incremental by stable window id and revision. Processing the
         # historical input set lets the server collapse each window to its
         # latest revision; document-style authoritative snapshots do not apply.
@@ -2549,20 +2618,12 @@ def _run_cloud_teams_sync_job(
             local_agent_attempt_count=int(job["attempt_count"]),
         )
         sync_started = not bool(sync_result.get("error"))
-        if sync_started:
-            for receipt in pending_receipts:
-                ledger_store.record_receipt(
-                    source_id=source_id,
-                    window_id=str(receipt["window_id"]),
-                    revision_hash=str(receipt["revision_hash"]),
-                    document_hash=receipt["document_hash"],
-                )
 
     result = {
         "operation": operation,
         "source_id": source_id,
         "counts": {
-            "selected": len(documents),
+            "selected": selected_count,
             "pushed": len(pushed),
             "failed": len(failed),
             "skipped_existing": len(skipped_existing),
@@ -2578,7 +2639,13 @@ def _run_cloud_teams_sync_job(
         "sync_started": sync_started,
         "audit_log_path": str(audit_path.expanduser()),
     }
-    if failed:
+    if lease_lost:
+        result["error"] = "local agent lease is no longer current"
+        result["error_type"] = "LocalAgentLeaseLost"
+    elif inventory_error is not None:
+        result["error"] = f"server projection inventory is not reconcilable: {inventory_error}"
+        result["error_type"] = "TeamsProjectionInventoryError"
+    elif failed:
         result["error"] = "one or more Teams windows failed to push"
     if sync_result and sync_result.get("error"):
         result["error"] = (
@@ -2588,7 +2655,7 @@ def _run_cloud_teams_sync_job(
         )
         result["sync_error"] = sync_result
     if result.get("error"):
-        result["retryable"] = True
+        result["retryable"] = not lease_lost
 
     write_teams_audit_event(
         audit_path,
@@ -2597,8 +2664,14 @@ def _run_cloud_teams_sync_job(
             "run_id": run_id,
             "operation": operation,
             "source_id": source_id,
-            "status": "completed" if not result.get("error") else "completed_with_error",
-            "selected_windows": len(documents),
+            "status": (
+                "inventory_failed"
+                if inventory_error is not None
+                else "completed"
+                if not result.get("error")
+                else "completed_with_error"
+            ),
+            "selected_windows": selected_count,
             "pushed_windows": len(pushed),
             "failed_windows": len(failed),
             "skipped_existing_windows": len(skipped_existing),
@@ -2626,6 +2699,396 @@ def _teams_collection_documents_and_polls(collection: Any) -> tuple[list[dict[st
     if isinstance(collection, list):
         return collection, []
     return [], []
+
+
+def _teams_scope_attestation_documents(
+    *,
+    source_id: str,
+    job: dict[str, Any],
+    poll_audits: list[dict[str, Any]],
+    configured_conversation_ids: set[str],
+    scope_transition: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Build one current-attempt control unit for every target conversation."""
+
+    if scope_transition is None:
+        return []
+    from memforge.local_agent.source_contract import (
+        canonical_teams_conversation_ids,
+        local_agent_sync_snapshot_id,
+    )
+    from memforge.local_agent.teams_contract import teams_scope_attestation_window_id
+    from memforge.source_projection_config import projection_scope_fingerprint
+
+    transition_id = str(scope_transition.get("id") or "").strip()
+    target_scope = scope_transition.get("target_scope")
+    if not transition_id or not isinstance(target_scope, dict):
+        raise ValueError("Teams scope transition evidence is invalid")
+    target_conversations = set(canonical_teams_conversation_ids(target_scope, require_nonempty=True))
+    if target_conversations != configured_conversation_ids:
+        raise ValueError("Teams target scope does not match the leased collection config")
+    collection_attempt_id = local_agent_sync_snapshot_id(
+        job.get("job_id"),
+        job.get("attempt_count"),
+    )
+    target_scope_fingerprint = projection_scope_fingerprint(target_scope)
+    audits = {
+        str(audit.get("raw_conversation_id") or "").strip(): audit
+        for audit in poll_audits
+        if str(audit.get("raw_conversation_id") or "").strip()
+    }
+    documents: list[dict[str, Any]] = []
+    now = datetime.now(timezone.utc).isoformat()
+    for conversation_id in sorted(target_conversations):
+        window_id = teams_scope_attestation_window_id(
+            source_id=source_id,
+            conversation_id=conversation_id,
+        )
+        audit = audits.get(conversation_id) or {
+            "raw_conversation_id": conversation_id,
+            "access_probe_status": "missing",
+            "pagination_complete": False,
+            "stop_reason": "missing_provider_poll_audit",
+        }
+        raw_payload = {
+            "_scope_attestation": True,
+            "conversation_id": conversation_id,
+            "window_id": window_id,
+            "messages": [],
+            "transition_id": transition_id,
+            "target_scope_fingerprint": target_scope_fingerprint,
+            "target_conversation_ids": sorted(target_conversations),
+            "collection_attempt_id": collection_attempt_id,
+            "poll": audit,
+        }
+        raw_hash = hashlib.sha256(
+            json.dumps(
+                raw_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        documents.append(
+            {
+                "conversation_id": conversation_id,
+                "root_message_id": "",
+                "window_id": window_id,
+                "window_type": "scope_attestation",
+                "revision_hash": raw_hash,
+                "title": f"Teams scope attestation: {conversation_id}",
+                "source_url": "",
+                "last_modified": now,
+                "date_from": now,
+                "date_to": now,
+                "raw_payload": raw_payload,
+                "raw_hash": raw_hash,
+                "message_count": 0,
+            }
+        )
+    return documents
+
+
+def _iter_teams_inventory_tombstones(
+    *,
+    client: ToolClient,
+    source_id: str,
+    current_documents: list[dict[str, Any]],
+    poll_audits: list[dict[str, Any]],
+    configured_conversation_ids: set[str],
+    scope_transition: dict[str, Any] | None,
+):
+    """Page only relevant inventory slices and yield required tombstones."""
+
+    plans = _teams_inventory_query_plans(
+        poll_audits=poll_audits,
+        configured_conversation_ids=configured_conversation_ids,
+        scope_transition=scope_transition,
+    )
+    for plan in plans:
+        cursor = None
+        seen_cursors: set[str] = set()
+        while True:
+            try:
+                response = client.get_source_projection_inventory(
+                    source_id,
+                    unit_type="teams_window",
+                    conversation_id=plan["conversation_id"],
+                    observed_from_lte=plan.get("observed_from_lte"),
+                    observed_to_gte=plan.get("observed_to_gte"),
+                    observed_to_lt=plan.get("observed_to_lt"),
+                    cursor=cursor,
+                    limit=200,
+                )
+            except Exception as exc:
+                raise RuntimeError(str(exc)) from exc
+            if not isinstance(response, dict) or response.get("error"):
+                error = (
+                    str(response.get("error") or "").strip() if isinstance(response, dict) else ""
+                ) or "server projection inventory response is invalid"
+                raise RuntimeError(error)
+            units = _validated_teams_projection_inventory_units(response.get("units"))
+            reconciled = _reconcile_teams_documents_with_server_inventory(
+                documents=current_documents,
+                poll_audits=poll_audits,
+                inventory_units=units,
+                configured_conversation_ids=configured_conversation_ids,
+                destructive_enabled=True,
+            )
+            yield from reconciled[len(current_documents) :]
+            next_cursor = str(response.get("next_cursor") or "").strip()
+            if not next_cursor:
+                break
+            if next_cursor in seen_cursors or next_cursor == cursor or not units:
+                raise RuntimeError("server projection inventory cursor did not advance")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+
+def _teams_inventory_query_plans(
+    *,
+    poll_audits: list[dict[str, Any]],
+    configured_conversation_ids: set[str],
+    scope_transition: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    audits = {
+        str(audit.get("raw_conversation_id") or "").strip(): audit
+        for audit in poll_audits
+        if str(audit.get("raw_conversation_id") or "").strip()
+    }
+    previous_scope = (
+        scope_transition.get("previous_scope")
+        if isinstance(scope_transition, dict) and isinstance(scope_transition.get("previous_scope"), dict)
+        else {}
+    )
+    target_scope = (
+        scope_transition.get("target_scope")
+        if isinstance(scope_transition, dict) and isinstance(scope_transition.get("target_scope"), dict)
+        else {}
+    )
+    plans: list[dict[str, str]] = []
+    for conversation_id in sorted(configured_conversation_ids):
+        audit = audits.get(conversation_id)
+        if _teams_poll_proves_complete_absence(audit):
+            plans.append({"conversation_id": conversation_id})
+            continue
+        if not audit or str(audit.get("stop_reason") or "") != "cutoff_reached":
+            continue
+        covered_from = _parse_teams_coverage_time(audit.get("absence_covered_from"))
+        covered_to = _parse_teams_coverage_time(audit.get("absence_covered_to"))
+        if not covered_from or not covered_to or covered_from > covered_to:
+            continue
+        plans.append(
+            {
+                "conversation_id": conversation_id,
+                "observed_from_lte": covered_to.isoformat(),
+                "observed_to_gte": covered_from.isoformat(),
+            }
+        )
+        plans.append(
+            {
+                "conversation_id": conversation_id,
+                "observed_to_lt": covered_from.isoformat(),
+            }
+        )
+
+    removed_conversations = _teams_scope_selector_values(previous_scope) - (_teams_scope_selector_values(target_scope))
+    for conversation_id in sorted(removed_conversations):
+        plans.append({"conversation_id": conversation_id})
+    return plans
+
+
+def _teams_scope_selector_values(scope: object) -> set[str]:
+    from memforge.local_agent.source_contract import canonical_teams_conversation_ids
+
+    if not isinstance(scope, dict):
+        return set()
+    return set(canonical_teams_conversation_ids(scope))
+
+
+def _validated_teams_projection_inventory_units(value: object) -> list[dict[str, Any]]:
+    """Validate the server-owned inventory before any destructive decision."""
+
+    if not isinstance(value, list):
+        raise ValueError("units must be a list")
+    units: list[dict[str, Any]] = []
+    for unit in value:
+        if not isinstance(unit, dict):
+            raise ValueError("unit must be an object")
+        locator = unit.get("locator")
+        provider_key = str(unit.get("provider_key") or "").strip()
+        if (
+            str(unit.get("unit_type") or "").strip() != "teams_window"
+            or not str(unit.get("source_unit_id") or "").strip()
+            or not provider_key
+            or not isinstance(locator, dict)
+            or not str(locator.get("conversation_id") or "").strip()
+            or str(locator.get("window_id") or "").strip() != provider_key
+        ):
+            raise ValueError("unit is missing canonical Teams window identity")
+        units.append(unit)
+    return units
+
+
+def _reconcile_teams_documents_with_server_inventory(
+    *,
+    documents: list[dict[str, Any]],
+    poll_audits: list[dict[str, Any]],
+    inventory_units: list[dict[str, Any]],
+    configured_conversation_ids: set[str],
+    destructive_enabled: bool,
+) -> list[dict[str, Any]]:
+    """Return current documents plus server-inventory-backed window tombstones."""
+
+    if not destructive_enabled:
+        return documents
+    current_window_ids = {
+        str(document.get("window_id") or "").strip()
+        for document in documents
+        if str(document.get("window_id") or "").strip()
+    }
+    audits = {
+        str(audit.get("raw_conversation_id") or "").strip(): audit
+        for audit in poll_audits
+        if str(audit.get("raw_conversation_id") or "").strip()
+    }
+    result = list(documents)
+    for unit in inventory_units:
+        locator = unit.get("locator")
+        if not isinstance(locator, dict):
+            continue
+        window_id = str(locator.get("window_id") or unit.get("provider_key") or "").strip()
+        conversation_id = str(locator.get("conversation_id") or "").strip()
+        if not window_id or not conversation_id or window_id in current_window_ids:
+            continue
+        reason = None
+        if conversation_id not in configured_conversation_ids:
+            reason = "conversation_removed_from_projection_scope"
+        else:
+            audit = audits.get(conversation_id)
+            if _teams_poll_proves_complete_absence(audit):
+                reason = "not_returned_by_complete_conversation_poll"
+            elif _teams_poll_proves_bounded_unit_absence(audit, locator):
+                reason = "not_returned_by_bounded_conversation_poll"
+            elif _teams_poll_proves_unit_outside_time_scope(audit, locator):
+                reason = "outside_configured_time_scope"
+        if reason is not None:
+            result.append(
+                _teams_window_tombstone_document(
+                    conversation_id=conversation_id,
+                    window_id=window_id,
+                    locator=locator,
+                    reason=reason,
+                )
+            )
+    return result
+
+
+def _teams_poll_proves_complete_absence(audit: dict[str, Any] | None) -> bool:
+    return bool(
+        audit
+        and audit.get("pagination_complete") is True
+        and str(audit.get("access_probe_status") or "").strip().lower() == "ok"
+        and str(audit.get("stop_reason") or "").strip() == "no_backward_link"
+    )
+
+
+def _teams_poll_proves_bounded_unit_absence(
+    audit: dict[str, Any] | None,
+    locator: dict[str, Any],
+) -> bool:
+    if (
+        not audit
+        or str(audit.get("access_probe_status") or "").strip().lower() != "ok"
+        or str(audit.get("stop_reason") or "").strip() != "cutoff_reached"
+    ):
+        return False
+    coverage_from = _parse_teams_coverage_time(audit.get("absence_covered_from"))
+    coverage_to = _parse_teams_coverage_time(audit.get("absence_covered_to"))
+    observed_from = _parse_teams_coverage_time(locator.get("observed_from"))
+    observed_to = _parse_teams_coverage_time(locator.get("observed_to"))
+    return bool(
+        coverage_from
+        and coverage_to
+        and observed_from
+        and observed_to
+        and coverage_from <= observed_from <= observed_to <= coverage_to
+    )
+
+
+def _teams_poll_proves_unit_outside_time_scope(
+    audit: dict[str, Any] | None,
+    locator: dict[str, Any],
+) -> bool:
+    if (
+        not audit
+        or str(audit.get("access_probe_status") or "").strip().lower() != "ok"
+        or str(audit.get("stop_reason") or "").strip() != "cutoff_reached"
+    ):
+        return False
+    coverage_from = _parse_teams_coverage_time(audit.get("absence_covered_from"))
+    observed_to = _parse_teams_coverage_time(locator.get("observed_to"))
+    return bool(coverage_from and observed_to and observed_to < coverage_from)
+
+
+def _parse_teams_coverage_time(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _teams_window_tombstone_document(
+    *,
+    conversation_id: str,
+    window_id: str,
+    locator: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    if reason not in TEAMS_TOMBSTONE_REASONS:
+        raise ValueError(f"unsupported Teams tombstone reason: {reason}")
+    from memforge.local_agent.teams_ledger import decode_teams_window_id
+
+    decoded = decode_teams_window_id(window_id)
+    raw_payload = {
+        "conversation_id": conversation_id,
+        "window_id": window_id,
+        "messages": [],
+        "_authoritative_snapshot": True,
+        "_tombstone": True,
+        "tombstone_reason": reason,
+    }
+    canonical_payload = json.dumps(
+        raw_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    revision_hash = hashlib.sha256(canonical_payload).hexdigest()
+    observed_from = str(locator.get("observed_from") or "")
+    observed_to = str(locator.get("observed_to") or "")
+    return {
+        "conversation_id": conversation_id,
+        "root_message_id": decoded["root_or_anchor_message_id"],
+        "window_id": window_id,
+        "window_type": decoded["window_type"],
+        "revision_hash": revision_hash,
+        "title": "Removed Teams window",
+        "source_url": str(locator.get("url") or ""),
+        "last_modified": observed_to or observed_from,
+        "date_from": observed_from or None,
+        "date_to": observed_to or None,
+        "raw_payload": raw_payload,
+        "raw_hash": revision_hash,
+        "message_count": 0,
+        "tombstone": True,
+    }
 
 
 def _github_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -2778,26 +3241,42 @@ async def _collect_teams_documents_from_cloud_job(
                 break
             raw = await gene.fetch(item)
             raw_payload = json.loads(raw.body.decode("utf-8"))
-            raw_hash = hashlib.sha256(raw.body).hexdigest()
+            if not isinstance(raw_payload, dict):
+                raise ValueError("Teams window payload must be an object")
             conversation_id = str(item.extra.get("conversation_id") or "")
             root_message_id = str(item.extra.get("root_message_id") or item.item_id)
             window_type = "thread" if item.extra.get("is_thread") else "time_block"
-            window_id = str(item.extra.get("window_id") or _teams_window_id(
-                source_id=source_id,
-                conversation_id=conversation_id,
-                root_message_id=root_message_id,
-                window_type=window_type,
-            ))
-            revision_hash = str(item.version or hashlib.sha256(
-                f"{window_id}\n{raw_hash}".encode("utf-8")
-            ).hexdigest())
+            window_id = str(
+                item.extra.get("window_id")
+                or _teams_window_id(
+                    source_id=source_id,
+                    conversation_id=conversation_id,
+                    root_message_id=root_message_id,
+                    window_type=window_type,
+                )
+            )
+            raw_payload["conversation_id"] = conversation_id
+            raw_payload["window_id"] = window_id
+            raw_hash = hashlib.sha256(
+                json.dumps(
+                    raw_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            revision_hash = str(item.version or hashlib.sha256(f"{window_id}\n{raw_hash}".encode("utf-8")).hexdigest())
             messages = raw_payload.get("messages") if isinstance(raw_payload, dict) else []
             message_count = item.extra.get("message_count") or (len(messages) if isinstance(messages, list) else None)
-            message_times = [
-                str(message.get("time") or "")
-                for message in messages
-                if isinstance(message, dict) and message.get("time")
-            ] if isinstance(messages, list) else []
+            message_times = (
+                [
+                    str(message.get("time") or "")
+                    for message in messages
+                    if isinstance(message, dict) and message.get("time")
+                ]
+                if isinstance(messages, list)
+                else []
+            )
             documents.append(
                 {
                     "conversation_id": conversation_id,
@@ -2824,12 +3303,14 @@ async def _collect_teams_documents_from_cloud_job(
                     unit="message",
                 ),
             )
-            poll_inputs.append({
-                "conversation_id": conversation_id,
-                "message_count": message_count,
-                "last_modified": item.last_modified.isoformat(),
-                "window_type": window_type,
-            })
+            poll_inputs.append(
+                {
+                    "conversation_id": conversation_id,
+                    "message_count": message_count,
+                    "last_modified": item.last_modified.isoformat(),
+                    "window_type": window_type,
+                }
+            )
     finally:
         api_client = getattr(gene, "_client", None)
         if api_client is not None:
@@ -2837,6 +3318,8 @@ async def _collect_teams_documents_from_cloud_job(
     poll_audits = gene.get_poll_audits() if hasattr(gene, "get_poll_audits") else []
     if not poll_audits:
         poll_audits = _teams_poll_audits_from_documents(poll_inputs)
+    _attest_teams_documents_from_poll_audits(documents, poll_audits)
+
     return {"documents": documents, "poll_audits": poll_audits}
 
 
@@ -2865,11 +3348,7 @@ def _sync_progress_snapshot(
         snapshot["progress"] = {"completed": completed, "unit": unit}
         if total is not None:
             snapshot["progress"]["total"] = total
-    source_time_range = {
-        key: value
-        for key, value in (("start", source_time_start), ("end", source_time_end))
-        if value
-    }
+    source_time_range = {key: value for key, value in (("start", source_time_start), ("end", source_time_end)) if value}
     if source_time_range:
         snapshot["source_time_range"] = source_time_range
     counts = {
@@ -2920,51 +3399,23 @@ def _teams_progress_summary(
         "date_from": min(date_from_values) if date_from_values else None,
         "date_to": max(date_to_values) if date_to_values else None,
         "messages": messages,
-        "conversations": len(poll_audits) or len({
-            str(doc.get("conversation_id")) for doc in documents if doc.get("conversation_id")
-        }),
+        "conversations": len(poll_audits)
+        or len({str(doc.get("conversation_id")) for doc in documents if doc.get("conversation_id")}),
     }
 
 
 def _teams_direct_rest_config_from_cloud_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    from memforge.local_agent.source_contract import (
+        TEAMS_CONVERSATION_SELECTOR_FIELDS,
+        canonical_teams_conversation_ids,
+    )
+
     config = dict(payload)
-    direct_ids: list[str] = []
-
-    for key in ("conversation_ids", "channels", "group_chats", "individual_chats"):
-        values = _teams_string_list(config.pop(key, []))
-        for value in values:
-            if not _is_direct_teams_conversation_id(value):
-                raise ValueError("teams_sync_requires_direct_conversation_ids")
-            direct_ids.append(value)
-
-    if not direct_ids:
-        raise ValueError("teams_sync_requires_direct_conversation_ids")
-
-    config["conversation_ids"] = _dedupe_preserving_order(direct_ids)
+    direct_ids = canonical_teams_conversation_ids(config, require_nonempty=True)
+    for field in TEAMS_CONVERSATION_SELECTOR_FIELDS:
+        config.pop(field, None)
+    config["conversation_ids"] = list(direct_ids)
     return config
-
-
-def _is_direct_teams_conversation_id(value: str) -> bool:
-    return bool(value and (":" in value or "@" in value))
-
-
-def _teams_string_list(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    return []
-
-
-def _dedupe_preserving_order(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        result.append(value)
-    return result
 
 
 def _teams_poll_audits_from_documents(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2981,23 +3432,88 @@ def _teams_poll_audits_from_documents(items: list[dict[str, Any]]) -> list[dict[
         timestamps = [str(item.get("last_modified") or "") for item in conversation_items if item.get("last_modified")]
         covered_from = min(timestamps) if timestamps else None
         covered_to = max(timestamps) if timestamps else None
-        audits.append({
-            "raw_conversation_id": conversation_id,
-            "pagination_complete": True,
-            "access_probe_status": "ok",
-            "covered_created_from": covered_from,
-            "covered_created_to": covered_to,
-            "raw_messages_seen": raw_messages,
-            "unique_message_keys_seen": raw_messages,
-            "duplicate_raw_messages": 0,
-            "upsert_new": raw_messages,
-            "upsert_updated": 0,
-            "upsert_unchanged": 0,
-            "explicit_delete_markers": 0,
-            "missing_once_candidates": 0,
-            "field_contract_version": "teams_chatsvc_rest_v1",
-        })
+        audits.append(
+            {
+                "raw_conversation_id": conversation_id,
+                "pagination_complete": False,
+                "access_probe_status": "ok",
+                "stop_reason": "missing_provider_poll_audit",
+                "covered_created_from": covered_from,
+                "covered_created_to": covered_to,
+                "raw_messages_seen": raw_messages,
+                "unique_message_keys_seen": raw_messages,
+                "duplicate_raw_messages": 0,
+                "upsert_new": raw_messages,
+                "upsert_updated": 0,
+                "upsert_unchanged": 0,
+                "explicit_delete_markers": 0,
+                "missing_once_candidates": 0,
+                "field_contract_version": "teams_chatsvc_rest_v1",
+            }
+        )
     return audits
+
+
+def _teams_complete_poll_conversation_ids(
+    poll_audits: list[dict[str, Any]],
+) -> set[str]:
+    """Return conversations whose successful poll proves window completeness."""
+
+    return {
+        str(audit.get("raw_conversation_id") or "")
+        for audit in poll_audits
+        if str(audit.get("raw_conversation_id") or "")
+        and audit.get("pagination_complete") is True
+        and str(audit.get("access_probe_status") or "").strip().lower() == "ok"
+        and str(audit.get("stop_reason") or "").strip() == "no_backward_link"
+    }
+
+
+def _attest_teams_documents_from_poll_audits(
+    documents: list[dict[str, Any]],
+    poll_audits: list[dict[str, Any]],
+) -> None:
+    """Attach only provider-proven unit/time coverage to returned windows."""
+
+    audits = {
+        str(audit.get("raw_conversation_id") or ""): audit
+        for audit in poll_audits
+        if str(audit.get("raw_conversation_id") or "")
+    }
+    complete_conversation_ids = _teams_complete_poll_conversation_ids(poll_audits)
+    for document in documents:
+        conversation_id = str(document.get("conversation_id") or "")
+        raw_payload = document.get("raw_payload")
+        if not isinstance(raw_payload, dict):
+            continue
+        changed = False
+        if conversation_id in complete_conversation_ids:
+            # This proves only the returned stable window's current membership;
+            # source-wide absence still requires inventory reconciliation.
+            raw_payload["_authoritative_snapshot"] = True
+            changed = True
+        else:
+            audit = audits.get(conversation_id)
+            if (
+                audit
+                and str(audit.get("access_probe_status") or "").strip().lower() == "ok"
+                and str(audit.get("stop_reason") or "").strip() == "cutoff_reached"
+            ):
+                covered_from = _parse_teams_coverage_time(audit.get("absence_covered_from"))
+                covered_to = _parse_teams_coverage_time(audit.get("absence_covered_to"))
+                if covered_from and covered_to and covered_from <= covered_to:
+                    raw_payload["_scope_coverage_from"] = covered_from.isoformat()
+                    raw_payload["_scope_coverage_to"] = covered_to.isoformat()
+                    changed = True
+        if changed:
+            document["raw_hash"] = hashlib.sha256(
+                json.dumps(
+                    raw_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
 
 
 def _int_or_zero(value: Any) -> int:
@@ -3077,12 +3593,22 @@ def _push_kb_profile_to_source(
             submitted_by=submitted_by,
         )
         if isinstance(response, dict) and response.get("error"):
-            failed.append({"relative_path": entry["relative_path"], "error": response.get("error"),
-                           "detail": response.get("detail"), "status_code": response.get("status_code")})
+            failed.append(
+                {
+                    "relative_path": entry["relative_path"],
+                    "error": response.get("error"),
+                    "detail": response.get("detail"),
+                    "status_code": response.get("status_code"),
+                }
+            )
         else:
-            pushed.append({"relative_path": entry["relative_path"],
-                           "doc_id": response.get("doc_id"),
-                           "document_hash": response.get("document_hash")})
+            pushed.append(
+                {
+                    "relative_path": entry["relative_path"],
+                    "doc_id": response.get("doc_id"),
+                    "document_hash": response.get("document_hash"),
+                }
+            )
         _report_local_agent_progress(
             report_progress,
             _sync_progress_snapshot(
@@ -3293,7 +3819,9 @@ async def run_watch_tick(*, base_url, browser, client, last_hash, capture, log):
         return "unchanged", last_hash
 
     uploaded = client.upload_jira_session(
-        base_url=base_url, cookie_header=result.cookie_header, browser=result.browser,
+        base_url=base_url,
+        cookie_header=result.cookie_header,
+        browser=result.browser,
     )
     if uploaded.get("status_code") == 409:
         log(f"A different Jira user is signed in for {base_url}; re-run refresh with --confirm-principal-change.")
@@ -3390,8 +3918,13 @@ def _make_browser_session_group(descriptor):
     @group.command("watch")
     @click.option("--base-url", required=True, help=f"{descriptor.label} base URL.")
     @click.option("--browser", default=None, help="Browser to read cookies from, for example chrome or edge.")
-    @click.option("--interval-seconds", type=int, default=WATCH_DEFAULT_INTERVAL_SECONDS, show_default=True,
-                  help="Seconds between re-capture attempts. Keep it under your Jira idle timeout.")
+    @click.option(
+        "--interval-seconds",
+        type=int,
+        default=WATCH_DEFAULT_INTERVAL_SECONDS,
+        show_default=True,
+        help="Seconds between re-capture attempts. Keep it under your Jira idle timeout.",
+    )
     @click.pass_context
     def watch_cmd(ctx, base_url, browser, interval_seconds):
         """Keep the server's Jira session fresh by re-capturing on an interval."""
@@ -3408,8 +3941,12 @@ def _make_browser_session_group(descriptor):
             while True:
                 try:
                     action, last_hash = await run_watch_tick(
-                        base_url=base_url, browser=browser, client=client,
-                        last_hash=last_hash, capture=_capture, log=click.echo,
+                        base_url=base_url,
+                        browser=browser,
+                        client=client,
+                        last_hash=last_hash,
+                        capture=_capture,
+                        log=click.echo,
                     )
                 except Exception as exc:  # a daemon must survive any single-tick failure
                     click.echo(f"Jira watch tick failed: {exc}")
@@ -3446,8 +3983,7 @@ def auth():
 
 
 @auth.command("teams")
-@click.option("--region", default="emea", type=click.Choice(["emea", "amer", "apac"]),
-              help="Teams API region")
+@click.option("--region", default="emea", type=click.Choice(["emea", "amer", "apac"]), help="Teams API region")
 def auth_teams(region: str):
     """Authenticate with Microsoft Teams through Keychain and Teams Web."""
 
@@ -3466,6 +4002,7 @@ def auth_teams(region: str):
     console.print(f"[green]Captured {len(tokens)} tokens:[/]")
 
     from datetime import datetime, timezone
+
     table = Table()
     table.add_column("Audience")
     table.add_column("Scopes")
@@ -3486,6 +4023,7 @@ def auth_teams(region: str):
     chat_token = authenticator.get_token_for_audience(tokens, "https://ic3.teams.office.com")
     if chat_token:
         import httpx
+
         try:
             resp = httpx.get(
                 f"https://teams.cloud.microsoft/api/chatsvc/{region}/v1/users/ME/conversations",
@@ -3529,12 +4067,14 @@ def auth_status():
     expiry = TeamsAuthenticator.check_token_expiry(tokens)
 
     from rich.table import Table as RichTable
+
     table = RichTable(title="Teams Authentication")
     table.add_column("Audience")
     table.add_column("Status")
     table.add_column("Expires")
 
     from datetime import datetime, timezone
+
     for audience, valid in expiry.items():
         info = tokens.get(audience, {})
         expires_at = info.get("expiresAt", 0) if isinstance(info, dict) else 0

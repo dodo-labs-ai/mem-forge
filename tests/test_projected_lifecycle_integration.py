@@ -1,0 +1,1669 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+
+import pytest
+import pytest_asyncio
+
+from memforge.llm.structured import (
+    ContradictionDecision,
+    ContradictionResponse,
+    MemoryEquivalenceResponse,
+    MemorySupportValidationResponse,
+    ReconciliationDecision,
+    ReconciliationResponse,
+)
+from memforge.memory.engine import MemoryEngine
+from memforge.memory.evidence import (
+    EvidenceContentProvenance,
+    EvidenceReference,
+    EvidenceRole,
+    EvidenceUnit,
+    MemorySupportAssertion,
+)
+from memforge.memory.lifecycle_plan import (
+    CutoverFindingReason,
+    CutoverFindingStatus,
+    LifecycleCutoverFinding,
+    LifecycleGateState,
+    LifecycleVectorOperation,
+    LifecycleVectorTaskStatus,
+    ReconciliationScope,
+)
+from memforge.memory.lifecycle_planner import (
+    NewMemoryDefaults,
+    build_lifecycle_plan,
+    lifecycle_access_context_hash,
+)
+from memforge.memory.store import MemoryStore
+from memforge.models import (
+    ContentItem,
+    DocumentRecord,
+    Memory,
+    NormalizedContent,
+    RawContent,
+    RawMemory,
+    ReconcileAction,
+    ReconcileOperation,
+    SourceLifecycleResetResult,
+    content_hash,
+)
+from memforge.pipeline.projection_evidence import build_projected_claim_evidence
+from memforge.pipeline.source_projection_adapters import (
+    project_source_item,
+    project_source_unit_tombstone,
+)
+from memforge.source_projection import AnchorKind, SourceAnchor, SourceProjection
+from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from memforge.storage.database import Database
+
+
+@pytest_asyncio.fixture
+async def db(tmp_path):
+    database = Database(str(tmp_path / "projected-lifecycle.db"))
+    await database.connect()
+    await database.upsert_source(
+        id="src-1",
+        type="confluence",
+        name="Engineering",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc).isoformat()
+    await database.db.execute(
+        """INSERT INTO documents (
+               doc_id, source, source_url, title, space_or_project,
+               last_modified, version, content_hash, last_synced
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("confluence-123", "src-1", "https://example.test/123", "Page", "ENG", now, "2", "h", now),
+    )
+    try:
+        yield database
+    finally:
+        await database.close()
+
+
+def _projection(
+    *,
+    run_id: str,
+    body: str,
+    item_id: str = "confluence-123",
+    source_id: str = "src-1",
+    prior=None,
+    prior_observations=None,
+):
+    item = ContentItem(
+        item_id=item_id,
+        title="Page",
+        source_url="https://example.test/123",
+        last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc),
+        version="2",
+        extra={"page_id": "123", "space_key": "ENG"},
+    )
+    raw = RawContent(item=item, body=body.encode(), content_type="text/html")
+    normalized = NormalizedContent(item=item, markdown_body=body)
+    return project_source_item(
+        source_id=source_id,
+        source_type="confluence",
+        run_id=run_id,
+        item=item,
+        raw=raw,
+        normalized=normalized,
+        prior_unit_revision=prior,
+        prior_observation_revisions=prior_observations,
+    )
+
+
+def _jira_projection(
+    *,
+    run_id: str,
+    description: str,
+    comment_body: str = "Decision: retain A7",
+    comments_truncated: bool = False,
+    prior=None,
+    prior_observations=None,
+):
+    item = ContentItem(
+        item_id="confluence-123",
+        title="PAY-12",
+        source_url="https://jira.example.test/browse/PAY-12",
+        last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc),
+        version="2",
+        extra={"issue_key": "PAY-12", "issue_id": "10012"},
+    )
+    payload = {
+        "id": "10012",
+        "key": "PAY-12",
+        "fields": {
+            "summary": "Payroll",
+            "description": description,
+            "status": None,
+            "priority": None,
+            "assignee": None,
+            "labels": [],
+            "resolution": None,
+            "updated": "2026-07-15T10:00:00Z",
+        },
+        "_comments": [{"id": "502", "body": comment_body}],
+        "_comments_included": True,
+        "_comments_total": 2 if comments_truncated else 1,
+        "changelog": {"startAt": 0, "histories": [], "total": 0},
+    }
+    if comments_truncated:
+        payload["_comments_truncated"] = {"returned": 1, "total": 2}
+    return project_source_item(
+        source_id="src-1",
+        source_type="jira",
+        run_id=run_id,
+        item=item,
+        raw=RawContent(
+            item=item,
+            body=json.dumps(payload).encode(),
+            content_type="application/json",
+        ),
+        normalized=NormalizedContent(item=item, markdown_body="PAY-12"),
+        prior_unit_revision=prior,
+        prior_observation_revisions=prior_observations,
+    )
+class _ReplacementClient:
+    def __init__(self, incumbent_id: str) -> None:
+        self.incumbent_id = incumbent_id
+
+    async def reconcile_memories(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return ReconciliationResponse(
+            decisions=[
+                ReconciliationDecision(
+                    index=0,
+                    action="SUPERSEDE",
+                    memory_id=self.incumbent_id,
+                    reason="The source now retains A7.",
+                )
+            ]
+        )
+
+    async def detect_contradictions(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return ContradictionResponse(
+            decisions=[
+                ContradictionDecision(
+                    pair_index=0,
+                    classification="contradiction",
+                    reason="Independent source still says A7 is removed.",
+                )
+            ]
+        )
+
+
+class _NoopClient:
+    def __init__(self, incumbent_id: str) -> None:
+        self.incumbent_id = incumbent_id
+
+    async def reconcile_memories(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return ReconciliationResponse(
+            decisions=[
+                ReconciliationDecision(
+                    action="NOOP",
+                    memory_id=self.incumbent_id,
+                    reason="The exact claim remains in the revised page.",
+                )
+            ]
+        )
+
+    async def detect_contradictions(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return ContradictionResponse(
+            decisions=[
+                ContradictionDecision(
+                    pair_index=0,
+                    classification="contradiction",
+                    reason="Independent source still says A7 is removed.",
+                )
+            ]
+        )
+
+
+class _DeleteClient:
+    def __init__(self, incumbent_id: str) -> None:
+        self.incumbent_id = incumbent_id
+
+    async def reconcile_memories(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return ReconciliationResponse(
+            decisions=[
+                ReconciliationDecision(
+                    action="DELETE",
+                    memory_id=self.incumbent_id,
+                    reason="The incomplete rendering appears to omit the claim.",
+                )
+            ]
+        )
+
+
+class _OutboxDrainer:
+    def __init__(self, database: Database) -> None:
+        self.db = database
+
+    async def drain_lifecycle_vector_outbox(self, lifecycle_plan_id: str) -> None:
+        for task in await self.db.list_lifecycle_vector_tasks(
+            lifecycle_plan_id=lifecycle_plan_id
+        ):
+            await self.db.complete_lifecycle_vector_task(task.id)
+
+
+class _EquivalentMemoryStore(_OutboxDrainer):
+    def __init__(self, database: Database, target: Memory) -> None:
+        super().__init__(database)
+        self.target = target
+
+    async def find_access_compatible_equivalence_candidates(
+        self,
+        memory: Memory,
+        **kwargs,
+    ) -> tuple[Memory, ...]:
+        del memory, kwargs
+        return (self.target,)
+
+
+class _SemanticEquivalentClient:
+    async def reconcile_memories(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return ReconciliationResponse(
+            decisions=[ReconciliationDecision(action="ADD", index=0)]
+        )
+
+    async def classify_memory_equivalence(self, prompt: str, **kwargs):
+        del kwargs
+        assert "A7 is removed." in prompt
+        assert "A7 remains excluded." in prompt
+        return MemoryEquivalenceResponse(
+            equivalent=True,
+            reason="Both claims state that A7 is excluded.",
+        )
+
+
+class _SupportValidatingNoopClient(_NoopClient):
+    def __init__(self, memory_id: str, *, supported: bool) -> None:
+        super().__init__(memory_id)
+        self.supported = supported
+
+    async def validate_memory_support(self, prompt: str, **kwargs):
+        del kwargs
+        assert "A7 is retained for regular payroll." in prompt
+        return MemorySupportValidationResponse(
+            supported=self.supported,
+            reason=(
+                "The applicability remains regular payroll."
+                if self.supported
+                else "The applicability changed from regular to off-cycle payroll."
+            ),
+        )
+
+
+def test_lifecycle_access_identity_treats_project_as_relevance_only() -> None:
+    pay = lifecycle_access_context_hash(
+        visibility="workspace",
+        owner_user_id=None,
+        project_key="PAY",
+        repo_identifier=None,
+    )
+    risk = lifecycle_access_context_hash(
+        visibility="workspace",
+        owner_user_id=None,
+        project_key="RISK",
+        repo_identifier=None,
+    )
+
+    assert pay == risk
+
+
+async def _seed_incumbent_support(
+    db: Database,
+    *,
+    projection,
+    memory_id: str = "mem-old",
+    memory_content: str = "A7 is removed.",
+    observation_index: int = 0,
+    source_type: str = "confluence",
+) -> Memory:
+    incumbent = Memory(
+        id=memory_id,
+        memory_type="decision",
+        content=memory_content,
+        content_hash=content_hash(memory_content),
+    )
+    await db.insert_memory(incumbent)
+    await db.add_memory_source(
+        incumbent.id,
+        "confluence-123",
+        source_type,
+        memory_content,
+        source_updated_at=None,
+    )
+    observation = projection.observations[observation_index]
+    revisions_by_observation = {
+        item.observation_id: item for item in projection.observation_revisions
+    }
+    revision = revisions_by_observation[observation.id]
+    unit = EvidenceUnit(
+        id=f"eu-{memory_id}",
+        source_id="src-1",
+        doc_id="confluence-123",
+        doc_revision_id=projection.source_unit_revisions[0].id,
+        source_type=source_type,
+        source_anchor=observation.id,
+        source_lineage_id=projection.source_units[0].id,
+        project_key="ENG",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        content=revision.content,
+        excerpt=memory_content,
+        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        access_context_hash="workspace-eng",
+    )
+    await db.upsert_evidence_unit(unit)
+    reference = (
+        await db.record_evidence_references(
+            unit.id,
+            (
+                EvidenceReference(
+                    role=EvidenceRole.PRIMARY,
+                    anchor=SourceAnchor(
+                        kind=AnchorKind.WHOLE_OBSERVATION,
+                        observation_id=observation.id,
+                        observation_revision_id=revision.id,
+                    ),
+                ),
+            ),
+        )
+    )[0]
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id=f"support-{memory_id}",
+            memory_id=incumbent.id,
+            evidence_reference_id=reference.id or "",
+            source_id="src-1",
+            access_context_hash="workspace-eng",
+        )
+    )
+    return incumbent
+
+
+@pytest.mark.asyncio
+async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> None:
+    first = _projection(run_id="projection-noop-1", body="A7 is removed.")
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    incumbent = await db.get_memory(incumbent.id)
+    assert incumbent is not None
+    await db.enable_lifecycle_gate("src-1")
+    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+
+    second = _projection(
+        run_id="projection-noop-2",
+        body="A7 is removed.\n\nThe page now also documents rollout ownership.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision for revision in first.observation_revisions
+        },
+    )
+    raw = RawMemory(
+        content=incumbent.content,
+        memory_type=incumbent.memory_type,
+        confidence=incumbent.confidence,
+        tags=list(incumbent.tags),
+        extraction_context="A7 is removed.",
+        evidence_quote="A7 is removed.",
+    )
+    evidence = build_projected_claim_evidence(
+        projection=second,
+        raw_memories=(raw,),
+        doc_id="confluence-123",
+        source_type="confluence",
+        project_key="ENG",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        access_context_hash="workspace-eng",
+        extractor_run_id=second.run_id,
+    )
+    delta = second.deltas[0]
+    scope = ReconciliationScope(
+        id="scope-noop-rebind",
+        source_id="src-1",
+        source_unit_id=delta.source_unit_id,
+        base_unit_revision_id=delta.previous_unit_revision_id,
+        target_unit_revision_id=delta.current_unit_revision_id,
+    )
+    plan = build_lifecycle_plan(
+        plan_id="plan-noop-rebind",
+        scope=scope,
+        gate_state=LifecycleGateState.ENABLED,
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.NOOP,
+                memory_id=incumbent.id,
+                memory=raw,
+                reason="claim remains valid",
+            ),
+        ),
+        incumbents={incumbent.id: incumbent},
+        source_support_reference_ids={incumbent.id: old_support},
+        all_active_support_reference_ids={incumbent.id: old_support},
+        support_set_hashes={
+            incumbent.id: await db.get_memory_support_set_hash(incumbent.id)
+        },
+        observation_revision_ids=tuple(
+            revision.id for revision in second.observation_revisions
+        ),
+        new_evidence_reference_ids=(),
+        evidence_reference_ids_by_claim_hash=evidence.reference_ids_by_claim_hash,
+        defaults=NewMemoryDefaults(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key="ENG",
+            repo_identifier=None,
+            doc_id="confluence-123",
+            source_type="confluence",
+            access_context_hash="workspace-eng",
+        ),
+        evidence_units=evidence.units,
+        evidence_references=evidence.references,
+    )
+
+    await db.apply_source_projection_lifecycle(second, plan)
+
+    current_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    expected_support = evidence.reference_ids_by_claim_hash[content_hash(raw.content)]
+    assert current_support == expected_support
+    assert set(current_support).isdisjoint(old_support)
+    current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
+    assert current_unit is not None
+    assert current_unit.id == second.source_unit_revisions[0].id
+
+
+@pytest.mark.asyncio
+async def test_noop_without_current_evidence_rolls_back_stale_support(db: Database) -> None:
+    first = _projection(run_id="projection-stale-1", body="A7 is removed.")
+    await db.record_source_projection(first)
+    seeded = await _seed_incumbent_support(db, projection=first)
+    incumbent = await db.get_memory(seeded.id)
+    assert incumbent is not None
+    await db.enable_lifecycle_gate("src-1")
+    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    second = _projection(
+        run_id="projection-stale-2",
+        body="A7 is retained.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision for revision in first.observation_revisions
+        },
+    )
+    delta = second.deltas[0]
+    scope = ReconciliationScope(
+        id="scope-stale-noop",
+        source_id="src-1",
+        source_unit_id=delta.source_unit_id,
+        base_unit_revision_id=delta.previous_unit_revision_id,
+        target_unit_revision_id=delta.current_unit_revision_id,
+    )
+    plan = build_lifecycle_plan(
+        plan_id="plan-stale-noop",
+        scope=scope,
+        gate_state=LifecycleGateState.ENABLED,
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.NOOP,
+                memory_id=incumbent.id,
+                reason="incorrectly kept without current evidence",
+            ),
+        ),
+        incumbents={incumbent.id: incumbent},
+        source_support_reference_ids={incumbent.id: old_support},
+        all_active_support_reference_ids={incumbent.id: old_support},
+        support_set_hashes={
+            incumbent.id: await db.get_memory_support_set_hash(incumbent.id)
+        },
+        observation_revision_ids=tuple(
+            revision.id for revision in second.observation_revisions
+        ),
+        new_evidence_reference_ids=(),
+        defaults=NewMemoryDefaults(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key="ENG",
+            repo_identifier=None,
+            doc_id="confluence-123",
+            source_type="confluence",
+            access_context_hash="workspace-eng",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="stale or ambiguous source support"):
+        await db.apply_source_projection_lifecycle(second, plan)
+
+    current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
+    assert current_unit is not None
+    assert current_unit.id == first.source_unit_revisions[0].id
+    assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
+
+
+@pytest.mark.asyncio
+async def test_incremental_noop_rebinds_exact_unchanged_claim_without_new_extraction(
+    db: Database,
+) -> None:
+    first = _projection(
+        run_id="projection-incremental-keep-1",
+        body="A7 is removed.\nOld deployment note.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    await db.enable_lifecycle_gate("src-1")
+    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    second = _projection(
+        run_id="projection-incremental-keep-2",
+        body="A7 is removed.\nNew deployment note.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            first.observations[0].id: first.observation_revisions[0]
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_NoopClient(incumbent.id),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content=second.observation_revisions[0].content,
+        update_mode="diff_guided",
+        changed_hunks="Old deployment note -> New deployment note",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
+    )
+
+    current_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    assert stats["noop"] == 1
+    assert current_support
+    assert set(current_support).isdisjoint(old_support)
+    [evidence] = await db.get_active_memory_support_evidence(
+        incumbent.id,
+        source_id="src-1",
+    )
+    assert evidence.anchor.observation_revision_id == second.observation_revisions[0].id
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_revision_deterministically_removes_incumbent_support(
+    db: Database,
+) -> None:
+    first = _projection(
+        run_id="projection-empty-1",
+        body="A7 is removed.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    await db.enable_lifecycle_gate("src-1")
+    second = _projection(
+        run_id="projection-empty-2",
+        body="",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            first.observations[0].id: first.observation_revisions[0]
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=None,
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content="",
+        update_mode="diff_guided",
+        changed_hunks="A7 is removed. -> empty",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert stats["deleted"] == 1
+    assert await db.get_active_memory_support_reference_ids(incumbent.id) == ()
+    retired = await db.get_memory(incumbent.id)
+    assert retired is not None
+    assert retired.status == "retired"
+
+
+async def _seed_jira_required_incumbent(
+    db: Database,
+    first: SourceProjection,
+) -> Memory:
+    incumbent = Memory(
+        id="mem-jira-required",
+        memory_type="decision",
+        content="A7 is retained for regular payroll.",
+        content_hash=content_hash("A7 is retained for regular payroll."),
+        project_key="ENG",
+    )
+    await db.insert_memory(incumbent)
+    await db.add_memory_source(
+        incumbent.id,
+        "confluence-123",
+        "jira",
+        "Decision: retain A7",
+        source_updated_at=None,
+    )
+    primary = first.observations[1]
+    required = first.observations[0]
+    revisions = {
+        item.observation_id: item for item in first.observation_revisions
+    }
+    unit = EvidenceUnit(
+        id="eu-jira-required",
+        source_id="src-1",
+        doc_id="confluence-123",
+        doc_revision_id=first.source_unit_revisions[0].id,
+        source_type="jira",
+        source_anchor=primary.id,
+        source_lineage_id=first.source_units[0].id,
+        project_key="ENG",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        content=revisions[primary.id].content,
+        excerpt="Decision: retain A7",
+        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        access_context_hash="workspace-eng",
+    )
+    await db.upsert_evidence_unit(unit)
+    references = await db.record_evidence_references(
+        unit.id,
+        (
+            EvidenceReference(
+                role=EvidenceRole.PRIMARY,
+                anchor=SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id=primary.id,
+                    observation_revision_id=revisions[primary.id].id,
+                ),
+            ),
+            EvidenceReference(
+                role=EvidenceRole.REQUIRED,
+                anchor=SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id=required.id,
+                    observation_revision_id=revisions[required.id].id,
+                ),
+            ),
+        ),
+    )
+    for index, reference in enumerate(references):
+        await db.upsert_memory_support_assertion(
+            MemorySupportAssertion(
+                id=f"support-jira-required-{index}",
+                memory_id=incumbent.id,
+                evidence_reference_id=reference.id or "",
+                source_id="src-1",
+                access_context_hash="workspace-eng",
+            )
+        )
+    return incumbent
+
+
+@pytest.mark.asyncio
+async def test_partial_jira_projection_forces_disjoint_incumbent_keep(db: Database) -> None:
+    first = _jira_projection(
+        run_id="projection-jira-partial-fence-1",
+        description="Initial issue description.",
+        comment_body="Decision: retain A7",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-jira-disjoint",
+        memory_content="Decision: retain A7",
+        observation_index=1,
+        source_type="jira",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    second = _jira_projection(
+        run_id="projection-jira-partial-fence-2",
+        description="Changed issue description.",
+        comment_body="Decision: retain A7",
+        comments_truncated=True,
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    assert second.coverage.value == "partial_projection"
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_DeleteClient(incumbent.id),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content="PAY-12 changed description",
+        update_mode="diff_guided",
+        changed_hunks="description changed; comment page is truncated",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+
+    current = await db.get_memory(incumbent.id)
+    assert current is not None and current.status == "active"
+    assert stats["deleted"] == 0
+    assert stats["noop"] == 1
+    assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
+
+
+@pytest.mark.asyncio
+async def test_partial_jira_projection_admits_directly_affected_incumbent_delete(
+    db: Database,
+) -> None:
+    first = _jira_projection(
+        run_id="projection-jira-partial-affected-1",
+        description="A7 is retained.",
+        comment_body="Unrelated comment",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-jira-affected",
+        memory_content="A7 is retained.",
+        observation_index=0,
+        source_type="jira",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    second = _jira_projection(
+        run_id="projection-jira-partial-affected-2",
+        description="A7 is removed.",
+        comment_body="Unrelated comment",
+        comments_truncated=True,
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    assert second.coverage.value == "partial_projection"
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_DeleteClient(incumbent.id),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content="PAY-12 changed description",
+        update_mode="diff_guided",
+        changed_hunks="description changed; comment page is truncated",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+
+    current = await db.get_memory(incumbent.id)
+    assert current is not None and current.status == "retired"
+    assert stats["deleted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_noop_revalidates_revised_required_jira_description(db: Database) -> None:
+    first = _jira_projection(
+        run_id="projection-jira-required-1",
+        description="A7 applies only to regular payroll.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_jira_required_incumbent(db, first)
+    await db.enable_lifecycle_gate("src-1")
+    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    revisions = {
+        item.observation_id: item for item in first.observation_revisions
+    }
+    second = _jira_projection(
+        run_id="projection-jira-required-2",
+        description="A7 remains limited to regular payroll runs.",
+        prior=first.source_unit_revisions[0],
+        prior_observations=revisions,
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_SupportValidatingNoopClient(
+            incumbent.id,
+            supported=True,
+        ),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content="PAY-12",
+        update_mode="diff_guided",
+        changed_hunks="wording clarified; scope remains regular payroll",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
+    )
+
+    current_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    assert stats["noop"] == 1
+    assert set(current_support).isdisjoint(old_support)
+    evidence = await db.get_active_memory_support_evidence(
+        incumbent.id,
+        source_id="src-1",
+    )
+    assert {item.role for item in evidence} == {
+        EvidenceRole.PRIMARY,
+        EvidenceRole.REQUIRED,
+    }
+    current_revisions = {
+        item.observation_id: item.id for item in second.observation_revisions
+    }
+    assert all(
+        item.anchor.observation_revision_id
+        == current_revisions[item.anchor.observation_id]
+        for item in evidence
+    )
+    current = await db.get_current_source_unit_revision(first.source_units[0].id)
+    assert current is not None
+    assert current.id == second.source_unit_revisions[0].id
+    [plan_row] = await db.db.execute_fetchall(
+        "SELECT payload_json FROM lifecycle_plans WHERE source_id = ?",
+        ("src-1",),
+    )
+    plan_payload = json.loads(str(plan_row["payload_json"]))
+    attach = next(
+        mutation
+        for mutation in plan_payload["mutations"]
+        if mutation["mutation_type"] == "attach_support"
+    )
+    assert attach["payload"]["support_validation"]["supported"] is True
+
+
+@pytest.mark.asyncio
+async def test_noop_with_invalidated_required_evidence_creates_review(db: Database) -> None:
+    first = _jira_projection(
+        run_id="projection-jira-invalid-required-1",
+        description="A7 applies only to regular payroll.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_jira_required_incumbent(db, first)
+    await db.enable_lifecycle_gate("src-1")
+    second = _jira_projection(
+        run_id="projection-jira-invalid-required-2",
+        description="A7 now applies only to off-cycle payroll.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_SupportValidatingNoopClient(
+            incumbent.id,
+            supported=False,
+        ),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content="PAY-12",
+        update_mode="diff_guided",
+        changed_hunks="regular -> off-cycle",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert stats["pending_review"] == 1
+    current = await db.get_memory(incumbent.id)
+    assert current is not None and current.status == "active"
+    assert await db.get_active_memory_support_reference_ids(incumbent.id)
+
+
+@pytest.mark.asyncio
+async def test_source_rebaseline_preserves_source_and_documents_but_resets_derived_lifecycle(
+    db: Database,
+) -> None:
+    projection = _projection(run_id="projection-before-rebaseline", body="A7 is removed.")
+    await db.record_source_projection(projection)
+    incumbent = await _seed_incumbent_support(db, projection=projection)
+    await db.set_source_subscription("src-1", "user-1", False)
+    await db.enable_lifecycle_gate("src-1")
+    await db.upsert_lifecycle_cutover_finding(
+        LifecycleCutoverFinding(
+            id="finding-before-rebaseline",
+            source_id="src-1",
+            memory_id=incumbent.id,
+            reason=CutoverFindingReason.AMBIGUOUS_OBSERVATION,
+            status=CutoverFindingStatus.OPEN,
+            available_provenance={"doc_id": "confluence-123"},
+            mapping_attempt={"strategy": "exact"},
+        )
+    )
+
+    result = await db.rebaseline_source_lifecycle("src-1")
+
+    assert result.retired_memory_ids == (incumbent.id,)
+    assert await db.get_source("src-1") is not None
+    assert await db.get_document("confluence-123") is not None
+    assert await db.is_source_enabled_for_user("src-1", "user-1") is False
+    reset_memory = await db.get_memory(incumbent.id)
+    assert reset_memory is not None
+    assert reset_memory.status == "retired"
+    assert reset_memory.retirement_reason == "source_rebaseline"
+    assert await db.get_active_memory_support_reference_ids(incumbent.id) == ()
+    assert await db.get_source_projection(projection.run_id) is None
+    assert await db.find_source_unit_by_document_id("src-1", "confluence-123") is None
+    gate = await db.get_lifecycle_gate("src-1")
+    assert gate.state is LifecycleGateState.GATED
+    assert gate.reason == "source rebaseline requires a complete successful replay"
+    finding = await db.get_lifecycle_cutover_finding("finding-before-rebaseline")
+    assert finding is not None
+    assert finding.status is CutoverFindingStatus.RESOLVED
+    assert finding.mapping_attempt["resolution"] == "source_rebaseline"
+    cleanup_tasks = await db.list_lifecycle_vector_tasks(source_id="src-1")
+    assert len(cleanup_tasks) == 1
+    assert cleanup_tasks[0].memory_id == incumbent.id
+    assert cleanup_tasks[0].operation is LifecycleVectorOperation.DELETE
+
+
+@pytest.mark.asyncio
+async def test_source_rebaseline_preserves_failed_vector_cleanup_for_retry(db: Database) -> None:
+    projection = _projection(run_id="projection-before-rebaseline-retry", body="A7 is removed.")
+    await db.record_source_projection(projection)
+    await _seed_incumbent_support(db, projection=projection)
+
+    await db.rebaseline_source_lifecycle("src-1")
+    [task] = await db.list_lifecycle_vector_tasks(source_id="src-1")
+    await db.fail_lifecycle_vector_task(task.id, "temporary Chroma failure")
+
+    # Retrying the relational reset has no remaining source associations, but
+    # it must not erase the failed external cleanup task.
+    await db.rebaseline_source_lifecycle("src-1")
+
+    [retryable] = await db.list_lifecycle_vector_tasks(source_id="src-1")
+    assert retryable.id == task.id
+    assert retryable.status is LifecycleVectorTaskStatus.FAILED
+    assert retryable.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_store_rebaseline_drains_only_its_source_vector_tasks() -> None:
+    class _Relational:
+        async def rebaseline_source_lifecycle(self, source_id: str) -> SourceLifecycleResetResult:
+            assert source_id == "src-1"
+            return SourceLifecycleResetResult(
+                retired_memory_ids=("mem-1",),
+                retired_search_cleanup_required=True,
+            )
+
+    store = object.__new__(MemoryStore)
+    store.relational = _Relational()
+    store._operation_context = lambda **_kwargs: None
+    store._emit = lambda *_args, **_kwargs: _async_none()
+    drained: list[tuple[str | None, str | None]] = []
+
+    async def record_drain(
+        lifecycle_plan_id: str | None = None,
+        *,
+        source_id: str | None = None,
+    ) -> None:
+        drained.append((lifecycle_plan_id, source_id))
+
+    store.drain_lifecycle_vector_outbox = record_drain
+
+    assert await store.rebaseline_source_lifecycle("src-1") == ["mem-1"]
+    assert drained == [(None, "src-1")]
+
+
+async def _async_none() -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_cross_source_keep_persists_provenance_and_survives_other_source_rebaseline(
+    db: Database,
+) -> None:
+    first = _projection(run_id="projection-cross-source-1", body="A7 is removed.")
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    incumbent = await db.get_memory(incumbent.id)
+    assert incumbent is not None
+
+    await db.upsert_source(
+        id="src-2",
+        type="confluence",
+        name="Second source",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-2",
+    )
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc).isoformat()
+    await db.db.execute(
+        """INSERT INTO documents (
+               doc_id, source, source_url, title, space_or_project,
+               last_modified, version, content_hash, last_synced
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "confluence-456",
+            "src-2",
+            "https://example.test/456",
+            "Second page",
+            "ENG",
+            now,
+            "1",
+            "h2",
+            now,
+        ),
+    )
+    await db.db.commit()
+    await db.enable_lifecycle_gate("src-2")
+    second = _projection(
+        run_id="projection-cross-source-2",
+        body="A7 is removed.",
+        item_id="confluence-456",
+        source_id="src-2",
+    )
+    raw = RawMemory(
+        content=incumbent.content,
+        memory_type=incumbent.memory_type,
+        confidence=incumbent.confidence,
+        tags=list(incumbent.tags),
+        evidence_quote="A7 is removed.",
+    )
+    evidence = build_projected_claim_evidence(
+        projection=second,
+        raw_memories=(raw,),
+        doc_id="confluence-456",
+        source_type="confluence",
+        project_key="ENG",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        access_context_hash="workspace-eng",
+        extractor_run_id=second.run_id,
+    )
+    delta = second.deltas[0]
+    source_one_refs = await db.get_active_memory_support_reference_ids(incumbent.id)
+    plan = build_lifecycle_plan(
+        plan_id="plan-cross-source-keep",
+        scope=ReconciliationScope(
+            id="scope-cross-source-keep",
+            source_id="src-2",
+            source_unit_id=delta.source_unit_id,
+            base_unit_revision_id=delta.previous_unit_revision_id,
+            target_unit_revision_id=delta.current_unit_revision_id,
+        ),
+        gate_state=LifecycleGateState.ENABLED,
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.NOOP,
+                memory_id=incumbent.id,
+                memory=raw,
+                reason="independent source corroborates the claim",
+            ),
+        ),
+        incumbents={incumbent.id: incumbent},
+        source_support_reference_ids={incumbent.id: ()},
+        all_active_support_reference_ids={incumbent.id: source_one_refs},
+        support_set_hashes={
+            incumbent.id: await db.get_memory_support_set_hash(incumbent.id)
+        },
+        observation_revision_ids=tuple(
+            revision.id for revision in second.observation_revisions
+        ),
+        new_evidence_reference_ids=(),
+        evidence_reference_ids_by_claim_hash=evidence.reference_ids_by_claim_hash,
+        defaults=NewMemoryDefaults(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key="ENG",
+            repo_identifier=None,
+            doc_id="confluence-456",
+            source_type="confluence",
+            access_context_hash="workspace-eng",
+        ),
+        evidence_units=evidence.units,
+        evidence_references=evidence.references,
+    )
+
+    await db.apply_source_projection_lifecycle(second, plan)
+
+    sources = await db.get_memory_sources(incumbent.id)
+    assert {(item.source_id, item.doc_id) for item in sources} == {
+        ("src-1", "confluence-123"),
+        ("src-2", "confluence-456"),
+    }
+    assert (await db.get_memory(incumbent.id)).corroboration_count == 2
+
+    await db.rebaseline_source_lifecycle("src-1")
+
+    surviving = await db.get_memory(incumbent.id)
+    assert surviving is not None
+    assert surviving.status == "active"
+    assert surviving.corroboration_count == 1
+    assert {(item.source_id, item.doc_id) for item in await db.get_memory_sources(incumbent.id)} == {
+        ("src-2", "confluence-456")
+    }
+
+
+@pytest.mark.asyncio
+async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attaches_support(
+    db: Database,
+) -> None:
+    first = _projection(run_id="projection-equivalent-source-1", body="A7 is removed.")
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    incumbent = await db.get_memory(incumbent.id)
+    assert incumbent is not None
+    await db.upsert_source(
+        id="src-2",
+        type="confluence",
+        name="Independent Engineering",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc).isoformat()
+    await db.db.execute(
+        """INSERT INTO documents (
+               doc_id, source, source_url, title, space_or_project,
+               last_modified, version, content_hash, last_synced
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "confluence-456",
+            "src-2",
+            "https://example.test/456",
+            "Independent Page",
+            "ENG",
+            now,
+            "1",
+            "h2",
+            now,
+        ),
+    )
+    await db.db.commit()
+    second = _projection(
+        run_id="projection-equivalent-source-2",
+        body="A7 remains excluded.",
+        item_id="confluence-456",
+        source_id="src-2",
+    )
+    raw = RawMemory(
+        content="A7 remains excluded.",
+        memory_type="decision",
+        confidence=0.9,
+        evidence_quote="A7 remains excluded.",
+        extraction_context="A7 remains excluded.",
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_EquivalentMemoryStore(db, incumbent),
+        structured_llm_client=_SemanticEquivalentClient(),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-456",
+        raw_memories=[raw],
+        doc_type="design-doc",
+        project_key=None,
+        repo_identifier=None,
+        entity_ids=[],
+        document_content="A7 remains excluded.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc),
+    )
+
+    assert stats["added"] == 0
+    assert stats["corroborated"] == 1
+    sources = await db.get_memory_sources(incumbent.id)
+    assert {source.source_id for source in sources} == {"src-1", "src-2"}
+    plan_rows = await db.db.execute_fetchall(
+        "SELECT payload_json FROM lifecycle_plans WHERE source_id = ?",
+        ("src-2",),
+    )
+    assert len(plan_rows) == 1
+    plan_payload = json.loads(str(plan_rows[0]["payload_json"]))
+    attach = next(
+        mutation
+        for mutation in plan_payload["mutations"]
+        if mutation["mutation_type"] == "attach_support"
+    )
+    assert attach["payload"]["equivalence_proof"] == {
+        "candidate_content_hash": content_hash("A7 remains excluded."),
+        "incumbent_content_hash": content_hash("A7 is removed."),
+        "method": "structured_classifier",
+        "model": engine.llm_model,
+        "reason": "Both claims state that A7 is excluded.",
+    }
+    support = await db.get_active_memory_support_evidence(
+        incumbent.id,
+        source_id="src-2",
+    )
+    assert len(support) == 1
+    assert support[0].anchor.observation_revision_id == second.observation_revisions[0].id
+
+
+@pytest.mark.asyncio
+async def test_post_cutover_direct_source_memory_write_is_rejected(db: Database) -> None:
+    await db.enable_lifecycle_gate("src-1")
+    memory = Memory(
+        id="mem-direct-bypass",
+        memory_type="fact",
+        content="This bypass has no Source Observation lineage.",
+        content_hash=content_hash("This bypass has no Source Observation lineage."),
+    )
+
+    with pytest.raises(ValueError, match="projected lifecycle required"):
+        await db.insert_memory_with_source_and_relation(
+            memory,
+            doc_id="confluence-123",
+            source_type="confluence",
+            excerpt=memory.content,
+            entity_ids=None,
+            relation_outcome=None,
+            source_updated_at=None,
+        )
+
+    assert await db.get_memory(memory.id) is None
+
+
+@pytest.mark.asyncio
+async def test_direct_terminal_transition_rejects_active_source_support(db: Database) -> None:
+    projection = _projection(run_id="projection-before-direct-terminal", body="A7 is removed.")
+    await db.record_source_projection(projection)
+    incumbent = await _seed_incumbent_support(db, projection=projection)
+
+    with pytest.raises(ValueError, match="active source support"):
+        await db.update_memory_status(incumbent.id, "retired", reason="direct bypass")
+    with pytest.raises(ValueError, match="active source support"):
+        await db.update_memory_status(incumbent.id, "pending_review", reason="direct bypass")
+    with pytest.raises(ValueError, match="active source support"):
+        await db.update_memory_content(
+            incumbent.id,
+            "A7 was mutated in place.",
+            None,
+            None,
+        )
+
+    # Non-semantic metadata tuning does not invalidate source evidence.
+    await db.update_memory_content(
+        incumbent.id,
+        incumbent.content,
+        0.8,
+        list(incumbent.tags),
+    )
+
+    replacement = Memory(
+        id="mem-direct-replacement",
+        memory_type="decision",
+        content="A7 is retained.",
+        content_hash=content_hash("A7 is retained."),
+    )
+    with pytest.raises(ValueError, match="active source support"):
+        await db.supersede_memory(
+            incumbent.id,
+            replacement,
+            replacement_reason="direct bypass",
+            replacement_kind="revision",
+        )
+
+    stored = await db.get_memory(incumbent.id)
+    assert stored is not None and stored.status == "active"
+    assert stored.content == incumbent.content
+    assert stored.confidence == 0.8
+    assert await db.get_memory(replacement.id) is None
+
+
+@pytest.mark.asyncio
+async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Database) -> None:
+    first = _projection(
+        run_id="projection-1",
+        body="A7 is removed.",
+        item_id="confluence-old-path",
+    )
+    await db.record_source_projection(first)
+    now = datetime(2026, 7, 14, tzinfo=timezone.utc)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="confluence-old-path",
+            source="src-1",
+            source_url="https://example.test/123",
+            title="Page",
+            space_or_project="ENG",
+            author=None,
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash="old-hash",
+            token_count=10,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
+    incumbent = Memory(
+        id="mem-old",
+        memory_type="decision",
+        content="A7 is removed.",
+        content_hash=content_hash("A7 is removed."),
+    )
+    await db.insert_memory(incumbent)
+    await db.add_memory_source(
+        incumbent.id,
+        "confluence-old-path",
+        "confluence",
+        "A7 is removed.",
+        source_updated_at=None,
+    )
+    old_revision = first.observation_revisions[0]
+    old_unit = EvidenceUnit(
+        id="eu-old",
+        source_id="src-1",
+        doc_id="confluence-old-path",
+        doc_revision_id=first.source_unit_revisions[0].id,
+        source_type="confluence",
+        source_anchor=first.observations[0].id,
+        source_lineage_id=first.source_units[0].id,
+        project_key="ENG",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        content=old_revision.content,
+        excerpt="A7 is removed.",
+        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        access_context_hash="workspace-eng",
+    )
+    await db.upsert_evidence_unit(old_unit)
+    old_reference = (
+        await db.record_evidence_references(
+            old_unit.id,
+            (
+                EvidenceReference(
+                    role=EvidenceRole.PRIMARY,
+                    anchor=SourceAnchor(
+                        kind=AnchorKind.WHOLE_OBSERVATION,
+                        observation_id=first.observations[0].id,
+                        observation_revision_id=old_revision.id,
+                    ),
+                ),
+            ),
+        )
+    )[0]
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id="support-old",
+            memory_id=incumbent.id,
+            evidence_reference_id=old_reference.id or "",
+            source_id="src-1",
+            access_context_hash="workspace-eng",
+        )
+    )
+    await db.enable_lifecycle_gate("src-1")
+
+    entity_id = await db.upsert_entity("A7", "A7", ["payroll-result-slot"])
+    await db.upsert_source(
+        id="src-2",
+        type="jira",
+        name="Payroll Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="jira-456",
+            source="src-2",
+            source_url="https://example.test/browse/PAY-456",
+            title="A7 behavior",
+            space_or_project="PAY",
+            author=None,
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash="jira-hash",
+            token_count=20,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
+    cross_source_memory = Memory(
+        id="mem-cross-source",
+        memory_type="decision",
+        content="A7 is removed.",
+        content_hash=content_hash("A7 is removed."),
+        project_key="ENG",
+    )
+    await db.insert_memory(cross_source_memory)
+    await db.add_memory_source(
+        cross_source_memory.id,
+        "jira-456",
+        "jira",
+        "A7 is removed.",
+        source_updated_at=now,
+    )
+    await db.link_memory_entity(cross_source_memory.id, entity_id)
+
+    second = _projection(
+        run_id="projection-2",
+        body="A7 is retained and marked as reduced retro chain.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={first.observations[0].id: old_revision},
+    )
+    raw = RawMemory(
+        content="A7 is retained and marked as reduced retro chain.",
+        memory_type="decision",
+        confidence=0.95,
+        tags=["payroll", "retro"],
+        extraction_context="A7 is retained and marked as reduced retro chain.",
+    )
+    evidence = build_projected_claim_evidence(
+        projection=second,
+        raw_memories=(raw,),
+        doc_id="confluence-123",
+        source_type="confluence",
+        project_key="ENG",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        access_context_hash="workspace-eng",
+        extractor_run_id="sync-2",
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_ReplacementClient(incumbent.id),
+    )
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[raw],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[entity_id],
+        document_content=raw.content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
+    )
+
+    old = await db.get_memory(incumbent.id)
+    assert old is not None and old.status == "superseded"
+    assert old.superseded_by is not None
+    replacement = await db.get_memory(old.superseded_by)
+    assert replacement is not None and replacement.status == "active"
+    assert stats["superseded"] == 1
+    assert stats["contradictions_found"] == 1
+    cross_source_review = await db.get_pending_review_for_challenger(replacement.id)
+    assert cross_source_review is not None
+    assert cross_source_review.kind == "cross_source_conflict"
+    assert (await db.get_memory(cross_source_memory.id)).status == "active"
+    assert (await db.get_memory(replacement.id)).status == "active"
+    persisted_evidence = await db.get_evidence_unit(evidence.units[0].id)
+    assert persisted_evidence is not None
+    assert persisted_evidence.source_lineage_id == evidence.units[0].source_lineage_id
+    assert persisted_evidence.content == evidence.units[0].content
+    assert persisted_evidence.extractor_run_id == second.run_id
+    assert persisted_evidence.observed_at == "2026-07-15T10:36:00+00:00"
+    assert await db.list_lifecycle_vector_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_enabled_source_tombstone_retires_last_supported_incumbent(db: Database) -> None:
+    initial = _projection(run_id="projection-before-delete", body="A7 is removed.")
+    await db.record_source_projection(initial)
+    incumbent = await _seed_incumbent_support(db, projection=initial)
+    await db.enable_lifecycle_gate("src-1")
+    tombstone = project_source_unit_tombstone(
+        source_type="confluence",
+        run_id="projection-delete",
+        source_unit=initial.source_units[0],
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision for revision in initial.observation_revisions
+        },
+        reason="not_returned_by_authoritative_snapshot",
+    )
+    engine = MemoryEngine(
+        relational=build_sqlite_adapters(db, object()).relational,
+        vector=build_sqlite_adapters(db, object()).vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+
+    result = await engine.apply_projected_tombstone(
+        projection=tombstone,
+        doc_id="confluence-123",
+        reason="not_returned_by_authoritative_snapshot",
+    )
+
+    retired = await db.get_memory(incumbent.id)
+    assert retired is not None and retired.status == "retired"
+    assert result == {"retired": 1, "pending_review": 0, "can_delete_document": True}
+    assert await db.list_lifecycle_vector_tasks() == []
+
+    await db.delete_projected_document("confluence-123")
+
+    assert await db.get_document("confluence-123") is None
+    assert await db.get_memory_sources(incumbent.id) == []
+    assert await db.get_evidence_unit(f"eu-{incumbent.id}") is not None
+    assert await db.get_source_projection(initial.run_id) == initial
+
+
+@pytest.mark.asyncio
+async def test_gated_source_tombstone_only_opens_review(db: Database) -> None:
+    initial = _projection(run_id="projection-before-gated-delete", body="A7 is removed.")
+    await db.record_source_projection(initial)
+    incumbent = await _seed_incumbent_support(db, projection=initial)
+    tombstone = project_source_unit_tombstone(
+        source_type="confluence",
+        run_id="projection-gated-delete",
+        source_unit=initial.source_units[0],
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision for revision in initial.observation_revisions
+        },
+        reason="not_returned_by_authoritative_snapshot",
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+
+    result = await engine.apply_projected_tombstone(
+        projection=tombstone,
+        doc_id="confluence-123",
+        reason="not_returned_by_authoritative_snapshot",
+    )
+
+    active = await db.get_memory(incumbent.id)
+    assert active is not None and active.status == "active"
+    assert result == {"retired": 0, "pending_review": 1, "can_delete_document": False}
+    with pytest.raises(ValueError, match="active document support remains"):
+        await db.delete_projected_document("confluence-123")

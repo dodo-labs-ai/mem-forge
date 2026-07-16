@@ -397,6 +397,42 @@ class ToolClient:
         """List search-eligible sources for MCP/source-id discovery."""
         return self._resource_json("GET", "/sources/searchable", None)
 
+    def get_source_projection_inventory(
+        self,
+        source_id: str,
+        *,
+        unit_type: str | None = None,
+        conversation_id: str | None = None,
+        observed_from_lte: str | None = None,
+        observed_to_gte: str | None = None,
+        observed_to_lt: str | None = None,
+        cursor: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        source_id = source_id.strip()
+        if not source_id:
+            return {"error": "source_id is required"}
+        query = urlencode(
+            {
+                key: value
+                for key, value in {
+                    "unit_type": unit_type,
+                    "conversation_id": conversation_id,
+                    "observed_from_lte": observed_from_lte,
+                    "observed_to_gte": observed_to_gte,
+                    "observed_to_lt": observed_to_lt,
+                    "cursor": cursor,
+                    "limit": limit,
+                }.items()
+                if value is not None
+            }
+        )
+        return self._resource_json(
+            "GET",
+            f"/sources/{quote(source_id, safe='')}/projection-inventory?{query}",
+            None,
+        )
+
     def list_memory_reviews(
         self,
         *,

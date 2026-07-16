@@ -6,7 +6,6 @@ from memforge.local_agent.teams_ledger import (
     TeamsLedgerMessage,
     TeamsLedgerProjector,
     TeamsLedgerStateStore,
-    build_teams_receipt_key,
     build_teams_window_id,
     decode_teams_window_id,
 )
@@ -92,20 +91,6 @@ def test_late_message_before_anchor_expands_bounds_without_changing_window_id():
     assert block.member_max_created_at == _ts("2026-07-08T10:30:00")
     assert block.member_message_ids == ("m1", "m2", "m3")
     assert block.revision_hash != original_block.revision_hash
-
-
-def test_receipt_key_uses_source_window_and_revision_without_policy_version():
-    receipt = build_teams_receipt_key(
-        source_id="src-teams",
-        window_id="teams-block:v1:opaque",
-        revision_hash="sha256:revision",
-    )
-
-    assert receipt == {
-        "source_id": "src-teams",
-        "window_id": "teams-block:v1:opaque",
-        "revision_hash": "sha256:revision",
-    }
 
 
 def test_teams_ledger_state_store_preserves_frozen_block_anchor_across_restart(tmp_path):

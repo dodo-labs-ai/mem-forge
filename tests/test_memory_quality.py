@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from memforge.config import AppConfig
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.store import MemoryStore
-from memforge.models import DocumentRecord, Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
+from memforge.models import DocumentRecord, Memory, RawMemory, content_hash
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
@@ -67,21 +67,6 @@ class DirectInsertStore:
         if relation_outcome is not None:
             await self.db.record_relation_outcome_bundle(relation_outcome)
         return "inserted"
-
-
-class FailingUpdateAuditStore(DirectInsertStore):
-    def __init__(self, db: Database) -> None:
-        super().__init__(db)
-        self.audit_events: list[tuple[str, str, dict]] = []
-
-    def operation_context(self, **fields):
-        return None
-
-    async def record_audit_event(self, event_type: str, status: str, **fields) -> None:
-        self.audit_events.append((event_type, status, fields))
-
-    async def update_memory(self, *args, **kwargs) -> None:
-        raise RuntimeError("update failed")
 
 
 class FakeCollection:
@@ -319,187 +304,6 @@ async def test_engine_keeps_conditional_ap_rule(db: Database):
     assert stats == {"inserted": 1, "corroborated": 0, "skipped": 0}
     assert len(memories) == 1
     assert memories[0].content == CONDITIONAL_RULE_CONTENT
-
-
-@pytest.mark.asyncio
-async def test_reconciliation_skips_bad_replacement_candidate_instead_of_superseding(db: Database, monkeypatch):
-    doc = await _insert_document(db, doc_id="doc-acd")
-    old_memory = await _insert_memory(
-        db,
-        mem_id="mem-oldgood",
-        content="Payroll Processing V2 uses the Payroll Processing concept as its reference design.",
-    )
-    await db.add_memory_source(old_memory.id, doc.doc_id, "confluence", source_updated_at=None)
-    adapters = build_sqlite_adapters(db, FakeCollection())
-    engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
-        db=db,
-        memory_store=DirectInsertStore(db),
-        structured_llm_client=object(),
-    )
-    good_extraction = _raw("Payroll Processing V2 validates changed regular pay dates.", "accepted rule")
-    bad_replacement = _raw(LINK_CONTENT, LINK_CONTEXT)
-
-    async def fake_reconcile_memories(**kwargs):
-        return [
-            ReconcileOperation(
-                action=ReconcileAction.SUPERSEDE,
-                memory_id=old_memory.id,
-                memory=bad_replacement,
-                reason="Bad replacement from a link-list row",
-            )
-        ]
-
-    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
-
-    stats = await engine.reconcile_and_persist(
-        doc_id=doc.doc_id,
-        raw_memories=[good_extraction],
-        source_type="confluence",
-        doc_type="design-doc",
-        source_updated_at=None,
-    )
-
-    stored_old = await db.get_memory(old_memory.id)
-    assert stats["superseded"] == 0
-    assert stats["skipped"] == 1
-    assert stored_old.status == "active"
-    assert await db.count_memories() == 1
-
-
-@pytest.mark.asyncio
-async def test_reconciliation_action_failure_is_audited_without_fallback(db: Database, monkeypatch):
-    doc = await _insert_document(db, doc_id="doc-fallback")
-    old_memory = await _insert_memory(db, mem_id="mem-fallback-old", content="Old fact")
-    await db.add_memory_source(old_memory.id, doc.doc_id, "confluence", source_updated_at=None)
-    store = FailingUpdateAuditStore(db)
-    adapters = build_sqlite_adapters(db, FakeCollection())
-    engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
-        db=db,
-        memory_store=store,
-        structured_llm_client=object(),
-    )
-    replacement = _raw("New fact", "new excerpt")
-
-    async def fake_reconcile_memories(**kwargs):
-        return [
-            ReconcileOperation(
-                action=ReconcileAction.UPDATE,
-                memory_id=old_memory.id,
-                memory=replacement,
-                reason="refresh",
-            )
-        ]
-
-    monkeypatch.setattr("memforge.pipeline.reconciler.reconcile_memories", fake_reconcile_memories)
-
-    stats = await engine.reconcile_and_persist(
-        doc_id=doc.doc_id,
-        raw_memories=[replacement],
-        source_type="confluence",
-        doc_type="design-doc",
-        source_updated_at=None,
-    )
-
-    assert stats["added"] == 0
-    assert stats["skipped"] == 1
-    assert await db.count_memories() == 1
-    assert [event[0] for event in store.audit_events] == [
-        "reconciliation_decision_returned",
-        "reconciliation_action_failed",
-    ]
-    assert store.audit_events[0][2]["memory_id"] == old_memory.id
-    assert store.audit_events[1][2]["memory_id"] == old_memory.id
-
-
-@pytest.mark.asyncio
-async def test_reconciliation_all_filtered_update_retires_sole_source_memory(db: Database):
-    doc = await _insert_document(db, doc_id="doc-acd")
-    old_memory = await _insert_memory(
-        db,
-        mem_id="mem-sole001",
-        content="Payroll Processing V2 repeats AP validation after changed regular pay dates.",
-    )
-    await db.add_memory_source(old_memory.id, doc.doc_id, "confluence", source_updated_at=None)
-    collection = FakeCollection()
-    adapters = build_sqlite_adapters(db, collection)
-    store = MemoryStore(
-        relational=adapters.relational,
-        keyword=adapters.keyword,
-        vector=adapters.vector,
-        embed_cfg={},
-    )
-    engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
-        db=db,
-        memory_store=store,
-        structured_llm_client=object(),
-    )
-
-    stats = await engine.reconcile_and_persist(
-        doc_id=doc.doc_id,
-        raw_memories=[_raw(LINK_CONTENT, LINK_CONTEXT)],
-        source_type="confluence",
-        doc_type="design-doc",
-        source_updated_at=None,
-    )
-
-    stored_old = await db.get_memory(old_memory.id)
-    assert stats["skipped"] == 1
-    assert stored_old.status == "retired"
-    assert stored_old.retirement_reason == "no_support"
-    assert await db.get_memory_sources(old_memory.id) == []
-    assert await _fts_has_memory(db, old_memory.id) is False
-    assert collection.deleted == [old_memory.id]
-
-
-@pytest.mark.asyncio
-async def test_reconciliation_all_filtered_update_removes_one_source_but_keeps_supported_memory_active(db: Database):
-    doc = await _insert_document(db, doc_id="doc-acd")
-    other_doc = await _insert_document(db, doc_id="doc-runbook")
-    old_memory = await _insert_memory(
-        db,
-        mem_id="mem-supported",
-        content="Payroll Processing V2 repeats AP validation after changed regular pay dates.",
-    )
-    await db.add_memory_source(old_memory.id, doc.doc_id, "confluence", source_updated_at=None)
-    await db.add_memory_source(old_memory.id, other_doc.doc_id, "confluence", source_updated_at=None)
-    collection = FakeCollection()
-    adapters = build_sqlite_adapters(db, collection)
-    store = MemoryStore(
-        relational=adapters.relational,
-        keyword=adapters.keyword,
-        vector=adapters.vector,
-        embed_cfg={},
-    )
-    engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
-        db=db,
-        memory_store=store,
-        structured_llm_client=object(),
-    )
-
-    stats = await engine.reconcile_and_persist(
-        doc_id=doc.doc_id,
-        raw_memories=[_raw(LINK_CONTENT, LINK_CONTEXT)],
-        source_type="confluence",
-        doc_type="design-doc",
-        source_updated_at=None,
-    )
-
-    stored_old = await db.get_memory(old_memory.id)
-    remaining_sources = await db.get_memory_sources(old_memory.id)
-    assert stats["skipped"] == 1
-    assert stored_old.status == "active"
-    assert stored_old.corroboration_count == 1
-    assert [source.doc_id for source in remaining_sources] == [other_doc.doc_id]
-    assert await _fts_has_memory(db, old_memory.id) is True
-    assert collection.deleted == []
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import datetime
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
@@ -291,6 +291,7 @@ class ConfluenceGene(Gene):
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         """Discover wiki pages from configured spaces or page tree root."""
         self.normalize_config(self.config)
+        self._discovered_page_ids: set[str] = set()
         sync_mode = self._effective_sync_mode(self.config)
         page_tree_root = str(self.config.get("page_tree_root") or "").strip()
         include_children = self.config.get("include_children", True)
@@ -300,6 +301,8 @@ class ConfluenceGene(Gene):
                 raise ValueError("Confluence Page Tree Root is required when syncing a page tree")
             async for item in self._discover_page_tree(page_tree_root, include_children, since):
                 yield item
+            if self._preview_discovery_limit() is None:
+                self.attest_discovery_complete("confluence_page_tree_exhausted")
             return
 
         spaces = self._space_keys(self.config.get("spaces"))
@@ -308,6 +311,8 @@ class ConfluenceGene(Gene):
         for space_key in spaces:
             async for item in self._discover_space(space_key, since):
                 yield item
+        if self._preview_discovery_limit() is None:
+            self.attest_discovery_complete("confluence_spaces_exhausted")
 
     async def _discover_page_tree(
         self, root_id: str, include_children: bool, since: datetime | None
@@ -330,8 +335,12 @@ class ConfluenceGene(Gene):
 
         # BFS through children
         queue = [root_id]
+        traversed_parent_ids: set[str] = set()
         while queue:
             parent_id = queue.pop(0)
+            if parent_id in traversed_parent_ids:
+                raise RuntimeError(f"Confluence page tree contains a traversal cycle at page {parent_id}")
+            traversed_parent_ids.add(parent_id)
             start = 0
             limit = self._page_request_limit(preview_limit, emitted)
             while True:
@@ -345,7 +354,11 @@ class ConfluenceGene(Gene):
                     logger.error("Failed to list children of page %s: %s", parent_id, e)
                     raise RuntimeError(f"Failed to list Confluence children for page {parent_id}: {e}") from e
 
-                results = data.get("results", [])
+                results = self._validated_page_results(
+                    data,
+                    context=f"children of page {parent_id}",
+                    expected_start=start,
+                )
                 if not results:
                     break
 
@@ -361,9 +374,9 @@ class ConfluenceGene(Gene):
                         if page_id:
                             queue.append(page_id)
 
-                if len(results) < limit:
+                if not self._has_next_page(data):
                     break
-                start += limit
+                start += len(results)
                 limit = self._page_request_limit(preview_limit, emitted)
 
     async def _get_page_as_content_item(
@@ -376,7 +389,10 @@ class ConfluenceGene(Gene):
                 params={"expand": "version,metadata.labels,space"},
             )
             page = self._json_response(resp, f"fetching page {page_id}")
-            return self._parse_page(page, since, exclude_labels)
+            item = self._parse_page(page, since, exclude_labels)
+            if str(page.get("id") or "").strip() != page_id:
+                raise RuntimeError(f"Confluence page {page_id} response identity mismatch")
+            return item
         except Exception as e:
             logger.error("Failed to fetch page %s: %s", page_id, e)
             raise RuntimeError(f"Failed to fetch Confluence page {page_id}: {e}") from e
@@ -385,6 +401,32 @@ class ConfluenceGene(Gene):
         self, page: dict, since: datetime | None, exclude_labels: set
     ) -> ContentItem | None:
         """Parse a Confluence page JSON into a ContentItem."""
+        page_id = str(page.get("id") or "").strip()
+        if not page_id:
+            raise RuntimeError("Confluence page record is missing a stable page id")
+        discovered_page_ids = getattr(self, "_discovered_page_ids", None)
+        if discovered_page_ids is None:
+            raise RuntimeError("Confluence discovery identity ledger is not initialized")
+        if page_id in discovered_page_ids:
+            raise RuntimeError(f"Confluence discovery returned duplicate page id {page_id}")
+        discovered_page_ids.add(page_id)
+
+        version_info = page.get("version")
+        if not isinstance(version_info, dict):
+            raise RuntimeError(f"Confluence page {page_id} is missing version metadata")
+        version_number = version_info.get("number")
+        if not isinstance(version_number, int) or isinstance(version_number, bool) or version_number <= 0:
+            raise RuntimeError(f"Confluence page {page_id} is missing a stable version number")
+        modified_str = version_info.get("when")
+        if not isinstance(modified_str, str) or not modified_str.strip():
+            raise RuntimeError(f"Confluence page {page_id} is missing a version timestamp")
+        try:
+            last_modified = datetime.fromisoformat(modified_str.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise RuntimeError(f"Confluence page {page_id} has an invalid version timestamp") from exc
+        if last_modified.tzinfo is None or last_modified.utcoffset() is None:
+            raise RuntimeError(f"Confluence page {page_id} version timestamp has no timezone")
+
         labels = [
             label["name"]
             for label in page.get("metadata", {}).get("labels", {}).get("results", [])
@@ -392,17 +434,9 @@ class ConfluenceGene(Gene):
         if exclude_labels and set(labels) & exclude_labels:
             return None
 
-        version_info = page.get("version", {})
-        modified_str = version_info.get("when", "")
-        try:
-            last_modified = datetime.fromisoformat(modified_str.replace("Z", "+00:00"))
-        except (ValueError, AttributeError):
-            last_modified = datetime.now(timezone.utc)
-
         if since and last_modified <= since:
             return None
 
-        page_id = page.get("id", "")
         space_key = page.get("space", {}).get("key", self.config.get("spaces", [""])[0] if self.config.get("spaces") else "")
 
         return ContentItem(
@@ -412,7 +446,7 @@ class ConfluenceGene(Gene):
             last_modified=last_modified,
             content_type="text/html",
             space_or_project=space_key,
-            version=str(version_info.get("number", "1")),
+            version=str(version_number),
             author=version_info.get("by", {}).get("displayName"),
             labels=labels,
             extra={"page_id": page_id, "space_key": space_key},
@@ -447,7 +481,11 @@ class ConfluenceGene(Gene):
                 logger.error("Failed to list pages in space %s: %s", space_key, e)
                 raise RuntimeError(f"Failed to list Confluence pages in space {space_key}: {e}") from e
 
-            results = data.get("results", [])
+            results = self._validated_page_results(
+                data,
+                context=f"space {space_key}",
+                expected_start=start,
+            )
             if not results:
                 break
 
@@ -459,9 +497,9 @@ class ConfluenceGene(Gene):
                     if preview_limit is not None and emitted >= preview_limit:
                         return
 
-            if len(results) < limit:
+            if not self._has_next_page(data):
                 break
-            start += limit
+            start += len(results)
             limit = self._page_request_limit(preview_limit, emitted)
 
     async def fetch(self, item: ContentItem) -> RawContent:
@@ -469,17 +507,77 @@ class ConfluenceGene(Gene):
         page_id = item.extra.get("page_id", item.item_id.replace("confluence-", ""))
         resp = await self._get(
             f"{self._api_prefix}/rest/api/content/{page_id}",
-            params={"expand": "body.storage,version"},
+            params={"expand": "body.storage,version,ancestors,space"},
         )
         data = self._json_response(resp, f"fetching page content {page_id}")
+        if str(data.get("id") or "").strip() != str(page_id):
+            raise RuntimeError(f"Confluence page {page_id} content response identity mismatch")
+        fetched_version = data.get("version")
+        if (
+            not isinstance(fetched_version, dict)
+            or str(fetched_version.get("number") or "").strip() != str(item.version)
+        ):
+            raise RuntimeError(f"Confluence page {page_id} changed during discovery")
 
-        body_html = data.get("body", {}).get("storage", {}).get("value", "")
+        body = data.get("body")
+        storage = body.get("storage") if isinstance(body, dict) else None
+        if not isinstance(storage, dict) or "value" not in storage or not isinstance(storage.get("value"), str):
+            raise RuntimeError(f"Confluence page {page_id} response is missing body.storage.value")
+        body_html = storage["value"]
+        semantic_body = strip_boilerplate(html_to_markdown(body_html))
+        authoritative_empty = not semantic_body.strip()
+        ancestors = data.get("ancestors") if isinstance(data.get("ancestors"), list) else []
+        parent = ancestors[-1] if ancestors and isinstance(ancestors[-1], dict) else {}
+        item.extra["parent_page_id"] = str(parent.get("id") or "") or None
+        item.extra["space_key"] = str(
+            (data.get("space") or {}).get("key") or item.extra.get("space_key") or item.space_or_project
+        )
 
         return RawContent(
             item=item,
             body=body_html.encode("utf-8"),
             content_type="text/html",
+            authoritative_empty=authoritative_empty,
+            empty_evidence=(
+                "confluence_content_api_successful_semantically_empty_storage_body"
+                if authoritative_empty
+                else None
+            ),
         )
+
+    @staticmethod
+    def _has_next_page(data: dict) -> bool:
+        links = data.get("_links")
+        return isinstance(links, dict) and bool(str(links.get("next") or "").strip())
+
+    @classmethod
+    def _validated_page_results(
+        cls,
+        data: object,
+        *,
+        context: str,
+        expected_start: int,
+    ) -> list[dict]:
+        if not isinstance(data, dict) or "results" not in data or not isinstance(data.get("results"), list):
+            raise RuntimeError(f"Confluence {context} response is missing a results list")
+        results = data["results"]
+        if any(not isinstance(page, dict) for page in results):
+            raise RuntimeError(f"Confluence {context} response contains an invalid page record")
+        size = data.get("size")
+        if not isinstance(size, int) or isinstance(size, bool) or size != len(results):
+            raise RuntimeError(f"Confluence {context} response has inconsistent pagination size")
+        start = data.get("start")
+        if not isinstance(start, int) or isinstance(start, bool) or start != expected_start:
+            raise RuntimeError(f"Confluence {context} response has inconsistent pagination start")
+        links = data.get("_links")
+        if not isinstance(links, dict):
+            raise RuntimeError(f"Confluence {context} response is missing pagination links")
+        next_link = links.get("next")
+        if next_link is not None and (not isinstance(next_link, str) or not next_link.strip()):
+            raise RuntimeError(f"Confluence {context} response has an invalid next link")
+        if not results and cls._has_next_page(data):
+            raise RuntimeError(f"Confluence {context} response has a next link without results")
+        return results
 
     async def fetch_pdf(self, item: ContentItem) -> bytes | None:
         """Render Confluence export HTML to a local PDF."""
@@ -522,6 +620,19 @@ class ConfluenceGene(Gene):
         markdown = html_to_markdown(html)
         markdown = strip_boilerplate(markdown)
 
+        if raw.authoritative_empty:
+            return NormalizedContent(
+                item=raw.item,
+                markdown_body="",
+                source_semantics={
+                    "semantic_markdown": "",
+                    "space_key": raw.item.space_or_project,
+                    "labels": raw.item.labels,
+                    "author": raw.item.author,
+                    "version": raw.item.version,
+                },
+            )
+
         # Add structured header with metadata
         header_lines = [
             f"# {raw.item.title}",
@@ -540,6 +651,9 @@ class ConfluenceGene(Gene):
             item=raw.item,
             markdown_body=full_markdown,
             source_semantics={
+                # Provider-neutral projection hashes this body rather than the
+                # display header, whose Last modified/author fields are operational.
+                "semantic_markdown": markdown,
                 "space_key": raw.item.space_or_project,
                 "labels": raw.item.labels,
                 "author": raw.item.author,

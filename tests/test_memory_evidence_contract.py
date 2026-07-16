@@ -11,6 +11,8 @@ from memforge.memory.evidence import (
     CandidateBucketResult,
     CandidateMemory,
     EvidenceContentProvenance,
+    EvidenceReference,
+    EvidenceRole,
     EvidenceUnit,
     LifecycleAction,
     MemoryRelationApplyService,
@@ -23,7 +25,9 @@ from memforge.memory.evidence import (
     is_destructive_authority,
     is_mandatory_candidate_bucket,
     relation_run_id_for,
+    validate_evidence_references,
 )
+from memforge.source_projection import AnchorKind, SourceAnchor
 
 
 def _unit(**overrides) -> EvidenceUnit:
@@ -72,6 +76,61 @@ def _access(**overrides) -> AccessContext:
     )
     defaults.update(overrides)
     return AccessContext(**defaults)
+
+
+def _source_anchor(observation_id: str, revision_id: str) -> SourceAnchor:
+    return SourceAnchor(
+        kind=AnchorKind.WHOLE_OBSERVATION,
+        observation_id=observation_id,
+        observation_revision_id=revision_id,
+    )
+
+
+def test_evidence_references_require_primary_and_revision_pinning() -> None:
+    references = (
+        EvidenceReference(
+            role=EvidenceRole.PRIMARY,
+            anchor=_source_anchor("obs-comment-1", "obsrev-comment-2"),
+        ),
+        EvidenceReference(
+            role=EvidenceRole.CONTEXT,
+            anchor=_source_anchor("obs-issue-core", "obsrev-core-3"),
+        ),
+    )
+
+    validated = validate_evidence_references(
+        references,
+        available_revision_ids={"obsrev-comment-2", "obsrev-core-3"},
+    )
+
+    assert validated == references
+    assert [item.anchor for item in validated if item.grants_support] == [references[0].anchor]
+
+
+def test_context_only_evidence_cannot_grant_support() -> None:
+    with pytest.raises(ValueError, match="PRIMARY"):
+        validate_evidence_references(
+            (
+                EvidenceReference(
+                    role=EvidenceRole.CONTEXT,
+                    anchor=_source_anchor("obs-issue-core", "obsrev-core-3"),
+                ),
+            ),
+            available_revision_ids={"obsrev-core-3"},
+        )
+
+
+def test_evidence_reference_rejects_unknown_revision() -> None:
+    with pytest.raises(ValueError, match="unavailable observation revision"):
+        validate_evidence_references(
+            (
+                EvidenceReference(
+                    role=EvidenceRole.PRIMARY,
+                    anchor=_source_anchor("obs-comment-1", "obsrev-missing"),
+                ),
+            ),
+            available_revision_ids=set(),
+        )
 
 
 def test_relation_run_id_includes_classifier_action_and_candidate_contract() -> None:

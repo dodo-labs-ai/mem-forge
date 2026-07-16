@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
-import base64
 import logging
 import re
 import xml.etree.ElementTree as ET
@@ -20,6 +19,10 @@ from bs4 import BeautifulSoup
 
 from memforge.genes.atlassian_auth import require_https_base_url, resolve_pat, tls_verify
 from memforge.genes.base import Gene
+from memforge.github_repo_utils import (
+    decode_github_contents_payload,
+    validate_github_tree_payload,
+)
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -169,6 +172,20 @@ class GitHubPagesGene(Gene):
                     order=6,
                     advanced=True,
                 ),
+                ConfigField(
+                    key="sitemap_authoritative",
+                    label="Treat Sitemap as Complete Inventory",
+                    field_type=ConfigFieldType.BOOLEAN,
+                    required=False,
+                    default="false",
+                    help_text=(
+                        "Allow a validated sitemap urlset to retire pages that are no longer listed. "
+                        "Leave disabled unless the site guarantees that its sitemap is exhaustive."
+                    ),
+                    group="scope",
+                    order=7,
+                    advanced=True,
+                ),
             ],
         )
 
@@ -204,6 +221,7 @@ class GitHubPagesGene(Gene):
             item = await self._content_item_for_url(url)
             if _is_modified_since(item.last_modified, since):
                 yield item
+            self.attest_discovery_complete("github_pages_single_page_resolved")
             return
 
         if mode == SYNC_MODE_EXPLICIT_LIST:
@@ -211,6 +229,7 @@ class GitHubPagesGene(Gene):
                 item = await self._content_item_for_url(url)
                 if _is_modified_since(item.last_modified, since):
                     yield item
+            self.attest_discovery_complete("github_pages_explicit_list_exhausted")
             return
 
         if mode != SYNC_MODE_SUBTREE:
@@ -219,6 +238,7 @@ class GitHubPagesGene(Gene):
         if self._auth_mode == AUTH_MODE_GITHUB_PAT:
             async for item in self._repo_subtree_items(since):
                 yield item
+            self.attest_discovery_complete("github_pages_repository_tree_exhausted")
             return
 
         sitemap_items = await self._sitemap_items()
@@ -226,10 +246,16 @@ class GitHubPagesGene(Gene):
             for item in sitemap_items:
                 if _is_modified_since(item.last_modified, since):
                     yield item
+            if _bool_config(self.config, "sitemap_authoritative", False):
+                self.attest_discovery_complete("github_pages_authoritative_sitemap_exhausted")
             return
 
         async for item in self._discover_bfs(since):
             yield item
+        # A bounded link crawl proves only the currently reachable graph, not
+        # the complete URL inventory.  A live page may temporarily lose its
+        # inbound link or sit beyond max_depth, so BFS must never authorize
+        # source-wide absence retirement.
 
     async def fetch(self, item: ContentItem) -> RawContent:
         repo_api_url = item.extra.get("repo_api_url")
@@ -237,30 +263,68 @@ class GitHubPagesGene(Gene):
             response = await self._client.get(str(repo_api_url))
             response.raise_for_status()
             payload = response.json()
-            body = base64.b64decode(str(payload.get("content") or "").replace("\n", ""))
+            try:
+                body = decode_github_contents_payload(
+                    payload,
+                    expected_sha=str(item.version or ""),
+                    label=str(item.extra.get("repo_path") or item.item_id),
+                )
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
             return RawContent(
                 item=item,
                 body=body,
                 content_type="text/markdown",
+                authoritative_empty=not body.strip(),
+                empty_evidence=(
+                    "github_contents_api_successful_empty_blob"
+                    if not body.strip()
+                    else None
+                ),
             )
 
         response = await self._client.get(item.source_url)
         response.raise_for_status()
+        self._validate_http_response_identity(response, item.source_url)
+        expected_hash = str(item.extra.get("http_content_sha256") or "").strip()
+        actual_hash = hashlib.sha256(response.content).hexdigest()
+        if not expected_hash or actual_hash != expected_hash:
+            raise RuntimeError(
+                f"GitHub Pages content changed between discovery and fetch for {item.source_url}"
+            )
         return RawContent(
             item=item,
             body=response.content,
             content_type=response.headers.get("content-type", item.content_type) or "text/html",
+            authoritative_empty=not response.content.strip(),
+            empty_evidence=(
+                "github_pages_http_successful_empty_response"
+                if not response.content.strip()
+                else None
+            ),
         )
 
     async def normalize(self, raw: RawContent) -> NormalizedContent:
         raw_text = raw.body.decode("utf-8", errors="replace")
+        page_url = _canonicalize_url(raw.item.source_url)
+        if raw.authoritative_empty:
+            return NormalizedContent(
+                item=raw.item,
+                markdown_body="",
+                source_semantics={
+                    "source_type": "github_pages",
+                    "site_url": self._base_url,
+                    "page_url": page_url,
+                    "canonical_url": page_url,
+                    "title": raw.item.title.strip() or "GitHub Pages Document",
+                },
+            )
         if raw.content_type in {"text/markdown", "text/x-markdown"} or raw.item.extra.get("repo_api_url"):
             body = strip_boilerplate(raw_text)
         else:
             article_html = _extract_article_html(raw_text)
             body = strip_boilerplate(html_to_markdown(article_html))
         body = annotate_code_blocks(body)
-        page_url = _canonicalize_url(raw.item.source_url)
         metadata_lines = [
             "## Source Metadata",
             "- Source Type: GitHub Pages",
@@ -309,10 +373,34 @@ class GitHubPagesGene(Gene):
         canonical_url = self._require_in_site(url)
         if self._auth_mode == AUTH_MODE_GITHUB_PAT:
             return await self._repo_file_item_for_url(canonical_url)
-        headers = metadata_headers
-        if headers is None:
-            headers = await self._metadata_headers(canonical_url)
-        return _content_item_from_url(canonical_url, headers)
+        # Build identity and revision from the same successful body response.
+        # ``metadata_headers`` remains accepted for compatibility, but cannot
+        # replace body-bound evidence.
+        response = await self._client.get(canonical_url)
+        response.raise_for_status()
+        self._validate_http_response_identity(response, canonical_url)
+        headers = {**dict(response.headers), **dict(metadata_headers or {})}
+        return self._content_item_from_http_response(canonical_url, headers, response.content)
+
+    def _content_item_from_http_response(
+        self,
+        url: str,
+        headers: dict[str, str],
+        body: bytes,
+    ) -> ContentItem:
+        item = _content_item_from_url(url, headers)
+        body_hash = hashlib.sha256(body).hexdigest()
+        item.version = f"sha256:{body_hash}"
+        item.extra["http_content_sha256"] = body_hash
+        return item
+
+    @staticmethod
+    def _validate_http_response_identity(response: object, expected_url: str) -> None:
+        final_url = _canonicalize_url(str(getattr(response, "url", "") or expected_url))
+        if final_url != _canonicalize_url(expected_url):
+            raise RuntimeError(
+                f"GitHub Pages response identity mismatch: expected {expected_url}, got {final_url}"
+            )
 
     async def _repo_content_item(
         self,
@@ -399,14 +487,20 @@ class GitHubPagesGene(Gene):
     async def _default_branch(self, ref: "_RepoRef") -> str:
         response = await self._client.get(_repo_api_url(ref))
         response.raise_for_status()
-        return str(response.json().get("default_branch") or "main")
+        payload = response.json()
+        branch = str(payload.get("default_branch") or "").strip() if isinstance(payload, dict) else ""
+        if not branch:
+            raise RuntimeError("GitHub Pages repository response is missing default_branch")
+        return branch
 
     async def _repo_tree(self, ref: "_RepoRef", branch: str) -> list[dict]:
         response = await self._client.get(f"{_repo_api_url(ref)}/git/trees/{branch}?recursive=1")
         response.raise_for_status()
         payload = response.json()
-        tree = payload.get("tree")
-        return tree if isinstance(tree, list) else []
+        try:
+            return validate_github_tree_payload(payload, label="GitHub Pages repository")
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     async def _repo_path_last_modified(self, ref: "_RepoRef", branch: str, repo_path: str) -> datetime:
         response = await self._client.get(f"{_repo_api_url(ref)}/commits?sha={branch}&path={repo_path}&per_page=1")
@@ -437,19 +531,28 @@ class GitHubPagesGene(Gene):
             response = await self._client.get(sitemap_url)
             if response.status_code >= 400:
                 return None
-            urls = _urls_from_sitemap(response.text)
+            sitemap_kind, urls = _urls_from_sitemap(response.text)
         except Exception:
             logger.debug("GitHub Pages sitemap discovery failed for %s", sitemap_url, exc_info=True)
             return None
 
-        scoped = sorted(url for url in urls if self._url_is_in_scope(url))
+        if sitemap_kind != "urlset":
+            logger.warning(
+                "Ignoring non-urlset GitHub Pages sitemap inventory at %s; falling back to bounded crawl",
+                sitemap_url,
+            )
+            return None
+
+        canonical_urls = [_canonicalize_url(url) for url in urls]
+        if len(canonical_urls) != len(set(canonical_urls)):
+            raise RuntimeError("GitHub Pages sitemap contains duplicate canonical URLs")
+        scoped = sorted(url for url in canonical_urls if self._url_is_in_scope(url))
         items: list[ContentItem] = []
         for url in _limit_urls(scoped, _max_pages(self.config)):
             lastmod = _lastmod_for_url(response.text, url)
             if lastmod:
                 item = await self._content_item_for_url(url, metadata_headers={})
                 item.last_modified = lastmod
-                item.version = lastmod.isoformat()
             else:
                 item = await self._content_item_for_url(url)
             items.append(item)
@@ -472,7 +575,8 @@ class GitHubPagesGene(Gene):
             discovered += 1
             response = await self._client.get(url)
             response.raise_for_status()
-            item = _content_item_from_url(url, dict(response.headers))
+            self._validate_http_response_identity(response, url)
+            item = self._content_item_from_http_response(url, dict(response.headers), response.content)
             if _is_modified_since(item.last_modified, since):
                 yield item
             if depth >= max_depth:
@@ -583,6 +687,13 @@ def _list_config(value: object) -> list[str]:
     if isinstance(value, str):
         return [item.strip() for item in value.split(",") if item.strip()]
     return []
+
+
+def _bool_config(config: dict, key: str, default: bool) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _canonicalize_url(url: str) -> str:
@@ -773,14 +884,17 @@ def _parse_datetime(value: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _urls_from_sitemap(sitemap_text: str) -> list[str]:
+def _urls_from_sitemap(sitemap_text: str) -> tuple[str, list[str]]:
     root = ET.fromstring(sitemap_text)
     namespace = _xml_namespace(root.tag)
+    root_name = root.tag.rsplit("}", 1)[-1]
+    if root_name not in {"urlset", "sitemapindex"}:
+        raise ValueError("GitHub Pages sitemap has an unsupported root element")
     urls: list[str] = []
     for loc in root.findall(f".//{namespace}loc"):
         if loc.text:
             urls.append(_canonicalize_url(loc.text))
-    return urls
+    return root_name, urls
 
 
 def _xml_namespace(tag: str) -> str:

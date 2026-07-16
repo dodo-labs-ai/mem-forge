@@ -12,7 +12,9 @@ from memforge.llm.structured import (
     EnrichmentResponse,
     LiteLlmStructuredClient,
     MemoryCandidate,
+    MemoryEquivalenceResponse,
     MemoryExtractionResponse,
+    MemorySupportValidationResponse,
     ReconciliationResponse,
     RerankResponse,
     SourceSupportDecision,
@@ -275,12 +277,19 @@ async def test_litellm_structured_client_uses_response_schema_for_agent_session_
 
 
 @pytest.mark.asyncio
-async def test_agent_session_authority_classifier_does_not_retry_native_schema_failure(monkeypatch):
+async def test_agent_session_authority_classifier_retries_invalid_native_schema_as_json_text(
+    monkeypatch,
+):
     calls = []
 
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
-        raise RuntimeError("native schema rejected")
+        if len(calls) == 1:
+            return CompletionResponse("not valid json")
+        return CompletionResponse(
+            '{"decisions":[{"evidence_id":"E1","is_authoritative":true,'
+            '"authority_kind":"durable_user_intent","reason":"explicit user rule"}]}'
+        )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     set_native_schema_support(monkeypatch, True)
@@ -293,11 +302,14 @@ async def test_agent_session_authority_classifier_does_not_retry_native_schema_f
         )
     )
 
-    with pytest.raises(StructuredLlmError):
-        await client.classify_agent_session_evidence_authority("prompt", max_tokens=1024)
+    response = await client.classify_agent_session_evidence_authority("prompt", max_tokens=1024)
 
-    assert len(calls) == 1
+    assert response.decisions[0].evidence_id == "E1"
+    assert response.decisions[0].is_authoritative is True
+    assert len(calls) == 2
     assert calls[0]["response_format"] is AgentSessionAuthorityResponse
+    assert "response_format" not in calls[1]
+    assert calls[1]["messages"][0]["content"].startswith("prompt\n\nReturn ONLY")
 
 
 @pytest.mark.asyncio
@@ -414,6 +426,10 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
             return CompletionResponse(
                 '{"decisions":[{"pair_index":0,"classification":"unrelated","reason":"different topic"}]}'
             )
+        if schema is MemoryEquivalenceResponse:
+            return CompletionResponse('{"equivalent":true,"reason":"same claim"}')
+        if schema is MemorySupportValidationResponse:
+            return CompletionResponse('{"supported":true,"reason":"still entailed"}')
         if schema is EntityValidationResponse:
             return CompletionResponse('{"same_entity":true,"matched_id":7,"confidence":0.95}')
         if schema is RerankResponse:
@@ -434,6 +450,8 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     assert (await client.enrich_document("prompt", max_tokens=64000)).summary == "Summary"
     assert (await client.reconcile_memories("prompt")).decisions[0].action == "ADD"
     assert (await client.detect_contradictions("prompt")).decisions[0].classification == "unrelated"
+    assert (await client.classify_memory_equivalence("prompt")).equivalent is True
+    assert (await client.validate_memory_support("prompt")).supported is True
     assert (await client.validate_entity_match("prompt")).matched_id == 7
     assert (await client.rerank_memories("prompt")).ranking == [2, 0, 1]
 
@@ -441,6 +459,8 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         EnrichmentResponse,
         ReconciliationResponse,
         ContradictionResponse,
+        MemoryEquivalenceResponse,
+        MemorySupportValidationResponse,
         EntityValidationResponse,
         RerankResponse,
     ]

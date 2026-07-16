@@ -21,7 +21,8 @@ from memforge.memory.evidence import (
     RelationType,
 )
 from memforge.memory.store import MemoryStore
-from memforge.models import Memory, MemoryReview, MemorySource, content_hash
+from memforge.memory.lifecycle_plan import LifecycleVectorTaskStatus
+from memforge.models import DocumentRecord, Memory, MemoryReview, MemorySource, content_hash
 from memforge.memory.review_service import ReviewKind, ReviewStatus
 from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.storage.database import Database
@@ -225,6 +226,15 @@ async def db(tmp_path):
 
 
 async def _insert_doc(db: Database, doc_id: str = "doc-1", source: str = "src-1") -> None:
+    if await db.get_source(source) is None:
+        await db.upsert_source(
+            id=source,
+            type="confluence",
+            name=source,
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="owner-1",
+        )
     now = datetime.now(timezone.utc).isoformat()
     await db.db.execute(
         """INSERT INTO documents
@@ -1521,6 +1531,52 @@ async def test_delete_document_restores_db_when_retired_memory_index_delete_fail
 
 
 @pytest.mark.asyncio
+async def test_delete_virtual_document_restores_without_configured_source_on_index_failure(
+    db: Database,
+):
+    now = datetime.now(timezone.utc)
+    document = DocumentRecord(
+        doc_id="user-memory-rollback",
+        source="user_memory",
+        source_url="memforge://user-memory/user-memory-rollback",
+        title="User memory",
+        space_or_project="UNSORTED",
+        author="owner-1",
+        last_modified=now,
+        labels=["user_memory"],
+        version="1",
+        content_hash="user-memory-hash",
+        token_count=3,
+        raw_content_uri=None,
+        raw_content_type=None,
+        normalized_content_uri=None,
+        pdf_content_uri=None,
+        last_synced=now,
+    )
+    await db.upsert_document(document)
+    memory = _memory("mem-user-rollback", "User supplied fact")
+    await db.insert_memory(memory)
+    await db.add_memory_source(
+        memory.id,
+        document.doc_id,
+        "user_memory",
+        "User supplied fact",
+        source_updated_at=now,
+    )
+    store = _store(db, FailingDeleteCollection())
+
+    with pytest.raises(RuntimeError, match="delete failed"):
+        await store.delete_document(document.doc_id)
+
+    assert await db.get_document(document.doc_id) is not None
+    restored = await db.get_memory(memory.id)
+    assert restored is not None and restored.status == "active"
+    assert [source.doc_id for source in await db.get_memory_sources(memory.id)] == [
+        document.doc_id
+    ]
+
+
+@pytest.mark.asyncio
 async def test_delete_document_restores_missing_document_vector_when_delete_mutates_then_fails(db: Database):
     await _insert_doc(db, "doc-missing-vector-rollback")
     doc_collection = InsertThenFailingDeleteCollection()
@@ -1569,7 +1625,7 @@ async def test_delete_document_rolls_back_sqlite_when_db_delete_fails_mid_transa
 
 
 @pytest.mark.asyncio
-async def test_delete_source_cascade_restores_db_when_retired_memory_index_delete_fails(db: Database):
+async def test_delete_source_cascade_keeps_durable_cleanup_when_memory_vector_delete_fails(db: Database):
     await db.upsert_source(
         "src-rollback", "confluence", "Rollback Source", "{}", access_policy="workspace", owner_user_id="dev"
     )
@@ -1615,40 +1671,34 @@ async def test_delete_source_cascade_restores_db_when_retired_memory_index_delet
     )
     store = _store(db, FailingDeleteCollection(), document_collection=doc_collection)
 
-    with pytest.raises(RuntimeError, match="delete failed"):
-        await store.delete_source_cascade("src-rollback")
+    retired = await store.delete_source_cascade("src-rollback")
 
     stored_source = await db.get_source("src-rollback")
     stored_doc = await db.get_document("doc-source-rollback")
     stored_memory = await db.get_memory(memory.id)
     sources = await db.get_memory_sources(memory.id)
-    assert stored_source is not None
-    assert {
-        "status": stored_source["status"],
-        "last_sync": stored_source["last_sync"],
-        "doc_count": stored_source["doc_count"],
-        "created_at": stored_source["created_at"],
-    } == {
-        "status": "paused",
-        "last_sync": "2026-05-01T00:00:00+00:00",
-        "doc_count": 7,
-        "created_at": "2026-04-01T00:00:00+00:00",
-    }
-    assert stored_doc is not None
-    assert stored_memory.status == "active"
-    assert [(source.doc_id, source.excerpt) for source in sources] == [("doc-source-rollback", "source excerpt")]
+    assert retired == [memory.id]
+    assert stored_source is None
+    assert stored_doc is None
+    assert stored_memory.status == "retired"
+    assert sources == []
     assert await _doc_side_counts(db, "doc-source-rollback") == {
-        "metadata": 1,
-        "relationships": 1,
-        "changelog": 1,
-        "receipts": 1,
+        "metadata": 0,
+        "relationships": 0,
+        "changelog": 0,
+        "receipts": 0,
     }
     assert await _source_bookkeeping_counts(db, "src-rollback") == {
-        "sync_state": 1,
-        "sync_history": 1,
+        "sync_state": 0,
+        "sync_history": 0,
     }
-    assert doc_collection.upserted["doc-source-rollback"]["content_hash"] == "hash-doc-source-rollback"
-    assert doc_collection.upserted["doc-source-rollback"]["document"] == "original source rollback document"
+    [cleanup] = await db.list_lifecycle_vector_tasks(source_id="src-rollback")
+    assert cleanup.memory_id == memory.id
+    assert cleanup.status is LifecycleVectorTaskStatus.FAILED
+
+    retry_store = _store(db, RecordingCollection())
+    await retry_store.drain_lifecycle_vector_outbox(source_id="src-rollback")
+    assert await db.list_lifecycle_vector_tasks(source_id="src-rollback") == []
 
 
 @pytest.mark.asyncio

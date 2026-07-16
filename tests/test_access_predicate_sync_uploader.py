@@ -8,9 +8,8 @@ forward it to the memory engine, instead of falling back to LOCAL_DEV_USER_ID.
 
 The orchestrator-driven test below is the regression gate: it runs the real
 GeneSyncOrchestrator against a real AgentSessionGene and watches what the
-orchestrator forwards to the memory engine. Removing the ``user_id=...`` kwarg
-from either branch of ``_process_item`` (the new-document ``process_memories``
-call or the existing-document ``reconcile_and_persist`` call) makes the
+orchestrator forwards to the projected lifecycle entrypoint. Removing the
+``user_id=...`` kwarg from either new-document or update processing makes the
 spy-engine assertions fail.
 """
 
@@ -143,19 +142,20 @@ class _SpyMemoryEngine:
     """
 
     def __init__(self) -> None:
-        self.process_memories_calls: list[dict] = []
-        self.reconcile_calls: list[dict] = []
+        self.projected_lifecycle_calls: list[dict] = []
 
     async def process_enrichment(self, *, doc_id, enrichment, doc_context=None):
         return []
 
-    async def process_memories(self, **kwargs):
-        self.process_memories_calls.append(kwargs)
-        return {"inserted": len(kwargs.get("raw_memories") or []), "corroborated": 0, "skipped": 0}
-
-    async def reconcile_and_persist(self, **kwargs):
-        self.reconcile_calls.append(kwargs)
-        return {"added": 1, "updated": 0, "superseded": 0, "deleted": 0, "noop": 0}
+    async def apply_projected_lifecycle(self, **kwargs):
+        self.projected_lifecycle_calls.append(kwargs)
+        return {
+            "added": len(kwargs.get("raw_memories") or []),
+            "updated": 0,
+            "superseded": 0,
+            "deleted": 0,
+            "noop": 0,
+        }
 
 
 class _SpySourceSupportDetector:
@@ -346,16 +346,15 @@ async def test_orchestrator_forwards_uploader_user_id_on_new_documents(database_
     assert state_u1.last_sync_status == "success"
     assert state_u2.last_sync_status == "success"
 
-    # New documents -> the orchestrator goes through process_memories, not
-    # reconcile_and_persist. Both calls must carry the uploader's user_id.
-    by_doc = {call["doc_id"]: call for call in spy.process_memories_calls}
+    # Every projected document uses the same lifecycle seam. Both calls must
+    # carry the uploader's user_id.
+    by_doc = {call["doc_id"]: call for call in spy.projected_lifecycle_calls}
     assert item_u1.item_id in by_doc
     assert item_u2.item_id in by_doc
     assert by_doc[item_u1.item_id]["user_id"] == U1_USER
     assert by_doc[item_u2.item_id]["user_id"] == U2_USER
     assert by_doc[item_u1.item_id]["repo_identifier"] == "mem-forge"
     assert by_doc[item_u2.item_id]["repo_identifier"] == "mem-forge"
-    assert spy.reconcile_calls == []
 
 
 @pytest.mark.asyncio
@@ -390,14 +389,13 @@ async def test_orchestrator_forwards_source_updated_at_on_new_documents(database
     state = await orchestrator.sync_gene(gene=gene, source_name=src["name"], source_id=src["id"])
 
     assert state.last_sync_status == "success"
-    by_doc = {call["doc_id"]: call for call in spy.process_memories_calls}
+    by_doc = {call["doc_id"]: call for call in spy.projected_lifecycle_calls}
     assert by_doc[item.item_id]["source_updated_at"].isoformat() == "2026-06-20T04:23:51+00:00"
-    assert spy.reconcile_calls == []
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_forwards_source_updated_at_to_source_support_detector(database_fixture, tmp_path):
-    """Source-support detection must receive the same explicit provenance timestamp."""
+async def test_orchestrator_forwards_source_updated_at_to_projected_lifecycle(database_fixture, tmp_path):
+    """Projected lifecycle owns evidence and receives its source observation time."""
     database = database_fixture
     cfg = _config(tmp_path)
 
@@ -411,15 +409,14 @@ async def test_orchestrator_forwards_source_updated_at_to_source_support_detecto
         source_updated_at="2026-06-20T04:23:51Z",
     )
 
-    support_detector = _SpySourceSupportDetector()
+    spy = _SpyMemoryEngine()
     orchestrator = GeneSyncOrchestrator(
         db=database,
         doc_store=_StubDocumentStore(),
         enricher=_StubEnricher(),
         memory_extractor=_SingleMemoryExtractor(),
-        memory_engine=_SpyMemoryEngine(),
+        memory_engine=spy,
         memory_store=None,
-        source_support_detector=support_detector,
         max_concurrent=1,
     )
 
@@ -431,13 +428,15 @@ async def test_orchestrator_forwards_source_updated_at_to_source_support_detecto
     )
 
     assert state.last_sync_status == "success"
-    assert support_detector.calls[0]["source_updated_at"].isoformat() == "2026-06-20T04:23:51+00:00"
+    assert len(spy.projected_lifecycle_calls) == 1
+    forwarded = spy.projected_lifecycle_calls[0]
+    assert forwarded["source_updated_at"].isoformat() == "2026-06-20T04:23:51+00:00"
 
 
 @pytest.mark.asyncio
 async def test_orchestrator_forwards_uploader_user_id_on_document_updates(database_fixture, tmp_path):
     """Second sync (existing doc, new content): the orchestrator MUST forward
-    the uploader's id on its ``reconcile_and_persist`` call.
+    the uploader's id on its projected lifecycle call.
 
     If ``user_id=uploader_user_id`` is removed from the update branch (sync.py
     around line 1036), the recorded ``user_id`` becomes ``None`` and this test
@@ -474,12 +473,11 @@ async def test_orchestrator_forwards_uploader_user_id_on_document_updates(databa
         source_id=src["id"],
     )
     assert initial_state.last_sync_status == "success"
-    assert initial_spy.process_memories_calls
-    assert initial_spy.reconcile_calls == []
+    assert initial_spy.projected_lifecycle_calls
 
     # Second submission: same client + session + trigger -> same doc_id, with
     # different markdown (and therefore a different content_hash). The next
-    # sync must take the update branch (reconcile_and_persist).
+    # sync must invoke lifecycle reconciliation again.
     submitted_second, item_second, _ = await _submit_and_normalize(
         db=database,
         cfg=cfg,
@@ -510,12 +508,12 @@ async def test_orchestrator_forwards_uploader_user_id_on_document_updates(databa
     )
 
     assert update_state.last_sync_status == "success"
-    # Existing document with changed content -> reconcile_and_persist branch.
-    assert update_spy.reconcile_calls, (
-        "expected the orchestrator to take the reconcile_and_persist branch "
+    # Existing document with changed content -> the same projected lifecycle seam.
+    assert update_spy.projected_lifecycle_calls, (
+        "expected the orchestrator to invoke projected lifecycle "
         "for an existing document with changed content"
     )
-    forwarded = update_spy.reconcile_calls[0]
+    forwarded = update_spy.projected_lifecycle_calls[0]
     assert forwarded["doc_id"] == item_second.item_id
     assert forwarded["user_id"] == U1_USER
     assert forwarded["repo_identifier"] == "mem-forge"
@@ -555,7 +553,7 @@ async def test_orchestrator_forwards_source_updated_at_on_document_updates(datab
         source_id=src["id"],
     )
     assert initial_state.last_sync_status == "success"
-    assert initial_spy.process_memories_calls
+    assert initial_spy.projected_lifecycle_calls
 
     submitted_second, item_second, _ = await _submit_and_normalize(
         db=database,
@@ -588,6 +586,5 @@ async def test_orchestrator_forwards_source_updated_at_on_document_updates(datab
     )
 
     assert update_state.last_sync_status == "success"
-    by_doc = {call["doc_id"]: call for call in update_spy.reconcile_calls}
+    by_doc = {call["doc_id"]: call for call in update_spy.projected_lifecycle_calls}
     assert by_doc[item_second.item_id]["source_updated_at"].isoformat() == "2026-06-21T05:00:00+00:00"
-    assert update_spy.process_memories_calls == []

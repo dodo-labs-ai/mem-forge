@@ -184,6 +184,8 @@ class MemoryCandidate(StructuredResponseModel):
     extraction_context: str | None = None
     evidence_quote: str | None = None
     evidence_anchor: Literal["unit", "glossary", "preamble", "outline", "document", "unknown"] = "unknown"
+    source_observation_id: str | None = None
+    required_source_observation_ids: list[str] = Field(default_factory=list)
 
 
 class MemoryExtractionResponse(StructuredResponseModel):
@@ -231,6 +233,24 @@ class ContradictionResponse(StructuredResponseModel):
     model_config = ConfigDict(extra="ignore")
 
     decisions: list[ContradictionDecision]
+
+
+class MemoryEquivalenceResponse(StructuredResponseModel):
+    """Schema for the semantic proof required before Memory ID reuse."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    equivalent: bool
+    reason: str = Field(default="", max_length=1000)
+
+
+class MemorySupportValidationResponse(StructuredResponseModel):
+    """Schema proving whether revised dependencies still support a claim."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    supported: bool
+    reason: str = Field(default="", max_length=1000)
 
 
 class EntityValidationResponse(StructuredResponseModel):
@@ -317,6 +337,24 @@ class SourceSupportStructuredClient(Protocol):
         model: str | None = None,
     ) -> ContradictionResponse:
         """Return schema-validated cross-document contradiction decisions."""
+
+    async def classify_memory_equivalence(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 512,
+        model: str | None = None,
+    ) -> MemoryEquivalenceResponse:
+        """Prove whether two claims have identical semantic truth conditions."""
+
+    async def validate_memory_support(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 512,
+        model: str | None = None,
+    ) -> MemorySupportValidationResponse:
+        """Prove whether current Primary and Required evidence support a claim."""
 
     async def validate_entity_match(
         self,
@@ -525,6 +563,34 @@ class LiteLlmStructuredClient:
             model=model,
         )
 
+    async def classify_memory_equivalence(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 512,
+        model: str | None = None,
+    ) -> MemoryEquivalenceResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=MemoryEquivalenceResponse,
+            max_tokens=max_tokens,
+            model=model,
+        )
+
+    async def validate_memory_support(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 512,
+        model: str | None = None,
+    ) -> MemorySupportValidationResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=MemorySupportValidationResponse,
+            max_tokens=max_tokens,
+            model=model,
+        )
+
     async def validate_entity_match(
         self,
         prompt: str,
@@ -595,7 +661,6 @@ class LiteLlmStructuredClient:
             response_format=AgentSessionAuthorityResponse,
             max_tokens=max_tokens,
             model=model,
-            retry_with_json_text=False,
         )
 
     async def _call_schema(

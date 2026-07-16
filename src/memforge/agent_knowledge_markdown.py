@@ -63,6 +63,33 @@ async def render_agent_concept_markdown_with_patch(
     )
 
 
+async def render_agent_concept_markdown_without_claim(
+    db: AgentConceptMarkdownDatabase,
+    concept: dict[str, Any],
+    *,
+    claim_id: str,
+) -> str:
+    """Render a concept while preserving every active claim except one."""
+
+    claims = [
+        claim for claim in await db.list_agent_claims(concept["id"])
+        if claim["id"] != claim_id
+    ]
+    citations = [
+        citation["citation_url"]
+        for claim in claims
+        for citation in await db.list_agent_claim_citations(claim["id"])
+        if citation["citation_url"].strip()
+    ]
+    return _render_agent_concept_markdown_from_claims(
+        title=concept["title"],
+        concept_type=concept["concept_type"],
+        repo_identifier=concept.get("repo_identifier"),
+        claims=[{"id": claim["id"], "claim_text": claim["claim_text"]} for claim in claims],
+        citations=citations,
+    )
+
+
 def render_agent_concept_markdown(
     *,
     title: str,
