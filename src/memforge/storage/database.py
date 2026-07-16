@@ -5393,6 +5393,101 @@ class Database:
         assert stored is not None
         return stored
 
+    async def recover_stale_lifecycle_backfill_job(
+        self,
+        job_id: str,
+        *,
+        error: str,
+    ) -> LifecycleBackfillJob:
+        """Fail an orphaned lifecycle job only after its lease lost authority."""
+
+        now = datetime.now(timezone.utc)
+        now_iso = _utc_iso(now)
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    "SELECT * FROM lifecycle_backfill_jobs WHERE id = ?",
+                    (job_id,),
+                ) as cursor:
+                    job = await cursor.fetchone()
+                if job is None:
+                    raise LookupError(f"unknown lifecycle backfill job: {job_id}")
+                status = LifecycleBackfillJobStatus(str(job["status"]))
+                if status is LifecycleBackfillJobStatus.FAILED:
+                    await self.db.rollback()
+                    stored = self._row_to_lifecycle_backfill_job(job)
+                    return stored
+                if status not in {
+                    LifecycleBackfillJobStatus.QUEUED,
+                    LifecycleBackfillJobStatus.RUNNING,
+                }:
+                    raise ValueError("only an active lifecycle backfill job can be recovered")
+                source_id = str(job["source_id"])
+                source_lock = await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (source_id,),
+                )
+                if source_lock.rowcount != 1:
+                    raise ValueError(f"Source not found: {source_id}")
+                async with self.db.execute(
+                    "SELECT * FROM lifecycle_backfill_jobs WHERE id = ?",
+                    (job_id,),
+                ) as cursor:
+                    job = await cursor.fetchone()
+                if job is None:
+                    raise LookupError(f"unknown lifecycle backfill job: {job_id}")
+                status = LifecycleBackfillJobStatus(str(job["status"]))
+                if status not in {
+                    LifecycleBackfillJobStatus.QUEUED,
+                    LifecycleBackfillJobStatus.RUNNING,
+                }:
+                    raise ValueError("lifecycle backfill job changed during stale recovery")
+                if str(job["source_id"]) != source_id:
+                    raise SourceActivityConflict(
+                        f"source lifecycle activity retry identity mismatch: {job_id}"
+                    )
+                async with self.db.execute(
+                    "SELECT source_id, capability, lease_until FROM source_activity_leases WHERE id = ?",
+                    (job_id,),
+                ) as cursor:
+                    lease = await cursor.fetchone()
+                if lease is not None:
+                    if (
+                        str(lease["source_id"]) != str(job["source_id"])
+                        or lease["capability"] != job_id
+                    ):
+                        raise SourceActivityConflict(
+                            f"source lifecycle activity retry identity mismatch: {job_id}"
+                        )
+                    if str(lease["lease_until"]) > now_iso:
+                        raise SourceActivityConflict(
+                            f"source lifecycle activity lease is still current: {job_id}"
+                        )
+                    lease_cursor = await self.db.execute(
+                        "DELETE FROM source_activity_leases "
+                        "WHERE id = ? AND capability = ? AND lease_until <= ?",
+                        (job_id, job_id, now_iso),
+                    )
+                    if lease_cursor.rowcount != 1:
+                        raise SourceActivityConflict(
+                            f"source lifecycle activity lease changed during recovery: {job_id}"
+                        )
+                cursor = await self.db.execute(
+                    """UPDATE lifecycle_backfill_jobs
+                       SET status = 'failed', error = ?, completed_at = ?, updated_at = ?
+                       WHERE id = ? AND status IN ('queued', 'running')""",
+                    (error, now_iso, now_iso, job_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("lifecycle backfill job changed during stale recovery")
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        stored = await self.get_lifecycle_backfill_job(job_id)
+        assert stored is not None
+        return stored
+
     async def get_lifecycle_backfill_job(
         self,
         job_id: str,

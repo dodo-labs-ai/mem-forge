@@ -265,6 +265,12 @@ class RelationalStore(Protocol):
         *,
         error: str,
     ) -> LifecycleBackfillJob: ...
+    async def recover_stale_lifecycle_backfill_job(
+        self,
+        job_id: str,
+        *,
+        error: str,
+    ) -> LifecycleBackfillJob: ...
     async def get_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob | None: ...
     async def get_active_lifecycle_backfill_job(
         self,

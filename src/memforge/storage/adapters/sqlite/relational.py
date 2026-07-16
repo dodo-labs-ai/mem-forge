@@ -547,6 +547,17 @@ class SqliteRelationalStore:
     ) -> LifecycleBackfillJob:
         return await self._db.fail_lifecycle_backfill_job(job_id, error=error)
 
+    async def recover_stale_lifecycle_backfill_job(
+        self,
+        job_id: str,
+        *,
+        error: str,
+    ) -> LifecycleBackfillJob:
+        return await self._db.recover_stale_lifecycle_backfill_job(
+            job_id,
+            error=error,
+        )
+
     async def get_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob | None:
         return await self._db.get_lifecycle_backfill_job(job_id)
 

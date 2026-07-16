@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
+import sqlite3
 
 import pytest
 import pytest_asyncio
@@ -1638,6 +1639,227 @@ async def test_sqlite_lifecycle_terminal_transition_requires_current_activity_le
     stored = await db.get_lifecycle_backfill_job(job.id)
     assert stored is not None
     assert stored.status is LifecycleBackfillJobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_lifecycle_backfill_job_fails_expired_job_atomically(
+    db: Database,
+) -> None:
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-recover-expired-lifecycle-job",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", job.id),
+    )
+    await db.db.commit()
+
+    recovered = await db.recover_stale_lifecycle_backfill_job(
+        job.id,
+        error="operator recovered expired lifecycle job",
+    )
+
+    assert recovered.status is LifecycleBackfillJobStatus.FAILED
+    assert recovered.error == "operator recovered expired lifecycle job"
+    assert await db.get_active_lifecycle_backfill_job("src-1") is None
+    assert not await db.release_source_activity(
+        activity_id=job.id,
+        capability=job.id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_lifecycle_backfill_job_refuses_current_lease(
+    db: Database,
+) -> None:
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-refuse-current-lifecycle-job",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+
+    with pytest.raises(SourceActivityConflict, match="lease is still current"):
+        await db.recover_stale_lifecycle_backfill_job(
+            job.id,
+            error="must not replace a live lifecycle owner",
+        )
+
+    stored = await db.get_lifecycle_backfill_job(job.id)
+    assert stored is not None
+    assert stored.status is LifecycleBackfillJobStatus.RUNNING
+    await db.fail_lifecycle_backfill_job(job.id, error="test cleanup")
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_lifecycle_backfill_job_accepts_missing_lease(
+    db: Database,
+) -> None:
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-recover-orphaned-lifecycle-job",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    await db.db.execute(
+        "DELETE FROM source_activity_leases WHERE id = ?",
+        (job.id,),
+    )
+    await db.db.commit()
+
+    recovered = await db.recover_stale_lifecycle_backfill_job(
+        job.id,
+        error="operator recovered orphaned lifecycle job",
+    )
+
+    assert recovered.status is LifecycleBackfillJobStatus.FAILED
+    assert recovered.error == "operator recovered orphaned lifecycle job"
+    assert await db.get_active_lifecycle_backfill_job("src-1") is None
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_lifecycle_backfill_job_serializes_job_reacquisition(
+    db: Database,
+    monkeypatch,
+) -> None:
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-recover-serialized-lifecycle-job",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    await db.db.execute("DELETE FROM source_activity_leases WHERE id = ?", (job.id,))
+    await db.db.commit()
+    other = Database(db.db_path)
+    await other.connect()
+    source_locked = asyncio.Event()
+    release_recovery = asyncio.Event()
+    original_execute = db.db._execute
+
+    async def pause_after_source_lock(function, *args, **kwargs):
+        cursor = await original_execute(function, *args, **kwargs)
+        sql = args[0] if args and isinstance(args[0], str) else ""
+        if sql.startswith("UPDATE sources SET status = status"):
+            source_locked.set()
+            await release_recovery.wait()
+        return cursor
+
+    monkeypatch.setattr(db.db, "_execute", pause_after_source_lock)
+    recovery = asyncio.create_task(
+        db.recover_stale_lifecycle_backfill_job(
+            job.id,
+            error="operator recovered orphaned lifecycle job",
+        )
+    )
+    await asyncio.wait_for(source_locked.wait(), timeout=1)
+    reacquisition = asyncio.create_task(other.create_lifecycle_backfill_job(job))
+    await asyncio.sleep(0.05)
+    assert not reacquisition.done()
+
+    release_recovery.set()
+    recovered, retried = await asyncio.gather(recovery, reacquisition)
+
+    assert recovered.status is LifecycleBackfillJobStatus.FAILED
+    assert retried.status is LifecycleBackfillJobStatus.FAILED
+    assert await other.get_active_lifecycle_backfill_job("src-1") is None
+    assert not await other.release_source_activity(activity_id=job.id, capability=job.id)
+    await other.close()
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_lifecycle_backfill_job_rejects_lease_identity_mismatch(
+    db: Database,
+) -> None:
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-recover-identity-mismatch",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    await db.db.execute(
+        "UPDATE source_activity_leases SET capability = ?, lease_until = ? WHERE id = ?",
+        ("different-capability", "2000-01-01T00:00:00+00:00", job.id),
+    )
+    await db.db.commit()
+
+    with pytest.raises(SourceActivityConflict, match="identity mismatch"):
+        await db.recover_stale_lifecycle_backfill_job(job.id, error="must roll back")
+
+    stored = await db.get_lifecycle_backfill_job(job.id)
+    assert stored is not None
+    assert stored.status is LifecycleBackfillJobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_lifecycle_backfill_job_is_idempotent_after_failure(
+    db: Database,
+) -> None:
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-recover-idempotent-failure",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    await db.db.execute("DELETE FROM source_activity_leases WHERE id = ?", (job.id,))
+    await db.db.commit()
+    first = await db.recover_stale_lifecycle_backfill_job(job.id, error="first recovery")
+
+    second = await db.recover_stale_lifecycle_backfill_job(job.id, error="second recovery")
+
+    assert second == first
+    assert second.error == "first recovery"
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_lifecycle_backfill_job_rolls_back_partial_failure(
+    db: Database,
+) -> None:
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-recover-rollback",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", job.id),
+    )
+    await db.db.execute(
+        """CREATE TRIGGER abort_stale_recovery
+           BEFORE UPDATE OF status ON lifecycle_backfill_jobs
+           WHEN NEW.id = 'sqlite-recover-rollback' AND NEW.status = 'failed'
+           BEGIN SELECT RAISE(ABORT, 'forced recovery failure'); END"""
+    )
+    await db.db.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced recovery failure"):
+        await db.recover_stale_lifecycle_backfill_job(job.id, error="must roll back")
+
+    stored = await db.get_lifecycle_backfill_job(job.id)
+    assert stored is not None
+    assert stored.status is LifecycleBackfillJobStatus.RUNNING
+    async with db.db.execute(
+        "SELECT COUNT(*) AS count FROM source_activity_leases WHERE id = ?",
+        (job.id,),
+    ) as cursor:
+        assert int((await cursor.fetchone())["count"]) == 1
 
 
 @pytest.mark.asyncio
