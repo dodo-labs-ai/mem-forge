@@ -4811,6 +4811,39 @@ class Database:
             for row in rows
         ]
 
+    async def count_active_source_memories_without_support(self, source_id: str) -> int:
+        """Count active Memories whose same-source support invariant is absent."""
+
+        async with self.db.execute(
+            """SELECT COUNT(DISTINCT ms.memory_id) AS count
+               FROM memory_sources ms
+               JOIN memories m ON m.id = ms.memory_id
+               WHERE ms.source_id = ?
+                 AND m.status = 'active'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM memory_support_assertions msa
+                     WHERE msa.memory_id = ms.memory_id
+                       AND msa.source_id = ms.source_id
+                       AND msa.active = 1
+                 )""",
+            (source_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row["count"] if row is not None else 0)
+
+    async def count_active_source_memories(self, source_id: str) -> int:
+        """Count active source-backed Memories without loading their LOB content."""
+
+        async with self.db.execute(
+            """SELECT COUNT(DISTINCT ms.memory_id) AS count
+               FROM memory_sources ms
+               JOIN memories m ON m.id = ms.memory_id
+               WHERE ms.source_id = ? AND m.status = 'active'""",
+            (source_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row["count"] if row is not None else 0)
+
     async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate:
         async with self.db.execute(
             "SELECT * FROM source_lifecycle_gates WHERE source_id = ?",
@@ -5025,6 +5058,30 @@ class Database:
                         f"{active_access['operation_id']}"
                     )
                 async with self.db.execute(
+                    "SELECT source_id, status FROM lifecycle_backfill_jobs WHERE id = ?",
+                    (job.id,),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if existing is not None:
+                    if existing["source_id"] != job.source_id:
+                        raise ValueError("lifecycle backfill job retry identity mismatch")
+                    if existing["status"] in {
+                        LifecycleBackfillJobStatus.QUEUED.value,
+                        LifecycleBackfillJobStatus.RUNNING.value,
+                    }:
+                        await self._acquire_source_activity_unlocked(
+                            activity_id=job.id,
+                            source_id=job.source_id,
+                            kind=SourceActivityKind.MAINTENANCE,
+                            capability=job.id,
+                            lease_seconds=900,
+                            bump_epoch=True,
+                        )
+                    await self.db.commit()
+                    stored = await self.get_lifecycle_backfill_job(job.id)
+                    assert stored is not None
+                    return stored
+                async with self.db.execute(
                     "SELECT id FROM lifecycle_backfill_jobs "
                     "WHERE source_id = ? AND status IN ('queued', 'running') "
                     "AND id <> ? LIMIT 1",
@@ -5044,19 +5101,12 @@ class Database:
                     bump_epoch=True,
                 )
                 await self.db.execute(
-                    """INSERT OR IGNORE INTO lifecycle_backfill_jobs (
+                    """INSERT INTO lifecycle_backfill_jobs (
                         id, source_id, status, scanned_memories, mapped_memories,
                         finding_count, error, created_at, started_at, completed_at, updated_at
                     ) VALUES (?, ?, 'queued', 0, 0, 0, NULL, ?, NULL, NULL, ?)""",
                     (job.id, job.source_id, job.created_at or now, now),
                 )
-                async with self.db.execute(
-                    "SELECT source_id FROM lifecycle_backfill_jobs WHERE id = ?",
-                    (job.id,),
-                ) as cursor:
-                    existing = await cursor.fetchone()
-                if existing is None or existing["source_id"] != job.source_id:
-                    raise ValueError("lifecycle backfill job retry identity mismatch")
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()

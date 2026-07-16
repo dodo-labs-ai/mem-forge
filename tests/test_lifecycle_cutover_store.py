@@ -37,11 +37,13 @@ from memforge.memory.lifecycle_planner import NewMemoryDefaults, build_lifecycle
 from memforge.memory.lifecycle_review import build_lifecycle_review_approval_plan
 from memforge.genes.local_markdown_gene import LocalMarkdownGene
 from memforge.memory.cutover import (
+    list_agent_session_lifecycle_migration_candidates,
     reconstruct_historical_source_projection,
     repair_lifecycle_cutover_finding,
     run_source_lifecycle_backfill,
     run_source_lifecycle_backfill_job,
     run_source_lifecycle_recovery_job,
+    run_with_lifecycle_activity_heartbeat,
 )
 from memforge.models import (
     ContentItem,
@@ -139,6 +141,233 @@ async def test_new_source_is_destructive_lifecycle_gated_by_default(db: Database
     gate = await db.get_lifecycle_gate("src-1")
 
     assert gate.state is LifecycleGateState.GATED
+
+
+@pytest.mark.asyncio
+async def test_agent_session_migration_inventory_includes_hidden_gate_and_enabled_lineage_gap(
+    db: Database,
+    monkeypatch,
+) -> None:
+    for source_id in ("src-agent-hidden", "src-agent-enabled-gap", "src-agent-healthy"):
+        await db.upsert_source(
+            id=source_id,
+            type="agent_session",
+            name="Agent Session",
+            config_json="{}",
+            access_policy="private",
+            owner_user_id=f"owner-{source_id}",
+        )
+        memory_id = f"mem-{source_id}"
+        doc_id = f"doc-{source_id}"
+        await db.insert_memory(
+            Memory(
+                id=memory_id,
+                memory_type="fact",
+                content=f"claim for {source_id}",
+                content_hash=content_hash(f"claim for {source_id}"),
+                visibility="private",
+                owner_user_id=f"owner-{source_id}",
+            )
+        )
+        await db.db.execute(
+            """INSERT INTO documents (
+                   doc_id, source, source_url, title, space_or_project, last_modified,
+                   version, content_hash, last_synced
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                doc_id,
+                source_id,
+                f"agent-knowledge://{source_id}/{doc_id}",
+                "Agent concept",
+                "agent-session",
+                "2026-07-16T00:00:00+00:00",
+                "1",
+                "hash",
+                "2026-07-16T00:00:00+00:00",
+            ),
+        )
+        await db.add_memory_source(
+            memory_id,
+            doc_id,
+            "agent_session",
+            f"claim for {source_id}",
+            source_updated_at=None,
+        )
+
+    # Simulate a legacy writer that created unsupported provenance after a gate
+    # had already been enabled. The public gate API correctly rejects this state.
+    await db.db.execute(
+        """INSERT INTO source_lifecycle_gates (
+               source_id, state, reason, audited_at, enabled_at, updated_at
+           ) VALUES (?, 'enabled', NULL, ?, ?, ?)""",
+        (
+            "src-agent-enabled-gap",
+            "2026-07-16T00:00:00+00:00",
+            "2026-07-16T00:00:00+00:00",
+            "2026-07-16T00:00:00+00:00",
+        ),
+    )
+    await db.db.commit()
+
+    healthy_projection = _projection()
+    healthy_observation = replace(
+        healthy_projection.observations[0],
+        id="obs-agent-healthy",
+        source_id="src-agent-healthy",
+        source_unit_id="unit-agent-healthy",
+        observation_type="agent_concept",
+        provider_key="doc-src-agent-healthy:concept",
+    )
+    healthy_observation_revision = replace(
+        healthy_projection.observation_revisions[0],
+        id="obsrev-agent-healthy",
+        observation_id=healthy_observation.id,
+    )
+    healthy_source_unit = replace(
+        healthy_projection.source_units[0],
+        id="unit-agent-healthy",
+        source_id="src-agent-healthy",
+        unit_type="agent_concept",
+        provider_key="doc-src-agent-healthy",
+        locator={"document_id": "doc-src-agent-healthy"},
+    )
+    healthy_source_unit_revision = replace(
+        healthy_projection.source_unit_revisions[0],
+        id="unitrev-agent-healthy",
+        source_unit_id=healthy_source_unit.id,
+        observation_revision_ids=(healthy_observation_revision.id,),
+    )
+    await db.record_source_projection(
+        replace(
+            healthy_projection,
+            run_id="projection-agent-healthy",
+            source_id="src-agent-healthy",
+            source_type="agent_session",
+            observations=(healthy_observation,),
+            observation_revisions=(healthy_observation_revision,),
+            source_units=(healthy_source_unit,),
+            source_unit_revisions=(healthy_source_unit_revision,),
+            relations=(),
+            deltas=(),
+        )
+    )
+    healthy_unit = replace(
+        _unit(),
+        id="eu-agent-healthy",
+        source_id="src-agent-healthy",
+        doc_id="doc-src-agent-healthy",
+        doc_revision_id=healthy_observation_revision.id,
+        source_type="agent_session",
+        source_lineage_id=healthy_source_unit.id,
+    )
+    await db.upsert_evidence_unit(healthy_unit)
+    healthy_reference = EvidenceReference(
+        role=EvidenceRole.PRIMARY,
+        anchor=SourceAnchor(
+            kind=AnchorKind.WHOLE_OBSERVATION,
+            observation_id="obs-agent-healthy",
+            observation_revision_id=healthy_observation_revision.id,
+        ),
+        evidence_unit_id=healthy_unit.id,
+    )
+    healthy_reference = replace(
+        healthy_reference,
+        id=evidence_reference_id_for(healthy_unit.id, healthy_reference),
+    )
+    await db.record_evidence_references(healthy_unit.id, (healthy_reference,))
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id="support-agent-healthy",
+            memory_id="mem-src-agent-healthy",
+            evidence_reference_id=healthy_reference.id or "",
+            source_id="src-agent-healthy",
+            access_context_hash="private:owner-src-agent-healthy",
+        )
+    )
+    await db.enable_lifecycle_gate("src-agent-healthy")
+
+    async def forbid_content_scan(_source_id: str):
+        raise AssertionError("candidate inventory must not load Memory content or excerpts")
+
+    monkeypatch.setattr(db, "list_legacy_memory_provenance", forbid_content_scan)
+
+    candidates = await list_agent_session_lifecycle_migration_candidates(db)
+
+    assert [candidate.source_id for candidate in candidates] == [
+        "src-agent-enabled-gap",
+        "src-agent-hidden",
+    ]
+    assert [candidate.active_memory_count for candidate in candidates] == [1, 1]
+    assert [candidate.missing_support_count for candidate in candidates] == [1, 1]
+    assert candidates[0].gate_state is LifecycleGateState.ENABLED
+    assert candidates[1].gate_state is LifecycleGateState.GATED
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_activity_heartbeat_cancels_operation_with_wrapper() -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class HeartbeatDatabase:
+        async def renew_source_activity(self, **_kwargs) -> None:
+            raise AssertionError("long heartbeat interval should not renew")
+
+    async def operation() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    task = asyncio.create_task(
+        run_with_lifecycle_activity_heartbeat(
+            HeartbeatDatabase(),
+            "job-cancelled",
+            operation,
+            heartbeat_interval_seconds=3600,
+        )
+    )
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_activity_heartbeat_prefers_completed_work_when_both_tasks_finish(
+    monkeypatch,
+) -> None:
+    import memforge.memory.cutover as cutover_module
+
+    real_wait = asyncio.wait
+
+    async def wait_for_both(tasks, *, return_when):
+        del return_when
+        await asyncio.gather(*tasks, return_exceptions=True)
+        return set(tasks), set()
+
+    monkeypatch.setattr(cutover_module.asyncio, "wait", wait_for_both)
+
+    class HeartbeatDatabase:
+        async def renew_source_activity(self, **_kwargs) -> None:
+            raise RuntimeError("lease already released by completed job")
+
+    async def operation() -> str:
+        return "completed"
+
+    try:
+        result = await run_with_lifecycle_activity_heartbeat(
+            HeartbeatDatabase(),
+            "job-completed",
+            operation,
+            heartbeat_interval_seconds=0,
+        )
+    finally:
+        monkeypatch.setattr(cutover_module.asyncio, "wait", real_wait)
+
+    assert result == "completed"
 
 
 @pytest.mark.asyncio
@@ -1111,6 +1340,7 @@ async def test_backfill_job_records_completed_counts_and_is_idempotent(db: Datab
         "src-1",
         job_id="backfill-job-1",
     )
+    epoch_after_completion = await db.get_source_activity_epoch("src-1")
     retried = await run_source_lifecycle_backfill_job(
         db,
         "src-1",
@@ -1120,6 +1350,97 @@ async def test_backfill_job_records_completed_counts_and_is_idempotent(db: Datab
     assert completed.status is LifecycleBackfillJobStatus.COMPLETED
     assert retried == completed
     assert await db.list_lifecycle_backfill_jobs("src-1") == [completed]
+    assert await db.get_source_activity_epoch("src-1") == epoch_after_completion
+    async with db.db.execute(
+        "SELECT COUNT(*) AS count FROM source_activity_leases WHERE source_id = ?",
+        ("src-1",),
+    ) as cursor:
+        assert int((await cursor.fetchone())["count"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_backfill_job_retry_does_not_reacquire_activity(db: Database) -> None:
+    failed = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="backfill-job-terminal-failed",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(failed.id)
+    failed = await db.fail_lifecycle_backfill_job(failed.id, error="operator blocker")
+    epoch_after_failure = await db.get_source_activity_epoch("src-1")
+
+    retried = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id=failed.id,
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+
+    assert retried == failed
+    assert await db.get_source_activity_epoch("src-1") == epoch_after_failure
+    async with db.db.execute(
+        "SELECT COUNT(*) AS count FROM source_activity_leases WHERE source_id = ?",
+        ("src-1",),
+    ) as cursor:
+        assert int((await cursor.fetchone())["count"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_gates_enabled_source_before_scanning_missing_support(
+    db: Database,
+    monkeypatch,
+) -> None:
+    now = "2026-07-16T00:00:00+00:00"
+    await db.db.execute(
+        """INSERT INTO documents (
+               doc_id, source, source_url, title, space_or_project, last_modified,
+               version, content_hash, last_synced
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "legacy-doc",
+            "src-1",
+            "https://example.test/legacy",
+            "Legacy document",
+            "ENG",
+            now,
+            "1",
+            "legacy-hash",
+            now,
+        ),
+    )
+    await db.add_memory_source(
+        "mem-legacy",
+        "legacy-doc",
+        "confluence",
+        "Legacy claim",
+        source_updated_at=None,
+    )
+    await db.db.execute(
+        """INSERT INTO source_lifecycle_gates (
+               source_id, state, reason, audited_at, enabled_at, updated_at
+           ) VALUES (?, 'enabled', NULL, ?, ?, ?)""",
+        ("src-1", now, now, now),
+    )
+    await db.db.commit()
+
+    async def fail_scan(_source_id: str):
+        raise RuntimeError("simulated audit failure")
+
+    monkeypatch.setattr(db, "list_legacy_memory_provenance", fail_scan)
+
+    with pytest.raises(RuntimeError, match="simulated audit failure"):
+        await run_source_lifecycle_recovery_job(
+            db,
+            "src-1",
+            job_id="recovery-gates-before-scan",
+        )
+
+    gate = await db.get_lifecycle_gate("src-1")
+    assert gate.state is LifecycleGateState.GATED
+    assert gate.reason and "support invariant violation" in gate.reason
 
 
 @pytest.mark.asyncio
