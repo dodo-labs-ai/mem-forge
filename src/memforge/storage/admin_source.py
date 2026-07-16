@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
@@ -11,6 +13,44 @@ SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES = 10080
 SourceListSortMode = Literal["newest", "name", "recently_synced"]
 SOURCE_LIST_DEFAULT_SORT_MODE: SourceListSortMode = "newest"
 SOURCE_LIST_SORT_MODES = frozenset({"newest", "name", "recently_synced"})
+
+
+def is_pause_only_source_update(
+    *,
+    current: Mapping[str, Any],
+    proposed: Mapping[str, Any],
+    requested_status: str | None,
+) -> bool:
+    """Return whether an upsert only pauses an otherwise unchanged source.
+
+    Pausing is a control-plane cancellation signal and must remain possible while
+    a sync is pending or running. Every other source mutation stays fenced until
+    that run reaches a terminal state.
+    """
+    if requested_status != "paused":
+        return False
+
+    def canonical(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                return value
+        if isinstance(value, Mapping):
+            return json.dumps(dict(value), sort_keys=True, separators=(",", ":"))
+        return value
+
+    if set(current) != set(proposed):
+        return False
+    structured_fields = {"config", "project_binding"}
+    return all(
+        (
+            canonical(current[key]) == canonical(proposed[key])
+            if key in structured_fields
+            else current[key] == proposed[key]
+        )
+        for key in current
+    )
 
 
 def validate_source_list_sort_mode(value: str) -> SourceListSortMode:

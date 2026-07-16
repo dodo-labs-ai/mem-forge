@@ -122,7 +122,34 @@ class Gene(ABC):
         """
         self.config = config
         self.source_id = source_id
+        self._discovery_complete = False
+        self._discovery_completion_reason = "discovery_not_started"
         self._log = logging.getLogger(f"{__name__}.{type(self).__name__}[{source_id}]")
+
+    def begin_discovery(self) -> None:
+        """Reset run-scoped collection evidence before enumeration starts."""
+
+        self._discovery_complete = False
+        self._discovery_completion_reason = "discovery_incomplete"
+
+    def attest_discovery_complete(self, reason: str) -> None:
+        """Record validated provider enumeration completion for this run."""
+
+        normalized_reason = str(reason or "").strip()
+        if not normalized_reason:
+            raise ValueError("discovery completion reason is required")
+        self._discovery_complete = True
+        self._discovery_completion_reason = normalized_reason
+
+    @property
+    def discovery_complete(self) -> bool:
+        """Whether this exact discover call proved enumeration completion."""
+
+        return self._discovery_complete
+
+    @property
+    def discovery_completion_reason(self) -> str:
+        return self._discovery_completion_reason
 
     def bind_document_store(self, document_store: Any) -> None:
         """Bind the runtime document artifact store when a gene needs it."""

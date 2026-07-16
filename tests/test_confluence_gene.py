@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
 from memforge.genes.confluence_gene import ConfluenceGene, PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY
+from memforge.models import ContentItem
 
 
 def test_confluence_schema_hides_runtime_transport_fields_from_ui():
@@ -151,12 +153,16 @@ class PageTreeClient:
         if url.endswith("/content/root"):
             return JsonResponse(_page("root", "Root", "2026-05-20T00:00:00Z"))
         if url.endswith("/content/root/child/page"):
-            return JsonResponse({"results": [_page("parent", "Unchanged Parent", "2026-05-20T00:00:00Z")]})
+            return JsonResponse(
+                _page_batch([_page("parent", "Unchanged Parent", "2026-05-20T00:00:00Z")])
+            )
         if url.endswith("/content/parent/child/page"):
-            return JsonResponse({"results": [_page("target", "Changed Child", "2026-05-26T14:51:21Z")]})
+            return JsonResponse(
+                _page_batch([_page("target", "Changed Child", "2026-05-26T14:51:21Z")])
+            )
         if url.endswith("/content/target/child/page"):
-            return JsonResponse({"results": []})
-        return JsonResponse({"results": []})
+            return JsonResponse(_page_batch([]))
+        return JsonResponse(_page_batch([]))
 
     async def get(self, url: str, **kwargs):
         return await self.request("GET", url, **kwargs)
@@ -172,15 +178,15 @@ class PreviewLimitClient:
             return JsonResponse(_page("root", "Root", "2026-05-20T00:00:00Z"))
         if url.endswith("/content/root/child/page"):
             return JsonResponse(
-                {
-                    "results": [
+                _page_batch(
+                    [
                         _page("child-1", "Child 1", "2026-05-21T00:00:00Z"),
                         _page("child-2", "Child 2", "2026-05-22T00:00:00Z"),
                         _page("child-3", "Child 3", "2026-05-23T00:00:00Z"),
-                    ],
-                }
+                    ]
+                )
             )
-        return JsonResponse({"results": []})
+        return JsonResponse(_page_batch([]))
 
     async def get(self, url: str, **kwargs):
         return await self.request("GET", url, **kwargs)
@@ -195,6 +201,99 @@ def _page(page_id: str, title: str, when: str) -> dict:
         "metadata": {"labels": {"results": []}},
         "_links": {"webui": f"/display/PAY/{title.replace(' ', '+')}"},
     }
+
+
+def _page_batch(results: list[dict], *, start: int = 0, next_link: str | None = None) -> dict:
+    links = {} if next_link is None else {"next": next_link}
+    return {"results": results, "start": start, "size": len(results), "_links": links}
+
+
+@pytest.mark.asyncio
+async def test_semantically_empty_confluence_page_stays_empty_after_normalization():
+    gene = ConfluenceGene(
+        config={
+            "base_url": "https://wiki.example.test/wiki/",
+            "spaces": ["PAY"],
+            "pat": "confluence-pat",
+        },
+        source_id="src-confluence",
+    )
+    gene._api_prefix = "/wiki"
+    gene._get = AsyncMock(
+        return_value=JsonResponse(
+            {
+                "id": "123",
+                "version": {"number": 7},
+                "body": {"storage": {"value": "<p></p>"}},
+                "ancestors": [],
+                "space": {"key": "PAY"},
+            }
+        )
+    )
+    item = ContentItem(
+        item_id="confluence-123",
+        title="Empty page",
+        source_url="https://wiki.example.test/wiki/pages/123",
+        last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        space_or_project="PAY",
+        version="7",
+        extra={"page_id": "123"},
+    )
+
+    raw = await gene.fetch(item)
+    normalized = await gene.normalize(raw)
+
+    assert raw.authoritative_empty is True
+    assert raw.empty_evidence == "confluence_content_api_successful_semantically_empty_storage_body"
+    assert normalized.markdown_body == ""
+    assert normalized.source_semantics["semantic_markdown"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"body": {}},
+        {"body": {"storage": {}}},
+        {"body": {"storage": {"value": None}}},
+    ],
+)
+async def test_fetch_rejects_missing_or_invalid_storage_body(payload):
+    gene = ConfluenceGene(
+        config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
+        source_id="src-confluence",
+    )
+    gene._api_prefix = "/wiki"
+    gene._get = AsyncMock(
+        return_value=JsonResponse({"id": "123", "version": {"number": 7}, **payload})
+    )
+    item = ContentItem(
+        item_id="confluence-123",
+        title="Page",
+        source_url="https://wiki.example.test/wiki/pages/123",
+        last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        space_or_project="PAY",
+        version="7",
+        extra={"page_id": "123"},
+    )
+
+    with pytest.raises(RuntimeError, match="body.storage.value"):
+        await gene.fetch(item)
+
+
+@pytest.mark.asyncio
+async def test_space_discovery_rejects_missing_results_without_completion_evidence():
+    gene = ConfluenceGene(
+        config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
+        source_id="src-confluence",
+    )
+    gene._api_prefix = "/wiki"
+    gene._get = AsyncMock(return_value=JsonResponse({}))
+
+    with pytest.raises(RuntimeError, match="missing a results list"):
+        _ = [item async for item in gene.discover()]
+    assert gene.discovery_complete is False
 
 
 @pytest.mark.asyncio
@@ -441,3 +540,75 @@ async def test_page_tree_preview_limits_child_page_request_size():
     assert [item.title for item in items] == ["Root", "Child 1", "Child 2"]
     child_requests = [params for url, params in client.requests if url.endswith("/content/root/child/page")]
     assert child_requests == [{"start": 0, "limit": 2, "expand": "version,metadata.labels"}]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"results": [], "start": 0, "size": 0},
+        {"results": [], "start": 1, "size": 0, "_links": {}},
+        {"results": [], "start": 0, "size": 1, "_links": {}},
+    ],
+)
+def test_confluence_pagination_envelope_is_required_for_completion(payload):
+    with pytest.raises(RuntimeError):
+        ConfluenceGene._validated_page_results(
+            payload,
+            context="test",
+            expected_start=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_page_tree_rejects_duplicate_page_identity_before_completion():
+    class DuplicatePageClient(PageTreeClient):
+        async def request(self, _method: str, url: str, **_kwargs):
+            if url.endswith("/content/root"):
+                return JsonResponse(_page("root", "Root", "2026-05-20T00:00:00Z"))
+            if url.endswith("/content/root/child/page"):
+                duplicate = _page("child", "Child", "2026-05-21T00:00:00Z")
+                return JsonResponse(_page_batch([duplicate, duplicate]))
+            return JsonResponse(_page_batch([]))
+
+    gene = ConfluenceGene(
+        config={
+            "base_url": "https://wiki.example.com",
+            "page_tree_root": "root",
+            "include_children": True,
+        },
+        source_id="src-confluence",
+    )
+    gene._base_url = "https://wiki.example.com"
+    gene._api_prefix = "/wiki"
+    gene._client = DuplicatePageClient()
+
+    with pytest.raises(RuntimeError, match="duplicate page id"):
+        _ = [item async for item in gene.discover()]
+    assert gene.discovery_complete is False
+
+
+@pytest.mark.asyncio
+async def test_page_tree_rejects_page_without_stable_version():
+    class MissingVersionClient(PageTreeClient):
+        async def request(self, _method: str, url: str, **_kwargs):
+            if url.endswith("/content/root"):
+                page = _page("root", "Root", "2026-05-20T00:00:00Z")
+                page.pop("version")
+                return JsonResponse(page)
+            return JsonResponse(_page_batch([]))
+
+    gene = ConfluenceGene(
+        config={
+            "base_url": "https://wiki.example.com",
+            "page_tree_root": "root",
+            "include_children": True,
+        },
+        source_id="src-confluence",
+    )
+    gene._base_url = "https://wiki.example.com"
+    gene._api_prefix = "/wiki"
+    gene._client = MissingVersionClient()
+
+    with pytest.raises(RuntimeError, match="version metadata"):
+        _ = [item async for item in gene.discover()]
+    assert gene.discovery_complete is False

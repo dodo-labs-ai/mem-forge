@@ -42,7 +42,16 @@ def _jira_projection():
     payload = {
         "id": "10012",
         "key": "PAY-12",
-        "fields": {"summary": "Payroll", "description": "Issue context"},
+        "fields": {
+            "summary": "Payroll",
+            "description": "Issue context",
+            "status": None,
+            "priority": None,
+            "assignee": None,
+            "labels": [],
+            "resolution": None,
+            "updated": "2026-07-15T00:00:00Z",
+        },
         "_comments": [
             {"id": "501", "body": "Question", "created": "2026-07-15T10:00:00Z"},
             {
@@ -51,6 +60,9 @@ def _jira_projection():
                 "created": "2026-07-15T10:01:00Z",
             },
         ],
+        "_comments_included": True,
+        "_comments_total": 2,
+        "changelog": {"startAt": 0, "histories": [], "total": 0},
     }
     raw = RawContent(
         item=item,

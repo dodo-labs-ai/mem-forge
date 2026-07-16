@@ -97,6 +97,8 @@ class SourceSyncMode(str, Enum):
 
     NORMAL = "normal"
     PROJECTION_REPAIR = "projection_repair"
+    REBASELINE_PREFLIGHT = "rebaseline_preflight"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -570,6 +572,8 @@ class GeneSyncOrchestrator:
         """
         run_id = uuid.uuid4().hex[:12]
         projection_repair = execution_mode is SourceSyncMode.PROJECTION_REPAIR
+        rebaseline_preflight = execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT
+        non_mutating_run = projection_repair or rebaseline_preflight
         if projection_repair and not reprocess_doc_ids:
             raise ValueError("projection repair requires explicit document identifiers")
         started_at = datetime.now(timezone.utc)
@@ -605,7 +609,7 @@ class GeneSyncOrchestrator:
             "owner_user_id": (configured_source or {}).get("owner_user_id"),
         }
         scope_transition = None
-        if not projection_repair:
+        if not non_mutating_run:
             scope_transition = await self.db.get_open_projection_scope_transition(source_id)
         transition_started = False
         run_coverage = ProjectionCoverage.PARTIAL_PROJECTION
@@ -618,9 +622,7 @@ class GeneSyncOrchestrator:
             logger.info("Gene %s authenticated successfully", source_name)
             if scope_transition is not None:
                 if dict(scope_transition.target_scope) != configured_projection_scope:
-                    raise RuntimeError(
-                        "open Projection Scope transition does not match configured target scope"
-                    )
+                    raise RuntimeError("open Projection Scope transition does not match configured target scope")
                 scope_transition = await self.db.start_projection_scope_transition(
                     scope_transition.id,
                     run_id=run_id,
@@ -642,7 +644,7 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             last_sync_time = (
                 None
-                if projection_repair or force_full_sync or authoritative_snapshot or scope_transition is not None
+                if non_mutating_run or force_full_sync or authoritative_snapshot or scope_transition is not None
                 else (existing_state.last_sync_at if existing_state else None)
             )
             if last_sync_time and hasattr(gene, "fetch_pdf"):
@@ -666,16 +668,6 @@ class GeneSyncOrchestrator:
             elif last_sync_time:
                 last_sync_time = last_sync_time - DEFAULT_INCREMENTAL_SYNC_OVERLAP
 
-            run_coverage = (
-                ProjectionCoverage.PARTIAL_PROJECTION
-                if projection_repair
-                else source_run_projection_coverage(
-                    source_type=configured_source_type,
-                    incremental=last_sync_time is not None,
-                    authoritative_snapshot=authoritative_snapshot,
-                )
-            )
-
             # ----------------------------------------------------------
             # Step 3: Discover content items
             # ----------------------------------------------------------
@@ -690,6 +682,9 @@ class GeneSyncOrchestrator:
                     }
                 )
 
+            begin_discovery = getattr(gene, "begin_discovery", None)
+            if callable(begin_discovery):
+                begin_discovery()
             async for item in gene.discover(since=last_sync_time):
                 items.append(item)
                 crawled_doc_ids.add(item.item_id)
@@ -703,14 +698,20 @@ class GeneSyncOrchestrator:
                         }
                     )
 
+            run_coverage = (
+                ProjectionCoverage.PARTIAL_PROJECTION
+                if non_mutating_run
+                else source_run_projection_coverage(
+                    incremental=last_sync_time is not None,
+                    authoritative_snapshot=authoritative_snapshot,
+                    discovery_complete=bool(getattr(gene, "discovery_complete", False)),
+                )
+            )
+
             if projection_repair:
                 requested_doc_ids = set(reprocess_doc_ids or ())
                 discovered_by_id = {item.item_id: item for item in items}
-                items = [
-                    discovered_by_id[doc_id]
-                    for doc_id in sorted(requested_doc_ids)
-                    if doc_id in discovered_by_id
-                ]
+                items = [discovered_by_id[doc_id] for doc_id in sorted(requested_doc_ids) if doc_id in discovered_by_id]
                 for missing_doc_id in sorted(requested_doc_ids - discovered_by_id.keys()):
                     failed_docs.append(
                         FailedDoc(
@@ -764,6 +765,9 @@ class GeneSyncOrchestrator:
                     "memories_extracted": 0,
                     "memories_corroborated": 0,
                     "failed": False,
+                    "preflight_source_unit_id": None,
+                    "preflight_observation_ids": (),
+                    "projection_scope_attestation": None,
                 }
                 document_completed = False
 
@@ -826,6 +830,12 @@ class GeneSyncOrchestrator:
                                 "memories_corroborated",
                                 0,
                             )
+                            stats["preflight_source_unit_id"] = item_stats.get("preflight_source_unit_id")
+                            stats["preflight_observation_ids"] = item_stats.get(
+                                "preflight_observation_ids",
+                                (),
+                            )
+                            stats["projection_scope_attestation"] = item_stats.get("projection_scope_attestation")
                             last_error = None
                             break
                         except Exception as e:
@@ -903,6 +913,28 @@ class GeneSyncOrchestrator:
                 memories_extracted += r["memories_extracted"]
                 memories_corroborated += r["memories_corroborated"]
 
+            if rebaseline_preflight and docs_failed == 0:
+                current_units = await self.db.list_current_source_unit_observation_ids(source_id)
+                replayed_units = {
+                    str(result["preflight_source_unit_id"]): frozenset(
+                        str(observation_id) for observation_id in result["preflight_observation_ids"]
+                    )
+                    for result in results
+                    if result["preflight_source_unit_id"] is not None
+                }
+                missing_units = sorted(set(current_units) - set(replayed_units))
+                missing_observations = {
+                    unit_id: sorted(set(observation_ids) - replayed_units.get(unit_id, frozenset()))
+                    for unit_id, observation_ids in current_units.items()
+                    if set(observation_ids) - replayed_units.get(unit_id, frozenset())
+                }
+                if missing_units or missing_observations:
+                    raise ValueError(
+                        "source rebaseline replay closure is incomplete: "
+                        f"missing_units={missing_units}, "
+                        f"missing_observations={missing_observations}"
+                    )
+
             # ----------------------------------------------------------
             # Step 5: Detect deletions (only on full sync, not incremental)
             # ----------------------------------------------------------
@@ -910,9 +942,7 @@ class GeneSyncOrchestrator:
             # Pages not returned aren't deleted — they're just unchanged.
             # Only run deletion detection on full syncs (since=None).
             deleted_count = 0
-            absence_is_authoritative = (
-                not projection_repair and run_coverage.proves_absence and docs_failed == 0
-            )
+            absence_is_authoritative = not non_mutating_run and run_coverage.proves_absence and docs_failed == 0
 
             if absence_is_authoritative:
                 if progress_callback:
@@ -953,11 +983,23 @@ class GeneSyncOrchestrator:
                 )
 
             if scope_transition is not None:
-                if absence_is_authoritative and docs_failed == 0:
+                scoped_reconciliation_coverage = None
+                if docs_failed == 0:
+                    scoped_reconciliation_coverage = self.source_projection_adapter.reconciliation_coverage(
+                        source_type=configured_source_type,
+                        transition=scope_transition,
+                        current_units=await self.db.list_current_source_units(source_id),
+                        run_attestations=tuple(
+                            result["projection_scope_attestation"]
+                            for result in results
+                            if result.get("projection_scope_attestation") is not None
+                        ),
+                    )
+                if (absence_is_authoritative or scoped_reconciliation_coverage is not None) and docs_failed == 0:
                     scope_transition = await self.db.complete_projection_scope_transition(
                         scope_transition.id,
                         run_id=run_id,
-                        coverage=run_coverage,
+                        coverage=scoped_reconciliation_coverage or run_coverage,
                     )
                 else:
                     scope_transition = await self.db.fail_projection_scope_transition(
@@ -974,8 +1016,9 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             # Step 6: Update source doc_count
             # ----------------------------------------------------------
-            total_docs = await self.db.count_documents(source=source_id)
-            await self.db.update_source_doc_count(source_id, total_docs)
+            if not non_mutating_run:
+                total_docs = await self.db.count_documents(source=source_id)
+                await self.db.update_source_doc_count(source_id, total_docs)
 
             # ----------------------------------------------------------
             # Determine final status
@@ -1041,14 +1084,14 @@ class GeneSyncOrchestrator:
             failed_docs=failed_docs,
         )
 
-        if not projection_repair:
+        if not non_mutating_run:
             try:
                 await self.db.upsert_sync_state(sync_state)
             except Exception as e:
                 logger.error("Failed to upsert sync state: %s", e)
 
         # Record in sync_history for audit trail
-        if not projection_repair:
+        if not non_mutating_run:
             try:
                 await self.db.insert_sync_history(
                     source=source_id,
@@ -1202,6 +1245,7 @@ class GeneSyncOrchestrator:
             "memory_supports_added": 0,
             "memory_supports_updated": 0,
             "memory_supports_removed": 0,
+            "projection_scope_attestation": None,
         }
 
         # ------------------------------------------------------------------
@@ -1230,10 +1274,13 @@ class GeneSyncOrchestrator:
             content_chars=len(markdown_body or ""),
         )
 
-        if not markdown_body or not markdown_body.strip():
-            logger.warning("Empty normalized content for %s, skipping", doc_id)
-            return stats
-
+        empty_content = not markdown_body or not markdown_body.strip()
+        if empty_content and raw.body.strip() and not raw.authoritative_empty:
+            raise ValueError(f"normalization produced empty content from a non-empty artifact: {doc_id}")
+        if empty_content and not raw.authoritative_empty:
+            raise ValueError(f"provider did not attest authoritative empty content: {doc_id}")
+        if empty_content and not str(raw.empty_evidence or "").strip():
+            raise ValueError(f"authoritative empty content is missing provider evidence: {doc_id}")
         # ------------------------------------------------------------------
         # 3. Project provider-native content into stable source lineage.
         #
@@ -1278,9 +1325,7 @@ class GeneSyncOrchestrator:
             # Reusing a historical locator after its former Unit moved is a
             # new incarnation, not a move back. Seed a distinct identity once;
             # subsequent snapshots bind through the new current document row.
-            probe_scope["source_unit_incarnation"] = (
-                f"{historical_source_unit.id}:{item.version}"
-            )
+            probe_scope["source_unit_incarnation"] = f"{historical_source_unit.id}:{item.version}"
         projection_probe = await self.source_projection_adapter.project(
             ProjectionEnvelope(
                 request=ProjectionRequest(
@@ -1339,6 +1384,23 @@ class GeneSyncOrchestrator:
                 break
         source_unit = projection_probe.source_units[0]
 
+        if source_unit.unit_type == "teams_scope_attestation":
+            # Scope evidence is valid only for this processing run. Persisting
+            # it as a document/Source Unit would turn historical selectors into
+            # an ever-growing pseudo corpus and make later rebaseline replay
+            # stale control state. Return the validated locator directly to the
+            # reconciliation step without recording durable lineage.
+            stats["projection_scope_attestation"] = dict(source_unit.locator)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "processing",
+                        "event": "document_processed",
+                        "title": item.title,
+                    }
+                )
+            return stats
+
         projection_run_id = f"{run_id or 'direct'}:{source_unit.id}:{projection_probe.source_unit_revisions[0].id}"
         async with self._db_lock:
             projection = await self.db.get_source_projection(projection_run_id)
@@ -1357,9 +1419,11 @@ class GeneSyncOrchestrator:
                                 "source_unit_provider_key": source_unit.provider_key,
                             },
                             run_mode=(
-                                ProjectionRunMode.DELTA
-                                if prior_unit_revision is not None
-                                else ProjectionRunMode.FULL_SNAPSHOT
+                                ProjectionRunMode.FULL_SNAPSHOT
+                                if (
+                                    execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT or prior_unit_revision is None
+                                )
+                                else ProjectionRunMode.DELTA
                             ),
                             scope_transition=scope_transition,
                             access_context=dict(projection_access_context or {}),
@@ -1367,18 +1431,31 @@ class GeneSyncOrchestrator:
                         item=item,
                         raw=raw,
                         normalized=normalized,
-                        prior_unit_revision=prior_unit_revision,
-                        prior_observation_revisions=prior_observation_revisions,
+                        prior_unit_revision=(
+                            None if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT else prior_unit_revision
+                        ),
+                        prior_observation_revisions=(
+                            {} if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT else prior_observation_revisions
+                        ),
                     )
                 )
 
             projection_requires_extraction = projection.deltas[0].requires_extraction
-            if not projection_requires_extraction:
+            if not projection_requires_extraction and execution_mode is not SourceSyncMode.REBASELINE_PREFLIGHT:
                 # Location/access-only and idempotent observations carry no
                 # Memory mutation, so their lineage can advance independently.
                 await self.db.record_source_projection(projection)
 
             lineage_document_ids = await self.db.list_source_unit_document_ids(source_unit.id)
+
+        if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT:
+            if not projection.coverage.proves_absence:
+                raise ValueError(
+                    f"source rebaseline projection is not complete: {doc_id} coverage={projection.coverage.value}"
+                )
+            stats["preflight_source_unit_id"] = source_unit.id
+            stats["preflight_observation_ids"] = tuple(observation.id for observation in projection.observations)
+            return stats
 
         lineage_predecessor_docs: list[DocumentRecord] = []
         for lineage_doc_id in lineage_document_ids:
@@ -1399,11 +1476,7 @@ class GeneSyncOrchestrator:
             if existing_doc is None and lineage_predecessor_docs:
                 existing_doc = lineage_predecessor_docs[0]
                 existing_hash = existing_doc.content_hash
-            existing_metadata = (
-                await self.db.get_metadata(existing_doc.doc_id)
-                if existing_doc is not None
-                else None
-            )
+            existing_metadata = await self.db.get_metadata(existing_doc.doc_id) if existing_doc is not None else None
 
         content_unchanged = existing_hash == new_hash
         unchanged = (
@@ -1462,11 +1535,7 @@ class GeneSyncOrchestrator:
         should_fetch_pdf = (
             execution_mode is not SourceSyncMode.PROJECTION_REPAIR
             and hasattr(gene, "fetch_pdf")
-            and (
-                projection_requires_extraction
-                or requires_pdf_uri
-                or not pdf_uri
-            )
+            and (projection_requires_extraction or requires_pdf_uri or not pdf_uri)
         )
         if should_fetch_pdf:
             try:
@@ -1663,6 +1732,89 @@ class GeneSyncOrchestrator:
                 doc_record,
                 require_configured_source=True,
             )
+
+        if empty_content:
+            try:
+                if self.document_index.enabled:
+                    self.document_index.delete(doc_id)
+                memory_stats = await self.memory_engine.apply_projected_lifecycle(
+                    projection=projection,
+                    doc_id=doc_id,
+                    raw_memories=[],
+                    doc_type=(existing_metadata.doc_type if existing_metadata is not None else f"{source_type}_empty"),
+                    project_key=project_key,
+                    repo_identifier=normalized.source_semantics.get("repo_identifier"),
+                    entity_ids=[],
+                    document_content="",
+                    update_mode=update_plan.mode if update_plan else "full_document",
+                    changed_hunks=(update_plan.changed_hunks if update_plan else None),
+                    update_plan_stats=self._document_update_plan_stats(update_plan),
+                    source_updated_at=_source_updated_at_for_item(
+                        item,
+                        normalized.source_semantics,
+                    ),
+                    user_id=(
+                        str(normalized.source_semantics.get("uploader_user_id")).strip()
+                        if normalized.source_semantics.get("uploader_user_id")
+                        else None
+                    ),
+                )
+            except Exception:
+                await self._restore_document_processing_snapshot(
+                    doc_id=doc_id,
+                    existing_doc=existing_doc,
+                    document_vector_snapshot=document_vector_snapshot,
+                )
+                raise
+            await self.db.record_source_projection(projection)
+            stats["memories_extracted"] = memory_stats.get("added", 0)
+            stats["memories_corroborated"] = memory_stats.get("updated", 0)
+            stats["memory_supports_removed"] = memory_stats.get("deleted", 0)
+            await self.db.upsert_metadata(
+                DocumentMetadata(
+                    doc_id=doc_id,
+                    summary="",
+                    tags=[],
+                    entities=[],
+                    doc_type=(existing_metadata.doc_type if existing_metadata is not None else f"{source_type}_empty"),
+                    complexity="empty",
+                    enriched_at=now,
+                )
+            )
+            await self._insert_changelog(
+                ChangelogEntry(
+                    id=None,
+                    doc_id=doc_id,
+                    change_type=change_type,
+                    previous_version=previous_version,
+                    current_version=item.version,
+                    content_diff=None,
+                    ai_change_summary=f"Document '{item.title}' is now empty.",
+                    detected_at=now,
+                    title=item.title,
+                    source=source_id,
+                )
+            )
+            await self._finalize_projected_document_moves(
+                predecessor_docs=lineage_predecessor_docs,
+                current_doc_id=doc_id,
+                metadata=await self.db.get_metadata(doc_id),
+                source_unit_id=source_unit.id,
+            )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "processing",
+                        "event": "document_processed",
+                        "title": item.title,
+                    }
+                )
+            logger.info(
+                "Reconciled explicit empty Source Observation for %s (%s)",
+                item.title,
+                doc_id,
+            )
+            return stats
 
         # ------------------------------------------------------------------
         # 6. Call 1: Enrich document (under semaphore)

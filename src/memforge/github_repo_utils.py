@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import base64
 import binascii
+from collections.abc import Mapping
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from memforge.models import slugify
@@ -134,17 +136,69 @@ def github_content_type(relative_path: str) -> str:
 
 
 def decode_github_base64_content(*, content: object, encoding: object, size: object, label: str) -> bytes:
-    text = str(content or "")
-    if encoding not in {None, "base64"} or (not text and _int_value(size) > 0):
+    if not isinstance(content, str) or encoding != "base64":
         raise ValueError(f"GitHub contents API did not return base64 content for {label}")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise ValueError(f"GitHub contents API did not return a valid size for {label}")
+    text = content
     try:
-        return base64.b64decode(text.replace("\n", ""), validate=True)
+        decoded = base64.b64decode(text.replace("\n", ""), validate=True)
     except binascii.Error as exc:
         raise ValueError(f"GitHub contents API returned invalid base64 content for {label}") from exc
+    if len(decoded) != size:
+        raise ValueError(f"GitHub contents API content size mismatch for {label}")
+    return decoded
 
 
-def _int_value(value: object) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
+def validate_github_tree_payload(payload: object, *, label: str) -> list[dict[str, Any]]:
+    """Return one complete, stable Git tree or fail closed."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{label} tree response must be an object")
+    if payload.get("truncated") is not False:
+        raise ValueError(f"{label} tree response did not attest truncated=false")
+    tree = payload.get("tree")
+    if not isinstance(tree, list):
+        raise ValueError(f"{label} tree response is missing a tree list")
+    result: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for entry in tree:
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"{label} tree response contains an invalid entry")
+        entry_type = str(entry.get("type") or "").strip()
+        if entry_type not in {"blob", "tree", "commit"}:
+            raise ValueError(f"{label} tree entry has an invalid type")
+        raw_path = str(entry.get("path") or "").strip()
+        try:
+            canonical_path = normalize_github_relative_path(raw_path).rstrip("/")
+        except ValueError as exc:
+            raise ValueError(f"{label} tree entry has an invalid path") from exc
+        object_sha = str(entry.get("sha") or "").strip()
+        if not object_sha:
+            raise ValueError(f"{label} tree entry is missing an object sha")
+        if canonical_path in seen_paths:
+            raise ValueError(f"{label} tree response contains duplicate path {canonical_path!r}")
+        seen_paths.add(canonical_path)
+        result.append(dict(entry))
+    return result
+
+
+def decode_github_contents_payload(
+    payload: object,
+    *,
+    expected_sha: str,
+    label: str,
+) -> bytes:
+    """Decode a Contents response bound to the blob discovered in the tree."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"GitHub contents API returned an invalid object for {label}")
+    actual_sha = str(payload.get("sha") or "").strip()
+    if not expected_sha or actual_sha != expected_sha:
+        raise ValueError(f"GitHub contents API blob identity mismatch for {label}")
+    return decode_github_base64_content(
+        content=payload.get("content"),
+        encoding=payload.get("encoding"),
+        size=payload.get("size"),
+        label=label,
+    )

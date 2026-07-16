@@ -372,6 +372,14 @@ async def test_runtime_resolves_jira_browser_session_without_persisting_cookie(d
             "auth_mode": "browser_cookie",
         },
     }
+    await db.upsert_source(
+        id=source["id"],
+        type=source["type"],
+        name=source["name"],
+        config_json=json.dumps(source["config"]),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
 
     captured = {}
 
@@ -449,6 +457,14 @@ async def test_runtime_keeps_legacy_jira_pat_source_in_pat_mode(db, tmp_path, mo
             secret_fields=("pat", "jira_cookie"),
         ),
     }
+    await db.upsert_source(
+        id=source["id"],
+        type=source["type"],
+        name=source["name"],
+        config_json=json.dumps(source["config"]),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
 
     captured = {}
 

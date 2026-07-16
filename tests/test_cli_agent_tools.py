@@ -28,6 +28,7 @@ class FakeToolClient:
     response: dict = {}
     list_response: dict = {"data": []}
     create_response: dict = {"id": "src-created"}
+    projection_inventory_response: dict = {"units": []}
 
     def __init__(
         self,
@@ -48,6 +49,7 @@ class FakeToolClient:
         cls.response = response
         cls.list_response = {"data": []} if list_response is None else list_response
         cls.create_response = {"id": "src-created"} if create_response is None else create_response
+        cls.projection_inventory_response = {"units": []}
 
     def list_sources(self):
         self.calls.append(("list_sources", {"api_url": self.api_url, "api_token": self.api_token}))
@@ -56,6 +58,19 @@ class FakeToolClient:
     def list_searchable_sources(self):
         self.calls.append(("list_searchable_sources", {"api_url": self.api_url, "api_token": self.api_token}))
         return self.list_response
+
+    def get_source_projection_inventory(self, source_id: str, **filters):
+        self.calls.append(
+            (
+                "get_source_projection_inventory",
+                {
+                    "source_id": source_id,
+                    "workspace_id": self.workspace_id,
+                    **filters,
+                },
+            )
+        )
+        return self.projection_inventory_response
 
     def create_source(self, **kwargs):
         self.calls.append(("create_source", {"api_url": self.api_url, "api_token": self.api_token, **kwargs}))
@@ -1684,6 +1699,7 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
             "attempt_count": 1,
             "source_id": "src-teams",
             "payload": {
+                "conversation_ids": ["19:conversation@thread.tacv2"],
                 "conversation_gap_minutes": 60,
                 "limit": 2,
                 "audit_log_path": str(audit_log_path),
@@ -1789,7 +1805,14 @@ def test_local_agent_cloud_teams_sync_reauths_after_stale_session(monkeypatch, t
                     "message_count": 1,
                 }
             ],
-            "poll_audits": [],
+            "poll_audits": [
+                {
+                    "raw_conversation_id": "19:conversation@thread.tacv2",
+                    "pagination_complete": True,
+                    "access_probe_status": "ok",
+                    "stop_reason": "no_backward_link",
+                }
+            ],
         }
 
     class FakeTeamsAuthenticator:
@@ -1884,6 +1907,7 @@ def test_local_agent_cloud_teams_sync_reports_push_failure_without_generic_sourc
             "attempt_count": 1,
             "source_id": "src-teams",
             "payload": {
+                "conversation_ids": ["19:conversation@thread.tacv2"],
                 "audit_log_path": str(audit_log_path),
                 "ledger_state_path": str(ledger_state_path),
             },
@@ -1904,7 +1928,154 @@ def test_local_agent_cloud_teams_sync_reports_push_failure_without_generic_sourc
     assert audit_rows[-1]["failed_windows"] == 1
 
 
-def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypatch, tmp_path: Path):
+def test_local_agent_cloud_teams_sync_pushes_current_attempt_scope_attestation_for_empty_target(
+    monkeypatch,
+    tmp_path: Path,
+):
+    conversation_id = "19:empty@thread.v2"
+    target_scope = {"conversation_ids": [conversation_id]}
+
+    async def fake_collect(job, *, source_id, limit, report_progress=None):
+        return {
+            "documents": [],
+            "poll_audits": [
+                {
+                    "raw_conversation_id": conversation_id,
+                    "pagination_complete": True,
+                    "access_probe_status": "ok",
+                    "stop_reason": "no_backward_link",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        main,
+        "_collect_teams_documents_from_cloud_job",
+        fake_collect,
+        raising=False,
+    )
+    FakeToolClient.reset({"doc_id": "scope-doc", "document_hash": "scope-hash"})
+    result = main._run_cloud_teams_sync_job(
+        {
+            "job_id": "laj-teams-empty-scope",
+            "workspace_id": "ws-from-cloud",
+            "operation": "teams_sync",
+            "attempt_count": 2,
+            "source_id": "src-teams",
+            "payload": {
+                "conversation_ids": [conversation_id],
+                "audit_log_path": str(tmp_path / "teams-audit.jsonl"),
+                "projection_scope_transition": {
+                    "id": "transition-empty-scope",
+                    "previous_scope": {"conversation_ids": ["19:old@thread.v2"]},
+                    "target_scope": target_scope,
+                },
+            },
+        },
+        _cloud_test_client(),
+    )
+
+    push = next(call for call in FakeToolClient.calls if call[0] == "push_teams_window_package")
+    raw_payload = push[1]["raw_payload"]
+    assert raw_payload["_scope_attestation"] is True
+    assert raw_payload["transition_id"] == "transition-empty-scope"
+    assert raw_payload["target_conversation_ids"] == [conversation_id]
+    assert raw_payload["collection_attempt_id"] == "laj-teams-empty-scope:attempt:2"
+    assert raw_payload["poll"]["stop_reason"] == "no_backward_link"
+    assert result["counts"]["pushed"] == 1
+    assert result["sync_started"] is True
+
+
+@pytest.mark.parametrize(
+    "inventory_response",
+    [
+        {"error": "inventory unavailable"},
+        {
+            "units": [
+                {
+                    "source_unit_id": "unit-stale",
+                    "unit_type": "teams_window",
+                    "provider_key": "window-stale",
+                    "locator": {"conversation_id": "19:conversation@thread.tacv2"},
+                }
+            ]
+        },
+    ],
+)
+def test_local_agent_cloud_teams_sync_fails_closed_when_projection_inventory_is_unavailable(
+    monkeypatch,
+    tmp_path: Path,
+    inventory_response: dict,
+):
+    async def fake_collect(job, *, source_id, limit, report_progress=None):
+        return {
+            "documents": [
+                {
+                    "conversation_id": "19:conversation@thread.tacv2",
+                    "root_message_id": "1783500000000",
+                    "window_id": "teams-thread:v1:opaque-window",
+                    "window_type": "thread",
+                    "revision_hash": "sha256:revision-1",
+                    "title": "Thread window",
+                    "source_url": "https://teams.example.test/window",
+                    "last_modified": "2026-07-08T09:24:57Z",
+                    "raw_payload": {
+                        "messages": [
+                            {
+                                "id": "1783500000000",
+                                "content": "Thread window",
+                            }
+                        ]
+                    },
+                    "raw_hash": "sha256:raw-1",
+                    "message_count": 1,
+                }
+            ],
+            "poll_audits": [
+                {
+                    "raw_conversation_id": "19:conversation@thread.tacv2",
+                    "pagination_complete": True,
+                    "access_probe_status": "ok",
+                    "stop_reason": "no_backward_link",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        main,
+        "_collect_teams_documents_from_cloud_job",
+        fake_collect,
+        raising=False,
+    )
+    FakeToolClient.reset({})
+    FakeToolClient.projection_inventory_response = inventory_response
+
+    result = main._run_cloud_teams_sync_job(
+        {
+            "job_id": "laj-teams-inventory-failure",
+            "workspace_id": "ws-from-cloud",
+            "operation": "teams_sync",
+            "attempt_count": 1,
+            "source_id": "src-teams",
+            "payload": {
+                "conversation_ids": ["19:conversation@thread.tacv2"],
+                "audit_log_path": str(tmp_path / "teams-audit.jsonl"),
+            },
+        },
+        _cloud_test_client(),
+    )
+
+    assert result["error_type"] == "TeamsProjectionInventoryError"
+    assert result["retryable"] is True
+    assert not [
+        call for call in FakeToolClient.calls if call[0] in {"push_teams_window_package", "start_source_processing"}
+    ]
+
+
+def test_local_agent_cloud_teams_sync_replays_revision_until_server_projection_is_confirmed(
+    monkeypatch,
+    tmp_path: Path,
+):
     from memforge.local_agent.teams_audit import validate_teams_audit_run
 
     async def fake_collect(job, *, source_id, limit, report_progress=None):
@@ -1938,6 +2109,7 @@ def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypat
         "attempt_count": 1,
         "source_id": "src-teams",
         "payload": {
+            "conversation_ids": ["19:conversation@thread.tacv2"],
             "audit_log_path": str(audit_log_path),
             "ledger_state_path": str(ledger_state_path),
         },
@@ -1959,9 +2131,9 @@ def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypat
         report_progress=retry_progress.append,
     )
 
-    assert second["counts"] == {"selected": 1, "pushed": 0, "failed": 0, "skipped_existing": 1, "polls": 0}
-    assert not [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
-    assert not [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
+    assert second["counts"] == {"selected": 1, "pushed": 1, "failed": 0, "skipped_existing": 0, "polls": 0}
+    assert len([call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]) == 1
+    assert len([call for call in FakeToolClient.calls if call[0] == "start_source_processing"]) == 1
     assert retry_progress[-1]["progress"] == {
         "completed": 2,
         "total": 2,
@@ -1972,9 +2144,9 @@ def test_local_agent_cloud_teams_sync_skips_existing_revision_receipts(monkeypat
     second_run = [row for row in audit_rows if row["run_id"] == "laj-teams-sync-retry"]
     assert validate_teams_audit_run(second_run) == []
     assert second_run[0]["event"] == "teams_window_projection"
-    assert second_run[0]["receipt_status"] == "existing"
-    assert second_run[0]["receipt_skip_reason"] == "receipt_exists"
-    assert second_run[-1]["skipped_existing_windows"] == 1
+    assert second_run[0]["receipt_status"] == "new"
+    assert "receipt_skip_reason" not in second_run[0]
+    assert second_run[-1]["skipped_existing_windows"] == 0
 
 
 def test_local_agent_cloud_teams_sync_retries_window_when_processing_was_not_accepted(
@@ -2018,6 +2190,7 @@ def test_local_agent_cloud_teams_sync_retries_window_when_processing_was_not_acc
         "attempt_count": 1,
         "source_id": "src-teams",
         "payload": {
+            "conversation_ids": ["19:conversation@thread.tacv2"],
             "audit_log_path": str(audit_log_path),
             "ledger_state_path": str(ledger_state_path),
         },
@@ -2104,6 +2277,7 @@ def test_local_agent_cloud_teams_sync_writes_conversation_poll_audit(monkeypatch
             "attempt_count": 1,
             "source_id": "src-teams",
             "payload": {
+                "conversation_ids": ["19:conversation@thread.tacv2"],
                 "audit_log_path": str(audit_log_path),
                 "ledger_state_path": str(ledger_state_path),
             },
@@ -2268,10 +2442,327 @@ def test_collect_teams_documents_from_cloud_job_uses_gene_window_shape(monkeypat
     }
     assert doc["window_type"] == "time_block"
     assert len(doc["raw_payload"]["messages"]) == 3
+    assert doc["raw_payload"]["_authoritative_snapshot"] is True
     assert doc["message_count"] == 3
     assert doc["last_modified"] == "2026-07-08T09:24:57+00:00"
     assert doc["raw_hash"]
     assert doc["revision_hash"]
+
+
+def test_teams_window_completeness_requires_successful_full_conversation_poll():
+    assert main._teams_complete_poll_conversation_ids(
+        [
+            {
+                "raw_conversation_id": "conversation-complete",
+                "pagination_complete": True,
+                "access_probe_status": "ok",
+                "stop_reason": "no_backward_link",
+            },
+            {
+                "raw_conversation_id": "conversation-truncated",
+                "pagination_complete": False,
+                "access_probe_status": "ok",
+                "stop_reason": "cutoff_reached",
+            },
+            {
+                "raw_conversation_id": "conversation-denied",
+                "pagination_complete": True,
+                "access_probe_status": "forbidden",
+                "stop_reason": "no_backward_link",
+            },
+        ]
+    ) == {"conversation-complete"}
+
+
+def test_teams_coverage_time_rejects_naive_provider_evidence():
+    assert main._parse_teams_coverage_time("2026-07-16T09:00:00") is None
+    assert main._parse_teams_coverage_time("2026-07-16T09:00:00+00:00") is not None
+
+
+def test_server_inventory_emits_window_tombstone_only_after_complete_poll():
+    from memforge.local_agent.teams_ledger import build_teams_window_id
+
+    conversation_id = "19:conversation@thread.tacv2"
+    window_id = build_teams_window_id(
+        source_id="src-teams",
+        conversation_id=conversation_id,
+        root_or_anchor_message_id="m1",
+        window_type="time_block",
+    )
+    documents = main._reconcile_teams_documents_with_server_inventory(
+        documents=[],
+        poll_audits=[
+            {
+                "raw_conversation_id": conversation_id,
+                "pagination_complete": True,
+                "access_probe_status": "ok",
+                "stop_reason": "no_backward_link",
+            }
+        ],
+        inventory_units=[
+            {
+                "provider_key": window_id,
+                "locator": {
+                    "conversation_id": conversation_id,
+                    "window_id": window_id,
+                    "observed_from": "2026-07-08T09:00:00+00:00",
+                    "observed_to": "2026-07-08T09:30:00+00:00",
+                    "url": "https://teams.example.test/window/m1",
+                },
+            }
+        ],
+        configured_conversation_ids={conversation_id},
+        destructive_enabled=True,
+    )
+
+    assert len(documents) == 1
+    tombstone = documents[0]
+    assert tombstone["window_id"] == window_id
+    assert tombstone["message_count"] == 0
+    assert tombstone["raw_payload"] == {
+        "conversation_id": conversation_id,
+        "window_id": window_id,
+        "messages": [],
+        "_authoritative_snapshot": True,
+        "_tombstone": True,
+        "tombstone_reason": "not_returned_by_complete_conversation_poll",
+    }
+
+
+def test_server_inventory_uses_bounded_poll_only_for_contained_window():
+    from memforge.local_agent.teams_ledger import build_teams_window_id
+
+    conversation_id = "19:conversation@thread.tacv2"
+
+    def inventory(window_name: str, observed_from: str, observed_to: str):
+        window_id = build_teams_window_id(
+            source_id="src-teams",
+            conversation_id=conversation_id,
+            root_or_anchor_message_id=window_name,
+            window_type="time_block",
+        )
+        return {
+            "provider_key": window_id,
+            "locator": {
+                "conversation_id": conversation_id,
+                "window_id": window_id,
+                "observed_from": observed_from,
+                "observed_to": observed_to,
+            },
+        }
+
+    documents = main._reconcile_teams_documents_with_server_inventory(
+        documents=[],
+        poll_audits=[
+            {
+                "raw_conversation_id": conversation_id,
+                "pagination_complete": False,
+                "access_probe_status": "ok",
+                "stop_reason": "cutoff_reached",
+                "absence_covered_from": "2026-07-01T00:00:00+00:00",
+                "absence_covered_to": "2026-07-16T00:00:00+00:00",
+            }
+        ],
+        inventory_units=[
+            inventory(
+                "recent-deleted",
+                "2026-07-08T09:00:00+00:00",
+                "2026-07-08T09:30:00+00:00",
+            ),
+            inventory(
+                "older-retained",
+                "2026-06-08T09:00:00+00:00",
+                "2026-06-08T09:30:00+00:00",
+            ),
+        ],
+        configured_conversation_ids={conversation_id},
+        destructive_enabled=True,
+    )
+
+    assert len(documents) == 2
+    assert documents[0]["root_message_id"] == "recent-deleted"
+    assert documents[0]["raw_payload"]["tombstone_reason"] == "not_returned_by_bounded_conversation_poll"
+    assert documents[1]["root_message_id"] == "older-retained"
+    assert documents[1]["raw_payload"]["tombstone_reason"] == "outside_configured_time_scope"
+
+
+def test_server_inventory_never_tombstones_after_invalid_message_page():
+    from memforge.local_agent.teams_ledger import build_teams_window_id
+
+    conversation_id = "19:conversation@thread.tacv2"
+    window_id = build_teams_window_id(
+        source_id="src-teams",
+        conversation_id=conversation_id,
+        root_or_anchor_message_id="still-unknown",
+        window_type="time_block",
+    )
+
+    documents = main._reconcile_teams_documents_with_server_inventory(
+        documents=[],
+        poll_audits=[
+            {
+                "raw_conversation_id": conversation_id,
+                "pagination_complete": False,
+                "access_probe_status": "ok",
+                "stop_reason": "invalid_message_page_schema",
+            }
+        ],
+        inventory_units=[
+            {
+                "provider_key": window_id,
+                "locator": {
+                    "conversation_id": conversation_id,
+                    "window_id": window_id,
+                    "observed_from": "2026-07-08T09:00:00+00:00",
+                    "observed_to": "2026-07-08T09:30:00+00:00",
+                },
+            }
+        ],
+        configured_conversation_ids={conversation_id},
+        destructive_enabled=True,
+    )
+
+    assert documents == []
+
+
+def test_server_inventory_tombstones_conversation_removed_from_scope():
+    from memforge.local_agent.teams_ledger import build_teams_window_id
+
+    removed_conversation = "19:removed@thread.tacv2"
+    window_id = build_teams_window_id(
+        source_id="src-teams",
+        conversation_id=removed_conversation,
+        root_or_anchor_message_id="removed-root",
+        window_type="thread",
+    )
+
+    documents = main._reconcile_teams_documents_with_server_inventory(
+        documents=[],
+        poll_audits=[],
+        inventory_units=[
+            {
+                "provider_key": window_id,
+                "locator": {
+                    "conversation_id": removed_conversation,
+                    "window_id": window_id,
+                },
+            }
+        ],
+        configured_conversation_ids={"19:retained@thread.tacv2"},
+        destructive_enabled=True,
+    )
+
+    assert len(documents) == 1
+    assert documents[0]["raw_payload"]["tombstone_reason"] == "conversation_removed_from_projection_scope"
+
+
+def test_server_inventory_pagination_reconciles_every_unit_once():
+    from memforge.local_agent.teams_ledger import build_teams_window_id
+
+    conversation_id = "19:conversation@thread.tacv2"
+    windows = [
+        build_teams_window_id(
+            source_id="src-teams",
+            conversation_id=conversation_id,
+            root_or_anchor_message_id=root,
+            window_type="time_block",
+        )
+        for root in ("root-a", "root-b")
+    ]
+
+    class PagingClient:
+        def __init__(self):
+            self.cursors = []
+
+        def get_source_projection_inventory(self, source_id, **filters):
+            assert source_id == "src-teams"
+            self.cursors.append(filters.get("cursor"))
+            index = 0 if filters.get("cursor") is None else 1
+            window_id = windows[index]
+            return {
+                "units": [
+                    {
+                        "source_unit_id": f"unit-{index}",
+                        "unit_type": "teams_window",
+                        "provider_key": window_id,
+                        "locator": {
+                            "conversation_id": conversation_id,
+                            "window_id": window_id,
+                            "observed_from": "2026-07-08T09:00:00+00:00",
+                            "observed_to": "2026-07-08T09:30:00+00:00",
+                        },
+                    }
+                ],
+                "next_cursor": "unit-0" if index == 0 else None,
+            }
+
+    client = PagingClient()
+    tombstones = list(
+        main._iter_teams_inventory_tombstones(
+            client=client,
+            source_id="src-teams",
+            current_documents=[],
+            poll_audits=[
+                {
+                    "raw_conversation_id": conversation_id,
+                    "pagination_complete": True,
+                    "access_probe_status": "ok",
+                    "stop_reason": "no_backward_link",
+                }
+            ],
+            configured_conversation_ids={conversation_id},
+            scope_transition=None,
+        )
+    )
+
+    assert [item["window_id"] for item in tombstones] == windows
+    assert client.cursors == [None, "unit-0"]
+
+
+def test_bounded_inventory_plan_separates_recent_reconciliation_from_scope_cleanup():
+    conversation_id = "19:conversation@thread.tacv2"
+    audit = {
+        "raw_conversation_id": conversation_id,
+        "pagination_complete": False,
+        "access_probe_status": "ok",
+        "stop_reason": "cutoff_reached",
+        "absence_covered_from": "2026-07-01T00:00:00+00:00",
+        "absence_covered_to": "2026-07-16T00:00:00+00:00",
+    }
+
+    ordinary = main._teams_inventory_query_plans(
+        poll_audits=[audit],
+        configured_conversation_ids={conversation_id},
+        scope_transition=None,
+    )
+    max_age_transition = main._teams_inventory_query_plans(
+        poll_audits=[audit],
+        configured_conversation_ids={conversation_id},
+        scope_transition={
+            "previous_scope": {
+                "conversation_ids": [conversation_id],
+                "max_age_days": 365,
+            },
+            "target_scope": {
+                "conversation_ids": [conversation_id],
+                "max_age_days": 30,
+            },
+        },
+    )
+
+    expected = [
+        {
+            "conversation_id": conversation_id,
+            "observed_from_lte": "2026-07-16T00:00:00+00:00",
+            "observed_to_gte": "2026-07-01T00:00:00+00:00",
+        },
+        {
+            "conversation_id": conversation_id,
+            "observed_to_lt": "2026-07-01T00:00:00+00:00",
+        },
+    ]
+    assert ordinary == expected
+    assert max_age_transition == expected
 
 
 def test_collect_teams_documents_from_cloud_job_maps_cloud_conversation_ids_to_direct_rest_config(monkeypatch):

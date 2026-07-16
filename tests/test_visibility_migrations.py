@@ -1,5 +1,6 @@
 # tests/test_visibility_migrations.py
 import pytest
+from memforge.models import SyncState
 from memforge.storage.database import Database
 
 
@@ -37,6 +38,34 @@ async def test_fresh_schema_has_visibility_columns_and_no_scope(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_fresh_schema_has_durable_source_activity_admission(tmp_path):
+    db = Database(str(tmp_path / "source-activity.db"))
+    await db.connect()
+    try:
+        source_columns = await _columns(db, "sources")
+        activity_columns = await _columns(db, "source_activity_leases")
+        assert "activity_epoch" in source_columns
+        assert activity_columns == [
+            "id",
+            "source_id",
+            "kind",
+            "epoch",
+            "capability",
+            "lease_until",
+            "created_at",
+            "updated_at",
+        ]
+        async with db.db.execute(
+            "SELECT description FROM schema_migrations WHERE version = 58"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == "Add durable source activity admission"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_agent_concept_rebuild_restores_foreign_key_enforcement(tmp_path):
     db = Database(str(tmp_path / "foreign-keys.db"))
     await db.connect()
@@ -57,6 +86,17 @@ async def test_agent_concept_rebuild_restores_foreign_key_enforcement(tmp_path):
         run = await db.enqueue_source_sync_run(
             source_id="src-cascade",
             trigger="manual",
+        )
+        leased = await db.lease_next_source_sync_run(worker_id="test-worker")
+        assert leased is not None and leased.run_id == run.run_id
+        assert await db.complete_source_sync_run(
+            run.run_id,
+            worker_id="test-worker",
+            lease_attempt_count=leased.lease_attempt_count,
+            final_state=SyncState(
+                source="src-cascade",
+                last_sync_status="success",
+            ),
         )
         await db.delete_source_cascade("src-cascade")
         assert await db.get_source_sync_run(run.run_id) is None

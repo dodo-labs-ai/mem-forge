@@ -23,11 +23,23 @@ def _jira_projection(comment_count: int = 3):
     payload = {
         "id": "10012",
         "key": "PAY-12",
-        "fields": {"summary": "Payroll", "description": "A7 processing context"},
+        "fields": {
+            "summary": "Payroll",
+            "description": "A7 processing context",
+            "status": None,
+            "priority": None,
+            "assignee": None,
+            "labels": [],
+            "resolution": None,
+            "updated": "2026-07-15T00:00:00Z",
+        },
         "_comments": [
             {"id": str(500 + index), "body": f"Reply {index}: retain A7"}
             for index in range(comment_count)
         ],
+        "_comments_included": True,
+        "_comments_total": comment_count,
+        "changelog": {"startAt": 0, "histories": [], "total": 0},
     }
     import json
 

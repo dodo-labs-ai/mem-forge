@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -16,10 +17,6 @@ LOCAL_AGENT_SYNC_OPERATIONS = frozenset(
         "teams_sync",
     }
 )
-AUTHORITATIVE_COLLECTION_SOURCE_TYPES = frozenset(
-    {"github_repo", "jira", "local_markdown"}
-)
-
 _IMMUTABLE_EXECUTION_MODE_FIELDS = {
     "github_repo": ("connection_mode",),
     "jira": ("sync_mode",),
@@ -77,6 +74,65 @@ LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS = frozenset(
     }
 )
 LOCAL_AGENT_JOB_MAX_ATTEMPTS = 5
+LOCAL_AGENT_SEMANTIC_INPUT_VERSION = "canonical-v1"
+TEAMS_TOMBSTONE_REASONS = frozenset(
+    {
+        "not_returned_by_complete_conversation_poll",
+        "not_returned_by_bounded_conversation_poll",
+        "conversation_removed_from_projection_scope",
+        "outside_configured_time_scope",
+    }
+)
+TEAMS_CONVERSATION_SELECTOR_FIELDS = (
+    "conversation_ids",
+    "channels",
+    "group_chats",
+    "individual_chats",
+)
+_TEAMS_CONVERSATION_ID_RE = re.compile(r"^19:[^\s@]+@[^\s@]+$")
+
+
+def is_direct_teams_conversation_id(value: object) -> bool:
+    """Return whether a selector is already a stable Teams conversation id."""
+
+    normalized = str(value or "").strip()
+    return bool(_TEAMS_CONVERSATION_ID_RE.fullmatch(normalized))
+
+
+def canonical_teams_conversation_ids(
+    config: Mapping[str, Any] | str | None,
+    *,
+    require_nonempty: bool = False,
+) -> tuple[str, ...]:
+    """Collapse every accepted Teams selector field into verified direct ids.
+
+    Legacy selector fields historically also accepted display names.  Those names
+    are not stable provider identity and therefore must never reach lifecycle or
+    inventory reconciliation as if they were conversation ids.
+    """
+
+    normalized_config = _source_config(config)
+    result: list[str] = []
+    seen: set[str] = set()
+    for field in TEAMS_CONVERSATION_SELECTOR_FIELDS:
+        raw_values = normalized_config.get(field, ())
+        if isinstance(raw_values, str):
+            values = [value.strip() for value in raw_values.split(",") if value.strip()]
+        elif isinstance(raw_values, (list, tuple)):
+            values = [str(value).strip() for value in raw_values if str(value).strip()]
+        elif raw_values in (None, ()):
+            values = []
+        else:
+            raise ValueError("teams conversation selectors must be strings or lists")
+        for value in values:
+            if not is_direct_teams_conversation_id(value):
+                raise ValueError("teams_sync_requires_direct_conversation_ids")
+            if value not in seen:
+                seen.add(value)
+                result.append(value)
+    if require_nonempty and not result:
+        raise ValueError("teams_sync_requires_direct_conversation_ids")
+    return tuple(result)
 
 
 def local_agent_completion_status(
@@ -114,7 +170,13 @@ def local_agent_authoritative_snapshot_id(
     """Return the server-owned snapshot identity for complete collections."""
     normalized_source_type = str(source_type or "").strip().lower()
     requested = str(requested_snapshot_id or "").strip()
-    if normalized_source_type not in AUTHORITATIVE_COLLECTION_SOURCE_TYPES:
+    from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
+
+    try:
+        authoritative_collection = get_local_source_replay_adapter(normalized_source_type).authoritative_collection
+    except ValueError:
+        authoritative_collection = False
+    if not authoritative_collection:
         if requested:
             raise ValueError("source type does not accept collection snapshots")
         return None
@@ -122,6 +184,17 @@ def local_agent_authoritative_snapshot_id(
     if requested and requested != canonical:
         raise ValueError("local agent snapshot does not match the leased job attempt")
     return canonical
+
+
+def local_agent_collection_is_authoritative(source_type: object) -> bool:
+    """Return whether one attempt proves the complete source collection."""
+
+    from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
+
+    try:
+        return get_local_source_replay_adapter(str(source_type or "").strip().lower()).authoritative_collection
+    except ValueError:
+        return False
 
 
 def local_agent_input_sha256(doc_id: object, document_hash: object) -> str:
@@ -137,6 +210,17 @@ def local_agent_input_sha256(doc_id: object, document_hash: object) -> str:
         sort_keys=True,
     )
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def local_agent_semantic_input_sha256(
+    doc_id: object,
+    semantic_hash: object,
+) -> str:
+    """Version the canonical semantic identity independently of legacy raw hashes."""
+    return local_agent_input_sha256(
+        doc_id,
+        f"{LOCAL_AGENT_SEMANTIC_INPUT_VERSION}:{semantic_hash}",
+    )
 
 
 def _source_config(value: object) -> Mapping[str, Any]:
@@ -161,15 +245,14 @@ def local_agent_sync_operation(
     normalized_config = _source_config(config)
     if normalized_type == "teams":
         return "teams_sync"
-    if normalized_type == "jira" and str(
-        normalized_config.get("sync_mode") or ""
-    ).strip().lower() == "local_agent":
+    if normalized_type == "jira" and str(normalized_config.get("sync_mode") or "").strip().lower() == "local_agent":
         return "jira_sync"
     if normalized_type == "local_markdown":
         return "local_markdown_sync"
-    if normalized_type == "github_repo" and str(
-        normalized_config.get("connection_mode") or ""
-    ).strip().lower() == "local_push":
+    if (
+        normalized_type == "github_repo"
+        and str(normalized_config.get("connection_mode") or "").strip().lower() == "local_push"
+    ):
         return "github_repo_sync"
     return None
 
@@ -194,9 +277,7 @@ def source_execution_descriptor(
     return {
         "kind": "local_agent" if operation is not None else "server",
         "operation": operation,
-        "immutable_config_fields": list(
-            _IMMUTABLE_EXECUTION_MODE_FIELDS.get(normalized_type, ())
-        ),
+        "immutable_config_fields": list(_IMMUTABLE_EXECUTION_MODE_FIELDS.get(normalized_type, ())),
     }
 
 
@@ -214,11 +295,7 @@ def local_agent_job_config(
         str(source_type or "").strip().lower(),
         frozenset(),
     )
-    return {
-        key: value
-        for key, value in _source_config(config).items()
-        if key in allowed
-    }
+    return {key: value for key, value in _source_config(config).items() if key in allowed}
 
 
 def local_agent_sync_job_payload(
@@ -238,6 +315,7 @@ def local_agent_sync_job_payload(
     payload["source_id"] = str(source.get("id") or "").strip()
     payload["source_type"] = source_type
     payload["source_config_revision"] = local_agent_source_config_revision(source)
+    payload["source_activity_epoch"] = int(source.get("activity_epoch") or 0)
     return payload
 
 
@@ -262,9 +340,11 @@ def source_with_sync_inputs(
     inputs: list[Any],
     *,
     authoritative_snapshot: bool = False,
+    preserve_version_history: bool = False,
 ) -> dict[str, Any]:
     """Project immutable raw inputs into the connector's runtime manifest."""
     latest_entries: dict[str, dict[str, Any]] = {}
+    historical_entries: list[dict[str, Any]] = []
     for source_input in sorted(
         inputs,
         key=lambda item: int(getattr(item, "input_generation", 0)),
@@ -277,10 +357,43 @@ def source_with_sync_inputs(
         raw_uri = str(getattr(source_input, "raw_uri", "") or "").strip()
         if not doc_id or not raw_uri:
             continue
-        latest_entries[doc_id] = {**entry, "package_uri": raw_uri}
+        package_sha256 = str(metadata.get("package_sha256") or "").strip()
+        projected_entry = {
+            **entry,
+            "package_uri": raw_uri,
+            "input_sha256": str(getattr(source_input, "raw_sha256", "") or "").strip(),
+            **({"package_sha256": package_sha256} if package_sha256 else {}),
+        }
+        latest_entries[doc_id] = projected_entry
+        historical_entries.append(projected_entry)
     projected = dict(source)
     if latest_entries or authoritative_snapshot:
         config = dict(_source_config(source.get("config")))
-        config["local_agent_package_manifest"] = list(latest_entries.values())
+        config["local_agent_package_manifest"] = (
+            historical_entries
+            if preserve_version_history
+            else list(latest_entries.values())
+        )
         projected["config"] = config
     return projected
+
+
+def validate_local_agent_replay_package(
+    source_type: str,
+    body: bytes,
+    *,
+    expected_doc_id: str,
+    expected_version: str,
+    expected_input_sha256: str,
+    expected_package_sha256: str,
+) -> Mapping[str, Any]:
+    """Compatibility wrapper around the registered provider adapter."""
+    from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
+
+    return get_local_source_replay_adapter(source_type).validate(
+        body,
+        expected_doc_id=expected_doc_id,
+        expected_version=expected_version,
+        expected_input_sha256=expected_input_sha256,
+        expected_package_sha256=expected_package_sha256,
+    )

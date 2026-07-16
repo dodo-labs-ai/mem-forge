@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import json
 import os
 import re
 import tempfile
+import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,11 +30,73 @@ from memforge.memory.project_resolver import resolve_project_key
 from memforge.llm.structured import AgentSessionAuthorityResponse
 from memforge.models import AgentHookReceipt, AgentSessionReceipt, content_hash, slugify
 from memforge.storage.database import Database
+from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 
 AGENT_SESSION_SOURCE_TYPE = "agent_session"
 AGENT_SESSION_SOURCE_KIND = "generated_agent_summary"
 AGENT_SESSION_WINDOW_SOURCE_KIND = "generated_agent_window_summary"
 AGENT_SESSION_KNOWLEDGE_PATCH_MAX_TOKENS = 8192
+
+
+async def _run_agent_patch_with_activity(
+    *,
+    db: Database,
+    source_id: str,
+    expected_epoch: int | None,
+    operation: Callable[[], Awaitable[Any]],
+    lease_seconds: int = 300,
+    heartbeat_seconds: float = 60.0,
+) -> Any:
+    """Run one Agent patch only while its durable Source lease is current."""
+
+    activity_id = f"agent-patch-{uuid.uuid4().hex}"
+    await db.acquire_source_activity(
+        activity_id=activity_id,
+        source_id=source_id,
+        kind=SourceActivityKind.AGENT_PATCH,
+        expected_epoch=expected_epoch,
+        lease_seconds=lease_seconds,
+    )
+
+    async def heartbeat() -> None:
+        while True:
+            await asyncio.sleep(heartbeat_seconds)
+            await db.renew_source_activity(
+                activity_id=activity_id,
+                lease_seconds=lease_seconds,
+            )
+
+    patch_task = asyncio.create_task(operation())
+    heartbeat_task = asyncio.create_task(heartbeat())
+    try:
+        done, _ = await asyncio.wait(
+            {patch_task, heartbeat_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if heartbeat_task in done:
+            try:
+                await heartbeat_task
+            except Exception as exc:
+                patch_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await patch_task
+                raise SourceActivityConflict(
+                    f"agent patch activity heartbeat stopped: {activity_id}"
+                ) from exc
+            raise SourceActivityConflict(
+                f"agent patch activity heartbeat stopped: {activity_id}"
+            )
+        return await patch_task
+    finally:
+        heartbeat_task.cancel()
+        if not heartbeat_task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+        if not patch_task.done():
+            patch_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await patch_task
+        await db.release_source_activity(activity_id=activity_id)
 
 _KNOWN_CLIENT_SOURCE_NAMES: dict[str, str] = {
     "codex": "Codex Session",
@@ -993,6 +1059,14 @@ async def submit_agent_session_window(
             "reason": "empty window",
         }
 
+    source_id = agent_session_source_id(client, owner_user_id)
+    source = await db.get_source(source_id)
+    source_activity_epoch = (
+        int(source.get("activity_epoch") or 0)
+        if source is not None
+        else None
+    )
+
     if structured_llm_client is None:
         await _record_window_outcome(
             db=db,
@@ -1024,74 +1098,91 @@ async def submit_agent_session_window(
         )
         raise
 
-    prompt = await render_agent_knowledge_patch_prompt(
-        db=db,
-        owner_user_id=owner_user_id,
-        client=client,
-        session_id=session_id,
-        trigger=trigger,
-        workspace=workspace,
-        repo_identifier=repo_identifier,
-        branch=branch,
-        history_window=redacted_history_window,
-        events=canonical_events,
-        transcript_markdown=transcript_fallback,
-    )
-    try:
-        generated = await structured_llm_client.generate_agent_knowledge_patch(
-            prompt,
-            max_tokens=min(
-                config.llm.enrichment_max_tokens,
-                AGENT_SESSION_KNOWLEDGE_PATCH_MAX_TOKENS,
-            ),
-        )
-    except Exception as exc:
-        await _record_window_outcome(
-            db=db,
-            **outcome_identity,
-            outcome="failed",
-            reason=f"{type(exc).__name__}: {exc}"[:500],
-        )
-        raise
-
     citation = f"agent-window://{slugify(client)}/{slugify(session_id)}/sha256-{window_hash}"
-    try:
-        proposal = (
-            generated
-            if isinstance(generated, AgentKnowledgePatchProposal)
-            else AgentKnowledgePatchProposal.model_validate(generated)
-        )
-    except Exception as exc:
-        await _record_window_outcome(
+
+    async def generate_proposal() -> AgentKnowledgePatchProposal:
+        prompt = await render_agent_knowledge_patch_prompt(
             db=db,
-            **outcome_identity,
-            outcome="failed",
-            reason=f"{type(exc).__name__}: {exc}"[:500],
+            owner_user_id=owner_user_id,
+            client=client,
+            session_id=session_id,
+            trigger=trigger,
+            workspace=workspace,
+            repo_identifier=repo_identifier,
+            branch=branch,
+            history_window=redacted_history_window,
+            events=canonical_events,
+            transcript_markdown=transcript_fallback,
         )
-        raise ValueError(f"agent knowledge patch validation failed: {exc}") from exc
-    if citation not in proposal.citations:
-        proposal.citations.append(citation)
-
-    primary_evidence_error = _agent_patch_primary_evidence_error(proposal, canonical_events)
-    if primary_evidence_error:
-        proposal = AgentKnowledgePatchProposal(
-            action="no_output",
-            reason=primary_evidence_error,
-            covered_concept_id=proposal.covered_concept_id,
-            covered_claim_id=proposal.covered_claim_id,
+        try:
+            generated = await structured_llm_client.generate_agent_knowledge_patch(
+                prompt,
+                max_tokens=min(
+                    config.llm.enrichment_max_tokens,
+                    AGENT_SESSION_KNOWLEDGE_PATCH_MAX_TOKENS,
+                ),
+            )
+        except Exception as exc:
+            await _record_window_outcome(
+                db=db,
+                **outcome_identity,
+                outcome="failed",
+                reason=f"{type(exc).__name__}: {exc}"[:500],
+            )
+            raise
+        try:
+            proposal = (
+                generated
+                if isinstance(generated, AgentKnowledgePatchProposal)
+                else AgentKnowledgePatchProposal.model_validate(generated)
+            )
+        except Exception as exc:
+            await _record_window_outcome(
+                db=db,
+                **outcome_identity,
+                outcome="failed",
+                reason=f"{type(exc).__name__}: {exc}"[:500],
+            )
+            raise ValueError(f"agent knowledge patch validation failed: {exc}") from exc
+        if citation not in proposal.citations:
+            proposal.citations.append(citation)
+        primary_evidence_error = _agent_patch_primary_evidence_error(
+            proposal,
+            canonical_events,
         )
+        if primary_evidence_error:
+            return AgentKnowledgePatchProposal(
+                action="no_output",
+                reason=primary_evidence_error,
+                covered_concept_id=proposal.covered_concept_id,
+                covered_claim_id=proposal.covered_claim_id,
+            )
+        return proposal
 
-    if proposal.action == "no_output":
+    async def apply_proposal(
+        proposal: AgentKnowledgePatchProposal,
+        admitted_source: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         patch_service = AgentKnowledgeBundleService(db=db, memory_store=memory_store)
+        project_key = (
+            resolve_project_key(
+                admitted_source.get("project_binding"),
+                item_field_value=None,
+                repo=repo,
+                workspace=workspace,
+            )
+            if admitted_source is not None
+            else None
+        )
         patch = await patch_service.apply_patch_proposal(
             proposal=proposal,
             owner_user_id=owner_user_id,
-            source_id=agent_session_source_id(client, owner_user_id),
+            source_id=source_id,
             client=client,
             session_id=session_id,
             workspace=workspace,
             repo_identifier=repo_identifier,
-            project_key=None,
+            project_key=project_key,
             submitted_at=_parse_submitted_at(submitted_at),
             source_updated_at=(
                 _parse_source_updated_at(normalized_source_updated_at)
@@ -1099,6 +1190,53 @@ async def submit_agent_session_window(
                 else None
             ),
         )
+
+        if proposal.action != "no_output" and patch.outcome == "applied":
+            await _record_window_outcome(
+                db=db,
+                **outcome_identity,
+                outcome="knowledge_patched",
+                reason=patch.reason or "agent knowledge patch applied",
+                metadata={
+                    "patch_outcome": patch.outcome,
+                    "concept_id": patch.concept_id,
+                    "claim_id": patch.claim_id,
+                    "memory_id": patch.memory_id,
+                },
+            )
+            return {
+                "accepted": True,
+                "window_hash": f"sha256:{window_hash}",
+                "status": "processed",
+                "result": "knowledge_patched",
+                "patch_outcome": patch.outcome,
+                "concept_id": patch.concept_id,
+                "claim_id": patch.claim_id,
+                "memory_id": patch.memory_id,
+                "source_id": source_id,
+                "source_type": AGENT_SESSION_SOURCE_TYPE,
+                "process_now": process_now,
+            }
+
+        if proposal.action != "no_output":
+            reason = patch.reason or proposal.reason or "window had no durable memory value"
+            result = patch.result_bucket
+            await _record_window_outcome(
+                db=db,
+                **outcome_identity,
+                outcome=result,
+                reason=reason,
+                metadata={"patch_outcome": patch.outcome},
+            )
+            return {
+                "accepted": True,
+                "window_hash": f"sha256:{window_hash}",
+                "status": "processed",
+                "result": result,
+                "patch_outcome": patch.outcome,
+                "reason": reason,
+            }
+
         reason = patch.reason or proposal.reason or "window had no durable memory value"
         await _record_window_outcome(
             db=db,
@@ -1122,36 +1260,28 @@ async def submit_agent_session_window(
             "covered_claim_id": patch.covered_claim_id,
         }
 
-    source = await ensure_agent_session_source(
-        db,
-        config,
-        client=client,
-        owner_user_id=owner_user_id,
-    )
-    project = resolve_project_key(
-        source.get("project_binding"),
-        item_field_value=None,
-        repo=repo,
-        workspace=workspace,
-    )
-    patch_service = AgentKnowledgeBundleService(db=db, memory_store=memory_store)
+    async def generate_and_apply(admitted_source: dict[str, Any]) -> dict[str, Any]:
+        return await apply_proposal(await generate_proposal(), admitted_source)
 
-    try:
-        patch = await patch_service.apply_patch_proposal(
-            proposal=proposal,
-            owner_user_id=owner_user_id,
-            source_id=agent_session_source_id(client, owner_user_id),
+    if source is None:
+        preliminary = await generate_proposal()
+        if preliminary.action == "no_output":
+            return await apply_proposal(preliminary, None)
+        source = await ensure_agent_session_source(
+            db,
+            config,
             client=client,
-            session_id=session_id,
-            workspace=workspace,
-            repo_identifier=repo_identifier,
-            project_key=project,
-            submitted_at=_parse_submitted_at(submitted_at),
-            source_updated_at=(
-                _parse_source_updated_at(normalized_source_updated_at)
-                if normalized_source_updated_at is not None
-                else None
-            ),
+            owner_user_id=owner_user_id,
+        )
+        source_activity_epoch = int(source.get("activity_epoch") or 0)
+
+    assert source_activity_epoch is not None
+    try:
+        return await _run_agent_patch_with_activity(
+            db=db,
+            source_id=source_id,
+            expected_epoch=source_activity_epoch,
+            operation=lambda: generate_and_apply(source),
         )
     except Exception as exc:
         await _record_window_outcome(
@@ -1161,48 +1291,3 @@ async def submit_agent_session_window(
             reason=f"{type(exc).__name__}: {exc}"[:500],
         )
         raise
-
-    if patch.outcome != "applied":
-        reason = patch.reason or proposal.reason or "window had no durable memory value"
-        result = patch.result_bucket
-        await _record_window_outcome(
-            db=db,
-            **outcome_identity,
-            outcome=result,
-            reason=reason,
-            metadata={"patch_outcome": patch.outcome},
-        )
-        return {
-            "accepted": True,
-            "window_hash": f"sha256:{window_hash}",
-            "status": "processed",
-            "result": result,
-            "patch_outcome": patch.outcome,
-            "reason": reason,
-        }
-
-    await _record_window_outcome(
-        db=db,
-        **outcome_identity,
-        outcome="knowledge_patched",
-        reason=patch.reason or "agent knowledge patch applied",
-        metadata={
-            "patch_outcome": patch.outcome,
-            "concept_id": patch.concept_id,
-            "claim_id": patch.claim_id,
-            "memory_id": patch.memory_id,
-        },
-    )
-    return {
-        "accepted": True,
-        "window_hash": f"sha256:{window_hash}",
-        "status": "processed",
-        "result": "knowledge_patched",
-        "patch_outcome": patch.outcome,
-        "concept_id": patch.concept_id,
-        "claim_id": patch.claim_id,
-        "memory_id": patch.memory_id,
-        "source_id": agent_session_source_id(client, owner_user_id),
-        "source_type": AGENT_SESSION_SOURCE_TYPE,
-        "process_now": process_now,
-    }

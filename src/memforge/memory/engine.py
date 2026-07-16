@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from datetime import date, datetime, timezone
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any
@@ -38,6 +39,7 @@ from memforge.memory.lifecycle_planner import (
 )
 from memforge.memory.quality import classify_memory_candidate
 from memforge.source_access import memory_visibility_for_document
+from memforge.source_projection import ImpactResult, ProjectionCoverage, resolve_anchor_impact
 from memforge.models import (
     Memory,
     RawMemory,
@@ -371,6 +373,61 @@ class MemoryEngine:
                 incumbents_by_id.setdefault(memory.id, memory)
         return [incumbents_by_id[key] for key in sorted(incumbents_by_id)], unit_support
 
+    async def _partial_projection_protected_incumbents(
+        self,
+        *,
+        projection: SourceProjection,
+        incumbent_ids: frozenset[str],
+        unit_support: Mapping[str, tuple[str, ...]],
+    ) -> frozenset[str]:
+        """Return incumbents without deterministic affected-anchor proof.
+
+        A partial projection cannot authorize destructive mutation merely
+        because a model saw an incomplete rendering of the Source Unit.
+        Legacy, disjoint, and unknown anchors are therefore protected; only an
+        anchor resolved as AFFECTED may admit UPDATE/SUPERSEDE/DELETE.
+        """
+
+        if projection.coverage is not ProjectionCoverage.PARTIAL_PROJECTION:
+            return frozenset()
+        delta = projection.deltas[0]
+        protected: set[str] = set(incumbent_ids.difference(unit_support))
+        for memory_id, reference_ids in unit_support.items():
+            scoped_reference_ids = set(reference_ids)
+            evidence = await self.db.get_active_memory_support_evidence(
+                memory_id,
+                source_id=projection.source_id,
+            )
+            impacts = {
+                resolve_anchor_impact(item.anchor, delta)
+                for item in evidence
+                if item.reference_id in scoped_reference_ids
+            }
+            if ImpactResult.AFFECTED not in impacts:
+                protected.add(memory_id)
+        return frozenset(protected)
+
+    @staticmethod
+    def _enforce_partial_projection_keep(
+        operations: tuple[ReconcileOperation, ...],
+        protected_memory_ids: frozenset[str],
+    ) -> tuple[ReconcileOperation, ...]:
+        destructive = {
+            ReconcileAction.UPDATE,
+            ReconcileAction.SUPERSEDE,
+            ReconcileAction.DELETE,
+        }
+        return tuple(
+            ReconcileOperation(
+                action=ReconcileAction.NOOP,
+                memory_id=operation.memory_id,
+                reason="partial projection has no deterministic affected-anchor proof",
+            )
+            if operation.memory_id in protected_memory_ids and operation.action in destructive
+            else operation
+            for operation in operations
+        )
+
     async def _rebind_noop_evidence_to_current_revision(
         self,
         *,
@@ -645,26 +702,48 @@ class MemoryEngine:
             doc_id=doc_id,
             source_unit_id=scope.source_unit_id,
         )
-        if incumbents and not self.structured_llm_client:
-            raise RuntimeError("complete lifecycle reconciliation requires an LLM client")
-        result = await reconcile_memories(
-            new_extractions=filtered_memories,
-            existing_memories=incumbents,
-            doc_type=doc_type,
-            structured_llm_client=self.structured_llm_client,
-            llm_model=self.llm_model,
-            updated_document=document_content,
-            update_mode=update_mode,
-            changed_hunks=changed_hunks,
-            update_plan_stats=update_plan_stats,
-            include_metadata=True,
-        )
-        failure = getattr(result, "failure", None)
-        if failure is not None:
-            raise RuntimeError(
-                f"complete lifecycle reconciliation failed: {failure.error_type}: {failure.error}"
+        if not document_content.strip() and not filtered_memories:
+            operations = tuple(
+                ReconcileOperation(
+                    action=ReconcileAction.DELETE,
+                    memory_id=memory.id,
+                    reason="source observation is explicitly empty",
+                )
+                for memory in sorted(incumbents, key=lambda item: item.id)
             )
-        operations = tuple(getattr(result, "operations", result))
+        else:
+            if incumbents and not self.structured_llm_client:
+                raise RuntimeError(
+                    "complete lifecycle reconciliation requires an LLM client"
+                )
+            result = await reconcile_memories(
+                new_extractions=filtered_memories,
+                existing_memories=incumbents,
+                doc_type=doc_type,
+                structured_llm_client=self.structured_llm_client,
+                llm_model=self.llm_model,
+                updated_document=document_content,
+                update_mode=update_mode,
+                changed_hunks=changed_hunks,
+                update_plan_stats=update_plan_stats,
+                include_metadata=True,
+            )
+            failure = getattr(result, "failure", None)
+            if failure is not None:
+                raise RuntimeError(
+                    "complete lifecycle reconciliation failed: "
+                    f"{failure.error_type}: {failure.error}"
+                )
+            operations = tuple(getattr(result, "operations", result))
+        protected_memory_ids = await self._partial_projection_protected_incumbents(
+            projection=projection,
+            incumbent_ids=frozenset(memory.id for memory in incumbents),
+            unit_support=unit_support,
+        )
+        operations = self._enforce_partial_projection_keep(
+            operations,
+            protected_memory_ids,
+        )
         for operation in operations:
             if operation.action not in {
                 ReconcileAction.ADD,

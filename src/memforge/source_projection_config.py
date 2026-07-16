@@ -91,9 +91,7 @@ def canonical_projection_scope(source_type: str, config: Mapping[str, Any]) -> d
     scope = _canonical_fields(config, _SCOPE_FIELDS.get(source_type, ()))
     if source_type == "confluence":
         mode = str(scope.get("sync_mode") or "").lower()
-        mode = mode if mode in {"page_tree", "space"} else (
-            "page_tree" if scope.get("page_tree_root") else "space"
-        )
+        mode = mode if mode in {"page_tree", "space"} else ("page_tree" if scope.get("page_tree_root") else "space")
         scope["sync_mode"] = mode
         if mode == "page_tree":
             scope.pop("spaces", None)
@@ -108,6 +106,18 @@ def canonical_projection_scope(source_type: str, config: Mapping[str, Any]) -> d
         else:
             scope.pop("jql", None)
     return scope
+
+
+def projection_scope_fingerprint(scope: Mapping[str, object]) -> str:
+    """Return the stable identity of one canonical Projection Scope."""
+
+    payload = json.dumps(
+        dict(scope),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def projection_scope_transition_id(

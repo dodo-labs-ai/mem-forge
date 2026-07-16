@@ -1357,7 +1357,13 @@ def test_source_secret_field_policy_is_gene_driven_for_known_sources():
     assert _source_secret_fields("github_pages") == ("pat",)
     assert _source_secret_fields("teams") == ()
     assert _source_secret_fields("removed_confluence") == ("pat",)
-    _validate_source_config("teams", {"base_url": "http://teams.internal"})
+    _validate_source_config(
+        "teams",
+        {
+            "base_url": "http://teams.internal",
+            "conversation_ids": ["19:conversation@example.test"],
+        },
+    )
     with pytest.raises(ValueError, match="HTTPS"):
         _validate_source_config("removed_confluence", {"base_url": "http://wiki.internal", "pat": "legacy"})
 
@@ -1808,7 +1814,11 @@ async def test_non_secret_source_noop_update_preserves_sync_cursor(db, tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_run_source_sync_leaves_authentication_to_orchestrator(monkeypatch, tmp_path):
+async def test_run_source_sync_leaves_authentication_to_orchestrator(
+    db: Database,
+    monkeypatch,
+    tmp_path,
+):
     from memforge import runtime
     from memforge.models import SyncState
 
@@ -1841,8 +1851,17 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(monkeypatch
     gene = FakeGene()
     monkeypatch.setattr(runtime, "create_gene", lambda **_kwargs: gene)
 
+    await db.upsert_source(
+        id="src-agent-sessions",
+        type="agent_session",
+        name="Agent Sessions",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+
     await runtime.run_source_sync(
-        db=None,
+        db=db,
         config=_config(tmp_path),
         source={"id": "src-agent-sessions", "type": "agent_session", "name": "Agent Sessions", "config": {}},
         runtime=FakeRuntime(),
@@ -1852,7 +1871,11 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_run_source_sync_decrypts_gene_declared_secret_fields(monkeypatch, tmp_path):
+async def test_run_source_sync_decrypts_gene_declared_secret_fields(
+    db: Database,
+    monkeypatch,
+    tmp_path,
+):
     from memforge import runtime
     from memforge.genes import GENE_REGISTRY
     from memforge.genes.base import Gene
@@ -1937,8 +1960,17 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(monkeypatch,
     )
     fake_runtime = FakeRuntime()
 
+    await db.upsert_source(
+        id="src-api-key",
+        type="api_key_gene",
+        name="API Key",
+        config_json=json.dumps(source_config),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+
     await runtime.run_source_sync(
-        db=None,
+        db=db,
         config=_config(tmp_path),
         source={
             "id": "src-api-key",
@@ -2379,6 +2411,126 @@ async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_manual_sync_returns_conflict_during_lifecycle_maintenance(
+    db,
+    tmp_path,
+):
+    from memforge.memory.lifecycle_plan import (
+        LifecycleBackfillJob,
+        LifecycleBackfillJobStatus,
+    )
+    from memforge.server.admin_api import create_admin_app
+
+    source_id = "src-sync-maintenance-conflict"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Maintenance conflict",
+        config_json=json.dumps({"base_url": "https://wiki.example"}),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="lifecycle-sync-conflict",
+            source_id=source_id,
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(f"/api/sources/{source_id}/sync")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "source lifecycle maintenance active: lifecycle-sync-conflict"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["sync", "force-resync"])
+async def test_server_sync_routes_translate_atomic_activity_race_to_409(
+    db,
+    tmp_path,
+    monkeypatch,
+    route,
+):
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_activity import SourceActivityConflict
+
+    source_id = f"src-atomic-{route}"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Atomic activity conflict",
+        config_json=json.dumps({"base_url": "https://wiki.example"}),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+
+    async def lose_enqueue_race(**kwargs):
+        raise SourceActivityConflict("source activity started during enqueue")
+
+    monkeypatch.setattr(db, "enqueue_source_sync_run", lose_enqueue_race)
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        response = client.post(f"/api/sources/{source_id}/{route}")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "source activity started during enqueue"
+
+
+@pytest.mark.asyncio
+async def test_local_process_route_translates_atomic_activity_race_to_409(
+    db,
+    tmp_path,
+    monkeypatch,
+):
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_activity import SourceActivityConflict
+    from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
+
+    source_id = "src-local-process-atomic-race"
+    await db.upsert_source(
+        id=source_id,
+        type="local_markdown",
+        name="Local process atomic conflict",
+        config_json=json.dumps({"root": "/repo", "vault_id": "notes"}),
+        created_by_user_id=LOCAL_DEV_USER_ID,
+        execution_owner_user_id=LOCAL_DEV_USER_ID,
+        access_policy="workspace",
+        owner_user_id=LOCAL_DEV_USER_ID,
+    )
+
+    async def lose_enqueue_race(**kwargs):
+        raise SourceActivityConflict("source activity started during local enqueue")
+
+    async def allow_lease(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(db, "enqueue_source_sync_run", lose_enqueue_race)
+    app = create_admin_app(
+        db=db,
+        config=_config(tmp_path),
+        local_agent_lease_validator=allow_lease,
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/sources/{source_id}/process",
+            json={
+                "local_agent_job_id": "atomic-race-job",
+                "local_agent_attempt_count": 1,
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "source activity started during local enqueue"
+    )
+
+
+@pytest.mark.asyncio
 async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds(db, tmp_path):
     from datetime import datetime, timezone
 
@@ -2431,8 +2583,9 @@ async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds
             force_full_sync: bool = False,
             workspace_id: str = "default",
             input_snapshot_id: str | None = None,
+            source_config_revision: str | None = None,
         ):
-            del workspace_id, input_snapshot_id
+            del workspace_id, input_snapshot_id, source_config_revision
             self.enqueued.append((enqueued_source_id, trigger, force_full_sync))
 
             class Run:
@@ -2499,8 +2652,9 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
             force_full_sync: bool = False,
             workspace_id: str = "default",
             input_snapshot_id: str | None = None,
+            source_config_revision: str | None = None,
         ):
-            del workspace_id, input_snapshot_id
+            del workspace_id, input_snapshot_id, source_config_revision
             self.enqueued.append((enqueued_source_id, trigger, force_full_sync))
 
             class Run:

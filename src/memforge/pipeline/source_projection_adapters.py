@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Mapping
 
 from memforge.github_repo_utils import build_github_repo_doc_id
@@ -26,11 +27,13 @@ from memforge.source_projection import (
     SourceObservation,
     SourceObservationRevision,
     SourceProjection,
+    ProjectionScopeTransition,
     SourceRelation,
     SourceRelationType,
     SourceUnit,
     SourceUnitRevision,
 )
+from memforge.source_projection_config import projection_scope_fingerprint
 
 
 BUILTIN_SPECIALIZED_SOURCE_TYPES = frozenset(
@@ -45,27 +48,25 @@ BUILTIN_SPECIALIZED_SOURCE_TYPES = frozenset(
     }
 )
 
-_AUTHORITATIVE_FULL_DISCOVERY_SOURCE_TYPES = BUILTIN_SPECIALIZED_SOURCE_TYPES.difference(
-    {"teams", "agent_session"}
-)
-
-
 def source_run_projection_coverage(
     *,
-    source_type: str,
+    source_type: str | None = None,
     incremental: bool,
     authoritative_snapshot: bool,
+    discovery_complete: bool = False,
 ) -> ProjectionCoverage:
     """Declare absence authority for a complete source discovery run."""
 
+    del source_type
     if authoritative_snapshot:
         return ProjectionCoverage.COMPLETE_SNAPSHOT
     if incremental:
         return ProjectionCoverage.PARTIAL_PROJECTION
-    if source_type in _AUTHORITATIVE_FULL_DISCOVERY_SOURCE_TYPES:
+    if discovery_complete:
         return ProjectionCoverage.COMPLETE_SNAPSHOT
-    # Teams polling and append-only agent sessions do not prove absence. They
-    # require provider tombstones/delta tokens or an explicit submitted snapshot.
+    # Absence authority comes from run-scoped provider evidence, never from a
+    # source-type allowlist. Extension genes and conversational sources remain
+    # partial until they explicitly prove enumeration completion.
     return ProjectionCoverage.PARTIAL_PROJECTION
 
 
@@ -96,6 +97,79 @@ class GeneSourceProjectionAdapter:
             prior_unit_revision=envelope.prior_unit_revision,
             prior_observation_revisions=envelope.prior_observation_revisions,
         )
+
+    def reconciliation_coverage(
+        self,
+        *,
+        source_type: str,
+        transition: ProjectionScopeTransition,
+        current_units: tuple[SourceUnit, ...],
+        run_attestations: tuple[Mapping[str, object], ...] = (),
+    ) -> ProjectionCoverage | None:
+        """Return scoped absence proof after provider tombstones were applied."""
+
+        if source_type != "teams":
+            return None
+        selector_fields = {
+            "conversation_ids",
+            "channels",
+            "group_chats",
+            "individual_chats",
+        }
+        time_scope_fields = {"max_age_days"}
+        membership_partition_fields = {
+            "conversation_gap_minutes",
+            "max_block_messages",
+        }
+        supported_fields = selector_fields | time_scope_fields | membership_partition_fields
+        changed_fields = {
+            key
+            for key in set(transition.previous_scope) | set(transition.target_scope)
+            if transition.previous_scope.get(key) != transition.target_scope.get(key)
+        }
+        if not changed_fields or not changed_fields.issubset(supported_fields):
+            return None
+        from memforge.local_agent.source_contract import (
+            canonical_teams_conversation_ids,
+        )
+
+        try:
+            target_conversations = set(
+                canonical_teams_conversation_ids(
+                    transition.target_scope,
+                    require_nonempty=True,
+                )
+            )
+        except ValueError:
+            return None
+        if not _teams_run_attests_target_scope(
+            transition=transition,
+            target_conversations=target_conversations,
+            run_attestations=run_attestations,
+        ):
+            return None
+        current_window_units = tuple(unit for unit in current_units if unit.unit_type == "teams_window")
+        if any(unit.unit_type not in {"teams_window", "teams_scope_attestation"} for unit in current_units):
+            return None
+        if (changed_fields & selector_fields or target_conversations) and not all(
+            str(unit.locator.get("conversation_id") or "").strip() in target_conversations
+            for unit in current_window_units
+        ):
+            return None
+
+        target_fingerprint = projection_scope_fingerprint(transition.target_scope)
+        if changed_fields & membership_partition_fields:
+            target_partition_fingerprint = _teams_partition_scope_fingerprint(transition.target_scope)
+            if not all(
+                unit.locator.get("projection_scope_fingerprint") == target_fingerprint
+                or unit.locator.get("partition_scope_fingerprint") == target_partition_fingerprint
+                for unit in current_window_units
+            ):
+                return None
+        if changed_fields & time_scope_fields:
+            if not all(_teams_unit_attests_time_scope(unit, target_fingerprint) for unit in current_window_units):
+                return None
+        return ProjectionCoverage.TOMBSTONED_DELTA
 
 
 DEFAULT_SOURCE_PROJECTION_ADAPTER = GeneSourceProjectionAdapter()
@@ -131,6 +205,13 @@ def project_source_item(
         normalized=normalized,
     )
     projected_scope = dict(scope or {})
+    if source_type == "teams":
+        locator = _teams_scope_attested_locator(
+            locator=locator,
+            native=native,
+            coverage=coverage,
+            projected_scope=projected_scope,
+        )
     persisted_unit_id = projected_scope.get("source_unit_id")
     persisted_provider_key = projected_scope.get("source_unit_provider_key")
     incarnation = projected_scope.get("source_unit_incarnation")
@@ -359,6 +440,123 @@ def project_source_unit_tombstone(
     )
 
 
+def _teams_scope_attested_locator(
+    *,
+    locator: Mapping[str, object],
+    native: object,
+    coverage: ProjectionCoverage,
+    projected_scope: Mapping[str, object],
+) -> Mapping[str, object]:
+    configured_scope = projected_scope.get("configured_scope")
+    if not isinstance(configured_scope, Mapping):
+        return locator
+    fingerprint = projection_scope_fingerprint(configured_scope)
+    result = dict(locator)
+    result["partition_scope_fingerprint"] = _teams_partition_scope_fingerprint(configured_scope)
+    if coverage is ProjectionCoverage.COMPLETE_SNAPSHOT:
+        result["projection_scope_fingerprint"] = fingerprint
+        return result
+    if not isinstance(native, Mapping):
+        return result
+    covered_from = _normalized_utc_timestamp(native.get("_scope_coverage_from"))
+    covered_to = _normalized_utc_timestamp(native.get("_scope_coverage_to"))
+    if covered_from and covered_to and covered_from <= covered_to:
+        result.update(
+            {
+                "time_scope_fingerprint": fingerprint,
+                "time_scope_coverage_from": covered_from,
+                "time_scope_coverage_to": covered_to,
+            }
+        )
+    return result
+
+
+def _teams_partition_scope_fingerprint(scope: Mapping[str, object]) -> str:
+    values: dict[str, object] = {}
+    for field, default in (
+        ("conversation_gap_minutes", 60),
+        ("max_block_messages", 100),
+    ):
+        try:
+            values[field] = int(scope.get(field, default))
+        except (TypeError, ValueError):
+            values[field] = default
+    return projection_scope_fingerprint(values)
+
+
+def _teams_run_attests_target_scope(
+    *,
+    transition: ProjectionScopeTransition,
+    target_conversations: set[str],
+    run_attestations: tuple[Mapping[str, object], ...],
+) -> bool:
+    """Require one exact, successful, same-attempt poll per target conversation."""
+
+    target_fingerprint = projection_scope_fingerprint(transition.target_scope)
+    expected_conversations = sorted(target_conversations)
+    by_conversation: dict[str, Mapping[str, object]] = {}
+    attempt_ids: set[str] = set()
+    for attestation in run_attestations:
+        conversation_id = str(attestation.get("conversation_id") or "").strip()
+        target_values = attestation.get("target_conversation_ids")
+        poll = attestation.get("poll")
+        attempt_id = str(attestation.get("collection_attempt_id") or "").strip()
+        if (
+            conversation_id not in target_conversations
+            or str(attestation.get("transition_id") or "").strip() != transition.id
+            or attestation.get("target_scope_fingerprint") != target_fingerprint
+            or target_values != expected_conversations
+            or not attempt_id
+            or not isinstance(poll, Mapping)
+            or str(poll.get("raw_conversation_id") or "").strip() != conversation_id
+            or str(poll.get("access_probe_status") or "").strip().lower() != "ok"
+        ):
+            return False
+        stop_reason = str(poll.get("stop_reason") or "").strip()
+        if stop_reason == "no_backward_link":
+            if poll.get("pagination_complete") is not True:
+                return False
+        elif stop_reason == "cutoff_reached":
+            covered_from = _normalized_utc_timestamp(poll.get("absence_covered_from"))
+            covered_to = _normalized_utc_timestamp(poll.get("absence_covered_to"))
+            if not covered_from or not covered_to or covered_from > covered_to:
+                return False
+        else:
+            return False
+        if conversation_id in by_conversation:
+            return False
+        by_conversation[conversation_id] = attestation
+        attempt_ids.add(attempt_id)
+    return set(by_conversation) == target_conversations and len(attempt_ids) == 1
+
+
+def _teams_unit_attests_time_scope(
+    unit: SourceUnit,
+    target_fingerprint: str,
+) -> bool:
+    locator = unit.locator
+    if locator.get("projection_scope_fingerprint") == target_fingerprint:
+        return True
+    if locator.get("time_scope_fingerprint") != target_fingerprint:
+        return False
+    covered_from = _normalized_utc_timestamp(locator.get("time_scope_coverage_from"))
+    covered_to = _normalized_utc_timestamp(locator.get("time_scope_coverage_to"))
+    observed_to = _normalized_utc_timestamp(locator.get("observed_to"))
+    return bool(covered_from and covered_to and observed_to and covered_from <= observed_to <= covered_to)
+
+
+def _normalized_utc_timestamp(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 def _project_native(
     *,
     source_id: str,
@@ -389,9 +587,7 @@ def _project_native(
                 ),
             )
         semantic_body = native if isinstance(native, str) else normalized.markdown_body
-        display_body = str(
-            normalized.source_semantics.get("semantic_markdown") or normalized.markdown_body
-        )
+        display_body = str(normalized.source_semantics.get("semantic_markdown") or normalized.markdown_body)
         semantic_value = {
             "title": item.title,
             "body": semantic_body,
@@ -422,6 +618,9 @@ def _project_native(
         data = native if isinstance(native, dict) else {}
         if data.get("package_kind") and isinstance(data.get("raw_payload"), dict):
             data = data["raw_payload"]
+        from memforge.local_agent.jira_contract import validate_jira_observation_identities
+
+        validate_jira_observation_identities(data)
         fields = data.get("fields") if isinstance(data.get("fields"), dict) else {}
         raw_issue_id = data.get("id") or item.extra.get("issue_id")
         issue_id = str(raw_issue_id or "").strip()
@@ -452,7 +651,7 @@ def _project_native(
         for comment in comments:
             if not isinstance(comment, dict):
                 continue
-            comment_id = str(comment.get("id") or _canonical_hash(comment)[:16])
+            comment_id = str(comment["id"])
             body = comment.get("body")
             semantic_comment = {"body": body, "attachments": comment.get("attachments")}
             inputs.append(
@@ -472,7 +671,7 @@ def _project_native(
         for history in histories if isinstance(histories, list) else []:
             if not isinstance(history, dict):
                 continue
-            history_id = str(history.get("id") or _canonical_hash(history)[:16])
+            history_id = str(history["id"])
             inputs.append(
                 _ObservationInput(
                     "changelog",
@@ -484,15 +683,12 @@ def _project_native(
                 )
             )
         changelog_total = changelog.get("total")
-        changelog_incomplete = (
-            isinstance(changelog_total, int)
-            and changelog_total > len(histories if isinstance(histories, list) else [])
+        changelog_incomplete = isinstance(changelog_total, int) and changelog_total > len(
+            histories if isinstance(histories, list) else []
         )
         coverage = (
             ProjectionCoverage.PARTIAL_PROJECTION
-            if data.get("_comments_truncated")
-            or data.get("_changelog_truncated")
-            or changelog_incomplete
+            if data.get("_comments_truncated") or data.get("_changelog_truncated") or changelog_incomplete
             else ProjectionCoverage.COMPLETE_SNAPSHOT
         )
         return (
@@ -514,31 +710,28 @@ def _project_native(
             if value
         ) or str(item.extra.get("repo_url") or semantics.get("repo_url") or item.space_or_project)
         path = str(item.extra.get("relative_path") or semantics.get("relative_path") or item.item_id)
-        previous = item.extra.get("previous_filename") or semantics.get("previous_filename")
+        rename_attested = (
+            item.extra.get("rename_evidence_authoritative") is True
+            or semantics.get("rename_evidence_authoritative") is True
+        )
+        previous = (
+            item.extra.get("previous_filename") or semantics.get("previous_filename")
+            if rename_attested
+            else None
+        )
         explicit_lineage = item.extra.get("file_lineage_id") or semantics.get("file_lineage_id")
-        # GitHub compare payloads can prove a first rename with
-        # ``previous_filename`` even when a daemon has not supplied its own
-        # stable lineage key. Reuse the predecessor path as the Unit key so the
-        # move changes only location. Once committed, sync's durable document
-        # lineage supplies this Unit identity to later ordinary snapshots;
-        # explicit ``file_lineage_id`` remains the preferred provider key when
-        # it is available from the start.
+        # Git/GitHub does not expose an immutable file id. Built-in cloud-pull
+        # and local-push connectors therefore define path as file identity.
+        # Rename continuity is optional and accepted only when a provider
+        # adapter explicitly attests authoritative rename evidence (for
+        # example, a validated Compare API `renamed` record). Never infer a
+        # move from a matching blob SHA because copy+delete is ambiguous.
         lineage = str(explicit_lineage or previous or path)
         relations = ()
         if previous:
-            predecessor_document_id = item.extra.get(
-                "previous_document_id"
-            ) or semantics.get("previous_document_id")
-            repo_url = str(
-                item.extra.get("repo_url")
-                or semantics.get("repo_url")
-                or ""
-            )
-            repo_ref = str(
-                item.extra.get("repo_ref")
-                or semantics.get("repo_ref")
-                or ""
-            )
+            predecessor_document_id = item.extra.get("previous_document_id") or semantics.get("previous_document_id")
+            repo_url = str(item.extra.get("repo_url") or semantics.get("repo_url") or "")
+            repo_ref = str(item.extra.get("repo_ref") or semantics.get("repo_ref") or "")
             if not predecessor_document_id and repo_url and repo_ref:
                 predecessor_document_id = build_github_repo_doc_id(
                     source_id=source_id,
@@ -552,11 +745,7 @@ def _project_native(
                     "$unit",
                     f"github_file:{repo}:{previous}",
                     None,
-                    (
-                        {"predecessor_document_id": str(predecessor_document_id)}
-                        if predecessor_document_id
-                        else {}
-                    ),
+                    ({"predecessor_document_id": str(predecessor_document_id)} if predecessor_document_id else {}),
                 ),
             )
         return (
@@ -607,16 +796,38 @@ def _project_native(
         data = native if isinstance(native, dict) else {}
         if data.get("package_kind") and isinstance(data.get("raw_payload"), dict):
             data = data["raw_payload"]
+        if data.get("_scope_attestation") is True:
+            conversation_id = str(data.get("conversation_id") or "").strip()
+            poll = data.get("poll")
+            if not conversation_id or not isinstance(poll, Mapping):
+                raise ValueError("Teams scope attestation is invalid")
+            return (
+                "teams_scope_attestation",
+                conversation_id,
+                (),
+                (),
+                ProjectionCoverage.COMPLETE_SNAPSHOT,
+                {
+                    "conversation_id": conversation_id,
+                    "transition_id": data.get("transition_id"),
+                    "target_scope_fingerprint": data.get("target_scope_fingerprint"),
+                    "target_conversation_ids": data.get("target_conversation_ids"),
+                    "collection_attempt_id": data.get("collection_attempt_id"),
+                    "poll": dict(poll),
+                },
+            )
         window_id = str(item.extra.get("window_id") or data.get("window_id") or item.item_id)
         conversation_id = str(item.extra.get("conversation_id") or data.get("conversation_id") or "")
         messages = data.get("messages") if isinstance(data.get("messages"), list) else []
+        if messages:
+            from memforge.local_agent.teams_contract import validate_teams_canonical_messages
+
+            messages = list(validate_teams_canonical_messages(messages))
         inputs = []
         relations = []
         previous_key = None
         for message in messages:
-            if not isinstance(message, dict):
-                continue
-            message_id = str(message.get("id") or _canonical_hash(message)[:16])
+            message_id = str(message["id"])
             semantic_message = {
                 "content": message.get("content"),
                 "attachments": message.get("attachments"),
@@ -643,13 +854,36 @@ def _project_native(
             if data.get("authoritative_snapshot") or data.get("_authoritative_snapshot")
             else ProjectionCoverage.PARTIAL_PROJECTION
         )
+        observed_times = sorted(
+            str(message.get("time") or "").strip()
+            for message in messages
+            if isinstance(message, dict) and str(message.get("time") or "").strip()
+        )
+        observed_from = str(
+            item.extra.get("block_start")
+            or data.get("first_message_time")
+            or (observed_times[0] if observed_times else "")
+        ).strip()
+        observed_to = str(
+            item.extra.get("block_end")
+            or data.get("last_message_time")
+            or (observed_times[-1] if observed_times else "")
+        ).strip()
+        observed_from = _normalized_utc_timestamp(observed_from) or observed_from
+        observed_to = _normalized_utc_timestamp(observed_to) or observed_to
         return (
             "teams_window",
             window_id,
             tuple(inputs),
             tuple(relations),
             coverage,
-            {"conversation_id": conversation_id, "window_id": window_id, "url": item.source_url},
+            {
+                "conversation_id": conversation_id,
+                "window_id": window_id,
+                "observed_from": observed_from or None,
+                "observed_to": observed_to or None,
+                "url": item.source_url,
+            },
         )
     if source_type == "agent_session":
         data = native if isinstance(native, dict) else {}
