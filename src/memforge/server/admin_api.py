@@ -46,6 +46,7 @@ from memforge.genes.atlassian_auth import (
 from memforge.github_repo_utils import github_extension_allowed, github_include_extensions
 from memforge.memory.audit import AuditContext
 from memforge.memory.lifecycle import normalize_memory_status
+from memforge.memory.cutover import run_with_lifecycle_activity_heartbeat
 from memforge.memory.lifecycle_service import (
     MemoryLifecycleConflict,
     MemoryLifecycleNotFound,
@@ -3931,45 +3932,6 @@ def create_admin_app(
         replay_source["config"]["local_agent_package_manifest"] = selected_manifest
         return replay_source, True
 
-    async def _run_with_lifecycle_activity_heartbeat(
-        db: Database,
-        job_id: str,
-        operation: Callable[[], Awaitable[Any]],
-    ) -> Any:
-        """Run maintenance while continuously proving its durable lease."""
-
-        async def heartbeat() -> None:
-            while True:
-                await asyncio.sleep(60)
-                await db.renew_source_activity(
-                    activity_id=job_id,
-                    capability=job_id,
-                    lease_seconds=900,
-                )
-
-        work_task = asyncio.create_task(operation())
-        heartbeat_task = asyncio.create_task(heartbeat())
-        try:
-            done, _ = await asyncio.wait(
-                {work_task, heartbeat_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if heartbeat_task in done:
-                work_task.cancel()
-                try:
-                    await work_task
-                except asyncio.CancelledError:
-                    pass
-                await heartbeat_task
-                raise SourceActivityConflict(f"source lifecycle activity heartbeat stopped: {job_id}")
-            return await work_task
-        finally:
-            heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
-
     async def _run_lifecycle_backfill_safely(
         db: Database,
         source_id: str,
@@ -4061,7 +4023,7 @@ def create_admin_app(
             )
 
         try:
-            await _run_with_lifecycle_activity_heartbeat(
+            await run_with_lifecycle_activity_heartbeat(
                 db,
                 job_id,
                 run_recovery,
@@ -4181,7 +4143,7 @@ def create_admin_app(
             )
 
         try:
-            await _run_with_lifecycle_activity_heartbeat(
+            await run_with_lifecycle_activity_heartbeat(
                 db,
                 job_id,
                 run_rebaseline,
@@ -4348,7 +4310,7 @@ def create_admin_app(
             return repaired_finding, backfill_result
 
         try:
-            finding, result = await _run_with_lifecycle_activity_heartbeat(
+            finding, result = await run_with_lifecycle_activity_heartbeat(
                 db,
                 job.id,
                 run_finding_repair,

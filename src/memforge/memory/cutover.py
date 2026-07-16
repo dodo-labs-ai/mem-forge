@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
@@ -25,9 +26,11 @@ from memforge.memory.lifecycle_plan import (
     LifecycleCutoverFinding,
     LifecycleBackfillJob,
     LifecycleBackfillJobStatus,
+    LifecycleGateState,
 )
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.source_activity import SourceActivityConflict
 from memforge.source_projection import (
     AnchorKind,
     SourceAnchor,
@@ -43,6 +46,98 @@ class CutoverBackfillResult:
     mapped_memories: int
     finding_count: int
     gate_enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AgentSessionLifecycleMigrationCandidate:
+    """Safe operator inventory row for one Agent Session migration target."""
+
+    source_id: str
+    gate_state: LifecycleGateState
+    active_memory_count: int
+    missing_support_count: int
+
+
+async def run_with_lifecycle_activity_heartbeat(
+    db: Any,
+    job_id: str,
+    operation: Callable[[], Awaitable[Any]],
+    *,
+    heartbeat_interval_seconds: float = 60,
+    lease_seconds: int = 900,
+) -> Any:
+    """Run lifecycle maintenance while continuously proving its durable lease."""
+
+    async def heartbeat() -> None:
+        while True:
+            await asyncio.sleep(heartbeat_interval_seconds)
+            await db.renew_source_activity(
+                activity_id=job_id,
+                capability=job_id,
+                lease_seconds=lease_seconds,
+            )
+
+    work_task = asyncio.create_task(operation())
+    heartbeat_task = asyncio.create_task(heartbeat())
+    try:
+        done, _ = await asyncio.wait(
+            {work_task, heartbeat_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        # Job completion owns lease release. If both tasks become observable in
+        # the same loop turn, its result is authoritative over a renewal that
+        # raced after that release.
+        if work_task in done:
+            return await work_task
+        try:
+            await heartbeat_task
+        except Exception as exc:
+            raise SourceActivityConflict(
+                f"source lifecycle activity heartbeat stopped: {job_id}"
+            ) from exc
+        raise SourceActivityConflict(f"source lifecycle activity heartbeat stopped: {job_id}")
+    finally:
+        for task in (work_task, heartbeat_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(work_task, heartbeat_task, return_exceptions=True)
+
+
+async def list_agent_session_lifecycle_migration_candidates(
+    db: Any,
+) -> tuple[AgentSessionLifecycleMigrationCandidate, ...]:
+    """Inventory active Agent Session sources without applying visibility filters.
+
+    This backend-only seam intentionally returns identifiers and counts, never
+    private source content or owner identity. An enabled gate is not accepted as
+    proof by itself: the same-source active support invariant is checked again.
+    """
+
+    candidates: list[AgentSessionLifecycleMigrationCandidate] = []
+    for source in await db.list_sources():
+        if (
+            str(source.get("type") or "") != "agent_session"
+            or str(source.get("status") or "") != "active"
+            or str(source.get("access_state") or "active") != "active"
+        ):
+            continue
+        source_id = str(source["id"])
+        active_memory_count = await db.count_active_source_memories(source_id)
+        if active_memory_count == 0:
+            continue
+        gate = await db.get_lifecycle_gate(source_id)
+        missing_support_count = await db.count_active_source_memories_without_support(source_id)
+        if gate.state is LifecycleGateState.ENABLED and missing_support_count == 0:
+            continue
+        candidates.append(
+            AgentSessionLifecycleMigrationCandidate(
+                source_id=source_id,
+                gate_state=gate.state,
+                active_memory_count=active_memory_count,
+                missing_support_count=missing_support_count,
+            )
+        )
+    return tuple(sorted(candidates, key=lambda candidate: candidate.source_id))
 
 
 async def run_source_lifecycle_backfill_job(
@@ -66,6 +161,15 @@ async def run_source_lifecycle_backfill_job(
         raise ValueError(f"lifecycle backfill job is already {job.status.value}")
     await db.start_lifecycle_backfill_job(job.id)
     try:
+        missing_support_count = await db.count_active_source_memories_without_support(source_id)
+        if missing_support_count:
+            await db.gate_destructive_lifecycle(
+                source_id,
+                reason=(
+                    "lifecycle recovery detected "
+                    f"{missing_support_count} active Memory support invariant violation(s)"
+                ),
+            )
         result = await run_source_lifecycle_backfill(db, source_id)
         return await db.complete_lifecycle_backfill_job(
             job.id,
@@ -109,6 +213,15 @@ async def run_source_lifecycle_recovery_job(
         raise ValueError(f"lifecycle backfill job is already {job.status.value}")
     await db.start_lifecycle_backfill_job(job.id)
     try:
+        missing_support_count = await db.count_active_source_memories_without_support(source_id)
+        if missing_support_count:
+            await db.gate_destructive_lifecycle(
+                source_id,
+                reason=(
+                    "lifecycle recovery detected "
+                    f"{missing_support_count} active Memory support invariant violation(s)"
+                ),
+            )
         result = await run_source_lifecycle_backfill(db, source_id)
         if result.finding_count and reconstruct_documents is not None:
             missing_projection_ids = await _missing_projection_document_ids(db, source_id)

@@ -483,6 +483,12 @@ class SqliteRelationalStore:
     ) -> list[LegacyMemoryProvenance]:
         return await self._db.list_legacy_memory_provenance(source_id)
 
+    async def count_active_source_memories_without_support(self, source_id: str) -> int:
+        return await self._db.count_active_source_memories_without_support(source_id)
+
+    async def count_active_source_memories(self, source_id: str) -> int:
+        return await self._db.count_active_source_memories(source_id)
+
     async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate:
         return await self._db.get_lifecycle_gate(source_id)
 
