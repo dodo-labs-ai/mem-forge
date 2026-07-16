@@ -116,7 +116,15 @@ def _projection(
     )
 
 
-def _jira_projection(*, run_id: str, description: str, prior=None, prior_observations=None):
+def _jira_projection(
+    *,
+    run_id: str,
+    description: str,
+    comment_body: str = "Decision: retain A7",
+    comments_truncated: bool = False,
+    prior=None,
+    prior_observations=None,
+):
     item = ContentItem(
         item_id="confluence-123",
         title="PAY-12",
@@ -128,9 +136,23 @@ def _jira_projection(*, run_id: str, description: str, prior=None, prior_observa
     payload = {
         "id": "10012",
         "key": "PAY-12",
-        "fields": {"summary": "Payroll", "description": description},
-        "_comments": [{"id": "502", "body": "Decision: retain A7"}],
+        "fields": {
+            "summary": "Payroll",
+            "description": description,
+            "status": None,
+            "priority": None,
+            "assignee": None,
+            "labels": [],
+            "resolution": None,
+            "updated": "2026-07-15T10:00:00Z",
+        },
+        "_comments": [{"id": "502", "body": comment_body}],
+        "_comments_included": True,
+        "_comments_total": 2 if comments_truncated else 1,
+        "changelog": {"startAt": 0, "histories": [], "total": 0},
     }
+    if comments_truncated:
+        payload["_comments_truncated"] = {"returned": 1, "total": 2}
     return project_source_item(
         source_id="src-1",
         source_type="jira",
@@ -199,6 +221,23 @@ class _NoopClient:
                     pair_index=0,
                     classification="contradiction",
                     reason="Independent source still says A7 is removed.",
+                )
+            ]
+        )
+
+
+class _DeleteClient:
+    def __init__(self, incumbent_id: str) -> None:
+        self.incumbent_id = incumbent_id
+
+    async def reconcile_memories(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return ReconciliationResponse(
+            decisions=[
+                ReconciliationDecision(
+                    action="DELETE",
+                    memory_id=self.incumbent_id,
+                    reason="The incomplete rendering appears to omit the claim.",
                 )
             ]
         )
@@ -286,36 +325,43 @@ async def _seed_incumbent_support(
     *,
     projection,
     memory_id: str = "mem-old",
+    memory_content: str = "A7 is removed.",
+    observation_index: int = 0,
+    source_type: str = "confluence",
 ) -> Memory:
     incumbent = Memory(
         id=memory_id,
         memory_type="decision",
-        content="A7 is removed.",
-        content_hash=content_hash("A7 is removed."),
+        content=memory_content,
+        content_hash=content_hash(memory_content),
     )
     await db.insert_memory(incumbent)
     await db.add_memory_source(
         incumbent.id,
         "confluence-123",
-        "confluence",
-        "A7 is removed.",
+        source_type,
+        memory_content,
         source_updated_at=None,
     )
-    revision = projection.observation_revisions[0]
+    observation = projection.observations[observation_index]
+    revisions_by_observation = {
+        item.observation_id: item for item in projection.observation_revisions
+    }
+    revision = revisions_by_observation[observation.id]
     unit = EvidenceUnit(
         id=f"eu-{memory_id}",
         source_id="src-1",
         doc_id="confluence-123",
         doc_revision_id=projection.source_unit_revisions[0].id,
-        source_type="confluence",
-        source_anchor=projection.observations[0].id,
+        source_type=source_type,
+        source_anchor=observation.id,
         source_lineage_id=projection.source_units[0].id,
         project_key="ENG",
         visibility="workspace",
         owner_user_id=None,
         repo_identifier=None,
         content=revision.content,
-        excerpt="A7 is removed.",
+        excerpt=memory_content,
         evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
         access_context_hash="workspace-eng",
     )
@@ -328,7 +374,7 @@ async def _seed_incumbent_support(
                     role=EvidenceRole.PRIMARY,
                     anchor=SourceAnchor(
                         kind=AnchorKind.WHOLE_OBSERVATION,
-                        observation_id=projection.observations[0].id,
+                        observation_id=observation.id,
                         observation_revision_id=revision.id,
                     ),
                 ),
@@ -561,6 +607,56 @@ async def test_incremental_noop_rebinds_exact_unchanged_claim_without_new_extrac
     assert evidence.anchor.observation_revision_id == second.observation_revisions[0].id
 
 
+@pytest.mark.asyncio
+async def test_explicit_empty_revision_deterministically_removes_incumbent_support(
+    db: Database,
+) -> None:
+    first = _projection(
+        run_id="projection-empty-1",
+        body="A7 is removed.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    await db.enable_lifecycle_gate("src-1")
+    second = _projection(
+        run_id="projection-empty-2",
+        body="",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            first.observations[0].id: first.observation_revisions[0]
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=None,
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content="",
+        update_mode="diff_guided",
+        changed_hunks="A7 is removed. -> empty",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert stats["deleted"] == 1
+    assert await db.get_active_memory_support_reference_ids(incumbent.id) == ()
+    retired = await db.get_memory(incumbent.id)
+    assert retired is not None
+    assert retired.status == "retired"
+
+
 async def _seed_jira_required_incumbent(
     db: Database,
     first: SourceProjection,
@@ -635,6 +731,127 @@ async def _seed_jira_required_incumbent(
             )
         )
     return incumbent
+
+
+@pytest.mark.asyncio
+async def test_partial_jira_projection_forces_disjoint_incumbent_keep(db: Database) -> None:
+    first = _jira_projection(
+        run_id="projection-jira-partial-fence-1",
+        description="Initial issue description.",
+        comment_body="Decision: retain A7",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-jira-disjoint",
+        memory_content="Decision: retain A7",
+        observation_index=1,
+        source_type="jira",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    second = _jira_projection(
+        run_id="projection-jira-partial-fence-2",
+        description="Changed issue description.",
+        comment_body="Decision: retain A7",
+        comments_truncated=True,
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    assert second.coverage.value == "partial_projection"
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_DeleteClient(incumbent.id),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content="PAY-12 changed description",
+        update_mode="diff_guided",
+        changed_hunks="description changed; comment page is truncated",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+
+    current = await db.get_memory(incumbent.id)
+    assert current is not None and current.status == "active"
+    assert stats["deleted"] == 0
+    assert stats["noop"] == 1
+    assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
+
+
+@pytest.mark.asyncio
+async def test_partial_jira_projection_admits_directly_affected_incumbent_delete(
+    db: Database,
+) -> None:
+    first = _jira_projection(
+        run_id="projection-jira-partial-affected-1",
+        description="A7 is retained.",
+        comment_body="Unrelated comment",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-jira-affected",
+        memory_content="A7 is retained.",
+        observation_index=0,
+        source_type="jira",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    second = _jira_projection(
+        run_id="projection-jira-partial-affected-2",
+        description="A7 is removed.",
+        comment_body="Unrelated comment",
+        comments_truncated=True,
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    assert second.coverage.value == "partial_projection"
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_DeleteClient(incumbent.id),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content="PAY-12 changed description",
+        update_mode="diff_guided",
+        changed_hunks="description changed; comment page is truncated",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+
+    current = await db.get_memory(incumbent.id)
+    assert current is not None and current.status == "retired"
+    assert stats["deleted"] == 1
 
 
 @pytest.mark.asyncio

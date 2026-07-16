@@ -988,9 +988,19 @@ async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: D
         item=item,
         body=json.dumps(
             {
-                "messages": [
-                    {"id": "message-1", "content": "Repeated quote", "attachments": []},
-                    {"id": "message-2", "content": "Repeated quote", "attachments": []},
+                    "messages": [
+                        {
+                            "id": "message-1",
+                            "content": "Repeated quote",
+                            "attachments": [],
+                            "time": "2026-07-15T10:00:00Z",
+                        },
+                        {
+                            "id": "message-2",
+                            "content": "Repeated quote",
+                            "attachments": [],
+                            "time": "2026-07-15T10:01:00Z",
+                        },
                 ]
             }
         ).encode(),
@@ -1121,6 +1131,7 @@ async def test_source_allows_only_one_active_lifecycle_job(db: Database) -> None
             status=LifecycleBackfillJobStatus.QUEUED,
         )
     )
+    assert await db.get_active_lifecycle_backfill_job("src-1") == first
 
     with pytest.raises(ValueError, match="source lifecycle job already active"):
         await db.create_lifecycle_backfill_job(
@@ -1132,6 +1143,11 @@ async def test_source_allows_only_one_active_lifecycle_job(db: Database) -> None
         )
 
     assert await db.create_lifecycle_backfill_job(first) == first
+
+    await db.start_lifecycle_backfill_job(first.id)
+    assert (await db.get_active_lifecycle_backfill_job("src-1")).status is LifecycleBackfillJobStatus.RUNNING
+    await db.fail_lifecycle_backfill_job(first.id, error="test terminal state")
+    assert await db.get_active_lifecycle_backfill_job("src-1") is None
 
 
 @pytest.mark.asyncio

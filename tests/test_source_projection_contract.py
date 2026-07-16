@@ -88,7 +88,7 @@ def test_partial_projection_cannot_claim_absence() -> None:
         )
 
 
-def test_whole_observation_anchor_is_never_disjoint_from_same_observation_change() -> None:
+def test_whole_observation_anchor_is_affected_by_same_observation_change() -> None:
     delta = RevisionDelta(
         source_unit_id="unit-1",
         previous_unit_revision_id="unitrev-1",
@@ -98,7 +98,7 @@ def test_whole_observation_anchor_is_never_disjoint_from_same_observation_change
         changed_anchors=(_anchor(fragment_id="section-new"),),
     )
 
-    assert resolve_anchor_impact(_anchor(), delta) is ImpactResult.UNKNOWN
+    assert resolve_anchor_impact(_anchor(), delta) is ImpactResult.AFFECTED
 
 
 def test_fragment_mapping_can_prove_affected_or_disjoint() -> None:

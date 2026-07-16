@@ -144,6 +144,23 @@ class SourceUnit:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceUnitInventoryFilter:
+    """Provider-neutral predicates over active Source Unit locator metadata."""
+
+    unit_type: str | None = None
+    locator_equals: Mapping[str, str] = field(default_factory=dict)
+    observed_from_lte: str | None = None
+    observed_to_gte: str | None = None
+    observed_to_lt: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceUnitInventoryPage:
+    units: tuple[SourceUnit, ...]
+    next_cursor: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SourceUnitRevision:
     id: str
     source_unit_id: str
@@ -260,9 +277,7 @@ class SourceProjection:
         _require_unique("source unit revision", tuple(item.id for item in self.source_unit_revisions))
         unit_ids = {item.id for item in self.source_units}
         observations_by_id = {item.id: item for item in self.observations}
-        observation_revisions_by_id = {
-            item.id: item for item in self.observation_revisions
-        }
+        observation_revisions_by_id = {item.id: item for item in self.observation_revisions}
         unit_revisions_by_id = {item.id: item for item in self.source_unit_revisions}
         if any(item.source_id != self.source_id for item in self.source_units):
             raise ValueError("all source units must belong to the projection source")
@@ -274,9 +289,7 @@ class SourceProjection:
             if item.observation_id in observations_by_id:
                 continue
             if not item.metadata.get("carried_forward"):
-                raise ValueError(
-                    "every Observation Revision must reference a projected Observation"
-                )
+                raise ValueError("every Observation Revision must reference a projected Observation")
         for unit_revision in self.source_unit_revisions:
             if unit_revision.source_unit_id not in unit_ids:
                 raise ValueError("every Source Unit Revision must reference a projected Source Unit")
@@ -286,12 +299,8 @@ class SourceProjection:
                     raise ValueError("Source Unit Revision references an unknown Observation Revision")
                 observation = observations_by_id.get(observation_revision.observation_id)
                 carried_unit_id = observation_revision.metadata.get("source_unit_id")
-                if (
-                    observation is not None
-                    and observation.source_unit_id != unit_revision.source_unit_id
-                ) or (
-                    observation is None
-                    and carried_unit_id != unit_revision.source_unit_id
+                if (observation is not None and observation.source_unit_id != unit_revision.source_unit_id) or (
+                    observation is None and carried_unit_id != unit_revision.source_unit_id
                 ):
                     raise ValueError("Source Unit Revision references another unit's Observation")
         for delta in self.deltas:
@@ -310,8 +319,7 @@ class SourceProjection:
                 if (
                     revision is None
                     or revision.observation_id != anchor.observation_id
-                    or observations_by_id[anchor.observation_id].source_unit_id
-                    != delta.source_unit_id
+                    or observations_by_id[anchor.observation_id].source_unit_id != delta.source_unit_id
                 ):
                     raise ValueError("Revision Delta anchor is not pinned to its projected Source Unit")
             for mapping in delta.fragment_mappings:
@@ -319,8 +327,7 @@ class SourceProjection:
                 if (
                     current_revision is None
                     or current_revision.observation_id != mapping.observation_id
-                    or observations_by_id[mapping.observation_id].source_unit_id
-                    != delta.source_unit_id
+                    or observations_by_id[mapping.observation_id].source_unit_id != delta.source_unit_id
                 ):
                     raise ValueError("Fragment Mapping current revision is not projected for its Source Unit")
 
@@ -328,6 +335,14 @@ class SourceProjection:
 @runtime_checkable
 class SourceProjectionAdapter(Protocol):
     async def project(self, envelope: ProjectionEnvelope) -> SourceProjection: ...
+    def reconciliation_coverage(
+        self,
+        *,
+        source_type: str,
+        transition: ProjectionScopeTransition,
+        current_units: tuple[SourceUnit, ...],
+        run_attestations: tuple[Mapping[str, object], ...] = (),
+    ) -> ProjectionCoverage | None: ...
 
 
 @runtime_checkable
@@ -353,6 +368,14 @@ class ProjectionStore(Protocol):
         self,
         source_unit_id: str,
     ) -> tuple[str, ...]: ...
+    async def list_current_source_units_page(
+        self,
+        source_id: str,
+        *,
+        filters: SourceUnitInventoryFilter,
+        cursor: str | None = None,
+        limit: int = 200,
+    ) -> SourceUnitInventoryPage: ...
 
 
 def source_projection_to_payload(projection: SourceProjection) -> dict[str, object]:
@@ -582,7 +605,11 @@ def resolve_anchor_impact(anchor: SourceAnchor, delta: RevisionDelta) -> ImpactR
     if not changed:
         return ImpactResult.DISJOINT
     if anchor.kind is AnchorKind.WHOLE_OBSERVATION:
-        return ImpactResult.UNKNOWN
+        # A whole-observation support anchor is affected by any semantic
+        # change to that same Observation.  Returning UNKNOWN here prevented
+        # partial Jira/Teams projections from reconciling the exact incumbent
+        # they had deterministically changed, leaving stale Memory active.
+        return ImpactResult.AFFECTED
 
     if anchor.kind is AnchorKind.REVISION_RANGE:
         if not all(item.kind is AnchorKind.REVISION_RANGE for item in changed):

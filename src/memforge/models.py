@@ -414,6 +414,12 @@ class RawContent:
     item: ContentItem
     body: bytes
     content_type: str
+    # Empty bytes are ambiguous by default: they can mean a genuinely empty
+    # provider object, a truncated response, or a connector failure.  A Gene
+    # must opt in only after a successful provider read established that the
+    # source object itself is authoritatively empty.
+    authoritative_empty: bool = False
+    empty_evidence: str | None = None
 
 
 @dataclass
@@ -514,6 +520,10 @@ class SourceSyncRun:
     force_full_sync: bool = False
     input_snapshot_id: str | None = None
     rerun_input_snapshot_id: str | None = None
+    input_generation_watermark: int | None = None
+    rerun_input_generation_watermark: int | None = None
+    source_config_revision: str | None = None
+    rerun_source_config_revision: str | None = None
     coalesced: bool = False
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None

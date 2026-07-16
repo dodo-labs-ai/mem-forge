@@ -281,6 +281,21 @@ def test_start_source_processing_resolves_the_workspace_resource_url(monkeypatch
     ]
 
 
+def test_get_source_projection_inventory_uses_source_resource_url():
+    client = _RecordingClient({"units": []})
+
+    result = client.get_source_projection_inventory("src teams")
+
+    assert result == {"units": []}
+    assert client.calls == [
+        (
+            "GET",
+            "/api/sources/src%20teams/projection-inventory?limit=200",
+            None,
+        )
+    ]
+
+
 def test_local_agent_job_methods_use_cloud_local_agent_contract():
     client = _RecordingClient({"jobs": []})
 

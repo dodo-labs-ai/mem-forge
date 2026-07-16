@@ -42,6 +42,7 @@ class RepoApiClient:
         if url.endswith("/api/v3/repos/payroll/architecture/git/trees/main?recursive=1"):
             return GithubResponse(
                 {
+                    "truncated": False,
                     "tree": [
                         {
                             "path": "Payroll Processing/README.md",
@@ -72,8 +73,12 @@ class RepoApiClient:
                 url=url,
             )
         if url.endswith("/api/v3/repos/payroll/architecture/contents/Payroll%20Processing/README.md?ref=main"):
-            encoded = base64.b64encode(b"# Payroll Processing\n\nCreate tasks carefully.").decode()
-            return GithubResponse({"content": encoded}, url=url)
+            body = b"# Payroll Processing\n\nCreate tasks carefully."
+            encoded = base64.b64encode(body).decode()
+            return GithubResponse(
+                {"sha": "readme-sha", "content": encoded, "encoding": "base64", "size": len(body)},
+                url=url,
+            )
         raise AssertionError(f"unexpected URL: {url}")
 
     async def aclose(self) -> None:
@@ -141,6 +146,8 @@ async def test_cloud_pull_discovers_scoped_markdown_and_fetches_content(monkeypa
     assert item.extra["repo_name"] == "architecture"
     assert item.extra["repo_ref"] == "main"
     assert item.extra["blob_sha"] == "readme-sha"
+    assert item.extra["file_identity_contract"] == "repository_path"
+    assert "previous_filename" not in item.extra
 
     raw = await gene.fetch(item)
     normalized = await gene.normalize(raw)
@@ -201,6 +208,105 @@ async def test_cloud_pull_rejects_truncated_git_tree(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cloud_pull_rejects_missing_git_tree_without_completion_evidence(monkeypatch):
+    class MissingTreeClient(RepoApiClient):
+        async def get(self, url: str):
+            self.calls.append(("GET", url))
+            if url.endswith("/api/v3/repos/payroll/architecture/git/trees/main?recursive=1"):
+                return GithubResponse({}, url=url)
+            raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr("memforge.genes.github_repo_gene._RequestsAsyncClient", MissingTreeClient)
+    gene = GitHubRepoGene(
+        config={
+            "connection_mode": "cloud_pull",
+            "repo_url": "https://github.example.test/payroll/architecture",
+            "ref": "main",
+        },
+        source_id="src-github-repo",
+    )
+
+    await gene.authenticate()
+    with pytest.raises(RuntimeError, match="truncated=false"):
+        _ = [item async for item in gene.discover()]
+    assert gene.discovery_complete is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tree_payload",
+    [
+        {"truncated": None, "tree": []},
+        {
+            "truncated": False,
+            "tree": [
+                {"path": "docs/a.md", "type": "blob", "sha": "sha-a"},
+                {"path": "docs/a.md", "type": "blob", "sha": "sha-b"},
+            ],
+        },
+        {"truncated": False, "tree": [{"path": "docs/a.md", "type": "blob", "sha": ""}]},
+    ],
+)
+async def test_cloud_pull_rejects_tree_without_unique_stable_inventory(monkeypatch, tree_payload):
+    class InvalidInventoryClient(RepoApiClient):
+        async def get(self, url: str):
+            self.calls.append(("GET", url))
+            if url.endswith("/api/v3/repos/payroll/architecture/git/trees/main?recursive=1"):
+                return GithubResponse(tree_payload, url=url)
+            raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr("memforge.genes.github_repo_gene._RequestsAsyncClient", InvalidInventoryClient)
+    gene = GitHubRepoGene(
+        config={
+            "connection_mode": "cloud_pull",
+            "repo_url": "https://github.example.test/payroll/architecture",
+            "ref": "main",
+        },
+        source_id="src-github-repo",
+    )
+
+    await gene.authenticate()
+    with pytest.raises(RuntimeError):
+        _ = [item async for item in gene.discover()]
+    assert gene.discovery_complete is False
+
+
+@pytest.mark.asyncio
+async def test_cloud_pull_rejects_contents_blob_that_changed_after_discovery(monkeypatch):
+    class ChangedBlobClient(RepoApiClient):
+        async def get(self, url: str):
+            if "/contents/Payroll%20Processing/README.md?ref=main" in url:
+                body = b"changed"
+                return GithubResponse(
+                    {
+                        "sha": "newer-sha",
+                        "content": base64.b64encode(body).decode(),
+                        "encoding": "base64",
+                        "size": len(body),
+                    },
+                    url=url,
+                )
+            return await super().get(url)
+
+    monkeypatch.setattr("memforge.genes.github_repo_gene._RequestsAsyncClient", ChangedBlobClient)
+    gene = GitHubRepoGene(
+        config={
+            "connection_mode": "cloud_pull",
+            "repo_url": "https://github.example.test/payroll/architecture",
+            "ref": "main",
+            "exclude_paths": ["Flexible Payroll", "Payroll Processing V2"],
+            "include_extensions": ["md"],
+        },
+        source_id="src-github-repo",
+    )
+
+    await gene.authenticate()
+    item = [item async for item in gene.discover()][0]
+    with pytest.raises(RuntimeError, match="blob identity mismatch"):
+        await gene.fetch(item)
+
+
+@pytest.mark.asyncio
 async def test_cloud_pull_rejects_contents_api_non_base64_payload(monkeypatch):
     class LargeFileClient(RepoApiClient):
         async def get(self, url: str):
@@ -208,6 +314,7 @@ async def test_cloud_pull_rejects_contents_api_non_base64_payload(monkeypatch):
             if url.endswith("/api/v3/repos/payroll/architecture/git/trees/main?recursive=1"):
                 return GithubResponse(
                     {
+                        "truncated": False,
                         "tree": [
                             {
                                 "path": "Payroll Processing/Large.md",
@@ -220,7 +327,10 @@ async def test_cloud_pull_rejects_contents_api_non_base64_payload(monkeypatch):
                     url=url,
                 )
             if url.endswith("/api/v3/repos/payroll/architecture/contents/Payroll%20Processing/Large.md?ref=main"):
-                return GithubResponse({"encoding": "none", "content": "", "size": 2_000_000}, url=url)
+                return GithubResponse(
+                    {"sha": "large-sha", "encoding": "none", "content": "", "size": 2_000_000},
+                    url=url,
+                )
             raise AssertionError(f"unexpected URL: {url}")
 
     monkeypatch.setattr("memforge.genes.github_repo_gene._RequestsAsyncClient", LargeFileClient)
@@ -249,6 +359,7 @@ async def test_cloud_pull_rejects_malformed_base64_payload(monkeypatch):
             if url.endswith("/api/v3/repos/payroll/architecture/git/trees/main?recursive=1"):
                 return GithubResponse(
                     {
+                        "truncated": False,
                         "tree": [
                             {
                                 "path": "Payroll Processing/Broken.md",
@@ -261,7 +372,10 @@ async def test_cloud_pull_rejects_malformed_base64_payload(monkeypatch):
                     url=url,
                 )
             if url.endswith("/api/v3/repos/payroll/architecture/contents/Payroll%20Processing/Broken.md?ref=main"):
-                return GithubResponse({"encoding": "base64", "content": "!!!!", "size": 10}, url=url)
+                return GithubResponse(
+                    {"sha": "broken-sha", "encoding": "base64", "content": "!!!!", "size": 10},
+                    url=url,
+                )
             raise AssertionError(f"unexpected URL: {url}")
 
     monkeypatch.setattr("memforge.genes.github_repo_gene._RequestsAsyncClient", MalformedContentClient)

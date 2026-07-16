@@ -26,7 +26,12 @@ from pathlib import Path
 import httpx
 
 from memforge.genes.base import Gene
-from memforge.genes.local_adapter_packages import read_package_body
+from memforge.genes.local_adapter_packages import has_package_manifest, read_package_body
+from memforge.local_agent.teams_contract import (
+    TeamsMessageEvidenceError,
+    parse_teams_source_timestamp,
+    validate_teams_provider_message,
+)
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -65,6 +70,7 @@ LOCAL_AGENT_TEAMS_PACKAGE_KIND = "teams_window_document"
 # Internal API Client
 # ============================================================================
 
+
 class _TeamsAPIClient:
     """Async HTTP client for Teams Chat API + Microsoft Graph API.
 
@@ -90,9 +96,7 @@ class _TeamsAPIClient:
 
         tokens = TeamsAuthenticator.load_tokens()
         if not tokens:
-            raise AuthenticationError(
-                "No Teams session found. Connect Teams from the source wizard."
-            )
+            raise AuthenticationError("No Teams session found. Connect Teams from the source wizard.")
 
         now = datetime.now(timezone.utc).timestamp()
         chat_token = None
@@ -114,9 +118,7 @@ class _TeamsAPIClient:
                 graph_token = token_str
 
         if not chat_token:
-            raise AuthenticationError(
-                "Teams session expired. Connect Teams from the source wizard."
-            )
+            raise AuthenticationError("Teams session expired. Connect Teams from the source wizard.")
         if not graph_token:
             # Graph is optional — some operations work without it
             logger.warning("Graph API token not found — team/channel resolution may fail")
@@ -165,7 +167,11 @@ class _TeamsAPIClient:
             await self._graph_client.aclose()
 
     async def _request(
-        self, client: httpx.AsyncClient, method: str, url: str, **kwargs,
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        **kwargs,
     ) -> httpx.Response:
         """Make an HTTP request with retry on 429/5xx."""
         from memforge.pipeline.retry import retry_async
@@ -173,12 +179,12 @@ class _TeamsAPIClient:
         async def _do_request() -> httpx.Response:
             resp = await client.request(method, url, **kwargs)
             if resp.status_code == 401:
-                raise AuthenticationError(
-                    "Teams session expired. Connect Teams from the source wizard."
-                )
+                raise AuthenticationError("Teams session expired. Connect Teams from the source wizard.")
             if resp.status_code == 429:
                 raise httpx.HTTPStatusError(
-                    "Rate limited", request=resp.request, response=resp,
+                    "Rate limited",
+                    request=resp.request,
+                    response=resp,
                 )
             resp.raise_for_status()
             return resp
@@ -202,7 +208,9 @@ class _TeamsAPIClient:
         await self._ensure_clients()
         try:
             resp = await self._request(
-                self._chat_client, "GET", "/properties",
+                self._chat_client,
+                "GET",
+                "/properties",
             )
             data = resp.json()
             fav_raw = data.get("favorites", {})
@@ -217,7 +225,9 @@ class _TeamsAPIClient:
         """List all conversations (channels + chats)."""
         await self._ensure_clients()
         resp = await self._request(
-            self._chat_client, "GET", "/conversations",
+            self._chat_client,
+            "GET",
+            "/conversations",
             params={"view": "msnp24Equivalent", "pageSize": _MAX_PAGE_SIZE},
         )
         data = resp.json()
@@ -232,7 +242,9 @@ class _TeamsAPIClient:
         """
         await self._ensure_clients()
         resp = await self._request(
-            self._chat_client, "GET", "/conversations",
+            self._chat_client,
+            "GET",
+            "/conversations",
             params={
                 "view": "msnp24Equivalent",
                 "pageSize": _MAX_PAGE_SIZE,
@@ -275,16 +287,20 @@ class _TeamsAPIClient:
                 teams[group_id]["favorite"] = True
 
             if topic:
-                teams[group_id]["channels"].append({
-                    "id": conv_id,
-                    "displayName": topic,
-                    "favorite": is_favorite,
-                })
+                teams[group_id]["channels"].append(
+                    {
+                        "id": conv_id,
+                        "displayName": topic,
+                        "favorite": is_favorite,
+                    }
+                )
 
         return list(teams.values())
 
     async def get_messages(
-        self, conversation_id: str, page_size: int = _MAX_PAGE_SIZE,
+        self,
+        conversation_id: str,
+        page_size: int = _MAX_PAGE_SIZE,
     ) -> list[dict]:
         """Fetch all messages for a conversation, paginated."""
         await self._ensure_clients()
@@ -296,12 +312,25 @@ class _TeamsAPIClient:
 
         while url:
             if url in requested_urls:
-                self.mark_poll_complete(conversation_id, stop_reason="repeated_backward_link")
+                self.mark_poll_incomplete(conversation_id, stop_reason="repeated_backward_link")
                 break
             requested_urls.add(url)
             resp = await self._request(self._chat_client, "GET", url, params=params)
             data = resp.json()
-            messages = data.get("messages", data) if isinstance(data, dict) else data
+            try:
+                messages = _validated_teams_message_page(data)
+            except TeamsMessageRecordSchemaError:
+                self.mark_poll_incomplete(
+                    conversation_id,
+                    stop_reason="invalid_message_record_schema",
+                )
+                raise
+            except TeamsMessagePageSchemaError:
+                self.mark_poll_incomplete(
+                    conversation_id,
+                    stop_reason="invalid_message_page_schema",
+                )
+                raise
 
             parsed_page: list[dict] = []
             if isinstance(messages, list):
@@ -329,7 +358,9 @@ class _TeamsAPIClient:
         return all_messages
 
     async def get_messages_until(
-        self, conversation_id: str, cutoff: datetime,
+        self,
+        conversation_id: str,
+        cutoff: datetime,
     ) -> list[dict]:
         """Fetch messages backward until hitting cutoff timestamp."""
         await self._ensure_clients()
@@ -342,7 +373,7 @@ class _TeamsAPIClient:
 
         while url:
             if url in requested_urls:
-                self.mark_poll_complete(conversation_id, stop_reason="repeated_backward_link")
+                self.mark_poll_incomplete(conversation_id, stop_reason="repeated_backward_link")
                 break
             requested_urls.add(url)
             # Rate-limit: Teams allows 15 req/10s — pace at ~1 req/s
@@ -351,7 +382,20 @@ class _TeamsAPIClient:
             resp = await self._request(self._chat_client, "GET", url, params=params)
             page_count += 1
             data = resp.json()
-            messages = data.get("messages", data) if isinstance(data, dict) else data
+            try:
+                messages = _validated_teams_message_page(data)
+            except TeamsMessageRecordSchemaError:
+                self.mark_poll_incomplete(
+                    conversation_id,
+                    stop_reason="invalid_message_record_schema",
+                )
+                raise
+            except TeamsMessagePageSchemaError:
+                self.mark_poll_incomplete(
+                    conversation_id,
+                    stop_reason="invalid_message_page_schema",
+                )
+                raise
 
             hit_cutoff = False
             parsed_page: list[dict] = []
@@ -371,7 +415,13 @@ class _TeamsAPIClient:
             self._record_message_poll_page(conversation_id, data, parsed_page)
 
             if hit_cutoff:
-                self.mark_poll_complete(conversation_id, stop_reason="cutoff_reached")
+                audit = self._poll_audits.setdefault(
+                    conversation_id,
+                    _new_poll_audit(conversation_id),
+                )
+                audit["absence_covered_from"] = cutoff.isoformat()
+                audit["absence_covered_to"] = audit["poll_started_at"]
+                self.mark_poll_incomplete(conversation_id, stop_reason="cutoff_reached")
                 break
 
             url = None
@@ -386,29 +436,46 @@ class _TeamsAPIClient:
         return all_messages
 
     async def get_thread_messages(
-        self, conversation_id: str, root_message_id: str,
+        self,
+        conversation_id: str,
+        root_message_id: str,
     ) -> list[dict]:
         """Fetch all messages in a thread (root + replies)."""
         await self._ensure_clients()
         url = f"/conversations/{conversation_id};messageid={root_message_id}/messages"
         resp = await self._request(
-            self._chat_client, "GET", url,
+            self._chat_client,
+            "GET",
+            url,
             params={"pageSize": _MAX_PAGE_SIZE},
         )
 
         data = resp.json()
-        messages = data.get("messages", data) if isinstance(data, dict) else data
+        try:
+            messages = _validated_teams_message_page(data)
+        except TeamsMessageRecordSchemaError:
+            self.mark_poll_incomplete(
+                conversation_id,
+                stop_reason="invalid_message_record_schema",
+            )
+            raise
+        except TeamsMessagePageSchemaError:
+            self.mark_poll_incomplete(
+                conversation_id,
+                stop_reason="invalid_thread_message_page_schema",
+            )
+            raise
         result = []
-        if isinstance(messages, list):
-            for m in messages:
-                parsed = self._parse_message(m)
-                if parsed:
-                    result.append(parsed)
+        for m in messages:
+            parsed = self._parse_message(m)
+            if parsed:
+                result.append(parsed)
 
         return result
 
     async def paginate_messages_backward(
-        self, conversation_id: str,
+        self,
+        conversation_id: str,
     ) -> AsyncIterator[list[dict]]:
         """Yield pages of messages from newest to oldest."""
         await self._ensure_clients()
@@ -420,7 +487,7 @@ class _TeamsAPIClient:
 
         while url:
             if url in requested_urls:
-                self.mark_poll_complete(conversation_id, stop_reason="repeated_backward_link")
+                self.mark_poll_incomplete(conversation_id, stop_reason="repeated_backward_link")
                 break
             requested_urls.add(url)
             if page_count > 0:
@@ -428,7 +495,20 @@ class _TeamsAPIClient:
             resp = await self._request(self._chat_client, "GET", url, params=params)
             page_count += 1
             data = resp.json()
-            raw_messages = data.get("messages", data) if isinstance(data, dict) else data
+            try:
+                raw_messages = _validated_teams_message_page(data)
+            except TeamsMessageRecordSchemaError:
+                self.mark_poll_incomplete(
+                    conversation_id,
+                    stop_reason="invalid_message_record_schema",
+                )
+                raise
+            except TeamsMessagePageSchemaError:
+                self.mark_poll_incomplete(
+                    conversation_id,
+                    stop_reason="invalid_message_page_schema",
+                )
+                raise
 
             page: list[dict] = []
             parsed_page: list[dict] = []
@@ -463,9 +543,7 @@ class _TeamsAPIClient:
         data: dict,
         parsed_messages: list[dict],
     ) -> None:
-        raw_messages = data.get("messages", data) if isinstance(data, dict) else data
-        if not isinstance(raw_messages, list):
-            raw_messages = []
+        raw_messages = _validated_teams_message_page(data)
         audit = self._poll_audits.setdefault(conversation_id, _new_poll_audit(conversation_id))
         audit["page_count"] += 1
         audit["raw_messages_seen"] += len(raw_messages)
@@ -506,6 +584,11 @@ class _TeamsAPIClient:
     def mark_poll_complete(self, conversation_id: str, *, stop_reason: str) -> None:
         audit = self._poll_audits.setdefault(conversation_id, _new_poll_audit(conversation_id))
         audit["pagination_complete"] = True
+        audit["stop_reason"] = stop_reason
+
+    def mark_poll_incomplete(self, conversation_id: str, *, stop_reason: str) -> None:
+        audit = self._poll_audits.setdefault(conversation_id, _new_poll_audit(conversation_id))
+        audit["pagination_complete"] = False
         audit["stop_reason"] = stop_reason
 
     def get_poll_audits(self) -> list[dict]:
@@ -592,10 +675,7 @@ class _TeamsAPIClient:
             if not conv_id:
                 continue
             topic = c.get("threadProperties", {}).get("topic", "")
-            last_activity_str = (
-                c.get("lastMessage", {}).get("composetime")
-                or c.get("lastActivity", "")
-            )
+            last_activity_str = c.get("lastMessage", {}).get("composetime") or c.get("lastActivity", "")
             last_activity = self._parse_timestamp(last_activity_str)
 
             # Extract last message sender info (useful for DM name resolution)
@@ -603,32 +683,32 @@ class _TeamsAPIClient:
             sender_display = last_msg.get("imdisplayname", "")
             sender_id = last_msg.get("from", "")
 
-            result.append({
-                "id": conv_id,
-                "topic": topic or "Untitled",
-                "lastActivity": last_activity,
-                "type": self._infer_conversation_type(conv_id),
-                "lastMessageSender": sender_display,
-                "lastMessageSenderId": sender_id,
-                "favorite": str(c.get("properties", {}).get("favorite", "")).lower() == "true",
-            })
+            result.append(
+                {
+                    "id": conv_id,
+                    "topic": topic or "Untitled",
+                    "lastActivity": last_activity,
+                    "type": self._infer_conversation_type(conv_id),
+                    "lastMessageSender": sender_display,
+                    "lastMessageSenderId": sender_id,
+                    "favorite": str(c.get("properties", {}).get("favorite", "")).lower() == "true",
+                }
+            )
         return result
 
     def _parse_message(self, m: dict) -> dict | None:
         """Parse a raw Teams message into a clean dict."""
-        msg_type = m.get("messagetype", m.get("messageType", ""))
-        # Skip system messages (topic changes, member additions, etc.)
-        if msg_type and msg_type not in (
-            "Text", "RichText/Html", "RichText", "RichText/Media_GenericCard",
-        ):
+        try:
+            memory_relevant = validate_teams_provider_message(m)
+        except TeamsMessageEvidenceError as exc:
+            raise TeamsMessageRecordSchemaError(str(exc)) from exc
+        if not memory_relevant:
             return None
 
-        content = m.get("content", "")
+        content = m["content"]
         # Convert HTML to clean text via normalizer_utils
         if "<" in content:
             content = html_to_markdown(content).strip()
-        if not content:
-            return None
 
         # Extract sender display name — prefer imdisplayname (human-readable)
         # over from (which is often a raw API URL like https://teams.cloud.microsoft/.../contacts/8:orgid:...)
@@ -641,6 +721,10 @@ class _TeamsAPIClient:
                 from_display = sender.get("displayName", sender.get("name", ""))
 
         composetime = m.get("composetime", m.get("originalarrivaltime", ""))
+        source_time = parse_teams_source_timestamp(composetime)
+        message_id = str(m.get("id") or m.get("amsreferencesid") or "").strip()
+        if not message_id or source_time is None:
+            raise TeamsMessageRecordSchemaError("Teams message record is missing a stable id or source timestamp")
         root_message_id = (
             m.get("rootMessageId")
             or m.get("properties", {}).get("rootMessageId")
@@ -648,11 +732,11 @@ class _TeamsAPIClient:
         )
 
         return {
-            "id": m.get("id", m.get("amsreferencesid", "")),
+            "id": message_id,
             "conversationid": m.get("conversationid"),
             "from": from_display or "Unknown",
             "content": content,
-            "time": self._parse_timestamp(composetime),
+            "time": source_time,
             "rootMessageId": root_message_id,
             "parentMessageId": m.get("properties", {}).get("parentMessageId"),
             "mentions": m.get("properties", {}).get("mentions", []),
@@ -684,13 +768,23 @@ class _TeamsAPIClient:
 # Error types
 # ============================================================================
 
+
 class AuthenticationError(Exception):
     """Raised when Teams authentication fails."""
+
+
+class TeamsMessagePageSchemaError(ValueError):
+    """Raised when a Chatsvc page cannot establish its message collection."""
+
+
+class TeamsMessageRecordSchemaError(ValueError):
+    """Raised when a memory-relevant message lacks stable source identity."""
 
 
 # ============================================================================
 # Teams Gene
 # ============================================================================
+
 
 class TeamsGene(Gene):
     """Microsoft Teams data source gene.
@@ -722,43 +816,75 @@ class TeamsGene(Gene):
             ],
             fields=[
                 ConfigField(
-                    key="region", label="Teams Region",
-                    field_type=ConfigFieldType.SELECT, required=False,
+                    key="region",
+                    label="Teams Region",
+                    field_type=ConfigFieldType.SELECT,
+                    required=False,
                     default="emea",
                     options=["emea", "amer", "apac"],
                     help_text="Teams API regional endpoint",
-                    group="connection", order=0,
+                    group="connection",
+                    order=0,
                 ),
                 ConfigField(
-                    key="conversation_ids", label="Teams Conversations",
-                    field_type=ConfigFieldType.TAG_LIST, required=False,
+                    key="conversation_ids",
+                    label="Teams Conversations",
+                    field_type=ConfigFieldType.TAG_LIST,
+                    required=False,
                     placeholder="Conversation IDs selected through Browse Teams",
                     help_text="Direct Teams conversation IDs selected through Browse Teams",
-                    group="scope", order=0,
+                    group="scope",
+                    order=0,
                 ),
                 ConfigField(
-                    key="max_age_days", label="Max Age (days)",
-                    field_type=ConfigFieldType.INTEGER, required=False,
+                    key="max_age_days",
+                    label="Max Age (days)",
+                    field_type=ConfigFieldType.INTEGER,
+                    required=False,
                     default="14",
                     help_text="How far back to fetch on initial sync",
-                    group="sync", order=0,
+                    group="sync",
+                    order=0,
                 ),
                 ConfigField(
-                    key="conversation_gap_minutes", label="Conversation Gap (minutes)",
-                    field_type=ConfigFieldType.INTEGER, required=False,
+                    key="conversation_gap_minutes",
+                    label="Conversation Gap (minutes)",
+                    field_type=ConfigFieldType.INTEGER,
+                    required=False,
                     default="60",
                     help_text="Minutes of silence that starts a new conversation block",
-                    group="sync", order=1,
+                    group="sync",
+                    order=1,
                 ),
                 ConfigField(
-                    key="max_block_messages", label="Max Block Messages",
-                    field_type=ConfigFieldType.INTEGER, required=False,
+                    key="max_block_messages",
+                    label="Max Block Messages",
+                    field_type=ConfigFieldType.INTEGER,
+                    required=False,
                     default="100",
                     help_text="Maximum messages per conversation block",
-                    group="sync", order=2,
+                    group="sync",
+                    order=2,
                 ),
             ],
         )
+
+    @classmethod
+    def normalize_config(cls, config: dict) -> None:
+        """Persist only canonical provider ids for the Teams projection scope."""
+
+        from memforge.local_agent.source_contract import (
+            TEAMS_CONVERSATION_SELECTOR_FIELDS,
+            canonical_teams_conversation_ids,
+        )
+
+        conversation_ids = canonical_teams_conversation_ids(
+            config,
+            require_nonempty=True,
+        )
+        for field in TEAMS_CONVERSATION_SELECTOR_FIELDS:
+            config.pop(field, None)
+        config["conversation_ids"] = list(conversation_ids)
 
     # -------------------------------------------------------------------
     # Instance methods
@@ -770,27 +896,24 @@ class TeamsGene(Gene):
         self._gap_minutes = int(config.get("conversation_gap_minutes", 60))
         self._max_block = int(config.get("max_block_messages", 100))
         self._max_age_days = int(config.get("max_age_days", 14))
-        self._conversation_fetch_timeout_seconds = int(
-            config.get("conversation_fetch_timeout_seconds", 300)
-        )
+        self._conversation_fetch_timeout_seconds = int(config.get("conversation_fetch_timeout_seconds", 300))
         self._message_cache: dict[str, list[dict]] = {}  # conv_id → messages (per-sync)
+        self._thread_message_cache: dict[str, list[dict]] = {}
 
         # Local-agent Teams sources read already-captured raw window packages
         # from the server-side inbox. They do not need remote Teams selectors.
-        if self._local_agent_documents_dir() is None and not self._local_agent_package_manifest():
+        if self._local_agent_documents_dir() is None and not has_package_manifest(self.config):
             conversation_ids = config.get("conversation_ids", [])
             channels = config.get("channels", [])
             group_chats = config.get("group_chats", [])
             individual_chats = config.get("individual_chats", [])
             if not any([conversation_ids, channels, group_chats, individual_chats]):
-                raise ValueError(
-                    "At least one Teams conversation ID must be configured"
-                )
+                raise ValueError("At least one Teams conversation ID must be configured")
 
     async def authenticate(self) -> None:
         """Authenticate with the cached Teams Access Token."""
         local_documents_dir = self._local_agent_documents_dir()
-        if self._local_agent_package_manifest():
+        if has_package_manifest(self.config):
             return
         if local_documents_dir is not None:
             local_documents_dir.mkdir(parents=True, exist_ok=True)
@@ -804,7 +927,7 @@ class TeamsGene(Gene):
         """Discover threads and conversation blocks from configured sources."""
         local_documents_dir = self._local_agent_documents_dir()
         manifest = self._local_agent_package_manifest()
-        if manifest:
+        if has_package_manifest(self.config):
             async for item in self._discover_local_agent_package_manifest(manifest, since):
                 yield item
             return
@@ -814,6 +937,7 @@ class TeamsGene(Gene):
             return
 
         self._message_cache.clear()  # fresh cache per sync run
+        self._thread_message_cache.clear()
         conversations = await self._client.list_conversations()
         conv_lookup = {c["id"]: c for c in conversations}
         self._log.info("Listed %d conversations, since=%s", len(conversations), since)
@@ -868,9 +992,14 @@ class TeamsGene(Gene):
                 if since and max(m["time"] for m in thread_msgs) < since:
                     continue
 
-                yield self._make_content_item(
-                    conv_meta, root_id, thread_msgs, is_thread=True,
+                item = self._make_content_item(
+                    conv_meta,
+                    root_id,
+                    thread_msgs,
+                    is_thread=True,
                 )
+                self._thread_message_cache[item.item_id] = list(thread_msgs)
+                yield item
 
             # Yield conversation blocks from unthreaded messages
             # (exclude messages that are thread roots — already yielded above)
@@ -890,10 +1019,21 @@ class TeamsGene(Gene):
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full thread/block content."""
         if item.extra.get("package_uri") or item.extra.get("package_path"):
+            body = read_package_body(self, item, source_label="Teams")
+            package = json.loads(body.decode("utf-8"))
+            raw_payload = package.get("raw_payload")
+            tombstone = isinstance(raw_payload, dict) and raw_payload.get("_tombstone") is True
+            scope_attestation = isinstance(raw_payload, dict) and raw_payload.get("_scope_attestation") is True
             return RawContent(
                 item=item,
-                body=read_package_body(self, item, source_label="Teams"),
+                body=body,
                 content_type="application/json",
+                authoritative_empty=tombstone or scope_attestation,
+                empty_evidence=(
+                    "teams_complete_conversation_poll_window_tombstone"
+                    if tombstone
+                    else ("teams_current_collection_scope_attestation" if scope_attestation else None)
+                ),
             )
 
         conv_id = item.extra["conversation_id"]
@@ -901,7 +1041,10 @@ class TeamsGene(Gene):
         conv_type = item.extra["conversation_type"]
 
         if item.extra.get("is_thread"):
-            messages = await self._client.get_thread_messages(conv_id, root_msg_id)
+            cached_thread = self._thread_message_cache.get(item.item_id)
+            if cached_thread is None:
+                raise RuntimeError("Teams thread payload is missing complete discovery evidence")
+            messages = list(cached_thread)
         else:
             # Use cached messages from discover() if available, else re-fetch
             cached = self._message_cache.get(conv_id)
@@ -974,6 +1117,29 @@ class TeamsGene(Gene):
                 "submitted_at": package.get("submitted_at"),
                 "submitted_by": package.get("submitted_by"),
             }
+
+        if data.get("_tombstone") is True:
+            return NormalizedContent(
+                item=raw.item,
+                markdown_body="",
+                source_semantics={
+                    **package_semantics,
+                    "tombstone_reason": data.get("tombstone_reason"),
+                },
+            )
+
+        if data.get("_scope_attestation") is True:
+            return NormalizedContent(
+                item=raw.item,
+                markdown_body="",
+                source_semantics={
+                    **package_semantics,
+                    "scope_attestation": True,
+                    "transition_id": data.get("transition_id"),
+                    "target_scope_fingerprint": data.get("target_scope_fingerprint"),
+                    "collection_attempt_id": data.get("collection_attempt_id"),
+                },
+            )
 
         raw_messages = data.get("messages", [])
         messages = [msg for msg in raw_messages if isinstance(msg, dict)] if isinstance(raw_messages, list) else []
@@ -1071,7 +1237,8 @@ class TeamsGene(Gene):
     # -------------------------------------------------------------------
 
     async def _resolve_configured_conversations(
-        self, conv_lookup: dict[str, dict],
+        self,
+        conv_lookup: dict[str, dict],
     ) -> list[tuple[str, dict]]:
         """Resolve configured channels/chats to (conversation_id, metadata) pairs."""
         result: list[tuple[str, dict]] = []
@@ -1083,12 +1250,17 @@ class TeamsGene(Gene):
             if conversation_id in conv_lookup:
                 result.append((conversation_id, conv_lookup[conversation_id]))
             else:
-                result.append((conversation_id, {
-                    "id": conversation_id,
-                    "topic": "Teams conversation",
-                    "type": _TeamsAPIClient._infer_conversation_type(conversation_id),
-                    "lastActivity": datetime.now(timezone.utc),
-                }))
+                result.append(
+                    (
+                        conversation_id,
+                        {
+                            "id": conversation_id,
+                            "topic": "Teams conversation",
+                            "type": _TeamsAPIClient._infer_conversation_type(conversation_id),
+                            "lastActivity": datetime.now(timezone.utc),
+                        },
+                    )
+                )
 
         # Channels
         channels = self.config.get("channels", [])
@@ -1103,11 +1275,19 @@ class TeamsGene(Gene):
                 meta["team_name"] = channel_spec.split("/")[0] if "/" in channel_spec else ""
                 result.append((conv_id, meta))
             elif conv_id:
-                result.append((conv_id, {
-                    "id": conv_id, "topic": channel_spec, "type": "channel",
-                    "lastActivity": datetime.now(timezone.utc),
-                    "channel_name": channel_spec, "team_name": "",
-                }))
+                result.append(
+                    (
+                        conv_id,
+                        {
+                            "id": conv_id,
+                            "topic": channel_spec,
+                            "type": "channel",
+                            "lastActivity": datetime.now(timezone.utc),
+                            "channel_name": channel_spec,
+                            "team_name": "",
+                        },
+                    )
+                )
 
         # Group chats
         group_chats = self.config.get("group_chats", [])
@@ -1123,10 +1303,17 @@ class TeamsGene(Gene):
                     # ID not in active conversation list — use it directly
                     # (the user selected it in the picker, so it's valid)
                     self._log.info("Group chat %s not in conversation list, using ID directly", chat_spec)
-                    result.append((chat_spec, {
-                        "id": chat_spec, "topic": "Group Chat", "type": "group_chat",
-                        "lastActivity": datetime.now(timezone.utc),
-                    }))
+                    result.append(
+                        (
+                            chat_spec,
+                            {
+                                "id": chat_spec,
+                                "topic": "Group Chat",
+                                "type": "group_chat",
+                                "lastActivity": datetime.now(timezone.utc),
+                            },
+                        )
+                    )
                 continue
             # Match by topic
             for conv_id, meta in conv_lookup.items():
@@ -1166,7 +1353,9 @@ class TeamsGene(Gene):
         return deduped
 
     async def _resolve_channel(
-        self, channel_spec: str, conv_lookup: dict[str, dict],
+        self,
+        channel_spec: str,
+        conv_lookup: dict[str, dict],
     ) -> str | None:
         """Resolve a channel spec (TeamName/ChannelName or direct ID) to conversation ID."""
         # Direct conversation ID
@@ -1202,7 +1391,9 @@ class TeamsGene(Gene):
         return channel.get("id")
 
     async def _fetch_with_context(
-        self, conv_id: str, since: datetime | None,
+        self,
+        conv_id: str,
+        since: datetime | None,
     ) -> list[dict]:
         """Fetch messages with full conversation block context.
 
@@ -1227,9 +1418,9 @@ class TeamsGene(Gene):
             for i in range(len(all_messages) - 1):
                 gap = (all_messages[i + 1]["time"] - all_messages[i]["time"]).total_seconds()
                 if gap > gap_seconds and all_messages[i]["time"] < since:
-                    all_messages = all_messages[i + 1:]
+                    all_messages = all_messages[i + 1 :]
                     found_boundary = True
-                    self._client.mark_poll_complete(conv_id, stop_reason="gap_boundary")
+                    self._client.mark_poll_incomplete(conv_id, stop_reason="gap_boundary")
                     break
 
             if found_boundary:
@@ -1237,13 +1428,15 @@ class TeamsGene(Gene):
 
             # Stop if we've gone past since + one full gap window
             if all_messages and all_messages[0]["time"] < since - timedelta(minutes=self._gap_minutes):
-                self._client.mark_poll_complete(conv_id, stop_reason="incremental_context_boundary")
+                self._client.mark_poll_incomplete(conv_id, stop_reason="incremental_context_boundary")
                 break
 
         return all_messages
 
     async def _fetch_with_timeout(
-        self, conv_id: str, since: datetime | None,
+        self,
+        conv_id: str,
+        since: datetime | None,
     ) -> list[dict]:
         timeout = self._conversation_fetch_timeout_seconds
         if timeout <= 0:
@@ -1255,7 +1448,7 @@ class TeamsGene(Gene):
             )
         except TimeoutError as exc:
             if self._client is not None:
-                self._client.mark_poll_complete(conv_id, stop_reason="fetch_timeout")
+                self._client.mark_poll_incomplete(conv_id, stop_reason="fetch_timeout")
             raise TimeoutError(
                 f"Teams message fetch timed out after {timeout}s for conversation {conv_id[:30]}"
             ) from exc
@@ -1330,9 +1523,14 @@ class TeamsGene(Gene):
             for block in _group_into_blocks(block_messages, self._gap_minutes, self._max_block):
                 if since and max(m["time"] for m in block) < since:
                     continue
-                items.append(self._make_content_item(
-                    conv_meta, block[0]["id"], block, is_thread=False,
-                ))
+                items.append(
+                    self._make_content_item(
+                        conv_meta,
+                        block[0]["id"],
+                        block,
+                        is_thread=False,
+                    )
+                )
             return items
 
         from memforge.local_agent.teams_ledger import (
@@ -1367,28 +1565,28 @@ class TeamsGene(Gene):
         items = []
         for block in projection.blocks:
             messages = [
-                messages_by_id[message_id]
-                for message_id in block.member_message_ids
-                if message_id in messages_by_id
+                messages_by_id[message_id] for message_id in block.member_message_ids if message_id in messages_by_id
             ]
             if not messages:
                 continue
             if since and block.member_max_created_at < since:
                 continue
-            items.append(self._make_content_item(
-                conv_meta,
-                block.frozen_anchor_message_id,
-                sorted(messages, key=lambda m: m["time"]),
-                is_thread=False,
-                window_id=block.window_id,
-                block_start=block.member_min_created_at,
-                block_end=block.member_max_created_at,
-                revision_hash=block.revision_hash,
-                block_membership_fingerprint=block.block_membership_fingerprint,
-                assignment_generation=block.assignment_generation,
-                rebuild_generation=block.rebuild_generation,
-                bridge_not_merged=block.bridge_not_merged,
-            ))
+            items.append(
+                self._make_content_item(
+                    conv_meta,
+                    block.frozen_anchor_message_id,
+                    sorted(messages, key=lambda m: m["time"]),
+                    is_thread=False,
+                    window_id=block.window_id,
+                    block_start=block.member_min_created_at,
+                    block_end=block.member_max_created_at,
+                    revision_hash=block.revision_hash,
+                    block_membership_fingerprint=block.block_membership_fingerprint,
+                    assignment_generation=block.assignment_generation,
+                    rebuild_generation=block.rebuild_generation,
+                    bridge_not_merged=block.bridge_not_merged,
+                )
+            )
         return items
 
     async def _discover_local_agent_packages(
@@ -1457,6 +1655,8 @@ class TeamsGene(Gene):
                 extra={
                     "package_uri": package_uri,
                     "package_path": entry.get("package_path"),
+                    "package_sha256": entry.get("package_sha256"),
+                    "input_sha256": entry.get("input_sha256"),
                     "conversation_id": entry.get("conversation_id"),
                     "root_message_id": entry.get("root_message_id"),
                     "window_id": window_id,
@@ -1543,6 +1743,34 @@ class TeamsGene(Gene):
 # Helpers
 # ============================================================================
 
+
+def _validated_teams_message_page(data: object) -> list[dict]:
+    """Return one Chatsvc message page or fail before granting coverage."""
+
+    messages: object
+    if isinstance(data, list):
+        messages = data
+    elif isinstance(data, dict) and "messages" in data:
+        messages = data["messages"]
+    else:
+        raise TeamsMessagePageSchemaError("Teams message page is missing an explicit messages list")
+    if not isinstance(messages, list) or any(not isinstance(message, dict) for message in messages):
+        raise TeamsMessagePageSchemaError("Teams message page has an invalid messages list")
+    for message in messages:
+        try:
+            validate_teams_provider_message(message)
+        except TeamsMessageEvidenceError as exc:
+            raise TeamsMessageRecordSchemaError(str(exc)) from exc
+    return messages
+
+
+def _teams_message_is_memory_relevant(message: dict) -> bool:
+    try:
+        return validate_teams_provider_message(message)
+    except TeamsMessageEvidenceError as exc:
+        raise TeamsMessageRecordSchemaError(str(exc)) from exc
+
+
 def _format_date_range(min_time: datetime, max_time: datetime) -> str:
     """Format a compact date range string for document titles."""
     if min_time.date() == max_time.date():
@@ -1556,6 +1784,7 @@ def _new_poll_audit(conversation_id: str) -> dict:
         "field_contract_version": "teams_chatsvc_rest_v1",
         "access_probe_status": "ok",
         "pagination_complete": False,
+        "poll_started_at": datetime.now(timezone.utc).isoformat(),
         "stop_reason": "",
         "page_count": 0,
         "raw_messages_seen": 0,
@@ -1648,11 +1877,7 @@ def _teams_attachment_names(value: object) -> list[str]:
     for item in value:
         if isinstance(item, dict):
             name = str(
-                item.get("fileName")
-                or item.get("name")
-                or item.get("title")
-                or item.get("contentUrl")
-                or "attachment"
+                item.get("fileName") or item.get("name") or item.get("title") or item.get("contentUrl") or "attachment"
             ).strip()
         else:
             name = str(item or "").strip()
@@ -1664,6 +1889,7 @@ def _teams_attachment_names(value: object) -> list[str]:
 # ============================================================================
 # Block grouping (module-level for testability)
 # ============================================================================
+
 
 def _group_into_blocks(
     messages: list[dict],

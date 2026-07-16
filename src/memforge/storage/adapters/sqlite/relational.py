@@ -47,7 +47,14 @@ from memforge.models import (
 )
 from memforge.retrieval.access_predicate import visible_sql
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
-from memforge.source_projection import SourceObservationRevision, SourceProjection, SourceUnit, SourceUnitRevision
+from memforge.source_projection import (
+    SourceObservationRevision,
+    SourceProjection,
+    SourceUnit,
+    SourceUnitInventoryFilter,
+    SourceUnitInventoryPage,
+    SourceUnitRevision,
+)
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope
 from memforge.storage.adapters.protocols import (
@@ -443,6 +450,33 @@ class SqliteRelationalStore:
     ) -> tuple[str, ...]:
         return await self._db.list_source_unit_document_ids(source_unit_id)
 
+    async def list_current_source_unit_observation_ids(
+        self,
+        source_id: str,
+    ) -> dict[str, tuple[str, ...]]:
+        return await self._db.list_current_source_unit_observation_ids(source_id)
+
+    async def list_current_source_units(
+        self,
+        source_id: str,
+    ) -> tuple[SourceUnit, ...]:
+        return await self._db.list_current_source_units(source_id)
+
+    async def list_current_source_units_page(
+        self,
+        source_id: str,
+        *,
+        filters: SourceUnitInventoryFilter,
+        cursor: str | None = None,
+        limit: int = 200,
+    ) -> SourceUnitInventoryPage:
+        return await self._db.list_current_source_units_page(
+            source_id,
+            filters=filters,
+            cursor=cursor,
+            limit=limit,
+        )
+
     async def list_legacy_memory_provenance(
         self,
         source_id: str,
@@ -509,6 +543,12 @@ class SqliteRelationalStore:
 
     async def get_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob | None:
         return await self._db.get_lifecycle_backfill_job(job_id)
+
+    async def get_active_lifecycle_backfill_job(
+        self,
+        source_id: str,
+    ) -> LifecycleBackfillJob | None:
+        return await self._db.get_active_lifecycle_backfill_job(source_id)
 
     async def list_lifecycle_backfill_jobs(
         self,

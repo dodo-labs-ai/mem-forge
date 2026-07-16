@@ -6,11 +6,16 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
 from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.local_agent.source_contract import source_with_sync_inputs
+from memforge.memory.lifecycle_plan import (
+    LifecycleBackfillJob,
+    LifecycleBackfillJobStatus,
+)
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
 
@@ -255,7 +260,7 @@ def test_create_github_repo_source_populates_inbox_path_for_local_push(tmp_path)
         asyncio.run(database.close())
 
 
-def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
+def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
     from memforge.genes.jira_gene import JiraGene
     from memforge.server.admin_api import create_admin_app
 
@@ -266,6 +271,27 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
         with LeaseAwareTestClient(app) as client:
             created = _create_jira_source(client)
             source_id = created["id"]
+            raw_payload = {
+                "id": "10001",
+                "key": "PAY-1",
+                "fields": {
+                    "summary": "Create daemon source support",
+                    "description": "Create daemon source support.",
+                    "status": {"name": "Open"},
+                    "issuetype": {"name": "Task"},
+                    "priority": {"name": "Medium"},
+                    "assignee": {"displayName": "Ada"},
+                    "labels": [],
+                    "resolution": None,
+                    "updated": "2026-07-10T08:00:00+00:00",
+                    "issuelinks": [],
+                    "subtasks": [],
+                },
+                "_comments": [],
+                "_comments_included": True,
+                "_comments_total": 0,
+                "changelog": {"startAt": 0, "histories": [], "total": 0},
+            }
             initial_row = asyncio.run(database.get_source(source_id))
             assert initial_row is not None
             initial_documents_dir = Path(initial_row["config"]["local_agent_documents_dir"])
@@ -277,21 +303,7 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
                     "issue_key": "PAY-1",
                     "source_url": "https://jira.example.test/browse/PAY-1",
                     "title": "Create daemon source support",
-                    "raw_payload": {
-                        "key": "PAY-1",
-                        "fields": {
-                            "summary": "Create daemon source support",
-                            "description": "Create daemon source support.",
-                            "status": {"name": "Open"},
-                            "issuetype": {"name": "Task"},
-                            "priority": {"name": "Medium"},
-                            "assignee": {"displayName": "Ada"},
-                            "labels": [],
-                            "issuelinks": [],
-                            "subtasks": [],
-                        },
-                        "_comments": [],
-                    },
+                    "raw_payload": raw_payload,
                     "sync_snapshot_id": "test-local-agent-job:attempt:1",
                     "submitted_at": "2026-07-10T08:00:00+00:00",
                 },
@@ -303,21 +315,7 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
                     "issue_key": "PAY-1",
                     "source_url": "https://jira.example.test/browse/PAY-1",
                     "title": "Create daemon source support",
-                    "raw_payload": {
-                        "key": "PAY-1",
-                        "fields": {
-                            "summary": "Create daemon source support",
-                            "description": "Create daemon source support.",
-                            "status": {"name": "Open"},
-                            "issuetype": {"name": "Task"},
-                            "priority": {"name": "Medium"},
-                            "assignee": {"displayName": "Ada"},
-                            "labels": [],
-                            "issuelinks": [],
-                            "subtasks": [],
-                        },
-                        "_comments": [],
-                    },
+                    "raw_payload": raw_payload,
                     "sync_snapshot_id": "test-local-agent-job:attempt:1",
                     "submitted_at": "2026-07-10T08:05:00+00:00",
                 },
@@ -336,14 +334,17 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
         repeated_payload = repeated_response.json()
         assert payload["issue_key"] == "PAY-1"
         assert payload["package_uri"]
-        assert repeated_payload["package_uri"] != payload["package_uri"]
+        assert repeated_payload["package_uri"] == payload["package_uri"]
         first_package = json.loads(Path(payload["package_uri"]).read_text(encoding="utf-8"))
         assert first_package["submitted_at"] == "2026-07-10T08:00:00+00:00"
+        package_artifacts = list(Path(cfg.storage.docs_path).rglob("*package*.json"))
+        assert package_artifacts == [Path(payload["package_uri"])]
         row = asyncio.run(database.get_source(source_id))
         assert row is not None
         documents_dir = Path(row["config"]["local_agent_documents_dir"])
         package_path = documents_dir / f"{payload['doc_id']}.json"
-        assert package_path.exists()
+        assert payload["package_path"] is None
+        assert not package_path.exists()
         inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
         assert len(inputs) == 1
         assert inputs[0].raw_uri == payload["package_uri"]
@@ -368,8 +369,6 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
         assert run is not None
         assert run.input_snapshot_id == "test-local-agent-job:attempt:1"
 
-        package_path.unlink()
-
         projected = _project_source_inputs(database, row)
         gene = JiraGene(projected["config"], source_id)
         gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
@@ -386,6 +385,34 @@ def test_jira_adapter_document_push_populates_local_agent_inbox(tmp_path):
         assert "Create daemon source support." in normalized.markdown_body
         assert normalized.source_semantics["status"] == "Open"
         assert normalized.source_semantics["issue_key"] == "PAY-1"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_jira_adapter_rejects_comment_without_stable_provider_id(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_jira_source(client)["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "base_url": "https://jira.example.test",
+                    "issue_key": "PAY-1",
+                    "raw_payload": {
+                        "key": "PAY-1",
+                        "fields": {"summary": "Issue"},
+                        "_comments": [{"body": "Decision"}],
+                    },
+                },
+            )
+
+        assert response.status_code == 400
+        assert "stable provider id" in response.json()["detail"]
     finally:
         asyncio.run(database.close())
 
@@ -564,8 +591,8 @@ def test_local_adapter_document_push_writes_package(tmp_path):
         assert body["sync_started"] is False
         assert body["relative_path"] == "decisions/cutoff.md"
 
-        package_path = Path(body["package_path"])
-        assert package_path.exists()
+        assert body["package_path"] is None
+        package_path = Path(body["package_uri"])
         package = json.loads(package_path.read_text())
         assert package["package_kind"] == "local_markdown_document"
         assert package["vault_id"] == "engineering"
@@ -580,8 +607,9 @@ def test_local_adapter_document_push_writes_package(tmp_path):
         assert inputs[0].raw_uri == body["package_uri"]
         assert inputs[0].metadata["doc_id"] == body["doc_id"]
         assert inputs[0].metadata["manifest_entry"]["doc_id"] == body["doc_id"]
+        assert inputs[0].metadata["package_sha256"] == body["package_sha256"]
+        assert inputs[0].metadata["manifest_entry"]["package_sha256"] == body["package_sha256"]
 
-        package_path.unlink()
         projected = _project_source_inputs(database, row)
         gene = LocalMarkdownGene(projected["config"], source_id)
         gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
@@ -596,6 +624,112 @@ def test_local_adapter_document_push_writes_package(tmp_path):
         items, normalized = asyncio.run(_read_package())
         assert items[0].extra["package_uri"] == body["package_uri"]
         assert normalized.markdown_body.startswith("# Cutoff")
+    finally:
+        asyncio.run(database.close())
+
+
+def test_normal_local_source_fetch_rejects_tampered_canonical_package(tmp_path):
+    from memforge.genes.local_markdown_gene import LocalMarkdownGene
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_local_markdown_source(client)["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "vault_id": "engineering",
+                    "relative_path": "tampered.md",
+                    "markdown_body": "# Original",
+                    "process_now": False,
+                },
+            )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        artifact = Path(body["package_uri"])
+        artifact.write_bytes(artifact.read_bytes() + b"\n")
+        source = asyncio.run(database.get_source(source_id))
+        projected = _project_source_inputs(database, source)
+        gene = LocalMarkdownGene(projected["config"], source_id)
+        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
+
+        async def fetch_package():
+            items = [item async for item in gene.discover(None)]
+            return await gene.fetch(items[0])
+
+        with pytest.raises(
+            ValueError,
+            match="source_lifecycle_local_replay_artifact_invalid",
+        ):
+            asyncio.run(fetch_package())
+    finally:
+        asyncio.run(database.close())
+
+
+@pytest.mark.parametrize("source_type", ["local_markdown", "github_repo"])
+def test_local_file_package_attests_explicit_empty_content(tmp_path, source_type):
+    from memforge.genes.github_repo_gene import GitHubRepoGene
+    from memforge.genes.local_markdown_gene import LocalMarkdownGene
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            if source_type == "local_markdown":
+                source_id = _create_local_markdown_source(client)["id"]
+                payload = {
+                    "vault_id": "engineering",
+                    "relative_path": "emptied.md",
+                    "markdown_body": "",
+                    "process_now": False,
+                }
+            else:
+                source_id = _create_github_repo_source(client)["id"]
+                payload = {
+                    "repo_url": ("https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"),
+                    "repo_ref": "main",
+                    "relative_path": "Payroll Processing/emptied.md",
+                    "markdown_body": "",
+                    "process_now": False,
+                }
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json=payload,
+            )
+        assert response.status_code == 200, response.text
+        source = asyncio.run(database.get_source(source_id))
+        projected = _project_source_inputs(database, source)
+        gene = (
+            LocalMarkdownGene(projected["config"], source_id)
+            if source_type == "local_markdown"
+            else GitHubRepoGene(projected["config"], source_id)
+        )
+        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
+
+        async def fetch_package():
+            items = [item async for item in gene.discover(None)]
+            raw = await gene.fetch(items[0])
+            normalized = await gene.normalize(raw)
+            return raw, normalized
+
+        raw, normalized = asyncio.run(fetch_package())
+        assert raw.body.strip()
+        assert raw.authoritative_empty is True
+        assert raw.empty_evidence
+        assert normalized.markdown_body == ""
     finally:
         asyncio.run(database.close())
 
@@ -638,7 +772,8 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
         assert body["package_uri"]
         assert body["relative_path"] == "Payroll Processing/README.md"
 
-        package_path = Path(body["package_path"])
+        assert body["package_path"] is None
+        package_path = Path(body["package_uri"])
         package = json.loads(package_path.read_text())
         assert package["package_kind"] == "github_repo_document"
         assert package["repo_url"] == "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture"
@@ -655,7 +790,6 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
         assert inputs[0].metadata["doc_id"] == body["doc_id"]
         assert inputs[0].metadata["manifest_entry"]["doc_id"] == body["doc_id"]
 
-        package_path.unlink()
         projected = _project_source_inputs(database, row)
         gene = GitHubRepoGene(projected["config"], source_id)
         gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
@@ -945,7 +1079,8 @@ def test_local_adapter_document_push_allows_unmapped_source(tmp_path):
         row = asyncio.run(database.get_source(source_id))
         assert row is not None
         assert row["project_binding"] is None
-        assert Path(body["package_path"]).exists()
+        assert body["package_path"] is None
+        assert Path(body["package_uri"]).exists()
     finally:
         asyncio.run(database.close())
 
@@ -975,6 +1110,7 @@ def test_local_adapter_push_is_idempotent_on_doc_id(tmp_path):
 
 
 def test_teams_adapter_push_writes_window_package(tmp_path):
+    from memforge.local_agent.teams_ledger import build_teams_window_id
     from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
@@ -983,17 +1119,25 @@ def test_teams_adapter_push_writes_window_package(tmp_path):
         app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
         with LeaseAwareTestClient(app) as client:
             source_id = _create_teams_source(client)["id"]
+            window_id = build_teams_window_id(
+                source_id=source_id,
+                conversation_id="19:channel@example.test",
+                root_or_anchor_message_id="root-1",
+                window_type="thread",
+            )
             response = client.post(
                 f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "conversation_id": "19:channel@example.test",
-                    "window_id": "teams-thread:src:conversation:root",
+                    "window_id": window_id,
                     "revision_hash": "rev-1",
                     "root_message_id": "root-1",
                     "window_type": "thread",
                     "title": "Teams decision",
                     "source_url": "teams-window://src/conversation/window/rev-1",
                     "raw_payload": {
+                        "conversation_id": "19:channel@example.test",
+                        "window_id": window_id,
                         "conversation_type": "channel",
                         "title": "Teams decision",
                         "channel_name": "architecture",
@@ -1025,11 +1169,12 @@ def test_teams_adapter_push_writes_window_package(tmp_path):
         body = response.json()
         assert body["source_id"] == source_id
         assert body["doc_id"].startswith("teams-")
-        package_path = Path(body["package_path"])
+        assert body["package_path"] is None
+        package_path = Path(body["package_uri"])
         package = json.loads(package_path.read_text(encoding="utf-8"))
         assert package["package_kind"] == "teams_window_document"
         assert package["content_role"] == "teams_conversation_window"
-        assert package["window_id"] == "teams-thread:src:conversation:root"
+        assert package["window_id"] == window_id
         assert package["revision_hash"] == "rev-1"
         assert package["conversation_id"] == "19:channel@example.test"
         assert "markdown" not in package
@@ -1044,7 +1189,104 @@ def test_teams_adapter_push_writes_window_package(tmp_path):
         assert inputs[0].metadata["doc_id"] == body["doc_id"]
         manifest_entry = inputs[0].metadata["manifest_entry"]
         assert manifest_entry["doc_id"] == body["doc_id"]
-        assert manifest_entry["window_id"] == "teams-thread:src:conversation:root"
+        assert manifest_entry["window_id"] == window_id
+    finally:
+        asyncio.run(database.close())
+
+
+@pytest.mark.parametrize(
+    "raw_payload",
+    [
+        {
+            "conversation_id": "19:channel@example.test",
+            "window_id": "window-a",
+            "messages": [{"id": "message-a", "content": "Decision"}],
+        },
+        {
+            "conversation_id": "19:other@example.test",
+            "window_id": "window-a",
+            "messages": [
+                {
+                    "id": "message-a",
+                    "content": "Decision",
+                    "time": "2026-07-16T09:00:00+00:00",
+                }
+            ],
+        },
+    ],
+)
+def test_teams_adapter_rejects_ambiguous_message_evidence(
+    tmp_path,
+    raw_payload,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_teams_source(client)["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "conversation_id": "19:channel@example.test",
+                    "window_id": "window-a",
+                    "revision_hash": "revision-a",
+                    "raw_payload": raw_payload,
+                    "process_now": False,
+                },
+            )
+
+        assert response.status_code == 400
+    finally:
+        asyncio.run(database.close())
+
+
+def test_teams_adapter_rejects_window_locator_bound_to_another_conversation(tmp_path):
+    from memforge.local_agent.teams_ledger import build_teams_window_id
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_teams_source(client)["id"]
+            window_id = build_teams_window_id(
+                source_id=source_id,
+                conversation_id="19:conversation-a@example.test",
+                root_or_anchor_message_id="message-a",
+                window_type="time_block",
+            )
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "conversation_id": "19:conversation-b@example.test",
+                    "window_id": window_id,
+                    "revision_hash": "revision-a",
+                    "root_message_id": "message-a",
+                    "window_type": "time_block",
+                    "raw_payload": {
+                        "conversation_id": "19:conversation-b@example.test",
+                        "window_id": window_id,
+                        "messages": [
+                            {
+                                "id": "message-a",
+                                "content": "Decision",
+                                "time": "2026-07-16T09:00:00+00:00",
+                            }
+                        ],
+                    },
+                },
+            )
+
+        assert response.status_code == 400
+        assert "locator" in response.json()["detail"]
     finally:
         asyncio.run(database.close())
 
@@ -1101,6 +1343,7 @@ def test_local_adapter_push_rejects_path_traversal(tmp_path):
 
 def test_teams_gene_discovers_local_agent_window_packages(tmp_path):
     from memforge.genes import create_gene
+    from memforge.local_agent.teams_ledger import build_teams_window_id
     from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
@@ -1109,16 +1352,24 @@ def test_teams_gene_discovers_local_agent_window_packages(tmp_path):
         app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
         with LeaseAwareTestClient(app) as client:
             source_id = _create_teams_source(client)["id"]
+            window_id = build_teams_window_id(
+                source_id=source_id,
+                conversation_id="19:channel@example.test",
+                root_or_anchor_message_id="anchor-1",
+                window_type="time_block",
+            )
             response = client.post(
                 f"/api/sources/{source_id}/adapter/packages",
                 json={
                     "conversation_id": "19:channel@example.test",
-                    "window_id": "teams-block:src:conversation:anchor",
+                    "window_id": window_id,
                     "revision_hash": "rev-block-1",
                     "root_message_id": "anchor-1",
-                    "window_type": "block",
+                    "window_type": "time_block",
                     "title": "Group: July 8, 10:00-10:45",
                     "raw_payload": {
+                        "conversation_id": "19:channel@example.test",
+                        "window_id": window_id,
                         "conversation_type": "group_chat",
                         "title": "Group: July 8, 10:00-10:45",
                         "team_name": "Planning",
@@ -1143,6 +1394,7 @@ def test_teams_gene_discovers_local_agent_window_packages(tmp_path):
         row = asyncio.run(database.get_source(source_id))
         projected = _project_source_inputs(database, row)
         gene = create_gene("teams", projected["config"], source_id)
+        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
         asyncio.run(gene.authenticate())
 
         async def _collect_normalized():
@@ -1157,10 +1409,10 @@ def test_teams_gene_discovers_local_agent_window_packages(tmp_path):
         assert len(items) == 1
         assert items[0].item_id.startswith("teams-")
         assert items[0].version == "rev-block-1"
-        assert items[0].extra["window_id"] == "teams-block:src:conversation:anchor"
+        assert items[0].extra["window_id"] == window_id
         assert "Decision captured." in normalized.markdown_body
         assert normalized.source_semantics["source_kind"] == "teams"
-        assert normalized.source_semantics["window_id"] == "teams-block:src:conversation:anchor"
+        assert normalized.source_semantics["window_id"] == window_id
         assert normalized.source_semantics["message_count"] == 1
     finally:
         asyncio.run(database.close())
@@ -1188,6 +1440,143 @@ def test_local_adapter_push_rejects_paused_source(tmp_path):
             )
         assert response.status_code == 400
         assert response.json()["detail"] == "Source is paused"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_adapter_push_rejects_lifecycle_maintenance_before_artifact_write(
+    tmp_path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_local_markdown_source(client)["id"]
+            asyncio.run(
+                database.create_lifecycle_backfill_job(
+                    LifecycleBackfillJob(
+                        id="lifecycle-package-fence",
+                        source_id=source_id,
+                        status=LifecycleBackfillJobStatus.QUEUED,
+                    )
+                )
+            )
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "vault_id": "engineering",
+                    "relative_path": "notes.md",
+                    "markdown_body": "# Notes",
+                    "process_now": False,
+                },
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == ("source lifecycle maintenance active: lifecycle-package-fence")
+        assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == []
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_adapter_push_cleans_artifact_when_lease_expires_after_write(
+    tmp_path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    validation_count = 0
+
+    async def validate_lease(*args, **kwargs) -> bool:
+        nonlocal validation_count
+        validation_count += 1
+        return validation_count == 1
+
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=validate_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_local_markdown_source(client)["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "vault_id": "engineering",
+                    "relative_path": "notes.md",
+                    "markdown_body": "# Notes",
+                    "process_now": False,
+                },
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "local_agent_lease_not_current"
+        assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == []
+        assert asyncio.run(database.list_source_artifact_cleanup_tasks()) == []
+        assert asyncio.run(database.list_source_sync_inputs(source_id=source_id)) == []
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_adapter_push_epoch_cas_rejects_maintenance_after_lease_check(
+    tmp_path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    original_create_input = database.create_source_sync_input
+    maintenance_started = False
+
+    async def create_input_after_maintenance_started(**kwargs):
+        nonlocal maintenance_started
+        if not maintenance_started:
+            maintenance_started = True
+            await database.create_lifecycle_backfill_job(
+                LifecycleBackfillJob(
+                    id="lifecycle-after-package-lease-check",
+                    source_id=str(kwargs["source_id"]),
+                    status=LifecycleBackfillJobStatus.QUEUED,
+                )
+            )
+            await database.fail_lifecycle_backfill_job(
+                "lifecycle-after-package-lease-check",
+                error="maintenance completed before stale upload",
+            )
+        return await original_create_input(**kwargs)
+
+    database.create_source_sync_input = create_input_after_maintenance_started
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_local_markdown_source(client)["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "vault_id": "engineering",
+                    "relative_path": "notes.md",
+                    "markdown_body": "# Notes",
+                    "process_now": False,
+                },
+            )
+
+        assert response.status_code == 409, response.text
+        assert "source activity epoch changed" in response.json()["detail"]
+        assert asyncio.run(database.list_source_sync_inputs(source_id=source_id)) == []
+        assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == []
+        assert asyncio.run(database.list_source_artifact_cleanup_tasks()) == []
     finally:
         asyncio.run(database.close())
 
@@ -1251,9 +1640,11 @@ def test_local_markdown_gene_discovers_pushed_packages(tmp_path):
                 },
             )
 
-        row = asyncio.run(database.get_source(source_id))
-        gene = create_gene("local_markdown", row["config"], source_id)
-        asyncio.run(gene.authenticate())
+            row = asyncio.run(database.get_source(source_id))
+            projected = _project_source_inputs(database, row)
+            gene = create_gene("local_markdown", projected["config"], source_id)
+            gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
+            asyncio.run(gene.authenticate())
 
         async def _collect():
             items = []
@@ -1317,9 +1708,11 @@ def test_local_markdown_gene_converts_by_content_type(tmp_path):
                 )
                 assert resp.status_code == 200, resp.text
 
-        row = asyncio.run(database.get_source(source_id))
-        gene = create_gene("local_markdown", row["config"], source_id)
-        asyncio.run(gene.authenticate())
+            row = asyncio.run(database.get_source(source_id))
+            projected = _project_source_inputs(database, row)
+            gene = create_gene("local_markdown", projected["config"], source_id)
+            gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
+            asyncio.run(gene.authenticate())
 
         async def _normalized_by_path():
             out = {}

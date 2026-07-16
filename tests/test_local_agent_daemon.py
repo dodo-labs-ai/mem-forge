@@ -244,6 +244,11 @@ def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
             assert workspace_id == "workspace-a"
             return self
 
+        def get_source_projection_inventory(self, source_id: str, **filters):
+            del filters
+            assert source_id == "src-teams"
+            return {"units": []}
+
     monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect)
     monkeypatch.setattr(main, "_run_cloud_teams_auth_job", fake_auth)
     monkeypatch.setattr(main, "_current_teams_chat_token_hashes", lambda: set())
@@ -261,6 +266,7 @@ def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
                 "audit_log_path": str(tmp_path / "teams-audit.jsonl"),
                 "ledger_state_path": str(tmp_path / "teams-ledger.json"),
                 "wait_seconds": 1,
+                "conversation_ids": ["19:conversation@thread.tacv2"],
             },
         },
         FakeClient(),

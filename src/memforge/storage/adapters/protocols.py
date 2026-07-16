@@ -43,6 +43,8 @@ from memforge.source_projection import (
     SourceObservationRevision,
     SourceProjection,
     SourceUnit,
+    SourceUnitInventoryFilter,
+    SourceUnitInventoryPage,
     SourceUnitRevision,
 )
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
@@ -170,6 +172,22 @@ class RelationalStore(Protocol):
         self,
         source_unit_id: str,
     ) -> tuple[str, ...]: ...
+    async def list_current_source_unit_observation_ids(
+        self,
+        source_id: str,
+    ) -> dict[str, tuple[str, ...]]: ...
+    async def list_current_source_units(
+        self,
+        source_id: str,
+    ) -> tuple[SourceUnit, ...]: ...
+    async def list_current_source_units_page(
+        self,
+        source_id: str,
+        *,
+        filters: SourceUnitInventoryFilter,
+        cursor: str | None = None,
+        limit: int = 200,
+    ) -> SourceUnitInventoryPage: ...
     async def create_projection_scope_transition(
         self,
         transition: ProjectionScopeTransition,
@@ -246,6 +264,10 @@ class RelationalStore(Protocol):
         error: str,
     ) -> LifecycleBackfillJob: ...
     async def get_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob | None: ...
+    async def get_active_lifecycle_backfill_job(
+        self,
+        source_id: str,
+    ) -> LifecycleBackfillJob | None: ...
     async def list_lifecycle_backfill_jobs(
         self,
         source_id: str,

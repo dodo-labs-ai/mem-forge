@@ -22,6 +22,7 @@ from memforge.source_projection import (
     SourceRelation,
     SourceRelationType,
     SourceUnit,
+    SourceUnitInventoryFilter,
     SourceUnitRevision,
 )
 from memforge.models import DocumentMetadata, DocumentRecord, Memory
@@ -129,6 +130,60 @@ def _projection() -> SourceProjection:
     )
 
 
+def _teams_inventory_projection(
+    unit_id: str,
+    conversation_id: str,
+    observed_from: str,
+    observed_to: str,
+) -> SourceProjection:
+    observation = SourceObservation(
+        id=f"obs-{unit_id}",
+        source_id="src-teams-inventory",
+        source_unit_id=unit_id,
+        observation_type="message",
+        provider_key=f"message-{unit_id}",
+    )
+    observation_revision = SourceObservationRevision(
+        id=f"obsrev-{unit_id}",
+        observation_id=observation.id,
+        semantic_hash=f"hash-{unit_id}",
+        content=unit_id,
+    )
+    unit = SourceUnit(
+        id=unit_id,
+        source_id="src-teams-inventory",
+        unit_type="teams_window",
+        provider_key=f"window-{unit_id}",
+        locator={
+            "conversation_id": conversation_id,
+            "window_id": f"window-{unit_id}",
+            "observed_from": observed_from,
+            "observed_to": observed_to,
+        },
+    )
+    return SourceProjection(
+        run_id=f"run-{unit_id}",
+        source_id="src-teams-inventory",
+        source_type="teams",
+        scope={},
+        coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+        observations=(observation,),
+        observation_revisions=(observation_revision,),
+        source_units=(unit,),
+        source_unit_revisions=(
+            SourceUnitRevision(
+                id=f"unitrev-{unit_id}",
+                source_unit_id=unit_id,
+                semantic_hash=f"unit-hash-{unit_id}",
+                observation_revision_ids=(observation_revision.id,),
+            ),
+        ),
+        relations=(),
+        deltas=(),
+        checkpoint={},
+    )
+
+
 def test_projection_schema_has_a_forward_migration() -> None:
     version, description, statements = next(item for item in MIGRATIONS if item[0] == 47)
 
@@ -152,6 +207,65 @@ async def test_source_projection_round_trips_as_one_atomic_record(db: Database) 
 
     assert await db.get_source_projection(projection.run_id) == projection
     assert await db.get_current_source_unit_revision("unit-page-1") == projection.source_unit_revisions[0]
+    assert await db.list_current_source_units("src-1") == projection.source_units
+
+
+@pytest.mark.asyncio
+async def test_source_unit_inventory_pages_are_filtered_and_cursor_stable(
+    db: Database,
+) -> None:
+    await db.upsert_source(
+        id="src-teams-inventory",
+        type="teams",
+        name="Teams Inventory",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    for projection in (
+        _teams_inventory_projection(
+            "unit-a",
+            "conversation-a",
+            "2026-07-01T09:00:00+00:00",
+            "2026-07-01T09:30:00+00:00",
+        ),
+        _teams_inventory_projection(
+            "unit-b",
+            "conversation-a",
+            "2026-07-10T09:00:00+00:00",
+            "2026-07-10T09:30:00+00:00",
+        ),
+        _teams_inventory_projection(
+            "unit-c",
+            "conversation-b",
+            "2026-07-10T09:00:00+00:00",
+            "2026-07-10T09:30:00+00:00",
+        ),
+    ):
+        await db.record_source_projection(projection)
+
+    filters = SourceUnitInventoryFilter(
+        unit_type="teams_window",
+        locator_equals={"conversation_id": "conversation-a"},
+        observed_from_lte="2026-07-16T00:00:00+00:00",
+        observed_to_gte="2026-07-01T00:00:00+00:00",
+    )
+    first = await db.list_current_source_units_page(
+        "src-teams-inventory",
+        filters=filters,
+        limit=1,
+    )
+    second = await db.list_current_source_units_page(
+        "src-teams-inventory",
+        filters=filters,
+        cursor=first.next_cursor,
+        limit=1,
+    )
+
+    assert [unit.id for unit in first.units] == ["unit-a"]
+    assert first.next_cursor == "unit-a"
+    assert [unit.id for unit in second.units] == ["unit-b"]
+    assert second.next_cursor is None
 
 
 @pytest.mark.asyncio

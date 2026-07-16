@@ -10,14 +10,21 @@ from fastapi.testclient import TestClient
 
 from memforge.agent_knowledge import AgentKnowledgePatchProposal
 from memforge.agent_sessions import (
+    _run_agent_patch_with_activity,
     agent_session_source_id,
     build_agent_session_doc_id,
     canonicalize_agent_session_events,
+    ensure_agent_session_source,
 )
 from memforge.config import AppConfig
 from memforge.llm.structured import AgentSessionAuthorityResponse
+from memforge.memory.lifecycle_plan import (
+    LifecycleBackfillJob,
+    LifecycleBackfillJobStatus,
+)
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.storage.database import Database
+from memforge.source_activity import SourceActivityConflict
 
 
 @pytest.fixture(autouse=True)
@@ -99,6 +106,48 @@ def _authorized_events(*supporting_events: dict) -> list[dict]:
         {"role": "user", "text": "Keep the durable outcome from this window for future work."},
         *supporting_events,
     ]
+
+
+def test_agent_patch_cancels_mutation_when_activity_heartbeat_fails():
+    import asyncio
+
+    class ActivityDatabase:
+        def __init__(self):
+            self.released = False
+
+        async def acquire_source_activity(self, **kwargs):
+            return None
+
+        async def renew_source_activity(self, **kwargs):
+            raise SourceActivityConflict("activity lease was lost")
+
+        async def release_source_activity(self, **kwargs):
+            self.released = True
+
+    db = ActivityDatabase()
+    operation_cancelled = False
+
+    async def operation():
+        nonlocal operation_cancelled
+        try:
+            await asyncio.Event().wait()
+        finally:
+            operation_cancelled = True
+
+    async def run():
+        with pytest.raises(SourceActivityConflict, match="heartbeat stopped"):
+            await _run_agent_patch_with_activity(
+                db=db,
+                source_id="src-agent",
+                expected_epoch=3,
+                operation=operation,
+                lease_seconds=1,
+                heartbeat_seconds=0,
+            )
+
+    asyncio.run(run())
+    assert operation_cancelled is True
+    assert db.released is True
 
 
 def test_canonical_agent_events_mark_user_turns_as_authority_candidates_not_primary():
@@ -369,6 +418,136 @@ def test_agent_session_window_submit_uses_server_principal(tmp_path):
         memory = asyncio.run(database.get_memory(body["memory_id"]))
         assert memory is not None
         assert memory.owner_user_id == "u-authorized"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_agent_session_window_holds_activity_while_llm_builds_patch(
+    tmp_path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+
+    import asyncio
+
+    asyncio.run(database.connect())
+    source_id = agent_session_source_id("codex", "u-race")
+    asyncio.run(
+        ensure_agent_session_source(
+            database,
+            cfg,
+            client="codex",
+            owner_user_id="u-race",
+        )
+    )
+
+    class MaintenanceDuringLLM(_AuthorizesAllCandidateUserEvidence):
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            await database.create_lifecycle_backfill_job(
+                LifecycleBackfillJob(
+                    id="agent-maintenance-during-llm",
+                    source_id=source_id,
+                    status=LifecycleBackfillJobStatus.QUEUED,
+                )
+            )
+            return _knowledge_patch(
+                title="Must not persist",
+                claim_text="A stale Agent Session patch must not cross maintenance.",
+            )
+
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            principal_resolver=lambda request: "u-race",
+        )
+        app.state.agent_session_window_client = MaintenanceDuringLLM()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/agent-sessions/windows",
+                json={
+                    "schema_version": "agent-session-window/v1",
+                    "client": "codex",
+                    "session_id": "sess-maintenance-race",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "events": _authorized_events(
+                        {
+                            "role": "assistant",
+                            "text": "A stale Agent Session patch must not cross maintenance.",
+                        }
+                    ),
+                    "retention": "none",
+                    "process_now": False,
+                },
+            )
+
+        assert response.status_code == 409, response.text
+        assert "source activity already active" in response.json()["detail"]
+        assert asyncio.run(database.list_memories(source=source_id)) == []
+    finally:
+        asyncio.run(database.close())
+
+
+def test_agent_session_window_does_not_build_prompt_during_active_maintenance(tmp_path):
+    import asyncio
+
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+    asyncio.run(database.connect())
+    source_id = agent_session_source_id("codex", "u-maintenance")
+    asyncio.run(
+        ensure_agent_session_source(
+            database,
+            cfg,
+            client="codex",
+            owner_user_id="u-maintenance",
+        )
+    )
+    asyncio.run(
+        database.create_lifecycle_backfill_job(
+            LifecycleBackfillJob(
+                id="agent-maintenance-active",
+                source_id=source_id,
+                status=LifecycleBackfillJobStatus.QUEUED,
+            )
+        )
+    )
+
+    class MustNotGenerate(_AuthorizesAllCandidateUserEvidence):
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            raise AssertionError("proposal generation must be behind activity admission")
+
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            principal_resolver=lambda request: "u-maintenance",
+        )
+        app.state.agent_session_window_client = MustNotGenerate()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/agent-sessions/windows",
+                json={
+                    "schema_version": "agent-session-window/v1",
+                    "client": "codex",
+                    "session_id": "sess-maintenance-active",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "events": _authorized_events(
+                        {"role": "assistant", "text": "Do not generate during maintenance."}
+                    ),
+                    "retention": "none",
+                    "process_now": False,
+                },
+            )
+
+        assert response.status_code == 409, response.text
+        assert "source activity already active" in response.json()["detail"]
     finally:
         asyncio.run(database.close())
 

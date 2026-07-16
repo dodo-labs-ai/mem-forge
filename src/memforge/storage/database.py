@@ -24,8 +24,15 @@ import aiosqlite
 
 from memforge.local_agent.source_contract import (
     local_agent_completion_status,
+    local_agent_source_config_revision,
     local_agent_sync_job_payload,
     local_agent_sync_operation,
+)
+from memforge.storage.admin_source import is_pause_only_source_update
+from memforge.source_activity import (
+    SourceActivityConflict,
+    SourceActivityKind,
+    SourceActivityLease,
 )
 from memforge.sync_progress import normalize_sync_progress_snapshot
 from memforge.models import (
@@ -111,6 +118,8 @@ from memforge.source_projection import (
     SourceAnchor,
     SourceProjection,
     SourceUnit,
+    SourceUnitInventoryFilter,
+    SourceUnitInventoryPage,
     SourceUnitRevision,
     source_projection_from_payload,
     source_projection_to_payload,
@@ -343,6 +352,12 @@ def _source_sync_run_from_row(row: Mapping[str, Any], *, coalesced: bool = False
         force_full_sync=bool(data["force_full_sync"]),
         input_snapshot_id=data.get("input_snapshot_id"),
         rerun_input_snapshot_id=data.get("rerun_input_snapshot_id"),
+        input_generation_watermark=data.get("input_generation_watermark"),
+        rerun_input_generation_watermark=data.get(
+            "rerun_input_generation_watermark"
+        ),
+        source_config_revision=data.get("source_config_revision"),
+        rerun_source_config_revision=data.get("rerun_source_config_revision"),
         coalesced=coalesced,
         lease_owner=data.get("lease_owner"),
         lease_expires_at=_parse_dt(data.get("lease_expires_at")),
@@ -1195,6 +1210,10 @@ CREATE TABLE IF NOT EXISTS source_sync_runs (
     force_full_sync         INTEGER NOT NULL DEFAULT 0,
     input_snapshot_id       TEXT,
     rerun_input_snapshot_id TEXT,
+    input_generation_watermark INTEGER,
+    rerun_input_generation_watermark INTEGER,
+    source_config_revision TEXT,
+    rerun_source_config_revision TEXT,
     lease_owner             TEXT,
     lease_expires_at        TEXT,
     lease_attempt_count     INTEGER NOT NULL DEFAULT 0,
@@ -2690,6 +2709,36 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ON source_deletion_vector_outbox(status, created_at)",
         ],
     ),
+    (
+        57,
+        "Track source sync consumed input boundary",
+        [
+            "ALTER TABLE source_sync_runs ADD COLUMN input_generation_watermark INTEGER",
+            "ALTER TABLE source_sync_runs ADD COLUMN rerun_input_generation_watermark INTEGER",
+            "ALTER TABLE source_sync_runs ADD COLUMN source_config_revision TEXT",
+            "ALTER TABLE source_sync_runs ADD COLUMN rerun_source_config_revision TEXT",
+        ],
+    ),
+    (
+        58,
+        "Add durable source activity admission",
+        [
+            "ALTER TABLE sources ADD COLUMN activity_epoch INTEGER NOT NULL DEFAULT 0",
+            """CREATE TABLE IF NOT EXISTS source_activity_leases (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('sync', 'external_collection', 'agent_patch', 'maintenance')),
+                epoch INTEGER NOT NULL,
+                capability TEXT,
+                lease_until TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_source_activity_leases_source "
+            "ON source_activity_leases(source_id, lease_until)",
+        ],
+    ),
 ]
 
 
@@ -3466,6 +3515,27 @@ class Database:
         now_iso = _utc_iso(None)
         requested_force = bool(payload.get("force_full_sync"))
         async with self._write_lock:
+            try:
+                source_lock = await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (source_id,),
+                )
+                if source_lock.rowcount != 1:
+                    raise ValueError(f"Source not found: {source_id}")
+                async with self.db.execute(
+                    """SELECT id FROM lifecycle_backfill_jobs
+                       WHERE source_id = ? AND status IN ('queued', 'running')
+                       ORDER BY created_at LIMIT 1""",
+                    (source_id,),
+                ) as cursor:
+                    lifecycle_job = await cursor.fetchone()
+                if lifecycle_job is not None:
+                    raise ValueError(
+                        f"source lifecycle maintenance active: {lifecycle_job['id']}"
+                    )
+            except Exception:
+                await self.db.rollback()
+                raise
             async with self.db.execute(
                 """SELECT * FROM local_agent_jobs
                    WHERE workspace_id = ? AND source_id = ? AND operation = ?
@@ -3702,11 +3772,16 @@ class Database:
         enqueued = 0
         async with self._write_lock:
             async with self.db.execute(
-                """SELECT * FROM sources WHERE status = 'active'
+                """SELECT * FROM sources s WHERE status = 'active'
                    AND sync_schedule_enabled = 1
                    AND sync_schedule_next_at IS NOT NULL
                    AND sync_schedule_next_at <= ?
-                   ORDER BY sync_schedule_next_at, created_at LIMIT ?""",
+                   AND NOT EXISTS (
+                       SELECT 1 FROM lifecycle_backfill_jobs j
+                       WHERE j.source_id = s.id
+                         AND j.status IN ('queued', 'running')
+                   )
+                   ORDER BY s.sync_schedule_next_at, s.created_at LIMIT ?""",
                 (due_at, limit),
             ) as cursor:
                 rows = [dict(row) async for row in cursor]
@@ -3781,6 +3856,22 @@ class Database:
         async with self.db.execute(query, params) as cursor:
             row = await cursor.fetchone()
             return int(row[0]) if row else 0
+
+    async def list_indexed_doc_ids(self, source_id: str) -> set[str]:
+        """Return the complete current document identity set for one source."""
+        async with self.db.execute(
+            "SELECT doc_id FROM documents WHERE source = ?",
+            (source_id,),
+        ) as cursor:
+            return {str(row[0]) async for row in cursor}
+
+    async def list_indexed_document_versions(self, source_id: str) -> dict[str, str]:
+        """Return the complete current document/version identity for one source."""
+        async with self.db.execute(
+            "SELECT doc_id, version FROM documents WHERE source = ?",
+            (source_id,),
+        ) as cursor:
+            return {str(row[0]): str(row[1]) async for row in cursor}
 
     async def delete_document(self, doc_id: str) -> list[str]:
         """Delete a document and manually cascade to related tables.
@@ -4577,6 +4668,118 @@ class Database:
         )
         return tuple(str(row["document_id"]) for row in rows)
 
+    async def list_current_source_unit_observation_ids(
+        self,
+        source_id: str,
+    ) -> dict[str, tuple[str, ...]]:
+        rows = await self.db.execute_fetchall(
+            """SELECT su.id AS source_unit_id, so.id AS observation_id
+               FROM source_units su
+               LEFT JOIN source_observations so
+                 ON so.source_unit_id = su.id AND so.current_revision_id IS NOT NULL
+               WHERE su.source_id = ? AND su.current_revision_id IS NOT NULL
+               ORDER BY su.id, so.id""",
+            (source_id,),
+        )
+        result: dict[str, list[str]] = {}
+        for row in rows:
+            unit_id = str(row["source_unit_id"])
+            result.setdefault(unit_id, [])
+            if row["observation_id"] is not None:
+                result[unit_id].append(str(row["observation_id"]))
+        return {unit_id: tuple(ids) for unit_id, ids in result.items()}
+
+    async def list_current_source_units(
+        self,
+        source_id: str,
+    ) -> tuple[SourceUnit, ...]:
+        rows = await self.db.execute_fetchall(
+            """SELECT su.*
+               FROM source_units su
+               WHERE su.source_id = ?
+                 AND su.current_revision_id IS NOT NULL
+                 AND EXISTS (
+                     SELECT 1 FROM source_observations so
+                     WHERE so.source_unit_id = su.id
+                       AND so.current_revision_id IS NOT NULL
+                 )
+               ORDER BY su.id""",
+            (source_id,),
+        )
+        return tuple(
+            SourceUnit(
+                id=row["id"],
+                source_id=row["source_id"],
+                unit_type=row["unit_type"],
+                provider_key=row["provider_key"],
+                locator=json.loads(row["locator_json"] or "{}"),
+            )
+            for row in rows
+        )
+
+    async def list_current_source_units_page(
+        self,
+        source_id: str,
+        *,
+        filters: SourceUnitInventoryFilter,
+        cursor: str | None = None,
+        limit: int = 200,
+    ) -> SourceUnitInventoryPage:
+        if limit < 1 or limit > 500:
+            raise ValueError("source unit inventory limit must be between 1 and 500")
+        conditions = [
+            "su.source_id = ?",
+            "su.current_revision_id IS NOT NULL",
+            "EXISTS (SELECT 1 FROM source_observations so "
+            "WHERE so.source_unit_id = su.id "
+            "AND so.current_revision_id IS NOT NULL)",
+        ]
+        params: list[object] = [source_id]
+        if filters.unit_type:
+            conditions.append("su.unit_type = ?")
+            params.append(filters.unit_type)
+        for key, value in sorted(filters.locator_equals.items()):
+            if not key.replace("_", "").isalnum():
+                raise ValueError("source unit locator filter key is invalid")
+            conditions.append("json_extract(su.locator_json, ?) = ?")
+            params.extend((f"$.{key}", value))
+        temporal_filters = (
+            ("observed_from", "<=", filters.observed_from_lte),
+            ("observed_to", ">=", filters.observed_to_gte),
+            ("observed_to", "<", filters.observed_to_lt),
+        )
+        for key, operator, value in temporal_filters:
+            if value is None:
+                continue
+            conditions.append(f"json_extract(su.locator_json, '$.{key}') {operator} ?")
+            params.append(value)
+        if cursor:
+            conditions.append("su.id > ?")
+            params.append(cursor)
+        params.append(limit + 1)
+        rows = await self.db.execute_fetchall(
+            "SELECT su.* FROM source_units su WHERE "
+            + " AND ".join(conditions)
+            + " ORDER BY su.id LIMIT ?",
+            tuple(params),
+        )
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        units = tuple(
+            SourceUnit(
+                id=row["id"],
+                source_id=row["source_id"],
+                unit_type=row["unit_type"],
+                provider_key=row["provider_key"],
+                locator=json.loads(row["locator_json"] or "{}"),
+            )
+            for row in page_rows
+        )
+        return SourceUnitInventoryPage(
+            units=units,
+            next_cursor=units[-1].id if has_more and units else None,
+        )
+
     async def list_legacy_memory_provenance(
         self,
         source_id: str,
@@ -4779,6 +4982,48 @@ class Database:
         now = _now_iso()
         async with self._write_lock:
             try:
+                source_lock = await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (job.source_id,),
+                )
+                if source_lock.rowcount != 1:
+                    raise ValueError(f"Source not found: {job.source_id}")
+                async with self.db.execute(
+                    """SELECT run_id FROM source_sync_runs
+                       WHERE source_id = ? AND status IN ('pending', 'running')
+                       ORDER BY created_at LIMIT 1""",
+                    (job.source_id,),
+                ) as cursor:
+                    active_run = await cursor.fetchone()
+                if active_run is not None:
+                    raise ValueError(
+                        f"source sync run already active: {active_run['run_id']}"
+                    )
+                async with self.db.execute(
+                    """SELECT job_id FROM local_agent_jobs
+                       WHERE source_id = ? AND status IN ('queued', 'leased')
+                       ORDER BY created_at LIMIT 1""",
+                    (job.source_id,),
+                ) as cursor:
+                    active_local_job = await cursor.fetchone()
+                if active_local_job is not None:
+                    raise ValueError(
+                        "local agent job already active: "
+                        f"{active_local_job['job_id']}"
+                    )
+                async with self.db.execute(
+                    """SELECT operation_id FROM source_access_transitions
+                       WHERE source_id = ?
+                         AND status IN ('queued', 'running', 'failed')
+                       ORDER BY created_at LIMIT 1""",
+                    (job.source_id,),
+                ) as cursor:
+                    active_access = await cursor.fetchone()
+                if active_access is not None:
+                    raise ValueError(
+                        "source access transition already active: "
+                        f"{active_access['operation_id']}"
+                    )
                 async with self.db.execute(
                     "SELECT id FROM lifecycle_backfill_jobs "
                     "WHERE source_id = ? AND status IN ('queued', 'running') "
@@ -4790,6 +5035,14 @@ class Database:
                     raise ValueError(
                         f"source lifecycle job already active: {active['id']}"
                     )
+                await self._acquire_source_activity_unlocked(
+                    activity_id=job.id,
+                    source_id=job.source_id,
+                    kind=SourceActivityKind.MAINTENANCE,
+                    capability=job.id,
+                    lease_seconds=900,
+                    bump_epoch=True,
+                )
                 await self.db.execute(
                     """INSERT OR IGNORE INTO lifecycle_backfill_jobs (
                         id, source_id, status, scanned_memories, mapped_memories,
@@ -4811,6 +5064,193 @@ class Database:
         stored = await self.get_lifecycle_backfill_job(job.id)
         assert stored is not None
         return stored
+
+    async def _acquire_source_activity_unlocked(
+        self,
+        *,
+        activity_id: str,
+        source_id: str,
+        kind: SourceActivityKind,
+        capability: str | None,
+        lease_seconds: int,
+        expected_epoch: int | None = None,
+        bump_epoch: bool = False,
+    ) -> SourceActivityLease:
+        now = datetime.now(timezone.utc)
+        now_iso = _utc_iso(now)
+        lease_until = now + timedelta(seconds=max(1, lease_seconds))
+        async with self.db.execute(
+            "SELECT activity_epoch FROM sources WHERE id = ?",
+            (source_id,),
+        ) as cursor:
+            source = await cursor.fetchone()
+        if source is None:
+            raise SourceActivityConflict(f"Source not found: {source_id}")
+        epoch = int(source["activity_epoch"] or 0)
+        if expected_epoch is not None and epoch != expected_epoch:
+            raise SourceActivityConflict(
+                f"source activity epoch changed: expected {expected_epoch}, current {epoch}"
+            )
+        # Expiry removes admission authority. Purge stale rows while holding
+        # the Source write boundary so a deterministic job/activity id can be
+        # reacquired after a crash without colliding with its old primary key.
+        await self.db.execute(
+            "DELETE FROM source_activity_leases WHERE source_id = ? AND lease_until <= ?",
+            (source_id, now_iso),
+        )
+        async with self.db.execute(
+            """SELECT id, kind, epoch, capability, lease_until
+               FROM source_activity_leases
+               WHERE source_id = ? AND lease_until > ?
+               ORDER BY created_at LIMIT 1""",
+            (source_id, now_iso),
+        ) as cursor:
+            active = await cursor.fetchone()
+        if active is not None and str(active["id"]) != activity_id:
+            raise SourceActivityConflict(
+                f"source activity already active: {active['id']} ({active['kind']})"
+            )
+        if active is not None:
+            if (
+                str(active["kind"]) != kind.value
+                or int(active["epoch"]) != epoch
+                or active["capability"] != capability
+            ):
+                raise SourceActivityConflict("source activity retry identity mismatch")
+            await self.db.execute(
+                "UPDATE source_activity_leases SET lease_until = ?, updated_at = ? WHERE id = ?",
+                (_utc_iso(lease_until), now_iso, activity_id),
+            )
+        else:
+            if bump_epoch:
+                epoch += 1
+                await self.db.execute(
+                    "UPDATE sources SET activity_epoch = ? WHERE id = ?",
+                    (epoch, source_id),
+                )
+            await self.db.execute(
+                """INSERT INTO source_activity_leases (
+                       id, source_id, kind, epoch, capability, lease_until,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    activity_id,
+                    source_id,
+                    kind.value,
+                    epoch,
+                    capability,
+                    _utc_iso(lease_until),
+                    now_iso,
+                    now_iso,
+                ),
+            )
+        return SourceActivityLease(
+            id=activity_id,
+            source_id=source_id,
+            kind=kind,
+            epoch=epoch,
+            capability=capability,
+            lease_until=lease_until,
+        )
+
+    async def acquire_source_activity(
+        self,
+        *,
+        activity_id: str,
+        source_id: str,
+        kind: SourceActivityKind,
+        capability: str | None = None,
+        lease_seconds: int = 900,
+        expected_epoch: int | None = None,
+    ) -> SourceActivityLease:
+        async with self._write_lock:
+            try:
+                source_lock = await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (source_id,),
+                )
+                if source_lock.rowcount != 1:
+                    raise SourceActivityConflict(f"Source not found: {source_id}")
+                lease = await self._acquire_source_activity_unlocked(
+                    activity_id=activity_id,
+                    source_id=source_id,
+                    kind=kind,
+                    capability=capability,
+                    lease_seconds=lease_seconds,
+                    expected_epoch=expected_epoch,
+                )
+                await self.db.commit()
+                return lease
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def renew_source_activity(
+        self,
+        *,
+        activity_id: str,
+        capability: str | None = None,
+        lease_seconds: int = 900,
+    ) -> SourceActivityLease:
+        now = datetime.now(timezone.utc)
+        lease_until = now + timedelta(seconds=max(1, lease_seconds))
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE source_activity_leases
+                   SET lease_until = ?, updated_at = ?
+                   WHERE id = ? AND capability IS ? AND lease_until > ?""",
+                (
+                    _utc_iso(lease_until),
+                    _utc_iso(now),
+                    activity_id,
+                    capability,
+                    _utc_iso(now),
+                ),
+            )
+            if cursor.rowcount != 1:
+                await self.db.rollback()
+                raise SourceActivityConflict(
+                    f"source activity lease is not current: {activity_id}"
+                )
+            async with self.db.execute(
+                "SELECT source_id, kind, epoch FROM source_activity_leases WHERE id = ?",
+                (activity_id,),
+            ) as read_cursor:
+                row = await read_cursor.fetchone()
+            await self.db.commit()
+        assert row is not None
+        return SourceActivityLease(
+            id=activity_id,
+            source_id=str(row["source_id"]),
+            kind=SourceActivityKind(str(row["kind"])),
+            epoch=int(row["epoch"]),
+            capability=capability,
+            lease_until=lease_until,
+        )
+
+    async def release_source_activity(
+        self,
+        *,
+        activity_id: str,
+        capability: str | None = None,
+    ) -> bool:
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                "DELETE FROM source_activity_leases WHERE id = ? AND capability IS ?",
+                (activity_id, capability),
+            )
+            await self.db.commit()
+        return bool(cursor.rowcount)
+
+    async def get_source_activity_epoch(self, source_id: str) -> int:
+        async with self.db.execute(
+            "SELECT activity_epoch FROM sources WHERE id = ?",
+            (source_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise SourceActivityConflict(f"Source not found: {source_id}")
+        return int(row["activity_epoch"] or 0)
 
     async def start_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob:
         now = _now_iso()
@@ -4849,6 +5289,10 @@ class Database:
             if cursor.rowcount != 1:
                 await self.db.rollback()
                 raise ValueError("lifecycle backfill job is not running")
+            await self.db.execute(
+                "DELETE FROM source_activity_leases WHERE id = ? AND capability = ?",
+                (job_id, job_id),
+            )
             await self.db.commit()
         stored = await self.get_lifecycle_backfill_job(job_id)
         assert stored is not None
@@ -4871,6 +5315,10 @@ class Database:
             if cursor.rowcount != 1:
                 await self.db.rollback()
                 raise ValueError("lifecycle backfill job cannot fail from its current state")
+            await self.db.execute(
+                "DELETE FROM source_activity_leases WHERE id = ? AND capability = ?",
+                (job_id, job_id),
+            )
             await self.db.commit()
         stored = await self.get_lifecycle_backfill_job(job_id)
         assert stored is not None
@@ -4883,6 +5331,19 @@ class Database:
         async with self.db.execute(
             "SELECT * FROM lifecycle_backfill_jobs WHERE id = ?",
             (job_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_lifecycle_backfill_job(row) if row is not None else None
+
+    async def get_active_lifecycle_backfill_job(
+        self,
+        source_id: str,
+    ) -> LifecycleBackfillJob | None:
+        async with self.db.execute(
+            """SELECT * FROM lifecycle_backfill_jobs
+               WHERE source_id = ? AND status IN ('queued', 'running')
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (source_id,),
         ) as cursor:
             row = await cursor.fetchone()
         return self._row_to_lifecycle_backfill_job(row) if row is not None else None
@@ -9478,6 +9939,7 @@ class Database:
         project_binding: Mapping[str, Any] | None = None,
         created_by_user_id: str | None = None,
         execution_owner_user_id: str | None = None,
+        projection_scope_transition: ProjectionScopeTransition | None = None,
     ) -> None:
         """Insert or update a source row.
 
@@ -9495,9 +9957,92 @@ class Database:
             }
         )
         binding_json = json.dumps(dict(project_binding)) if project_binding else None
+        if (
+            projection_scope_transition is not None
+            and projection_scope_transition.source_id != id
+        ):
+            raise ValueError("projection scope transition source mismatch")
+        if (
+            projection_scope_transition is not None
+            and projection_scope_transition.status
+            is not ProjectionScopeTransitionStatus.PENDING
+        ):
+            raise ValueError("new projection scope transition must be pending")
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO sources (
+            try:
+                source_lock = await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (id,),
+                )
+                if source_lock.rowcount:
+                    async with self.db.execute(
+                        """SELECT type, name, config, project_binding,
+                                  created_by_user_id, owner_user_id, access_policy,
+                                  access_state, execution_owner_user_id
+                           FROM sources WHERE id = ?""",
+                        (id,),
+                    ) as cursor:
+                        current_source = await cursor.fetchone()
+                    async with self.db.execute(
+                        """SELECT id FROM lifecycle_backfill_jobs
+                           WHERE source_id = ? AND status IN ('queued', 'running')
+                           ORDER BY created_at LIMIT 1""",
+                        (id,),
+                    ) as cursor:
+                        lifecycle_job = await cursor.fetchone()
+                    if lifecycle_job is not None:
+                        raise ValueError(
+                            f"source lifecycle maintenance active: {lifecycle_job['id']}"
+                        )
+                    async with self.db.execute(
+                        """SELECT run_id FROM source_sync_runs
+                           WHERE source_id = ? AND status IN ('pending', 'running')
+                           ORDER BY created_at LIMIT 1""",
+                        (id,),
+                    ) as cursor:
+                        active_run = await cursor.fetchone()
+                    if active_run is not None:
+                        current_creator = current_source["created_by_user_id"]
+                        current_execution_owner = current_source[
+                            "execution_owner_user_id"
+                        ]
+                        pause_only = is_pause_only_source_update(
+                            current={
+                                "type": current_source["type"],
+                                "name": current_source["name"],
+                                "config": current_source["config"],
+                                "project_binding": current_source["project_binding"],
+                                "created_by_user_id": current_creator,
+                                "owner_user_id": current_source["owner_user_id"],
+                                "access_policy": current_source["access_policy"],
+                                "access_state": current_source["access_state"],
+                                "execution_owner_user_id": current_execution_owner,
+                            },
+                            proposed={
+                                "type": type,
+                                "name": name,
+                                "config": config_json,
+                                "project_binding": binding_json,
+                                "created_by_user_id": current_creator
+                                or created_by_user_id,
+                                "owner_user_id": owner_user_id,
+                                "access_policy": access_policy,
+                                "access_state": access_state,
+                                "execution_owner_user_id": current_execution_owner
+                                or execution_owner_user_id,
+                            },
+                            requested_status=status,
+                        )
+                        if not pause_only:
+                            raise ValueError(
+                                f"source sync run already active: {active_run['run_id']}"
+                            )
+            except Exception:
+                await self.db.rollback()
+                raise
+            try:
+                await self.db.execute(
+                    """INSERT INTO sources (
                        id, type, name, config, status, project_binding,
                        created_by_user_id, owner_user_id, access_policy,
                        access_state, execution_owner_user_id
@@ -9520,32 +10065,87 @@ class Database:
                        sources.execution_owner_user_id,
                        excluded.execution_owner_user_id
                    )""",
-                (
-                    id,
-                    type,
-                    name,
-                    config_json,
-                    status,
-                    binding_json,
-                    created_by_user_id,
-                    owner_user_id,
-                    access_policy,
-                    access_state,
-                    execution_owner_user_id,
-                    status,
-                ),
-            )
-            stale_metadata_rows = await self.db.execute_fetchall(
-                """SELECT 1
+                    (
+                        id,
+                        type,
+                        name,
+                        config_json,
+                        status,
+                        binding_json,
+                        created_by_user_id,
+                        owner_user_id,
+                        access_policy,
+                        access_state,
+                        execution_owner_user_id,
+                        status,
+                    ),
+                )
+                if projection_scope_transition is not None:
+                    previous_json = json.dumps(
+                        dict(projection_scope_transition.previous_scope),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    target_json = json.dumps(
+                        dict(projection_scope_transition.target_scope),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    async with self.db.execute(
+                        """SELECT * FROM projection_scope_transitions
+                           WHERE source_id = ?
+                             AND status IN ('pending', 'running', 'failed')
+                           ORDER BY created_at, id LIMIT 1""",
+                        (id,),
+                    ) as cursor:
+                        open_transition = await cursor.fetchone()
+                    if (
+                        open_transition is not None
+                        and open_transition["id"] != projection_scope_transition.id
+                    ):
+                        raise ValueError("projection_scope_transition_active")
+                    await self.db.execute(
+                        """INSERT OR IGNORE INTO projection_scope_transitions (
+                            id, source_id, previous_scope_json, target_scope_json, status,
+                            run_id, coverage, error, created_at, updated_at, completed_at
+                        ) VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, ?, NULL)""",
+                        (
+                            projection_scope_transition.id,
+                            id,
+                            previous_json,
+                            target_json,
+                            projection_scope_transition.created_at or _now_iso(),
+                            _now_iso(),
+                        ),
+                    )
+                    async with self.db.execute(
+                        "SELECT * FROM projection_scope_transitions WHERE id = ?",
+                        (projection_scope_transition.id,),
+                    ) as cursor:
+                        stored_transition = await cursor.fetchone()
+                    if (
+                        stored_transition is None
+                        or stored_transition["source_id"] != id
+                        or stored_transition["previous_scope_json"] != previous_json
+                        or stored_transition["target_scope_json"] != target_json
+                    ):
+                        raise ValueError(
+                            "projection scope transition retry identity mismatch"
+                        )
+                stale_metadata_rows = await self.db.execute_fetchall(
+                    """SELECT 1
                      FROM memory_search_metadata_fts
                     WHERE source_id = ?
                       AND metadata_source_name_tokens IS NOT ?
                     LIMIT 1""",
-                (id, name),
-            )
-            if stale_metadata_rows:
-                await self._refresh_metadata_fts_for_source_unlocked(id)
-            await self.db.commit()
+                    (id, name),
+                )
+                if stale_metadata_rows:
+                    await self._refresh_metadata_fts_for_source_unlocked(id)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def get_source(self, source_id: str) -> dict | None:
         async with self.db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)) as cursor:
@@ -9574,6 +10174,34 @@ class Database:
         now = _now_iso()
         async with self._write_lock:
             try:
+                source_lock = await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (source_id,),
+                )
+                if source_lock.rowcount != 1:
+                    raise LookupError("source_not_found")
+                async with self.db.execute(
+                    """SELECT id FROM lifecycle_backfill_jobs
+                       WHERE source_id = ? AND status IN ('queued', 'running')
+                       ORDER BY created_at LIMIT 1""",
+                    (source_id,),
+                ) as cursor:
+                    lifecycle_job = await cursor.fetchone()
+                if lifecycle_job is not None:
+                    raise ValueError(
+                        f"source lifecycle maintenance active: {lifecycle_job['id']}"
+                    )
+                async with self.db.execute(
+                    """SELECT run_id FROM source_sync_runs
+                       WHERE source_id = ? AND status IN ('pending', 'running')
+                       ORDER BY created_at LIMIT 1""",
+                    (source_id,),
+                ) as cursor:
+                    active_run = await cursor.fetchone()
+                if active_run is not None:
+                    raise ValueError(
+                        f"source sync run already active: {active_run['run_id']}"
+                    )
                 async with self.db.execute(
                     "SELECT * FROM source_access_transitions "
                     "WHERE source_id = ? AND idempotency_key = ?",
@@ -10667,6 +11295,33 @@ class Database:
         """
         async with self._write_lock:
             try:
+                source_lock = await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (source_id,),
+                )
+                if source_lock.rowcount:
+                    async with self.db.execute(
+                        """SELECT id FROM lifecycle_backfill_jobs
+                           WHERE source_id = ? AND status IN ('queued', 'running')
+                           ORDER BY created_at LIMIT 1""",
+                        (source_id,),
+                    ) as cursor:
+                        lifecycle_job = await cursor.fetchone()
+                    if lifecycle_job is not None:
+                        raise ValueError(
+                            f"source lifecycle maintenance active: {lifecycle_job['id']}"
+                        )
+                    async with self.db.execute(
+                        """SELECT run_id FROM source_sync_runs
+                           WHERE source_id = ? AND status IN ('pending', 'running')
+                           ORDER BY created_at LIMIT 1""",
+                        (source_id,),
+                    ) as cursor:
+                        active_run = await cursor.fetchone()
+                    if active_run is not None:
+                        raise ValueError(
+                            f"source sync run already active: {active_run['run_id']}"
+                        )
                 await self.db.execute(
                     "UPDATE sources SET status = 'deleting' WHERE id = ?",
                     (source_id,),
@@ -10690,6 +11345,13 @@ class Database:
                             )
                             if uri
                         )
+                async with self.db.execute(
+                    "SELECT raw_uri FROM source_sync_inputs WHERE source_id = ?",
+                    (source_id,),
+                ) as cursor:
+                    async for row in cursor:
+                        if row["raw_uri"]:
+                            artifact_uris.append(str(row["raw_uri"]))
 
                 for artifact_uri in dict.fromkeys(artifact_uris):
                     task_id = source_artifact_cleanup_task_id(source_id, artifact_uri)
@@ -11015,6 +11677,21 @@ class Database:
                     )
                 )
         return tasks
+
+    async def enqueue_source_artifact_cleanup_task(
+        self,
+        *,
+        source_id: str,
+        artifact_uri: str,
+    ) -> None:
+        task_id = source_artifact_cleanup_task_id(source_id, artifact_uri)
+        async with self._write_lock:
+            await self.db.execute(
+                "INSERT OR IGNORE INTO source_artifact_cleanup_tasks "
+                "(task_id, source_id, artifact_uri) VALUES (?, ?, ?)",
+                (task_id, source_id, artifact_uri),
+            )
+            await self.db.commit()
 
     async def complete_source_artifact_cleanup_task(self, task_id: str) -> None:
         async with self._write_lock:
@@ -11443,6 +12120,7 @@ class Database:
         trigger: str = "manual",
         force_full_sync: bool = False,
         input_snapshot_id: str | None = None,
+        source_config_revision: str | None = None,
     ) -> SourceSyncRun:
         for _attempt in range(3):
             async with self._write_lock:
@@ -11453,6 +12131,7 @@ class Database:
                         trigger=trigger,
                         force_full_sync=force_full_sync,
                         input_snapshot_id=input_snapshot_id,
+                        source_config_revision=source_config_revision,
                     )
                     await self.db.commit()
                     return run
@@ -11472,12 +12151,20 @@ class Database:
         trigger: str = "manual",
         force_full_sync: bool = False,
         input_snapshot_id: str | None = None,
+        source_config_revision: str | None = None,
         now: str | None = None,
     ) -> SourceSyncRun:
         now_iso = now or _now_iso()
         normalized_snapshot_id = _non_empty_string(input_snapshot_id)
+        normalized_config_revision = _non_empty_string(source_config_revision)
+        source_lock = await self.db.execute(
+            "UPDATE sources SET status = status WHERE id = ?",
+            (source_id,),
+        )
+        if source_lock.rowcount != 1:
+            raise ValueError(f"Source not found: {source_id}")
         async with self.db.execute(
-            "SELECT status FROM sources WHERE id = ?",
+            "SELECT type, config, status FROM sources WHERE id = ?",
             (source_id,),
         ) as cursor:
             source = await cursor.fetchone()
@@ -11485,6 +12172,38 @@ class Database:
             raise ValueError(f"Source not found: {source_id}")
         if source["status"] != "active":
             raise ValueError(f"Source is not active: {source_id} ({source['status']})")
+        if normalized_config_revision is not None:
+            actual_config_revision = local_agent_source_config_revision(
+                {
+                    "type": source["type"],
+                    "config": json.loads(source["config"]),
+                }
+            )
+            if actual_config_revision != normalized_config_revision:
+                raise ValueError("source config revision changed before sync enqueue")
+        async with self.db.execute(
+            """SELECT id FROM lifecycle_backfill_jobs
+               WHERE source_id = ? AND status IN ('queued', 'running')
+               ORDER BY created_at LIMIT 1""",
+            (source_id,),
+        ) as cursor:
+            lifecycle_job = await cursor.fetchone()
+        if lifecycle_job is not None:
+            raise SourceActivityConflict(
+                f"source lifecycle maintenance active: {lifecycle_job['id']}"
+            )
+        async with self.db.execute(
+            """SELECT MAX(input_generation) AS watermark
+               FROM source_sync_inputs
+               WHERE workspace_id = ? AND source_id = ?""",
+            (workspace_id, source_id),
+        ) as cursor:
+            watermark_row = await cursor.fetchone()
+        input_generation_watermark = (
+            int(watermark_row["watermark"])
+            if watermark_row is not None and watermark_row["watermark"] is not None
+            else None
+        )
         async with self.db.execute(
             """SELECT * FROM source_sync_runs
                WHERE workspace_id = ?
@@ -11511,14 +12230,37 @@ class Database:
             cursor = await self.db.execute(
                 """UPDATE source_sync_runs
                    SET force_full_sync = CASE WHEN ? THEN 1 ELSE force_full_sync END,
-                       rerun_requested = CASE WHEN ? THEN 1 ELSE rerun_requested END,
+                       rerun_requested = CASE
+                           WHEN status = 'pending' THEN 0
+                           WHEN ? THEN 1
+                           ELSE rerun_requested
+                       END,
                        input_snapshot_id = CASE
                            WHEN status = 'pending' AND ? IS NOT NULL THEN ?
                            ELSE input_snapshot_id
                        END,
                        rerun_input_snapshot_id = CASE
+                           WHEN status = 'pending' THEN NULL
                            WHEN status = 'running' AND ? IS NOT NULL THEN ?
                            ELSE rerun_input_snapshot_id
+                       END,
+                       input_generation_watermark = CASE
+                           WHEN status = 'pending' THEN ?
+                           ELSE input_generation_watermark
+                       END,
+                       rerun_input_generation_watermark = CASE
+                           WHEN status = 'pending' THEN NULL
+                           WHEN status = 'running' AND ? THEN ?
+                           ELSE rerun_input_generation_watermark
+                       END,
+                       source_config_revision = CASE
+                           WHEN status = 'pending' AND ? IS NOT NULL THEN ?
+                           ELSE source_config_revision
+                       END,
+                       rerun_source_config_revision = CASE
+                           WHEN status = 'pending' THEN NULL
+                           WHEN status = 'running' AND ? AND ? IS NOT NULL THEN ?
+                           ELSE rerun_source_config_revision
                        END,
                        updated_at = ?
                    WHERE run_id = ? AND status IN ('pending', 'running')""",
@@ -11529,6 +12271,14 @@ class Database:
                     normalized_snapshot_id,
                     normalized_snapshot_id,
                     normalized_snapshot_id,
+                    input_generation_watermark,
+                    int(mark_rerun),
+                    input_generation_watermark,
+                    normalized_config_revision,
+                    normalized_config_revision,
+                    int(mark_rerun),
+                    normalized_config_revision,
+                    normalized_config_revision,
                     now_iso,
                     existing["run_id"],
                 ),
@@ -11546,8 +12296,9 @@ class Database:
         await self.db.execute(
             """INSERT INTO source_sync_runs (
                 run_id, workspace_id, source_id, trigger, status,
-                force_full_sync, input_snapshot_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+                force_full_sync, input_snapshot_id, input_generation_watermark,
+                source_config_revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)""",
             (
                 run_id,
                 workspace_id,
@@ -11555,6 +12306,8 @@ class Database:
                 trigger,
                 int(force_full_sync),
                 normalized_snapshot_id,
+                input_generation_watermark,
+                normalized_config_revision,
                 now_iso,
                 now_iso,
             ),
@@ -11828,6 +12581,37 @@ class Database:
             cursor = await self.db.execute(
                 """UPDATE source_sync_runs
                    SET status = ?,
+                       input_snapshot_id = CASE
+                           WHEN ? AND rerun_requested = 1
+                           THEN COALESCE(rerun_input_snapshot_id, input_snapshot_id)
+                           ELSE input_snapshot_id
+                       END,
+                       input_generation_watermark = CASE
+                           WHEN ? AND rerun_requested = 1
+                           THEN COALESCE(
+                               rerun_input_generation_watermark,
+                               input_generation_watermark
+                           )
+                           ELSE input_generation_watermark
+                       END,
+                       source_config_revision = CASE
+                           WHEN ? AND rerun_requested = 1
+                           THEN COALESCE(
+                               rerun_source_config_revision,
+                               source_config_revision
+                           )
+                           ELSE source_config_revision
+                       END,
+                       rerun_requested = CASE WHEN ? THEN 0 ELSE rerun_requested END,
+                       rerun_input_snapshot_id = CASE
+                           WHEN ? THEN NULL ELSE rerun_input_snapshot_id
+                       END,
+                       rerun_input_generation_watermark = CASE
+                           WHEN ? THEN NULL ELSE rerun_input_generation_watermark
+                       END,
+                       rerun_source_config_revision = CASE
+                           WHEN ? THEN NULL ELSE rerun_source_config_revision
+                       END,
                        lease_owner = NULL,
                        lease_expires_at = NULL,
                        next_attempt_at = ?,
@@ -11839,6 +12623,13 @@ class Database:
                      AND lease_expires_at > ?""",
                 (
                     status,
+                    int(retryable),
+                    int(retryable),
+                    int(retryable),
+                    int(retryable),
+                    int(retryable),
+                    int(retryable),
+                    int(retryable),
                     next_attempt_iso,
                     error_message,
                     completed_at,
@@ -11890,14 +12681,17 @@ class Database:
         await self.db.execute(
             """INSERT INTO source_sync_runs (
                 run_id, workspace_id, source_id, trigger, status,
-                force_full_sync, input_snapshot_id, created_at, updated_at
-            ) VALUES (?, ?, ?, 'rerun', 'pending', ?, ?, ?, ?)""",
+                force_full_sync, input_snapshot_id, input_generation_watermark,
+                source_config_revision, created_at, updated_at
+            ) VALUES (?, ?, ?, 'rerun', 'pending', ?, ?, ?, ?, ?, ?)""",
             (
                 successor_id,
                 completed["workspace_id"],
                 completed["source_id"],
                 int(completed["force_full_sync"]),
                 completed["rerun_input_snapshot_id"],
+                completed["rerun_input_generation_watermark"],
+                completed["rerun_source_config_revision"],
                 now,
                 now,
             ),
@@ -11913,6 +12707,7 @@ class Database:
         raw_content_type: str,
         metadata: dict[str, object] | None = None,
         sync_snapshot_id: str | None = None,
+        expected_activity_epoch: int | None = None,
     ) -> SourceSyncInput:
         now = _now_iso()
         metadata_payload = dict(metadata or {})
@@ -11921,65 +12716,102 @@ class Database:
         if snapshot_id and not snapshot_doc_id:
             raise ValueError("snapshot input requires doc_id")
         async with self._write_lock:
-            async with self.db.execute(
-                """SELECT * FROM source_sync_inputs
+            try:
+                source_lock = await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (source_id,),
+                )
+                if source_lock.rowcount != 1:
+                    raise ValueError(f"Source not found: {source_id}")
+                async with self.db.execute(
+                    """SELECT id FROM lifecycle_backfill_jobs
+                       WHERE source_id = ? AND status IN ('queued', 'running')
+                       ORDER BY created_at LIMIT 1""",
+                    (source_id,),
+                ) as cursor:
+                    lifecycle_job = await cursor.fetchone()
+                if lifecycle_job is not None:
+                    raise SourceActivityConflict(
+                        f"source lifecycle maintenance active: {lifecycle_job['id']}"
+                    )
+                if expected_activity_epoch is not None:
+                    async with self.db.execute(
+                        "SELECT activity_epoch FROM sources WHERE id = ?",
+                        (source_id,),
+                    ) as cursor:
+                        epoch_row = await cursor.fetchone()
+                    current_epoch = int(epoch_row["activity_epoch"] or 0)
+                    if current_epoch != expected_activity_epoch:
+                        raise SourceActivityConflict(
+                            "source activity epoch changed: "
+                            f"expected {expected_activity_epoch}, current {current_epoch}"
+                        )
+            except Exception:
+                await self.db.rollback()
+                raise
+            try:
+                async with self.db.execute(
+                    """SELECT * FROM source_sync_inputs
                    WHERE workspace_id = ? AND source_id = ? AND raw_sha256 = ?""",
-                (workspace_id, source_id, raw_sha256),
-            ) as cursor:
-                existing = await cursor.fetchone()
-            if existing is not None:
+                    (workspace_id, source_id, raw_sha256),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if existing is not None:
+                    if snapshot_id and snapshot_doc_id:
+                        await self._record_source_sync_snapshot_item_unlocked(
+                            workspace_id=workspace_id,
+                            source_id=source_id,
+                            snapshot_id=snapshot_id,
+                            doc_id=snapshot_doc_id,
+                            input_id=str(existing["input_id"]),
+                            now=now,
+                        )
+                    await self.db.commit()
+                    return _source_sync_input_from_row(existing)
+                async with self.db.execute(
+                    """SELECT COALESCE(MAX(input_generation), 0) + 1 AS next_generation
+                   FROM source_sync_inputs
+                   WHERE workspace_id = ? AND source_id = ?""",
+                    (workspace_id, source_id),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                generation = int(row["next_generation"] if row else 1)
+                input_id = f"ssi-{uuid.uuid4().hex}"
+                await self.db.execute(
+                    """INSERT INTO source_sync_inputs (
+                    input_id, workspace_id, source_id, input_generation,
+                    raw_uri, raw_sha256, raw_content_type, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        input_id,
+                        workspace_id,
+                        source_id,
+                        generation,
+                        raw_uri,
+                        raw_sha256,
+                        raw_content_type,
+                        json.dumps(metadata_payload, sort_keys=True),
+                        now,
+                    ),
+                )
                 if snapshot_id and snapshot_doc_id:
                     await self._record_source_sync_snapshot_item_unlocked(
                         workspace_id=workspace_id,
                         source_id=source_id,
                         snapshot_id=snapshot_id,
                         doc_id=snapshot_doc_id,
-                        input_id=str(existing["input_id"]),
+                        input_id=input_id,
                         now=now,
                     )
-                    await self.db.commit()
-                return _source_sync_input_from_row(existing)
-            async with self.db.execute(
-                """SELECT COALESCE(MAX(input_generation), 0) + 1 AS next_generation
-                   FROM source_sync_inputs
-                   WHERE workspace_id = ? AND source_id = ?""",
-                (workspace_id, source_id),
-            ) as cursor:
-                row = await cursor.fetchone()
-            generation = int(row["next_generation"] if row else 1)
-            input_id = f"ssi-{uuid.uuid4().hex}"
-            await self.db.execute(
-                """INSERT INTO source_sync_inputs (
-                    input_id, workspace_id, source_id, input_generation,
-                    raw_uri, raw_sha256, raw_content_type, metadata_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    input_id,
-                    workspace_id,
-                    source_id,
-                    generation,
-                    raw_uri,
-                    raw_sha256,
-                    raw_content_type,
-                    json.dumps(metadata_payload, sort_keys=True),
-                    now,
-                ),
-            )
-            if snapshot_id and snapshot_doc_id:
-                await self._record_source_sync_snapshot_item_unlocked(
-                    workspace_id=workspace_id,
-                    source_id=source_id,
-                    snapshot_id=snapshot_id,
-                    doc_id=snapshot_doc_id,
-                    input_id=input_id,
-                    now=now,
-                )
-            await self.db.commit()
-            async with self.db.execute(
-                "SELECT * FROM source_sync_inputs WHERE input_id = ?",
-                (input_id,),
-            ) as cursor:
-                inserted = await cursor.fetchone()
+                await self.db.commit()
+                async with self.db.execute(
+                    "SELECT * FROM source_sync_inputs WHERE input_id = ?",
+                    (input_id,),
+                ) as cursor:
+                    inserted = await cursor.fetchone()
+            except Exception:
+                await self.db.rollback()
+                raise
         assert inserted is not None
         return _source_sync_input_from_row(inserted)
 
