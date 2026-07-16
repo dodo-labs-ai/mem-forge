@@ -407,6 +407,59 @@ async def test_lifecycle_activity_cancellation_fails_durable_recovery_job(
 
 
 @pytest.mark.asyncio
+async def test_repeated_wrapper_cancellation_waits_for_durable_job_cleanup(
+    db: Database,
+    monkeypatch,
+) -> None:
+    scan_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    fail_job = db.fail_lifecycle_backfill_job
+
+    async def block_scan(_source_id: str):
+        scan_started.set()
+        await asyncio.Event().wait()
+
+    async def block_cleanup(job_id: str, *, error: str):
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        return await fail_job(job_id, error=error)
+
+    monkeypatch.setattr(db, "list_legacy_memory_provenance", block_scan)
+    monkeypatch.setattr(db, "fail_lifecycle_backfill_job", block_cleanup)
+    job_id = "recovery-repeated-cancellation"
+    task = asyncio.create_task(
+        run_with_lifecycle_activity_heartbeat(
+            db,
+            job_id,
+            lambda: run_source_lifecycle_recovery_job(
+                db,
+                "src-1",
+                job_id=job_id,
+            ),
+            heartbeat_interval_seconds=3600,
+        )
+    )
+    await scan_started.wait()
+    task.cancel()
+    await cleanup_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+
+    try:
+        assert not task.done()
+    finally:
+        allow_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    job = await db.get_lifecycle_backfill_job(job_id)
+    assert job is not None
+    assert job.status is LifecycleBackfillJobStatus.FAILED
+    assert await db.get_active_lifecycle_backfill_job("src-1") is None
+
+
+@pytest.mark.asyncio
 async def test_lifecycle_heartbeat_failure_fails_durable_recovery_job(
     db: Database,
     monkeypatch,
