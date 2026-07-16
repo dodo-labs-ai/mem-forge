@@ -2147,6 +2147,16 @@ class FailingDocumentDeleteMemoryStore:
         raise RuntimeError("delete document failed")
 
 
+class RecordingDocumentDeleteMemoryStore:
+    def __init__(self, db: Database) -> None:
+        self.db = db
+        self.calls: list[tuple[str, dict]] = []
+
+    async def delete_projected_document(self, doc_id: str, **kwargs):
+        self.calls.append((doc_id, kwargs))
+        await self.db.delete_projected_document(doc_id)
+
+
 class CountingMemoryEngine(NoopMemoryEngine):
     def __init__(self, inserted: int):
         self.inserted = inserted
@@ -3791,6 +3801,73 @@ async def test_deletion_failure_marks_sync_failed(db: Database):
     assert state.docs_failed == 1
     assert "delete document failed" in state.failed_docs[0].error
     assert history[0]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_rebaseline_replay_removes_legacy_document_without_source_unit(
+    db: Database,
+) -> None:
+    source_id = "src-rebaseline-legacy-document"
+    await _insert_source_and_doc(db, source_id)
+    memory_store = RecordingDocumentDeleteMemoryStore(db)
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=memory_store,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=EmptyGene(),
+        source_name="Architecture",
+        source_id=source_id,
+        execution_mode=SourceSyncMode.REBASELINE_REPLAY,
+    )
+
+    assert state.last_sync_status == "success"
+    assert await db.get_document("doc-1") is None
+    assert memory_store.calls == [
+        (
+            "doc-1",
+            {
+                "deletion_context": {
+                    "deletion_kind": "rebaseline_legacy_absence",
+                    "reason": "not_returned_by_complete_rebaseline_replay",
+                }
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_normal_sync_keeps_legacy_document_without_source_unit_fail_closed(
+    db: Database,
+) -> None:
+    source_id = "src-normal-legacy-document"
+    await _insert_source_and_doc(db, source_id)
+    memory_store = RecordingDocumentDeleteMemoryStore(db)
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=memory_store,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=EmptyGene(),
+        source_name="Architecture",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "failed"
+    assert state.docs_failed == 1
+    assert "without persisted Source Unit lineage" in state.failed_docs[0].error
+    assert await db.get_document("doc-1") is not None
+    assert memory_store.calls == []
 
 
 @pytest.mark.asyncio

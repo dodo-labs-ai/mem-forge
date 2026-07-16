@@ -4124,7 +4124,7 @@ def create_admin_app(
                 source=source,
                 force_full_sync=True,
                 authoritative_snapshot=authoritative_snapshot,
-                execution_mode=SourceSyncMode.NORMAL,
+                execution_mode=SourceSyncMode.REBASELINE_REPLAY,
                 lifecycle_job_id=job_id,
             )
             if state.last_sync_status != "success":

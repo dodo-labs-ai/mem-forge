@@ -805,7 +805,7 @@ def test_source_rebaseline_endpoint_is_confirmation_bound_and_completes_replay(t
         assert provider.calls[0]["execution_mode"] is SourceSyncMode.REBASELINE_PREFLIGHT
         assert provider.calls[0]["lifecycle_job_id"] == jobs[0].id
         assert provider.calls[1]["force_full_sync"] is True
-        assert provider.calls[1]["execution_mode"] is SourceSyncMode.NORMAL
+        assert provider.calls[1]["execution_mode"] is SourceSyncMode.REBASELINE_REPLAY
         assert provider.calls[1]["lifecycle_job_id"] == jobs[0].id
     finally:
         asyncio.run(database.close())
