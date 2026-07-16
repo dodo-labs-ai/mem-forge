@@ -289,6 +289,15 @@ class RelationalStore(Protocol):
         observation_id: str,
         source_unit_id: str,
     ) -> LifecycleCutoverFinding: ...
+    async def retire_unprovable_lifecycle_cutover_finding(
+        self,
+        finding_id: str,
+        *,
+        source_id: str,
+        reconstruction_attempt_id: str,
+        operator_id: str,
+        unavailable_documents: Mapping[str, str],
+    ) -> LifecycleCutoverFinding: ...
     async def record_evidence_references(
         self,
         evidence_unit_id: str,
