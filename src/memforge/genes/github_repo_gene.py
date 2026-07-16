@@ -24,7 +24,7 @@ from memforge.genes.local_markdown_gene import _parse_dt, _to_markdown
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSIONS,
     build_github_repo_doc_id,
-    decode_github_base64_content,
+    decode_github_contents_payload,
     github_content_type,
     github_exclude_paths,
     github_extension_allowed,
@@ -35,6 +35,7 @@ from memforge.github_repo_utils import (
     normalize_github_scope_paths,
     normalize_github_relative_path,
     parse_github_repo_url,
+    validate_github_tree_payload,
 )
 from memforge.models import (
     ConfigField,
@@ -262,6 +263,7 @@ class GitHubRepoGene(Gene):
                 labels=["github_repo"],
                 extra={
                     "connection_mode": CONNECTION_MODE_CLOUD_PULL,
+                    "file_identity_contract": "repository_path",
                     "repo_url": repo_ref.repo_url,
                     "repo_host": repo_ref.host,
                     "repo_owner": repo_ref.owner,
@@ -272,28 +274,51 @@ class GitHubRepoGene(Gene):
                     "repo_contents_url": _contents_url(repo_ref, path, ref),
                 },
             )
+        self.attest_discovery_complete("github_recursive_tree_exhausted")
 
     async def fetch(self, item: ContentItem) -> RawContent:
         if item.extra.get("package_uri") or item.extra.get("package_path"):
+            body = read_package_body(self, item, source_label="GitHub repository")
+            package = json.loads(body.decode("utf-8"))
+            semantic_markdown = _to_markdown(
+                package.get("content_type") or "text/markdown",
+                str(package.get("markdown") or ""),
+            )
+            authoritative_empty = not semantic_markdown.strip()
             return RawContent(
                 item=item,
-                body=read_package_body(self, item, source_label="GitHub repository"),
+                body=body,
                 content_type="application/json",
+                authoritative_empty=authoritative_empty,
+                empty_evidence=(
+                    "github_repo_package_attested_empty_file"
+                    if authoritative_empty
+                    else None
+                ),
             )
 
         response = await self._client.get(str(item.extra["repo_contents_url"]))
         response.raise_for_status()
         payload = response.json()
         try:
-            raw = decode_github_base64_content(
-                content=payload.get("content"),
-                encoding=payload.get("encoding"),
-                size=payload.get("size"),
+            raw = decode_github_contents_payload(
+                payload,
+                expected_sha=str(item.extra.get("blob_sha") or ""),
                 label=str(item.extra.get("relative_path") or item.item_id),
             )
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
-        return RawContent(item=item, body=raw, content_type=item.content_type or "text/plain")
+        return RawContent(
+            item=item,
+            body=raw,
+            content_type=item.content_type or "text/plain",
+            authoritative_empty=not raw.strip(),
+            empty_evidence=(
+                "github_contents_api_successful_empty_blob"
+                if not raw.strip()
+                else None
+            ),
+        )
 
     async def normalize(self, raw: RawContent) -> NormalizedContent:
         if raw.content_type == "application/json":
@@ -321,18 +346,20 @@ class GitHubRepoGene(Gene):
     async def _default_branch(self, ref: _RepoRef) -> str:
         response = await self._client.get(_repo_api_url(ref))
         response.raise_for_status()
-        return str(response.json().get("default_branch") or "main")
+        payload = response.json()
+        branch = str(payload.get("default_branch") or "").strip() if isinstance(payload, dict) else ""
+        if not branch:
+            raise RuntimeError("GitHub repository response is missing default_branch")
+        return branch
 
     async def _repo_tree(self, ref: _RepoRef, repo_ref: str) -> list[dict]:
         response = await self._client.get(f"{_repo_api_url(ref)}/git/trees/{quote(repo_ref, safe='')}?recursive=1")
         response.raise_for_status()
         payload = response.json()
-        if payload.get("truncated") is True:
-            raise RuntimeError(
-                "GitHub tree response was truncated; narrow include_paths or use a non-recursive tree walk"
-            )
-        tree = payload.get("tree")
-        return tree if isinstance(tree, list) else []
+        try:
+            return validate_github_tree_payload(payload, label="GitHub repository")
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     async def _discover_local_push(self, since: datetime | None) -> AsyncIterator[ContentItem]:
         manifest = self._package_manifest()
@@ -413,6 +440,8 @@ class GitHubRepoGene(Gene):
                 extra={
                     "package_uri": str(entry.get("package_uri")),
                     "package_path": entry.get("package_path"),
+                    "package_sha256": entry.get("package_sha256"),
+                    "input_sha256": entry.get("input_sha256"),
                     "relative_path": entry.get("relative_path"),
                 },
             )

@@ -2478,7 +2478,6 @@ def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
                             "follow_up": {"suggested_tool": "get_memory"},
                             "retrieval_evidence": {"metadata_lexical": {"matched_text": ["large debug text"]}},
                             "repo_identifier": "repo",
-                            "memory_level": "atomic",
                         }
                     ],
                     "total_candidates": 61,

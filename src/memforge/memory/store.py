@@ -33,18 +33,22 @@ from memforge.memory.index_payloads import (
     memory_embedding_text,
 )
 from memforge.memory.lifecycle import allowed_search_statuses
+from memforge.memory.lifecycle_plan import LifecyclePlan, LifecycleVectorOperation
+from memforge.memory.lifecycle_planner import lifecycle_access_context_hash
 from memforge.models import (
     Memory,
     MemoryReview,
     MemoryStatus,
     ReplacementKind,
     UNSORTED_PROJECT_KEY,
+    VIRTUAL_DOCUMENT_SOURCE_IDS,
     Visibility,
 )
 from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
+from memforge.source_projection import SourceProjection
 
 logger = logging.getLogger(__name__)
 
@@ -150,8 +154,6 @@ def _memory_metadata(
         "memory_type": memory.memory_type,
         "project_key": memory.project_key or "",
         "repo_identifier": memory.repo_identifier or "",
-        "memory_level": memory.memory_level,
-        "curation_cluster_id": memory.curation_cluster_id or "",
         "visibility": memory.visibility,
         "owner_user_id": memory.owner_user_id or "",
         "confidence": memory.confidence,
@@ -177,8 +179,6 @@ def _normalize_snapshot_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     out.setdefault("owner_user_id", "")
     out.setdefault("project_key", "")
     out.setdefault("repo_identifier", "")
-    out.setdefault("memory_level", "atomic")
-    out.setdefault("curation_cluster_id", "")
     return out
 
 
@@ -292,6 +292,50 @@ class MemoryStore:
                         rollback_err,
                     )
             raise
+
+    async def drain_lifecycle_vector_outbox(
+        self,
+        lifecycle_plan_id: str | None = None,
+        *,
+        source_id: str | None = None,
+    ) -> None:
+        """Deliver durable vector side effects within one explicit ownership scope."""
+
+        tasks = await self.relational.list_lifecycle_vector_tasks(
+            source_id=source_id,
+            lifecycle_plan_id=lifecycle_plan_id,
+        )
+        first_error: Exception | None = None
+        for task in tasks:
+            try:
+                if task.operation is LifecycleVectorOperation.DELETE:
+                    await self.vector.delete([task.memory_id])
+                else:
+                    memory = await self.relational.get_memory(task.memory_id)
+                    if memory is None or memory.status != MemoryStatus.ACTIVE.value:
+                        raise ValueError(f"active lifecycle Memory missing: {task.memory_id}")
+                    indexed_text = await self._canonical_memory_embedding_text(memory)
+                    indexed_embedding = await self._embed(indexed_text)
+                    sources = await self.relational.get_memory_sources(memory.id)
+                    await self.vector.upsert(
+                        ids=[memory.id],
+                        embeddings=[indexed_embedding],
+                        metadatas=[
+                            _memory_metadata(
+                                memory,
+                                embedding_text_hash=embedding_text_hash(indexed_text),
+                                extra={
+                                    "source_doc_id": sources[0].doc_id if sources else "",
+                                },
+                            )
+                        ],
+                    )
+                await self.relational.complete_lifecycle_vector_task(task.id)
+            except Exception as exc:
+                await self.relational.fail_lifecycle_vector_task(task.id, str(exc))
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
 
     # -------------------------------------------------------------------
     # Core: Deduplicate and Insert
@@ -482,6 +526,59 @@ class MemoryStore:
             payload={"content_hash": memory.content_hash, "memory_type": memory.memory_type},
         )
         return "inserted"
+
+    async def find_access_compatible_equivalence_candidates(
+        self,
+        memory: Memory,
+        *,
+        excluded_memory_ids: set[str] | frozenset[str] = frozenset(),
+        excluded_source_id: str | None = None,
+        scope: AccessScope | None = None,
+    ) -> tuple[Memory, ...]:
+        """Return bounded access-compatible candidates for semantic proof.
+
+        Vector distance is candidate recall only. The engine must prove exact or
+        semantic equivalence before reusing an identity. Project is deliberately
+        absent from the access check because it is a relevance/ranking dimension,
+        not a visibility boundary.
+        """
+
+        embedding = await self._embed(_memory_embedding_text(memory))
+        candidates = await self.vector.query(
+            embedding,
+            scope or _writer_access_scope(memory),
+            None,
+            DEDUP_CANDIDATE_LIMIT,
+        )
+        compatible: list[Memory] = []
+        for existing_id, score in candidates:
+            if existing_id in excluded_memory_ids:
+                continue
+            if not self.vector.within_dedup_threshold(self.dedup_threshold, score):
+                continue
+            existing = await self.db.get_memory(existing_id)
+            if existing is None or existing.status != MemoryStatus.ACTIVE.value:
+                continue
+            if existing.visibility != memory.visibility:
+                continue
+            if lifecycle_access_context_hash(
+                visibility=existing.visibility,
+                owner_user_id=existing.owner_user_id,
+                project_key=existing.project_key,
+                repo_identifier=existing.repo_identifier,
+            ) != lifecycle_access_context_hash(
+                visibility=memory.visibility,
+                owner_user_id=memory.owner_user_id,
+                project_key=memory.project_key,
+                repo_identifier=memory.repo_identifier,
+            ):
+                continue
+            if excluded_source_id is not None:
+                sources = await self.db.get_memory_sources(existing.id)
+                if any(source.source_id == excluded_source_id for source in sources):
+                    continue
+            compatible.append(existing)
+        return tuple(compatible)
 
     async def _dedup_support_relation_outcome_bundle(
         self,
@@ -1022,6 +1119,8 @@ class MemoryStore:
     async def insert_agent_claim_memory(
         self,
         memory: Memory,
+        projection: SourceProjection,
+        lifecycle_plan: LifecyclePlan,
         doc_id: str,
         source_type: str,
         *,
@@ -1041,45 +1140,13 @@ class MemoryStore:
         excerpt: str | None = None,
         relation_outcome: RelationOutcomeBundle | None = None,
     ) -> None:
-        """Insert an agent-session memory and claim projection as one DB mutation."""
+        """Commit Agent Knowledge through the common projected-lifecycle seam."""
         context = self._operation_context(doc_id=doc_id)
-        vector_upsert_started = False
         try:
-            embedding_text = await self._canonical_memory_embedding_text(memory)
-            embedding = await self._embed(embedding_text)
-            await self._emit(
-                "chroma_upsert_attempted",
-                "attempted",
-                context=context,
+            await self.relational.apply_agent_claim_source_projection_lifecycle(
+                projection,
+                lifecycle_plan,
                 memory_id=memory.id,
-                doc_id=doc_id,
-                payload={"operation": "agent_claim_insert"},
-            )
-            vector_upsert_started = True
-            await self.vector.upsert(
-                ids=[memory.id],
-                embeddings=[embedding],
-                metadatas=[
-                    _memory_metadata(
-                        memory,
-                        embedding_text_hash=embedding_text_hash(embedding_text),
-                        extra={"source_doc_id": doc_id},
-                    )
-                ],
-            )
-            await self._emit(
-                "chroma_upsert_committed",
-                "committed",
-                context=context,
-                memory_id=memory.id,
-                doc_id=doc_id,
-                payload={"operation": "agent_claim_insert"},
-            )
-            await self.db.insert_memory_and_upsert_agent_claim(
-                memory,
-                doc_id=doc_id,
-                source_type=source_type,
-                excerpt=excerpt,
                 relation_outcome=relation_outcome,
                 claim_id=claim_id,
                 concept_id=concept_id,
@@ -1089,12 +1156,11 @@ class MemoryStore:
                 tags=tags,
                 confidence=confidence,
                 observed_at=observed_at,
-                source_updated_at=source_updated_at,
                 citations=citations,
                 concept_projection=concept_projection,
                 concept_markdown_body=concept_markdown_body,
-                entity_ids=entity_ids,
             )
+            await self.drain_lifecycle_vector_outbox(lifecycle_plan.id)
             await self._emit(
                 "memory_insert_committed",
                 "committed",
@@ -1113,21 +1179,16 @@ class MemoryStore:
                 memory_id=memory.id,
                 doc_id=doc_id,
                 error=str(exc),
-                payload={"index": "chroma", "operation": "agent_claim_insert"},
+                payload={"operation": "agent_claim_projected_lifecycle"},
             )
-            if vector_upsert_started:
-                await self._restore_memory_vector_snapshot(
-                    None,
-                    memory_id=memory.id,
-                    context=context,
-                    label="agent_claim_insert_rollback",
-                )
             raise
 
     async def supersede_agent_claim_memory(
         self,
         old_memory_id: str,
         new_memory: Memory,
+        projection: SourceProjection,
+        lifecycle_plan: LifecyclePlan,
         doc_id: str,
         source_type: str,
         *,
@@ -1148,15 +1209,9 @@ class MemoryStore:
         replacement_reason: str | None = None,
         relation_outcome: RelationOutcomeBundle | None = None,
     ) -> None:
-        """Supersede an agent-session memory and move its claim projection together."""
+        """Commit Agent Knowledge replacement through projected lifecycle."""
+        del source_type, replacement_kind, entity_ids, excerpt, source_updated_at
         context = self._operation_context(doc_id=doc_id)
-        old_snapshot = await self.db.get_memory(old_memory_id)
-        old_source_snapshots = await self.db.get_memory_sources(old_memory_id)
-        old_relation_snapshots = await self.db.get_evidence_relations_by_memory(old_memory_id)
-        old_claim_snapshot = await self.db.get_agent_claim(claim_id)
-        old_vector = await self._memory_vector_snapshot(old_memory_id)
-        new_vector = await self._memory_vector_snapshot(new_memory.id)
-        new_chroma_upsert_started = False
         await self._emit(
             "memory_supersede_attempted",
             "attempted",
@@ -1166,16 +1221,11 @@ class MemoryStore:
             reason=replacement_reason,
         )
         try:
-            await self.db.supersede_memory_and_upsert_agent_claim(
-                old_memory_id,
-                new_memory,
-                doc_id=doc_id,
-                source_type=source_type,
-                excerpt=excerpt,
-                carry_revision_sources=replacement_kind == "revision",
-                entity_ids=entity_ids,
-                replacement_reason=replacement_reason,
-                replacement_kind=replacement_kind,
+            await self.relational.apply_agent_claim_source_projection_lifecycle(
+                projection,
+                lifecycle_plan,
+                memory_id=new_memory.id,
+                relation_outcome=relation_outcome,
                 claim_id=claim_id,
                 concept_id=concept_id,
                 display_anchor=display_anchor,
@@ -1184,64 +1234,10 @@ class MemoryStore:
                 tags=tags,
                 confidence=confidence,
                 observed_at=observed_at,
-                source_updated_at=source_updated_at,
                 citations=citations,
                 concept_markdown_body=concept_markdown_body,
-                relation_outcome=relation_outcome,
             )
-            await self._remove_from_search_indexes(old_memory_id, label="superseded", context=context)
-            await self._emit(
-                "fts_upsert_committed",
-                "committed",
-                context=context,
-                memory_id=new_memory.id,
-                doc_id=doc_id,
-                payload={"operation": "agent_claim_supersede_insert"},
-            )
-
-            embedding_text = await self._canonical_memory_embedding_text(new_memory)
-            embedding = await self._embed(embedding_text)
-            try:
-                await self._emit(
-                    "chroma_upsert_attempted",
-                    "attempted",
-                    context=context,
-                    memory_id=new_memory.id,
-                    doc_id=doc_id,
-                    payload={"operation": "agent_claim_supersede_insert"},
-                )
-                new_chroma_upsert_started = True
-                await self.vector.upsert(
-                    ids=[new_memory.id],
-                    embeddings=[embedding],
-                    metadatas=[
-                        _memory_metadata(
-                            new_memory,
-                            embedding_text_hash=embedding_text_hash(embedding_text),
-                            extra={"source_doc_id": doc_id},
-                        )
-                    ],
-                )
-                await self._emit(
-                    "chroma_upsert_committed",
-                    "committed",
-                    context=context,
-                    memory_id=new_memory.id,
-                    doc_id=doc_id,
-                    payload={"operation": "agent_claim_supersede_insert"},
-                )
-            except Exception as exc:
-                await self._emit(
-                    "index_operation_failed",
-                    "failed",
-                    context=context,
-                    memory_id=new_memory.id,
-                    doc_id=doc_id,
-                    error=str(exc),
-                    payload={"index": "chroma", "operation": "agent_claim_supersede_insert"},
-                )
-                raise
-
+            await self.drain_lifecycle_vector_outbox(lifecycle_plan.id)
             await self._emit(
                 "memory_supersede_committed",
                 "committed",
@@ -1253,74 +1249,16 @@ class MemoryStore:
                 payload={"old_memory_id": old_memory_id, "new_memory_id": new_memory.id},
             )
         except Exception as exc:
-            rollback_error: Exception | None = None
-            try:
-                await self.db.purge_memory(new_memory.id)
-            except Exception as cleanup_exc:
-                rollback_error = cleanup_exc
-            if old_snapshot:
-                try:
-                    await self._restore_memory_row(old_snapshot)
-                except Exception as cleanup_exc:
-                    rollback_error = rollback_error or cleanup_exc
-                try:
-                    if old_vector:
-                        await self._restore_memory_vector_snapshot(
-                            old_vector,
-                            memory_id=old_memory_id,
-                            context=context,
-                            label="agent_claim_supersede_rollback",
-                        )
-                    else:
-                        await self._restore_search_indexes(
-                            old_snapshot,
-                            context=context,
-                            label="agent_claim_supersede_rollback",
-                        )
-                except Exception as cleanup_exc:
-                    rollback_error = rollback_error or cleanup_exc
-                for source in old_source_snapshots:
-                    try:
-                        await self.db.restore_memory_source_snapshot(source)
-                    except Exception as cleanup_exc:
-                        rollback_error = rollback_error or cleanup_exc
-                for relation in old_relation_snapshots:
-                    try:
-                        await self.db.restore_evidence_relation_snapshot(relation)
-                    except Exception as cleanup_exc:
-                        rollback_error = rollback_error or cleanup_exc
-            if old_claim_snapshot:
-                try:
-                    await self.db.upsert_agent_claim(
-                        claim_id=old_claim_snapshot["id"],
-                        concept_id=old_claim_snapshot["concept_id"],
-                        display_anchor=old_claim_snapshot["display_anchor"],
-                        claim_text=old_claim_snapshot["claim_text"],
-                        memory_type=old_claim_snapshot["memory_type"],
-                        tags=old_claim_snapshot["tags"],
-                        confidence=old_claim_snapshot["confidence"],
-                        memory_id=old_claim_snapshot["memory_id"],
-                        observed_at=_parse_iso_datetime(
-                            old_claim_snapshot["last_observed_at"]
-                            or old_claim_snapshot["updated_at"]
-                            or old_claim_snapshot["created_at"]
-                        ),
-                    )
-                except Exception as cleanup_exc:
-                    rollback_error = rollback_error or cleanup_exc
-            if new_chroma_upsert_started or new_vector:
-                try:
-                    await self._restore_memory_vector_snapshot(
-                        new_vector,
-                        memory_id=new_memory.id,
-                        context=context,
-                        label="agent_claim_supersede_rollback",
-                    )
-                except Exception as cleanup_exc:
-                    rollback_error = rollback_error or cleanup_exc
-            if rollback_error:
-                raise rollback_error
-            raise exc
+            await self._emit(
+                "index_operation_failed",
+                "failed",
+                context=context,
+                memory_id=new_memory.id,
+                doc_id=doc_id,
+                error=str(exc),
+                payload={"operation": "agent_claim_projected_lifecycle_supersede"},
+            )
+            raise
 
         logger.info(
             "Agent claim memory superseded: %s -> %s (%s)",
@@ -1328,6 +1266,60 @@ class MemoryStore:
             new_memory.id,
             new_memory.memory_type,
         )
+
+    async def retire_agent_claim_memory(
+        self,
+        *,
+        old_memory_id: str,
+        projection: SourceProjection,
+        plan: LifecyclePlan,
+        claim_id: str,
+        concept_id: str,
+        display_anchor: str,
+        claim_text: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        observed_at: datetime,
+        concept_markdown_body: str,
+    ) -> None:
+        """Atomically retire an Agent claim and update its canonical concept."""
+
+        context = self._operation_context(doc_id=concept_id)
+        try:
+            await self.relational.apply_agent_claim_source_projection_lifecycle(
+                projection,
+                plan,
+                memory_id=old_memory_id,
+                relation_outcome=None,
+                claim_id=claim_id,
+                concept_id=concept_id,
+                display_anchor=display_anchor,
+                claim_text=claim_text,
+                memory_type=memory_type,
+                tags=tags,
+                confidence=confidence,
+                observed_at=observed_at,
+                concept_markdown_body=concept_markdown_body,
+            )
+            await self.drain_lifecycle_vector_outbox(plan.id)
+            await self._emit(
+                "memory_retire_committed",
+                "committed",
+                context=context,
+                memory_id=old_memory_id,
+                reason="managed_agent_claim_retirement",
+            )
+        except Exception as exc:
+            await self._emit(
+                "index_operation_failed",
+                "failed",
+                context=context,
+                memory_id=old_memory_id,
+                error=str(exc),
+                payload={"operation": "agent_claim_projected_lifecycle_retire"},
+            )
+            raise
 
     async def ensure_agent_claim_memory_projection(
         self,
@@ -1666,6 +1658,56 @@ class MemoryStore:
         )
         return retired_ids
 
+    async def delete_projected_document(
+        self,
+        doc_id: str,
+        *,
+        deletion_context: dict[str, Any] | None = None,
+    ) -> None:
+        """Remove document storage after lifecycle was committed separately.
+
+        This path deliberately performs no Memory mutation. Source Projection
+        lineage and Evidence records remain durable for audit, while the
+        document vector and relational document artifacts are removed together
+        with rollback protection.
+        """
+
+        context = self._operation_context(doc_id=doc_id)
+        document_snapshot = await self.db.get_document(doc_id)
+        document_side_snapshot = await self.db.get_document_side_table_snapshots([doc_id])
+        document_vector_snapshot = self._document_vector_snapshot(doc_id)
+        try:
+            await self._remove_document_vector(doc_id, context=context)
+        except Exception:
+            await self._restore_document_vector_snapshot(
+                doc_id,
+                document_vector_snapshot,
+                context=context,
+            )
+            raise
+        try:
+            await self.db.delete_projected_document(doc_id)
+        except Exception:
+            if document_snapshot:
+                await self.db.restore_document_snapshot(
+                    document_snapshot,
+                    require_configured_source=True,
+                )
+                await self.db.restore_document_side_table_snapshots(document_side_snapshot)
+            await self._restore_document_vector_snapshot(
+                doc_id,
+                document_vector_snapshot,
+                context=context,
+            )
+            raise
+        await self._emit(
+            "projected_document_delete_committed",
+            "committed",
+            context=context,
+            doc_id=doc_id,
+            payload=deletion_context or {},
+        )
+
     async def delete_source_cascade(self, source_id: str) -> list[str]:
         """Delete a source and remove newly retired memories from search indexes."""
         context = self._operation_context(source_id=source_id)
@@ -1709,20 +1751,47 @@ class MemoryStore:
         retired_ids = list(deletion_result.retired_memory_ids)
         if deletion_result.retired_search_cleanup_required:
             try:
-                await self._remove_retired_from_search_indexes(retired_ids, context=context)
-            except Exception:
-                await self._restore_deleted_source_state(
-                    source_snapshot=source_snapshot,
-                    document_snapshots=document_snapshots,
-                    document_side_snapshot=document_side_snapshot,
-                    document_vector_snapshots=document_vector_snapshots,
-                    memory_snapshots=memory_snapshots,
-                    source_snapshots=source_snapshots,
-                    context=context,
+                await self.drain_lifecycle_vector_outbox(source_id=source_id)
+            except Exception as exc:
+                # Relational deletion is already complete and authoritative.
+                # The independent outbox survives source-row deletion and is
+                # retried; never resurrect a partial copy of the deleted graph.
+                logger.warning(
+                    "Deferred source deletion vector cleanup for %s: %s",
+                    source_id,
+                    exc,
                 )
-                raise
+                await self._emit(
+                    "source_delete_vector_cleanup_deferred",
+                    "failed",
+                    context=context,
+                    source_id=source_id,
+                    error=str(exc),
+                    payload={"retired_memory_ids": retired_ids},
+                )
         await self._emit(
             "source_delete_cascade_committed",
+            "committed",
+            context=context,
+            source_id=source_id,
+            payload={"retired_memory_ids": retired_ids},
+        )
+        return retired_ids
+
+    async def rebaseline_source_lifecycle(self, source_id: str) -> list[str]:
+        """Reset replayable source derivations and remove retired vectors."""
+
+        context = self._operation_context(source_id=source_id)
+        result = await self.relational.rebaseline_source_lifecycle(source_id)
+        retired_ids = list(result.retired_memory_ids)
+        if result.retired_search_cleanup_required:
+            # SQLite records these external vector deletes in the durable
+            # lifecycle outbox as part of the relational reset.  Retry earlier
+            # failures for this source without coupling its job to another
+            # source's pending vector work.
+            await self.drain_lifecycle_vector_outbox(source_id=source_id)
+        await self._emit(
+            "source_rebaseline_committed",
             "committed",
             context=context,
             source_id=source_id,
@@ -2253,7 +2322,12 @@ class MemoryStore:
         context: AuditContext,
     ) -> None:
         if document_snapshot:
-            await self.db.restore_document_snapshot(document_snapshot)
+            await self.db.restore_document_snapshot(
+                document_snapshot,
+                require_configured_source=(
+                    document_snapshot.source not in VIRTUAL_DOCUMENT_SOURCE_IDS
+                ),
+            )
             await self.db.restore_document_side_table_snapshots(document_side_snapshot)
             await self._restore_document_vector_snapshot(
                 document_snapshot.doc_id,
@@ -2280,7 +2354,10 @@ class MemoryStore:
         if source_snapshot:
             await self.db.restore_source_snapshot(source_snapshot)
         for document in document_snapshots:
-            await self.db.restore_document_snapshot(document)
+            await self.db.restore_document_snapshot(
+                document,
+                require_configured_source=True,
+            )
         await self.db.restore_document_side_table_snapshots(document_side_snapshot)
         for document in document_snapshots:
             await self._restore_document_vector_snapshot(

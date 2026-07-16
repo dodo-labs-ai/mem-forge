@@ -8,11 +8,26 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from memforge.agent_knowledge import AgentKnowledgeBundleService, AgentKnowledgePatchProposal
 from memforge.config import AppConfig
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
+from memforge.memory.evidence import (
+    EvidenceContentProvenance,
+    EvidenceUnit,
+    MemorySupportAssertion,
+)
 from memforge.memory.lifecycle_service import MemoryLifecycleConflict, MemoryLifecycleService
 from memforge.memory.store import MemoryStore
-from memforge.models import DocumentRecord, Memory, Visibility, content_hash
+from memforge.models import (
+    ContentItem,
+    DocumentRecord,
+    Memory,
+    NormalizedContent,
+    RawContent,
+    Visibility,
+    content_hash,
+)
+from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
@@ -246,9 +261,138 @@ async def test_replace_document_memory_without_provenance_fails_closed(db: Datab
 
 
 @pytest.mark.asyncio
+async def test_user_lifecycle_cannot_bypass_active_projected_source_support(db: Database):
+    old = _memory("mem-source-managed", "The source-owned rule is current.")
+    await db.upsert_source(
+        id="src-managed",
+        type="confluence",
+        name="Managed source",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    observed = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="doc-managed",
+            source="src-managed",
+            source_url="https://example.test/doc-managed",
+            title="Managed document",
+            space_or_project="ENG",
+            author=None,
+            last_modified=observed,
+            labels=[],
+            version="1",
+            content_hash="managed-doc-hash",
+            token_count=8,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=observed,
+        )
+    )
+    await db.insert_memory(old)
+    await db.add_memory_source(
+        old.id,
+        "doc-managed",
+        "confluence",
+        old.content,
+        source_updated_at=observed,
+    )
+    item = ContentItem(
+        item_id="doc-managed",
+        title="Managed document",
+        source_url="https://example.test/doc-managed",
+        last_modified=observed,
+        version="1",
+        extra={"page_id": "managed", "space_key": "ENG"},
+    )
+    projection = project_source_item(
+        source_id="src-managed",
+        source_type="confluence",
+        run_id="projection-managed",
+        item=item,
+        raw=RawContent(item=item, body=old.content.encode(), content_type="text/html"),
+        normalized=NormalizedContent(item=item, markdown_body=old.content),
+    )
+    await db.record_source_projection(projection)
+    observation = projection.observations[0]
+    observation_revision = projection.observation_revisions[0]
+    unit = EvidenceUnit(
+        id="eu-source-managed",
+        source_id="src-managed",
+        doc_id="doc-managed",
+        doc_revision_id=projection.source_unit_revisions[0].id,
+        source_type="confluence",
+        source_anchor=observation.id,
+        source_lineage_id=projection.source_units[0].id,
+        project_key="ENG",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        content=old.content,
+        excerpt=old.content,
+        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        access_context_hash="workspace-eng",
+    )
+    await db.upsert_evidence_unit(unit)
+    await db.db.execute(
+        """INSERT INTO evidence_references (
+               id, evidence_unit_id, role, anchor_kind, observation_id,
+               observation_revision_id, fragment_id, range_start, range_end, created_at
+           ) VALUES (?, ?, 'primary', 'whole_observation', ?, ?, NULL, NULL, NULL, ?)""",
+        (
+            "eref-source-managed",
+            unit.id,
+            observation.id,
+            observation_revision.id,
+            observed.isoformat(),
+        ),
+    )
+    await db.db.commit()
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id="support-source-managed",
+            memory_id=old.id,
+            evidence_reference_id="eref-source-managed",
+            source_id="src-managed",
+            access_context_hash="workspace-eng",
+        )
+    )
+    service = MemoryLifecycleService(
+        db=db,
+        memory_store=_store(db, RecordingCollection()),
+    )
+
+    with pytest.raises(
+        MemoryLifecycleConflict,
+        match="source_backed_memory_requires_lifecycle_review",
+    ):
+        await service.retire_memory(
+            old.id,
+            reason="manual retirement",
+            expected_content_hash=old.content_hash,
+        )
+    with pytest.raises(
+        MemoryLifecycleConflict,
+        match="source_backed_memory_requires_lifecycle_review",
+    ):
+        await service.replace_memory(
+            old.id,
+            replacement_content="A user-authored replacement.",
+            provenance="Explicit user request.",
+            reason="manual replacement",
+            expected_content_hash=old.content_hash,
+        )
+
+    assert (await db.get_memory(old.id)).status == "active"
+    assert await db.count_documents("user_correction") == 0
+
+
+@pytest.mark.asyncio
 async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     observed_at = datetime(2026, 6, 28, tzinfo=timezone.utc)
-    old = _memory("mem-agent-tool-old", "Use claude-code to invoke Claude Code CLI")
     await db.upsert_source(
         "src-agent-sessions-codex",
         "agent_session",
@@ -258,56 +402,39 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
         "andrew.sun01@sap.com",
         created_by_user_id="andrew.sun01@sap.com",
     )
-    await db.upsert_document(
-        DocumentRecord(
-            doc_id="concept-claude-cli",
-            source="src-agent-sessions-codex",
-            source_url="memforge://agent-session/concept-claude-cli",
-            title="Claude Code CLI convention",
-            space_or_project="UNSORTED",
-            author="andrew.sun01@sap.com",
-            last_modified=observed_at,
-            labels=["agent_session"],
-            version="1",
-            content_hash="concept-hash",
-            token_count=20,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
-            last_synced=observed_at,
-        )
-    )
-    await db.insert_memory_and_upsert_agent_claim(
-        old,
-        doc_id="concept-claude-cli",
-        source_type="agent_session",
-        excerpt="Use claude-code to invoke Claude Code CLI",
-        relation_outcome=None,
-        claim_id="claim-claude-cli",
-        concept_id="concept-claude-cli",
-        display_anchor="Claude Code CLI convention",
-        claim_text="Use claude-code to invoke Claude Code CLI",
-        memory_type=old.memory_type,
-        tags=list(old.tags),
-        confidence=old.confidence,
-        observed_at=observed_at,
-        source_updated_at=observed_at,
-        concept_projection={
-            "concept_id": "concept-claude-cli",
-            "source_id": "src-agent-sessions-codex",
-            "owner_user_id": "andrew.sun01@sap.com",
-            "workspace": "/workspace",
-            "repo_identifier": "github.com/shno-labs/mem-forge",
-            "concept_type": "topic",
-            "concept_path": "concepts/claude-cli.md",
-            "title": "Claude Code CLI convention",
-            "markdown_body": "# Claude Code CLI convention\n",
-            "frontmatter": {},
-        },
-    )
     collection = RecordingCollection()
     store = _store(db, collection)
+    created = await AgentKnowledgeBundleService(db=db, memory_store=store).apply_patch_proposal(
+        proposal=AgentKnowledgePatchProposal(
+            action="create_new_concept",
+            concept_id="concept-claude-cli",
+            claim_id="claim-claude-cli",
+            concept_type="convention",
+            title="Claude Code CLI convention",
+            claim_text="Use claude-code to invoke Claude Code CLI",
+            durable_claim={
+                "rule": "Use claude-code to invoke Claude Code CLI",
+                "scope": "Claude Code CLI usage.",
+            },
+            memory_type="fact",
+            tags=["jira"],
+            reason="Initial observed convention.",
+            confidence=0.91,
+        ),
+        owner_user_id="andrew.sun01@sap.com",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="session-initial",
+        workspace="/workspace",
+        repo_identifier="github.com/shno-labs/mem-forge",
+        project_key="UNSORTED",
+        submitted_at=observed_at,
+        source_updated_at=observed_at,
+    )
+    assert created.memory_id is not None
+    old = await db.get_memory(created.memory_id)
+    assert old is not None
+    await db.enable_lifecycle_gate("src-agent-sessions-codex")
     service = MemoryLifecycleService(db=db, memory_store=store)
 
     result = await service.replace_memory(
@@ -327,8 +454,10 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     assert stored_old is not None
     assert stored_old.status == "superseded"
     assert stored_old.superseded_by == result.replacement_memory_id
+    assert await db.get_active_memory_support_reference_ids(old.id) == ()
     assert stored_new is not None
     assert stored_new.status == "active"
+    assert await db.get_active_memory_support_reference_ids(result.replacement_memory_id)
     assert stored_new.content == "Invoke Claude Code with `claude`, not `claude-code`."
     assert stored_new.extraction_context == "User corrected the command while reviewing Claude Code CLI usage."
     assert claim is not None
@@ -338,6 +467,26 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     assert "Invoke Claude Code with `claude`, not `claude-code`." in concept["markdown_body"]
     assert "Use claude-code to invoke Claude Code CLI" not in concept["markdown_body"]
     assert [(source.doc_id, source.source_type) for source in new_sources] == [("concept-claude-cli", "agent_session")]
+
+    await db.delete_source_cascade("src-agent-sessions-codex")
+
+    assert await db.get_source("src-agent-sessions-codex") is None
+    assert await db.get_agent_concept("concept-claude-cli") is None
+    assert await db.get_agent_claim("claim-claude-cli") is None
+    deleted_source_memory = await db.get_memory(result.replacement_memory_id)
+    assert deleted_source_memory is not None
+    assert deleted_source_memory.status == "retired"
+    assert await db.get_active_memory_support_reference_ids(result.replacement_memory_id) == ()
+    for table in (
+        "source_projection_runs",
+        "source_units",
+        "source_observations",
+        "source_lifecycle_gates",
+        "lifecycle_plans",
+        "memory_support_assertions",
+    ):
+        async with db.db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
+            assert (await cursor.fetchone())[0] == 0
 
 
 @pytest.mark.asyncio

@@ -275,31 +275,6 @@ class TeamsLedgerStateStore:
         }
         return self._save(payload)
 
-    def has_receipt(self, *, source_id: str, window_id: str, revision_hash: str) -> bool:
-        payload = self._load()
-        receipts = payload.get("receipts")
-        if not isinstance(receipts, dict):
-            return False
-        return _receipt_state_key(source_id, window_id, revision_hash) in receipts
-
-    def record_receipt(
-        self,
-        *,
-        source_id: str,
-        window_id: str,
-        revision_hash: str,
-        document_hash: str | None = None,
-    ) -> dict[str, Any]:
-        payload = self._load()
-        receipts = payload.setdefault("receipts", {})
-        receipts[_receipt_state_key(source_id, window_id, revision_hash)] = {
-            "source_id": source_id,
-            "window_id": window_id,
-            "revision_hash": revision_hash,
-            "document_hash": document_hash,
-        }
-        return self._save(payload)
-
     def observe_messages(
         self,
         *,
@@ -338,26 +313,34 @@ class TeamsLedgerStateStore:
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
-            return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": {}, "receipts": {}, "message_receipts": {}}
+            return {
+                "version": TEAMS_LEDGER_STATE_VERSION,
+                "conversations": {},
+                "message_receipts": {},
+            }
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": {}, "receipts": {}, "message_receipts": {}}
+            return {
+                "version": TEAMS_LEDGER_STATE_VERSION,
+                "conversations": {},
+                "message_receipts": {},
+            }
         if not isinstance(payload, dict) or payload.get("version") != TEAMS_LEDGER_STATE_VERSION:
-            return {"version": TEAMS_LEDGER_STATE_VERSION, "conversations": {}, "receipts": {}, "message_receipts": {}}
+            return {
+                "version": TEAMS_LEDGER_STATE_VERSION,
+                "conversations": {},
+                "message_receipts": {},
+            }
         conversations = payload.get("conversations")
         if not isinstance(conversations, dict):
             conversations = {}
-        receipts = payload.get("receipts")
-        if not isinstance(receipts, dict):
-            receipts = {}
         message_receipts = payload.get("message_receipts")
         if not isinstance(message_receipts, dict):
             message_receipts = {}
         return {
             "version": TEAMS_LEDGER_STATE_VERSION,
             "conversations": conversations,
-            "receipts": receipts,
             "message_receipts": message_receipts,
         }
 
@@ -365,7 +348,6 @@ class TeamsLedgerStateStore:
         cleaned = {
             "version": TEAMS_LEDGER_STATE_VERSION,
             "conversations": payload.get("conversations") if isinstance(payload.get("conversations"), dict) else {},
-            "receipts": payload.get("receipts") if isinstance(payload.get("receipts"), dict) else {},
             "message_receipts": (
                 payload.get("message_receipts") if isinstance(payload.get("message_receipts"), dict) else {}
             ),
@@ -421,14 +403,6 @@ def decode_teams_window_id(window_id: str) -> dict[str, str]:
     }
 
 
-def build_teams_receipt_key(*, source_id: str, window_id: str, revision_hash: str) -> dict[str, str]:
-    return {
-        "source_id": source_id,
-        "window_id": window_id,
-        "revision_hash": revision_hash,
-    }
-
-
 def _block_to_json(block: TeamsBlockProjection) -> dict[str, Any]:
     return {
         "source_id": block.source_id,
@@ -467,10 +441,6 @@ def _block_from_json(value: dict[str, Any]) -> TeamsBlockProjection:
 
 def _conversation_state_key(source_id: str, conversation_id: str) -> str:
     return _sha256_json({"source_id": source_id, "conversation_id": conversation_id})
-
-
-def _receipt_state_key(source_id: str, window_id: str, revision_hash: str) -> str:
-    return _sha256_json({"source_id": source_id, "window_id": window_id, "revision_hash": revision_hash})
 
 
 def _message_receipt_state_key(

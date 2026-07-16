@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from memforge.agent_knowledge_markdown import (
     render_agent_concept_markdown,
     render_agent_concept_markdown_with_patch,
+    render_agent_concept_markdown_without_claim,
 )
 from memforge.memory.evidence import (
     AccessContext,
@@ -36,14 +37,29 @@ from memforge.memory.evidence import (
     build_mandatory_candidate_bucket_results,
     relation_bundle_snapshot_audit,
 )
+from memforge.memory.lifecycle_plan import LifecycleMutationType, ReconciliationScope
+from memforge.memory.lifecycle_planner import (
+    NewMemoryDefaults,
+    build_lifecycle_plan,
+    lifecycle_access_context_hash,
+    lifecycle_plan_id,
+)
 from memforge.models import (
+    ContentItem,
     DocumentRecord,
     Memory,
+    NormalizedContent,
+    RawContent,
+    RawMemory,
+    ReconcileAction,
+    ReconcileOperation,
     ReplacementKind,
     Visibility,
     content_hash,
     slugify,
 )
+from memforge.pipeline.projection_evidence import build_projected_claim_evidence
+from memforge.pipeline.source_projection_adapters import project_source_item
 
 
 PatchAction = Literal[
@@ -449,6 +465,152 @@ class AgentKnowledgeBundleService:
             and (concept.get("repo_identifier") or None) == (repo_identifier or None)
         )
 
+    async def replace_claim_from_user_correction(
+        self,
+        *,
+        old_memory_id: str,
+        replacement_content: str,
+        provenance: str,
+        reason: str,
+        replacement_kind: ReplacementKind,
+        observed_at: datetime,
+    ) -> str:
+        """Apply an explicit user correction through Agent Source Projection."""
+
+        claim = await self.db.get_agent_claim_by_memory_id(old_memory_id)
+        concept = (
+            await self.db.get_agent_concept(claim["concept_id"])
+            if claim is not None
+            else None
+        )
+        old_memory = await self.db.get_memory(old_memory_id)
+        if claim is None or concept is None or old_memory is None:
+            raise ValueError("corrected agent claim lineage is incomplete")
+        source_id = str(concept["source_id"])
+        owner_user_id = str(concept["owner_user_id"])
+        session_id = "correction-" + sha256(
+            "\x1f".join((old_memory_id, replacement_content, reason)).encode("utf-8")
+        ).hexdigest()[:20]
+        action: PatchAction = (
+            "update_existing_claim"
+            if replacement_kind == "revision"
+            else "supersede_existing_claim"
+        )
+        proposal = AgentKnowledgePatchProposal(
+            action=action,
+            concept_id=str(concept["id"]),
+            claim_id=str(claim["id"]),
+            claim_text=replacement_content,
+            durable_claim=DurableClaim(rule=replacement_content, scope=provenance),
+            memory_type=str(claim["memory_type"]),
+            tags=list(claim["tags"]),
+            reason=reason,
+            confidence=float(claim["confidence"]),
+        )
+        markdown_body = await self._render_concept_markdown_with_patch(
+            concept,
+            claim_id=str(claim["id"]),
+            claim_text=replacement_content,
+            citations=[],
+        )
+        return await self._supersede_claim_memory(
+            proposal=proposal,
+            old_memory_id=old_memory_id,
+            concept_id=str(concept["id"]),
+            claim_id=str(claim["id"]),
+            display_anchor=str(claim["display_anchor"]),
+            source_id=source_id,
+            client="user_correction",
+            session_id=session_id,
+            workspace=str(concept["workspace"]),
+            claim_text=replacement_content,
+            memory_content=replacement_content,
+            memory_type=str(claim["memory_type"]),
+            tags=list(claim["tags"]),
+            confidence=float(claim["confidence"]),
+            owner_user_id=owner_user_id,
+            repo_identifier=concept.get("repo_identifier"),
+            project_key=old_memory.project_key,
+            source_type="agent_session",
+            replacement_reason=reason,
+            replacement_kind=replacement_kind,
+            memory_extraction_context=provenance,
+            submitted_at=observed_at,
+            observed_at=observed_at,
+            source_updated_at=observed_at,
+            concept_markdown_body=markdown_body,
+        )
+
+    async def retire_claim_from_user_request(
+        self,
+        *,
+        old_memory_id: str,
+        reason: str,
+        observed_at: datetime,
+    ) -> str:
+        """Retire one managed Agent claim through its Source Projection."""
+
+        claim = await self.db.get_agent_claim_by_memory_id(old_memory_id)
+        concept = (
+            await self.db.get_agent_concept(claim["concept_id"])
+            if claim is not None
+            else None
+        )
+        old_memory = await self.db.get_memory(old_memory_id)
+        if claim is None or concept is None or old_memory is None:
+            raise ValueError("retired agent claim lineage is incomplete")
+        markdown_body = await render_agent_concept_markdown_without_claim(
+            self.db,
+            concept,
+            claim_id=str(claim["id"]),
+        )
+        session_id = "retirement-" + sha256(
+            "\x1f".join((old_memory_id, reason)).encode("utf-8")
+        ).hexdigest()[:20]
+        projection, plan, target_memory_id = await self._build_agent_claim_lifecycle(
+            concept_id=str(concept["id"]),
+            source_id=str(concept["source_id"]),
+            client="user_retirement",
+            session_id=session_id,
+            workspace=str(concept["workspace"]),
+            claim_text=str(claim["claim_text"]),
+            memory_content=None,
+            memory_type=str(claim["memory_type"]),
+            tags=list(claim["tags"]),
+            confidence=float(claim["confidence"]),
+            owner_user_id=str(concept["owner_user_id"]),
+            repo_identifier=concept.get("repo_identifier"),
+            project_key=old_memory.project_key,
+            submitted_at=observed_at,
+            source_updated_at=observed_at,
+            concept_projection=None,
+            concept_markdown_body=markdown_body,
+            incumbent_memory_id=old_memory_id,
+            reconcile_action=ReconcileAction.DELETE,
+            reconciliation_reason=reason,
+        )
+        if not any(
+            mutation.mutation_type is LifecycleMutationType.RETIRE_MEMORY
+            and mutation.memory_id == old_memory_id
+            for mutation in plan.mutations
+        ):
+            raise ValueError("agent claim retirement requires an enabled lifecycle gate")
+        await self.memory_store.retire_agent_claim_memory(
+            old_memory_id=old_memory_id,
+            projection=projection,
+            plan=plan,
+            claim_id=str(claim["id"]),
+            concept_id=str(concept["id"]),
+            display_anchor=str(claim["display_anchor"]),
+            claim_text=str(claim["claim_text"]),
+            memory_type=str(claim["memory_type"]),
+            tags=list(claim["tags"]),
+            confidence=float(claim["confidence"]),
+            observed_at=observed_at,
+            concept_markdown_body=markdown_body,
+        )
+        return target_memory_id
+
     async def _resolve_claim_target_from_memory_candidate(
         self,
         *,
@@ -457,7 +619,7 @@ class AgentKnowledgeBundleService:
         client: str,
         session_id: str,
         workspace: str,
-        memory_content: str,
+        memory_content: str | None,
         owner_user_id: str,
         repo_identifier: str | None,
         project_key: str | None,
@@ -574,7 +736,28 @@ class AgentKnowledgeBundleService:
         lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [])
         if lifecycle.action is not LifecycleAction.CREATE_MEMORY or not lifecycle.created_memory_id:
             raise RuntimeError(f"unexpected agent claim create lifecycle action: {lifecycle.action}")
-        memory_id = lifecycle.created_memory_id
+        projection, plan, memory_id = await self._build_agent_claim_lifecycle(
+            concept_id=concept_id,
+            source_id=source_id,
+            client=client,
+            session_id=session_id,
+            workspace=workspace,
+            claim_text=claim_text,
+            memory_content=memory_content,
+            memory_type=memory_type,
+            tags=tags,
+            confidence=confidence,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            project_key=project_key,
+            submitted_at=submitted_at,
+            source_updated_at=source_updated_at,
+            concept_projection=concept_projection,
+            concept_markdown_body=concept_markdown_body,
+            incumbent_memory_id=None,
+            reconcile_action=ReconcileAction.ADD,
+            reconciliation_reason=proposal.reason or "agent claim created",
+        )
         memory = self._build_claim_memory(
             memory_id=memory_id,
             claim_text=claim_text,
@@ -601,6 +784,8 @@ class AgentKnowledgeBundleService:
         if existing is None:
             await self.memory_store.insert_agent_claim_memory(
                 memory=memory,
+                projection=projection,
+                lifecycle_plan=plan,
                 doc_id=concept_id,
                 source_type=source_type,
                 claim_id=claim_id,
@@ -621,6 +806,247 @@ class AgentKnowledgeBundleService:
         else:
             await self.db.record_relation_outcome_bundle(relation_outcome)
         return memory_id
+
+    async def _build_agent_claim_lifecycle(
+        self,
+        *,
+        concept_id: str,
+        source_id: str,
+        client: str,
+        session_id: str,
+        workspace: str,
+        claim_text: str,
+        memory_content: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        owner_user_id: str,
+        repo_identifier: str | None,
+        project_key: str | None,
+        submitted_at: datetime,
+        source_updated_at: datetime | None,
+        concept_projection: dict[str, object] | None,
+        concept_markdown_body: str | None,
+        incumbent_memory_id: str | None,
+        reconcile_action: ReconcileAction,
+        reconciliation_reason: str,
+        memory_extraction_context: str | None = None,
+    ):
+        """Build the provider-neutral projection and complete claim plan.
+
+        Agent Knowledge is command-originated source content, but its durable
+        Memory follows the same Source Projection and Lifecycle Plan seam as
+        every Gene-backed source.
+        """
+
+        existing_concept = await self.db.get_agent_concept(concept_id)
+        markdown_body = (
+            concept_markdown_body
+            or str((concept_projection or {}).get("markdown_body") or "")
+            or str((existing_concept or {}).get("markdown_body") or "")
+        )
+        if not markdown_body or (
+            reconcile_action is not ReconcileAction.DELETE
+            and claim_text.strip() not in markdown_body
+        ):
+            raise ValueError("agent claim projection must contain the exact claim evidence")
+        title = str(
+            (concept_projection or {}).get("title")
+            or (existing_concept or {}).get("title")
+            or concept_id
+        )
+        observed_at = source_updated_at or submitted_at
+        item = ContentItem(
+            item_id=concept_id,
+            title=title,
+            source_url=f"agent-knowledge://{slugify(owner_user_id)}/{concept_id}",
+            last_modified=observed_at,
+            content_type="text/markdown",
+            space_or_project=project_key or "UNSORTED",
+            version=content_hash(markdown_body),
+            author=client,
+        )
+        native = {
+            "doc_id": concept_id,
+            "markdown": markdown_body,
+            "receipt": {
+                "client": client,
+                "session_id": session_id,
+                "history_window_kind": "agent_knowledge_patch",
+                "workspace": workspace,
+            },
+        }
+        current_unit = await self.db.find_source_unit_by_document_id(source_id, concept_id)
+        prior_unit_revision = (
+            await self.db.get_current_source_unit_revision(current_unit.id)
+            if current_unit is not None
+            else None
+        )
+        prior_observation_revisions = (
+            await self.db.get_current_source_observation_revisions(current_unit.id)
+            if current_unit is not None
+            else {}
+        )
+        run_digest = sha256(
+            "\x1f".join(
+                (source_id, concept_id, client, session_id, content_hash(markdown_body))
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        raw = RawContent(
+            item=item,
+            body=json.dumps(native, sort_keys=True).encode("utf-8"),
+            content_type="application/json",
+        )
+        projection = project_source_item(
+            source_id=source_id,
+            source_type="agent_session",
+            run_id=f"agent-projection-{run_digest}",
+            item=item,
+            raw=raw,
+            normalized=NormalizedContent(item=item, markdown_body=markdown_body),
+            scope={"managed_capture_source": source_id},
+            access_context={
+                "visibility": Visibility.PRIVATE.value,
+                "owner_user_id": owner_user_id,
+            },
+            prior_unit_revision=prior_unit_revision,
+            prior_observation_revisions=prior_observation_revisions,
+        )
+        delta = projection.deltas[0]
+        scope = ReconciliationScope(
+            id=f"scope:{projection.run_id}",
+            source_id=source_id,
+            source_unit_id=delta.source_unit_id,
+            base_unit_revision_id=delta.previous_unit_revision_id,
+            target_unit_revision_id=delta.current_unit_revision_id,
+        )
+        raw_memory = (
+            RawMemory(
+                content=memory_content,
+                memory_type=memory_type,
+                confidence=confidence,
+                tags=list(tags),
+                extraction_context=(memory_extraction_context or claim_text).strip(),
+                evidence_quote=claim_text.strip(),
+            )
+            if memory_content is not None
+            else None
+        )
+        access_hash = lifecycle_access_context_hash(
+            visibility=Visibility.PRIVATE.value,
+            owner_user_id=owner_user_id,
+            project_key=project_key,
+            repo_identifier=repo_identifier,
+        )
+        source_support = await self.db.get_source_unit_support_reference_ids(
+            scope.source_unit_id
+        )
+        incumbents: dict[str, Memory] = {}
+        incumbent_candidates: dict[str, RawMemory] = {}
+        for memory_id in sorted(source_support):
+            current = await self.db.get_memory(memory_id)
+            if current is not None and current.status == "active":
+                incumbents[memory_id] = current
+                claim = await self.db.get_agent_claim_by_memory_id(memory_id)
+                if claim is None:
+                    raise ValueError("agent Source Unit support points to a non-claim Memory")
+                incumbent_candidates[memory_id] = RawMemory(
+                    content=current.content,
+                    memory_type=current.memory_type,
+                    confidence=current.confidence,
+                    tags=list(current.tags),
+                    extraction_context=str(claim["claim_text"]).strip(),
+                    evidence_quote=str(claim["claim_text"]).strip(),
+                )
+        if incumbent_memory_id is not None and incumbent_memory_id not in incumbents:
+            raise ValueError("agent claim replacement lacks current Source Unit support")
+        evidence_candidates = [
+            candidate
+            for memory_id, candidate in sorted(incumbent_candidates.items())
+            if memory_id != incumbent_memory_id
+        ]
+        if raw_memory is not None:
+            evidence_candidates.append(raw_memory)
+        evidence = build_projected_claim_evidence(
+            projection=projection,
+            raw_memories=tuple(evidence_candidates),
+            doc_id=concept_id,
+            source_type="agent_session",
+            project_key=project_key,
+            visibility=Visibility.PRIVATE.value,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            access_context_hash=access_hash,
+            extractor_run_id=projection.run_id,
+            observed_at=observed_at.isoformat(),
+        )
+        operations = [
+            ReconcileOperation(
+                action=ReconcileAction.NOOP,
+                memory_id=memory_id,
+                memory=incumbent_candidates[memory_id],
+                reason="unchanged agent claim",
+            )
+            for memory_id in sorted(incumbents)
+            if memory_id != incumbent_memory_id
+        ]
+        operations.append(
+            ReconcileOperation(
+                action=reconcile_action,
+                memory_id=incumbent_memory_id,
+                memory=raw_memory,
+                reason=reconciliation_reason,
+            )
+        )
+        all_active_support = {
+            memory_id: await self.db.get_active_memory_support_reference_ids(memory_id)
+            for memory_id in incumbents
+        }
+        support_hashes = {
+            memory_id: await self.db.get_memory_support_set_hash(memory_id)
+            for memory_id in incumbents
+        }
+        gate = await self.db.get_lifecycle_gate(source_id)
+        plan = build_lifecycle_plan(
+            plan_id=lifecycle_plan_id(scope),
+            scope=scope,
+            gate_state=gate.state,
+            operations=tuple(operations),
+            incumbents=incumbents,
+            source_support_reference_ids=source_support,
+            all_active_support_reference_ids=all_active_support,
+            support_set_hashes=support_hashes,
+            observation_revision_ids=tuple(
+                revision.id for revision in projection.observation_revisions
+            ),
+            new_evidence_reference_ids=(),
+            evidence_reference_ids_by_claim_hash=evidence.reference_ids_by_claim_hash,
+            defaults=NewMemoryDefaults(
+                visibility=Visibility.PRIVATE.value,
+                owner_user_id=owner_user_id,
+                project_key=project_key,
+                repo_identifier=repo_identifier,
+                doc_id=concept_id,
+                source_type="agent_session",
+                access_context_hash=access_hash,
+                source_updated_at=(
+                    source_updated_at.isoformat() if source_updated_at is not None else None
+                ),
+            ),
+            evidence_units=evidence.units,
+            evidence_references=evidence.references,
+        )
+        memory_id = next(
+            (
+                mutation.memory_id
+                for mutation in plan.mutations
+                if mutation.mutation_type is LifecycleMutationType.CREATE_MEMORY
+            ),
+            incumbent_memory_id,
+        )
+        if memory_id is None:
+            raise ValueError("agent claim lifecycle produced no target Memory")
+        return projection, plan, memory_id
 
     async def _supersede_claim_memory(
         self,
@@ -645,6 +1071,7 @@ class AgentKnowledgeBundleService:
         source_type: str,
         replacement_reason: str,
         replacement_kind: ReplacementKind,
+        memory_extraction_context: str | None = None,
         submitted_at: datetime,
         observed_at: datetime,
         source_updated_at: datetime | None,
@@ -665,31 +1092,15 @@ class AgentKnowledgeBundleService:
             submitted_at=submitted_at,
         )
         relation_run_id = _relation_run_id(unit.id, session_id, proposal.action)
-        new_memory_id = _replacement_memory_id(unit, replacement_kind)
-        memory = self._build_claim_memory(
-            memory_id=new_memory_id,
-            claim_text=claim_text,
-            memory_content=memory_content,
-            memory_type=memory_type,
-            tags=tags,
-            confidence=confidence,
-            owner_user_id=owner_user_id,
-            repo_identifier=repo_identifier,
-            project_key=project_key,
-        )
-        if old_memory_id == new_memory_id:
-            existing_run = await self.db.get_relation_run(relation_run_id)
-            if existing_run is None:
-                raise RuntimeError("agent claim replacement retry is missing its relation run")
-            if existing_run.result_memory_id != new_memory_id:
-                raise RuntimeError("agent claim replacement retry result memory does not match current claim")
+        existing_run = await self.db.get_relation_run(relation_run_id)
+        if existing_run is not None and existing_run.result_memory_id == old_memory_id:
             committed_candidates = tuple(await self.db.get_relation_candidates(relation_run_id))
             relation_outcome = self._relation_outcome_bundle(
                 unit=unit,
                 relation_run_id=relation_run_id,
                 lifecycle_action=LifecycleAction.SUPERSEDE_MEMORY,
                 review_case=None,
-                memory_id=new_memory_id,
+                memory_id=old_memory_id,
                 candidates=committed_candidates,
                 incomplete_mandatory_buckets=existing_run.incomplete_mandatory_buckets,
                 candidate_count=existing_run.candidate_count,
@@ -698,14 +1109,19 @@ class AgentKnowledgeBundleService:
                 submitted_at=submitted_at,
             )
             await self.db.record_relation_outcome_bundle(relation_outcome)
+            if not await self.db.get_active_memory_support_reference_ids(old_memory_id):
+                raise RuntimeError("agent claim replacement retry lacks active Source Projection support")
+            current_memory = await self.db.get_memory(old_memory_id)
+            if current_memory is None or current_memory.status != "active":
+                raise RuntimeError("agent claim replacement retry target is not active")
             await self.memory_store.ensure_agent_claim_memory_projection(
-                memory,
+                current_memory,
                 doc_id=concept_id,
                 source_type=source_type,
                 excerpt=claim_text.strip(),
                 source_updated_at=source_updated_at,
             )
-            return new_memory_id
+            return old_memory_id
         universe = await self._mandatory_candidate_universe(
             unit=unit,
             relation_run_id=relation_run_id,
@@ -734,6 +1150,45 @@ class AgentKnowledgeBundleService:
         lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [decision])
         if lifecycle.action is not LifecycleAction.SUPERSEDE_MEMORY:
             raise RuntimeError(f"unexpected agent claim replace lifecycle action: {lifecycle.action}")
+        projection, plan, new_memory_id = await self._build_agent_claim_lifecycle(
+            concept_id=concept_id,
+            source_id=source_id,
+            client=client,
+            session_id=session_id,
+            workspace=workspace,
+            claim_text=claim_text,
+            memory_content=memory_content,
+            memory_type=memory_type,
+            tags=tags,
+            confidence=confidence,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            project_key=project_key,
+            submitted_at=submitted_at,
+            source_updated_at=source_updated_at,
+            concept_projection=None,
+            concept_markdown_body=concept_markdown_body,
+            incumbent_memory_id=old_memory_id,
+            reconcile_action=(
+                ReconcileAction.UPDATE
+                if replacement_kind == "revision"
+                else ReconcileAction.SUPERSEDE
+            ),
+            reconciliation_reason=replacement_reason,
+            memory_extraction_context=memory_extraction_context,
+        )
+        memory = self._build_claim_memory(
+            memory_id=new_memory_id,
+            claim_text=claim_text,
+            memory_content=memory_content,
+            memory_type=memory_type,
+            tags=tags,
+            confidence=confidence,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            project_key=project_key,
+            extraction_context=memory_extraction_context,
+        )
         relation_outcome = self._relation_outcome_bundle(
             unit=unit,
             relation_run_id=relation_run_id,
@@ -750,6 +1205,8 @@ class AgentKnowledgeBundleService:
         await self.memory_store.supersede_agent_claim_memory(
             old_memory_id,
             memory,
+            projection,
+            plan,
             doc_id=concept_id,
             source_type=source_type,
             excerpt=claim_text.strip(),
@@ -866,6 +1323,7 @@ class AgentKnowledgeBundleService:
         owner_user_id: str,
         repo_identifier: str | None,
         project_key: str | None,
+        extraction_context: str | None = None,
     ) -> Memory:
         return Memory(
             id=memory_id,
@@ -881,7 +1339,7 @@ class AgentKnowledgeBundleService:
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
             status="active",
-            extraction_context=claim_text.strip(),
+            extraction_context=(extraction_context or claim_text).strip(),
         )
 
     async def _write_concept_document(
@@ -918,7 +1376,8 @@ class AgentKnowledgeBundleService:
                 pdf_content_uri=None,
                 last_synced=submitted_at,
                 client=client,
-            )
+            ),
+            require_configured_source=True,
         )
 
     async def _render_concept_markdown_with_patch(

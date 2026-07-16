@@ -50,6 +50,11 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# Provenance documents written by direct user lifecycle operations are virtual:
+# they intentionally do not correspond to a configured Source row.
+VIRTUAL_DOCUMENT_SOURCE_IDS = frozenset({"user_memory", "user_correction"})
+
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -70,11 +75,6 @@ class MemoryStatus(str, Enum):
 
 
 ReplacementKind = Literal["revision", "supersession"]
-
-
-class MemoryLevel(str, Enum):
-    ATOMIC = "atomic"
-    CONSOLIDATED = "consolidated"
 
 
 class Visibility(str, Enum):
@@ -192,8 +192,6 @@ class Memory:
     replacement_reason: str | None = None
     replacement_kind: ReplacementKind | None = None
     extraction_context: str | None = None
-    memory_level: str = MemoryLevel.ATOMIC.value
-    curation_cluster_id: str | None = None
 
 
 @dataclass
@@ -209,6 +207,9 @@ class RawMemory:
     extraction_context: str | None = None
     evidence_quote: str | None = None
     evidence_anchor: str | None = None
+    source_observation_id: str | None = None
+    required_source_observation_ids: list[str] = field(default_factory=list)
+    support_validation: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -222,34 +223,6 @@ class MemorySource:
     support_kind: str = "extracted"
     added_at: datetime | None = None
     source_updated_at: datetime | None = None
-
-
-@dataclass
-class MemoryDerivation:
-    """Lineage edge from a consolidated memory to an atomic child memory."""
-
-    parent_memory_id: str
-    child_memory_id: str
-    relation: str = "summarizes"
-    created_at: datetime | None = None
-
-
-@dataclass
-class MemoryCurationRun:
-    """Audit record for one Curator execution."""
-
-    id: str
-    policy_id: str
-    source_type: str
-    client: str | None
-    repo_identifier: str | None
-    project_key: str | None
-    candidate_count: int
-    created_memory_count: int
-    skipped_reason: str | None
-    error: str | None
-    started_at: datetime
-    completed_at: datetime | None = None
 
 
 @dataclass
@@ -441,6 +414,12 @@ class RawContent:
     item: ContentItem
     body: bytes
     content_type: str
+    # Empty bytes are ambiguous by default: they can mean a genuinely empty
+    # provider object, a truncated response, or a connector failure.  A Gene
+    # must opt in only after a successful provider read established that the
+    # source object itself is authoritatively empty.
+    authoritative_empty: bool = False
+    empty_evidence: str | None = None
 
 
 @dataclass
@@ -541,6 +520,10 @@ class SourceSyncRun:
     force_full_sync: bool = False
     input_snapshot_id: str | None = None
     rerun_input_snapshot_id: str | None = None
+    input_generation_watermark: int | None = None
+    rerun_input_generation_watermark: int | None = None
+    source_config_revision: str | None = None
+    rerun_source_config_revision: str | None = None
     coalesced: bool = False
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
@@ -584,6 +567,14 @@ class SourceArtifactCleanupTask:
 
 @dataclass(frozen=True)
 class SourceDeletionResult:
+    retired_memory_ids: tuple[str, ...] = ()
+    retired_search_cleanup_required: bool = True
+
+
+@dataclass(frozen=True)
+class SourceLifecycleResetResult:
+    """Derived-state cleanup outcome for an in-place source rebaseline."""
+
     retired_memory_ids: tuple[str, ...] = ()
     retired_search_cleanup_required: bool = True
 
@@ -632,9 +623,6 @@ class SearchResult:
     freshness: str = "current"  # current | stale | unverified
     contradiction_warning: str | None = None
     status: str = "active"
-    memory_level: str = MemoryLevel.ATOMIC.value
-    curation_cluster_id: str | None = None
-    covered_memory_count: int = 0
     repo_identifier: str | None = None
     follow_up: dict[str, str] | None = None
     retrieval_evidence: dict[str, Any] | None = None
@@ -663,6 +651,7 @@ class ReviewStatus(str, Enum):
 
 class ReviewKind(str, Enum):
     SUPERSEDE = "supersede"
+    CROSS_SOURCE_CONFLICT = "cross_source_conflict"
 
 
 def generate_review_id() -> str:

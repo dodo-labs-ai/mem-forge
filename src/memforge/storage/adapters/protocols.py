@@ -16,10 +16,36 @@ from memforge.models import (
     Entity,
     EntityAlias,
     Memory,
-    MemoryCurationRun,
-    MemoryDerivation,
     MemorySource,
     Project,
+    SourceLifecycleResetResult,
+)
+from memforge.memory.evidence import (
+    ActiveSupportEvidence,
+    EvidenceReference,
+    MemorySupportAssertion,
+    RelationOutcomeBundle,
+)
+from memforge.memory.lifecycle_plan import (
+    LegacyMemoryProvenance,
+    LifecycleCutoverFinding,
+    LifecycleBackfillJob,
+    CutoverFindingStatus,
+    LifecycleGate,
+    LifecyclePlan,
+    LifecycleReview,
+    LifecycleReviewStatus,
+    LifecycleVectorTask,
+)
+from memforge.source_projection import (
+    ProjectionCoverage,
+    ProjectionScopeTransition,
+    SourceObservationRevision,
+    SourceProjection,
+    SourceUnit,
+    SourceUnitInventoryFilter,
+    SourceUnitInventoryPage,
+    SourceUnitRevision,
 )
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.storage.adapters.context import AccessScope
@@ -92,9 +118,6 @@ class RankingMetadata(TypedDict, total=False):
     updated_at: datetime | None
     project_key: str | None
     repo_identifier: str | None
-    memory_level: str | None
-    curation_cluster_id: str | None
-    covered_memory_count: int
 
 
 @runtime_checkable
@@ -114,8 +137,235 @@ class RelationalStore(Protocol):
     async def insert_memory(self, memory: Memory) -> str: ...
     async def get_memory(self, memory_id: str) -> Memory | None: ...
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]: ...
-    async def upsert_document(self, doc: DocumentRecord) -> None: ...
+    async def upsert_document(
+        self,
+        doc: DocumentRecord,
+        *,
+        require_configured_source: bool = False,
+    ) -> None: ...
     async def get_document(self, doc_id: str) -> DocumentRecord | None: ...
+    async def delete_projected_document(self, doc_id: str) -> None: ...
+    async def rebaseline_source_lifecycle(self, source_id: str) -> SourceLifecycleResetResult: ...
+    async def rebind_projected_document_support(
+        self,
+        old_doc_id: str,
+        new_doc_id: str,
+    ) -> None: ...
+    async def record_source_projection(self, projection: SourceProjection) -> None: ...
+    async def get_source_projection(self, run_id: str) -> SourceProjection | None: ...
+    async def get_current_source_unit_revision(
+        self,
+        source_unit_id: str,
+    ) -> SourceUnitRevision | None: ...
+    async def get_current_source_observation_revisions(
+        self,
+        source_unit_id: str,
+    ) -> Mapping[str, SourceObservationRevision]: ...
+    async def find_source_unit_by_document_id(
+        self,
+        source_id: str,
+        document_id: str,
+        *,
+        current_only: bool = False,
+    ) -> SourceUnit | None: ...
+    async def list_source_unit_document_ids(
+        self,
+        source_unit_id: str,
+    ) -> tuple[str, ...]: ...
+    async def list_current_source_unit_observation_ids(
+        self,
+        source_id: str,
+    ) -> dict[str, tuple[str, ...]]: ...
+    async def list_current_source_units(
+        self,
+        source_id: str,
+    ) -> tuple[SourceUnit, ...]: ...
+    async def list_current_source_units_page(
+        self,
+        source_id: str,
+        *,
+        filters: SourceUnitInventoryFilter,
+        cursor: str | None = None,
+        limit: int = 200,
+    ) -> SourceUnitInventoryPage: ...
+    async def create_projection_scope_transition(
+        self,
+        transition: ProjectionScopeTransition,
+    ) -> ProjectionScopeTransition: ...
+    async def get_open_projection_scope_transition(
+        self,
+        source_id: str,
+    ) -> ProjectionScopeTransition | None: ...
+    async def list_projection_scope_transitions(
+        self,
+        source_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[ProjectionScopeTransition]: ...
+    async def start_projection_scope_transition(
+        self,
+        transition_id: str,
+        *,
+        run_id: str,
+    ) -> ProjectionScopeTransition: ...
+    async def complete_projection_scope_transition(
+        self,
+        transition_id: str,
+        *,
+        run_id: str,
+        coverage: ProjectionCoverage,
+    ) -> ProjectionScopeTransition: ...
+    async def fail_projection_scope_transition(
+        self,
+        transition_id: str,
+        *,
+        run_id: str,
+        coverage: ProjectionCoverage,
+        error: str,
+    ) -> ProjectionScopeTransition: ...
+    async def list_legacy_memory_provenance(
+        self,
+        source_id: str,
+    ) -> list[LegacyMemoryProvenance]: ...
+    async def count_active_source_memories(self, source_id: str) -> int: ...
+    async def count_active_source_memories_without_support(self, source_id: str) -> int: ...
+    async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate: ...
+    async def enable_lifecycle_gate(self, source_id: str) -> LifecycleGate: ...
+    async def gate_destructive_lifecycle(self, source_id: str, *, reason: str) -> LifecycleGate: ...
+    async def upsert_lifecycle_cutover_finding(
+        self,
+        finding: LifecycleCutoverFinding,
+    ) -> None: ...
+    async def get_lifecycle_cutover_finding(
+        self,
+        finding_id: str,
+    ) -> LifecycleCutoverFinding | None: ...
+    async def list_lifecycle_cutover_findings(
+        self,
+        source_id: str,
+        *,
+        status: CutoverFindingStatus | None = None,
+    ) -> list[LifecycleCutoverFinding]: ...
+    async def create_lifecycle_backfill_job(
+        self,
+        job: LifecycleBackfillJob,
+    ) -> LifecycleBackfillJob: ...
+    async def start_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob: ...
+    async def complete_lifecycle_backfill_job(
+        self,
+        job_id: str,
+        *,
+        scanned_memories: int,
+        mapped_memories: int,
+        finding_count: int,
+    ) -> LifecycleBackfillJob: ...
+    async def fail_lifecycle_backfill_job(
+        self,
+        job_id: str,
+        *,
+        error: str,
+    ) -> LifecycleBackfillJob: ...
+    async def recover_stale_lifecycle_backfill_job(
+        self,
+        job_id: str,
+        *,
+        error: str,
+    ) -> LifecycleBackfillJob: ...
+    async def get_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob | None: ...
+    async def get_active_lifecycle_backfill_job(
+        self,
+        source_id: str,
+    ) -> LifecycleBackfillJob | None: ...
+    async def list_lifecycle_backfill_jobs(
+        self,
+        source_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[LifecycleBackfillJob]: ...
+    async def resolve_lifecycle_cutover_finding(
+        self,
+        finding_id: str,
+        *,
+        observation_id: str,
+        source_unit_id: str,
+    ) -> LifecycleCutoverFinding: ...
+    async def retire_unprovable_lifecycle_cutover_finding(
+        self,
+        finding_id: str,
+        *,
+        source_id: str,
+        reconstruction_attempt_id: str,
+        operator_id: str,
+        unavailable_documents: Mapping[str, str],
+    ) -> LifecycleCutoverFinding: ...
+    async def record_evidence_references(
+        self,
+        evidence_unit_id: str,
+        references: Sequence[EvidenceReference],
+    ) -> tuple[EvidenceReference, ...]: ...
+    async def upsert_memory_support_assertion(self, assertion: MemorySupportAssertion) -> None: ...
+    async def get_memory_support_set_hash(self, memory_id: str) -> str: ...
+    async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]: ...
+    async def get_active_memory_support_evidence(
+        self,
+        memory_id: str,
+        *,
+        source_id: str | None = None,
+    ) -> tuple[ActiveSupportEvidence, ...]: ...
+    async def get_source_unit_support_reference_ids(
+        self,
+        source_unit_id: str,
+    ) -> Mapping[str, tuple[str, ...]]: ...
+    async def apply_source_projection_lifecycle(
+        self,
+        projection: SourceProjection,
+        plan: LifecyclePlan,
+    ) -> None: ...
+    async def apply_agent_claim_source_projection_lifecycle(
+        self,
+        projection: SourceProjection,
+        plan: LifecyclePlan,
+        *,
+        memory_id: str,
+        relation_outcome: RelationOutcomeBundle | None,
+        claim_id: str,
+        concept_id: str,
+        display_anchor: str,
+        claim_text: str,
+        memory_type: str,
+        tags: list[str],
+        confidence: float,
+        observed_at: datetime,
+        citations: list[str] | None = None,
+        concept_projection: Mapping[str, object] | None = None,
+        concept_markdown_body: str | None = None,
+    ) -> None: ...
+    async def apply_lifecycle_plan(self, plan: LifecyclePlan) -> None: ...
+    async def get_lifecycle_plan_payload(
+        self,
+        lifecycle_plan_id: str,
+    ) -> Mapping[str, object] | None: ...
+    async def get_lifecycle_review(self, review_id: str) -> LifecycleReview | None: ...
+    async def list_lifecycle_reviews(
+        self,
+        source_id: str,
+        *,
+        status: LifecycleReviewStatus | None = None,
+    ) -> list[LifecycleReview]: ...
+    async def resolve_lifecycle_review(
+        self,
+        review_id: str,
+        status: LifecycleReviewStatus,
+    ) -> LifecycleReview: ...
+    async def list_lifecycle_vector_tasks(
+        self,
+        *,
+        source_id: str | None = None,
+        lifecycle_plan_id: str | None = None,
+        limit: int = 100,
+    ) -> list[LifecycleVectorTask]: ...
+    async def complete_lifecycle_vector_task(self, task_id: str) -> None: ...
+    async def fail_lifecycle_vector_task(self, task_id: str, error: str) -> None: ...
     async def get_aliases_for_entity(self, entity_id: int) -> list[EntityAlias]: ...
     async def get_all_entities(self) -> list[Entity]: ...
     async def get_all_aliases(self) -> list[tuple[str, int]]: ...
@@ -167,25 +417,6 @@ class RelationalStore(Protocol):
         support_kind: str = "extracted",
         source_updated_at: datetime | None,
     ) -> None: ...
-    async def add_memory_derivation(
-        self,
-        parent_memory_id: str,
-        child_memory_id: str,
-        *,
-        relation: str = "summarizes",
-    ) -> None: ...
-    async def get_memory_derivation_children(
-        self,
-        parent_memory_id: str,
-    ) -> list[MemoryDerivation]: ...
-    async def record_memory_curation_run(
-        self,
-        run: MemoryCurationRun,
-    ) -> None: ...
-    async def get_memory_curation_run(
-        self,
-        run_id: str,
-    ) -> MemoryCurationRun | None: ...
     async def promote_to_workspace(
         self,
         memory_id: str,

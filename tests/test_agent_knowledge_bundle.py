@@ -10,6 +10,7 @@ from memforge.agent_knowledge import (
     render_agent_knowledge_patch_prompt,
 )
 from memforge.memory.evidence import CandidateBucket, LifecycleAction, RelationType
+from memforge.memory.lifecycle_service import MemoryLifecycleService
 from memforge.memory.store import MemoryStore
 from memforge.models import Memory, Visibility, content_hash
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -62,6 +63,7 @@ async def bundle_stack(tmp_path, monkeypatch):
         created_by_user_id="u-andrew",
         execution_owner_user_id="u-andrew",
     )
+    await db.enable_lifecycle_gate("src-agent-sessions-codex")
     collection = RecordingCollection()
     adapters = build_sqlite_adapters(db, collection)
     store = MemoryStore(
@@ -191,6 +193,40 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
     assert [(relation.memory_id, relation.relation_type) for relation in relations] == [
         (result.memory_id, RelationType.SUPPORTS)
     ]
+
+
+@pytest.mark.asyncio
+async def test_post_cutover_agent_claim_write_commits_source_projection_lineage(bundle_stack):
+    db, store, _collection = bundle_stack
+    source_id = "src-agent-sessions-codex"
+    await db.enable_lifecycle_gate(source_id)
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+
+    result = await service.apply_patch_proposal(
+        proposal=_proposal(
+            concept_id="akb_concept_post_cutover",
+            claim_id="akb_claim_post_cutover",
+        ),
+        owner_user_id="u-andrew",
+        source_id=source_id,
+        client="codex",
+        session_id="sess-post-cutover",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        submitted_at=datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc),
+        source_updated_at=datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc),
+    )
+
+    assert result.outcome == "applied"
+    assert result.memory_id is not None
+    assert result.concept_id is not None
+    source_unit = await db.find_source_unit_by_document_id(source_id, result.concept_id)
+    assert source_unit is not None
+    support_reference_ids = await db.get_active_memory_support_reference_ids(result.memory_id)
+    assert support_reference_ids
+    support_by_memory = await db.get_source_unit_support_reference_ids(source_unit.id)
+    assert support_by_memory[result.memory_id] == support_reference_ids
 
 
 @pytest.mark.asyncio
@@ -537,13 +573,13 @@ async def test_update_existing_claim_rolls_back_if_claim_projection_commit_fails
     )
     original_claim = await db.get_agent_claim(created.claim_id)
     original_memory = await db.get_memory(created.memory_id)
-    original_commit = db.supersede_memory_and_upsert_agent_claim
+    original_claim_projection = db._upsert_agent_claim_unlocked
 
-    async def flaky_atomic_commit(*args, **kwargs):
-        await original_commit(*args, **kwargs)
+    async def flaky_claim_projection(*args, **kwargs):
+        await original_claim_projection(*args, **kwargs)
         raise RuntimeError("atomic claim replacement commit failed")
 
-    monkeypatch.setattr(db, "supersede_memory_and_upsert_agent_claim", flaky_atomic_commit)
+    monkeypatch.setattr(db, "_upsert_agent_claim_unlocked", flaky_claim_projection)
     with pytest.raises(RuntimeError, match="atomic claim replacement commit failed"):
         await service.apply_patch_proposal(
             proposal=update_proposal,
@@ -613,10 +649,17 @@ async def test_retired_claim_backed_memory_is_removed_from_active_claim_projecti
         source_updated_at=None,
     )
 
-    await store.retire_memory(created.memory_id, reason="user_retired")
+    old = await db.get_memory(created.memory_id)
+    assert old is not None
+    await MemoryLifecycleService(db=db, memory_store=store).retire_memory(
+        created.memory_id,
+        reason="user_retired",
+        expected_content_hash=old.content_hash,
+    )
 
     active_claims = await db.list_agent_claims(created.concept_id)
     lineage_claim = await db.get_agent_claim(created.claim_id)
+    concept = await db.get_agent_concept(created.concept_id)
     prompt = await render_agent_knowledge_patch_prompt(
         db=db,
         owner_user_id="u-andrew",
@@ -640,6 +683,10 @@ async def test_retired_claim_backed_memory_is_removed_from_active_claim_projecti
     assert lineage_claim is not None
     assert lineage_claim["memory_id"] == created.memory_id
     assert active_claims == []
+    assert await db.get_active_memory_support_reference_ids(created.memory_id) == ()
+    assert (await db.get_memory(created.memory_id)).status == "retired"
+    assert concept is not None
+    assert "Workspace source schedulers must start during app startup" not in concept["markdown_body"]
     assert created.claim_id not in prompt
     assert "Workspace source schedulers must start during app startup" not in prompt
 
@@ -748,6 +795,14 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
         project_key="UNSORTED",
         source_updated_at=None,
     )
+    source_unit = await db.find_source_unit_by_document_id(
+        "src-agent-sessions-codex",
+        created.concept_id,
+    )
+    assert source_unit is not None
+    initial_revision = await db.get_current_source_unit_revision(source_unit.id)
+    assert initial_revision is not None
+    await db.enable_lifecycle_gate("src-agent-sessions-codex")
 
     updated = await service.apply_patch_proposal(
         proposal=_proposal(
@@ -795,6 +850,15 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
     assert old_memory.superseded_by == updated.memory_id
     assert old_memory.replacement_reason == "New evidence refines the scheduler lifecycle claim."
     assert old_memory.replacement_kind == "revision"
+    assert await db.get_active_memory_support_reference_ids(created.memory_id) == ()
+
+    updated_support = await db.get_active_memory_support_reference_ids(updated.memory_id)
+    assert updated_support
+    current_revision = await db.get_current_source_unit_revision(source_unit.id)
+    assert current_revision is not None
+    assert current_revision.id != initial_revision.id
+    support_by_memory = await db.get_source_unit_support_reference_ids(source_unit.id)
+    assert support_by_memory == {updated.memory_id: updated_support}
 
     claim = await db.get_agent_claim(created.claim_id)
     assert claim is not None

@@ -2,12 +2,71 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
 from memforge.genes.jira_gene import JiraGene
 from memforge.models import ContentItem
+
+
+def _search_page(issues: list[dict], *, total: int | None = None, start_at: int = 0) -> dict:
+    return {
+        "startAt": start_at,
+        "total": len(issues) if total is None else total,
+        "issues": issues,
+    }
+
+
+def _jira_issue(
+    key: str,
+    *,
+    issue_id: str | None = None,
+    field_overrides: dict | None = None,
+    comments: list[dict] | None = None,
+    comment_total: int | None = None,
+    histories: list[dict] | None = None,
+    changelog_total: int | None = None,
+) -> dict:
+    normalized_comments = [
+        {"id": str(index + 1), **comment}
+        for index, comment in enumerate(comments or [])
+    ]
+    normalized_histories = [
+        {"id": str(index + 1), **history}
+        for index, history in enumerate(histories or [])
+    ]
+    fields = {
+        "summary": key,
+        "description": None,
+        "status": None,
+        "priority": None,
+        "assignee": None,
+        "labels": [],
+        "resolution": None,
+        "updated": "2026-05-21T08:00:00.000+0000",
+        "project": {"key": "PAY"},
+        "issuetype": {"name": "Task"},
+        "issuelinks": [],
+        "subtasks": [],
+        "comment": {
+            "startAt": 0,
+            "comments": normalized_comments,
+            "total": len(normalized_comments) if comment_total is None else comment_total,
+        },
+        **(field_overrides or {}),
+    }
+    return {
+        "id": issue_id or str(100000 + int(key.rsplit("-", 1)[-1])),
+        "key": key,
+        "fields": fields,
+        "changelog": {
+            "startAt": 0,
+            "histories": normalized_histories,
+            "total": len(normalized_histories) if changelog_total is None else changelog_total,
+        },
+    }
 
 
 def test_jira_schema_hides_runtime_transport_fields_from_ui():
@@ -50,7 +109,11 @@ class RecordingAsyncClient:
 
     async def request(self, method: str, url: str, **kwargs):
         self.calls.append((method, url, kwargs))
-        return JsonResponse({"issues": [], "total": 0})
+        if url.endswith("/comment"):
+            return JsonResponse({"startAt": 0, "comments": [], "total": 0})
+        if "/issue/" in url:
+            return JsonResponse(_jira_issue(url.split("/issue/", 1)[1].split("/", 1)[0]))
+        return JsonResponse(_search_page([]))
 
     async def get(self, url: str, **kwargs):
         return await self.request("GET", url, **kwargs)
@@ -59,13 +122,101 @@ class RecordingAsyncClient:
         self.closed = True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"issues": None, "total": 0},
+        {"issues": [], "total": 1},
+        {"issues": [], "total": "0"},
+    ],
+)
+async def test_discovery_rejects_malformed_or_early_terminal_search_page(payload):
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"], "pat": "token"},
+        source_id="src-jira",
+    )
+    gene._base_url = "https://jira.example.test"
+    gene._request = AsyncMock(return_value=JsonResponse(payload))
+
+    with pytest.raises(RuntimeError, match="Jira search"):
+        _ = [item async for item in gene.discover()]
+    assert gene.discovery_complete is False
+
+
+@pytest.mark.asyncio
+async def test_discovery_rejects_duplicate_issue_identity_before_completion():
+    issue = _jira_issue("PAY-1")
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"], "pat": "token"},
+        source_id="src-jira",
+    )
+    gene._base_url = "https://jira.example.test"
+    gene._request = AsyncMock(return_value=JsonResponse(_search_page([issue, issue], total=2)))
+
+    with pytest.raises(RuntimeError, match="duplicate issue identity"):
+        _ = [item async for item in gene.discover()]
+    assert gene.discovery_complete is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_collection", ["comments", "changelog"])
+async def test_fetch_rejects_missing_requested_collection_evidence(missing_collection):
+    issue = _jira_issue("PAY-1")
+    if missing_collection == "comments":
+        issue["fields"].pop("comment")
+    else:
+        issue.pop("changelog")
+
+    class MissingCollectionClient(RecordingAsyncClient):
+        async def request(self, method: str, url: str, **kwargs):
+            self.calls.append((method, url, kwargs))
+            return JsonResponse(_search_page([issue]))
+
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"], "include_comments": True},
+        source_id="src-jira",
+    )
+    gene._client = MissingCollectionClient(base_url="https://jira.example.test")
+    gene._base_url = "https://jira.example.test"
+    item = [item async for item in gene.discover()][0]
+
+    with pytest.raises((RuntimeError, ValueError)):
+        await gene.fetch(item)
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_duplicate_comment_provider_ids():
+    issue = _jira_issue(
+        "PAY-1",
+        comments=[{"id": "same", "body": "one"}, {"id": "same", "body": "two"}],
+    )
+
+    class DuplicateCommentClient(RecordingAsyncClient):
+        async def request(self, method: str, url: str, **kwargs):
+            self.calls.append((method, url, kwargs))
+            return JsonResponse(_search_page([issue]))
+
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
+        source_id="src-jira",
+    )
+    gene._client = DuplicateCommentClient(base_url="https://jira.example.test")
+    gene._base_url = "https://jira.example.test"
+    item = [item async for item in gene.discover()][0]
+
+    with pytest.raises(ValueError, match="duplicate provider id"):
+        await gene.fetch(item)
+
+
 class RateLimitedThenSuccessClient(RecordingAsyncClient):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.responses = [
             JsonResponse({}, status_code=429),
             JsonResponse({}, status_code=429),
-            JsonResponse({"issues": [], "total": 0}),
+            JsonResponse(_search_page([])),
         ]
 
     async def request(self, method: str, url: str, **kwargs):
@@ -99,7 +250,7 @@ class IssueThenRateLimitedCommentClient(RecordingAsyncClient):
         self.calls.append((method, url, kwargs))
         if url.endswith("/comment"):
             return JsonResponse({}, status_code=429)
-        return JsonResponse({"fields": {}})
+        return JsonResponse(_jira_issue("PAY-123"))
 
 
 class AsyncNoop:
@@ -317,38 +468,31 @@ async def test_discover_hydrates_search_result_so_fetch_uses_no_per_issue_reques
         async def request(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             return JsonResponse(
-                {
-                    "total": 1,
-                    "issues": [
-                        {
-                            "key": "PAY-123",
-                            "fields": {
+                _search_page(
+                    [
+                        _jira_issue(
+                            "PAY-123",
+                            issue_id="100123",
+                            field_overrides={
                                 "summary": "Hydrated issue",
                                 "status": {"name": "In Progress"},
                                 "priority": {"name": "High"},
                                 "assignee": {"displayName": "Ada"},
                                 "issuetype": {"name": "Story"},
-                                "updated": "2026-05-21T08:00:00.000+0000",
-                                "project": {"key": "PAY"},
                                 "labels": ["architecture"],
                                 "description": "Design context",
-                                "issuelinks": [],
-                                "subtasks": [],
-                                "comment": {
-                                    "comments": [
-                                        {
-                                            "author": {"displayName": "Grace"},
-                                            "created": "2026-05-21T09:00:00.000+0000",
-                                            "body": "Keep the low-request path.",
-                                        }
-                                    ],
-                                    "total": 1,
-                                },
                             },
-                            "changelog": {"histories": []},
-                        }
-                    ],
-                }
+                            comments=[
+                                {
+                                    "author": {"displayName": "Grace"},
+                                    "created": "2026-05-21T09:00:00.000+0000",
+                                    "body": "Keep the low-request path.",
+                                }
+                            ],
+                            changelog_total=3,
+                        )
+                    ]
+                )
             )
 
     gene = JiraGene(
@@ -369,7 +513,9 @@ async def test_discover_hydrates_search_result_so_fetch_uses_no_per_issue_reques
     assert search_body["expand"] == ["changelog", "renderedFields"]
     assert isinstance(search_body["fields"], list)
     assert "_search_issue" not in items[0].extra
-    assert json.loads(raw.body)["_comments"][0]["body"] == "Keep the low-request path."
+    raw_payload = json.loads(raw.body)
+    assert raw_payload["_comments"][0]["body"] == "Keep the low-request path."
+    assert raw_payload["_changelog_truncated"] == {"returned": 0, "total": 3}
     assert "Design context" in normalized.markdown_body
     assert "Keep the low-request path." in normalized.markdown_body
 
@@ -392,19 +538,15 @@ async def test_discover_paces_paginated_jira_search_requests(monkeypatch):
     class TwoPageClient(RecordingAsyncClient):
         async def request(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
-            issue_key = f"PAY-{len(self.calls)}"
+            start_at = kwargs["json"]["startAt"]
+            page_size = 1 if start_at == 100 else 50
             return JsonResponse(
                 {
-                    "total": 51,
+                    "startAt": start_at,
+                    "total": 101,
                     "issues": [
-                        {
-                            "key": issue_key,
-                            "fields": {
-                                "summary": issue_key,
-                                "updated": "2026-05-21T08:00:00.000+0000",
-                                "project": {"key": "PAY"},
-                            },
-                        }
+                        _jira_issue(f"PAY-{index + 1}")
+                        for index in range(start_at, start_at + page_size)
                     ],
                 }
             )
@@ -426,7 +568,9 @@ async def test_discover_paces_paginated_jira_search_requests(monkeypatch):
 
     items = [item async for item in gene.discover()]
 
-    assert [item.item_id for item in items] == ["jira-PAY-1", "jira-PAY-2", "jira-PAY-3"]
+    assert len(items) == 101
+    assert items[0].item_id == "jira-PAY-1"
+    assert items[-1].item_id == "jira-PAY-101"
     assert [call[0:2] for call in client.calls] == [
         ("POST", "/rest/api/2/search"),
         ("POST", "/rest/api/2/search"),
@@ -443,33 +587,28 @@ async def test_fetch_tops_up_truncated_hydrated_comments_through_limiter():
             if url.endswith("/comment"):
                 return JsonResponse(
                     {
+                        "startAt": 0,
                         "comments": [
-                            {"author": {"displayName": "Grace"}, "created": "2026-05-21", "body": "First"},
-                            {"author": {"displayName": "Ada"}, "created": "2026-05-22", "body": "Second"},
+                            {"id": "1", "author": {"displayName": "Grace"}, "created": "2026-05-21", "body": "First"},
+                            {"id": "2", "author": {"displayName": "Ada"}, "created": "2026-05-22", "body": "Second"},
                         ],
                         "total": 2,
                     }
                 )
             return JsonResponse(
-                {
-                    "total": 1,
-                    "issues": [
-                        {
-                            "key": "PAY-123",
-                            "fields": {
-                                "summary": "Hydrated issue",
-                                "updated": "2026-05-21T08:00:00.000+0000",
-                                "project": {"key": "PAY"},
-                                "comment": {
-                                    "comments": [
-                                        {"author": {"displayName": "Grace"}, "created": "2026-05-21", "body": "First"}
-                                    ],
-                                    "total": 2,
-                                },
-                            },
-                        }
-                    ],
-                }
+                _search_page(
+                    [
+                        _jira_issue(
+                            "PAY-123",
+                            issue_id="100123",
+                            field_overrides={"summary": "Hydrated issue"},
+                            comments=[
+                                {"author": {"displayName": "Grace"}, "created": "2026-05-21", "body": "First"}
+                            ],
+                            comment_total=2,
+                        )
+                    ]
+                )
             )
 
     gene = JiraGene(
@@ -489,6 +628,34 @@ async def test_fetch_tops_up_truncated_hydrated_comments_through_limiter():
         ("GET", "/rest/api/2/issue/PAY-123/comment"),
     ]
     assert [comment["body"] for comment in json.loads(raw.body)["_comments"]] == ["First", "Second"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_malformed_comment_top_up_instead_of_clearing_truncation():
+    issue = _jira_issue(
+        "PAY-123",
+        issue_id="100123",
+        comments=[{"id": "1", "body": "First"}],
+        comment_total=2,
+    )
+
+    class MalformedTopUpClient(RecordingAsyncClient):
+        async def request(self, method: str, url: str, **kwargs):
+            self.calls.append((method, url, kwargs))
+            if url.endswith("/comment"):
+                return JsonResponse({})
+            return JsonResponse(_search_page([issue]))
+
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"], "include_comments": True},
+        source_id="src-jira",
+    )
+    gene._client = MalformedTopUpClient(base_url="https://jira.example.test")
+    gene._base_url = "https://jira.example.test"
+    item = [item async for item in gene.discover()][0]
+
+    with pytest.raises(RuntimeError, match="comments list"):
+        await gene.fetch(item)
 
 
 @pytest.mark.asyncio
@@ -690,19 +857,7 @@ async def test_discover_resets_hydrated_issue_cache_between_runs():
             self.calls.append((method, url, kwargs))
             issue_key = "PAY-1" if len(self.calls) == 1 else "PAY-2"
             return JsonResponse(
-                {
-                    "total": 1,
-                    "issues": [
-                        {
-                            "key": issue_key,
-                            "fields": {
-                                "summary": issue_key,
-                                "updated": "2026-05-21T08:00:00.000+0000",
-                                "project": {"key": "PAY"},
-                            },
-                        }
-                    ],
-                }
+                _search_page([_jira_issue(issue_key)])
             )
 
     gene = JiraGene(
@@ -852,7 +1007,7 @@ async def test_discover_retries_once_on_transient_timeout(monkeypatch):
             if not self._timed_out:
                 self._timed_out = True
                 raise httpx.ReadTimeout("slow", request=httpx.Request(method, f"https://jira.example.test{url}"))
-            return JsonResponse({"issues": [], "total": 0})
+            return JsonResponse(_search_page([]))
 
     gene = JiraGene(
         config={
@@ -890,7 +1045,7 @@ async def test_discover_retries_on_transient_connect_error(monkeypatch):
             if not self._failed:
                 self._failed = True
                 raise httpx.ConnectError("flaky", request=httpx.Request(method, f"https://jira.example.test{url}"))
-            return JsonResponse({"issues": [], "total": 0})
+            return JsonResponse(_search_page([]))
 
     gene = JiraGene(
         config={

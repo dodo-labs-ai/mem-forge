@@ -163,10 +163,24 @@ class LocalMarkdownGene(Gene):
             )
 
     async def fetch(self, item: ContentItem) -> RawContent:
+        body = read_package_body(self, item, source_label="local markdown")
+        package = json.loads(body.decode("utf-8"))
+        content_type = package.get("content_type") or "text/markdown"
+        semantic_markdown = _to_markdown(
+            content_type,
+            str(package.get("markdown") or ""),
+        )
+        authoritative_empty = not semantic_markdown.strip()
         return RawContent(
             item=item,
-            body=read_package_body(self, item, source_label="local markdown"),
+            body=body,
             content_type="application/json",
+            authoritative_empty=authoritative_empty,
+            empty_evidence=(
+                "local_markdown_package_attested_empty_file"
+                if authoritative_empty
+                else None
+            ),
         )
 
     async def normalize(self, raw: RawContent) -> NormalizedContent:
@@ -243,6 +257,8 @@ class LocalMarkdownGene(Gene):
                 extra={
                     "package_uri": package_uri,
                     "package_path": entry.get("package_path"),
+                    "package_sha256": entry.get("package_sha256"),
+                    "input_sha256": entry.get("input_sha256"),
                     "relative_path": entry.get("relative_path"),
                 },
             )

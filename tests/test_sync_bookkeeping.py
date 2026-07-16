@@ -8,7 +8,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
+from memforge.memory.lifecycle_plan import (
+    LifecycleBackfillJob,
+    LifecycleBackfillJobStatus,
+)
 from memforge.memory.store import MemoryStore
+from memforge.local_agent.source_contract import local_agent_source_config_revision
 from memforge.models import (
     ContentItem,
     DocumentMetadata,
@@ -25,13 +30,21 @@ from memforge.models import (
     content_hash,
 )
 from memforge.pipeline.sync_memory import MemorySample, SyncMemoryObserver
+from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.source_projection import (
+    ProjectionScopeTransition,
+    ProjectionScopeTransitionStatus,
+)
+from memforge.source_projection_config import projection_scope_fingerprint
 from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
     ExtractionWorkPool,
     GeneSyncOrchestrator,
+    SourceSyncMode,
     summarize_failed_documents,
 )
-from memforge.runtime import SyncService
+from memforge.runtime import SourceLifecycleMaintenanceError, SyncService
+from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.config import AppConfig, SyncConfig
 from memforge.storage.database import Database
 from memforge.storage.database import MIGRATIONS
@@ -47,12 +60,360 @@ async def db(tmp_path):
     await database.close()
 
 
+@pytest.mark.asyncio
+async def test_expired_source_activity_can_be_reacquired_with_same_id(
+    db: Database,
+) -> None:
+    await db.upsert_source(
+        id="src-activity-retry",
+        type="teams",
+        name="Activity Retry",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    first = await db.acquire_source_activity(
+        activity_id="job-stable-id",
+        source_id="src-activity-retry",
+        kind=SourceActivityKind.EXTERNAL_COLLECTION,
+        capability="job-stable-id",
+        expected_epoch=0,
+    )
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", first.id),
+    )
+    await db.db.commit()
+
+    retried = await db.acquire_source_activity(
+        activity_id="job-stable-id",
+        source_id="src-activity-retry",
+        kind=SourceActivityKind.EXTERNAL_COLLECTION,
+        capability="job-stable-id",
+        expected_epoch=0,
+    )
+
+    assert retried.id == first.id
+    assert retried.epoch == first.epoch
+
+
 def test_local_agent_broker_has_its_own_forward_migration() -> None:
     version, description, statements = next(migration for migration in MIGRATIONS if migration[0] == 37)
 
     assert version == 37
     assert description == "Add local agent job broker"
     assert any("CREATE TABLE IF NOT EXISTS local_agent_jobs" in sql for sql in statements)
+
+
+def test_source_sync_consumed_input_boundary_has_forward_migration() -> None:
+    version, description, statements = next(migration for migration in MIGRATIONS if migration[0] == 57)
+
+    assert version == 57
+    assert description == "Track source sync consumed input boundary"
+    assert any("input_generation_watermark" in sql for sql in statements)
+    assert any("source_config_revision" in sql for sql in statements)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_job_fences_source_sync_input_and_config_across_connections(tmp_path):
+    path = tmp_path / "lifecycle-maintenance-fence.db"
+    first = Database(str(path))
+    second = Database(str(path))
+    await first.connect()
+    await second.connect()
+    try:
+        await first.upsert_source(
+            id="src-fenced",
+            type="teams",
+            name="Teams",
+            config_json='{"conversation_ids":["conversation-a"]}',
+            access_policy="workspace",
+            owner_user_id="user-a",
+        )
+        await first.create_lifecycle_backfill_job(
+            LifecycleBackfillJob(
+                id="lifecycle-fence",
+                source_id="src-fenced",
+                status=LifecycleBackfillJobStatus.QUEUED,
+            )
+        )
+
+        with pytest.raises(ValueError, match="source lifecycle maintenance active"):
+            await second.enqueue_source_sync_run(source_id="src-fenced")
+        with pytest.raises(ValueError, match="source lifecycle maintenance active"):
+            await second.create_source_sync_input(
+                source_id="src-fenced",
+                raw_uri="object://src-fenced/input.json",
+                raw_sha256="sha-input",
+                raw_content_type="application/json",
+            )
+        with pytest.raises(ValueError, match="source lifecycle maintenance active"):
+            await second.enqueue_local_agent_job(
+                job_id="local-job-during-lifecycle",
+                source_id="src-fenced",
+                source_type="teams",
+                operation="teams_sync",
+                payload={"source_config_revision": "revision-a"},
+                created_by_user_id="user-a",
+                execution_owner_user_id="user-a",
+            )
+        with pytest.raises(ValueError, match="source lifecycle maintenance active"):
+            await second.upsert_source(
+                id="src-fenced",
+                type="teams",
+                name="Changed Teams",
+                config_json='{"conversation_ids":["conversation-b"]}',
+                access_policy="workspace",
+                owner_user_id="user-a",
+            )
+        with pytest.raises(ValueError, match="source lifecycle maintenance active"):
+            await second.create_source_access_transition(
+                operation_id="access-during-lifecycle",
+                source_id="src-fenced",
+                idempotency_key="access-during-lifecycle",
+                actor_user_id="user-a",
+                target_policy="private",
+            )
+        with pytest.raises(ValueError, match="source lifecycle maintenance active"):
+            await second.delete_source_cascade("src-fenced")
+
+        await first.fail_lifecycle_backfill_job(
+            "lifecycle-fence",
+            error="test release",
+        )
+        run = await second.enqueue_source_sync_run(source_id="src-fenced")
+        assert run.status == "pending"
+    finally:
+        await second.close()
+        await first.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_sync_service_rejects_active_lifecycle_maintenance(
+    db: Database,
+) -> None:
+    source_id = "src-direct-maintenance-fence"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Direct fence",
+        config_json='{"base_url":"https://wiki.example"}',
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="lifecycle-direct-fence",
+            source_id=source_id,
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    service = SyncService(db, AppConfig())
+
+    with pytest.raises(
+        SourceLifecycleMaintenanceError,
+        match="source lifecycle maintenance active: lifecycle-direct-fence",
+    ):
+        await service.start_source(source_id)
+
+    assert service.tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_job_acquire_rejects_running_direct_sync_activity(
+    db: Database,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from memforge import runtime as runtime_module
+
+    source_id = "src-direct-activity"
+    await db.upsert_source(
+        id=source_id,
+        type="agent_session",
+        name="Direct activity",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingRuntime:
+        def orchestrator(self):
+            return self
+
+        async def sync_gene(self, **kwargs):
+            entered.set()
+            await release.wait()
+            return SyncState(source=source_id, last_sync_status="success")
+
+    monkeypatch.setattr(runtime_module, "create_gene", lambda **kwargs: object())
+    task = asyncio.create_task(
+        runtime_module.run_source_sync(
+            db=db,
+            config=AppConfig(base_dir=tmp_path / "mem"),
+            source={
+                "id": source_id,
+                "type": "agent_session",
+                "name": "Direct activity",
+                "config": {},
+            },
+            runtime=BlockingRuntime(),
+        )
+    )
+    await entered.wait()
+
+    with pytest.raises(SourceActivityConflict, match="source activity already active"):
+        await db.create_lifecycle_backfill_job(
+            LifecycleBackfillJob(
+                id="lifecycle-during-direct-sync",
+                source_id=source_id,
+                status=LifecycleBackfillJobStatus.QUEUED,
+            )
+        )
+
+    release.set()
+    await task
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="lifecycle-after-direct-sync",
+            source_id=source_id,
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    assert job.id == "lifecycle-after-direct-sync"
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_job_acquire_rejects_active_sync_across_connections(tmp_path):
+    path = tmp_path / "lifecycle-maintenance-acquire.db"
+    first = Database(str(path))
+    second = Database(str(path))
+    await first.connect()
+    await second.connect()
+    try:
+        await first.upsert_source(
+            id="src-syncing",
+            type="confluence",
+            name="Confluence",
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="user-a",
+        )
+        run = await first.enqueue_source_sync_run(source_id="src-syncing")
+
+        with pytest.raises(ValueError, match=f"source sync run already active: {run.run_id}"):
+            await second.create_lifecycle_backfill_job(
+                LifecycleBackfillJob(
+                    id="lifecycle-blocked",
+                    source_id="src-syncing",
+                    status=LifecycleBackfillJobStatus.QUEUED,
+                )
+            )
+    finally:
+        await second.close()
+        await first.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_job_acquire_rejects_active_local_agent_job(
+    db: Database,
+) -> None:
+    source_id = "src-local-agent-active"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Teams",
+        config_json='{"conversation_ids":["conversation-a"]}',
+        access_policy="workspace",
+        owner_user_id="user-a",
+    )
+    local_job_id, created = await db.enqueue_local_agent_job(
+        job_id="local-agent-active",
+        source_id=source_id,
+        source_type="teams",
+        operation="teams_sync",
+        payload={"source_config_revision": "revision-a"},
+        created_by_user_id="user-a",
+        execution_owner_user_id="user-a",
+    )
+    assert created is True
+
+    with pytest.raises(
+        ValueError,
+        match=f"local agent job already active: {local_job_id}",
+    ):
+        await db.create_lifecycle_backfill_job(
+            LifecycleBackfillJob(
+                id="lifecycle-blocked-by-local-job",
+                source_id=source_id,
+                status=LifecycleBackfillJobStatus.QUEUED,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_active_sync_fences_source_access_and_deletion(db: Database) -> None:
+    await db.upsert_source(
+        id="src-active-control-plane",
+        type="confluence",
+        name="Confluence",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="user-a",
+    )
+    run = await db.enqueue_source_sync_run(source_id="src-active-control-plane")
+
+    with pytest.raises(
+        ValueError,
+        match=f"source sync run already active: {run.run_id}",
+    ):
+        await db.create_source_access_transition(
+            operation_id="access-during-sync",
+            source_id="src-active-control-plane",
+            idempotency_key="access-during-sync",
+            actor_user_id="user-a",
+            target_policy="private",
+        )
+    with pytest.raises(
+        ValueError,
+        match=f"source sync run already active: {run.run_id}",
+    ):
+        await db.delete_source_cascade("src-active-control-plane")
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_job_acquire_rejects_active_source_access_transition(
+    db: Database,
+) -> None:
+    await db.upsert_source(
+        id="src-access-changing",
+        type="confluence",
+        name="Confluence",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="user-a",
+    )
+    transition = await db.create_source_access_transition(
+        operation_id="access-changing",
+        source_id="src-access-changing",
+        idempotency_key="access-changing",
+        actor_user_id="user-a",
+        target_policy="private",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"source access transition already active: {transition['operation_id']}",
+    ):
+        await db.create_lifecycle_backfill_job(
+            LifecycleBackfillJob(
+                id="lifecycle-blocked-by-access",
+                source_id="src-access-changing",
+                status=LifecycleBackfillJobStatus.QUEUED,
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -161,6 +522,162 @@ async def test_enqueue_source_sync_run_coalesces_by_workspace_and_source(db: Dat
     assert second.coalesced is True
     assert other_workspace.run_id != first.run_id
     assert first.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_run_persists_consumed_input_boundary_and_rerun_revision(
+    db: Database,
+) -> None:
+    await db.upsert_source(
+        id="src-input-boundary",
+        type="teams",
+        name="Teams",
+        config_json='{"conversation_ids":["conversation-a"]}',
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    first_input = await db.create_source_sync_input(
+        source_id="src-input-boundary",
+        raw_uri="object://first",
+        raw_sha256="sha-first",
+        raw_content_type="application/json",
+    )
+    source = await db.get_source("src-input-boundary")
+    assert source is not None
+    config_revision = local_agent_source_config_revision(source)
+    first = await db.enqueue_source_sync_run(
+        source_id="src-input-boundary",
+        trigger="local_agent",
+        source_config_revision=config_revision,
+    )
+
+    assert first.input_generation_watermark == first_input.input_generation
+    assert first.source_config_revision == config_revision
+
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="default",
+        lease_seconds=60,
+    )
+    assert leased is not None
+    second_input = await db.create_source_sync_input(
+        source_id="src-input-boundary",
+        raw_uri="object://second",
+        raw_sha256="sha-second",
+        raw_content_type="application/json",
+    )
+    coalesced = await db.enqueue_source_sync_run(
+        source_id="src-input-boundary",
+        trigger="local_agent",
+        source_config_revision=config_revision,
+    )
+
+    assert coalesced.rerun_input_generation_watermark == second_input.input_generation
+    assert coalesced.rerun_source_config_revision == config_revision
+
+    completed = await db.complete_source_sync_run(
+        leased.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        final_state=SyncState(
+            source="src-input-boundary",
+            last_sync_status="success",
+        ),
+    )
+    assert completed is True
+    successor = await db.get_latest_source_sync_run(source_id="src-input-boundary")
+    assert successor is not None
+    assert successor.status == "pending"
+    assert successor.input_generation_watermark == second_input.input_generation
+    assert successor.source_config_revision == config_revision
+
+
+@pytest.mark.asyncio
+async def test_source_sync_enqueue_rejects_stale_config_revision_and_fences_updates(
+    db: Database,
+) -> None:
+    await db.upsert_source(
+        id="src-config-fenced",
+        type="teams",
+        name="Teams",
+        config_json='{"conversation_ids":["conversation-a"]}',
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+
+    with pytest.raises(ValueError, match="source config revision changed"):
+        await db.enqueue_source_sync_run(
+            source_id="src-config-fenced",
+            trigger="local_agent",
+            source_config_revision="stale-revision",
+        )
+
+    source = await db.get_source("src-config-fenced")
+    assert source is not None
+    run = await db.enqueue_source_sync_run(
+        source_id="src-config-fenced",
+        trigger="local_agent",
+        source_config_revision=local_agent_source_config_revision(source),
+    )
+    with pytest.raises(ValueError, match=f"source sync run already active: {run.run_id}"):
+        await db.upsert_source(
+            id="src-config-fenced",
+            type="teams",
+            name="Changed Teams",
+            config_json='{"conversation_ids":["conversation-b"]}',
+            access_policy="workspace",
+            owner_user_id="dev",
+        )
+
+    await db.upsert_source(
+        id="src-config-fenced",
+        type="teams",
+        name="Teams",
+        config_json='{"conversation_ids":["conversation-a"]}',
+        status="paused",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    paused = await db.get_source("src-config-fenced")
+    assert paused is not None
+    assert paused["status"] == "paused"
+
+    with pytest.raises(ValueError, match=f"source sync run already active: {run.run_id}"):
+        await db.upsert_source(
+            id="src-config-fenced",
+            type="teams",
+            name="Teams",
+            config_json='{"conversation_ids":["conversation-b"]}',
+            status="paused",
+            access_policy="workspace",
+            owner_user_id="dev",
+        )
+
+
+@pytest.mark.asyncio
+async def test_active_sync_pause_only_update_compares_identity_fields_exactly(
+    db: Database,
+) -> None:
+    await db.upsert_source(
+        id="src-pause-only-exact",
+        type="confluence",
+        name="1",
+        config_json='{"spaces":["PAY"]}',
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    run = await db.enqueue_source_sync_run(source_id="src-pause-only-exact")
+
+    with pytest.raises(ValueError, match=f"source sync run already active: {run.run_id}"):
+        await db.upsert_source(
+            id="src-pause-only-exact",
+            type="confluence",
+            name="1.0",
+            config_json='{"spaces":["PAY"]}',
+            status="paused",
+            access_policy="workspace",
+            owner_user_id="dev",
+        )
 
 
 @pytest.mark.asyncio
@@ -641,6 +1158,91 @@ async def test_fail_source_sync_run_requeues_retryable_failure_after_backoff(db:
 
 
 @pytest.mark.asyncio
+async def test_retryable_failure_folds_running_rerun_intent_into_same_run(db: Database):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    source_id = "src-retry-fold-rerun"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Teams",
+        config_json='{"conversation_ids":["chat-a"]}',
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    source = await db.get_source(source_id)
+    assert source is not None
+    revision = local_agent_source_config_revision(source)
+    first_input = await db.create_source_sync_input(
+        source_id=source_id,
+        raw_uri="object://first",
+        raw_sha256="sha-first",
+        raw_content_type="application/json",
+    )
+    active = await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="local_agent",
+        source_config_revision=revision,
+    )
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert leased is not None
+    second_input = await db.create_source_sync_input(
+        source_id=source_id,
+        raw_uri="object://second",
+        raw_sha256="sha-second",
+        raw_content_type="application/json",
+    )
+    coalesced = await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="local_agent",
+        source_config_revision=revision,
+    )
+    assert active.input_generation_watermark == first_input.input_generation
+    assert coalesced.rerun_requested is True
+    assert coalesced.rerun_input_generation_watermark == second_input.input_generation
+
+    assert await db.fail_source_sync_run(
+        active.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        error_message="temporary outage",
+        retryable=True,
+        failed_at=now + timedelta(seconds=5),
+        next_attempt_at=now + timedelta(seconds=10),
+    )
+    pending = await db.get_source_sync_run(active.run_id)
+
+    assert pending is not None
+    assert pending.status == "pending"
+    assert pending.input_generation_watermark == second_input.input_generation
+    assert pending.source_config_revision == revision
+    assert pending.rerun_requested is False
+    assert pending.rerun_input_generation_watermark is None
+    assert pending.rerun_source_config_revision is None
+
+    retried = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        lease_seconds=60,
+        now=now + timedelta(seconds=10),
+    )
+    assert retried is not None
+    assert await db.complete_source_sync_run(
+        active.run_id,
+        worker_id="worker-b",
+        lease_attempt_count=retried.lease_attempt_count,
+        final_state=SyncState(source=source_id, last_sync_status="success"),
+        completed_at=now + timedelta(seconds=20),
+    )
+    latest = await db.get_latest_source_sync_run(source_id=source_id)
+    assert latest is not None
+    assert latest.run_id == active.run_id
+    assert latest.status == "success"
+
+
+@pytest.mark.asyncio
 async def test_fail_source_sync_run_marks_terminal_after_retry_budget(db: Database):
     now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
     await db.upsert_source(
@@ -980,6 +1582,8 @@ async def test_source_sync_inputs_filter_by_current_snapshot_membership(db: Data
 
 
 class EmptyGene:
+    discovery_complete = True
+
     def __init__(self) -> None:
         self.bound_document_store = None
 
@@ -1002,6 +1606,10 @@ class EmptyGene:
     async def discover(self, since=None):
         if False:
             yield ContentItem(item_id="never", title="never", updated_at=datetime.now(timezone.utc))
+
+
+class IncompleteEmptyGene(EmptyGene):
+    discovery_complete = False
 
 
 def test_failed_document_summary_identifies_embedding_provider_outage():
@@ -1271,6 +1879,78 @@ class SinceRecordingEmptyGene(EmptyGene):
             yield ContentItem(item_id="never", title="never", updated_at=datetime.now(timezone.utc))
 
 
+class TeamsScopeAttestationGene(EmptyGene):
+    def __init__(
+        self,
+        *,
+        transition_id: str,
+        target_scope: dict[str, object],
+        collection_attempt_id: str = "job-scope:attempt:1",
+    ) -> None:
+        super().__init__()
+        self._transition_id = transition_id
+        self._target_scope = target_scope
+        self._collection_attempt_id = collection_attempt_id
+        self._payloads: dict[str, dict[str, object]] = {}
+
+    @classmethod
+    def metadata(cls) -> GeneMetadata:
+        return GeneMetadata(
+            name="teams",
+            display_name="Teams",
+            description="test scope attestation",
+            default_sync_interval_minutes=60,
+            auth_method="none",
+            data_shape="message",
+        )
+
+    async def discover(self, since=None):
+        del since
+        conversations = sorted(str(value) for value in self._target_scope.get("conversation_ids", []))
+        for conversation_id in conversations:
+            item_id = f"scope-{conversation_id}"
+            window_id = f"teams-scope:v1:{conversation_id}"
+            self._payloads[item_id] = {
+                "_scope_attestation": True,
+                "conversation_id": conversation_id,
+                "window_id": window_id,
+                "messages": [],
+                "transition_id": self._transition_id,
+                "target_scope_fingerprint": projection_scope_fingerprint(self._target_scope),
+                "target_conversation_ids": conversations,
+                "collection_attempt_id": self._collection_attempt_id,
+                "poll": {
+                    "raw_conversation_id": conversation_id,
+                    "access_probe_status": "ok",
+                    "pagination_complete": True,
+                    "stop_reason": "no_backward_link",
+                },
+            }
+            yield ContentItem(
+                item_id=item_id,
+                title=f"Scope {conversation_id}",
+                source_url="",
+                last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+                version=f"scope-{self._transition_id}",
+                extra={
+                    "conversation_id": conversation_id,
+                    "window_id": window_id,
+                },
+            )
+
+    async def fetch(self, item: ContentItem) -> RawContent:
+        return RawContent(
+            item=item,
+            body=json.dumps(self._payloads[item.item_id]).encode(),
+            content_type="application/json",
+            authoritative_empty=True,
+            empty_evidence="teams_current_collection_scope_attestation",
+        )
+
+    async def normalize(self, raw: RawContent) -> NormalizedContent:
+        return NormalizedContent(item=raw.item, markdown_body="")
+
+
 class IncrementalNewDocumentGene:
     def __init__(self) -> None:
         self.seen_since = None
@@ -1436,8 +2116,21 @@ class NoopMemoryEngine:
     async def process_memories(self, **kwargs):
         return {"inserted": 0, "corroborated": 0, "skipped": 0}
 
-    async def reconcile_and_persist(self, **kwargs):
+    async def apply_projected_lifecycle(self, **kwargs):
+        is_update = kwargs["projection"].deltas[0].previous_unit_revision_id is not None
+        if not is_update:
+            result = await self.process_memories(**kwargs)
+            return {
+                "added": result.get("inserted", 0),
+                "updated": result.get("corroborated", 0),
+                "superseded": 0,
+                "deleted": 0,
+                "noop": 0,
+            }
         return {"added": 0, "updated": 0, "superseded": 0, "deleted": 0, "noop": 0}
+
+    async def apply_projected_tombstone(self, **kwargs):
+        return {"retired": 0, "pending_review": 0, "can_delete_document": True}
 
 
 class RecordingSourceSupportDetector:
@@ -1450,8 +2143,18 @@ class RecordingSourceSupportDetector:
 
 
 class FailingDocumentDeleteMemoryStore:
-    async def delete_document(self, doc_id: str, **kwargs):
+    async def delete_projected_document(self, doc_id: str, **kwargs):
         raise RuntimeError("delete document failed")
+
+
+class RecordingDocumentDeleteMemoryStore:
+    def __init__(self, db: Database) -> None:
+        self.db = db
+        self.calls: list[tuple[str, dict]] = []
+
+    async def delete_projected_document(self, doc_id: str, **kwargs):
+        self.calls.append((doc_id, kwargs))
+        await self.db.delete_projected_document(doc_id)
 
 
 class CountingMemoryEngine(NoopMemoryEngine):
@@ -1471,16 +2174,20 @@ class CountingMemoryEngine(NoopMemoryEngine):
 
 class RecordingMemoryEngine(NoopMemoryEngine):
     def __init__(self) -> None:
-        self.process_memories_calls: list[dict] = []
-        self.reconcile_calls: list[dict] = []
+        self.projected_lifecycle_calls: list[dict] = []
 
-    async def process_memories(self, **kwargs):
-        self.process_memories_calls.append(kwargs)
-        return await super().process_memories(**kwargs)
+    async def apply_projected_lifecycle(self, **kwargs):
+        self.projected_lifecycle_calls.append(kwargs)
+        return await super().apply_projected_lifecycle(**kwargs)
 
-    async def reconcile_and_persist(self, **kwargs):
-        self.reconcile_calls.append(kwargs)
-        return await super().reconcile_and_persist(**kwargs)
+
+class FailingProjectedMemoryEngine(NoopMemoryEngine):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def apply_projected_lifecycle(self, **kwargs):
+        self.calls += 1
+        raise RuntimeError("lifecycle apply failed")
 
 
 class FailingVectorStore:
@@ -1577,6 +2284,17 @@ class RecordingMemoryExtractor(NoopMemoryExtractor):
         return MemoryExtractionResult(memories=[])
 
 
+class ProjectionBatchRecordingExtractor(RecordingMemoryExtractor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection_calls: list[object] = []
+
+    async def extract_projection_batch_memories(self, batch, **kwargs):
+        del kwargs
+        self.projection_calls.append(batch)
+        return MemoryExtractionResult(memories=[])
+
+
 class FailingMemoryExtractor(NoopMemoryExtractor):
     async def extract_memories(self, **kwargs):
         return MemoryExtractionResult(
@@ -1626,7 +2344,35 @@ class BlockingUnitMemoryExtractor(RecordingMemoryExtractor):
             self.active -= 1
 
 
+def _jira_raw_content(item: ContentItem) -> RawContent:
+    payload = {
+        "id": str(item.extra["issue_id"]),
+        "key": str(item.extra["issue_key"]),
+        "fields": {
+            "summary": item.title,
+            "description": "Body",
+            "status": None,
+            "priority": None,
+            "assignee": None,
+            "labels": [],
+            "resolution": None,
+            "updated": item.last_modified.isoformat(),
+        },
+        "_comments": [],
+        "_comments_included": True,
+        "_comments_total": 0,
+        "changelog": {"startAt": 0, "histories": [], "total": 0},
+    }
+    return RawContent(
+        item=item,
+        body=json.dumps(payload).encode("utf-8"),
+        content_type="application/json",
+    )
+
+
 class BlockingFetchGene:
+    discovery_complete = True
+
     def __init__(self, item_count: int, release: asyncio.Event):
         self.item_count = item_count
         self.release = release
@@ -1667,6 +2413,7 @@ class BlockingFetchGene:
                 content_type="application/json",
                 space_or_project="PAY",
                 version=str(idx),
+                extra={"issue_id": str(100000 + idx), "issue_key": f"PAY-{idx}"},
             )
 
     async def fetch(self, item):
@@ -1674,12 +2421,47 @@ class BlockingFetchGene:
         self.max_active_fetches = max(self.max_active_fetches, self.active_fetches)
         try:
             await self.release.wait()
-            return RawContent(item=item, body=b'{"summary":"test"}', content_type="application/json")
+            return _jira_raw_content(item)
         finally:
             self.active_fetches -= 1
 
     async def normalize(self, raw):
         return NormalizedContent(item=raw.item, markdown_body=f"# {raw.item.title}\n\nBody")
+
+
+class EmptyNormalizedBlockingFetchGene(BlockingFetchGene):
+    async def fetch(self, item):
+        return RawContent(item=item, body=b"", content_type="text/plain")
+
+    async def normalize(self, raw):
+        return NormalizedContent(item=raw.item, markdown_body="")
+
+
+class GitHubPagesBlockingFetchGene(BlockingFetchGene):
+    @classmethod
+    def metadata(cls):
+        return GeneMetadata(
+            name="github_pages",
+            display_name="GitHub Pages",
+            description="",
+            default_sync_interval_minutes=60,
+            auth_method="none",
+            data_shape="document",
+        )
+
+
+class EmptyGitHubPagesBlockingFetchGene(GitHubPagesBlockingFetchGene):
+    async def fetch(self, item):
+        return RawContent(
+            item=item,
+            body=b'{"provider_status":"successful_empty"}',
+            content_type="application/json",
+            authoritative_empty=True,
+            empty_evidence="test_provider_successful_empty_page",
+        )
+
+    async def normalize(self, raw):
+        return NormalizedContent(item=raw.item, markdown_body="")
 
 
 class SharedFetchTracker:
@@ -1714,13 +2496,14 @@ class TrackedFetchGene(BlockingFetchGene):
             content_type="application/json",
             space_or_project="PAY",
             version=self.prefix,
+            extra={"issue_id": "200000", "issue_key": f"PAY-{self.prefix}"},
         )
 
     async def fetch(self, item):
         self.tracker.enter()
         try:
             await self.release.wait()
-            return RawContent(item=item, body=b'{"summary":"test"}', content_type="application/json")
+            return _jira_raw_content(item)
         finally:
             self.tracker.exit()
 
@@ -1809,6 +2592,7 @@ class UpdatingDocumentGene:
             content_type="text/markdown",
             space_or_project="ARCH",
             version=self.version,
+            extra={"issue_id": "300001", "issue_key": "PAY-123"},
         )
 
     async def fetch(self, item):
@@ -1831,6 +2615,100 @@ class UpdatingTicketGene(UpdatingDocumentGene):
             default_sync_interval_minutes=360,
             auth_method="browser_cookie",
             data_shape="ticket",
+        )
+
+    async def fetch(self, item):
+        return RawContent(
+            item=item,
+            body=json.dumps(
+                {
+                    "id": str(item.extra["issue_id"]),
+                    "key": str(item.extra["issue_key"]),
+                    "fields": {
+                        "summary": item.title,
+                        "description": self.markdown,
+                        "status": None,
+                        "priority": None,
+                        "assignee": None,
+                        "labels": [],
+                        "resolution": None,
+                        "updated": item.last_modified.isoformat(),
+                    },
+                    "_comments": [],
+                    "_comments_included": True,
+                    "_comments_total": 0,
+                    "changelog": {"startAt": 0, "histories": [], "total": 0},
+                }
+            ).encode("utf-8"),
+            content_type="application/json",
+        )
+
+
+class LargeConfluenceGene(UpdatingDocumentGene):
+    @classmethod
+    def metadata(cls):
+        return GeneMetadata(
+            name="confluence",
+            display_name="Confluence",
+            description="",
+            default_sync_interval_minutes=1440,
+            auth_method="pat",
+            data_shape="document",
+        )
+
+
+class MovingGithubFileGene(UpdatingDocumentGene):
+    def __init__(
+        self,
+        *,
+        item_id: str,
+        relative_path: str,
+        previous_filename: str | None = None,
+        previous_document_id: str | None = None,
+        file_lineage_id: str | None = "file-lineage-77",
+        version: str = "blob-v1",
+    ) -> None:
+        super().__init__("# Design\n\nKeep A7.", version=version)
+        self.item_id = item_id
+        self.relative_path = relative_path
+        self.previous_filename = previous_filename
+        self.previous_document_id = previous_document_id
+        self.file_lineage_id = file_lineage_id
+
+    @classmethod
+    def metadata(cls):
+        return GeneMetadata(
+            name="github_repo",
+            display_name="GitHub Repository",
+            description="",
+            default_sync_interval_minutes=1440,
+            auth_method="pat",
+            data_shape="document",
+        )
+
+    async def discover(self, since=None):
+        extra = {
+            "relative_path": self.relative_path,
+            "repo_owner": "acme",
+            "repo_name": "payroll",
+            "repo_ref": "main",
+        }
+        if self.file_lineage_id is not None:
+            extra["file_lineage_id"] = self.file_lineage_id
+        if self.previous_filename is not None:
+            extra["previous_filename"] = self.previous_filename
+            extra["rename_evidence_authoritative"] = True
+        if self.previous_document_id is not None:
+            extra["previous_document_id"] = self.previous_document_id
+        yield ContentItem(
+            item_id=self.item_id,
+            title="Design",
+            source_url=f"https://github.example/acme/payroll/{self.relative_path}",
+            last_modified=self.last_modified,
+            content_type="text/markdown",
+            space_or_project="payroll",
+            version=self.version,
+            extra=extra,
         )
 
 
@@ -2049,6 +2927,42 @@ def _audited_memory_store(db: Database) -> MemoryStore:
 
 
 @pytest.mark.asyncio
+async def test_large_single_observation_uses_bounded_projection_batches(db: Database) -> None:
+    source_id = "src-large-confluence"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Large Confluence",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    body = "\n".join(f"design-line-{index:05d}" for index in range(9_000))
+    extractor = ProjectionBatchRecordingExtractor()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=extractor,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=2,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=LargeConfluenceGene(body),
+        source_name="Large Confluence",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "success"
+    assert len(extractor.projection_calls) > 1
+    assert all(len(batch.primary_markdown) <= 60_000 for batch in extractor.projection_calls)
+    assert extractor.full_calls == []
+    assert extractor.unit_calls == []
+
+
+@pytest.mark.asyncio
 async def test_sync_memory_observer_records_discovery_and_document_stages(db: Database):
     source_id = "src-sync-memory"
     await db.upsert_source(
@@ -2098,17 +3012,13 @@ async def test_sync_memory_observer_records_discovery_and_document_stages(db: Da
     assert "after_enrich" in stages
     assert "after_extract" in stages
     assert "after_memory_engine" in stages
-    assert "after_source_support" in stages
     assert "document_lifecycle_exit" in stages
     assert "sync_run_end" in stages
     discovery = next(event for event in events if event["stage"] == "after_discovery")
     assert discovery["item_count"] == 1
     assert discovery["indexed_doc_count"] == 0
     assert discovery["full_sync"] is True
-    support = next(event for event in events if event["stage"] == "after_source_support")
-    assert support["memory_supports_added"] == 1
-    assert "title" not in support
-    assert "source_url" not in support
+    assert "after_source_support" not in stages
 
 
 @pytest.mark.asyncio
@@ -2204,10 +3114,10 @@ async def test_successful_zero_change_sync_advances_last_sync_and_keeps_doc_coun
 
     orchestrator = GeneSyncOrchestrator(
         db=db,
-        doc_store=None,
+        doc_store=StubDocumentStore(),
         enricher=None,
         memory_extractor=None,
-        memory_engine=None,
+        memory_engine=NoopMemoryEngine(),
         memory_store=None,
     )
 
@@ -2227,6 +3137,49 @@ async def test_successful_zero_change_sync_advances_last_sync_and_keeps_doc_coun
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source_type", ["confluence", "jira", "github_repo", "github_pages"])
+async def test_full_discovery_without_completion_evidence_never_deletes_existing_documents(
+    db: Database,
+    source_type: str,
+) -> None:
+    source_id = f"src-incomplete-{source_type}"
+    await db.upsert_source(
+        id=source_id,
+        type=source_type,
+        name="Incomplete provider response",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    await db.db.execute(
+        """INSERT INTO documents
+           (doc_id, source, source_url, title, space_or_project, last_modified, version, content_hash, last_synced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("doc-existing", source_id, "https://example/doc", "Existing", "ENG", now, "1", "hash", now),
+    )
+    await db.db.commit()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=FailingDocumentDeleteMemoryStore(),
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=IncompleteEmptyGene(),
+        source_name="Incomplete provider response",
+        source_id=source_id,
+        force_full_sync=True,
+    )
+
+    assert state.last_sync_status == "success"
+    assert await db.list_indexed_doc_ids(source_id) == {"doc-existing"}
+
+
+@pytest.mark.asyncio
 async def test_incremental_sync_uses_overlap_window_for_discovery(db: Database):
     source_id = "src-sync-overlap"
     await _insert_source_and_doc(db, source_id)
@@ -2243,10 +3196,10 @@ async def test_incremental_sync_uses_overlap_window_for_discovery(db: Database):
     gene = SinceRecordingEmptyGene()
     orchestrator = GeneSyncOrchestrator(
         db=db,
-        doc_store=None,
+        doc_store=StubDocumentStore(),
         enricher=None,
         memory_extractor=None,
-        memory_engine=None,
+        memory_engine=NoopMemoryEngine(),
         memory_store=None,
     )
 
@@ -2368,6 +3321,270 @@ async def test_authoritative_snapshot_ignores_cursor_without_forcing_reprocessin
 
 
 @pytest.mark.asyncio
+async def test_complete_source_scope_transition_forces_snapshot_and_applies(db: Database):
+    source_id = "src-scope-transition-complete"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Architecture",
+        config_json=json.dumps({"spaces": ["NEW"]}),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await db.create_projection_scope_transition(
+        ProjectionScopeTransition(
+            id="scope-transition-complete",
+            source_id=source_id,
+            previous_scope={"sync_mode": "space", "spaces": ["OLD"]},
+            target_scope={"sync_mode": "space", "spaces": ["NEW"]},
+        )
+    )
+    gene = SinceRecordingEmptyGene()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=None,
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=None,
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(gene, "Architecture", source_id)
+    transition = (await db.list_projection_scope_transitions(source_id))[0]
+
+    assert state.last_sync_status == "success"
+    assert gene.seen_since is None
+    assert transition.status is ProjectionScopeTransitionStatus.APPLIED
+
+
+@pytest.mark.asyncio
+async def test_partial_conversation_scope_transition_preserves_old_membership(db: Database):
+    source_id = "src-scope-transition-partial"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Teams",
+        config_json=json.dumps({"conversation_ids": ["new-thread"]}),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await db.create_projection_scope_transition(
+        ProjectionScopeTransition(
+            id="scope-transition-partial",
+            source_id=source_id,
+            previous_scope={"conversation_ids": ["old-thread"]},
+            target_scope={"conversation_ids": ["new-thread"]},
+        )
+    )
+    old_item = ContentItem(
+        item_id="old-window",
+        title="Old Teams window",
+        source_url="https://teams.example.test/old-window",
+        last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc),
+        version="revision-old",
+        extra={
+            "conversation_id": "old-thread",
+            "window_id": "old-window",
+            "root_message_id": "old-message",
+        },
+    )
+    old_payload = {
+        "messages": [
+            {
+                "id": "old-message",
+                "content": "Old scoped answer",
+                "time": "2026-07-15T09:00:00Z",
+            }
+        ]
+    }
+    await db.record_source_projection(
+        project_source_item(
+            source_id=source_id,
+            source_type="teams",
+            run_id="projection-old-scope",
+            item=old_item,
+            raw=RawContent(
+                item=old_item,
+                body=json.dumps(old_payload).encode(),
+                content_type="application/json",
+            ),
+            normalized=NormalizedContent(
+                item=old_item,
+                markdown_body="Old scoped answer",
+            ),
+        )
+    )
+    gene = SinceRecordingEmptyGene()
+    gene.discovery_complete = False
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=None,
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=None,
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(gene, "Teams", source_id)
+    transition = (await db.list_projection_scope_transitions(source_id))[0]
+
+    assert state.last_sync_status == "success"
+    assert transition.status is ProjectionScopeTransitionStatus.FAILED
+    assert transition.coverage.value == "partial_projection"
+    assert "complete successful snapshot" in (transition.error or "")
+
+
+@pytest.mark.asyncio
+async def test_teams_scope_transition_applies_after_removed_units_are_tombstoned(
+    db: Database,
+):
+    source_id = "src-scope-transition-reconciled"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Teams",
+        config_json=json.dumps({"conversation_ids": ["19:retained-thread@example.test"]}),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await db.create_projection_scope_transition(
+        ProjectionScopeTransition(
+            id="scope-transition-reconciled",
+            source_id=source_id,
+            previous_scope={
+                "conversation_ids": [
+                    "19:retained-thread@example.test",
+                    "19:removed-thread@example.test",
+                ]
+            },
+            target_scope={"conversation_ids": ["19:retained-thread@example.test"]},
+        )
+    )
+    gene = TeamsScopeAttestationGene(
+        transition_id="scope-transition-reconciled",
+        target_scope={"conversation_ids": ["19:retained-thread@example.test"]},
+    )
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene,
+        "Teams",
+        source_id,
+    )
+    transition = (await db.list_projection_scope_transitions(source_id))[0]
+
+    assert state.last_sync_status == "success"
+    assert transition.status is ProjectionScopeTransitionStatus.APPLIED
+    assert transition.coverage.value == "tombstoned_delta"
+    assert await db.list_indexed_doc_ids(source_id) == set()
+    assert not any(
+        unit.unit_type == "teams_scope_attestation"
+        for unit in await db.list_current_source_units(source_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_teams_max_age_transition_applies_only_with_target_time_attestation(
+    db: Database,
+):
+    source_id = "src-scope-transition-time"
+    target_scope = {
+        "conversation_ids": ["19:conversation-a@example.test"],
+        "max_age_days": 30,
+    }
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Teams",
+        config_json=json.dumps(target_scope),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await db.create_projection_scope_transition(
+        ProjectionScopeTransition(
+            id="scope-transition-time",
+            source_id=source_id,
+            previous_scope={
+                "conversation_ids": ["19:conversation-a@example.test"],
+                "max_age_days": 365,
+            },
+            target_scope=target_scope,
+        )
+    )
+    item = ContentItem(
+        item_id="window-time",
+        title="Recent Teams window",
+        source_url="https://teams.example.test/window-time",
+        last_modified=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        version="revision-time",
+        extra={
+            "conversation_id": "19:conversation-a@example.test",
+            "window_id": "window-time",
+            "root_message_id": "message-time",
+        },
+    )
+    payload = {
+        "_scope_coverage_from": "2026-07-01T00:00:00+00:00",
+        "_scope_coverage_to": "2026-07-16T00:00:00+00:00",
+        "messages": [
+            {
+                "id": "message-time",
+                "content": "Current scoped answer",
+                "time": "2026-07-10T09:00:00+00:00",
+            }
+        ],
+    }
+    await db.record_source_projection(
+        project_source_item(
+            source_id=source_id,
+            source_type="teams",
+            run_id="projection-time-scope",
+            item=item,
+            raw=RawContent(
+                item=item,
+                body=json.dumps(payload).encode(),
+                content_type="application/json",
+            ),
+            normalized=NormalizedContent(
+                item=item,
+                markdown_body="Current scoped answer",
+            ),
+            scope={"configured_scope": target_scope},
+        )
+    )
+    gene = TeamsScopeAttestationGene(
+        transition_id="scope-transition-time",
+        target_scope=target_scope,
+    )
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene,
+        "Teams",
+        source_id,
+    )
+    transition = (await db.list_projection_scope_transitions(source_id))[0]
+
+    assert state.last_sync_status == "success"
+    assert transition.status is ProjectionScopeTransitionStatus.APPLIED
+    assert transition.coverage.value == "tombstoned_delta"
+
+
+@pytest.mark.asyncio
 async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_path):
     source_id = "src-force-reprocess"
     markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
@@ -2411,8 +3628,57 @@ async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_
     assert extractor.full_calls == []
     assert len(extractor.unit_calls) == 1
     assert extractor.change_calls == []
-    assert len(memory_engine.reconcile_calls) == 1
-    assert memory_engine.reconcile_calls[0]["update_mode"] == "full_document"
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    assert memory_engine.projected_lifecycle_calls[0]["update_mode"] == "full_document"
+
+
+@pytest.mark.asyncio
+async def test_targeted_recovery_skips_unchanged_documents_outside_finding_scope(
+    db: Database,
+) -> None:
+    source_id = "src-targeted-recovery"
+    markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
+    doc_store = StubDocumentStore()
+    normalized_content_uri = doc_store.store_normalized(
+        source_id=source_id,
+        title="Design Doc",
+        markdown=markdown,
+    )
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown=markdown,
+        version="2",
+        normalized_content_uri=normalized_content_uri,
+    )
+    extractor = RecordingMemoryExtractor()
+    memory_engine = RecordingMemoryEngine()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        enricher=DocumentVisibleEnricher(db, source_id),
+        memory_extractor=extractor,
+        memory_engine=memory_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=UpdatingDocumentGene(markdown, version="2"),
+        source_name="Documents",
+        source_id=source_id,
+        force_full_sync=True,
+        reprocess_doc_ids=frozenset({"another-doc"}),
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_processed == 1
+    assert state.docs_updated == 0
+    assert extractor.full_calls == []
+    assert extractor.unit_calls == []
+    assert memory_engine.projected_lifecycle_calls == []
 
 
 @pytest.mark.asyncio
@@ -2446,11 +3712,11 @@ async def test_document_last_modified_becomes_memory_source_updated_at(db: Datab
     )
 
     assert state.last_sync_status == "success"
-    assert len(memory_engine.reconcile_calls) == 0
+    assert len(memory_engine.projected_lifecycle_calls) == 1
     # No source-specific metadata was supplied; document last_modified is the
     # canonical source-side update time forwarded into memory provenance.
-    assert len(memory_engine.process_memories_calls) == 1
-    assert memory_engine.process_memories_calls[0]["source_updated_at"] == last_modified
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    assert memory_engine.projected_lifecycle_calls[0]["source_updated_at"] == last_modified
 
 
 @pytest.mark.asyncio
@@ -2489,20 +3755,38 @@ async def test_explicit_source_updated_at_overrides_document_last_modified(db: D
     )
 
     assert state.last_sync_status == "success"
-    assert len(memory_engine.process_memories_calls) == 1
-    assert memory_engine.process_memories_calls[0]["source_updated_at"].isoformat() == explicit_source_updated_at
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    assert memory_engine.projected_lifecycle_calls[0]["source_updated_at"].isoformat() == explicit_source_updated_at
 
 
 @pytest.mark.asyncio
 async def test_deletion_failure_marks_sync_failed(db: Database):
     source_id = "src-deletion-failure"
     await _insert_source_and_doc(db, source_id)
+    item = ContentItem(
+        item_id="doc-1",
+        title="Doc 1",
+        source_url="http://example/doc-1",
+        last_modified=datetime.now(timezone.utc),
+        version="1",
+        extra={"page_id": "doc-1", "space_key": "ARCH"},
+    )
+    raw = RawContent(item=item, body=b"Document body", content_type="text/html")
+    projection = project_source_item(
+        source_id=source_id,
+        source_type="confluence",
+        run_id="projection-before-delete-failure",
+        item=item,
+        raw=raw,
+        normalized=NormalizedContent(item=item, markdown_body="Document body"),
+    )
+    await db.record_source_projection(projection)
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
         enricher=None,
         memory_extractor=None,
-        memory_engine=None,
+        memory_engine=NoopMemoryEngine(),
         memory_store=FailingDocumentDeleteMemoryStore(),
     )
 
@@ -2517,6 +3801,73 @@ async def test_deletion_failure_marks_sync_failed(db: Database):
     assert state.docs_failed == 1
     assert "delete document failed" in state.failed_docs[0].error
     assert history[0]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_rebaseline_replay_removes_legacy_document_without_source_unit(
+    db: Database,
+) -> None:
+    source_id = "src-rebaseline-legacy-document"
+    await _insert_source_and_doc(db, source_id)
+    memory_store = RecordingDocumentDeleteMemoryStore(db)
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=memory_store,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=EmptyGene(),
+        source_name="Architecture",
+        source_id=source_id,
+        execution_mode=SourceSyncMode.REBASELINE_REPLAY,
+    )
+
+    assert state.last_sync_status == "success"
+    assert await db.get_document("doc-1") is None
+    assert memory_store.calls == [
+        (
+            "doc-1",
+            {
+                "deletion_context": {
+                    "deletion_kind": "rebaseline_legacy_absence",
+                    "reason": "not_returned_by_complete_rebaseline_replay",
+                }
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_normal_sync_keeps_legacy_document_without_source_unit_fail_closed(
+    db: Database,
+) -> None:
+    source_id = "src-normal-legacy-document"
+    await _insert_source_and_doc(db, source_id)
+    memory_store = RecordingDocumentDeleteMemoryStore(db)
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=memory_store,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=EmptyGene(),
+        source_name="Architecture",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "failed"
+    assert state.docs_failed == 1
+    assert "without persisted Source Unit lineage" in state.failed_docs[0].error
+    assert await db.get_document("doc-1") is not None
+    assert memory_store.calls == []
 
 
 @pytest.mark.asyncio
@@ -2776,6 +4127,42 @@ async def test_due_local_source_enqueues_owner_daemon_job_not_server_run(db: Dat
 
 
 @pytest.mark.asyncio
+async def test_due_local_source_remains_due_during_lifecycle_maintenance(
+    db: Database,
+) -> None:
+    due_at = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    source_id = "src-local-maintenance-schedule"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Scheduled Teams",
+        config_json='{"conversation_ids":["19:conversation@example.test"]}',
+        created_by_user_id="owner-a",
+        execution_owner_user_id="owner-a",
+        access_policy="workspace",
+        owner_user_id="owner-a",
+    )
+    await db.set_source_sync_schedule(
+        source_id,
+        enabled=True,
+        interval_minutes=60,
+        next_run_at=due_at,
+    )
+    await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="lifecycle-schedule-fence",
+            source_id=source_id,
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+
+    assert await db.enqueue_due_local_agent_jobs(now=due_at) == 0
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["sync_schedule"]["next_run_at"] == due_at.isoformat()
+
+
+@pytest.mark.asyncio
 async def test_due_ownerless_local_source_advances_schedule_without_job(db: Database):
     due_at = datetime(2026, 7, 10, tzinfo=timezone.utc)
     source_id = "src-ownerless-schedule"
@@ -2854,6 +4241,14 @@ async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
 
 @pytest.mark.asyncio
 async def test_queued_force_request_promotes_existing_local_agent_job(db: Database):
+    await db.upsert_source(
+        id="src-local",
+        type="local_markdown",
+        name="Local markdown",
+        config_json='{"root":"/vault","vault_id":"vault-a"}',
+        access_policy="workspace",
+        owner_user_id="owner-a",
+    )
     first_id, first_created = await db.enqueue_local_agent_job(
         job_id="laj-normal",
         source_id="src-local",
@@ -2883,6 +4278,14 @@ async def test_queued_force_request_promotes_existing_local_agent_job(db: Databa
 
 @pytest.mark.asyncio
 async def test_leased_force_request_creates_serial_successor_job(db: Database):
+    await db.upsert_source(
+        id="src-local",
+        type="local_markdown",
+        name="Local markdown",
+        config_json='{"root":"/vault","vault_id":"vault-a"}',
+        access_policy="workspace",
+        owner_user_id="owner-a",
+    )
     first_id, _ = await db.enqueue_local_agent_job(
         job_id="laj-leased-normal",
         source_id="src-local",
@@ -2925,6 +4328,14 @@ async def test_leased_force_request_creates_serial_successor_job(db: Database):
 @pytest.mark.asyncio
 async def test_expired_original_and_successor_are_not_released_in_same_batch(db: Database):
     now = datetime.now(timezone.utc)
+    await db.upsert_source(
+        id="src-local",
+        type="local_markdown",
+        name="Local markdown",
+        config_json='{"root":"/vault","vault_id":"vault-a"}',
+        access_policy="workspace",
+        owner_user_id="owner-a",
+    )
     first_id, _ = await db.enqueue_local_agent_job(
         job_id="laj-expired-original",
         source_id="src-local",
@@ -3102,6 +4513,35 @@ async def test_sync_service_enqueue_source_creates_durable_run_without_local_tas
 
 
 @pytest.mark.asyncio
+async def test_sync_service_captures_local_source_config_revision(db: Database) -> None:
+    source_id = "src-local-revision"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Local Teams",
+        config_json='{"conversation_ids":["conversation-a"],"sync_mode":"local_agent"}',
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    source = await db.get_source(source_id)
+    assert source is not None
+
+    run = await SyncService(db, AppConfig()).enqueue_source(
+        source_id,
+        trigger="local_agent",
+    )
+
+    assert run.source_config_revision == local_agent_source_config_revision(source)
+
+    with pytest.raises(ValueError, match="source config revision changed"):
+        await SyncService(db, AppConfig()).enqueue_source(
+            source_id,
+            trigger="local_agent",
+            source_config_revision="stale-revision",
+        )
+
+
+@pytest.mark.asyncio
 async def test_sync_service_rejects_source_while_deletion_is_in_progress(db: Database):
     source_id = "src-deleting-service"
     await db.upsert_source(
@@ -3258,6 +4698,245 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
     assert provider.authoritative_snapshot is True
     assert provider.source is not None
     assert provider.source["config"]["local_agent_package_manifest"] == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_snapshot_run_uses_snapshot_membership_without_watermark(
+    db: Database,
+):
+    import memforge.runtime as runtime
+
+    source_id = "src-legacy-snapshot"
+    snapshot_id = "snapshot-before-watermarks"
+    await db.upsert_source(
+        id=source_id,
+        type="local_markdown",
+        name="Legacy Snapshot",
+        config_json='{"root":"/vault","vault_id":"vault-a"}',
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await db.create_source_sync_input(
+        source_id=source_id,
+        raw_uri="object://legacy-snapshot-doc",
+        raw_sha256="sha-legacy-snapshot-doc",
+        raw_content_type="application/json",
+        metadata={
+            "doc_id": "doc-legacy",
+            "manifest_entry": {"doc_id": "doc-legacy", "version": "v1"},
+        },
+        sync_snapshot_id=snapshot_id,
+    )
+    run = await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="local_agent",
+        input_snapshot_id=snapshot_id,
+    )
+    await db.db.execute(
+        "UPDATE source_sync_runs SET input_generation_watermark = NULL WHERE run_id = ?",
+        (run.run_id,),
+    )
+    await db.db.commit()
+
+    class CapturingRuntimeProvider:
+        source: dict | None = None
+
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            self.source = kwargs["source"]
+            return SyncState(source=source_id, last_sync_status="success")
+
+    provider = CapturingRuntimeProvider()
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=provider,
+        worker_id="worker-legacy-snapshot",
+    )
+
+    await worker.run_once()
+
+    assert provider.source is not None
+    assert provider.source["config"]["local_agent_package_manifest"] == [
+        {
+            "doc_id": "doc-legacy",
+            "version": "v1",
+            "package_uri": "object://legacy-snapshot-doc",
+            "input_sha256": "sha-legacy-snapshot-doc",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_legacy_incremental_local_run_without_watermark_fails_closed(
+    db: Database,
+):
+    import memforge.runtime as runtime
+
+    source_id = "src-legacy-incremental"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Legacy Incremental",
+        config_json='{"conversation_ids":["chat-a"]}',
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await db.create_source_sync_input(
+        source_id=source_id,
+        raw_uri="object://legacy-window",
+        raw_sha256="sha-legacy-window",
+        raw_content_type="application/json",
+        metadata={
+            "doc_id": "doc-window",
+            "manifest_entry": {"doc_id": "doc-window", "version": "v1"},
+        },
+    )
+    run = await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="local_agent",
+    )
+    await db.db.execute(
+        "UPDATE source_sync_runs SET input_generation_watermark = NULL WHERE run_id = ?",
+        (run.run_id,),
+    )
+    await db.db.commit()
+
+    class MustNotRunProvider:
+        async def build_sync_runtime(self, *args, **kwargs):
+            raise AssertionError("legacy unbounded run must fail before runtime construction")
+
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=MustNotRunProvider(),
+        worker_id="worker-legacy-incremental",
+    )
+
+    await worker.run_once()
+    failed = await db.get_source_sync_run(run.run_id)
+
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.error_message == "local-agent sync run is missing its input generation boundary"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_consumes_only_inputs_at_run_watermark(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-watermark"
+    await db.upsert_source(
+        id=source_id,
+        type="local_markdown",
+        name="Watermark Worker",
+        config_json='{"root":"/vault","vault_id":"vault-a"}',
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    first = await db.create_source_sync_input(
+        source_id=source_id,
+        raw_uri="object://first",
+        raw_sha256="sha-first",
+        raw_content_type="application/json",
+        metadata={"manifest_entry": {"doc_id": "doc-first", "version": "v1"}},
+    )
+    run = await db.enqueue_source_sync_run(source_id=source_id, trigger="local_agent")
+    await db.create_source_sync_input(
+        source_id=source_id,
+        raw_uri="object://second",
+        raw_sha256="sha-second",
+        raw_content_type="application/json",
+        metadata={"manifest_entry": {"doc_id": "doc-second", "version": "v2"}},
+    )
+
+    class CapturingRuntimeProvider:
+        source: dict | None = None
+
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            self.source = kwargs["source"]
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
+
+    provider = CapturingRuntimeProvider()
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=provider,
+        worker_id="worker-watermark",
+    )
+
+    await worker.run_once()
+
+    assert run.input_generation_watermark == first.input_generation
+    assert provider.source is not None
+    assert provider.source["config"]["local_agent_package_manifest"] == [
+        {
+            "doc_id": "doc-first",
+            "version": "v1",
+            "package_uri": "object://first",
+            "input_sha256": "sha-first",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_rejects_stale_run_config_revision(db: Database, monkeypatch):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-stale-config"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Teams",
+        config_json='{"conversation_ids":["chat-a"]}',
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    source = await db.get_source(source_id)
+    assert source is not None
+    run = await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="local_agent",
+        source_config_revision=local_agent_source_config_revision(source),
+    )
+    changed_source = {
+        **source,
+        "config": {"conversation_ids": ["chat-b"]},
+    }
+
+    async def get_changed_source(requested_source_id: str):
+        assert requested_source_id == source_id
+        return changed_source
+
+    class MustNotRunProvider:
+        async def build_sync_runtime(self, *args, **kwargs):
+            raise AssertionError("stale run must fail before runtime construction")
+
+    monkeypatch.setattr(db, "get_source", get_changed_source)
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=MustNotRunProvider(),
+        worker_id="worker-stale-config",
+    )
+
+    await worker.run_once()
+    failed = await db.get_source_sync_run(run.run_id)
+
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.error_message == "source config revision changed before sync execution"
 
 
 @pytest.mark.asyncio
@@ -3661,19 +5340,23 @@ def test_reconciliation_without_measurable_work_is_indeterminate():
 def test_recovered_source_sync_progress_preserves_run_level_work():
     from memforge.sync_progress import SourceSyncProgressAccumulator
 
-    progress = SourceSyncProgressAccumulator({
-        "schema_version": 1,
-        "phase": "processing",
-        "progress": {"completed": 29, "total": 58, "unit": "file"},
-        "counts": {"changed": 11, "failed": 1, "memories_created": 101},
-    })
+    progress = SourceSyncProgressAccumulator(
+        {
+            "schema_version": 1,
+            "phase": "processing",
+            "progress": {"completed": 29, "total": 58, "unit": "file"},
+            "counts": {"changed": 11, "failed": 1, "memories_created": 101},
+        }
+    )
 
-    assert progress.update({
-        "schema_version": 1,
-        "phase": "processing",
-        "progress": {"completed": 2, "total": 58, "unit": "file"},
-        "counts": {"changed": 1, "failed": 0, "memories_created": 3},
-    }) == {
+    assert progress.update(
+        {
+            "schema_version": 1,
+            "phase": "processing",
+            "progress": {"completed": 2, "total": 58, "unit": "file"},
+            "counts": {"changed": 1, "failed": 0, "memories_created": 3},
+        }
+    ) == {
         "schema_version": 1,
         "phase": "processing",
         "progress": {"completed": 29, "total": 58, "unit": "file"},
@@ -3684,34 +5367,42 @@ def test_recovered_source_sync_progress_preserves_run_level_work():
 def test_recovered_source_sync_progress_does_not_reuse_a_changed_workset():
     from memforge.sync_progress import SourceSyncProgressAccumulator
 
-    progress = SourceSyncProgressAccumulator({
-        "schema_version": 1,
-        "phase": "processing",
-        "progress": {"completed": 29, "total": 58, "unit": "file"},
-    })
+    progress = SourceSyncProgressAccumulator(
+        {
+            "schema_version": 1,
+            "phase": "processing",
+            "progress": {"completed": 29, "total": 58, "unit": "file"},
+        }
+    )
 
-    assert progress.update({
-        "schema_version": 1,
-        "phase": "processing",
-        "progress": {"completed": 2, "total": 60, "unit": "file"},
-    })["progress"] == {"completed": 2, "total": 60, "unit": "file"}
+    assert progress.update(
+        {
+            "schema_version": 1,
+            "phase": "processing",
+            "progress": {"completed": 2, "total": 60, "unit": "file"},
+        }
+    )["progress"] == {"completed": 2, "total": 60, "unit": "file"}
 
 
 def test_source_sync_progress_preserves_attempt_counts_between_phases():
     from memforge.sync_progress import SourceSyncProgressAccumulator
 
     progress = SourceSyncProgressAccumulator()
-    progress.update({
-        "schema_version": 1,
-        "phase": "processing",
-        "progress": {"completed": 29, "total": 58, "unit": "file"},
-        "counts": {"changed": 11, "memories_created": 101},
-    })
+    progress.update(
+        {
+            "schema_version": 1,
+            "phase": "processing",
+            "progress": {"completed": 29, "total": 58, "unit": "file"},
+            "counts": {"changed": 11, "memories_created": 101},
+        }
+    )
 
-    assert progress.update({
-        "schema_version": 1,
-        "phase": "reconciling",
-    })["counts"] == {"changed": 11, "memories_created": 101}
+    assert progress.update(
+        {
+            "schema_version": 1,
+            "phase": "reconciling",
+        }
+    )["counts"] == {"changed": 11, "memories_created": 101}
 
 
 @pytest.mark.asyncio
@@ -4238,6 +5929,687 @@ async def test_document_is_indexed_before_enrichment(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_projection_repair_targets_only_requested_documents_without_semantic_work_or_cursor_advance(
+    db: Database,
+):
+    source_id = "src-jira-projection-repair"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Repair",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    prior_sync_at = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_sync_state(
+        SyncState(
+            source=source_id,
+            last_sync_at=prior_sync_at,
+            last_sync_status="success",
+            docs_processed=0,
+            docs_updated=0,
+        )
+    )
+
+    class SemanticWorkMustNotRun:
+        async def enrich_document(self, **kwargs):
+            raise AssertionError("projection repair must not enrich")
+
+        async def extract_memories(self, **kwargs):
+            raise AssertionError("projection repair must not extract")
+
+        async def process_enrichment(self, **kwargs):
+            raise AssertionError("projection repair must not process enrichment")
+
+        async def apply_projected_lifecycle(self, **kwargs):
+            raise AssertionError("projection repair must not apply lifecycle")
+
+    release = asyncio.Event()
+    release.set()
+    semantic_guard = SemanticWorkMustNotRun()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=semantic_guard,
+        memory_extractor=semantic_guard,
+        memory_engine=semantic_guard,
+        memory_store=None,
+        vector_store=FailingVectorStore(),
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=BlockingFetchGene(item_count=2, release=release),
+        source_name="Jira Repair",
+        source_id=source_id,
+        force_full_sync=True,
+        reprocess_doc_ids=frozenset({"jira-1"}),
+        execution_mode=SourceSyncMode.PROJECTION_REPAIR,
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_processed == 1
+    assert await db.get_document("jira-0") is None
+    assert await db.get_document("jira-1") is not None
+    projection_rows = await db.db.execute_fetchall(
+        "SELECT id FROM source_units WHERE source_id = ?",
+        (source_id,),
+    )
+    assert len(projection_rows) == 1
+    persisted_state = await db.get_sync_state(source_id)
+    assert persisted_state is not None
+    assert persisted_state.last_sync_at == prior_sync_at
+    history_rows = await db.db.execute_fetchall(
+        "SELECT id FROM sync_history WHERE source = ?",
+        (source_id,),
+    )
+    assert history_rows == []
+
+
+@pytest.mark.asyncio
+async def test_rebaseline_preflight_reads_full_provider_corpus_without_persisting(
+    db: Database,
+):
+    source_id = "src-jira-rebaseline-preflight"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Preflight",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+
+    class SemanticWorkMustNotRun:
+        async def enrich_document(self, **kwargs):
+            raise AssertionError("rebaseline preflight must not enrich")
+
+        async def extract_memories(self, **kwargs):
+            raise AssertionError("rebaseline preflight must not extract")
+
+        async def process_enrichment(self, **kwargs):
+            raise AssertionError("rebaseline preflight must not process enrichment")
+
+        async def apply_projected_lifecycle(self, **kwargs):
+            raise AssertionError("rebaseline preflight must not apply lifecycle")
+
+    release = asyncio.Event()
+    release.set()
+    semantic_guard = SemanticWorkMustNotRun()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=semantic_guard,
+        memory_extractor=semantic_guard,
+        memory_engine=semantic_guard,
+        memory_store=None,
+        vector_store=FailingVectorStore(),
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=BlockingFetchGene(item_count=2, release=release),
+        source_name="Jira Preflight",
+        source_id=source_id,
+        execution_mode=SourceSyncMode.REBASELINE_PREFLIGHT,
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_processed == 2
+    assert await db.count_documents(source=source_id) == 0
+    assert await db.get_sync_state(source_id) is None
+    assert (
+        await db.db.execute_fetchall(
+            "SELECT id FROM source_units WHERE source_id = ?",
+            (source_id,),
+        )
+        == []
+    )
+    assert (
+        await db.db.execute_fetchall(
+            "SELECT id FROM sync_history WHERE source = ?",
+            (source_id,),
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("discovery_complete", "expected_status"),
+    [(True, "success"), (False, "failed")],
+)
+async def test_rebaseline_preflight_accepts_missing_units_only_with_complete_discovery(
+    db: Database,
+    discovery_complete: bool,
+    expected_status: str,
+) -> None:
+    source_id = f"src-rebaseline-absence-{discovery_complete}"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Rebaseline Absence",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+    )
+    assert (
+        await orchestrator.sync_gene(
+            gene=BlockingFetchGene(item_count=2, release=release),
+            source_name="Jira Rebaseline Absence",
+            source_id=source_id,
+        )
+    ).last_sync_status == "success"
+    current_units = await db.list_current_source_unit_observation_ids(source_id)
+    assert len(current_units) == 2
+
+    class ReplayGene(BlockingFetchGene):
+        pass
+
+    ReplayGene.discovery_complete = discovery_complete
+    state = await orchestrator.sync_gene(
+        gene=ReplayGene(item_count=1, release=release),
+        source_name="Jira Rebaseline Absence",
+        source_id=source_id,
+        execution_mode=SourceSyncMode.REBASELINE_PREFLIGHT,
+    )
+
+    assert state.last_sync_status == expected_status
+    if not discovery_complete:
+        assert "rebaseline replay closure is incomplete" in (state.error_message or "")
+    assert await db.list_current_source_unit_observation_ids(source_id) == current_units
+
+
+@pytest.mark.asyncio
+async def test_rebaseline_preflight_fails_closed_on_empty_normalized_content(
+    db: Database,
+) -> None:
+    source_id = "src-empty-rebaseline-preflight"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Empty Preflight",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=EmptyNormalizedBlockingFetchGene(item_count=1, release=release),
+        source_name="Jira Empty Preflight",
+        source_id=source_id,
+        execution_mode=SourceSyncMode.REBASELINE_PREFLIGHT,
+    )
+
+    assert state.last_sync_status == "failed"
+    assert state.docs_failed == 1
+    assert await db.count_documents(source=source_id) == 0
+    assert (
+        await db.db.execute_fetchall(
+            "SELECT id FROM source_units WHERE source_id = ?",
+            (source_id,),
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_rebaseline_preflight_rejects_truncated_jira_projection(
+    db: Database,
+) -> None:
+    source_id = "src-jira-truncated-rebaseline-preflight"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Truncated Preflight",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+
+    class JiraPayloadGene(BlockingFetchGene):
+        def __init__(self, payload: dict[str, object]) -> None:
+            super().__init__(item_count=1, release=release)
+            self.payload = payload
+
+        async def fetch(self, item):
+            return RawContent(
+                item=item,
+                body=json.dumps(self.payload).encode("utf-8"),
+                content_type="application/json",
+            )
+
+        async def normalize(self, raw):
+            return NormalizedContent(
+                item=raw.item,
+                markdown_body="# PAY-0\n\nIssue and comment context.",
+            )
+
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+    )
+    full_payload = {
+        "id": "100000",
+        "key": "PAY-0",
+        "fields": {
+            "summary": "Payroll",
+            "description": None,
+            "status": None,
+            "priority": None,
+            "assignee": None,
+            "labels": [],
+            "resolution": None,
+            "updated": "2026-07-14T10:00:00Z",
+        },
+        "_comments": [{"id": "501", "body": "Keep A7"}],
+        "_comments_included": True,
+        "_comments_total": 1,
+        "changelog": {"startAt": 0, "histories": [], "total": 0},
+    }
+    assert (
+        await orchestrator.sync_gene(
+            gene=JiraPayloadGene(full_payload),
+            source_name="Jira Truncated Preflight",
+            source_id=source_id,
+        )
+    ).last_sync_status == "success"
+    current_units = await db.list_current_source_unit_observation_ids(source_id)
+    assert len(next(iter(current_units.values()))) == 2
+
+    partial_payload = {
+        "id": "100000",
+        "key": "PAY-0",
+        "fields": {
+            "summary": "Payroll",
+            "description": None,
+            "status": None,
+            "priority": None,
+            "assignee": None,
+            "labels": [],
+            "resolution": None,
+            "updated": "2026-07-14T10:00:00Z",
+        },
+        "_comments": [],
+        "_comments_included": True,
+        "_comments_total": 1,
+        "_comments_truncated": {"returned": 0, "total": 1},
+        "changelog": {"startAt": 0, "histories": [], "total": 0},
+    }
+    state = await orchestrator.sync_gene(
+        gene=JiraPayloadGene(partial_payload),
+        source_name="Jira Truncated Preflight",
+        source_id=source_id,
+        execution_mode=SourceSyncMode.REBASELINE_PREFLIGHT,
+    )
+
+    assert state.last_sync_status == "failed"
+    assert state.docs_failed == 1
+    assert "coverage=partial_projection" in state.failed_docs[0].error
+    assert await db.list_current_source_unit_observation_ids(source_id) == current_units
+
+    complete_removal_payload = {
+        **full_payload,
+        "_comments": [],
+        "_comments_total": 0,
+    }
+    complete_state = await orchestrator.sync_gene(
+        gene=JiraPayloadGene(complete_removal_payload),
+        source_name="Jira Truncated Preflight",
+        source_id=source_id,
+        execution_mode=SourceSyncMode.REBASELINE_PREFLIGHT,
+    )
+
+    assert complete_state.last_sync_status == "success"
+    assert await db.list_current_source_unit_observation_ids(source_id) == current_units
+
+
+@pytest.mark.asyncio
+async def test_rebaseline_preflight_accepts_provider_attested_empty_page(
+    db: Database,
+) -> None:
+    source_id = "src-attested-empty-rebaseline-preflight"
+    await db.upsert_source(
+        id=source_id,
+        type="github_pages",
+        name="Attested Empty Preflight",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=EmptyGitHubPagesBlockingFetchGene(item_count=1, release=release),
+        source_name="Attested Empty Preflight",
+        source_id=source_id,
+        execution_mode=SourceSyncMode.REBASELINE_PREFLIGHT,
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_failed == 0
+    assert await db.list_current_source_unit_observation_ids(source_id) == {}
+
+
+@pytest.mark.asyncio
+async def test_normal_sync_reconciles_empty_revision_without_llm_extraction(
+    db: Database,
+) -> None:
+    source_id = "src-empty-normal-sync"
+    await db.upsert_source(
+        id=source_id,
+        type="github_pages",
+        name="GitHub Pages Empty Normal",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    first_engine = RecordingMemoryEngine()
+    first = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=first_engine,
+        memory_store=None,
+    )
+    assert (
+        await first.sync_gene(
+            gene=GitHubPagesBlockingFetchGene(item_count=1, release=release),
+            source_name="GitHub Pages Empty Normal",
+            source_id=source_id,
+        )
+    ).last_sync_status == "success"
+
+    class SemanticWorkMustNotRun:
+        async def enrich_document(self, **kwargs):
+            raise AssertionError("empty revision must not enrich")
+
+        async def extract_memories(self, **kwargs):
+            raise AssertionError("empty revision must not extract")
+
+    empty_engine = RecordingMemoryEngine()
+    second = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=SemanticWorkMustNotRun(),
+        memory_extractor=SemanticWorkMustNotRun(),
+        memory_engine=empty_engine,
+        memory_store=None,
+    )
+    state = await second.sync_gene(
+        gene=EmptyGitHubPagesBlockingFetchGene(item_count=1, release=release),
+        source_name="GitHub Pages Empty Normal",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "success"
+    assert len(empty_engine.projected_lifecycle_calls) == 1
+    assert empty_engine.projected_lifecycle_calls[0]["raw_memories"] == []
+    assert empty_engine.projected_lifecycle_calls[0]["document_content"] == ""
+    current = await db.get_document("jira-0")
+    assert current is not None
+    assert current.content_hash == content_hash("")
+
+
+@pytest.mark.asyncio
+async def test_projection_repair_fails_when_requested_document_is_not_discovered(db: Database):
+    source_id = "src-jira-projection-missing"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Missing",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=BlockingFetchGene(item_count=1, release=release),
+        source_name="Jira Missing",
+        source_id=source_id,
+        force_full_sync=True,
+        reprocess_doc_ids=frozenset({"jira-absent"}),
+        execution_mode=SourceSyncMode.PROJECTION_REPAIR,
+    )
+
+    assert state.last_sync_status == "failed"
+    assert state.docs_processed == 0
+    assert state.docs_failed == 1
+    assert state.failed_docs[0].doc_id == "jira-absent"
+    assert "not returned by provider discovery" in state.failed_docs[0].error
+    assert await db.get_sync_state(source_id) is None
+
+
+@pytest.mark.asyncio
+async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: Database):
+    source_id = "src-github-move"
+    await db.upsert_source(
+        id=source_id,
+        type="github_repo",
+        name="Payroll Repo",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    extractor = RecordingMemoryExtractor()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=extractor,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    first = await orchestrator.sync_gene(
+        gene=MovingGithubFileGene(
+            item_id="github-old-design",
+            relative_path="old/design.md",
+            file_lineage_id=None,
+        ),
+        source_name="Payroll Repo",
+        source_id=source_id,
+    )
+    extraction_calls_after_first = len(extractor.full_calls) + len(extractor.change_calls) + len(extractor.unit_calls)
+    moved = await orchestrator.sync_gene(
+        gene=MovingGithubFileGene(
+            item_id="github-new-design",
+            relative_path="new/design.md",
+            previous_filename="old/design.md",
+            previous_document_id="github-old-design",
+            file_lineage_id=None,
+        ),
+        source_name="Payroll Repo",
+        source_id=source_id,
+    )
+    ordinary_after_move = await orchestrator.sync_gene(
+        gene=MovingGithubFileGene(
+            item_id="github-new-design",
+            relative_path="new/design.md",
+            file_lineage_id=None,
+        ),
+        source_name="Payroll Repo",
+        source_id=source_id,
+    )
+    moved_again = await orchestrator.sync_gene(
+        gene=MovingGithubFileGene(
+            item_id="github-final-design",
+            relative_path="final/design.md",
+            previous_filename="new/design.md",
+            previous_document_id="github-new-design",
+            file_lineage_id=None,
+        ),
+        source_name="Payroll Repo",
+        source_id=source_id,
+    )
+
+    assert first.last_sync_status == "success"
+    assert moved.last_sync_status == "success"
+    assert ordinary_after_move.last_sync_status == "success"
+    assert moved_again.last_sync_status == "success"
+    assert extraction_calls_after_first > 0
+    assert (
+        len(extractor.full_calls) + len(extractor.change_calls) + len(extractor.unit_calls)
+    ) == extraction_calls_after_first
+    assert await db.get_document("github-old-design") is None
+    assert await db.get_document("github-new-design") is None
+    assert await db.get_document("github-final-design") is not None
+    assert await db.get_metadata("github-final-design") is not None
+    unit_rows = await db.db.execute_fetchall(
+        "SELECT id FROM source_units WHERE source_id = ?",
+        (source_id,),
+    )
+    assert len(unit_rows) == 1
+    assert await db.list_source_unit_document_ids(str(unit_rows[0]["id"])) == (
+        "github-final-design",
+        "github-new-design",
+        "github-old-design",
+    )
+    moved_unit_id = str(unit_rows[0]["id"])
+
+    reused_old_path = await orchestrator.sync_gene(
+        gene=MovingGithubFileGene(
+            item_id="github-old-design",
+            relative_path="old/design.md",
+            file_lineage_id=None,
+        ),
+        source_name="Payroll Repo",
+        source_id=source_id,
+    )
+
+    assert reused_old_path.last_sync_status == "success"
+    current_reused = await db.find_source_unit_by_document_id(
+        source_id,
+        "github-old-design",
+        current_only=True,
+    )
+    assert current_reused is not None
+    assert current_reused.id != moved_unit_id
+    unit_rows = await db.db.execute_fetchall(
+        "SELECT id FROM source_units WHERE source_id = ?",
+        (source_id,),
+    )
+    assert len(unit_rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_exact_version_github_file_move_a_to_b_to_a_keeps_one_lineage(db: Database):
+    source_id = "src-github-move-reversion"
+    await db.upsert_source(
+        id=source_id,
+        type="github_repo",
+        name="Payroll Repo",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    extractor = RecordingMemoryExtractor()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=extractor,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    for gene in (
+        MovingGithubFileGene(
+            item_id="github-a",
+            relative_path="a/design.md",
+            file_lineage_id=None,
+            version="same-blob-sha",
+        ),
+        MovingGithubFileGene(
+            item_id="github-b",
+            relative_path="b/design.md",
+            previous_filename="a/design.md",
+            previous_document_id="github-a",
+            file_lineage_id=None,
+            version="same-blob-sha",
+        ),
+        MovingGithubFileGene(
+            item_id="github-a",
+            relative_path="a/design.md",
+            previous_filename="b/design.md",
+            previous_document_id="github-b",
+            file_lineage_id=None,
+            version="same-blob-sha",
+        ),
+    ):
+        state = await orchestrator.sync_gene(
+            gene=gene,
+            source_name="Payroll Repo",
+            source_id=source_id,
+        )
+        assert state.last_sync_status == "success"
+
+    assert await db.get_document("github-a") is not None
+    assert await db.get_document("github-b") is None
+    unit_rows = await db.db.execute_fetchall(
+        "SELECT id FROM source_units WHERE source_id = ?",
+        (source_id,),
+    )
+    assert len(unit_rows) == 1
+    assert await db.list_source_unit_document_ids(str(unit_rows[0]["id"])) == (
+        "github-a",
+        "github-b",
+    )
+    assert len(extractor.full_calls) + len(extractor.change_calls) + len(extractor.unit_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_full_document_extraction_failure_is_audited(db: Database):
     source_id = "src-full-extraction-failure"
     await db.upsert_source(
@@ -4335,11 +6707,11 @@ async def test_document_update_uses_diff_guided_extraction_and_audits_strategy(
     assert "PostgreSQL 14" in extractor.change_calls[0]["changed_hunks"]
     assert "PostgreSQL 15" in extractor.change_calls[0]["changed_hunks"]
     assert extractor.change_calls[0]["updated_document"] == new_markdown
-    assert len(memory_engine.reconcile_calls) == 1
-    assert memory_engine.reconcile_calls[0]["update_mode"] == "diff_guided"
-    assert "PostgreSQL 15" in memory_engine.reconcile_calls[0]["changed_hunks"]
-    assert memory_engine.reconcile_calls[0]["update_plan_stats"]["reason"] == "small_diff"
-    assert memory_engine.reconcile_calls[0]["update_plan_stats"]["data_shape"] == "document"
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    assert memory_engine.projected_lifecycle_calls[0]["update_mode"] == "diff_guided"
+    assert "PostgreSQL 15" in memory_engine.projected_lifecycle_calls[0]["changed_hunks"]
+    assert memory_engine.projected_lifecycle_calls[0]["update_plan_stats"]["reason"] == "small_diff"
+    assert memory_engine.projected_lifecycle_calls[0]["update_plan_stats"]["data_shape"] == "document"
     assert len(audit_rows) == 1
     assert audit_rows[0].doc_id == "doc-1"
     assert audit_rows[0].source_id == source_id
@@ -4412,10 +6784,10 @@ async def test_structured_source_update_uses_diff_guided_extraction_and_audits_s
     assert "Status: In Progress" in extractor.change_calls[0]["changed_hunks"]
     assert "Status: Done" in extractor.change_calls[0]["changed_hunks"]
     assert extractor.change_calls[0]["source_type"] == "jira"
-    assert len(memory_engine.reconcile_calls) == 1
-    assert memory_engine.reconcile_calls[0]["update_mode"] == "diff_guided"
-    assert memory_engine.reconcile_calls[0]["update_plan_stats"]["reason"] == "small_diff"
-    assert memory_engine.reconcile_calls[0]["update_plan_stats"]["data_shape"] == "ticket"
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    assert memory_engine.projected_lifecycle_calls[0]["update_mode"] == "diff_guided"
+    assert memory_engine.projected_lifecycle_calls[0]["update_plan_stats"]["reason"] == "small_diff"
+    assert memory_engine.projected_lifecycle_calls[0]["update_plan_stats"]["data_shape"] == "ticket"
     assert len(audit_rows) == 1
     assert audit_rows[0].decision == "diff_guided"
     assert audit_rows[0].reason == "small_diff"
@@ -4614,11 +6986,90 @@ async def test_partial_unit_extraction_failure_skips_reconciliation(db: Database
     assert state.docs_failed == 1
     assert state.failed_docs
     assert "partial_unit_failure" in state.failed_docs[0].error
-    assert len(memory_engine.reconcile_calls) == 0
+    assert len(memory_engine.projected_lifecycle_calls) == 0
     assert len(audit_rows) == 3
     assert audit_rows[0].reason == "partial_unit_failure"
     assert audit_rows[0].payload["failed_unit_count"] == 1
     assert audit_rows[0].payload["extracted_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(db: Database):
+    source_id = "src-lifecycle-retry"
+    old_markdown = "# Design Doc\n\nThe service uses PostgreSQL 14."
+    new_markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Documents",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    doc_store = StubDocumentStore()
+
+    first = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        enricher=DocumentVisibleEnricher(db, source_id),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+    )
+    first_state = await first.sync_gene(
+        gene=UpdatingDocumentGene(old_markdown, version="1"),
+        source_name="Documents",
+        source_id=source_id,
+    )
+    source_unit = await db.find_source_unit_by_document_id(source_id, "doc-1")
+    assert first_state.last_sync_status == "success"
+    assert source_unit is not None
+    prior_revision = await db.get_current_source_unit_revision(source_unit.id)
+    prior_document = await db.get_document("doc-1")
+    assert prior_revision is not None and prior_document is not None
+
+    failing_engine = FailingProjectedMemoryEngine()
+    failed = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        enricher=DocumentVisibleEnricher(db, source_id),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=failing_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+    failed_state = await failed.sync_gene(
+        gene=UpdatingDocumentGene(new_markdown, version="2"),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    assert failed_state.last_sync_status == "failed"
+    assert failing_engine.calls == 3
+    assert (await db.get_current_source_unit_revision(source_unit.id)).id == prior_revision.id  # type: ignore[union-attr]
+    assert (await db.get_document("doc-1")).content_hash == prior_document.content_hash  # type: ignore[union-attr]
+
+    retry_engine = RecordingMemoryEngine()
+    retry = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        enricher=DocumentVisibleEnricher(db, source_id),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=retry_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+    retry_state = await retry.sync_gene(
+        gene=UpdatingDocumentGene(new_markdown, version="2"),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    assert retry_state.last_sync_status == "success"
+    assert len(retry_engine.projected_lifecycle_calls) == 1
+    current_revision = await db.get_current_source_unit_revision(source_unit.id)
+    assert current_revision is not None and current_revision.id != prior_revision.id
 
 
 @pytest.mark.asyncio

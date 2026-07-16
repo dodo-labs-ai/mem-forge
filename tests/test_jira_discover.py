@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timezone
+import pytest
 
 from memforge.genes.jira_gene import _issue_content_item
 
@@ -10,6 +10,7 @@ from memforge.genes.jira_gene import _issue_content_item
 def test_handles_null_optional_fields():
     # A real Jira issue can carry explicit nulls (no priority/assignee/etc set).
     issue = {
+        "id": "10001",
         "key": "PROJ-1",
         "fields": {
             "summary": "Handle orphan data",
@@ -35,6 +36,7 @@ def test_handles_null_optional_fields():
 
 def test_maps_populated_fields():
     issue = {
+        "id": "10002",
         "key": "PROJ-2",
         "fields": {
             "summary": "Migration job",
@@ -57,8 +59,9 @@ def test_maps_populated_fields():
     assert item.extra["issue_type"] == "Story"
 
 
-def test_treats_offsetless_updated_timestamp_as_utc():
+def test_rejects_offsetless_updated_timestamp():
     issue = {
+        "id": "10003",
         "key": "PROJ-3",
         "fields": {
             "summary": "Offsetless timestamp",
@@ -66,7 +69,5 @@ def test_treats_offsetless_updated_timestamp_as_utc():
         },
     }
 
-    item = _issue_content_item(issue, "https://jira.example")
-
-    assert item.last_modified.tzinfo is timezone.utc
-    assert item.last_modified.isoformat() == "2026-06-01T12:00:00+00:00"
+    with pytest.raises(RuntimeError, match="timestamp has no timezone"):
+        _issue_content_item(issue, "https://jira.example")
