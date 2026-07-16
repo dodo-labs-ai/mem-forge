@@ -5348,10 +5348,15 @@ class Database:
             if cursor.rowcount != 1:
                 await self.db.rollback()
                 raise ValueError("lifecycle backfill job is not running")
-            await self.db.execute(
+            lease_cursor = await self.db.execute(
                 "DELETE FROM source_activity_leases WHERE id = ? AND capability = ?",
                 (job_id, job_id),
             )
+            if lease_cursor.rowcount != 1:
+                await self.db.rollback()
+                raise SourceActivityConflict(
+                    f"source lifecycle activity lease is not current: {job_id}"
+                )
             await self.db.commit()
         stored = await self.get_lifecycle_backfill_job(job_id)
         assert stored is not None
@@ -5374,10 +5379,15 @@ class Database:
             if cursor.rowcount != 1:
                 await self.db.rollback()
                 raise ValueError("lifecycle backfill job cannot fail from its current state")
-            await self.db.execute(
+            lease_cursor = await self.db.execute(
                 "DELETE FROM source_activity_leases WHERE id = ? AND capability = ?",
                 (job_id, job_id),
             )
+            if lease_cursor.rowcount != 1:
+                await self.db.rollback()
+                raise SourceActivityConflict(
+                    f"source lifecycle activity lease is not current: {job_id}"
+                )
             await self.db.commit()
         stored = await self.get_lifecycle_backfill_job(job_id)
         assert stored is not None

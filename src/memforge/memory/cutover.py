@@ -58,6 +58,15 @@ class AgentSessionLifecycleMigrationCandidate:
     missing_support_count: int
 
 
+async def _drain_task_despite_cancellation(task: asyncio.Future[Any]) -> Any:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
 async def run_with_lifecycle_activity_heartbeat(
     db: Any,
     job_id: str,
@@ -100,7 +109,12 @@ async def run_with_lifecycle_activity_heartbeat(
         for task in (work_task, heartbeat_task):
             if not task.done():
                 task.cancel()
-        await asyncio.gather(work_task, heartbeat_task, return_exceptions=True)
+        cleanup = asyncio.gather(
+            work_task,
+            heartbeat_task,
+            return_exceptions=True,
+        )
+        await _drain_task_despite_cancellation(cleanup)
 
 
 async def list_agent_session_lifecycle_migration_candidates(
@@ -161,11 +175,7 @@ async def _fail_cancelled_lifecycle_job(
     cleanup = asyncio.create_task(
         db.fail_lifecycle_backfill_job(job_id, error=f"{operation} cancelled")
     )
-    try:
-        await asyncio.shield(cleanup)
-    except asyncio.CancelledError:
-        await cleanup
-        raise
+    await _drain_task_despite_cancellation(cleanup)
 
 
 async def run_source_lifecycle_backfill_job(
