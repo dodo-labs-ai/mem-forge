@@ -443,11 +443,11 @@ async def test_repeated_wrapper_cancellation_waits_for_durable_job_cleanup(
     await scan_started.wait()
     task.cancel()
     await cleanup_started.wait()
-    task.cancel()
-    await asyncio.sleep(0)
-
     try:
-        assert not task.done()
+        for _ in range(5):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
     finally:
         allow_cleanup.set()
 
@@ -1599,6 +1599,45 @@ async def test_failed_backfill_job_retry_does_not_reacquire_activity(db: Databas
         ("src-1",),
     ) as cursor:
         assert int((await cursor.fetchone())["count"]) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_operation", ["complete", "fail"])
+async def test_sqlite_lifecycle_terminal_transition_requires_current_activity_lease(
+    db: Database,
+    terminal_operation: str,
+) -> None:
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id=f"sqlite-terminal-with-lost-lease-{terminal_operation}",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    await db.db.execute(
+        "DELETE FROM source_activity_leases WHERE id = ?",
+        (job.id,),
+    )
+    await db.db.commit()
+
+    with pytest.raises(SourceActivityConflict, match="lease is not current"):
+        if terminal_operation == "complete":
+            await db.complete_lifecycle_backfill_job(
+                job.id,
+                scanned_memories=3,
+                mapped_memories=2,
+                finding_count=1,
+            )
+        else:
+            await db.fail_lifecycle_backfill_job(
+                job.id,
+                error="operator blocker",
+            )
+
+    stored = await db.get_lifecycle_backfill_job(job.id)
+    assert stored is not None
+    assert stored.status is LifecycleBackfillJobStatus.RUNNING
 
 
 @pytest.mark.asyncio
