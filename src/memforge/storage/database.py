@@ -87,6 +87,7 @@ from memforge.memory.evidence import (
     validate_evidence_references,
 )
 from memforge.memory.lifecycle_plan import (
+    build_unprovable_cutover_resolution,
     CutoverFindingReason,
     CutoverFindingStatus,
     LifecycleCutoverFinding,
@@ -103,6 +104,8 @@ from memforge.memory.lifecycle_plan import (
     LifecycleVectorTask,
     LifecycleVectorTaskStatus,
     lifecycle_plan_to_payload,
+    unprovable_cutover_retirement_plan_id,
+    validate_unprovable_cutover_evidence,
 )
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
@@ -138,6 +141,17 @@ from memforge.storage.admin_source import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _drain_task_despite_cancellation(task: asyncio.Future[Any]) -> Any:
+    """Wait for transaction cleanup even if the caller is cancelled repeatedly."""
+
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
 
 
 def _agent_session_source_id_for_owner(client: str, owner_user_id: str) -> str:
@@ -5570,6 +5584,176 @@ class Database:
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
+                raise
+        resolved = await self.get_lifecycle_cutover_finding(finding_id)
+        assert resolved is not None
+        return resolved
+
+    async def retire_unprovable_lifecycle_cutover_finding(
+        self,
+        finding_id: str,
+        *,
+        source_id: str,
+        reconstruction_attempt_id: str,
+        operator_id: str,
+        unavailable_documents: Mapping[str, str],
+    ) -> LifecycleCutoverFinding:
+        """Retire one unprovable Agent Session Memory and preserve its finding history."""
+
+        resolution = build_unprovable_cutover_resolution(
+            reconstruction_attempt_id=reconstruction_attempt_id,
+            operator_id=operator_id,
+            unavailable_documents=unavailable_documents,
+        )
+        normalized_unavailable = resolution["unavailable_documents"]
+        assert isinstance(normalized_unavailable, dict)
+
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    "SELECT * FROM lifecycle_cutover_findings WHERE id = ?",
+                    (finding_id,),
+                ) as cursor:
+                    finding = await cursor.fetchone()
+                if finding is None:
+                    raise LookupError(f"unknown lifecycle cutover finding: {finding_id}")
+                if str(finding["source_id"]) != source_id:
+                    raise ValueError("cutover finding source identity mismatch")
+                existing_attempt = json.loads(finding["mapping_attempt_json"] or "{}")
+                if str(finding["status"]) == CutoverFindingStatus.RESOLVED.value:
+                    if existing_attempt.get("resolution") != resolution:
+                        raise ValueError("idempotent retirement evidence mismatch")
+                    await self.db.rollback()
+                    return self._row_to_lifecycle_cutover_finding(finding)
+                if str(finding["reason"]) != CutoverFindingReason.MISSING_SOURCE_PROVENANCE.value:
+                    raise ValueError("only missing_source_provenance findings may be retired as unprovable")
+
+                cursor = await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (source_id,),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError(f"Source not found: {source_id}")
+                cursor = await self.db.execute(
+                    "UPDATE memories SET status = status WHERE id = ?",
+                    (finding["memory_id"],),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("unprovable retirement Memory is unavailable")
+                async with self.db.execute(
+                    "SELECT * FROM lifecycle_cutover_findings WHERE id = ?",
+                    (finding_id,),
+                ) as cursor:
+                    locked_finding = await cursor.fetchone()
+                if (
+                    locked_finding is None
+                    or str(locked_finding["status"]) != CutoverFindingStatus.OPEN.value
+                    or str(locked_finding["source_id"]) != source_id
+                    or str(locked_finding["memory_id"]) != str(finding["memory_id"])
+                ):
+                    raise ValueError("unprovable retirement finding stale guard failed")
+                finding = locked_finding
+                existing_attempt = json.loads(finding["mapping_attempt_json"] or "{}")
+
+                async with self.db.execute(
+                    "SELECT type, status, access_state FROM sources WHERE id = ?",
+                    (source_id,),
+                ) as cursor:
+                    source = await cursor.fetchone()
+                if (
+                    source is None
+                    or str(source["type"]) != "agent_session"
+                    or str(source["status"]) != "active"
+                    or str(source["access_state"] or "active") != "active"
+                ):
+                    raise ValueError("unprovable retirement requires an active Agent Session source")
+
+                async with self.db.execute(
+                    "SELECT status FROM memories WHERE id = ?",
+                    (finding["memory_id"],),
+                ) as cursor:
+                    memory = await cursor.fetchone()
+                if memory is None or str(memory["status"]) != "active":
+                    raise ValueError("unprovable retirement requires an active Memory")
+
+                async with self.db.execute(
+                    "SELECT doc_id, source_id, source_type FROM memory_sources WHERE memory_id = ?",
+                    (finding["memory_id"],),
+                ) as cursor:
+                    source_rows = [dict(row) async for row in cursor]
+                available = json.loads(finding["available_provenance_json"] or "{}")
+                validate_unprovable_cutover_evidence(
+                    available_provenance=available,
+                    mapping_attempt=existing_attempt,
+                    source_rows=source_rows,
+                    source_id=source_id,
+                    unavailable_documents=normalized_unavailable,
+                )
+
+                async with self.db.execute(
+                    "SELECT 1 FROM memory_support_assertions WHERE memory_id = ? AND active = 1 LIMIT 1",
+                    (finding["memory_id"],),
+                ) as cursor:
+                    if await cursor.fetchone() is not None:
+                        raise ValueError("unprovable retirement rejected while active support remains")
+
+                now = _now_iso()
+                existing_attempt["resolution"] = resolution
+                plan_id = unprovable_cutover_retirement_plan_id(finding_id)
+                payload = {
+                    "operation": "retire_unprovable_lifecycle_cutover_finding",
+                    "finding_id": finding_id,
+                    "source_id": source_id,
+                    "memory_id": str(finding["memory_id"]),
+                    "resolution": resolution,
+                }
+                payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
+                await self.db.execute(
+                    """INSERT INTO lifecycle_plans (
+                           id, reconciliation_scope_id, source_id, source_unit_id,
+                           target_unit_revision_id, status, payload_json, payload_hash,
+                           created_at, applied_at, error
+                       ) VALUES (?, 'cutover_unprovable_retirement', ?, ?, NULL, 'staged', ?, ?, ?, NULL, NULL)""",
+                    (plan_id, source_id, f"cutover-finding:{finding_id}", payload_json, payload_hash, now),
+                )
+                cursor = await self.db.execute(
+                    """UPDATE memories SET status = 'retired',
+                           retirement_reason = 'unprovable_source_lineage',
+                           retired_at = ?, valid_until = ?, updated_at = ?
+                       WHERE id = ? AND status = 'active'""",
+                    (now, _today_iso(), now, finding["memory_id"]),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("unprovable retirement Memory stale guard failed")
+                await self._rebuild_memory_fts_unlocked(
+                    str(finding["memory_id"]),
+                    search_visible_statuses=set(allowed_search_statuses()),
+                )
+                cursor = await self.db.execute(
+                    """UPDATE lifecycle_cutover_findings
+                       SET status = 'resolved', mapping_attempt_json = ?,
+                           observation_id = NULL, source_unit_id = NULL,
+                           updated_at = ?, resolved_at = ?
+                       WHERE id = ? AND status = 'open'""",
+                    (json.dumps(existing_attempt, sort_keys=True), now, now, finding_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("unprovable retirement finding stale guard failed")
+                await self._enqueue_lifecycle_vector_task_unlocked(
+                    plan_id,
+                    str(finding["memory_id"]),
+                    LifecycleVectorOperation.DELETE,
+                    now=now,
+                )
+                await self.db.execute(
+                    "UPDATE lifecycle_plans SET status = 'applied', applied_at = ? WHERE id = ?",
+                    (now, plan_id),
+                )
+                await self.db.commit()
+            except BaseException:
+                rollback_task = asyncio.create_task(self.db.rollback())
+                await _drain_task_despite_cancellation(rollback_task)
                 raise
         resolved = await self.get_lifecycle_cutover_finding(finding_id)
         assert resolved is not None

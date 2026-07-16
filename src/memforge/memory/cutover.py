@@ -7,8 +7,9 @@ import hashlib
 import json
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass, replace
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -27,8 +28,15 @@ from memforge.memory.lifecycle_plan import (
     LifecycleBackfillJob,
     LifecycleBackfillJobStatus,
     LifecycleGateState,
+    HistoricalProjectionFailureReason,
 )
-from memforge.models import ContentItem, NormalizedContent, RawContent
+from memforge.models import (
+    ContentItem,
+    DocumentRecord,
+    NormalizedContent,
+    RawContent,
+    content_hash,
+)
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_activity import SourceActivityConflict
 from memforge.source_projection import (
@@ -56,6 +64,14 @@ class AgentSessionLifecycleMigrationCandidate:
     gate_state: LifecycleGateState
     active_memory_count: int
     missing_support_count: int
+
+
+class HistoricalProjectionUnavailable(ValueError):
+    """A durable historical projection input is deterministically absent."""
+
+    def __init__(self, reason: HistoricalProjectionFailureReason) -> None:
+        self.reason = reason
+        super().__init__(reason.value)
 
 
 async def _drain_task_despite_cancellation(task: asyncio.Future[Any]) -> Any:
@@ -297,21 +313,89 @@ async def reconstruct_historical_source_projection(
     """
 
     document = await db.get_document(document_id)
-    if document is None or document.source != source_id:
-        raise ValueError("historical document is unavailable in the requested source")
-    content_type = document.raw_content_type or "application/octet-stream"
-    if document.raw_content_uri and document.normalized_content_uri:
-        raw_body = document_store.read_artifact(document.raw_content_uri)
-        normalized_body = document_store.read_normalized(document.normalized_content_uri)
-        if normalized_body is None:
-            raise ValueError("historical normalized artifact is unreadable")
-    elif source_type == "agent_session":
+    concept: Mapping[str, Any] | None = None
+    if document is not None and document.source != source_id:
+        raise ValueError("historical document belongs to another configured source")
+    if document is None:
+        if source_type != "agent_session":
+            raise HistoricalProjectionUnavailable(
+                HistoricalProjectionFailureReason.DOCUMENT_MISSING
+            )
         concept = await db.get_agent_concept(document_id)
         if concept is None or str(concept.get("source_id") or "") != source_id:
-            raise ValueError("historical Agent Knowledge concept is unavailable in the requested source")
+            raise HistoricalProjectionUnavailable(
+                HistoricalProjectionFailureReason.DOCUMENT_MISSING
+            )
         normalized_body = str(concept.get("markdown_body") or "").strip()
         if not normalized_body:
-            raise ValueError("historical Agent Knowledge concept has no canonical content")
+            raise HistoricalProjectionUnavailable(
+                HistoricalProjectionFailureReason.CANONICAL_CONCEPT_EMPTY
+            )
+        observed_at = datetime.fromisoformat(str(concept.get("last_observed_at") or ""))
+        document = DocumentRecord(
+            doc_id=document_id,
+            source=source_id,
+            source_url=f"agent-knowledge://{concept['owner_user_id']}/{document_id}",
+            title=str(concept.get("title") or document_id),
+            space_or_project=str(concept.get("workspace") or "UNSORTED"),
+            author="agent_session",
+            last_modified=observed_at,
+            labels=[str(concept.get("concept_type") or "concept")],
+            version=content_hash(normalized_body),
+            content_hash=content_hash(normalized_body),
+            token_count=None,
+            raw_content_uri=None,
+            raw_content_type="application/json",
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=observed_at,
+            client="agent_session",
+        )
+        await db.upsert_document(document, require_configured_source=True)
+    content_type = document.raw_content_type or "application/octet-stream"
+    artifact_failure_reason: HistoricalProjectionFailureReason | None = None
+    artifact_failure_cause: FileNotFoundError | None = None
+    if document.raw_content_uri and document.normalized_content_uri:
+        try:
+            raw_body = document_store.read_artifact(document.raw_content_uri)
+        except FileNotFoundError as exc:
+            artifact_failure_reason = HistoricalProjectionFailureReason.RAW_ARTIFACT_MISSING
+            artifact_failure_cause = exc
+        if artifact_failure_reason is None:
+            try:
+                normalized_body = document_store.read_normalized(document.normalized_content_uri)
+            except FileNotFoundError as exc:
+                artifact_failure_reason = (
+                    HistoricalProjectionFailureReason.NORMALIZED_ARTIFACT_MISSING
+                )
+                artifact_failure_cause = exc
+            if artifact_failure_reason is None and normalized_body is None:
+                artifact_failure_reason = (
+                    HistoricalProjectionFailureReason.NORMALIZED_ARTIFACT_MISSING
+                )
+    if source_type == "agent_session" and (
+        not document.raw_content_uri
+        or not document.normalized_content_uri
+        or artifact_failure_reason is not None
+    ):
+        concept = concept or await db.get_agent_concept(document_id)
+        if concept is None or str(concept.get("source_id") or "") != source_id:
+            if artifact_failure_reason is not None:
+                raise HistoricalProjectionUnavailable(
+                    HistoricalProjectionFailureReason.EXACT_INPUTS_MISSING
+                ) from artifact_failure_cause
+            raise HistoricalProjectionUnavailable(
+                HistoricalProjectionFailureReason.CANONICAL_CONCEPT_MISSING
+            )
+        normalized_body = str(concept.get("markdown_body") or "").strip()
+        if not normalized_body:
+            if artifact_failure_reason is not None:
+                raise HistoricalProjectionUnavailable(
+                    HistoricalProjectionFailureReason.EXACT_INPUTS_MISSING
+                ) from artifact_failure_cause
+            raise HistoricalProjectionUnavailable(
+                HistoricalProjectionFailureReason.CANONICAL_CONCEPT_EMPTY
+            )
         content_type = "application/json"
         raw_body = json.dumps(
             {
@@ -325,8 +409,12 @@ async def reconstruct_historical_source_projection(
             },
             sort_keys=True,
         ).encode("utf-8")
-    else:
-        raise ValueError("historical document does not retain complete projection content")
+    elif artifact_failure_reason is not None:
+        raise HistoricalProjectionUnavailable(artifact_failure_reason) from artifact_failure_cause
+    elif not document.raw_content_uri or not document.normalized_content_uri:
+        raise HistoricalProjectionUnavailable(
+            HistoricalProjectionFailureReason.RAW_ARTIFACT_MISSING
+        )
 
     item = ContentItem(
         item_id=document.doc_id,

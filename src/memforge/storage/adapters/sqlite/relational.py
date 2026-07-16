@@ -588,6 +588,23 @@ class SqliteRelationalStore:
             source_unit_id=source_unit_id,
         )
 
+    async def retire_unprovable_lifecycle_cutover_finding(
+        self,
+        finding_id: str,
+        *,
+        source_id: str,
+        reconstruction_attempt_id: str,
+        operator_id: str,
+        unavailable_documents: Mapping[str, str],
+    ) -> LifecycleCutoverFinding:
+        return await self._db.retire_unprovable_lifecycle_cutover_finding(
+            finding_id,
+            source_id=source_id,
+            reconstruction_attempt_id=reconstruction_attempt_id,
+            operator_id=operator_id,
+            unavailable_documents=unavailable_documents,
+        )
+
     async def record_evidence_references(
         self,
         evidence_unit_id: str,

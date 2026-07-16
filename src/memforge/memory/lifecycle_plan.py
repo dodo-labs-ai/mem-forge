@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Mapping, Protocol, runtime_checkable
+from hashlib import sha256
+from typing import Mapping, Protocol, Sequence, runtime_checkable
 
 from memforge.memory.evidence import (
     EvidenceReference,
@@ -35,6 +36,134 @@ class CutoverFindingReason(str, Enum):
     OBSERVATION_NOT_FOUND = "observation_not_found"
     AMBIGUOUS_OBSERVATION = "ambiguous_observation"
     LINEAGE_VALIDATION_FAILED = "lineage_validation_failed"
+
+
+class HistoricalProjectionFailureReason(str, Enum):
+    """Deterministic absence reasons that may justify cutover retirement."""
+
+    DOCUMENT_MISSING = "document_missing"
+    RAW_ARTIFACT_MISSING = "raw_artifact_missing"
+    NORMALIZED_ARTIFACT_MISSING = "normalized_artifact_missing"
+    CANONICAL_CONCEPT_MISSING = "canonical_concept_missing"
+    CANONICAL_CONCEPT_EMPTY = "canonical_concept_empty"
+    EXACT_INPUTS_MISSING = "exact_inputs_missing"
+
+
+AGENT_SESSION_TERMINAL_PROJECTION_FAILURES = frozenset(
+    {
+        HistoricalProjectionFailureReason.DOCUMENT_MISSING,
+        HistoricalProjectionFailureReason.CANONICAL_CONCEPT_MISSING,
+        HistoricalProjectionFailureReason.CANONICAL_CONCEPT_EMPTY,
+        HistoricalProjectionFailureReason.EXACT_INPUTS_MISSING,
+    }
+)
+
+
+def build_unprovable_cutover_resolution(
+    *,
+    reconstruction_attempt_id: str,
+    operator_id: str,
+    unavailable_documents: Mapping[str, str],
+) -> dict[str, object]:
+    """Normalize the exact terminal evidence persisted by both adapters."""
+
+    if not reconstruction_attempt_id.strip() or not operator_id.strip():
+        raise ValueError("unprovable retirement requires operator and reconstruction attempt ids")
+    normalized: dict[str, str] = {}
+    for document_id, raw_reason in unavailable_documents.items():
+        if not isinstance(document_id, str) or not document_id.strip():
+            raise ValueError("unprovable retirement requires deterministic unavailable documents")
+        reason = HistoricalProjectionFailureReason(raw_reason)
+        if reason not in AGENT_SESSION_TERMINAL_PROJECTION_FAILURES:
+            raise ValueError("unprovable retirement requires exhausted Agent Session recovery paths")
+        normalized[document_id.strip()] = reason.value
+    if len(normalized) != len(unavailable_documents) or not normalized:
+        raise ValueError("unprovable retirement requires deterministic unavailable documents")
+    return {
+        "kind": "unprovable_source_retired",
+        "operator_id": operator_id.strip(),
+        "reconstruction_attempt_id": reconstruction_attempt_id.strip(),
+        "unavailable_documents": dict(sorted(normalized.items())),
+    }
+
+
+def validate_unprovable_cutover_evidence(
+    *,
+    available_provenance: Mapping[str, object],
+    mapping_attempt: Mapping[str, object],
+    source_rows: Sequence[Mapping[str, object]],
+    source_id: str,
+    unavailable_documents: Mapping[str, str],
+) -> tuple[str, ...]:
+    """Reject every malformed or contradictory entry before destructive cutover."""
+
+    raw_documents = available_provenance.get("documents")
+    raw_attempts = mapping_attempt.get("attempts")
+    if not isinstance(raw_documents, list) or not raw_documents:
+        raise ValueError("unprovable retirement requires strict exact source provenance")
+    if not isinstance(raw_attempts, list) or not raw_attempts or not source_rows:
+        raise ValueError("unprovable retirement requires strict exact source provenance")
+
+    document_ids: list[str] = []
+    for item in raw_documents:
+        if not isinstance(item, Mapping) or set(item) != {"doc_id", "source_type", "excerpt"}:
+            raise ValueError("unprovable retirement requires strict exact source provenance")
+        doc_id = item.get("doc_id")
+        excerpt = item.get("excerpt")
+        if (
+            not isinstance(doc_id, str)
+            or not doc_id.strip()
+            or item.get("source_type") != "agent_session"
+            or (excerpt is not None and not isinstance(excerpt, str))
+        ):
+            raise ValueError("unprovable retirement requires strict exact source provenance")
+        document_ids.append(doc_id.strip())
+
+    attempt_ids: list[str] = []
+    for item in raw_attempts:
+        if not isinstance(item, Mapping) or set(item) != {"doc_id", "result"}:
+            raise ValueError("unprovable retirement requires strict exact source provenance")
+        doc_id = item.get("doc_id")
+        if (
+            not isinstance(doc_id, str)
+            or not doc_id.strip()
+            or item.get("result") != "source_unit_not_found"
+        ):
+            raise ValueError("unprovable retirement requires strict exact source provenance")
+        attempt_ids.append(doc_id.strip())
+
+    edge_ids: list[str] = []
+    for row in source_rows:
+        if set(row) != {"doc_id", "source_id", "source_type"}:
+            raise ValueError("unprovable retirement requires strict exact source provenance")
+        doc_id = row.get("doc_id")
+        if (
+            not isinstance(doc_id, str)
+            or not doc_id.strip()
+            or row.get("source_id") != source_id
+            or row.get("source_type") != "agent_session"
+        ):
+            raise ValueError("unprovable retirement requires exclusive source provenance")
+        edge_ids.append(doc_id.strip())
+
+    unavailable_ids = list(unavailable_documents)
+    if (
+        len(set(document_ids)) != len(document_ids)
+        or len(set(attempt_ids)) != len(attempt_ids)
+        or len(set(edge_ids)) != len(edge_ids)
+        or set(document_ids) != set(attempt_ids)
+        or set(document_ids) != set(edge_ids)
+        or set(document_ids) != set(unavailable_ids)
+    ):
+        raise ValueError("unprovable retirement requires strict exact source provenance")
+    return tuple(sorted(document_ids))
+
+
+def unprovable_cutover_retirement_plan_id(finding_id: str) -> str:
+    """Stable lifecycle-plan identity for one terminal cutover finding."""
+
+    digest = sha256(f"unprovable-cutover-retirement\x1f{finding_id}".encode()).hexdigest()[:20]
+    return f"lifecycle-cutover-retire-{digest}"
 
 
 class LifecycleBackfillJobStatus(str, Enum):
