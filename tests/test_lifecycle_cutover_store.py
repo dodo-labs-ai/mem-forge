@@ -56,6 +56,7 @@ from memforge.models import (
     content_hash,
 )
 from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.source_activity import SourceActivityConflict
 from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.storage.database import Database, MIGRATIONS
 from memforge.storage.document_store import LocalDocumentStore
@@ -116,6 +117,38 @@ def _unit() -> EvidenceUnit:
         content="Legacy claim",
         excerpt="Legacy claim",
         evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+    )
+
+
+async def _add_unsupported_legacy_source_edge(
+    db: Database,
+    *,
+    doc_id: str = "legacy-doc",
+) -> None:
+    now = "2026-07-16T00:00:00+00:00"
+    await db.db.execute(
+        """INSERT INTO documents (
+               doc_id, source, source_url, title, space_or_project, last_modified,
+               version, content_hash, last_synced
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            doc_id,
+            "src-1",
+            f"https://example.test/{doc_id}",
+            "Legacy document",
+            "ENG",
+            now,
+            "1",
+            "legacy-hash",
+            now,
+        ),
+    )
+    await db.add_memory_source(
+        "mem-legacy",
+        doc_id,
+        "confluence",
+        "Legacy claim",
+        source_updated_at=None,
     )
 
 
@@ -333,6 +366,83 @@ async def test_lifecycle_activity_heartbeat_cancels_operation_with_wrapper() -> 
     with pytest.raises(asyncio.CancelledError):
         await task
     assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_activity_cancellation_fails_durable_recovery_job(
+    db: Database,
+    monkeypatch,
+) -> None:
+    scan_started = asyncio.Event()
+
+    async def block_scan(_source_id: str):
+        scan_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(db, "list_legacy_memory_provenance", block_scan)
+    job_id = "recovery-cancelled-durably"
+    task = asyncio.create_task(
+        run_with_lifecycle_activity_heartbeat(
+            db,
+            job_id,
+            lambda: run_source_lifecycle_recovery_job(
+                db,
+                "src-1",
+                job_id=job_id,
+            ),
+            heartbeat_interval_seconds=3600,
+        )
+    )
+    await scan_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    job = await db.get_lifecycle_backfill_job(job_id)
+    assert job is not None
+    assert job.status is LifecycleBackfillJobStatus.FAILED
+    assert job.error == "lifecycle recovery cancelled"
+    assert await db.get_active_lifecycle_backfill_job("src-1") is None
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_heartbeat_failure_fails_durable_recovery_job(
+    db: Database,
+    monkeypatch,
+) -> None:
+    scan_started = asyncio.Event()
+
+    async def block_scan(_source_id: str):
+        scan_started.set()
+        await asyncio.Event().wait()
+
+    async def fail_heartbeat(**_kwargs) -> None:
+        await scan_started.wait()
+        raise RuntimeError("simulated lease loss")
+
+    monkeypatch.setattr(db, "list_legacy_memory_provenance", block_scan)
+    monkeypatch.setattr(db, "renew_source_activity", fail_heartbeat)
+    job_id = "recovery-heartbeat-failed-durably"
+
+    with pytest.raises(SourceActivityConflict, match="heartbeat stopped"):
+        await run_with_lifecycle_activity_heartbeat(
+            db,
+            job_id,
+            lambda: run_source_lifecycle_recovery_job(
+                db,
+                "src-1",
+                job_id=job_id,
+            ),
+            heartbeat_interval_seconds=0,
+        )
+
+    assert scan_started.is_set()
+    job = await db.get_lifecycle_backfill_job(job_id)
+    assert job is not None
+    assert job.status is LifecycleBackfillJobStatus.FAILED
+    assert job.error == "lifecycle recovery cancelled"
+    assert await db.get_active_lifecycle_backfill_job("src-1") is None
 
 
 @pytest.mark.asyncio
@@ -1359,6 +1469,56 @@ async def test_backfill_job_records_completed_counts_and_is_idempotent(db: Datab
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runner",
+    [run_source_lifecycle_backfill_job, run_source_lifecycle_recovery_job],
+)
+async def test_completed_job_retry_gates_a_new_support_invariant_violation(
+    db: Database,
+    runner,
+) -> None:
+    job_id = f"completed-before-gap-{runner.__name__}"
+    completed = await runner(db, "src-1", job_id=job_id)
+    assert completed.status is LifecycleBackfillJobStatus.COMPLETED
+    assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
+    await _add_unsupported_legacy_source_edge(db)
+
+    retried = await runner(db, "src-1", job_id=job_id)
+
+    assert retried == completed
+    gate = await db.get_lifecycle_gate("src-1")
+    assert gate.state is LifecycleGateState.GATED
+    assert gate.reason and "support invariant violation" in gate.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runner",
+    [run_source_lifecycle_backfill_job, run_source_lifecycle_recovery_job],
+)
+async def test_support_preflight_failure_does_not_create_job_or_activity(
+    db: Database,
+    monkeypatch,
+    runner,
+) -> None:
+    async def fail_preflight(_source_id: str) -> int:
+        raise RuntimeError("support invariant unavailable")
+
+    monkeypatch.setattr(
+        db,
+        "count_active_source_memories_without_support",
+        fail_preflight,
+    )
+    job_id = f"preflight-failed-{runner.__name__}"
+
+    with pytest.raises(RuntimeError, match="support invariant unavailable"):
+        await runner(db, "src-1", job_id=job_id)
+
+    assert await db.get_lifecycle_backfill_job(job_id) is None
+    assert await db.get_active_lifecycle_backfill_job("src-1") is None
+
+
+@pytest.mark.asyncio
 async def test_failed_backfill_job_retry_does_not_reacquire_activity(db: Database) -> None:
     failed = await db.create_lifecycle_backfill_job(
         LifecycleBackfillJob(
@@ -1393,31 +1553,8 @@ async def test_recovery_gates_enabled_source_before_scanning_missing_support(
     db: Database,
     monkeypatch,
 ) -> None:
+    await _add_unsupported_legacy_source_edge(db)
     now = "2026-07-16T00:00:00+00:00"
-    await db.db.execute(
-        """INSERT INTO documents (
-               doc_id, source, source_url, title, space_or_project, last_modified,
-               version, content_hash, last_synced
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            "legacy-doc",
-            "src-1",
-            "https://example.test/legacy",
-            "Legacy document",
-            "ENG",
-            now,
-            "1",
-            "legacy-hash",
-            now,
-        ),
-    )
-    await db.add_memory_source(
-        "mem-legacy",
-        "legacy-doc",
-        "confluence",
-        "Legacy claim",
-        source_updated_at=None,
-    )
     await db.db.execute(
         """INSERT INTO source_lifecycle_gates (
                source_id, state, reason, audited_at, enabled_at, updated_at

@@ -2763,14 +2763,23 @@ class Database:
     # Connection lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> None:
-        """Open the database, enable WAL mode, create schema, and run migrations."""
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(self.db_path)
+    async def connect(self, *, run_migrations: bool = True) -> None:
+        """Open the database, optionally in a non-mutating evaluation mode."""
+
+        path = Path(self.db_path).expanduser()
+        if run_migrations:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._db = await aiosqlite.connect(str(path))
+        else:
+            read_only_uri = f"{path.resolve().as_uri()}?mode=ro"
+            self._db = await aiosqlite.connect(read_only_uri, uri=True)
         self._db.row_factory = aiosqlite.Row
-        await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA busy_timeout=5000")
         await self._db.execute("PRAGMA foreign_keys = ON")
+        if not run_migrations:
+            await self._db.execute("PRAGMA query_only = ON")
+            return
+        await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.executescript(SCHEMA)
         await self._run_migrations()
         await self._assert_memory_source_ids_resolved()
