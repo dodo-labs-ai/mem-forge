@@ -140,6 +140,34 @@ async def list_agent_session_lifecycle_migration_candidates(
     return tuple(sorted(candidates, key=lambda candidate: candidate.source_id))
 
 
+async def _gate_active_support_invariant_violation(db: Any, source_id: str) -> None:
+    missing_support_count = await db.count_active_source_memories_without_support(source_id)
+    if missing_support_count:
+        await db.gate_destructive_lifecycle(
+            source_id,
+            reason=(
+                "lifecycle recovery detected "
+                f"{missing_support_count} active Memory support invariant violation(s)"
+            ),
+        )
+
+
+async def _fail_cancelled_lifecycle_job(
+    db: Any,
+    job_id: str,
+    *,
+    operation: str,
+) -> None:
+    cleanup = asyncio.create_task(
+        db.fail_lifecycle_backfill_job(job_id, error=f"{operation} cancelled")
+    )
+    try:
+        await asyncio.shield(cleanup)
+    except asyncio.CancelledError:
+        await cleanup
+        raise
+
+
 async def run_source_lifecycle_backfill_job(
     db: Any,
     source_id: str,
@@ -148,6 +176,7 @@ async def run_source_lifecycle_backfill_job(
 ) -> LifecycleBackfillJob:
     """Run backfill through a durable operator-visible job state machine."""
 
+    await _gate_active_support_invariant_violation(db, source_id)
     job = await db.create_lifecycle_backfill_job(
         LifecycleBackfillJob(
             id=job_id or f"lifecycle-backfill-{uuid.uuid4().hex}",
@@ -161,15 +190,6 @@ async def run_source_lifecycle_backfill_job(
         raise ValueError(f"lifecycle backfill job is already {job.status.value}")
     await db.start_lifecycle_backfill_job(job.id)
     try:
-        missing_support_count = await db.count_active_source_memories_without_support(source_id)
-        if missing_support_count:
-            await db.gate_destructive_lifecycle(
-                source_id,
-                reason=(
-                    "lifecycle recovery detected "
-                    f"{missing_support_count} active Memory support invariant violation(s)"
-                ),
-            )
         result = await run_source_lifecycle_backfill(db, source_id)
         return await db.complete_lifecycle_backfill_job(
             job.id,
@@ -177,6 +197,13 @@ async def run_source_lifecycle_backfill_job(
             mapped_memories=result.mapped_memories,
             finding_count=result.finding_count,
         )
+    except asyncio.CancelledError:
+        await _fail_cancelled_lifecycle_job(
+            db,
+            job.id,
+            operation="lifecycle backfill",
+        )
+        raise
     except Exception as exc:
         await db.fail_lifecycle_backfill_job(job.id, error=str(exc))
         raise
@@ -200,6 +227,7 @@ async def run_source_lifecycle_recovery_job(
     Memory lifecycle work.
     """
 
+    await _gate_active_support_invariant_violation(db, source_id)
     job = await db.create_lifecycle_backfill_job(
         LifecycleBackfillJob(
             id=job_id,
@@ -213,15 +241,6 @@ async def run_source_lifecycle_recovery_job(
         raise ValueError(f"lifecycle backfill job is already {job.status.value}")
     await db.start_lifecycle_backfill_job(job.id)
     try:
-        missing_support_count = await db.count_active_source_memories_without_support(source_id)
-        if missing_support_count:
-            await db.gate_destructive_lifecycle(
-                source_id,
-                reason=(
-                    "lifecycle recovery detected "
-                    f"{missing_support_count} active Memory support invariant violation(s)"
-                ),
-            )
         result = await run_source_lifecycle_backfill(db, source_id)
         if result.finding_count and reconstruct_documents is not None:
             missing_projection_ids = await _missing_projection_document_ids(db, source_id)
@@ -239,6 +258,13 @@ async def run_source_lifecycle_recovery_job(
             mapped_memories=result.mapped_memories,
             finding_count=result.finding_count,
         )
+    except asyncio.CancelledError:
+        await _fail_cancelled_lifecycle_job(
+            db,
+            job.id,
+            operation="lifecycle recovery",
+        )
+        raise
     except Exception as exc:
         await db.fail_lifecycle_backfill_job(job.id, error=str(exc))
         raise
