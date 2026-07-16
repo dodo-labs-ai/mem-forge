@@ -354,6 +354,42 @@ def test_local_agent_leases_heartbeats_and_completes_cloud_job(tmp_path):
     assert report["counts"] == {"total": 2, "success": 2, "failed": 0}
 
 
+def test_local_agent_rejected_initial_heartbeat_never_runs_handler(tmp_path):
+    completed: list[tuple[str, int, str, dict, str | None]] = []
+    handled: list[str] = []
+    runner = LocalAgentRunner(
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        cloud_job_handler=lambda job: handled.append(job["job_id"]) or {"count": 1},
+        cloud_jobs_provider=lambda: {
+            "jobs": [
+                {
+                    "job_id": "laj-legacy",
+                    "operation": "teams_sync",
+                    "source_id": "src-teams",
+                    "attempt_count": 1,
+                }
+            ]
+        },
+        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: (
+            completed.append((job_id, attempt_count, status, result, error)) or {"ok": True}
+        ),
+        cloud_job_heartbeat=lambda job_id, attempt_count, lease_seconds: {
+            "error": "MemForge API request failed",
+            "status_code": 409,
+            "detail": '{"detail":"local_agent_source_activity_epoch_required"}',
+        },
+    )
+
+    report = runner.run_once(now=datetime(2026, 7, 16, tzinfo=timezone.utc))
+
+    assert handled == []
+    assert len(completed) == 1
+    assert completed[0][2] == "failed"
+    assert completed[0][3] == {"retryable": False}
+    assert "local_agent_source_activity_epoch_required" in str(completed[0][4])
+    assert report["results"][-1]["status"] == "failed"
+
+
 def test_local_agent_forwards_retryable_handler_failure_to_broker(tmp_path):
     completed: list[tuple[str, int, str, dict, str | None]] = []
     runner = LocalAgentRunner(

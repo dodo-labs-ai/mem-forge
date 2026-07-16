@@ -1928,6 +1928,61 @@ def test_local_agent_cloud_teams_sync_reports_push_failure_without_generic_sourc
     assert audit_rows[-1]["failed_windows"] == 1
 
 
+def test_local_agent_cloud_teams_sync_stops_after_lease_is_rejected(monkeypatch, tmp_path: Path):
+    async def fake_collect(job, *, source_id, limit, report_progress=None):
+        return [
+            {
+                "conversation_id": "19:conversation@thread.tacv2",
+                "root_message_id": f"178350000000{index}",
+                "window_id": f"teams-thread:v1:window-{index}",
+                "window_type": "thread",
+                "revision_hash": f"sha256:revision-{index}",
+                "title": f"Thread window {index}",
+                "source_url": f"https://teams.example.test/window-{index}",
+                "last_modified": "2026-07-08T09:24:57Z",
+                "raw_payload": {"messages": [{"id": str(index), "content": "Window"}]},
+                "raw_hash": f"sha256:raw-{index}",
+                "message_count": 1,
+            }
+            for index in range(2)
+        ]
+
+    def rejected_push(self, **kwargs):
+        self.calls.append(("push_teams_window_package", kwargs))
+        return {
+            "error": "MemForge API request failed",
+            "status_code": 409,
+            "detail": '{"detail":"local_agent_lease_not_current"}',
+        }
+
+    monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect, raising=False)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    monkeypatch.setattr(FakeToolClient, "push_teams_window_package", rejected_push)
+    FakeToolClient.reset({})
+
+    result = main._run_cloud_teams_sync_job(
+        {
+            "job_id": "laj-teams-stale-lease",
+            "workspace_id": "ws-from-cloud",
+            "operation": "teams_sync",
+            "attempt_count": 1,
+            "source_id": "src-teams",
+            "payload": {
+                "conversation_ids": ["19:conversation@thread.tacv2"],
+                "audit_log_path": str(tmp_path / "teams-audit.jsonl"),
+            },
+        },
+        _cloud_test_client(),
+    )
+
+    pushes = [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
+    assert len(pushes) == 1
+    assert result["counts"]["selected"] == 1
+    assert result["error_type"] == "LocalAgentLeaseLost"
+    assert result["retryable"] is False
+    assert result["sync_started"] is False
+
+
 def test_local_agent_cloud_teams_sync_pushes_current_attempt_scope_attestation_for_empty_target(
     monkeypatch,
     tmp_path: Path,

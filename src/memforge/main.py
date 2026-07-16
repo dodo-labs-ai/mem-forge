@@ -1950,6 +1950,20 @@ def _run_cloud_local_agent_job(
     return handler()
 
 
+def _local_agent_lease_not_current(response: object) -> bool:
+    if not isinstance(response, dict) or response.get("status_code") != 409:
+        return False
+    detail = response.get("detail")
+    if isinstance(detail, str):
+        try:
+            parsed = json.loads(detail)
+        except json.JSONDecodeError:
+            return "local_agent_lease_not_current" in detail
+        if isinstance(parsed, dict):
+            return parsed.get("detail") == "local_agent_lease_not_current"
+    return detail == "local_agent_lease_not_current"
+
+
 def _run_cloud_github_preview_job(job: dict[str, Any]) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
@@ -2460,6 +2474,7 @@ def _run_cloud_teams_sync_job(
     submitted_by = str(payload.get("submitted_by") or "memforge-local-agent")
     sync_started = False
     inventory_error = inventory_setup_error
+    lease_lost = False
 
     processed_messages = 0
     selected_count = 0
@@ -2548,6 +2563,9 @@ def _run_cloud_teams_sync_job(
                     "claim_rejected_ambiguous": 0,
                 },
             )
+            if _local_agent_lease_not_current(response):
+                lease_lost = True
+                break
             continue
         pushed.append(
             {
@@ -2589,7 +2607,7 @@ def _run_cloud_teams_sync_job(
     )
 
     sync_result = None
-    if pushed and inventory_error is None:
+    if pushed and inventory_error is None and not lease_lost:
         # Teams is incremental by stable window id and revision. Processing the
         # historical input set lets the server collapse each window to its
         # latest revision; document-style authoritative snapshots do not apply.
@@ -2621,7 +2639,10 @@ def _run_cloud_teams_sync_job(
         "sync_started": sync_started,
         "audit_log_path": str(audit_path.expanduser()),
     }
-    if inventory_error is not None:
+    if lease_lost:
+        result["error"] = "local agent lease is no longer current"
+        result["error_type"] = "LocalAgentLeaseLost"
+    elif inventory_error is not None:
         result["error"] = f"server projection inventory is not reconcilable: {inventory_error}"
         result["error_type"] = "TeamsProjectionInventoryError"
     elif failed:
@@ -2634,7 +2655,7 @@ def _run_cloud_teams_sync_job(
         )
         result["sync_error"] = sync_result
     if result.get("error"):
-        result["retryable"] = True
+        result["retryable"] = not lease_lost
 
     write_teams_audit_event(
         audit_path,
