@@ -98,6 +98,7 @@ class SourceSyncMode(str, Enum):
     NORMAL = "normal"
     PROJECTION_REPAIR = "projection_repair"
     REBASELINE_PREFLIGHT = "rebaseline_preflight"
+    REBASELINE_REPLAY = "rebaseline_replay"
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +565,10 @@ class GeneSyncOrchestrator:
             projection baseline for explicitly requested documents without
             running enrichment, Memory lifecycle, vector writes, deletion
             detection, or advancing the ordinary source sync cursor.
+            ``rebaseline_replay`` runs only after a successful preflight and
+            lifecycle reset, so it may remove legacy documents that predate
+            persisted Source Unit lineage when complete discovery proves their
+            absence.
 
         Returns
         -------
@@ -573,6 +578,7 @@ class GeneSyncOrchestrator:
         run_id = uuid.uuid4().hex[:12]
         projection_repair = execution_mode is SourceSyncMode.PROJECTION_REPAIR
         rebaseline_preflight = execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT
+        rebaseline_replay = execution_mode is SourceSyncMode.REBASELINE_REPLAY
         non_mutating_run = projection_repair or rebaseline_preflight
         if projection_repair and not reprocess_doc_ids:
             raise ValueError("projection repair requires explicit document identifiers")
@@ -967,6 +973,7 @@ class GeneSyncOrchestrator:
                     indexed_doc_ids=indexed_doc_ids,
                     crawled_doc_ids=crawled_doc_ids,
                     source_filter_summary=_source_filter_summary(gene, last_sync_time),
+                    allow_legacy_orphan_cleanup=rebaseline_replay,
                 )
                 if deletion_failures:
                     failed_docs.extend(deletion_failures)
@@ -2608,6 +2615,7 @@ class GeneSyncOrchestrator:
         indexed_doc_ids: set[str],
         crawled_doc_ids: set[str],
         source_filter_summary: str | None,
+        allow_legacy_orphan_cleanup: bool = False,
     ) -> tuple[int, list[FailedDoc]]:
         """Detect and handle documents deleted from the source.
 
@@ -2644,6 +2652,24 @@ class GeneSyncOrchestrator:
 
                 source_unit = await self.db.find_source_unit_by_document_id(source_id, doc_id)
                 if source_unit is None:
+                    if allow_legacy_orphan_cleanup:
+                        deletion_context = {
+                            "deletion_kind": "rebaseline_legacy_absence",
+                            "reason": "not_returned_by_complete_rebaseline_replay",
+                        }
+                        if self.memory_store is not None:
+                            await self.memory_store.delete_projected_document(
+                                doc_id,
+                                deletion_context=deletion_context,
+                            )
+                        else:
+                            await self.db.delete_projected_document(doc_id)
+                        logger.info(
+                            "Removed legacy document %s after complete rebaseline replay proved absence",
+                            doc_id,
+                        )
+                        deleted_count += 1
+                        continue
                     raise RuntimeError("source absence cannot be reconciled without persisted Source Unit lineage")
                 lineage_document_ids = await self.db.list_source_unit_document_ids(source_unit.id)
                 current_document_id = lineage_document_ids[0] if lineage_document_ids else doc_id

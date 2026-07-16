@@ -661,7 +661,6 @@ class LiteLlmStructuredClient:
             response_format=AgentSessionAuthorityResponse,
             max_tokens=max_tokens,
             model=model,
-            retry_with_json_text=False,
         )
 
     async def _call_schema(
