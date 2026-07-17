@@ -24,7 +24,6 @@ from memforge.memory.evidence import (
     RelationOutcomeBundle,
 )
 from memforge.memory.lifecycle_plan import (
-    ExactRevisionReplay,
     LegacyMemoryProvenance,
     LifecycleCutoverFinding,
     LifecycleBackfillJob,
@@ -371,21 +370,6 @@ class SqliteRelationalStore:
             visibility=visibility,
             owner_user_id=owner_user_id,
             repo_identifier=repo_identifier,
-        )
-
-    async def get_exact_revision_replay(
-        self,
-        *,
-        source_id: str,
-        source_unit_id: str,
-        target_unit_revision_id: str,
-        observation_revision_ids: tuple[str, ...],
-    ) -> ExactRevisionReplay | None:
-        return await self._db.get_exact_revision_replay(
-            source_id=source_id,
-            source_unit_id=source_unit_id,
-            target_unit_revision_id=target_unit_revision_id,
-            observation_revision_ids=observation_revision_ids,
         )
 
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]:
