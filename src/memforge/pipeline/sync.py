@@ -543,6 +543,7 @@ class GeneSyncOrchestrator:
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         source_activity_epoch: int | None = None,
+        lifecycle_cycle_id: str | None = None,
     ) -> SyncState:
         """Run the full sync pipeline for a gene.
 
@@ -582,6 +583,7 @@ class GeneSyncOrchestrator:
             Final sync result with counts and error details.
         """
         run_id = uuid.uuid4().hex[:12]
+        durable_cycle_id = lifecycle_cycle_id or run_id
         projection_repair = execution_mode is SourceSyncMode.PROJECTION_REPAIR
         rebaseline_preflight = execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT
         rebaseline_replay = execution_mode is SourceSyncMode.REBASELINE_REPLAY
@@ -637,7 +639,7 @@ class GeneSyncOrchestrator:
                     raise RuntimeError("open Projection Scope transition does not match configured target scope")
                 scope_transition = await self.db.start_projection_scope_transition(
                     scope_transition.id,
-                    run_id=run_id,
+                    run_id=durable_cycle_id,
                 )
                 transition_started = True
 
@@ -978,6 +980,11 @@ class GeneSyncOrchestrator:
                     source_type=configured_source_type,
                     source_name=source_name,
                     run_id=run_id,
+                    lifecycle_cycle_id=(
+                        scope_transition.id
+                        if scope_transition is not None
+                        else durable_cycle_id
+                    ),
                     indexed_doc_ids=indexed_doc_ids,
                     crawled_doc_ids=crawled_doc_ids,
                     source_filter_summary=_source_filter_summary(gene, last_sync_time),
@@ -1018,13 +1025,13 @@ class GeneSyncOrchestrator:
                 if (absence_is_authoritative or scoped_reconciliation_coverage is not None) and docs_failed == 0:
                     scope_transition = await self.db.complete_projection_scope_transition(
                         scope_transition.id,
-                        run_id=run_id,
+                        run_id=durable_cycle_id,
                         coverage=scoped_reconciliation_coverage or run_coverage,
                     )
                 else:
                     scope_transition = await self.db.fail_projection_scope_transition(
                         scope_transition.id,
-                        run_id=run_id,
+                        run_id=durable_cycle_id,
                         coverage=run_coverage,
                         error=(
                             "target scope did not produce a complete successful snapshot: "
@@ -1064,7 +1071,7 @@ class GeneSyncOrchestrator:
                 try:
                     await self.db.fail_projection_scope_transition(
                         scope_transition.id,
-                        run_id=run_id,
+                        run_id=durable_cycle_id,
                         coverage=run_coverage,
                         error=error_message,
                     )
@@ -2845,6 +2852,7 @@ class GeneSyncOrchestrator:
         source_type: str,
         source_name: str,
         run_id: str,
+        lifecycle_cycle_id: str,
         indexed_doc_ids: set[str],
         crawled_doc_ids: set[str],
         source_filter_summary: str | None,
@@ -2966,6 +2974,7 @@ class GeneSyncOrchestrator:
                     projection=tombstone,
                     doc_id=doc_id,
                     reason=AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON,
+                    lifecycle_cycle_id=lifecycle_cycle_id,
                     expected_source_activity_epoch=expected_source_activity_epoch,
                 )
                 await self.db.record_source_projection(

@@ -207,6 +207,7 @@ class RuntimeProvider(Protocol):
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_job_id: str | None = None,
+        lifecycle_cycle_id: str | None = None,
     ) -> SyncState: ...
 
 
@@ -265,6 +266,7 @@ class DefaultRuntimeProvider:
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_job_id: str | None = None,
+        lifecycle_cycle_id: str | None = None,
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -277,6 +279,7 @@ class DefaultRuntimeProvider:
             reprocess_doc_ids=reprocess_doc_ids,
             execution_mode=execution_mode,
             lifecycle_job_id=lifecycle_job_id,
+            lifecycle_cycle_id=lifecycle_cycle_id,
         )
 
 
@@ -627,6 +630,7 @@ async def run_source_sync(
     reprocess_doc_ids: frozenset[str] | None = None,
     execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
     lifecycle_job_id: str | None = None,
+    lifecycle_cycle_id: str | None = None,
 ) -> SyncState:
     await authorize_source_sync_maintenance(
         db,
@@ -660,6 +664,9 @@ async def run_source_sync(
         heartbeat_task = asyncio.create_task(heartbeat_activity())
     else:
         source_activity_epoch = await db.get_source_activity_epoch(str(source["id"]))
+    lifecycle_cycle_id = lifecycle_cycle_id or lifecycle_job_id or activity_id
+    if lifecycle_cycle_id is None:
+        lifecycle_cycle_id = f"source-sync-cycle-{uuid.uuid4().hex}"
     try:
         runtime = runtime or await build_sync_runtime(db, config)
         secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
@@ -679,6 +686,7 @@ async def run_source_sync(
             "authoritative_snapshot": authoritative_snapshot,
             "reprocess_doc_ids": reprocess_doc_ids,
             "source_activity_epoch": source_activity_epoch,
+            "lifecycle_cycle_id": lifecycle_cycle_id,
         }
         if execution_mode is not SourceSyncMode.NORMAL:
             sync_kwargs["execution_mode"] = execution_mode
@@ -952,6 +960,9 @@ class SourceSyncWorker:
                 progress_callback=None,
                 force_full_sync=run.force_full_sync,
                 authoritative_snapshot=authoritative_collection,
+                lifecycle_cycle_id=(
+                    f"{run.run_id}:attempt:{run.lease_attempt_count}"
+                ),
             )
             if final_state is None:
                 final_state = SyncState(

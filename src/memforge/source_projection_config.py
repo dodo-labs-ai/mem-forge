@@ -124,14 +124,17 @@ def projection_scope_transition_id(
     source_id: str,
     previous_scope: Mapping[str, object],
     target_scope: Mapping[str, object],
+    *,
+    predecessor_transition_id: str | None = None,
 ) -> str:
-    """Return a retry-stable identity for one exact scope transition."""
+    """Return a retry-stable identity for one scope-transition cycle."""
 
     payload = json.dumps(
         {
             "source_id": source_id,
             "previous_scope": dict(previous_scope),
             "target_scope": dict(target_scope),
+            "predecessor_transition_id": predecessor_transition_id,
         },
         sort_keys=True,
         separators=(",", ":"),

@@ -395,8 +395,14 @@ async def test_runtime_resolves_jira_browser_session_without_persisting_cookie(d
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
             source_activity_epoch=None,
+            lifecycle_cycle_id=None,
         ):
-            del authoritative_snapshot, reprocess_doc_ids, source_activity_epoch
+            del (
+                authoritative_snapshot,
+                reprocess_doc_ids,
+                source_activity_epoch,
+                lifecycle_cycle_id,
+            )
             captured["gene_config"] = gene.config
             return SyncState(source=source_id, last_sync_status="success")
 
@@ -488,8 +494,14 @@ async def test_runtime_keeps_legacy_jira_pat_source_in_pat_mode(db, tmp_path, mo
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
             source_activity_epoch=None,
+            lifecycle_cycle_id=None,
         ):
-            del authoritative_snapshot, reprocess_doc_ids, source_activity_epoch
+            del (
+                authoritative_snapshot,
+                reprocess_doc_ids,
+                source_activity_epoch,
+                lifecycle_cycle_id,
+            )
             captured["gene_config"] = gene.config
             return SyncState(source=source_id, last_sync_status="success")
 

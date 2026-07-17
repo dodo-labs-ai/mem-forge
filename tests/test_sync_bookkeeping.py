@@ -39,7 +39,11 @@ from memforge.source_projection import (
     ProjectionScopeTransition,
     ProjectionScopeTransitionStatus,
 )
-from memforge.source_projection_config import canonical_projection_scope, projection_scope_fingerprint
+from memforge.source_projection_config import (
+    canonical_projection_scope,
+    projection_scope_fingerprint,
+    projection_scope_transition_id,
+)
 from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
     ExtractionWorkPool,
@@ -5157,6 +5161,7 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
         def __init__(self) -> None:
             self.force_full_sync_values: list[bool] = []
             self.extraction_pools: list[ExtractionWorkPool | None] = []
+            self.lifecycle_cycle_ids: list[str] = []
 
         async def build_sync_runtime(
             self,
@@ -5172,6 +5177,7 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
 
         async def run_source_sync(self, **kwargs):
             self.force_full_sync_values.append(bool(kwargs["force_full_sync"]))
+            self.lifecycle_cycle_ids.append(str(kwargs["lifecycle_cycle_id"]))
             return SyncState(
                 source=source_id,
                 last_sync_at=datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc),
@@ -5204,6 +5210,71 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
     assert completed.lease_owner is None
     assert provider.force_full_sync_values == [True]
     assert provider.extraction_pools == [worker._extraction_pool]
+    assert provider.lifecycle_cycle_ids == [f"{enqueued.run_id}:attempt:1"]
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_gives_each_retry_attempt_a_new_lifecycle_cycle(
+    db: Database,
+):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-retry-cycle"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker retry cycle",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+
+    class RetryRuntimeProvider:
+        def __init__(self) -> None:
+            self.lifecycle_cycle_ids: list[str] = []
+
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            self.lifecycle_cycle_ids.append(str(kwargs["lifecycle_cycle_id"]))
+            if len(self.lifecycle_cycle_ids) == 1:
+                raise RuntimeError("retry this attempt")
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
+
+    provider = RetryRuntimeProvider()
+    enqueued = await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="manual",
+    )
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(
+            sync=SyncConfig(
+                worker_retry_base_seconds=0,
+                worker_retry_max_seconds=0,
+            )
+        ),
+        runtime_provider=provider,
+        worker_id="worker-a",
+    )
+
+    await worker.run_once()
+    await asyncio.sleep(0.12)
+    await worker.run_once()
+
+    completed = await db.get_source_sync_run(enqueued.run_id)
+    assert completed is not None
+    assert completed.status == "success"
+    assert provider.lifecycle_cycle_ids == [
+        f"{enqueued.run_id}:attempt:1",
+        f"{enqueued.run_id}:attempt:2",
+    ]
 
 
 @pytest.mark.asyncio
@@ -7502,6 +7573,10 @@ async def test_scope_reentry_replays_exact_revision_without_calling_extractor_ag
 
     async def set_scope(previous_paths: list[str], target_paths: list[str]) -> None:
         target_config = config(target_paths)
+        previous_transitions = await db.list_projection_scope_transitions(
+            source_id,
+            limit=1,
+        )
         await db.upsert_source(
             id=source_id,
             type="github_repo",
@@ -7510,7 +7585,22 @@ async def test_scope_reentry_replays_exact_revision_without_calling_extractor_ag
             access_policy="workspace",
             owner_user_id="dev",
             projection_scope_transition=ProjectionScopeTransition(
-                id=f"scope-{'-'.join(previous_paths)}-to-{'-'.join(target_paths)}",
+                id=projection_scope_transition_id(
+                    source_id,
+                    canonical_projection_scope(
+                        "github_repo",
+                        config(previous_paths),
+                    ),
+                    canonical_projection_scope(
+                        "github_repo",
+                        target_config,
+                    ),
+                    predecessor_transition_id=(
+                        previous_transitions[0].id
+                        if previous_transitions
+                        else None
+                    ),
+                ),
                 source_id=source_id,
                 previous_scope=canonical_projection_scope(
                     "github_repo",
@@ -7654,13 +7744,26 @@ async def test_scope_reentry_replays_exact_revision_without_calling_extractor_ag
         memory.id,
         source_id=source_id,
     )
+
+    await set_scope(["docs"], ["other"])
+    repeated_removal = await orchestrator.sync_gene(
+        gene=EmptyGene(),
+        source_name="Payroll Repo",
+        source_id=source_id,
+        authoritative_snapshot=True,
+    )
+
     assert first.last_sync_status == "success"
     assert removed.last_sync_status == "success"
     assert restored.last_sync_status == "success"
+    assert repeated_removal.last_sync_status == "success"
     assert len(extractor.claim_calls) == 1
     assert current is not None and current.status == "active"
     assert len(support) == 1
     assert support[0].anchor.observation_revision_id
+    repeatedly_retired = await db.get_memory(memory.id)
+    assert repeatedly_retired is not None
+    assert repeatedly_retired.status == "retired"
 
 
 @pytest.mark.asyncio
