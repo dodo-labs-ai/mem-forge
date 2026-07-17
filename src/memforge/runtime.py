@@ -988,6 +988,19 @@ class SourceSyncWorker:
                 if not failed:
                     raise SourceSyncLeaseLost(f"source sync lease lost before failure update for run {run.run_id}")
                 return run
+            try:
+                await runtime.memory_store.attempt_lifecycle_vector_delivery(
+                    source_id=run.source_id
+                )
+            except Exception:
+                # The relational lifecycle graph is already authoritative.
+                # Delivery stays durable in the outbox and must never turn a
+                # successful source run into a failed extraction transaction.
+                logger.exception(
+                    "Source sync completed with lifecycle vector delivery still pending "
+                    "for source %s",
+                    run.source_id,
+                )
             completed = await self.db.complete_source_sync_run(
                 run.run_id,
                 worker_id=self.worker_id,
