@@ -2263,6 +2263,78 @@ async def test_document_lifecycle_admission_caps_fetch_across_sources(db: Databa
     assert [state.last_sync_status for state in states] == ["success", "success"]
 
 
+@pytest.mark.asyncio
+async def test_document_lifecycle_admission_does_not_prequeue_one_source_ahead_of_another(
+    db: Database,
+):
+    for source_id in ("src-fair-a", "src-fair-b"):
+        await db.upsert_source(
+            id=source_id,
+            type="jira",
+            name=f"Source {source_id}",
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="dev",
+        )
+
+    admission = DocumentLifecycleAdmission(max_active=1)
+    entered: asyncio.Queue[str] = asyncio.Queue()
+    releases = {
+        item_id: asyncio.Event()
+        for item_id in ("jira-a-0", "jira-a-1", "jira-a-2", "jira-b-0")
+    }
+
+    def make_orchestrator() -> GeneSyncOrchestrator:
+        return GeneSyncOrchestrator(
+            db=db,
+            doc_store=StubDocumentStore(),
+            enricher=InstantEnricher(),
+            memory_extractor=NoopMemoryExtractor(),
+            memory_engine=NoopMemoryEngine(),
+            memory_store=None,
+            max_concurrent=3,
+            document_lifecycle_admission=admission,
+        )
+
+    task_a = asyncio.create_task(
+        make_orchestrator().sync_gene(
+            gene=OrderedBlockingFetchGene(
+                prefix="a",
+                item_count=3,
+                entered=entered,
+                releases=releases,
+            ),
+            source_name="Source A",
+            source_id="src-fair-a",
+        )
+    )
+    first = await asyncio.wait_for(entered.get(), timeout=2)
+    assert first == "jira-a-0"
+
+    task_b = asyncio.create_task(
+        make_orchestrator().sync_gene(
+            gene=OrderedBlockingFetchGene(
+                prefix="b",
+                item_count=1,
+                entered=entered,
+                releases=releases,
+            ),
+            source_name="Source B",
+            source_id="src-fair-b",
+        )
+    )
+    await asyncio.sleep(0.05)
+    releases[first].set()
+    second = await asyncio.wait_for(entered.get(), timeout=2)
+
+    for release in releases.values():
+        release.set()
+    states = await asyncio.gather(task_a, task_b)
+
+    assert second == "jira-b-0"
+    assert [state.last_sync_status for state in states] == ["success", "success"]
+
+
 def test_failed_document_summary_keeps_rate_limit_precedence_over_llm_timeout_text():
     message = summarize_failed_documents(
         1,
@@ -3072,6 +3144,43 @@ class TrackedFetchGene(BlockingFetchGene):
             return _jira_raw_content(item)
         finally:
             self.tracker.exit()
+
+
+class OrderedBlockingFetchGene(BlockingFetchGene):
+    def __init__(
+        self,
+        *,
+        prefix: str,
+        item_count: int,
+        entered: asyncio.Queue[str],
+        releases: dict[str, asyncio.Event],
+    ) -> None:
+        super().__init__(item_count=item_count, release=asyncio.Event())
+        self.prefix = prefix
+        self.entered = entered
+        self.releases = releases
+
+    async def discover(self, since=None):
+        for idx in range(self.item_count):
+            issue_number = (300000 if self.prefix == "a" else 400000) + idx
+            yield ContentItem(
+                item_id=f"jira-{self.prefix}-{idx}",
+                title=f"Jira {self.prefix} {idx}",
+                source_url=f"https://jira.example/browse/{self.prefix}-{idx}",
+                last_modified=datetime.now(timezone.utc),
+                content_type="application/json",
+                space_or_project="PAY",
+                version=f"{self.prefix}-{idx}",
+                extra={
+                    "issue_id": str(issue_number),
+                    "issue_key": f"PAY-{issue_number}",
+                },
+            )
+
+    async def fetch(self, item):
+        await self.entered.put(item.item_id)
+        await self.releases[item.item_id].wait()
+        return _jira_raw_content(item)
 
 
 class PdfBackfillGene(BlockingFetchGene):
@@ -8200,6 +8309,45 @@ async def test_full_document_unit_extraction_honors_orchestrator_concurrency(db:
         await asyncio.sleep(0.2)
         assert not extractor.started_two.is_set()
         assert extractor.max_active == 1
+    finally:
+        extractor.release.set()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_document_admission_capacity_does_not_throttle_unit_extraction(db: Database):
+    markdown = "# Design Doc\n\nIntro.\n\n" + "\n\n".join(
+        f"## Section {index}\n\n" + ("Durable design detail. " * 900) for index in range(8)
+    )
+    extractor = BlockingUnitMemoryExtractor()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=DocumentVisibleEnricher(db, "src-large-doc-admission"),
+        memory_extractor=extractor,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=_audited_memory_store(db),
+        max_concurrent=2,
+        document_lifecycle_admission=DocumentLifecycleAdmission(max_active=1),
+    )
+
+    task = asyncio.create_task(
+        orchestrator._extract_full_document_units(
+            markdown_body=markdown,
+            source_type="github_pages",
+            doc_type="reference",
+            entity_names=[],
+            existing_memories=[],
+            doc_id="doc-large",
+            source_id="src-large-doc-admission",
+            document_title="Design Doc",
+            document_url="https://example.test/design",
+        )
+    )
+
+    try:
+        await asyncio.wait_for(extractor.started_two.wait(), timeout=2)
+        assert extractor.max_active == 2
     finally:
         extractor.release.set()
         await task
