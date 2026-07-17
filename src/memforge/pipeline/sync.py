@@ -481,6 +481,11 @@ class GeneSyncOrchestrator:
     def _source_parallelism_limit(self) -> int:
         return self.max_concurrent
 
+    def _document_parallelism_limit(self) -> int:
+        if self.document_lifecycle_admission is None:
+            return self.max_concurrent
+        return min(self.max_concurrent, self.document_lifecycle_admission.max_active)
+
     @asynccontextmanager
     async def _heavy_work_slot(self, source_id: str):
         if self.extraction_pool is not None:
@@ -772,7 +777,7 @@ class GeneSyncOrchestrator:
             progress_counter = 0
             docs_updated_counter = 0
             memories_extracted_counter = 0
-            item_semaphore = asyncio.Semaphore(self._source_parallelism_limit())
+            item_semaphore = asyncio.Semaphore(self._document_parallelism_limit())
 
             async def _process_one(item: ContentItem) -> dict:
                 """Process a single item with retry logic and error isolation."""
