@@ -1193,6 +1193,10 @@ class SyncService:
             except asyncio.CancelledError:
                 pass
         self.progress.pop(source_id, None)
+        await self.db.cancel_pending_source_sync_run(
+            source_id=source_id,
+            error_message="cancelled_by_source_change",
+        )
 
     async def shutdown(self) -> None:
         source_ids = list(self.tasks)

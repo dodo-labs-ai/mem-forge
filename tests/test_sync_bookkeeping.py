@@ -6499,6 +6499,36 @@ async def test_cancel_queued_source_clears_progress(db: Database, monkeypatch):
     await task_active
 
 
+@pytest.mark.asyncio
+async def test_cancel_source_terminates_durable_pending_run(db: Database):
+    await db.upsert_source(
+        id="src-durable-pending",
+        type="jira",
+        name="Durable Pending Source",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    service = SyncService(db, AppConfig())
+    enqueued = await service.enqueue_source(
+        "src-durable-pending",
+        trigger="manual",
+    )
+
+    await service.cancel_source("src-durable-pending")
+
+    cancelled = await db.get_source_sync_run(enqueued.run_id)
+    assert cancelled is not None
+    assert cancelled.status == "failed"
+    assert cancelled.error_message == "cancelled_by_source_change"
+    replacement = await service.enqueue_source(
+        "src-durable-pending",
+        trigger="manual",
+    )
+    assert replacement.run_id != enqueued.run_id
+    assert replacement.coalesced is False
+
+
 def test_sync_max_active_sources_can_be_set_from_env(monkeypatch):
     monkeypatch.setenv("MEMFORGE_SYNC_MAX_ACTIVE_SOURCES", "2")
 
