@@ -430,6 +430,42 @@ def test_incomplete_local_agent_jira_changelog_forces_partial_coverage() -> None
     assert projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
 
 
+def test_jira_projection_types_changelog_semantics_for_generic_quality_policy() -> None:
+    item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
+    raw, normalized = _inputs(
+        item,
+        _jira_payload(
+            histories=[
+                {"id": "attachment", "items": [{"field": "Attachment"}]},
+                {"id": "routing", "items": [{"field": "priority"}]},
+                {"id": "domain", "items": [{"field": "description"}]},
+            ]
+        ),
+    )
+
+    projection = project_source_item(
+        source_id="src-j",
+        source_type="jira",
+        run_id="run-j-typed-changelog",
+        item=item,
+        raw=raw,
+        normalized=normalized,
+    )
+
+    semantics = {
+        str(revision.metadata["provider_key"]): revision.metadata.get(
+            "semantic_class"
+        )
+        for revision in projection.observation_revisions
+        if str(revision.metadata["provider_key"]) in {"attachment", "routing", "domain"}
+    }
+    assert semantics == {
+        "attachment": "attachment_event",
+        "routing": "operational_transition",
+        "domain": "domain_transition",
+    }
+
+
 @pytest.mark.parametrize("source_type", ["jira", "teams"])
 def test_operational_message_metadata_does_not_create_semantic_revision(source_type: str) -> None:
     if source_type == "jira":

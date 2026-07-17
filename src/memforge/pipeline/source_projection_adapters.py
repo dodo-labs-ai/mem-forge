@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Mapping
 
@@ -48,6 +48,23 @@ BUILTIN_SPECIALIZED_SOURCE_TYPES = frozenset(
     }
 )
 
+_JIRA_OPERATIONAL_HISTORY_FIELDS = frozenset(
+    {
+        "assignee",
+        "due date",
+        "duedate",
+        "fix version",
+        "fix version/s",
+        "fixversion",
+        "labels",
+        "priority",
+        "rank",
+        "resolution",
+        "sprint",
+        "status",
+    }
+)
+
 def source_run_projection_coverage(
     *,
     source_type: str | None = None,
@@ -78,6 +95,7 @@ class _ObservationInput:
     semantic_value: object
     locator: Mapping[str, object]
     observed_at: str | None = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
 
 
 class GeneSourceProjectionAdapter:
@@ -262,7 +280,7 @@ def project_source_item(
                 semantic_hash=semantic_hash,
                 content=value.content,
                 observed_at=value.observed_at,
-                metadata={"provider_key": value.provider_key},
+                metadata={**dict(value.metadata), "provider_key": value.provider_key},
             )
         )
     if coverage is ProjectionCoverage.PARTIAL_PROJECTION:
@@ -503,14 +521,14 @@ def _provider_authoritative_unit_coverage(
 
 def _teams_partition_scope_fingerprint(scope: Mapping[str, object]) -> str:
     values: dict[str, object] = {}
-    for field, default in (
+    for field_name, default in (
         ("conversation_gap_minutes", 60),
         ("max_block_messages", 100),
     ):
         try:
-            values[field] = int(scope.get(field, default))
+            values[field_name] = int(scope.get(field_name, default))
         except (TypeError, ValueError):
-            values[field] = default
+            values[field_name] = default
     return projection_scope_fingerprint(values)
 
 
@@ -710,6 +728,11 @@ def _project_native(
                     history,
                     {"issue_key": issue_key},
                     str(history.get("created") or "") or None,
+                    {
+                        "semantic_class": _jira_changelog_semantic_class(
+                            history
+                        )
+                    },
                 )
             )
         changelog_total = changelog.get("total")
@@ -951,6 +974,22 @@ def _project_native(
             "source_type": source_type,
         },
     )
+
+
+def _jira_changelog_semantic_class(history: Mapping[str, object]) -> str:
+    items = history.get("items")
+    history_items = items if isinstance(items, list) else []
+    fields = {
+        " ".join(str(item.get("field") or "").strip().lower().split())
+        for item in history_items
+        if isinstance(item, Mapping)
+    }
+    fields.discard("")
+    if fields and fields.issubset({"attachment"}):
+        return "attachment_event"
+    if fields and fields.issubset(_JIRA_OPERATIONAL_HISTORY_FIELDS):
+        return "operational_transition"
+    return "domain_transition"
 
 
 def _native_payload(raw: RawContent) -> object:

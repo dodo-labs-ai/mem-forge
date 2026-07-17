@@ -1038,6 +1038,23 @@ CREATE TABLE IF NOT EXISTS lifecycle_plans (
     error             TEXT
 );
 
+CREATE TABLE IF NOT EXISTS lifecycle_replay_ledgers (
+    lifecycle_plan_id TEXT PRIMARY KEY REFERENCES lifecycle_plans(id) ON DELETE CASCADE,
+    claim_count       INTEGER NOT NULL CHECK (claim_count >= 0),
+    created_at        TEXT NOT NULL,
+    invalidated_at    TEXT,
+    invalidation_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS lifecycle_replay_claims (
+    lifecycle_plan_id         TEXT NOT NULL REFERENCES lifecycle_replay_ledgers(lifecycle_plan_id) ON DELETE CASCADE,
+    memory_id                 TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    content_hash              TEXT NOT NULL,
+    evidence_reference_ids_json TEXT NOT NULL,
+    access_context_hash       TEXT NOT NULL,
+    PRIMARY KEY (lifecycle_plan_id, memory_id)
+);
+
 CREATE TABLE IF NOT EXISTS lifecycle_reviews (
     id                  TEXT PRIMARY KEY,
     lifecycle_plan_id   TEXT NOT NULL REFERENCES lifecycle_plans(id) ON DELETE CASCADE,
@@ -1405,6 +1422,10 @@ CREATE INDEX IF NOT EXISTS idx_agent_concepts_owner_repo ON agent_concepts(owner
 CREATE INDEX IF NOT EXISTS idx_agent_claims_concept ON agent_claims(concept_id);
 CREATE INDEX IF NOT EXISTS idx_agent_claims_memory ON agent_claims(memory_id);
 CREATE INDEX IF NOT EXISTS idx_relation_runs_result_memory ON relation_runs(result_memory_id);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_plans_exact_replay
+    ON lifecycle_plans(source_id, source_unit_id, target_unit_revision_id, status);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_replay_claims_memory
+    ON lifecycle_replay_claims(memory_id);
 
 -- Cross-document contradiction tracking
 CREATE TABLE IF NOT EXISTS memory_contradictions (
@@ -2766,6 +2787,33 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         [
             "ALTER TABLE source_sync_runs ADD COLUMN predecessor_activity_id TEXT",
             "ALTER TABLE source_sync_runs ADD COLUMN rerun_predecessor_activity_id TEXT",
+        ],
+    ),
+    (
+        60,
+        "Add immutable exact revision replay ledgers",
+        [
+            """CREATE TABLE IF NOT EXISTS lifecycle_replay_ledgers (
+                lifecycle_plan_id TEXT PRIMARY KEY REFERENCES lifecycle_plans(id) ON DELETE CASCADE,
+                claim_count INTEGER NOT NULL CHECK (claim_count >= 0),
+                created_at TEXT NOT NULL,
+                invalidated_at TEXT,
+                invalidation_reason TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS lifecycle_replay_claims (
+                lifecycle_plan_id TEXT NOT NULL REFERENCES lifecycle_replay_ledgers(lifecycle_plan_id) ON DELETE CASCADE,
+                memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                content_hash TEXT NOT NULL,
+                evidence_reference_ids_json TEXT NOT NULL,
+                access_context_hash TEXT NOT NULL,
+                PRIMARY KEY (lifecycle_plan_id, memory_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_lifecycle_plans_exact_replay
+                ON lifecycle_plans(
+                    source_id, source_unit_id, target_unit_revision_id, status
+                )""",
+            """CREATE INDEX IF NOT EXISTS idx_lifecycle_replay_claims_memory
+                ON lifecycle_replay_claims(memory_id)""",
         ],
     ),
 ]
@@ -6082,16 +6130,21 @@ class Database:
         """
 
         async with self.db.execute(
-            """SELECT id, payload_json
-                 FROM lifecycle_plans
-                WHERE source_id = ? AND source_unit_id = ?
-                  AND target_unit_revision_id = ? AND status = 'applied'
-                ORDER BY applied_at DESC, created_at DESC, id DESC
+            """SELECT lp.id, lp.payload_json,
+                      lrl.lifecycle_plan_id AS replay_ledger_id,
+                      lrl.claim_count, lrl.invalidated_at
+                 FROM lifecycle_plans lp
+                 LEFT JOIN lifecycle_replay_ledgers lrl ON lrl.lifecycle_plan_id = lp.id
+                WHERE lp.source_id = ? AND lp.source_unit_id = ?
+                  AND lp.target_unit_revision_id = ? AND lp.status = 'applied'
+                ORDER BY lp.applied_at DESC, lp.created_at DESC, lp.id DESC
                 LIMIT 1""",
             (source_id, source_unit_id, target_unit_revision_id),
         ) as cursor:
             plan_row = await cursor.fetchone()
         if plan_row is None:
+            return None
+        if plan_row["replay_ledger_id"] is None or plan_row["invalidated_at"] is not None:
             return None
 
         payload = json.loads(str(plan_row["payload_json"]))
@@ -6104,28 +6157,34 @@ class Database:
         } != set(observation_revision_ids):
             raise ValueError("exact revision replay Observation ledger mismatch")
 
-        raw_mutations = payload.get("mutations")
-        if not isinstance(raw_mutations, list):
-            raise ValueError("exact revision replay plan lacks a mutation ledger")
-        references_by_memory: dict[str, set[str]] = defaultdict(set)
-        for raw_mutation in raw_mutations:
-            if not isinstance(raw_mutation, Mapping) or raw_mutation.get("mutation_type") != "attach_support":
-                continue
-            memory_id = raw_mutation.get("memory_id")
-            reference_ids = raw_mutation.get("evidence_reference_ids")
-            if not isinstance(memory_id, str) or not memory_id:
-                raise ValueError("exact revision replay contains an invalid Memory id")
-            if not isinstance(reference_ids, list) or any(
-                not isinstance(reference_id, str) or not reference_id
-                for reference_id in reference_ids
-            ):
-                raise ValueError("exact revision replay contains invalid Evidence references")
-            references_by_memory[memory_id].update(reference_ids)
+        ledger_rows = await self.db.execute_fetchall(
+            """SELECT memory_id, content_hash, evidence_reference_ids_json,
+                      access_context_hash
+                 FROM lifecycle_replay_claims
+                WHERE lifecycle_plan_id = ?
+                ORDER BY memory_id""",
+            (plan_row["id"],),
+        )
+        if len(ledger_rows) != int(plan_row["claim_count"]):
+            raise ValueError("exact revision replay claim ledger is incomplete")
 
         claims: list[ExactRevisionReplayClaim] = []
         expected_revision_ids = set(observation_revision_ids)
-        for memory_id, reference_id_set in sorted(references_by_memory.items()):
-            reference_ids = tuple(sorted(reference_id_set))
+        for ledger_row in ledger_rows:
+            memory_id = str(ledger_row["memory_id"])
+            historical_content_hash = str(ledger_row["content_hash"])
+            raw_reference_ids = json.loads(str(ledger_row["evidence_reference_ids_json"]))
+            if (
+                not isinstance(raw_reference_ids, list)
+                or not raw_reference_ids
+                or any(
+                    not isinstance(reference_id, str) or not reference_id
+                    for reference_id in raw_reference_ids
+                )
+            ):
+                raise ValueError("exact revision replay contains invalid Evidence references")
+            reference_ids = tuple(sorted(set(raw_reference_ids)))
+            reference_id_set = set(reference_ids)
             placeholders = ", ".join("?" for _ in reference_ids)
             rows = await self.db.execute_fetchall(
                 f"""SELECT er.id AS reference_id, er.role,
@@ -6146,7 +6205,8 @@ class Database:
             if len(rows) != len(reference_ids):
                 raise ValueError("exact revision replay Evidence ledger is incomplete")
             access_hashes = {str(row["access_context_hash"]) for row in rows}
-            if len(access_hashes) != 1 or any(
+            historical_access_hash = str(ledger_row["access_context_hash"])
+            if access_hashes != {historical_access_hash} or any(
                 str(row["reference_id"]) not in reference_id_set
                 or str(row["role"]) == EvidenceRole.CONTEXT.value
                 or str(row["observation_revision_id"]) not in expected_revision_ids
@@ -6163,14 +6223,16 @@ class Database:
                 memory_row = await cursor.fetchone()
             if memory_row is None:
                 raise ValueError("exact revision replay Memory is missing")
+            if str(memory_row["content_hash"]) != historical_content_hash:
+                return None
             claims.append(
                 ExactRevisionReplayClaim(
                     memory_id=memory_id,
-                    content_hash=str(memory_row["content_hash"]),
+                    content_hash=historical_content_hash,
                     status=str(memory_row["status"]),
                     retirement_reason=memory_row["retirement_reason"],
                     evidence_reference_ids=reference_ids,
-                    access_context_hash=next(iter(access_hashes)),
+                    access_context_hash=historical_access_hash,
                     memory_version=_lifecycle_memory_version(memory_row),
                 )
             )
@@ -6441,6 +6503,7 @@ class Database:
                         (int(source_count["total"] or 0), memory_id),
                     )
                 await self._validate_projected_support_invariant_unlocked(plan)
+                await self._capture_lifecycle_replay_ledger_unlocked(plan, now=now)
                 await self.db.execute(
                     "UPDATE lifecycle_plans SET status = 'applied', applied_at = ? WHERE id = ?",
                     (now, plan.id),
@@ -6451,6 +6514,71 @@ class Database:
                 if _manage_transaction:
                     await self.db.rollback()
                 raise
+
+    async def _capture_lifecycle_replay_ledger_unlocked(
+        self,
+        plan: LifecyclePlan,
+        *,
+        now: str,
+    ) -> None:
+        """Persist the complete post-plan claim snapshot for exact revision replay."""
+
+        if any(
+            mutation.mutation_type is LifecycleMutationType.CREATE_REVIEW
+            for mutation in plan.mutations
+        ):
+            return
+        rows = await self.db.execute_fetchall(
+            """SELECT msa.memory_id, m.content_hash, msa.access_context_hash,
+                      msa.evidence_reference_id
+                 FROM memory_support_assertions msa
+                 JOIN memories m ON m.id = msa.memory_id
+                 JOIN evidence_references er ON er.id = msa.evidence_reference_id
+                 JOIN source_observations so ON so.id = er.observation_id
+                WHERE msa.source_id = ? AND msa.active = 1
+                  AND so.source_unit_id = ?
+                  AND er.observation_revision_id = so.current_revision_id
+                ORDER BY msa.memory_id, msa.evidence_reference_id""",
+            (plan.scope.source_id, plan.scope.source_unit_id),
+        )
+        claims: dict[str, tuple[str, str, list[str]]] = {}
+        for row in rows:
+            memory_id = str(row["memory_id"])
+            content_hash_value = str(row["content_hash"])
+            access_context_hash = str(row["access_context_hash"])
+            claim = claims.setdefault(
+                memory_id,
+                (content_hash_value, access_context_hash, []),
+            )
+            if claim[:2] != (content_hash_value, access_context_hash):
+                raise ValueError("exact revision replay claim snapshot is ambiguous")
+            claim[2].append(str(row["evidence_reference_id"]))
+
+        await self.db.execute(
+            """INSERT INTO lifecycle_replay_ledgers (
+                   lifecycle_plan_id, claim_count, created_at
+               ) VALUES (?, ?, ?)""",
+            (plan.id, len(claims), now),
+        )
+        for memory_id, (content_hash_value, access_context_hash, reference_ids) in sorted(
+            claims.items()
+        ):
+            await self.db.execute(
+                """INSERT INTO lifecycle_replay_claims (
+                       lifecycle_plan_id, memory_id, content_hash,
+                       evidence_reference_ids_json, access_context_hash
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    plan.id,
+                    memory_id,
+                    content_hash_value,
+                    json.dumps(
+                        sorted(set(reference_ids)),
+                        separators=(",", ":"),
+                    ),
+                    access_context_hash,
+                ),
+            )
 
     async def _validate_projected_support_invariant_unlocked(
         self,
@@ -8556,6 +8684,16 @@ class Database:
                 return False
 
             now = _now_iso()
+            await self.db.execute(
+                """UPDATE lifecycle_replay_ledgers
+                      SET invalidated_at = ?, invalidation_reason = 'memory_purged'
+                    WHERE lifecycle_plan_id IN (
+                        SELECT lifecycle_plan_id
+                          FROM lifecycle_replay_claims
+                         WHERE memory_id = ?
+                    )""",
+                (now, memory_id),
+            )
             await self.db.execute(
                 """UPDATE memories SET
                     superseded_by = NULL, status = 'retired',

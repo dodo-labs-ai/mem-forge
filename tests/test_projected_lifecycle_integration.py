@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -2544,6 +2545,72 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
 
 
 @pytest.mark.asyncio
+async def test_projected_quality_consumes_typed_observation_semantics(
+    db: Database,
+) -> None:
+    projection = _projection(
+        run_id="projection-operational-transition",
+        body="The ticket priority changed from high to low.",
+    )
+    typed_revision = replace(
+        projection.observation_revisions[0],
+        metadata={
+            **projection.observation_revisions[0].metadata,
+            "semantic_class": "operational_transition",
+        },
+    )
+    projection = replace(
+        projection,
+        observation_revisions=(typed_revision,),
+    )
+    raw = RawMemory(
+        content="The ticket priority changed from high to low.",
+        memory_type="fact",
+        extraction_context="opaque provider payload",
+        source_observation_id=projection.observations[0].id,
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=[raw],
+        doc_type="document",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content=typed_revision.content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+
+    assert stats["added"] == 0
+    assert stats["skipped"] == 1
+    assert await db.count_memories() == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_replay_schema_has_bounded_lookup_indexes(db: Database) -> None:
+    async with db.db.execute("PRAGMA index_list('lifecycle_plans')") as cursor:
+        plan_indexes = {str(row["name"]) for row in await cursor.fetchall()}
+    async with db.db.execute(
+        "PRAGMA index_list('lifecycle_replay_claims')"
+    ) as cursor:
+        claim_indexes = {str(row["name"]) for row in await cursor.fetchall()}
+
+    assert "idx_lifecycle_plans_exact_replay" in plan_indexes
+    assert "idx_lifecycle_replay_claims_memory" in claim_indexes
+
+
+@pytest.mark.asyncio
 async def test_enabled_source_tombstone_retires_last_supported_incumbent(db: Database) -> None:
     initial = _projection(run_id="projection-before-delete", body="A7 is removed.")
     await db.record_source_projection(initial)
@@ -2584,6 +2651,160 @@ async def test_enabled_source_tombstone_retires_last_supported_incumbent(db: Dat
     assert await db.get_memory_sources(incumbent.id) == []
     assert await db.get_evidence_unit(f"eu-{incumbent.id}") is not None
     assert await db.get_source_projection(initial.run_id) == initial
+
+
+@pytest.mark.asyncio
+async def test_exact_revision_replay_uses_complete_snapshot_after_later_noop_plan(
+    db: Database,
+) -> None:
+    body = "A7 applies only to regular payroll."
+    projection = _projection(run_id="projection-before-later-noop", body=body)
+    raw = RawMemory(
+        content=body,
+        memory_type="decision",
+        confidence=0.95,
+        evidence_quote=body,
+        extraction_context=body,
+        evidence_anchor="projection_batch",
+        source_observation_id=projection.observations[0].id,
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+    await engine.apply_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=[raw],
+        doc_type="document",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content=body,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    [memory] = await db.list_memories(source="src-1", status="active")
+
+    target_revision_id = projection.source_unit_revisions[0].id
+    later_scope = ReconciliationScope(
+        id="same-revision-later-noop",
+        source_id="src-1",
+        source_unit_id=projection.source_units[0].id,
+        base_unit_revision_id=target_revision_id,
+        target_unit_revision_id=target_revision_id,
+    )
+    later_plan = LifecyclePlan(
+        id=lifecycle_plan_id(later_scope),
+        scope=later_scope,
+        gate_state=LifecycleGateState.GATED,
+        coverage_proof=CoverageProof((), (), (), ()),
+        stale_guard=StaleGuard(
+            observation_revision_ids=tuple(
+                revision.id for revision in projection.observation_revisions
+            ),
+            support_set_hashes={},
+        ),
+        mutations=(),
+    )
+    await db.apply_lifecycle_plan(later_plan)
+
+    replay = await adapters.relational.get_exact_revision_replay(
+        source_id="src-1",
+        source_unit_id=projection.source_units[0].id,
+        target_unit_revision_id=target_revision_id,
+        observation_revision_ids=tuple(
+            revision.id for revision in projection.observation_revisions
+        ),
+    )
+
+    assert replay is not None
+    assert replay.lifecycle_plan_id == later_plan.id
+    assert [claim.memory_id for claim in replay.claims] == [memory.id]
+    assert replay.claims[0].content_hash == memory.content_hash
+
+    await db.db.execute(
+        "UPDATE memories SET content_hash = ? WHERE id = ?",
+        ("incompatible-current-content", memory.id),
+    )
+    await db.db.commit()
+
+    incompatible = await adapters.relational.get_exact_revision_replay(
+        source_id="src-1",
+        source_unit_id=projection.source_units[0].id,
+        target_unit_revision_id=target_revision_id,
+        observation_revision_ids=tuple(
+            revision.id for revision in projection.observation_revisions
+        ),
+    )
+
+    assert incompatible is None
+
+    await db.db.execute(
+        "UPDATE memories SET content_hash = ? WHERE id = ?",
+        (memory.content_hash, memory.id),
+    )
+    await db.db.commit()
+
+    review_scope = replace(later_scope, id="same-revision-later-review")
+    review_plan = LifecyclePlan(
+        id=lifecycle_plan_id(review_scope),
+        scope=review_scope,
+        gate_state=LifecycleGateState.GATED,
+        coverage_proof=CoverageProof((), (), (), ()),
+        stale_guard=later_plan.stale_guard,
+        mutations=(
+            LifecycleMutation(
+                mutation_type=LifecycleMutationType.CREATE_REVIEW,
+                memory_id=memory.id,
+                source_id="src-1",
+                payload={"review_id": "review-blocks-exact-replay"},
+            ),
+        ),
+    )
+    await db.apply_lifecycle_plan(review_plan)
+
+    review_blocked = await adapters.relational.get_exact_revision_replay(
+        source_id="src-1",
+        source_unit_id=projection.source_units[0].id,
+        target_unit_revision_id=target_revision_id,
+        observation_revision_ids=tuple(
+            revision.id for revision in projection.observation_revisions
+        ),
+    )
+
+    assert review_blocked is None
+
+    async with db.db.execute(
+        "SELECT lifecycle_plan_id FROM lifecycle_replay_claims WHERE memory_id = ?",
+        (memory.id,),
+    ) as cursor:
+        replay_plan_ids = tuple(row[0] for row in await cursor.fetchall())
+    assert len(replay_plan_ids) == 2
+
+    assert await db.purge_memory(memory.id) is True
+    placeholders = ", ".join("?" for _ in replay_plan_ids)
+    async with db.db.execute(
+        f"SELECT invalidated_at, invalidation_reason FROM lifecycle_replay_ledgers "
+        f"WHERE lifecycle_plan_id IN ({placeholders})",
+        replay_plan_ids,
+    ) as cursor:
+        invalidated_ledgers = await cursor.fetchall()
+    assert len(invalidated_ledgers) == 2
+    assert all(row["invalidated_at"] for row in invalidated_ledgers)
+    assert {
+        row["invalidation_reason"] for row in invalidated_ledgers
+    } == {"memory_purged"}
+    async with db.db.execute(
+        "SELECT COUNT(*) FROM lifecycle_replay_claims WHERE memory_id = ?",
+        (memory.id,),
+    ) as cursor:
+        assert (await cursor.fetchone())[0] == 0
 
 
 @pytest.mark.asyncio
@@ -2677,6 +2898,25 @@ async def test_exact_scope_reentry_restores_historical_revision_without_reextrac
     still_retired = await db.get_memory(memory.id)
     assert access_mismatch is None
     assert still_retired is not None and still_retired.status == "retired"
+
+    await db.db.execute(
+        "UPDATE memories SET retirement_reason = ? WHERE id = ?",
+        ("admin_hidden", memory.id),
+    )
+    await db.db.commit()
+    incompatible_lifecycle = await engine.restore_exact_projected_revision(
+        projection=reentry,
+        doc_id="confluence-123",
+        project_key="ENG",
+        repo_identifier=None,
+        scope_transition={"id": "scope-return-to-original-selector"},
+    )
+    assert incompatible_lifecycle is None
+    await db.db.execute(
+        "UPDATE memories SET retirement_reason = ? WHERE id = ?",
+        ("source Unit removed by authoritative discovery", memory.id),
+    )
+    await db.db.commit()
 
     restored = await engine.restore_exact_projected_revision(
         projection=reentry,
