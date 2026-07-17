@@ -5328,6 +5328,8 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
             self.force_full_sync_values: list[bool] = []
             self.extraction_pools: list[ExtractionWorkPool | None] = []
             self.lifecycle_cycle_ids: list[str] = []
+            self.vector_delivery_source_ids: list[str] = []
+            self.memory_store = self
 
         async def build_sync_runtime(
             self,
@@ -5339,7 +5341,14 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
         ):
             del db, config, document_lifecycle_admission
             self.extraction_pools.append(extraction_pool)
-            return object()
+            return self
+
+        async def attempt_lifecycle_vector_delivery(
+            self,
+            *,
+            source_id: str,
+        ) -> None:
+            self.vector_delivery_source_ids.append(source_id)
 
         async def run_source_sync(self, **kwargs):
             self.force_full_sync_values.append(bool(kwargs["force_full_sync"]))
@@ -5377,6 +5386,67 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
     assert provider.force_full_sync_values == [True]
     assert provider.extraction_pools == [worker._extraction_pool]
     assert provider.lifecycle_cycle_ids == [f"{enqueued.run_id}:attempt:1"]
+    assert provider.vector_delivery_source_ids == [source_id]
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_keeps_success_when_vector_delivery_raises(
+    db: Database,
+    monkeypatch,
+) -> None:
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-vector-pending"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Worker vector pending",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+
+    class PendingVectorRuntimeProvider:
+        def __init__(self) -> None:
+            self.memory_store = self
+
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return self
+
+        async def attempt_lifecycle_vector_delivery(self, *, source_id: str) -> None:
+            raise RuntimeError(f"temporary vector failure for {source_id}")
+
+        async def run_source_sync(self, **kwargs):
+            return SyncState(
+                source=str(kwargs["source"]["id"]),
+                last_sync_at=datetime(2026, 7, 17, 9, 0, tzinfo=timezone.utc),
+                last_sync_status="success",
+            )
+
+    logged_errors: list[tuple] = []
+    monkeypatch.setattr(
+        runtime.logger,
+        "exception",
+        lambda *args, **kwargs: logged_errors.append((args, kwargs)),
+    )
+    provider = PendingVectorRuntimeProvider()
+    service = SyncService(db, AppConfig(), runtime_provider=provider)
+    enqueued = await service.enqueue_source(source_id, trigger="manual")
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=provider,
+        worker_id="worker-vector-pending",
+    )
+
+    await worker.run_once()
+
+    completed = await db.get_source_sync_run(enqueued.run_id)
+    assert completed is not None
+    assert completed.status == "success"
+    assert len(logged_errors) == 1
+    assert logged_errors[0][0][1] == source_id
 
 
 @pytest.mark.asyncio
