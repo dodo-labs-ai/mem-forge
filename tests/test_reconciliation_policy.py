@@ -407,3 +407,62 @@ async def test_missing_new_extraction_decision_invalidates_batch() -> None:
     assert result.operations == []
     assert result.failure is not None
     assert "missing new extraction decisions" in result.failure.error
+
+
+@pytest.mark.asyncio
+async def test_invalid_replacement_without_candidate_index_retries_only_reconciliation_batch() -> None:
+    incumbent = _memory("mem-existing", "Service uses PostgreSQL 15.")
+
+    class CorrectingClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.prompts: list[str] = []
+
+        async def reconcile_memories(self, prompt: str, **kwargs):
+            del kwargs
+            self.calls += 1
+            self.prompts.append(prompt)
+            if self.calls == 1:
+                return ReconciliationResponse(
+                    decisions=[
+                        ReconciliationDecision(
+                            index=0,
+                            action="ADD",
+                            reason="New version claim",
+                        ),
+                        ReconciliationDecision(
+                            action="SUPERSEDE",
+                            memory_id=incumbent.id,
+                            reason="Version changed",
+                        ),
+                    ]
+                )
+            return ReconciliationResponse(
+                decisions=[
+                    ReconciliationDecision(
+                        index=0,
+                        action="SUPERSEDE",
+                        memory_id=incumbent.id,
+                        reason="Version changed",
+                    )
+                ]
+            )
+
+    client = CorrectingClient()
+    result = await reconcile_memories(
+        new_extractions=[
+            RawMemory(content="Service uses PostgreSQL 16.", memory_type="fact")
+        ],
+        existing_memories=[incumbent],
+        doc_type="design",
+        structured_llm_client=client,
+        updated_document="# Design\n\nService uses PostgreSQL 16.",
+        include_metadata=True,
+    )
+
+    assert result.failure is None
+    assert client.calls == 2
+    assert "replacement decision for incumbent mem-existing requires a new extraction index" in client.prompts[1]
+    assert [operation.action for operation in result.operations] == [
+        ReconcileAction.SUPERSEDE
+    ]
