@@ -4269,7 +4269,6 @@ def create_admin_app(
                 status_code=409,
                 detail="agent_session_requires_managed_claim_lineage_repair",
             )
-        await sync_service.cancel_source(source_id)
         try:
             job = await db.create_source_rebaseline_job(
                 LifecycleBackfillJob(
@@ -4280,6 +4279,7 @@ def create_admin_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await sync_service.cancel_source(source_id)
         fenced_source = await db.get_source(source_id)
         if fenced_source is None:
             await db.fail_lifecycle_backfill_job(

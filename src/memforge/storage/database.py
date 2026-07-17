@@ -13041,6 +13041,41 @@ class Database:
             row = await cursor.fetchone()
         return _source_sync_run_from_row(row) if row else None
 
+    async def cancel_pending_source_sync_run(
+        self,
+        *,
+        source_id: str,
+        error_message: str,
+    ) -> bool:
+        """Terminate an unleased durable run so source configuration can change."""
+
+        cancelled_at = _now_iso()
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE source_sync_runs
+                   SET status = 'failed',
+                       rerun_requested = 0,
+                       rerun_input_snapshot_id = NULL,
+                       rerun_input_generation_watermark = NULL,
+                       rerun_source_config_revision = NULL,
+                       rerun_predecessor_activity_id = NULL,
+                       lease_owner = NULL,
+                       lease_expires_at = NULL,
+                       next_attempt_at = NULL,
+                       error_message = ?,
+                       completed_at = ?,
+                       updated_at = ?
+                   WHERE source_id = ? AND status = 'pending'""",
+                (
+                    error_message,
+                    cancelled_at,
+                    cancelled_at,
+                    source_id,
+                ),
+            )
+            await self.db.commit()
+        return bool(cursor.rowcount)
+
     async def get_latest_source_sync_run(
         self,
         *,
