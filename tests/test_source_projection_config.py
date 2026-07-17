@@ -42,8 +42,28 @@ def test_namespace_is_separate_from_scope() -> None:
         "base_url": "https://jira.example.test"
     }
     assert canonical_projection_scope("jira", config) == {
-        "query_mode": "projects",
+        "query_mode": "simple",
         "projects": ["PAY"],
+        "include_comments": True,
+    }
+
+
+def test_jira_advanced_jql_is_the_projection_scope() -> None:
+    scope = canonical_projection_scope(
+        "jira",
+        {
+            "query_mode": "advanced",
+            "jql": "project = PAY AND updated >= -30d ORDER BY Rank ASC",
+            "projects": ["IGNORED"],
+            "jql_filter": "status = Open",
+            "issue_types": ["Bug"],
+            "include_comments": True,
+        },
+    )
+
+    assert scope == {
+        "query_mode": "advanced",
+        "jql": "project = PAY AND updated >= -30d ORDER BY Rank ASC",
         "include_comments": True,
     }
 
