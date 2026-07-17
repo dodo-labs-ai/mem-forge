@@ -410,6 +410,83 @@ async def test_litellm_structured_client_repairs_invalid_json_backslash_escapes(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        (
+            "Looking at the updated document, this memory should be removed.\n"
+            '{"decisions":[{"action":"DELETE","memory_id":"mem-1",'
+            '"reason":"unsupported","flag_for_review":false}]}'
+        ),
+        (
+            "Here is the corrected ledger:\n```json\n"
+            '{"decisions":[{"action":"DELETE","memory_id":"mem-1",'
+            '"reason":"unsupported","flag_for_review":false}]}\n```'
+        ),
+    ],
+)
+async def test_litellm_structured_client_accepts_one_schema_valid_json_object_with_commentary(
+    monkeypatch,
+    content,
+    caplog,
+):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse(content)
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+        )
+    )
+
+    response = await client.reconcile_memories("prompt")
+
+    assert response.decisions[0].action == "DELETE"
+    assert response.decisions[0].memory_id == "mem-1"
+    assert len(calls) == 1
+    assert any(
+        "recovered exactly one schema-valid JSON object" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_rejects_ambiguous_schema_valid_json_objects(monkeypatch):
+    calls = []
+    decision = (
+        '{"decisions":[{"action":"DELETE","memory_id":"mem-1",'
+        '"reason":"unsupported","flag_for_review":false}]}'
+    )
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse(f"{decision}\n{decision}")
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+        )
+    )
+
+    with pytest.raises(StructuredLlmError, match="ambiguous structured JSON objects"):
+        await client.reconcile_memories("prompt")
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypatch):
     calls = []
 

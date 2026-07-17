@@ -299,6 +299,52 @@ class TestSupportAwareRetirement:
         assert await db.list_source_artifact_cleanup_tasks(limit=10) == []
 
     @pytest.mark.asyncio
+    async def test_artifact_cleanup_completes_uri_not_owned_by_current_store(self, db, tmp_path):
+        from memforge.storage.document_store import LocalDocumentStore
+        from memforge.storage.source_cleanup import SourceArtifactCleanupService
+
+        source_id = "src-legacy-artifact"
+        now = datetime.now(timezone.utc)
+        stale_uri = "/old-container/.memforge/documents/src-legacy-artifact/page.md"
+        await db.upsert_source(
+            source_id,
+            "confluence",
+            "Legacy Artifact Source",
+            "{}",
+            access_policy="workspace",
+            owner_user_id="dev",
+        )
+        await db.upsert_document(
+            DocumentRecord(
+                doc_id="doc-legacy-artifact",
+                source=source_id,
+                source_url="https://wiki.example.test/doc-legacy-artifact",
+                title="Legacy Architecture",
+                space_or_project="SFPAY",
+                author=None,
+                last_modified=now,
+                labels=[],
+                version="1",
+                content_hash="legacy-artifact-hash",
+                token_count=10,
+                raw_content_uri=None,
+                raw_content_type=None,
+                normalized_content_uri=stale_uri,
+                pdf_content_uri=None,
+                last_synced=now,
+            )
+        )
+        await db.delete_source_cascade(source_id)
+
+        processed = await SourceArtifactCleanupService(
+            db,
+            LocalDocumentStore(str(tmp_path / "current-documents")),
+        ).run_pending(limit=10)
+
+        assert processed == 1
+        assert await db.list_source_artifact_cleanup_tasks(limit=10) == []
+
+    @pytest.mark.asyncio
     async def test_document_deletion_uses_the_same_artifact_cleanup_outbox(self, db):
         source_id = "src-document-cleanup"
         now = datetime.now(timezone.utc)

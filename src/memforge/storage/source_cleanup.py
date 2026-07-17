@@ -7,7 +7,7 @@ import logging
 from typing import Protocol
 
 from memforge.models import SourceArtifactCleanupTask
-from memforge.storage.document_store import DocumentStore
+from memforge.storage.document_store import ArtifactNotOwnedError, DocumentStore
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,16 @@ class SourceArtifactCleanupService:
                     self._document_store.delete_artifact,
                     task.artifact_uri,
                 )
+            except ArtifactNotOwnedError as exc:
+                logger.warning(
+                    "Artifact cleanup task %s is outside this store's ownership boundary; "
+                    "completing without deletion: %s",
+                    task.task_id,
+                    exc,
+                )
+                await self._store.complete_source_artifact_cleanup_task(task.task_id)
+                completed += 1
+                continue
             except Exception as exc:
                 logger.warning("Artifact cleanup failed for task %s: %s", task.task_id, exc)
                 await self._store.fail_source_artifact_cleanup_task(task.task_id, str(exc))

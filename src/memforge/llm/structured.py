@@ -477,9 +477,38 @@ def _validate_structured_json_text(text: str, response_format: type[BaseModel]):
         return response_format.model_validate_json(stripped)
     except ValidationError as exc:
         repaired = _escape_invalid_json_backslashes(stripped)
-        if repaired == stripped or "Invalid JSON" not in str(exc):
-            raise
-        return response_format.model_validate_json(repaired)
+        if repaired != stripped and "Invalid JSON" in str(exc):
+            try:
+                return response_format.model_validate_json(repaired)
+            except ValidationError:
+                pass
+
+        valid_objects = []
+        decoder = json.JSONDecoder()
+        cursor = 0
+        while (start := stripped.find("{", cursor)) != -1:
+            try:
+                candidate, end = decoder.raw_decode(stripped, start)
+            except json.JSONDecodeError:
+                cursor = start + 1
+                continue
+            cursor = end
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                valid_objects.append(response_format.model_validate(candidate))
+            except ValidationError:
+                continue
+        if len(valid_objects) == 1:
+            logger.warning(
+                "Structured LLM output for schema %s contained non-JSON framing; "
+                "recovered exactly one schema-valid JSON object",
+                response_format.__name__,
+            )
+            return valid_objects[0]
+        if len(valid_objects) > 1:
+            raise ValueError("ambiguous structured JSON objects") from exc
+        raise
 
 
 class LiteLlmStructuredClient:
