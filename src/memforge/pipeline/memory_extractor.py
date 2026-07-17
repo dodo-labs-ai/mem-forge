@@ -13,6 +13,7 @@ from memforge.config import DEFAULT_ENRICHMENT_MAX_TOKENS
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError
 from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.document_units import ExtractionContext
+from memforge.pipeline.document_update import DEFAULT_MAX_DIFF_CHARS
 from memforge.pipeline.projection_context import ProjectionExtractionBatch
 
 if TYPE_CHECKING:
@@ -32,7 +33,7 @@ EXTRACTION_QUOTE_MAX_CHARS = 200
 EXTRACTION_TAG_MIN = 2
 EXTRACTION_TAG_MAX = 5
 DOC_CONTENT_CHAR_CAP = 100_000
-CHANGED_HUNK_CHAR_CAP = 40_000
+CHANGED_HUNK_CHAR_CAP = DEFAULT_MAX_DIFF_CHARS
 UPDATED_DOC_CHAR_CAP = 100_000
 EXISTING_MEMORIES_WINDOW = 30
 EXISTING_MEMORIES_WINDOW_CHANGE = 50
@@ -467,6 +468,7 @@ class MemoryExtractor:
             return result
         kept = []
         primary_content = dict(batch.primary_content_by_observation_id)
+        context_by_primary = dict(batch.context_observation_ids_by_primary)
         for memory in result.memories:
             quote = (memory.evidence_quote or memory.extraction_context or "").strip()
             if not quote or quote not in batch.primary_markdown:
@@ -490,9 +492,10 @@ class MemoryExtractor:
             memory.extraction_context = quote[:EXTRACTION_QUOTE_MAX_CHARS]
             memory.source_observation_id = source_observation_id
             required_ids = tuple(dict.fromkeys(memory.required_source_observation_ids))
+            allowed_context_ids = context_by_primary.get(source_observation_id, ())
             if (
                 source_observation_id in required_ids
-                or any(item not in batch.context_observation_ids for item in required_ids)
+                or any(item not in allowed_context_ids for item in required_ids)
             ):
                 continue
             memory.required_source_observation_ids = list(required_ids)

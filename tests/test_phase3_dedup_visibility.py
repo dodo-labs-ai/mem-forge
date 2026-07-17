@@ -266,6 +266,39 @@ async def test_projected_equivalence_crosses_project_relevance_boundary(db, monk
 
 
 @pytest.mark.asyncio
+async def test_projected_equivalence_recalls_exact_rebaseline_retirement_without_vector(
+    db,
+    monkeypatch,
+):
+    retired = _mem(
+        "m-rebaseline-retired",
+        "A7 is retained.",
+        project_key="RISK",
+        status="retired",
+    )
+    retired.retirement_reason = "source_rebaseline"
+    await db.insert_memory(retired)
+    adapters = build_sqlite_adapters(db, memory_collection=_FakeColl())
+    store = MemoryStore(
+        adapters.relational,
+        adapters.keyword,
+        adapters.vector,
+        embed_cfg={},
+        dedup_threshold=0.08,
+    )
+
+    async def _stub_embed(_text):
+        return [0.1, 0.1, 0.1]
+
+    monkeypatch.setattr(store, "_embed", _stub_embed)
+    replayed = _mem("m-replayed", "A7 is retained.", project_key="PAY")
+
+    candidates = await store.find_access_compatible_equivalence_candidates(replayed)
+
+    assert [item.id for item in candidates] == [retired.id]
+
+
+@pytest.mark.asyncio
 async def test_projected_equivalence_does_not_cross_repository_access_identity(db, monkeypatch):
     incumbent = _mem("m-incumbent", "A7 is retained.", project_key="RISK")
     incumbent.repo_identifier = "repo-a"

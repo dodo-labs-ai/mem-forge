@@ -10,10 +10,11 @@ from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
     execution_owner_user_id,
     is_local_agent_backed_source,
-    local_agent_authoritative_snapshot_id,
+    local_agent_collection_attempt_id,
     local_agent_completion_status,
     local_agent_input_sha256,
     local_agent_job_config,
+    local_agent_rebaseline_snapshot_is_authoritative,
     local_agent_semantic_input_sha256,
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
@@ -80,10 +81,51 @@ def test_local_agent_attempt_identity_and_retry_status_are_deterministic() -> No
     assert local_agent_sync_snapshot_id("job-1", 2) == "job-1:attempt:2"
     assert local_agent_completion_status("failed", retryable=True, attempt_count=4) == "queued"
     assert local_agent_completion_status("failed", retryable=True, attempt_count=5) == "failed"
-    assert local_agent_authoritative_snapshot_id("jira", "job-1", 2, "job-1:attempt:2") == "job-1:attempt:2"
+    assert local_agent_collection_attempt_id(
+        "jira", "job-1", 2, "job-1:attempt:2"
+    ) == "job-1:attempt:2"
+    assert local_agent_collection_attempt_id("teams", "job-1", 2) == "job-1:attempt:2"
     with pytest.raises(ValueError, match="does not match"):
-        local_agent_authoritative_snapshot_id("jira", "job-1", 2, "spoofed")
-    assert local_agent_authoritative_snapshot_id("teams", "job-1", 2) is None
+        local_agent_collection_attempt_id("jira", "job-1", 2, "spoofed")
+    with pytest.raises(ValueError, match="not registered"):
+        local_agent_collection_attempt_id("unregistered", "job-1", 2)
+
+
+@pytest.mark.parametrize("source_type", ["github_repo", "jira", "local_markdown"])
+def test_document_collection_snapshot_is_authoritative_for_rebaseline(
+    source_type: str,
+) -> None:
+    assert local_agent_rebaseline_snapshot_is_authoritative(
+        source_type,
+        force_full_sync=False,
+        input_snapshot_id="job-1:attempt:1",
+    )
+
+
+def test_teams_snapshot_is_authoritative_for_rebaseline_only_when_force_full() -> None:
+    assert local_agent_rebaseline_snapshot_is_authoritative(
+        "teams",
+        force_full_sync=True,
+        input_snapshot_id="job-1:attempt:1",
+    )
+    assert not local_agent_rebaseline_snapshot_is_authoritative(
+        "teams",
+        force_full_sync=False,
+        input_snapshot_id="job-1:attempt:1",
+    )
+    assert not local_agent_rebaseline_snapshot_is_authoritative(
+        "teams",
+        force_full_sync=True,
+        input_snapshot_id=None,
+    )
+
+
+def test_unregistered_source_never_inherits_rebaseline_snapshot_authority() -> None:
+    assert not local_agent_rebaseline_snapshot_is_authoritative(
+        "unregistered",
+        force_full_sync=True,
+        input_snapshot_id="job-1:attempt:1",
+    )
 
 
 def test_local_agent_job_payload_preserves_complete_collection_scope() -> None:

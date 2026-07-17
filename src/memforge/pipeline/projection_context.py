@@ -17,6 +17,7 @@ class ProjectionExtractionBatch:
     primary_observation_ids: tuple[str, ...]
     primary_content_by_observation_id: tuple[tuple[str, str], ...]
     context_observation_ids: tuple[str, ...]
+    context_observation_ids_by_primary: tuple[tuple[str, tuple[str, ...]], ...]
     primary_markdown: str
     context_markdown: str
 
@@ -64,12 +65,6 @@ def plan_projection_extraction_batches(
     if not primary_ids:
         return ()
 
-    related: dict[str, set[str]] = {item: set() for item in ordered_ids}
-    for relation in projection.relations:
-        if relation.from_id in related and relation.to_id in related:
-            related[relation.from_id].add(relation.to_id)
-            related[relation.to_id].add(relation.from_id)
-
     if max_primary_observations < 1 or max_primary_chars < 1 or max_context_chars < 0:
         raise ValueError("projection extraction budgets must be positive")
     if primary_overlap_chars < 0:
@@ -106,21 +101,39 @@ def plan_projection_extraction_batches(
     batches = []
     for index, group in enumerate(groups):
         primary = tuple(dict.fromkeys(segment.observation_id for segment in group))
-        context_candidates: list[str] = []
-        for observation_id in primary:
-            position = ordered_ids.index(observation_id)
-            if position > 0:
-                context_candidates.append(ordered_ids[position - 1])
-            if position + 1 < len(ordered_ids):
-                context_candidates.append(ordered_ids[position + 1])
-            context_candidates.extend(sorted(related[observation_id]))
-        if ordered_ids:
-            context_candidates.append(ordered_ids[0])
         primary_set = set(primary)
+        context_candidates_by_primary = tuple(
+            (
+                observation_id,
+                tuple(
+                    item
+                    for item in context_observation_ids_for(projection, observation_id)
+                    if item not in primary_set
+                ),
+            )
+            for observation_id in primary
+        )
+        root_observation_id = ordered_ids[0] if ordered_ids else None
+        context_candidates = [
+            item
+            for _, candidates in context_candidates_by_primary
+            for item in candidates
+            if item != root_observation_id
+        ]
+        if root_observation_id is not None and root_observation_id not in primary_set:
+            context_candidates.append(root_observation_id)
         context = tuple(
             dict.fromkeys(
-                item for item in context_candidates if item not in primary_set and item in revisions
+                item for item in context_candidates if item in revisions
             )
+        )
+        context_set = set(context)
+        context_by_primary = tuple(
+            (
+                observation_id,
+                tuple(item for item in candidates if item in context_set),
+            )
+            for observation_id, candidates in context_candidates_by_primary
         )
         primary_markdown = "\n\n".join(segment.markdown for segment in group)
         primary_content_by_observation_id = tuple(
@@ -148,11 +161,38 @@ def plan_projection_extraction_batches(
                 primary_observation_ids=primary,
                 primary_content_by_observation_id=primary_content_by_observation_id,
                 context_observation_ids=context,
+                context_observation_ids_by_primary=context_by_primary,
                 primary_markdown=primary_markdown,
                 context_markdown=context_markdown,
             )
         )
     return tuple(batches)
+
+
+def context_observation_ids_for(
+    projection: SourceProjection,
+    primary_observation_id: str,
+) -> tuple[str, ...]:
+    """Return deterministic claim context for one projected Observation."""
+
+    revisions = {item.observation_id for item in projection.observation_revisions}
+    ordered_ids = tuple(item.id for item in projection.observations if item.id in revisions)
+    if primary_observation_id not in ordered_ids:
+        return ()
+    position = ordered_ids.index(primary_observation_id)
+    candidates: list[str] = []
+    if position > 0:
+        candidates.append(ordered_ids[position - 1])
+    if position + 1 < len(ordered_ids):
+        candidates.append(ordered_ids[position + 1])
+    for relation in projection.relations:
+        if relation.from_id == primary_observation_id and relation.to_id in revisions:
+            candidates.append(relation.to_id)
+        elif relation.to_id == primary_observation_id and relation.from_id in revisions:
+            candidates.append(relation.from_id)
+    if ordered_ids and ordered_ids[0] != primary_observation_id:
+        candidates.append(ordered_ids[0])
+    return tuple(dict.fromkeys(candidates))
 
 
 def _primary_segments(

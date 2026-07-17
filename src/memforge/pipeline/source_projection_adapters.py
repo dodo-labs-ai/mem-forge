@@ -197,6 +197,7 @@ def project_source_item(
 
     prior_observation_revisions = prior_observation_revisions or {}
     native = _native_payload(raw)
+    projected_scope = dict(scope or {})
     unit_type, provider_key, observations_input, relations_input, coverage, locator = _project_native(
         source_id=source_id,
         source_type=source_type,
@@ -204,7 +205,12 @@ def project_source_item(
         native=native,
         normalized=normalized,
     )
-    projected_scope = dict(scope or {})
+    coverage = _provider_authoritative_unit_coverage(
+        source_type=source_type,
+        native=native,
+        coverage=coverage,
+        projected_scope=projected_scope,
+    )
     if source_type == "teams":
         locator = _teams_scope_attested_locator(
             locator=locator,
@@ -469,6 +475,30 @@ def _teams_scope_attested_locator(
             }
         )
     return result
+
+
+def _provider_authoritative_unit_coverage(
+    *,
+    source_type: str,
+    native: object,
+    coverage: ProjectionCoverage,
+    projected_scope: Mapping[str, object],
+) -> ProjectionCoverage:
+    """Apply run authority only where the provider unit contract supports it."""
+
+    if coverage.proves_absence or projected_scope.get("authoritative_snapshot") is not True:
+        return coverage
+    if (
+        source_type == "teams"
+        and isinstance(native, Mapping)
+        and native.get("package_kind") == "teams_window_document"
+        and isinstance(native.get("raw_payload"), Mapping)
+    ):
+        # A force-full local collection attempt is validated against its
+        # immutable package manifest before replay. That source-wide proof also
+        # makes each canonical window package a complete snapshot of its unit.
+        return ProjectionCoverage.COMPLETE_SNAPSHOT
+    return coverage
 
 
 def _teams_partition_scope_fingerprint(scope: Mapping[str, object]) -> str:

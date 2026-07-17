@@ -577,11 +577,46 @@ async def run_source_lifecycle_backfill(db: Any, source_id: str) -> CutoverBackf
     for memory_id, provenance_rows in sorted(by_memory.items()):
         finding_id = _stable_id("finding", source_id, memory_id)
         existing_finding = await db.get_lifecycle_cutover_finding(finding_id)
+        active_support = await db.get_active_memory_support_evidence(
+            memory_id,
+            source_id=source_id,
+        )
+        primary_support = next(
+            (item for item in active_support if item.role is EvidenceRole.PRIMARY),
+            None,
+        )
+        support_unit = (
+            await db.get_evidence_unit(primary_support.evidence_unit_id)
+            if primary_support is not None
+            else None
+        )
+        current_support_revision = None
+        if support_unit is not None and support_unit.source_lineage_id:
+            current_revisions = await db.get_current_source_observation_revisions(
+                support_unit.source_lineage_id
+            )
+            current_support_revision = current_revisions.get(
+                primary_support.anchor.observation_id
+            )
         if (
-            existing_finding is not None
-            and existing_finding.status is CutoverFindingStatus.RESOLVED
+            primary_support is not None
+            and support_unit is not None
+            and support_unit.source_id == source_id
+            and support_unit.source_lineage_id
+            and current_support_revision is not None
+            and current_support_revision.id
+            == primary_support.anchor.observation_revision_id
         ):
             mapped += 1
+            if (
+                existing_finding is not None
+                and existing_finding.status is CutoverFindingStatus.OPEN
+            ):
+                await db.resolve_lifecycle_cutover_finding(
+                    finding_id,
+                    observation_id=primary_support.anchor.observation_id,
+                    source_unit_id=support_unit.source_lineage_id,
+                )
             continue
         mapped_lineage: tuple[str, str] | None = None
         attempts: list[dict[str, object]] = []
