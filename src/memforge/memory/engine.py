@@ -441,6 +441,7 @@ class MemoryEngine:
         *,
         operations: tuple[ReconcileOperation, ...],
         incumbents: dict[str, Memory],
+        unit_support: Mapping[str, tuple[str, ...]],
         projection: SourceProjection,
     ) -> tuple[ReconcileOperation, ...]:
         """Carry an exact, still-present claim forward without re-extracting it.
@@ -456,11 +457,6 @@ class MemoryEngine:
             revision.observation_id: revision
             for revision in projection.observation_revisions
         }
-        current_unit_reference_ids = (
-            await self.db.get_source_unit_support_reference_ids(
-                projection.source_units[0].id
-            )
-        )
         rebound: list[ReconcileOperation] = []
         for operation in operations:
             if (
@@ -475,7 +471,7 @@ class MemoryEngine:
                 source_id=projection.source_id,
             )
             scoped_reference_ids = frozenset(
-                current_unit_reference_ids.get(operation.memory_id, ())
+                unit_support.get(operation.memory_id, ())
             )
             support = tuple(
                 item
@@ -817,6 +813,7 @@ class MemoryEngine:
         operations = await self._rebind_noop_evidence_to_current_revision(
             operations=operations,
             incumbents=incumbents_by_id,
+            unit_support=unit_support,
             projection=projection,
         )
         gate = await self.db.get_lifecycle_gate(scope.source_id)
