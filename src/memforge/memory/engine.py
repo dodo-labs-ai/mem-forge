@@ -732,7 +732,14 @@ class MemoryEngine:
         }
         filtered_memories: list[RawMemory] = []
         for raw in raw_memories:
-            if self._candidate_can_persist(raw, stats):
+            if self._candidate_can_persist(
+                raw,
+                stats,
+                observation_semantic_class=_observation_semantic_class(
+                    projection,
+                    raw.source_observation_id,
+                ),
+            ):
                 filtered_memories.append(raw)
         quality_candidate_count = len(filtered_memories)
         filtered_memories = await self._select_projected_candidates(
@@ -1038,20 +1045,12 @@ class MemoryEngine:
         payload: dict[str, Any],
         error: str | None = None,
     ) -> None:
-        recorder = getattr(self.memory_store, "record_audit_event", None)
-        if recorder is None:
-            return
-        context_factory = getattr(self.memory_store, "operation_context", None)
-        context = (
-            context_factory(
-                run_id=projection.run_id,
-                source_id=projection.source_id,
-                doc_id=doc_id,
-            )
-            if context_factory is not None
-            else None
+        context = self.memory_store.operation_context(
+            run_id=projection.run_id,
+            source_id=projection.source_id,
+            doc_id=doc_id,
         )
-        await recorder(
+        await self.memory_store.record_audit_event(
             "candidate_ledger_completed" if status == "committed" else "candidate_ledger_failed",
             status,
             context=context,
@@ -1225,7 +1224,7 @@ class MemoryEngine:
         observation_revision_ids = tuple(
             sorted(revision.id for revision in projection.observation_revisions)
         )
-        replay = await self.db.get_exact_revision_replay(
+        replay = await self.relational.get_exact_revision_replay(
             source_id=projection.source_id,
             source_unit_id=delta.source_unit_id,
             target_unit_revision_id=target_revision_id,
@@ -1251,15 +1250,22 @@ class MemoryEngine:
             # The immutable content returned, but its access boundary changed.
             # Re-extraction must establish a new access-compatible lifecycle.
             return None
+        if any(
+            claim.status != "active"
+            and not (
+                claim.status == "retired"
+                and claim.retirement_reason
+                == AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON
+            )
+            for claim in replay.claims
+        ):
+            # Content identity alone cannot override another lifecycle authority.
+            return None
 
         mutations: list[LifecycleMutation] = []
         reactivated = 0
         for claim in replay.claims:
             if claim.status == "retired":
-                if claim.retirement_reason != AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON:
-                    raise ValueError(
-                        "exact revision replay Memory was retired by another lifecycle authority"
-                    )
                 mutations.append(
                     LifecycleMutation(
                         LifecycleMutationType.REACTIVATE_MEMORY,
@@ -1273,10 +1279,6 @@ class MemoryEngine:
                     )
                 )
                 reactivated += 1
-            elif claim.status != "active":
-                raise ValueError(
-                    "exact revision replay Memory is no longer active or authoritatively retired"
-                )
             mutations.extend(
                 (
                     LifecycleMutation(
@@ -1337,9 +1339,18 @@ class MemoryEngine:
             "vector_delivery_pending": int(delivery.pending),
         }
 
-    def _candidate_can_persist(self, raw: RawMemory, stats: dict | None = None) -> bool:
+    def _candidate_can_persist(
+        self,
+        raw: RawMemory,
+        stats: dict | None = None,
+        *,
+        observation_semantic_class: str | None = None,
+    ) -> bool:
         """Return whether a raw candidate should be persisted, updating stats when skipped."""
-        quality = classify_memory_candidate(raw)
+        quality = classify_memory_candidate(
+            raw,
+            observation_semantic_class=observation_semantic_class,
+        )
         if quality.keep:
             return True
 
@@ -1537,6 +1548,20 @@ class MemoryEngine:
             candidates=tuple(candidates),
             relations=relations,
         )
+
+
+def _observation_semantic_class(
+    projection: SourceProjection,
+    observation_id: str | None,
+) -> str | None:
+    if observation_id is None:
+        return None
+    for revision in projection.observation_revisions:
+        if revision.observation_id != observation_id:
+            continue
+        value = revision.metadata.get("semantic_class")
+        return str(value) if isinstance(value, str) and value else None
+    return None
 
 
 def _candidate_ledger_audit_payload(result: CandidateLedgerResult) -> dict[str, Any]:

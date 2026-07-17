@@ -220,6 +220,28 @@ def test_classifier_skips_attachment_event_without_attachment_content_claim():
     assert quality.skip_reason == "attachment_event_only"
 
 
+@pytest.mark.parametrize(
+    ("semantic_class", "expected_reason"),
+    [
+        ("attachment_event", "attachment_event_only"),
+        ("operational_transition", "operational_history_only"),
+    ],
+)
+def test_classifier_consumes_provider_neutral_observation_semantics(
+    semantic_class: str,
+    expected_reason: str,
+) -> None:
+    from memforge.memory.quality import classify_memory_candidate
+
+    quality = classify_memory_candidate(
+        _raw("A provider event occurred.", "opaque provider payload"),
+        observation_semantic_class=semantic_class,
+    )
+
+    assert quality.keep is False
+    assert quality.skip_reason == expected_reason
+
+
 def test_classifier_keeps_claim_extracted_from_attachment_content():
     from memforge.memory.quality import classify_memory_candidate
 
@@ -244,7 +266,8 @@ def test_classifier_rejects_attachment_claim_when_evidence_is_only_upload_event(
         _raw(
             "The attached screenshot shows that payroll triggers remained OPEN for ten minutes.",
             ATTACHMENT_EVENT_CONTEXT,
-        )
+        ),
+        observation_semantic_class="attachment_event",
     )
 
     assert quality.keep is False
@@ -255,7 +278,8 @@ def test_classifier_skips_operational_field_history_without_durable_claim():
     from memforge.memory.quality import classify_memory_candidate
 
     quality = classify_memory_candidate(
-        _raw(OPERATIONAL_HISTORY_CONTENT, OPERATIONAL_HISTORY_CONTEXT)
+        _raw(OPERATIONAL_HISTORY_CONTENT, OPERATIONAL_HISTORY_CONTEXT),
+        observation_semantic_class="operational_transition",
     )
 
     assert quality.keep is False
@@ -270,7 +294,8 @@ def test_classifier_skips_pure_operational_history_for_shared_fields(field: str)
         _raw(
             f"The ticket recorded an operational {field} field transition.",
             f'{{"field":"{field}","fromString":"old","toString":"new"}}',
-        )
+        ),
+        observation_semantic_class="operational_transition",
     )
 
     assert quality.keep is False
@@ -287,7 +312,8 @@ def test_classifier_keeps_mixed_history_that_contains_a_durable_root_cause():
                 '[{"field":"status","fromString":"IN PROGRESS","toString":"OPEN"},'
                 '{"field":"Root Cause","toString":"scheduler lease expired"}]'
             ),
-        )
+        ),
+        observation_semantic_class="domain_transition",
     )
 
     assert quality.keep is True
@@ -301,7 +327,8 @@ def test_classifier_skips_resolution_field_history_without_rationale():
         _raw(
             "The incident resolution changed to Cannot Reproduce.",
             '{"field":"resolution","toString":"Cannot Reproduce"}',
-        )
+        ),
+        observation_semantic_class="operational_transition",
     )
 
     assert quality.keep is False

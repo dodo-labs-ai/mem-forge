@@ -605,7 +605,7 @@ class MemoryStore:
         """
 
         compatible: list[Memory] = []
-        reactivation_candidate = await self.db.find_rebaseline_reactivation_candidate(
+        reactivation_candidate = await self.relational.find_rebaseline_reactivation_candidate(
             memory.content_hash,
             visibility=memory.visibility,
             owner_user_id=memory.owner_user_id,
