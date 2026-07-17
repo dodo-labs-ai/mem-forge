@@ -134,6 +134,7 @@ Return ONLY the JSON object."""
 
 
 RECONCILIATION_INCUMBENT_BATCH_SIZE = 30
+RECONCILIATION_BATCH_VALIDATION_ATTEMPTS = 2
 
 
 async def reconcile_memories(
@@ -203,17 +204,35 @@ async def reconcile_memories(
                 new_extractions=new_json,
                 existing_memories=existing_json,
             )
-            response = await structured_llm_client.reconcile_memories(
-                prompt,
-                max_tokens=4096,
-                model=llm_model,
-            )
-            batch_decisions = [decision.model_dump() for decision in response.decisions]
-            _validate_complete_reconciliation_batch(
-                batch_decisions,
-                batch,
-                new_extraction_count=len(new_extractions),
-            )
+            batch_decisions: list[dict] = []
+            for validation_attempt in range(RECONCILIATION_BATCH_VALIDATION_ATTEMPTS):
+                response = await structured_llm_client.reconcile_memories(
+                    prompt,
+                    max_tokens=4096,
+                    model=llm_model,
+                )
+                batch_decisions = [decision.model_dump() for decision in response.decisions]
+                try:
+                    _validate_complete_reconciliation_batch(
+                        batch_decisions,
+                        batch,
+                        new_extraction_count=len(new_extractions),
+                    )
+                except ValueError as exc:
+                    if validation_attempt + 1 >= RECONCILIATION_BATCH_VALIDATION_ATTEMPTS:
+                        raise
+                    logger.warning(
+                        "Reconciliation batch validation failed: %s — retrying only this batch",
+                        exc,
+                    )
+                    prompt = (
+                        f"{prompt}\n\n<validation_feedback>\n"
+                        f"The previous response was rejected: {exc}. "
+                        "Return a complete corrected decisions ledger that satisfies every rule.\n"
+                        "</validation_feedback>"
+                    )
+                    continue
+                break
             decisions.extend(batch_decisions)
 
         return _return_result(
@@ -411,6 +430,10 @@ def _validate_complete_reconciliation_batch(
             if isinstance(item.get("index"), int)
             and str(item.get("action", "")).upper() in {"UPDATE", "SUPERSEDE"}
         ]
+        if "replace" in dispositions and not replacements:
+            raise ValueError(
+                f"replacement decision for incumbent {memory_id} requires a new extraction index"
+            )
         if len(replacements) > 1:
             raise ValueError(f"multiple replacement candidates for incumbent {memory_id}")
 
