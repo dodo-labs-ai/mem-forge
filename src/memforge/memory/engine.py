@@ -30,7 +30,15 @@ from memforge.memory.evidence import (
     RelationType,
     relation_run_id_for,
 )
-from memforge.memory.lifecycle_plan import ReconciliationScope
+from memforge.memory.lifecycle_plan import (
+    AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON,
+    CoverageProof,
+    LifecycleMutation,
+    LifecycleMutationType,
+    LifecyclePlan,
+    ReconciliationScope,
+    StaleGuard,
+)
 from memforge.memory.lifecycle_planner import (
     NewMemoryDefaults,
     build_lifecycle_plan,
@@ -1056,6 +1064,151 @@ class MemoryEngine:
             "retired": retired,
             "pending_review": pending_review,
             "can_delete_document": pending_review == 0,
+        }
+
+    async def restore_exact_projected_revision(
+        self,
+        *,
+        projection: SourceProjection,
+        doc_id: str,
+        project_key: str | None,
+        repo_identifier: str | None,
+        scope_transition: Mapping[str, object] | None,
+        expected_source_activity_epoch: int | None = None,
+    ) -> dict[str, int] | None:
+        """Replay an immutable historical claim ledger during selector re-entry.
+
+        This is deliberately narrower than semantic Memory reuse. Authority
+        requires an explicit Projection Scope transition plus an already
+        applied Lifecycle Plan for the exact Source Unit and Observation
+        revisions. A normal delete/recreate or changed revision returns no
+        replay and must use ordinary extraction/reconciliation.
+        """
+
+        transition_id = (
+            str(scope_transition.get("id") or "").strip()
+            if isinstance(scope_transition, Mapping)
+            else ""
+        )
+        if not transition_id or len(projection.deltas) != 1:
+            return None
+        delta = projection.deltas[0]
+        target_revision_id = delta.current_unit_revision_id
+        if target_revision_id is None:
+            return None
+        observation_revision_ids = tuple(
+            sorted(revision.id for revision in projection.observation_revisions)
+        )
+        replay = await self.db.get_exact_revision_replay(
+            source_id=projection.source_id,
+            source_unit_id=delta.source_unit_id,
+            target_unit_revision_id=target_revision_id,
+            observation_revision_ids=observation_revision_ids,
+        )
+        if replay is None:
+            return None
+
+        visibility, owner_user_id = await memory_visibility_for_document(
+            self.db,
+            doc_id=doc_id,
+        )
+        current_access_context_hash = lifecycle_access_context_hash(
+            visibility=visibility,
+            owner_user_id=owner_user_id,
+            project_key=project_key,
+            repo_identifier=repo_identifier,
+        )
+        if any(
+            claim.access_context_hash != current_access_context_hash
+            for claim in replay.claims
+        ):
+            # The immutable content returned, but its access boundary changed.
+            # Re-extraction must establish a new access-compatible lifecycle.
+            return None
+
+        mutations: list[LifecycleMutation] = []
+        reactivated = 0
+        for claim in replay.claims:
+            if claim.status == "retired":
+                if claim.retirement_reason != AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON:
+                    raise ValueError(
+                        "exact revision replay Memory was retired by another lifecycle authority"
+                    )
+                mutations.append(
+                    LifecycleMutation(
+                        LifecycleMutationType.REACTIVATE_MEMORY,
+                        memory_id=claim.memory_id,
+                        source_id=projection.source_id,
+                        payload={
+                            "expected_content_hash": claim.content_hash,
+                            "expected_retirement_reason": AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON,
+                            "reason": "exact Source revision returned during scope transition",
+                        },
+                    )
+                )
+                reactivated += 1
+            elif claim.status != "active":
+                raise ValueError(
+                    "exact revision replay Memory is no longer active or authoritatively retired"
+                )
+            mutations.extend(
+                (
+                    LifecycleMutation(
+                        LifecycleMutationType.ATTACH_SUPPORT,
+                        memory_id=claim.memory_id,
+                        source_id=projection.source_id,
+                        evidence_reference_ids=claim.evidence_reference_ids,
+                        payload={
+                            "access_context_hash": claim.access_context_hash,
+                            "replay_plan_id": replay.lifecycle_plan_id,
+                            "scope_transition_id": transition_id,
+                        },
+                    ),
+                    LifecycleMutation(
+                        LifecycleMutationType.REFRESH_MEMORY_INDEX,
+                        memory_id=claim.memory_id,
+                        source_id=projection.source_id,
+                    ),
+                )
+            )
+
+        gate = await self.db.get_lifecycle_gate(projection.source_id)
+        scope = ReconciliationScope(
+            id=f"exact-revision-replay:{transition_id}:{target_revision_id}",
+            source_id=projection.source_id,
+            source_unit_id=delta.source_unit_id,
+            base_unit_revision_id=delta.previous_unit_revision_id,
+            target_unit_revision_id=target_revision_id,
+        )
+        plan = LifecyclePlan(
+            id=lifecycle_plan_id(scope),
+            scope=scope,
+            gate_state=gate.state,
+            coverage_proof=CoverageProof((), (), (), ()),
+            stale_guard=StaleGuard(
+                observation_revision_ids=observation_revision_ids,
+                support_set_hashes={
+                    claim.memory_id: await self.db.get_memory_support_set_hash(
+                        claim.memory_id
+                    )
+                    for claim in replay.claims
+                },
+                memory_versions={
+                    claim.memory_id: claim.memory_version for claim in replay.claims
+                },
+            ),
+            mutations=tuple(mutations),
+        )
+        await self.db.apply_source_projection_lifecycle(
+            projection,
+            plan,
+            expected_source_activity_epoch=expected_source_activity_epoch,
+        )
+        delivery = await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)
+        return {
+            "reactivated": reactivated,
+            "reattached": len(replay.claims),
+            "vector_delivery_pending": int(delivery.pending),
         }
 
     def _candidate_can_persist(self, raw: RawMemory, stats: dict | None = None) -> bool:

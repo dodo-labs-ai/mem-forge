@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
+from memforge.memory.engine import MemoryEngine
 from memforge.memory.lifecycle_plan import (
     LifecycleBackfillJob,
     LifecycleBackfillJobStatus,
@@ -2560,6 +2561,10 @@ class NoopMemoryEngine:
 
     async def apply_projected_tombstone(self, **kwargs):
         return {"retired": 0, "pending_review": 0, "can_delete_document": True}
+
+    async def restore_exact_projected_revision(self, **kwargs):
+        del kwargs
+        return None
 
 
 class RecordingSourceSupportDetector:
@@ -7480,6 +7485,182 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
     assert [source.doc_id for source in await db.get_memory_sources(memory.id)] == [
         "github-ref-a"
     ]
+
+
+@pytest.mark.asyncio
+async def test_scope_reentry_replays_exact_revision_without_calling_extractor_again(
+    db: Database,
+) -> None:
+    source_id = "src-github-scope-reentry-replay"
+
+    def config(include_paths: list[str]) -> dict[str, object]:
+        return {
+            "ref": "ref-a",
+            "include_paths": include_paths,
+            "include_extensions": ["md"],
+        }
+
+    async def set_scope(previous_paths: list[str], target_paths: list[str]) -> None:
+        target_config = config(target_paths)
+        await db.upsert_source(
+            id=source_id,
+            type="github_repo",
+            name="Payroll Repo",
+            config_json=json.dumps(target_config),
+            access_policy="workspace",
+            owner_user_id="dev",
+            projection_scope_transition=ProjectionScopeTransition(
+                id=f"scope-{'-'.join(previous_paths)}-to-{'-'.join(target_paths)}",
+                source_id=source_id,
+                previous_scope=canonical_projection_scope(
+                    "github_repo",
+                    config(previous_paths),
+                ),
+                target_scope=canonical_projection_scope(
+                    "github_repo",
+                    target_config,
+                ),
+            ),
+        )
+
+    class OneClaimExtractor(RecordingMemoryExtractor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.claim_calls: list[str] = []
+
+        def _result(self, mode: str) -> MemoryExtractionResult:
+            self.claim_calls.append(mode)
+            return MemoryExtractionResult(
+                memories=[
+                    RawMemory(
+                        content="A7 remains enabled.",
+                        memory_type="fact",
+                        evidence_quote="Keep A7.",
+                        extraction_context="Keep A7.",
+                    )
+                ]
+            )
+
+        async def extract_memories(self, **kwargs):
+            self.full_calls.append(kwargs)
+            return self._result("full")
+
+        async def extract_memory_changes(self, **kwargs):
+            self.change_calls.append(kwargs)
+            return self._result("changes")
+
+        async def extract_unit_memories(self, context, **kwargs):
+            self.unit_calls.append({"context": context, **kwargs})
+            return self._result("unit")
+
+        async def extract_projection_batch_memories(self, batch, **kwargs):
+            del kwargs
+            return self._result(f"projection:{batch.batch_id}")
+
+    class ReplayMemoryStore:
+        def __init__(self, database: Database) -> None:
+            self.db = database
+
+        def operation_context(self, **kwargs):
+            del kwargs
+            return None
+
+        async def record_audit_event(self, *args, **kwargs):
+            del args, kwargs
+
+        async def find_access_compatible_equivalence_candidates(self, *args, **kwargs):
+            del args, kwargs
+            return ()
+
+        async def attempt_lifecycle_vector_delivery(self, lifecycle_plan_id: str):
+            from memforge.memory.lifecycle_plan import (
+                LifecycleVectorDeliveryResult,
+                LifecycleVectorDeliveryState,
+            )
+
+            for task in await self.db.list_lifecycle_vector_tasks(
+                lifecycle_plan_id=lifecycle_plan_id
+            ):
+                await self.db.complete_lifecycle_vector_task(task.id)
+            return LifecycleVectorDeliveryResult(
+                state=LifecycleVectorDeliveryState.DELIVERED
+            )
+
+        async def delete_projected_document(self, doc_id: str, **kwargs):
+            del kwargs
+            await self.db.delete_projected_document(doc_id)
+
+    await db.upsert_source(
+        id=source_id,
+        type="github_repo",
+        name="Payroll Repo",
+        config_json=json.dumps(config(["docs"])),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await db.enable_lifecycle_gate(source_id)
+    adapters = build_sqlite_adapters(db, object())
+    memory_store = ReplayMemoryStore(db)
+    extractor = OneClaimExtractor()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=extractor,
+        memory_engine=MemoryEngine(
+            relational=adapters.relational,
+            vector=adapters.vector,
+            db=db,
+            memory_store=memory_store,
+        ),
+        memory_store=memory_store,
+        max_concurrent=1,
+    )
+    gene = MovingGithubFileGene(
+        item_id="github-ref-a",
+        relative_path="docs/design.md",
+        file_lineage_id=None,
+        version="blob-a",
+    )
+
+    first = await orchestrator.sync_gene(
+        gene=gene,
+        source_name="Payroll Repo",
+        source_id=source_id,
+        authoritative_snapshot=True,
+    )
+    [memory] = await db.list_memories(source=source_id, status="active")
+
+    await set_scope(["docs"], ["other"])
+    removed = await orchestrator.sync_gene(
+        gene=EmptyGene(),
+        source_name="Payroll Repo",
+        source_id=source_id,
+        authoritative_snapshot=True,
+    )
+    retired = await db.get_memory(memory.id)
+    assert retired is not None and retired.status == "retired"
+
+    await set_scope(["other"], ["docs"])
+    restored = await orchestrator.sync_gene(
+        gene=gene,
+        source_name="Payroll Repo",
+        source_id=source_id,
+        authoritative_snapshot=True,
+    )
+
+    current = await db.get_memory(memory.id)
+    support = await db.get_active_memory_support_evidence(
+        memory.id,
+        source_id=source_id,
+    )
+    assert first.last_sync_status == "success"
+    assert removed.last_sync_status == "success"
+    assert restored.last_sync_status == "success"
+    assert len(extractor.claim_calls) == 1
+    assert current is not None and current.status == "active"
+    assert len(support) == 1
+    assert support[0].anchor.observation_revision_id
 
 
 @pytest.mark.asyncio
