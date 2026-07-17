@@ -5069,6 +5069,14 @@ def create_admin_app(
                     status_code=409,
                     detail="projection_scope_transition_active",
                 )
+        predecessor_scope_transition_id = None
+        if scope_changed:
+            previous_scope_transitions = await db.list_projection_scope_transitions(
+                source_id,
+                limit=1,
+            )
+            if previous_scope_transitions:
+                predecessor_scope_transition_id = previous_scope_transitions[0].id
         auth_secret_changed = req.config is not None and _jira_auth_secret_changed(
             existing["type"],
             req.config,
@@ -5089,6 +5097,7 @@ def create_admin_app(
                     source_id,
                     previous_projection_scope,
                     target_projection_scope,
+                    predecessor_transition_id=predecessor_scope_transition_id,
                 ),
                 source_id=source_id,
                 previous_scope=previous_projection_scope,

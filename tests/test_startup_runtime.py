@@ -1830,6 +1830,8 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             self.auth_calls += 1
 
     class FakeRuntime:
+        lifecycle_cycle_id = None
+
         def orchestrator(self):
             return self
 
@@ -1844,12 +1846,15 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
             source_activity_epoch=None,
+            lifecycle_cycle_id=None,
         ):
             del authoritative_snapshot, reprocess_doc_ids, source_activity_epoch
+            self.lifecycle_cycle_id = lifecycle_cycle_id
             await gene.authenticate()
             return SyncState(source=source_id, last_sync_status="success")
 
     gene = FakeGene()
+    fake_runtime = FakeRuntime()
     monkeypatch.setattr(runtime, "create_gene", lambda **_kwargs: gene)
 
     await db.upsert_source(
@@ -1865,10 +1870,12 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
         db=db,
         config=_config(tmp_path),
         source={"id": "src-agent-sessions", "type": "agent_session", "name": "Agent Sessions", "config": {}},
-        runtime=FakeRuntime(),
+        runtime=fake_runtime,
+        lifecycle_cycle_id="source-sync-run-1",
     )
 
     assert gene.auth_calls == 1
+    assert fake_runtime.lifecycle_cycle_id == "source-sync-run-1"
 
 
 @pytest.mark.asyncio
@@ -1949,8 +1956,14 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
             source_activity_epoch=None,
+            lifecycle_cycle_id=None,
         ):
-            del authoritative_snapshot, reprocess_doc_ids, source_activity_epoch
+            del (
+                authoritative_snapshot,
+                reprocess_doc_ids,
+                source_activity_epoch,
+                lifecycle_cycle_id,
+            )
             self.gene = gene
             return SyncState(source=source_id, last_sync_status="success")
 
@@ -2410,6 +2423,82 @@ async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path
     assert transition is not None
     assert transition.previous_scope["page_tree_root"] == "5695886009"
     assert transition.target_scope["page_tree_root"] == "5625394036"
+
+
+@pytest.mark.asyncio
+async def test_repeated_source_scope_update_creates_a_new_transition_cycle(
+    db,
+    tmp_path,
+    monkeypatch,
+):
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_projection import ProjectionCoverage
+    from memforge.source_secrets import prepare_source_config_for_storage
+
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
+    source_id = "src-confluence-repeated-rescope"
+
+    def config(root: str) -> dict[str, object]:
+        return {
+            "base_url": "https://wiki.example",
+            "sync_mode": "page_tree",
+            "page_tree_root": root,
+            "include_children": True,
+            "spaces": ["SFPAY"],
+        }
+
+    stored_config = prepare_source_config_for_storage(
+        {**config("root-a"), "pat": "confluence-pat-secret"},
+        secret_fields=("pat",),
+    )
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Repeated rescope",
+        config_json=json.dumps(stored_config),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    async def complete_open_transition(run_id: str) -> str:
+        transition = await db.get_open_projection_scope_transition(source_id)
+        assert transition is not None
+        await db.start_projection_scope_transition(transition.id, run_id=run_id)
+        await db.complete_projection_scope_transition(
+            transition.id,
+            run_id=run_id,
+            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+        )
+        return transition.id
+
+    with TestClient(app) as client:
+        first = client.put(
+            f"/api/sources/{source_id}",
+            json={"name": "Repeated rescope", "config": config("root-b")},
+        )
+    assert first.status_code == 200
+    first_a_to_b = await complete_open_transition("run-a-to-b-1")
+
+    with TestClient(app) as client:
+        reverse = client.put(
+            f"/api/sources/{source_id}",
+            json={"name": "Repeated rescope", "config": config("root-a")},
+        )
+    assert reverse.status_code == 200
+    await complete_open_transition("run-b-to-a")
+
+    with TestClient(app) as client:
+        repeated = client.put(
+            f"/api/sources/{source_id}",
+            json={"name": "Repeated rescope", "config": config("root-b")},
+        )
+    assert repeated.status_code == 200
+    second_a_to_b = await db.get_open_projection_scope_transition(source_id)
+
+    assert second_a_to_b is not None
+    assert second_a_to_b.id != first_a_to_b
+    assert len(await db.list_projection_scope_transitions(source_id)) == 3
 
 
 @pytest.mark.asyncio

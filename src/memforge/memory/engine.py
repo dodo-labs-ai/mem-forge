@@ -978,6 +978,7 @@ class MemoryEngine:
         projection: SourceProjection,
         doc_id: str,
         reason: str,
+        lifecycle_cycle_id: str,
         expected_source_activity_epoch: int | None = None,
     ) -> dict[str, int | bool]:
         """Apply an authoritative Source Unit tombstone without an LLM call.
@@ -990,14 +991,48 @@ class MemoryEngine:
 
         if len(projection.deltas) != 1 or not projection.coverage.proves_absence:
             raise ValueError("projected tombstone requires one absence-proving Revision Delta")
+        if not lifecycle_cycle_id.strip():
+            raise ValueError("projected tombstone requires lifecycle cycle identity")
         delta = projection.deltas[0]
         scope = ReconciliationScope(
-            id=f"tombstone:{delta.source_unit_id}:{delta.current_unit_revision_id or 'removed'}",
+            id=(
+                f"tombstone:{lifecycle_cycle_id}:{delta.source_unit_id}:"
+                f"{delta.current_unit_revision_id or 'removed'}"
+            ),
             source_id=projection.source_id,
             source_unit_id=delta.source_unit_id,
             base_unit_revision_id=delta.previous_unit_revision_id,
             target_unit_revision_id=delta.current_unit_revision_id,
         )
+        plan_id = lifecycle_plan_id(scope)
+        applied_payload = await self.db.get_lifecycle_plan_payload(plan_id)
+        if applied_payload is not None:
+            stored_scope = applied_payload.get("scope")
+            mutations = applied_payload.get("mutations")
+            if (
+                not isinstance(stored_scope, Mapping)
+                or stored_scope.get("id") != scope.id
+                or stored_scope.get("source_id") != scope.source_id
+                or stored_scope.get("source_unit_id") != scope.source_unit_id
+                or stored_scope.get("target_unit_revision_id")
+                != scope.target_unit_revision_id
+                or not isinstance(mutations, list)
+            ):
+                raise ValueError("applied tombstone lifecycle ledger is malformed")
+            mutation_types = [
+                mutation.get("mutation_type")
+                for mutation in mutations
+                if isinstance(mutation, Mapping)
+            ]
+            if len(mutation_types) != len(mutations):
+                raise ValueError("applied tombstone lifecycle mutation ledger is malformed")
+            await self.memory_store.attempt_lifecycle_vector_delivery(plan_id)
+            pending_review = mutation_types.count("create_review")
+            return {
+                "retired": mutation_types.count("retire_memory"),
+                "pending_review": pending_review,
+                "can_delete_document": pending_review == 0,
+            }
         source_type = projection.source_type
         incumbents, unit_support = await self._active_projected_incumbents(
             doc_id=doc_id,
@@ -1023,7 +1058,7 @@ class MemoryEngine:
         }
         visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
         plan = build_lifecycle_plan(
-            plan_id=lifecycle_plan_id(scope),
+            plan_id=plan_id,
             scope=scope,
             gate_state=gate.state,
             operations=operations,

@@ -2319,6 +2319,7 @@ async def test_enabled_source_tombstone_retires_last_supported_incumbent(db: Dat
         projection=tombstone,
         doc_id="confluence-123",
         reason="not_returned_by_authoritative_snapshot",
+        lifecycle_cycle_id="enabled-source-removal",
     )
 
     retired = await db.get_memory(incumbent.id)
@@ -2388,11 +2389,19 @@ async def test_exact_scope_reentry_restores_historical_revision_without_reextrac
         },
         reason="not_returned_by_authoritative_snapshot",
     )
-    await engine.apply_projected_tombstone(
+    first_removal_result = await engine.apply_projected_tombstone(
         projection=tombstone,
         doc_id="confluence-123",
         reason="source Unit removed by authoritative discovery",
+        lifecycle_cycle_id="scope-removal-cycle-1",
     )
+    retry_result = await engine.apply_projected_tombstone(
+        projection=tombstone,
+        doc_id="confluence-123",
+        reason="source Unit removed by authoritative discovery",
+        lifecycle_cycle_id="scope-removal-cycle-1",
+    )
+    assert retry_result == first_removal_result
     await db.delete_projected_document("confluence-123")
     await db.restore_document_snapshot(original_document)
 
@@ -2433,6 +2442,56 @@ async def test_exact_scope_reentry_restores_historical_revision_without_reextrac
     assert len(support) == 1
     assert support[0].anchor.observation_revision_id == initial.observation_revisions[0].id
 
+    later_incumbent = Memory(
+        id="mem-added-before-repeated-removal",
+        memory_type="fact",
+        content="A later claim belongs to the same document.",
+        content_hash=content_hash("A later claim belongs to the same document."),
+    )
+    await db.insert_memory(later_incumbent)
+    await db.add_memory_source(
+        later_incumbent.id,
+        "confluence-123",
+        "confluence",
+        "A later claim belongs to the same document.",
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id="support-added-before-repeated-removal",
+            memory_id=later_incumbent.id,
+            evidence_reference_id=support[0].reference_id,
+            source_id="src-1",
+            access_context_hash="workspace-eng",
+        )
+    )
+
+    repeated_tombstone = project_source_unit_tombstone(
+        source_type="confluence",
+        run_id="projection-repeated-scope-removal",
+        source_unit=reentry.source_units[0],
+        prior_unit_revision=reentry.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision
+            for revision in reentry.observation_revisions
+        },
+        reason="not_returned_by_authoritative_snapshot",
+    )
+    repeated_result = await engine.apply_projected_tombstone(
+        projection=repeated_tombstone,
+        doc_id="confluence-123",
+        reason="source Unit removed by authoritative discovery",
+        lifecycle_cycle_id="scope-removal-cycle-2",
+    )
+
+    repeated_retirement = await db.get_memory(memory.id)
+    assert repeated_result["retired"] == 2
+    assert repeated_retirement is not None
+    assert repeated_retirement.status == "retired"
+    later_retirement = await db.get_memory(later_incumbent.id)
+    assert later_retirement is not None
+    assert later_retirement.status == "retired"
+
 
 @pytest.mark.asyncio
 async def test_gated_source_tombstone_only_opens_review(db: Database) -> None:
@@ -2461,6 +2520,7 @@ async def test_gated_source_tombstone_only_opens_review(db: Database) -> None:
         projection=tombstone,
         doc_id="confluence-123",
         reason="not_returned_by_authoritative_snapshot",
+        lifecycle_cycle_id="gated-source-removal",
     )
 
     active = await db.get_memory(incumbent.id)

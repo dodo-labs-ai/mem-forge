@@ -87,3 +87,33 @@ def test_scope_transition_id_is_order_independent_and_target_specific() -> None:
         {"projects": ["A", "B"], "comments": True},
         {"projects": ["D"]},
     )
+
+
+def test_scope_transition_id_distinguishes_a_repeated_transition_cycle() -> None:
+    first_a_to_b = projection_scope_transition_id(
+        "src-1",
+        {"include_paths": ["docs"]},
+        {"include_paths": ["other"]},
+        predecessor_transition_id=None,
+    )
+    b_to_a = projection_scope_transition_id(
+        "src-1",
+        {"include_paths": ["other"]},
+        {"include_paths": ["docs"]},
+        predecessor_transition_id=first_a_to_b,
+    )
+    second_a_to_b = projection_scope_transition_id(
+        "src-1",
+        {"include_paths": ["docs"]},
+        {"include_paths": ["other"]},
+        predecessor_transition_id=b_to_a,
+    )
+    retry = projection_scope_transition_id(
+        "src-1",
+        {"include_paths": ["docs"]},
+        {"include_paths": ["other"]},
+        predecessor_transition_id=b_to_a,
+    )
+
+    assert second_a_to_b != first_a_to_b
+    assert retry == second_a_to_b
