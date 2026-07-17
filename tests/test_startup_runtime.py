@@ -1843,8 +1843,9 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             force_full_sync=False,
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
+            source_activity_epoch=None,
         ):
-            del authoritative_snapshot, reprocess_doc_ids
+            del authoritative_snapshot, reprocess_doc_ids, source_activity_epoch
             await gene.authenticate()
             return SyncState(source=source_id, last_sync_status="success")
 
@@ -1947,8 +1948,9 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             force_full_sync=False,
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
+            source_activity_epoch=None,
         ):
-            del authoritative_snapshot, reprocess_doc_ids
+            del authoritative_snapshot, reprocess_doc_ids, source_activity_epoch
             self.gene = gene
             return SyncState(source=source_id, last_sync_status="success")
 
@@ -2622,6 +2624,7 @@ async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds
 
 @pytest.mark.asyncio
 async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_path):
+    from memforge.local_agent.source_contract import local_agent_source_config_revision
     from memforge.server.admin_api import create_admin_app
     from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 
@@ -2639,7 +2642,7 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
 
     class FakeSyncService:
         def __init__(self):
-            self.enqueued: list[tuple[str, str, bool]] = []
+            self.enqueued: list[dict[str, object]] = []
 
         def is_running(self, source_id: str):
             return False
@@ -2653,9 +2656,19 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
             workspace_id: str = "default",
             input_snapshot_id: str | None = None,
             source_config_revision: str | None = None,
+            predecessor_activity_id: str | None = None,
         ):
-            del workspace_id, input_snapshot_id, source_config_revision
-            self.enqueued.append((enqueued_source_id, trigger, force_full_sync))
+            del workspace_id
+            self.enqueued.append(
+                {
+                    "source_id": enqueued_source_id,
+                    "trigger": trigger,
+                    "force_full_sync": force_full_sync,
+                    "input_snapshot_id": input_snapshot_id,
+                    "source_config_revision": source_config_revision,
+                    "predecessor_activity_id": predecessor_activity_id,
+                }
+            )
 
             class Run:
                 run_id = "run-local-process"
@@ -2696,7 +2709,18 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
         "status": "pending",
         "coalesced": False,
     }
-    assert fake_sync_service.enqueued == [(source_id, "local_agent", True)]
+    assert fake_sync_service.enqueued == [
+        {
+            "source_id": source_id,
+            "trigger": "local_agent",
+            "force_full_sync": True,
+            "input_snapshot_id": "test-job:attempt:1",
+            "source_config_revision": local_agent_source_config_revision(
+                await db.get_source(source_id)
+            ),
+            "predecessor_activity_id": "test-job",
+        }
+    ]
 
 
 @pytest.mark.asyncio

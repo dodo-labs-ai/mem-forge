@@ -27,6 +27,7 @@ from memforge.local_agent.source_contract import (
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
     local_agent_sync_operation,
+    source_sync_input_metadata_with_artifact_attestation,
 )
 from memforge.storage.admin_source import is_pause_only_source_update
 from memforge.source_activity import (
@@ -372,6 +373,8 @@ def _source_sync_run_from_row(row: Mapping[str, Any], *, coalesced: bool = False
         ),
         source_config_revision=data.get("source_config_revision"),
         rerun_source_config_revision=data.get("rerun_source_config_revision"),
+        predecessor_activity_id=data.get("predecessor_activity_id"),
+        rerun_predecessor_activity_id=data.get("rerun_predecessor_activity_id"),
         coalesced=coalesced,
         lease_owner=data.get("lease_owner"),
         lease_expires_at=_parse_dt(data.get("lease_expires_at")),
@@ -1228,6 +1231,8 @@ CREATE TABLE IF NOT EXISTS source_sync_runs (
     rerun_input_generation_watermark INTEGER,
     source_config_revision TEXT,
     rerun_source_config_revision TEXT,
+    predecessor_activity_id TEXT,
+    rerun_predecessor_activity_id TEXT,
     lease_owner             TEXT,
     lease_expires_at        TEXT,
     lease_attempt_count     INTEGER NOT NULL DEFAULT 0,
@@ -2753,6 +2758,14 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ON source_activity_leases(source_id, lease_until)",
         ],
     ),
+    (
+        59,
+        "Track source sync predecessor activity",
+        [
+            "ALTER TABLE source_sync_runs ADD COLUMN predecessor_activity_id TEXT",
+            "ALTER TABLE source_sync_runs ADD COLUMN rerun_predecessor_activity_id TEXT",
+        ],
+    ),
 ]
 
 
@@ -3911,6 +3924,18 @@ class Database:
                     (doc_id,),
                 ) as cursor:
                     document_row = await cursor.fetchone()
+                async with self.db.execute(
+                    "SELECT 1 FROM memory_support_assertions msa "
+                    "JOIN evidence_references er ON er.id = msa.evidence_reference_id "
+                    "JOIN evidence_units eu ON eu.id = er.evidence_unit_id "
+                    "WHERE msa.active = 1 AND eu.doc_id = ? LIMIT 1",
+                    (doc_id,),
+                ) as cursor:
+                    active_projected_support = await cursor.fetchone()
+                if active_projected_support is not None:
+                    raise ValueError(
+                        "active projected support remains; apply a Lifecycle Plan before deleting the document"
+                    )
                 if document_row is not None:
                     source_id = str(document_row["source"])
                     for artifact_uri in dict.fromkeys(
@@ -4137,6 +4162,7 @@ class Database:
         self,
         projection: SourceProjection,
         *,
+        expected_source_activity_epoch: int | None = None,
         _manage_transaction: bool = True,
     ) -> None:
         """Persist one complete provider-neutral projection atomically.
@@ -4159,6 +4185,18 @@ class Database:
                     "UPDATE sources SET status = status WHERE id = ?",
                     (projection.source_id,),
                 )
+                if expected_source_activity_epoch is not None:
+                    async with self.db.execute(
+                        "SELECT activity_epoch FROM sources WHERE id = ?",
+                        (projection.source_id,),
+                    ) as cursor:
+                        source_epoch = await cursor.fetchone()
+                    current_epoch = int(source_epoch["activity_epoch"] or 0)
+                    if current_epoch != expected_source_activity_epoch:
+                        raise SourceActivityConflict(
+                            "source activity epoch changed: "
+                            f"expected {expected_source_activity_epoch}, current {current_epoch}"
+                        )
                 async with self.db.execute(
                     "SELECT payload_hash FROM source_projection_runs WHERE id = ?",
                     (projection.run_id,),
@@ -5033,6 +5071,28 @@ class Database:
         self,
         job: LifecycleBackfillJob,
     ) -> LifecycleBackfillJob:
+        return await self._create_lifecycle_backfill_job(
+            job,
+            cancel_active_sync=False,
+        )
+
+    async def create_source_rebaseline_job(
+        self,
+        job: LifecycleBackfillJob,
+    ) -> LifecycleBackfillJob:
+        """Atomically fence active sync work and admit destructive maintenance."""
+
+        return await self._create_lifecycle_backfill_job(
+            job,
+            cancel_active_sync=True,
+        )
+
+    async def _create_lifecycle_backfill_job(
+        self,
+        job: LifecycleBackfillJob,
+        *,
+        cancel_active_sync: bool,
+    ) -> LifecycleBackfillJob:
         if job.status is not LifecycleBackfillJobStatus.QUEUED:
             raise ValueError("new lifecycle backfill job must be queued")
         now = _now_iso()
@@ -5051,7 +5111,7 @@ class Database:
                     (job.source_id,),
                 ) as cursor:
                     active_run = await cursor.fetchone()
-                if active_run is not None:
+                if active_run is not None and not cancel_active_sync:
                     raise ValueError(
                         f"source sync run already active: {active_run['run_id']}"
                     )
@@ -5115,6 +5175,21 @@ class Database:
                     raise ValueError(
                         f"source lifecycle job already active: {active['id']}"
                     )
+                if active_run is not None:
+                    await self._cancel_source_sync_run_for_maintenance_unlocked(
+                        str(active_run["run_id"]),
+                        maintenance_job_id=job.id,
+                    )
+                if cancel_active_sync:
+                    # A normal sync holds this lease in addition to its durable
+                    # SourceSyncRun lease.  Revoking only SYNC leaves collection
+                    # and agent-patch state machines independent; the epoch bump
+                    # below fences any already-computed stale lifecycle commit.
+                    await self.db.execute(
+                        "DELETE FROM source_activity_leases "
+                        "WHERE source_id = ? AND kind = ?",
+                        (job.source_id, SourceActivityKind.SYNC.value),
+                    )
                 await self._acquire_source_activity_unlocked(
                     activity_id=job.id,
                     source_id=job.source_id,
@@ -5137,6 +5212,64 @@ class Database:
         stored = await self.get_lifecycle_backfill_job(job.id)
         assert stored is not None
         return stored
+
+    async def _cancel_source_sync_run_for_maintenance_unlocked(
+        self,
+        run_id: str,
+        *,
+        maintenance_job_id: str,
+    ) -> None:
+        now = _now_iso()
+        cursor = await self.db.execute(
+            """UPDATE source_sync_runs
+               SET status = 'failed',
+                   input_snapshot_id = CASE
+                       WHEN rerun_requested = 1
+                       THEN COALESCE(rerun_input_snapshot_id, input_snapshot_id)
+                       ELSE input_snapshot_id
+                   END,
+                   input_generation_watermark = CASE
+                       WHEN rerun_requested = 1
+                       THEN COALESCE(
+                           rerun_input_generation_watermark,
+                           input_generation_watermark
+                       )
+                       ELSE input_generation_watermark
+                   END,
+                   source_config_revision = CASE
+                       WHEN rerun_requested = 1
+                       THEN COALESCE(rerun_source_config_revision, source_config_revision)
+                       ELSE source_config_revision
+                   END,
+                   predecessor_activity_id = CASE
+                       WHEN rerun_requested = 1
+                       THEN COALESCE(
+                           rerun_predecessor_activity_id,
+                           predecessor_activity_id
+                       )
+                       ELSE predecessor_activity_id
+                   END,
+                   rerun_requested = 0,
+                   rerun_input_snapshot_id = NULL,
+                   rerun_input_generation_watermark = NULL,
+                   rerun_source_config_revision = NULL,
+                   rerun_predecessor_activity_id = NULL,
+                   lease_owner = NULL,
+                   lease_expires_at = NULL,
+                   next_attempt_at = NULL,
+                   error_message = ?,
+                   completed_at = ?,
+                   updated_at = ?
+               WHERE run_id = ? AND status IN ('pending', 'running')""",
+            (
+                f"cancelled_by_source_lifecycle_maintenance:{maintenance_job_id}",
+                now,
+                now,
+                run_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(f"source sync run changed during maintenance admission: {run_id}")
 
     async def _acquire_source_activity_unlocked(
         self,
@@ -5963,6 +6096,8 @@ class Database:
         self,
         projection: SourceProjection,
         plan: LifecyclePlan,
+        *,
+        expected_source_activity_epoch: int | None = None,
     ) -> None:
         """Advance Source Projection and Memory lifecycle in one transaction."""
 
@@ -5980,6 +6115,7 @@ class Database:
             try:
                 await self.record_source_projection(
                     projection,
+                    expected_source_activity_epoch=expected_source_activity_epoch,
                     _manage_transaction=False,
                 )
                 await self.apply_lifecycle_plan(
@@ -6206,7 +6342,9 @@ class Database:
         Review-only plans intentionally preserve the incumbent while a human
         decides; their contested support is represented by the durable review.
         Every applied non-review plan must leave each surviving same-source
-        assertion pinned to an Observation that is current in this Source Unit.
+        assertion pinned to an Observation current in its own stable Source
+        Unit. A newly activated Memory must additionally gain support in the
+        plan's current Unit.
         """
 
         if any(
@@ -6219,9 +6357,15 @@ class Database:
             for mutation in plan.mutations
             if mutation.mutation_type is LifecycleMutationType.CREATE_MEMORY
         }
+        reactivated_ids = {
+            mutation.memory_id
+            for mutation in plan.mutations
+            if mutation.mutation_type is LifecycleMutationType.REACTIVATE_MEMORY
+        }
         candidate_ids = (
             set(plan.coverage_proof.mandatory_incumbent_ids)
             | created_ids
+            | reactivated_ids
             | {
                 mutation.memory_id
                 for mutation in plan.mutations
@@ -6237,30 +6381,39 @@ class Database:
             if memory is None or memory["status"] != "active":
                 continue
             async with self.db.execute(
-                """SELECT COUNT(*) AS total,
+                """SELECT SUM(CASE
+                              WHEN so.source_unit_id = ?
+                               AND eu.source_lineage_id = so.source_unit_id
+                               AND eu.source_id = msa.source_id
+                               AND so.source_id = msa.source_id
+                               AND su.source_id = msa.source_id
+                               AND er.observation_revision_id = so.current_revision_id
+                              THEN 1 ELSE 0 END) AS current_scope_total,
                           SUM(CASE
-                              WHEN eu.source_lineage_id = ?
-                               AND so.source_unit_id = ?
+                              WHEN eu.source_lineage_id = so.source_unit_id
+                               AND eu.source_id = msa.source_id
+                               AND so.source_id = msa.source_id
+                               AND su.source_id = msa.source_id
                                AND er.observation_revision_id = so.current_revision_id
                               THEN 0 ELSE 1 END) AS invalid
                    FROM memory_support_assertions msa
                    JOIN evidence_references er ON er.id = msa.evidence_reference_id
                    JOIN evidence_units eu ON eu.id = er.evidence_unit_id
                    JOIN source_observations so ON so.id = er.observation_id
+                   JOIN source_units su ON su.id = so.source_unit_id
                    WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1""",
                 (
-                    plan.scope.source_unit_id,
                     plan.scope.source_unit_id,
                     memory_id,
                     plan.scope.source_id,
                 ),
             ) as cursor:
                 support = await cursor.fetchone()
-            total = int(support["total"] or 0)
+            current_scope_total = int(support["current_scope_total"] or 0)
             invalid = int(support["invalid"] or 0)
-            if memory_id in created_ids and total == 0:
+            if memory_id in created_ids | reactivated_ids and current_scope_total == 0:
                 raise ValueError(
-                    f"projected lifecycle created active Memory without source support: {memory_id}"
+                    f"projected lifecycle activated Memory without source support: {memory_id}"
                 )
             if invalid:
                 raise ValueError(
@@ -6388,6 +6541,26 @@ class Database:
                 memory.id,
                 LifecycleVectorOperation.UPSERT,
                 now=now,
+            )
+            return
+        if mutation_type is LifecycleMutationType.REACTIVATE_MEMORY:
+            expected_content_hash = mutation.payload.get("expected_content_hash")
+            if not isinstance(expected_content_hash, str) or not expected_content_hash:
+                raise ValueError("reactivate_memory requires expected_content_hash")
+            cursor = await self.db.execute(
+                """UPDATE memories
+                      SET status = 'active', retirement_reason = NULL,
+                          retired_at = NULL, valid_until = NULL, updated_at = ?
+                    WHERE id = ? AND status = 'retired'
+                      AND retirement_reason = 'source_rebaseline'
+                      AND content_hash = ?""",
+                (now, mutation.memory_id, expected_content_hash),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("reactivate Memory stale guard failed")
+            await self._rebuild_memory_fts_unlocked(
+                mutation.memory_id,
+                search_visible_statuses=set(allowed_search_statuses()),
             )
             return
         if mutation_type is LifecycleMutationType.ATTACH_SUPPORT:
@@ -6723,7 +6896,7 @@ class Database:
             cursor = await self.db.execute(
                 """UPDATE lifecycle_vector_outbox
                    SET status = 'completed', attempts = attempts + 1,
-                       error = NULL, updated_at = ?
+                       updated_at = ?
                    WHERE id = ? AND status IN ('pending', 'failed')""",
                 (_now_iso(), task_id),
             )
@@ -6731,7 +6904,7 @@ class Database:
                 cursor = await self.db.execute(
                     """UPDATE source_deletion_vector_outbox
                        SET status = 'completed', attempts = attempts + 1,
-                           error = NULL, updated_at = ?
+                           updated_at = ?
                        WHERE id = ? AND status IN ('pending', 'failed')""",
                     (_now_iso(), task_id),
                 )
@@ -6744,7 +6917,7 @@ class Database:
             cursor = await self.db.execute(
                 """UPDATE lifecycle_vector_outbox
                    SET status = 'failed', attempts = attempts + 1,
-                       error = ?, updated_at = ?
+                       error = COALESCE(error, ?), updated_at = ?
                    WHERE id = ? AND status IN ('pending', 'failed')""",
                 (error[:4000], _now_iso(), task_id),
             )
@@ -6752,7 +6925,7 @@ class Database:
                 cursor = await self.db.execute(
                     """UPDATE source_deletion_vector_outbox
                        SET status = 'failed', attempts = attempts + 1,
-                           error = ?, updated_at = ?
+                           error = COALESCE(error, ?), updated_at = ?
                        WHERE id = ? AND status IN ('pending', 'failed')""",
                     (error[:4000], _now_iso(), task_id),
                 )
@@ -7928,6 +8101,36 @@ class Database:
             if not row:
                 return None
             return self._row_to_memory(row)
+
+    async def find_rebaseline_reactivation_candidate(
+        self,
+        memory_content_hash: str,
+        *,
+        visibility: str,
+        owner_user_id: str | None,
+        repo_identifier: str | None,
+    ) -> Memory | None:
+        """Return the canonical exact claim retired only for source rebaseline."""
+
+        async with self.db.execute(
+            """SELECT * FROM memories
+                WHERE content_hash = ?
+                  AND status = 'retired'
+                  AND retirement_reason = 'source_rebaseline'
+                  AND visibility = ?
+                  AND owner_user_id IS ?
+                  AND repo_identifier IS ?
+                ORDER BY created_at, id
+                LIMIT 1""",
+            (
+                memory_content_hash,
+                visibility,
+                owner_user_id,
+                repo_identifier,
+            ),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_memory(row) if row else None
 
     async def get_memories_by_source_doc(
         self,
@@ -11823,8 +12026,11 @@ class Database:
                     doc_ids = [str(row[0]) async for row in cursor]
                 memory_ids: set[str] = set()
                 async with self.db.execute(
-                    "SELECT DISTINCT memory_id FROM memory_sources WHERE source_id = ?",
-                    (source_id,),
+                    """SELECT DISTINCT ms.memory_id
+                         FROM memory_sources ms
+                         LEFT JOIN documents d ON d.doc_id = ms.doc_id
+                        WHERE ms.source_id = ? OR d.source = ?""",
+                    (source_id, source_id),
                 ) as cursor:
                     async for row in cursor:
                         memory_ids.add(str(row[0]))
@@ -11929,7 +12135,12 @@ class Database:
                 )
                 await self.db.execute("DELETE FROM source_units WHERE source_id = ?", (source_id,))
                 await self.db.execute("DELETE FROM projection_scope_transitions WHERE source_id = ?", (source_id,))
-                await self.db.execute("DELETE FROM memory_sources WHERE source_id = ?", (source_id,))
+                await self.db.execute(
+                    """DELETE FROM memory_sources
+                        WHERE source_id = ?
+                           OR doc_id IN (SELECT doc_id FROM documents WHERE source = ?)""",
+                    (source_id, source_id),
+                )
                 for doc_id in doc_ids:
                     await self.db.execute("DELETE FROM memory_search_metadata_fts WHERE doc_id = ?", (doc_id,))
                     await self.db.execute("DELETE FROM memory_search_metadata_alias_fts WHERE doc_id = ?", (doc_id,))
@@ -12469,6 +12680,7 @@ class Database:
         force_full_sync: bool = False,
         input_snapshot_id: str | None = None,
         source_config_revision: str | None = None,
+        predecessor_activity_id: str | None = None,
     ) -> SourceSyncRun:
         for _attempt in range(3):
             async with self._write_lock:
@@ -12480,6 +12692,7 @@ class Database:
                         force_full_sync=force_full_sync,
                         input_snapshot_id=input_snapshot_id,
                         source_config_revision=source_config_revision,
+                        predecessor_activity_id=predecessor_activity_id,
                     )
                     await self.db.commit()
                     return run
@@ -12500,11 +12713,15 @@ class Database:
         force_full_sync: bool = False,
         input_snapshot_id: str | None = None,
         source_config_revision: str | None = None,
+        predecessor_activity_id: str | None = None,
         now: str | None = None,
     ) -> SourceSyncRun:
         now_iso = now or _now_iso()
         normalized_snapshot_id = _non_empty_string(input_snapshot_id)
         normalized_config_revision = _non_empty_string(source_config_revision)
+        normalized_predecessor_activity_id = _non_empty_string(
+            predecessor_activity_id
+        )
         source_lock = await self.db.execute(
             "UPDATE sources SET status = status WHERE id = ?",
             (source_id,),
@@ -12610,6 +12827,15 @@ class Database:
                            WHEN status = 'running' AND ? AND ? IS NOT NULL THEN ?
                            ELSE rerun_source_config_revision
                        END,
+                       predecessor_activity_id = CASE
+                           WHEN status = 'pending' AND ? IS NOT NULL THEN ?
+                           ELSE predecessor_activity_id
+                       END,
+                       rerun_predecessor_activity_id = CASE
+                           WHEN status = 'pending' THEN NULL
+                           WHEN status = 'running' AND ? THEN ?
+                           ELSE rerun_predecessor_activity_id
+                       END,
                        updated_at = ?
                    WHERE run_id = ? AND status IN ('pending', 'running')""",
                 (
@@ -12627,6 +12853,10 @@ class Database:
                     int(mark_rerun),
                     normalized_config_revision,
                     normalized_config_revision,
+                    normalized_predecessor_activity_id,
+                    normalized_predecessor_activity_id,
+                    int(mark_rerun),
+                    normalized_predecessor_activity_id,
                     now_iso,
                     existing["run_id"],
                 ),
@@ -12645,8 +12875,9 @@ class Database:
             """INSERT INTO source_sync_runs (
                 run_id, workspace_id, source_id, trigger, status,
                 force_full_sync, input_snapshot_id, input_generation_watermark,
-                source_config_revision, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)""",
+                source_config_revision, predecessor_activity_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id,
                 workspace_id,
@@ -12656,6 +12887,7 @@ class Database:
                 normalized_snapshot_id,
                 input_generation_watermark,
                 normalized_config_revision,
+                normalized_predecessor_activity_id,
                 now_iso,
                 now_iso,
             ),
@@ -12705,9 +12937,15 @@ class Database:
         lease_expires_at = _utc_iso(lease_started_at + timedelta(seconds=lease_seconds))
         conditions = [
             "((status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) "
-            "OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))"
+            "OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))",
+            "NOT EXISTS ("
+            "SELECT 1 FROM source_activity_leases predecessor "
+            "WHERE predecessor.id = source_sync_runs.predecessor_activity_id "
+            "AND predecessor.source_id = source_sync_runs.source_id "
+            "AND predecessor.kind = 'external_collection' "
+            "AND predecessor.lease_until > ?)",
         ]
-        params: list[Any] = [lease_started_iso, lease_started_iso]
+        params: list[Any] = [lease_started_iso, lease_started_iso, lease_started_iso]
         if workspace_id is not None:
             conditions.append("workspace_id = ?")
             params.append(workspace_id)
@@ -12739,6 +12977,13 @@ class Database:
                        (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
                        OR
                        (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM source_activity_leases predecessor
+                       WHERE predecessor.id = ?
+                         AND predecessor.source_id = ?
+                         AND predecessor.kind = 'external_collection'
+                         AND predecessor.lease_until > ?
                      )""",
                 (
                     worker_id,
@@ -12748,6 +12993,9 @@ class Database:
                     lease_started_iso,
                     row["run_id"],
                     lease_started_iso,
+                    lease_started_iso,
+                    row["predecessor_activity_id"],
+                    row["source_id"],
                     lease_started_iso,
                 ),
             )
@@ -12950,6 +13198,14 @@ class Database:
                            )
                            ELSE source_config_revision
                        END,
+                       predecessor_activity_id = CASE
+                           WHEN ? AND rerun_requested = 1
+                           THEN COALESCE(
+                               rerun_predecessor_activity_id,
+                               predecessor_activity_id
+                           )
+                           ELSE predecessor_activity_id
+                       END,
                        rerun_requested = CASE WHEN ? THEN 0 ELSE rerun_requested END,
                        rerun_input_snapshot_id = CASE
                            WHEN ? THEN NULL ELSE rerun_input_snapshot_id
@@ -12959,6 +13215,9 @@ class Database:
                        END,
                        rerun_source_config_revision = CASE
                            WHEN ? THEN NULL ELSE rerun_source_config_revision
+                       END,
+                       rerun_predecessor_activity_id = CASE
+                           WHEN ? THEN NULL ELSE rerun_predecessor_activity_id
                        END,
                        lease_owner = NULL,
                        lease_expires_at = NULL,
@@ -12971,6 +13230,8 @@ class Database:
                      AND lease_expires_at > ?""",
                 (
                     status,
+                    int(retryable),
+                    int(retryable),
                     int(retryable),
                     int(retryable),
                     int(retryable),
@@ -13030,8 +13291,9 @@ class Database:
             """INSERT INTO source_sync_runs (
                 run_id, workspace_id, source_id, trigger, status,
                 force_full_sync, input_snapshot_id, input_generation_watermark,
-                source_config_revision, created_at, updated_at
-            ) VALUES (?, ?, ?, 'rerun', 'pending', ?, ?, ?, ?, ?, ?)""",
+                source_config_revision, predecessor_activity_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, 'rerun', 'pending', ?, ?, ?, ?, ?, ?, ?)""",
             (
                 successor_id,
                 completed["workspace_id"],
@@ -13040,6 +13302,7 @@ class Database:
                 completed["rerun_input_snapshot_id"],
                 completed["rerun_input_generation_watermark"],
                 completed["rerun_source_config_revision"],
+                completed["rerun_predecessor_activity_id"],
                 now,
                 now,
             ),
@@ -13188,6 +13451,72 @@ class Database:
             async for row in cursor:
                 results.append(_source_sync_input_from_row(row))
         return results
+
+    async def attest_source_sync_input_artifact(
+        self,
+        *,
+        source_id: str,
+        input_id: str,
+        package_sha256: str,
+        expected_activity_epoch: int | None = None,
+    ) -> SourceSyncInput:
+        """Atomically fill or verify a retained input's own package hash."""
+        async with self._write_lock:
+            try:
+                source_lock = await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (source_id,),
+                )
+                if source_lock.rowcount != 1:
+                    raise ValueError(f"Source not found: {source_id}")
+                async with self.db.execute(
+                    """SELECT id FROM lifecycle_backfill_jobs
+                       WHERE source_id = ? AND status IN ('queued', 'running')
+                       ORDER BY created_at LIMIT 1""",
+                    (source_id,),
+                ) as cursor:
+                    lifecycle_job = await cursor.fetchone()
+                if lifecycle_job is not None:
+                    raise SourceActivityConflict(
+                        f"source lifecycle maintenance active: {lifecycle_job['id']}"
+                    )
+                if expected_activity_epoch is not None:
+                    async with self.db.execute(
+                        "SELECT activity_epoch FROM sources WHERE id = ?",
+                        (source_id,),
+                    ) as cursor:
+                        epoch_row = await cursor.fetchone()
+                    current_epoch = int(epoch_row["activity_epoch"] or 0)
+                    if current_epoch != expected_activity_epoch:
+                        raise SourceActivityConflict(
+                            "source activity epoch changed: "
+                            f"expected {expected_activity_epoch}, current {current_epoch}"
+                        )
+                async with self.db.execute(
+                    "SELECT * FROM source_sync_inputs WHERE input_id = ? AND source_id = ?",
+                    (input_id, source_id),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if existing is None:
+                    raise ValueError(f"Source sync input not found: {input_id}")
+                current = _source_sync_input_from_row(existing)
+                metadata = source_sync_input_metadata_with_artifact_attestation(
+                    current.metadata,
+                    package_sha256=package_sha256,
+                    input_id=input_id,
+                )
+                async with self.db.execute(
+                    """UPDATE source_sync_inputs SET metadata_json = ?
+                       WHERE input_id = ? AND source_id = ?""",
+                    (json.dumps(metadata, sort_keys=True), input_id, source_id),
+                ) as cursor:
+                    if cursor.rowcount != 1:
+                        raise ValueError(f"Source sync input not found: {input_id}")
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return replace(current, metadata=metadata)
 
     async def _record_source_sync_snapshot_item_unlocked(
         self,

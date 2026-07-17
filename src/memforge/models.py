@@ -524,6 +524,8 @@ class SourceSyncRun:
     rerun_input_generation_watermark: int | None = None
     source_config_revision: str | None = None
     rerun_source_config_revision: str | None = None
+    predecessor_activity_id: str | None = None
+    rerun_predecessor_activity_id: str | None = None
     coalesced: bool = False
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None

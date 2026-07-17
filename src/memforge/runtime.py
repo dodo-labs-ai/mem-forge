@@ -634,16 +634,18 @@ async def run_source_sync(
         lifecycle_job_id=lifecycle_job_id,
     )
     activity_id = None
+    source_activity_epoch: int | None = None
     heartbeat_task: asyncio.Task[None] | None = None
     if lifecycle_job_id is None:
         activity_id = f"source-sync-{uuid.uuid4().hex}"
         try:
-            await db.acquire_source_activity(
+            activity_lease = await db.acquire_source_activity(
                 activity_id=activity_id,
                 source_id=str(source["id"]),
                 kind=SourceActivityKind.SYNC,
                 lease_seconds=300,
             )
+            source_activity_epoch = activity_lease.epoch
         except SourceActivityConflict as exc:
             raise SourceLifecycleMaintenanceError(str(exc)) from exc
 
@@ -656,6 +658,8 @@ async def run_source_sync(
                 )
 
         heartbeat_task = asyncio.create_task(heartbeat_activity())
+    else:
+        source_activity_epoch = await db.get_source_activity_epoch(str(source["id"]))
     try:
         runtime = runtime or await build_sync_runtime(db, config)
         secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
@@ -674,6 +678,7 @@ async def run_source_sync(
             "force_full_sync": force_full_sync,
             "authoritative_snapshot": authoritative_snapshot,
             "reprocess_doc_ids": reprocess_doc_ids,
+            "source_activity_epoch": source_activity_epoch,
         }
         if execution_mode is not SourceSyncMode.NORMAL:
             sync_kwargs["execution_mode"] = execution_mode
@@ -1069,6 +1074,7 @@ class SyncService:
         workspace_id: str = "default",
         input_snapshot_id: str | None = None,
         source_config_revision: str | None = None,
+        predecessor_activity_id: str | None = None,
     ) -> SourceSyncRun:
         source = await self._ensure_source_can_sync(source_id)
         current_config_revision = (
@@ -1086,6 +1092,7 @@ class SyncService:
             force_full_sync=force_full_sync,
             input_snapshot_id=input_snapshot_id,
             source_config_revision=effective_config_revision,
+            predecessor_activity_id=predecessor_activity_id,
         )
 
     async def start_source(self, source_id: str, *, force_full_sync: bool = False) -> asyncio.Task:

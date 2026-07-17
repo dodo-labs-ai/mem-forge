@@ -75,6 +75,9 @@ MEMORY_SUPPORT_VALIDATION_PROMPT = """Determine whether the current evidence sti
 Return supported=true only when the claim's truth conditions remain entailed by the current
 Primary and every current Required observation. A change in scope, subject, condition,
 polarity, or applicability means supported=false.
+When supported=true and the previous Primary quote is no longer present verbatim, return
+evidence_quote as one exact, non-empty substring copied from the current Primary observation
+that directly supports the claim. Never paraphrase evidence_quote.
 
 <case_json>
 {case_json}
@@ -492,18 +495,14 @@ class MemoryEngine:
                     f"{operation.memory_id}"
                 )
             selected = primary[0]
-            if (
+            primary_needs_validation = (
                 selected in stale
                 and (
                     not selected.excerpt
                     or selected.excerpt
                     not in current_revisions[selected.anchor.observation_id].content
                 )
-            ):
-                raise RuntimeError(
-                    "NOOP incumbent lacks exact current-revision PRIMARY evidence: "
-                    f"{operation.memory_id}"
-                )
+            )
             required_observation_ids = sorted(
                 {
                     item.anchor.observation_id
@@ -516,7 +515,8 @@ class MemoryEngine:
                 item for item in stale if item.role is EvidenceRole.REQUIRED
             ]
             support_validation: dict[str, object] = {}
-            if stale_required:
+            current_primary_quote = selected.excerpt or ""
+            if primary_needs_validation or stale_required:
                 validator = getattr(
                     self.structured_llm_client,
                     "validate_memory_support",
@@ -524,7 +524,15 @@ class MemoryEngine:
                 )
                 if validator is None:
                     raise RuntimeError(
-                        "revised REQUIRED evidence needs structured semantic validation: "
+                        "revised evidence needs structured semantic validation: "
+                        f"{operation.memory_id}"
+                    )
+                current_primary = current_revisions.get(
+                    selected.anchor.observation_id
+                )
+                if current_primary is None:
+                    raise RuntimeError(
+                        "NOOP incumbent current PRIMARY observation is unavailable: "
                         f"{operation.memory_id}"
                     )
                 validation = await validator(
@@ -532,9 +540,8 @@ class MemoryEngine:
                         case_json=json.dumps(
                             {
                                 "memory_claim": incumbent.content,
-                                "primary": current_revisions[
-                                    selected.anchor.observation_id
-                                ].content,
+                                "previous_primary_quote": selected.excerpt,
+                                "primary": current_primary.content,
                                 "required": [
                                     current_revisions[item.anchor.observation_id].content
                                     for item in stale_required
@@ -552,6 +559,7 @@ class MemoryEngine:
                     "model": self.llm_model,
                     "supported": bool(validation.supported),
                     "reason": validation.reason,
+                    "primary_observation_id": selected.anchor.observation_id,
                     "required_observation_ids": sorted(
                         item.anchor.observation_id for item in stale_required
                     ),
@@ -569,6 +577,19 @@ class MemoryEngine:
                         )
                     )
                     continue
+                if primary_needs_validation:
+                    current_primary_quote = str(
+                        getattr(validation, "evidence_quote", "") or ""
+                    ).strip()
+                    if (
+                        not current_primary_quote
+                        or current_primary_quote not in current_primary.content
+                    ):
+                        raise RuntimeError(
+                            "NOOP incumbent support validation lacks exact current "
+                            "PRIMARY evidence: "
+                            f"{operation.memory_id}"
+                        )
             rebound.append(
                 ReconcileOperation(
                     action=operation.action,
@@ -578,8 +599,8 @@ class MemoryEngine:
                         memory_type=incumbent.memory_type,
                         confidence=incumbent.confidence,
                         tags=list(incumbent.tags),
-                        extraction_context=selected.excerpt,
-                        evidence_quote=selected.excerpt,
+                        extraction_context=current_primary_quote,
+                        evidence_quote=current_primary_quote,
                         evidence_anchor="revalidated_noop",
                         source_observation_id=selected.anchor.observation_id,
                         required_source_observation_ids=required_observation_ids,
@@ -662,6 +683,7 @@ class MemoryEngine:
         update_plan_stats: dict[str, Any] | None,
         source_updated_at: datetime | None,
         user_id: str | None = None,
+        expected_source_activity_epoch: int | None = None,
     ) -> dict[str, int]:
         """Reconcile a complete Source Unit ledger and atomically apply one plan."""
 
@@ -685,6 +707,7 @@ class MemoryEngine:
 
         stats = {
             "added": 0,
+            "reactivated": 0,
             "corroborated": 0,
             "updated": 0,
             "superseded": 0,
@@ -692,6 +715,7 @@ class MemoryEngine:
             "noop": 0,
             "pending_review": 0,
             "skipped": 0,
+            "vector_delivery_pending": 0,
         }
         filtered_memories: list[RawMemory] = []
         for raw in raw_memories:
@@ -887,19 +911,24 @@ class MemoryEngine:
             evidence_units=projected_evidence.units,
             evidence_references=projected_evidence.references,
         )
-        await self.db.apply_source_projection_lifecycle(projection, plan)
-        await self.memory_store.drain_lifecycle_vector_outbox(plan.id)
+        await self.db.apply_source_projection_lifecycle(
+            projection,
+            plan,
+            expected_source_activity_epoch=expected_source_activity_epoch,
+        )
+        delivery = await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)
+        stats["vector_delivery_pending"] = int(delivery.pending)
 
-        created_memory_ids = [
+        activated_memory_ids = [
             mutation.memory_id
             for mutation in plan.mutations
-            if mutation.mutation_type.value == "create_memory"
+            if mutation.mutation_type.value in {"create_memory", "reactivate_memory"}
         ]
-        if created_memory_ids and self.structured_llm_client:
+        if activated_memory_ids and self.structured_llm_client:
             from memforge.pipeline.contradiction_detector import detect_cross_doc_contradictions
 
             contradiction_stats = await detect_cross_doc_contradictions(
-                new_memory_ids=created_memory_ids,
+                new_memory_ids=activated_memory_ids,
                 doc_id=doc_id,
                 db=self.db,
                 memory_store=self.memory_store,
@@ -912,6 +941,8 @@ class MemoryEngine:
         for mutation in plan.mutations:
             if mutation.mutation_type.value == "create_memory":
                 stats["added"] += 1
+            elif mutation.mutation_type.value == "reactivate_memory":
+                stats["reactivated"] += 1
             elif mutation.mutation_type.value == "supersede_memory":
                 stats["superseded"] += 1
             elif mutation.mutation_type.value == "retire_memory":
@@ -939,6 +970,7 @@ class MemoryEngine:
         projection: SourceProjection,
         doc_id: str,
         reason: str,
+        expected_source_activity_epoch: int | None = None,
     ) -> dict[str, int | bool]:
         """Apply an authoritative Source Unit tombstone without an LLM call.
 
@@ -1008,8 +1040,12 @@ class MemoryEngine:
                 ),
             ),
         )
-        await self.db.apply_source_projection_lifecycle(projection, plan)
-        await self.memory_store.drain_lifecycle_vector_outbox(plan.id)
+        await self.db.apply_source_projection_lifecycle(
+            projection,
+            plan,
+            expected_source_activity_epoch=expected_source_activity_epoch,
+        )
+        await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)
         pending_review = sum(
             mutation.mutation_type.value == "create_review" for mutation in plan.mutations
         )

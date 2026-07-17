@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -9,6 +10,7 @@ from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import plan_projection_extraction_batches
 from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.source_projection import AnchorKind, DeltaAxis, SourceAnchor
 
 
 def _jira_projection(comment_count: int = 3):
@@ -238,6 +240,63 @@ async def test_projection_batch_extractor_preserves_declared_required_context() 
         "A7 is retained under the issue context."
     ]
     assert result.memories[0].required_source_observation_ids == [required_id]
+
+
+@pytest.mark.asyncio
+async def test_projection_batch_rejects_context_that_belongs_only_to_another_primary() -> None:
+    projection = _jira_projection(3)
+    comments = [item for item in projection.observations if item.observation_type == "comment"]
+    revisions = {item.observation_id: item for item in projection.observation_revisions}
+    changed = comments[:2]
+    delta = replace(
+        projection.deltas[0],
+        axes=frozenset({DeltaAxis.SEMANTIC}),
+        changed_anchors=tuple(
+            SourceAnchor(
+                kind=AnchorKind.WHOLE_OBSERVATION,
+                observation_id=item.id,
+                observation_revision_id=revisions[item.id].id,
+            )
+            for item in changed
+        ),
+        added_observation_ids=(),
+    )
+    projection = replace(projection, deltas=(delta,))
+    batch = plan_projection_extraction_batches(projection)[0]
+    first_primary_id = changed[0].id
+    context_for_other_primary_id = comments[2].id
+    assert context_for_other_primary_id in batch.context_observation_ids
+
+    class Client:
+        async def extract_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return MemoryExtractionResponse(
+                memories=[
+                    MemoryCandidate(
+                        content="The first comment depends on non-adjacent context.",
+                        memory_type="decision",
+                        evidence_quote="Reply 0: retain A7",
+                        source_observation_id=first_primary_id,
+                        required_source_observation_ids=[context_for_other_primary_id],
+                    ),
+                    MemoryCandidate(
+                        content="The second comment depends on its adjacent context.",
+                        memory_type="decision",
+                        evidence_quote="Reply 1: retain A7",
+                        source_observation_id=changed[1].id,
+                        required_source_observation_ids=[context_for_other_primary_id],
+                    ),
+                ]
+            )
+
+    result = await MemoryExtractor(structured_llm_client=Client()).extract_projection_batch_memories(
+        batch,
+        source_type="jira",
+    )
+
+    assert [item.content for item in result.memories] == [
+        "The second comment depends on its adjacent context."
+    ]
 
 
 @pytest.mark.asyncio

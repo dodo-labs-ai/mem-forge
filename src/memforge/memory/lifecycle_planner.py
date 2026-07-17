@@ -138,8 +138,24 @@ def build_lifecycle_plan(
         evidence_reference_ids = references_for(operation.memory)
         if not evidence_reference_ids:
             raise ValueError("corroborated Memory candidate lacks support-granting evidence")
+        reactivation_mutations: tuple[LifecycleMutation, ...] = ()
+        if target.status == "retired":
+            if target.retirement_reason != "source_rebaseline":
+                raise ValueError("only source-rebaseline retirement may be reactivated")
+            reactivation_mutations = (
+                LifecycleMutation(
+                    LifecycleMutationType.REACTIVATE_MEMORY,
+                    memory_id=target.id,
+                    source_id=scope.source_id,
+                    payload={
+                        "expected_content_hash": target.content_hash,
+                        "reason": "exact claim replayed after source rebaseline",
+                    },
+                ),
+            )
         mutations.extend(
             (
+                *reactivation_mutations,
                 LifecycleMutation(
                     LifecycleMutationType.ATTACH_SUPPORT,
                     memory_id=target.id,

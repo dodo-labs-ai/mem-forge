@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 
@@ -624,6 +625,158 @@ def test_local_adapter_document_push_writes_package(tmp_path):
         items, normalized = asyncio.run(_read_package())
         assert items[0].extra["package_uri"] == body["package_uri"]
         assert normalized.markdown_body.startswith("# Cutoff")
+    finally:
+        asyncio.run(database.close())
+
+
+def test_duplicate_local_package_attests_the_retained_artifact_not_the_new_upload(
+    tmp_path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_local_markdown_source(client)["id"]
+            first = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "vault_id": "engineering",
+                    "relative_path": "decisions/retained.md",
+                    "markdown_body": "# Decision\n\nKeep the retained artifact.",
+                    "submitted_at": "2026-07-15T10:00:00+00:00",
+                    "process_now": False,
+                },
+            )
+            assert first.status_code == 200, first.text
+            retained_uri = first.json()["package_uri"]
+            retained_sha = hashlib.sha256(Path(retained_uri).read_bytes()).hexdigest()
+            [legacy_input] = asyncio.run(
+                database.list_source_sync_inputs(source_id=source_id)
+            )
+            legacy_metadata = dict(legacy_input.metadata)
+            legacy_metadata.pop("package_sha256")
+            manifest_entry = dict(legacy_metadata["manifest_entry"])
+            manifest_entry.pop("package_sha256", None)
+            legacy_metadata["manifest_entry"] = manifest_entry
+            asyncio.run(
+                database.db.execute(
+                    "UPDATE source_sync_inputs SET metadata_json = ? WHERE input_id = ?",
+                    (json.dumps(legacy_metadata, sort_keys=True), legacy_input.input_id),
+                )
+            )
+            asyncio.run(database.db.commit())
+
+            duplicate = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "vault_id": "engineering",
+                    "relative_path": "decisions/retained.md",
+                    "markdown_body": "# Decision\n\nKeep the retained artifact.",
+                    "submitted_at": "2026-07-16T10:00:00+00:00",
+                    "process_now": False,
+                },
+            )
+
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json()["package_uri"] == retained_uri
+        assert duplicate.json()["package_sha256"] == retained_sha
+        [attested] = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
+        assert attested.input_id == legacy_input.input_id
+        assert attested.raw_uri == retained_uri
+        assert attested.metadata["package_sha256"] == retained_sha
+        assert attested.metadata["manifest_entry"]["package_sha256"] == retained_sha
+        assert Path(retained_uri).exists()
+        assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == [
+            Path(retained_uri)
+        ]
+        assert asyncio.run(database.list_source_artifact_cleanup_tasks()) == []
+    finally:
+        asyncio.run(database.close())
+
+
+@pytest.mark.parametrize("retained_failure", ["corrupt", "missing"])
+def test_duplicate_local_package_does_not_attest_an_invalid_retained_artifact(
+    tmp_path,
+    retained_failure,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_local_markdown_source(client)["id"]
+            first = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "vault_id": "engineering",
+                    "relative_path": "decisions/corrupt.md",
+                    "markdown_body": "# Original",
+                    "submitted_at": "2026-07-15T10:00:00+00:00",
+                    "process_now": False,
+                },
+            )
+            assert first.status_code == 200, first.text
+            retained_uri = first.json()["package_uri"]
+            [legacy_input] = asyncio.run(
+                database.list_source_sync_inputs(source_id=source_id)
+            )
+            legacy_metadata = dict(legacy_input.metadata)
+            legacy_metadata.pop("package_sha256")
+            manifest_entry = dict(legacy_metadata["manifest_entry"])
+            manifest_entry.pop("package_sha256", None)
+            legacy_metadata["manifest_entry"] = manifest_entry
+            asyncio.run(
+                database.db.execute(
+                    "UPDATE source_sync_inputs SET metadata_json = ? WHERE input_id = ?",
+                    (json.dumps(legacy_metadata, sort_keys=True), legacy_input.input_id),
+                )
+            )
+            asyncio.run(database.db.commit())
+            if retained_failure == "corrupt":
+                Path(retained_uri).write_bytes(b"{}")
+            else:
+                Path(retained_uri).unlink()
+
+            duplicate = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "vault_id": "engineering",
+                    "relative_path": "decisions/corrupt.md",
+                    "markdown_body": "# Original",
+                    "submitted_at": "2026-07-16T10:00:00+00:00",
+                    "process_now": False,
+                },
+            )
+
+        assert duplicate.status_code == 409, duplicate.text
+        assert duplicate.json()["detail"] == (
+            "source_lifecycle_local_replay_artifact_invalid"
+        )
+        [unchanged] = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
+        assert "package_sha256" not in unchanged.metadata
+        assert "package_sha256" not in unchanged.metadata["manifest_entry"]
+        if retained_failure == "corrupt":
+            assert Path(retained_uri).read_bytes() == b"{}"
+            assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == [
+                Path(retained_uri)
+            ]
+        else:
+            assert not Path(retained_uri).exists()
+            assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == []
+        assert asyncio.run(database.list_source_artifact_cleanup_tasks()) == []
     finally:
         asyncio.run(database.close())
 

@@ -251,6 +251,7 @@ class MemorySupportValidationResponse(StructuredResponseModel):
 
     supported: bool
     reason: str = Field(default="", max_length=1000)
+    evidence_quote: str = Field(default="", max_length=4000)
 
 
 class EntityValidationResponse(StructuredResponseModel):
