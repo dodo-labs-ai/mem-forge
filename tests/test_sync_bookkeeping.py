@@ -2844,6 +2844,24 @@ class ProjectionBatchRecordingExtractor(RecordingMemoryExtractor):
         return MemoryExtractionResult(memories=[])
 
 
+class ProjectionBatchCandidateExtractor(ProjectionBatchRecordingExtractor):
+    async def extract_projection_batch_memories(self, batch, **kwargs):
+        del kwargs
+        self.projection_calls.append(batch)
+        index = len(self.projection_calls) - 1
+        return MemoryExtractionResult(
+            memories=[
+                RawMemory(
+                    content=f"Durable claim from projection batch {index}.",
+                    memory_type="fact",
+                    source_observation_id=next(
+                        iter(dict(batch.primary_content_by_observation_id))
+                    ),
+                )
+            ]
+        )
+
+
 @pytest.mark.asyncio
 async def test_unchanged_multi_observation_projection_skips_full_document_extraction(
     db: Database,
@@ -3635,6 +3653,45 @@ async def test_large_single_observation_uses_bounded_projection_batches(db: Data
     assert all(len(batch.primary_markdown) <= 60_000 for batch in extractor.projection_calls)
     assert extractor.full_calls == []
     assert extractor.unit_calls == []
+
+
+@pytest.mark.asyncio
+async def test_projection_batch_candidates_are_aggregated_before_projected_lifecycle(
+    db: Database,
+) -> None:
+    source_id = "src-large-confluence-ledger"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Large Confluence",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    body = "\n".join(f"design-line-{index:05d}" for index in range(9_000))
+    extractor = ProjectionBatchCandidateExtractor()
+    memory_engine = RecordingMemoryEngine()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=extractor,
+        memory_engine=memory_engine,
+        memory_store=None,
+        max_concurrent=2,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=LargeConfluenceGene(body),
+        source_name="Large Confluence",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "success"
+    assert len(extractor.projection_calls) > 1
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    [lifecycle_call] = memory_engine.projected_lifecycle_calls
+    assert len(lifecycle_call["raw_memories"]) == len(extractor.projection_calls)
 
 
 @pytest.mark.asyncio

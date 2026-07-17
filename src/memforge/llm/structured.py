@@ -196,6 +196,25 @@ class MemoryExtractionResponse(StructuredResponseModel):
     memories: list[MemoryCandidate]
 
 
+class CandidateLedgerDecision(StructuredResponseModel):
+    """One uniqueness decision for a transient extracted candidate."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    index: int = Field(ge=0)
+    action: Literal["KEEP", "DROP_REDUNDANT"]
+    canonical_index: int | None = Field(default=None, ge=0)
+    reason: str = Field(default="", max_length=1000)
+
+
+class CandidateLedgerResponse(StructuredResponseModel):
+    """Complete within-revision uniqueness ledger for extracted candidates."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    decisions: list[CandidateLedgerDecision]
+
+
 class ReconciliationDecision(StructuredResponseModel):
     """One same-document memory reconciliation decision."""
 
@@ -320,6 +339,15 @@ class SourceSupportStructuredClient(Protocol):
         model: str | None = None,
     ) -> MemoryExtractionResponse:
         """Return schema-validated extracted memory candidates."""
+
+    async def select_memory_candidates(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 8192,
+        model: str | None = None,
+    ) -> CandidateLedgerResponse:
+        """Return a complete within-revision candidate uniqueness ledger."""
 
     async def reconcile_memories(
         self,
@@ -561,6 +589,20 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=MemoryExtractionResponse,
+            max_tokens=max_tokens,
+            model=model,
+        )
+
+    async def select_memory_candidates(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 8192,
+        model: str | None = None,
+    ) -> CandidateLedgerResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=CandidateLedgerResponse,
             max_tokens=max_tokens,
             model=model,
         )

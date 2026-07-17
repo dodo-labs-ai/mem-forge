@@ -7,6 +7,23 @@ from dataclasses import dataclass
 
 from memforge.models import RawMemory
 
+_OPERATIONAL_HISTORY_FIELDS = frozenset(
+    {
+        "assignee",
+        "due date",
+        "duedate",
+        "fix version",
+        "fix version/s",
+        "fixversion",
+        "labels",
+        "priority",
+        "rank",
+        "resolution",
+        "sprint",
+        "status",
+    }
+)
+
 __all__ = [
     "MemoryCandidateQuality",
     "classify_memory_candidate",
@@ -33,6 +50,10 @@ def classify_memory_candidate(raw: RawMemory) -> MemoryCandidateQuality:
         return MemoryCandidateQuality(keep=False, skip_reason="self_referential")
     if _is_reference_only(content, context):
         return MemoryCandidateQuality(keep=False, skip_reason="reference_only")
+    if _is_attachment_event_only(content, context):
+        return MemoryCandidateQuality(keep=False, skip_reason="attachment_event_only")
+    if _is_operational_history_only(context):
+        return MemoryCandidateQuality(keep=False, skip_reason="operational_history_only")
     if _is_metadata_only(content, context):
         return MemoryCandidateQuality(keep=False, skip_reason="metadata_only")
     if _is_open_question(content, context):
@@ -114,6 +135,28 @@ def _is_reference_only(content: str, context: str) -> bool:
         or re.search(r"\breferences?\b", content)
     )
     return content_is_link_sentence or (context_is_link_list and content_describes_link)
+
+
+def _is_attachment_event_only(content: str, context: str) -> bool:
+    """Drop upload bookkeeping; only a separate attachment artifact grants authority."""
+    provider_attachment_event = bool(
+        re.search(r'["\']field["\']\s*:\s*["\']attachment["\']', context)
+    )
+    unstructured_upload_event = bool(
+        re.search(r"\battachment id\b", content)
+        and
+        re.search(r"\b(?:attached|uploaded|added (?:an? )?attachment)\b", content)
+    )
+    return provider_attachment_event or unstructured_upload_event
+
+
+def _is_operational_history_only(context: str) -> bool:
+    """Drop evidence made solely of routing and workflow field transitions."""
+    fields = {
+        re.sub(r"\s+", " ", value.strip().lower())
+        for value in re.findall(r'["\']field["\']\s*:\s*["\']([^"\']+)["\']', context)
+    }
+    return bool(fields) and fields.issubset(_OPERATIONAL_HISTORY_FIELDS)
 
 
 def _is_open_question(content: str, context: str) -> bool:

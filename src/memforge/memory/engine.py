@@ -15,6 +15,11 @@ from datetime import date, datetime, timezone
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 
+from memforge.memory.candidate_ledger import (
+    CandidateLedgerError,
+    CandidateLedgerResult,
+    select_unique_memory_candidates,
+)
 from memforge.memory.entity_resolver import EntityResolver, insert_llm_alias, resolve_entity
 from memforge.memory.evidence import (
     AuthorityCase,
@@ -729,6 +734,13 @@ class MemoryEngine:
         for raw in raw_memories:
             if self._candidate_can_persist(raw, stats):
                 filtered_memories.append(raw)
+        quality_candidate_count = len(filtered_memories)
+        filtered_memories = await self._select_projected_candidates(
+            projection=projection,
+            doc_id=doc_id,
+            candidates=filtered_memories,
+        )
+        stats["skipped"] += quality_candidate_count - len(filtered_memories)
 
         incumbents, unit_support = await self._active_projected_incumbents(
             doc_id=doc_id,
@@ -971,6 +983,85 @@ class MemoryEngine:
             for decision in plan.coverage_proof.incumbent_decisions
         )
         return stats
+
+    async def _select_projected_candidates(
+        self,
+        *,
+        projection: SourceProjection,
+        doc_id: str,
+        candidates: list[RawMemory],
+    ) -> list[RawMemory]:
+        """Select one complete within-revision candidate ledger before writes."""
+
+        try:
+            result = await select_unique_memory_candidates(
+                candidates,
+                structured_llm_client=self.structured_llm_client,
+                llm_model=self.llm_model,
+            )
+        except CandidateLedgerError as exc:
+            await self._record_candidate_ledger_audit(
+                projection=projection,
+                doc_id=doc_id,
+                status="failed",
+                reason=exc.error_type,
+                payload={
+                    "input_count": exc.input_count,
+                    "semantic_input_count": exc.semantic_input_count,
+                    "selected_count": 0,
+                    "candidate_fingerprints": _candidate_fingerprints(candidates),
+                    "fingerprints_truncated": len(candidates) > 200,
+                },
+                error=str(exc),
+            )
+            raise RuntimeError(
+                f"candidate ledger failed closed: {exc.error_type}: {exc}"
+            ) from exc
+
+        if result.semantic_input_count > 1 or result.dropped_exact_count:
+            await self._record_candidate_ledger_audit(
+                projection=projection,
+                doc_id=doc_id,
+                status="committed",
+                reason="complete_candidate_ledger",
+                payload=_candidate_ledger_audit_payload(result),
+            )
+        return list(result.candidates)
+
+    async def _record_candidate_ledger_audit(
+        self,
+        *,
+        projection: SourceProjection,
+        doc_id: str,
+        status: str,
+        reason: str,
+        payload: dict[str, Any],
+        error: str | None = None,
+    ) -> None:
+        recorder = getattr(self.memory_store, "record_audit_event", None)
+        if recorder is None:
+            return
+        context_factory = getattr(self.memory_store, "operation_context", None)
+        context = (
+            context_factory(
+                run_id=projection.run_id,
+                source_id=projection.source_id,
+                doc_id=doc_id,
+            )
+            if context_factory is not None
+            else None
+        )
+        await recorder(
+            "candidate_ledger_completed" if status == "committed" else "candidate_ledger_failed",
+            status,
+            context=context,
+            doc_id=doc_id,
+            source_id=projection.source_id,
+            decision="select_unique_candidates",
+            reason=reason,
+            payload=payload,
+            error=error,
+        )
 
     async def apply_projected_tombstone(
         self,
@@ -1446,6 +1537,44 @@ class MemoryEngine:
             candidates=tuple(candidates),
             relations=relations,
         )
+
+
+def _candidate_ledger_audit_payload(result: CandidateLedgerResult) -> dict[str, Any]:
+    return {
+        "input_count": result.input_count,
+        "semantic_input_count": result.semantic_input_count,
+        "selected_count": len(result.candidates),
+        "dropped_exact_count": result.dropped_exact_count,
+        "dropped_redundant_count": result.dropped_redundant_count,
+        "drops": [
+            {
+                "candidate_content_hash": content_hash(drop.candidate.content),
+                "candidate_source_observation_id": drop.candidate.source_observation_id,
+                "canonical_content_hash": content_hash(drop.canonical_candidate.content),
+                "canonical_source_observation_id": (
+                    drop.canonical_candidate.source_observation_id
+                ),
+                "method": drop.method,
+                "reason": drop.reason[:240],
+            }
+            for drop in result.drops
+        ],
+    }
+
+
+def _candidate_fingerprints(
+    candidates: list[RawMemory],
+    *,
+    limit: int = 200,
+) -> list[dict[str, str | None]]:
+    return [
+        {
+            "content_hash": content_hash(candidate.content),
+            "source_observation_id": candidate.source_observation_id,
+        }
+        for candidate in candidates[:limit]
+    ]
+
 
 def _document_evidence_unit_id(
     *,
