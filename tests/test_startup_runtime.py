@@ -2483,6 +2483,58 @@ async def test_source_scope_update_terminates_durable_pending_run(db, tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_jira_advanced_jql_update_terminates_pending_run(db, tmp_path, monkeypatch):
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_secrets import prepare_source_config_for_storage
+
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
+    source_id = "src-jira-advanced-pending"
+    old_config = {
+        "base_url": "https://jira.example",
+        "auth_mode": "pat",
+        "query_mode": "advanced",
+        "jql": "key = PAY-1",
+        "include_comments": True,
+    }
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Advanced pending",
+        config_json=json.dumps(
+            prepare_source_config_for_storage(
+                {**old_config, "pat": "jira-pat-secret"},
+                secret_fields=("pat",),
+            )
+        ),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    pending = await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="manual",
+    )
+    config = _config(tmp_path)
+    config.sync.worker_enabled = False
+    config.sync.scheduler_enabled = False
+    app = create_admin_app(db=db, config=config)
+
+    with TestClient(app) as client:
+        response = client.put(
+            f"/api/sources/{source_id}",
+            json={"config": {**old_config, "jql": "key = PAY-2"}},
+        )
+
+    assert response.status_code == 200, response.text
+    cancelled = await db.get_source_sync_run(pending.run_id)
+    assert cancelled is not None
+    assert cancelled.status == "failed"
+    transition = await db.get_open_projection_scope_transition(source_id)
+    assert transition is not None
+    assert transition.previous_scope["jql"] == "key = PAY-1"
+    assert transition.target_scope["jql"] == "key = PAY-2"
+
+
+@pytest.mark.asyncio
 async def test_repeated_source_scope_update_creates_a_new_transition_cycle(
     db,
     tmp_path,
