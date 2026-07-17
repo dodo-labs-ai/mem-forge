@@ -27,7 +27,6 @@ from memforge.memory.evidence import (
     RelationOutcomeBundle,
 )
 from memforge.memory.lifecycle_plan import (
-    ExactRevisionReplay,
     LegacyMemoryProvenance,
     LifecycleCutoverFinding,
     LifecycleBackfillJob,
@@ -334,14 +333,6 @@ class RelationalStore(Protocol):
         self,
         source_unit_id: str,
     ) -> Mapping[str, tuple[str, ...]]: ...
-    async def get_exact_revision_replay(
-        self,
-        *,
-        source_id: str,
-        source_unit_id: str,
-        target_unit_revision_id: str,
-        observation_revision_ids: tuple[str, ...],
-    ) -> ExactRevisionReplay | None: ...
     async def apply_source_projection_lifecycle(
         self,
         projection: SourceProjection,

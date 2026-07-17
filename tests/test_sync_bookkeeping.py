@@ -2638,11 +2638,6 @@ class NoopMemoryEngine:
     async def apply_projected_tombstone(self, **kwargs):
         return {"retired": 0, "pending_review": 0, "can_delete_document": True}
 
-    async def restore_exact_projected_revision(self, **kwargs):
-        del kwargs
-        return None
-
-
 class RecordingSourceSupportDetector:
     async def detect_and_persist(self, **kwargs):
         return {
@@ -7825,7 +7820,7 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
 
 
 @pytest.mark.asyncio
-async def test_scope_reentry_replays_exact_revision_without_calling_extractor_again(
+async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_memory(
     db: Database,
 ) -> None:
     source_id = "src-github-scope-reentry-replay"
@@ -7998,16 +7993,17 @@ async def test_scope_reentry_replays_exact_revision_without_calling_extractor_ag
     assert retired is not None and retired.status == "retired"
 
     await set_scope(["other"], ["docs"])
-    restored = await orchestrator.sync_gene(
+    reentered = await orchestrator.sync_gene(
         gene=gene,
         source_name="Payroll Repo",
         source_id=source_id,
         authoritative_snapshot=True,
     )
 
-    current = await db.get_memory(memory.id)
+    original_after_reentry = await db.get_memory(memory.id)
+    [current] = await db.list_memories(source=source_id, status="active")
     support = await db.get_active_memory_support_evidence(
-        memory.id,
+        current.id,
         source_id=source_id,
     )
 
@@ -8021,13 +8017,15 @@ async def test_scope_reentry_replays_exact_revision_without_calling_extractor_ag
 
     assert first.last_sync_status == "success"
     assert removed.last_sync_status == "success"
-    assert restored.last_sync_status == "success"
+    assert reentered.last_sync_status == "success"
     assert repeated_removal.last_sync_status == "success"
-    assert len(extractor.claim_calls) == 1
-    assert current is not None and current.status == "active"
+    assert len(extractor.claim_calls) == 2
+    assert original_after_reentry is not None
+    assert original_after_reentry.status == "retired"
+    assert current.id != memory.id
     assert len(support) == 1
     assert support[0].anchor.observation_revision_id
-    repeatedly_retired = await db.get_memory(memory.id)
+    repeatedly_retired = await db.get_memory(current.id)
     assert repeatedly_retired is not None
     assert repeatedly_retired.status == "retired"
 
