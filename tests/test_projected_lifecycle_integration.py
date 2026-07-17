@@ -252,6 +252,25 @@ class _DeleteClient:
         )
 
 
+class _PersistentlyIndexlessReplacementClient:
+    def __init__(self, incumbent_id: str) -> None:
+        self.incumbent_id = incumbent_id
+        self.calls = 0
+
+    async def reconcile_memories(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        self.calls += 1
+        return ReconciliationResponse(
+            decisions=[
+                ReconciliationDecision(
+                    action="SUPERSEDE",
+                    memory_id=self.incumbent_id,
+                    reason="The incumbent appears stale but no replacement candidate was selected.",
+                )
+            ]
+        )
+
+
 class _OutboxDrainer:
     def __init__(self, database: Database) -> None:
         self.db = database
@@ -956,6 +975,60 @@ async def test_incremental_noop_invalidated_primary_creates_review(
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
     assert await db.get_active_memory_support_reference_ids(incumbent.id)
+
+
+@pytest.mark.asyncio
+async def test_persistent_indexless_replacement_creates_review_without_mutating_incumbent(
+    db: Database,
+) -> None:
+    first = _projection(
+        run_id="projection-indexless-replacement-1",
+        body="A7 is removed.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    await db.enable_lifecycle_gate("src-1")
+    second = _projection(
+        run_id="projection-indexless-replacement-2",
+        body="A7 is now retained.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            first.observations[0].id: first.observation_revisions[0]
+        },
+    )
+    client = _PersistentlyIndexlessReplacementClient(incumbent.id)
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=client,
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content=second.observation_revisions[0].content,
+        update_mode="diff_guided",
+        changed_hunks="removed -> retained",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert client.calls == 2
+    assert stats["pending_review"] == 1
+    current = await db.get_memory(incumbent.id)
+    assert current is not None and current.status == "active"
+    assert await db.get_active_memory_support_reference_ids(incumbent.id)
+    reviews = await db.list_lifecycle_reviews("src-1")
+    assert len(reviews) == 1
+    assert reviews[0].incumbent_memory_id == incumbent.id
 
 
 @pytest.mark.asyncio
