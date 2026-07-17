@@ -36,6 +36,24 @@ OPEN_QUESTION_CONTEXT = (
     "we should bear it in mind and discuss whether all the synchronous checks would be fully repeated"
 )
 
+ATTACHMENT_EVENT_CONTENT = (
+    "In SFPay, Donchev, Georgi attached 'screenshot-8.png' "
+    "(attachment ID 11786339) to the payroll run timeout ticket on 2026-06-25."
+)
+ATTACHMENT_EVENT_CONTEXT = (
+    '{"field":"Attachment","fieldtype":"jira","from":null,'
+    '"to":"11786339","toString":"screenshot-8.png"}'
+)
+
+OPERATIONAL_HISTORY_CONTENT = (
+    "In SFPay, the payroll timeout ticket due date changed from 2026-06-23 "
+    "to 2026-06-17."
+)
+OPERATIONAL_HISTORY_CONTEXT = (
+    '{"field":"duedate","fieldtype":"jira","fromString":"2026-06-23",'
+    '"toString":"2026-06-17"}'
+)
+
 CONDITIONAL_RULE_CONTENT = (
     "If an employee's regular pay date is changed via a deviating payroll process and the employee is "
     "assigned to an on-demand AP group, the out-of-sequence validation should be repeated."
@@ -191,6 +209,117 @@ def test_classifier_skips_unresolved_design_question():
 
     assert quality.keep is False
     assert quality.skip_reason == "open_question"
+
+
+def test_classifier_skips_attachment_event_without_attachment_content_claim():
+    from memforge.memory.quality import classify_memory_candidate
+
+    quality = classify_memory_candidate(_raw(ATTACHMENT_EVENT_CONTENT, ATTACHMENT_EVENT_CONTEXT))
+
+    assert quality.keep is False
+    assert quality.skip_reason == "attachment_event_only"
+
+
+def test_classifier_keeps_claim_extracted_from_attachment_content():
+    from memforge.memory.quality import classify_memory_candidate
+
+    quality = classify_memory_candidate(
+        _raw(
+            "The attached screenshot shows that payroll triggers remained OPEN for ten minutes.",
+            (
+                '{"artifact_type":"image/png","attachment_id":"11786339",'
+                '"fragment_id":"image-analysis-1"}'
+            ),
+        )
+    )
+
+    assert quality.keep is True
+    assert quality.skip_reason is None
+
+
+def test_classifier_rejects_attachment_claim_when_evidence_is_only_upload_event():
+    from memforge.memory.quality import classify_memory_candidate
+
+    quality = classify_memory_candidate(
+        _raw(
+            "The attached screenshot shows that payroll triggers remained OPEN for ten minutes.",
+            ATTACHMENT_EVENT_CONTEXT,
+        )
+    )
+
+    assert quality.keep is False
+    assert quality.skip_reason == "attachment_event_only"
+
+
+def test_classifier_skips_operational_field_history_without_durable_claim():
+    from memforge.memory.quality import classify_memory_candidate
+
+    quality = classify_memory_candidate(
+        _raw(OPERATIONAL_HISTORY_CONTENT, OPERATIONAL_HISTORY_CONTEXT)
+    )
+
+    assert quality.keep is False
+    assert quality.skip_reason == "operational_history_only"
+
+
+@pytest.mark.parametrize("field", ["status", "priority", "assignee", "labels"])
+def test_classifier_skips_pure_operational_history_for_shared_fields(field: str):
+    from memforge.memory.quality import classify_memory_candidate
+
+    quality = classify_memory_candidate(
+        _raw(
+            f"The ticket recorded an operational {field} field transition.",
+            f'{{"field":"{field}","fromString":"old","toString":"new"}}',
+        )
+    )
+
+    assert quality.keep is False
+    assert quality.skip_reason == "operational_history_only"
+
+
+def test_classifier_keeps_mixed_history_that_contains_a_durable_root_cause():
+    from memforge.memory.quality import classify_memory_candidate
+
+    quality = classify_memory_candidate(
+        _raw(
+            "The payroll trigger stayed OPEN because the scheduler lease expired.",
+            (
+                '[{"field":"status","fromString":"IN PROGRESS","toString":"OPEN"},'
+                '{"field":"Root Cause","toString":"scheduler lease expired"}]'
+            ),
+        )
+    )
+
+    assert quality.keep is True
+    assert quality.skip_reason is None
+
+
+def test_classifier_skips_resolution_field_history_without_rationale():
+    from memforge.memory.quality import classify_memory_candidate
+
+    quality = classify_memory_candidate(
+        _raw(
+            "The incident resolution changed to Cannot Reproduce.",
+            '{"field":"resolution","toString":"Cannot Reproduce"}',
+        )
+    )
+
+    assert quality.keep is False
+    assert quality.skip_reason == "operational_history_only"
+
+
+def test_classifier_keeps_resolution_rationale_from_comment_evidence():
+    from memforge.memory.quality import classify_memory_candidate
+
+    quality = classify_memory_candidate(
+        _raw(
+            "The incident was closed as Cannot Reproduce because the failure was flaky.",
+            "I am closing this as Cannot Reproduce because the environment failure is flaky.",
+        )
+    )
+
+    assert quality.keep is True
+    assert quality.skip_reason is None
 
 
 def test_classifier_skips_memory_system_narration():

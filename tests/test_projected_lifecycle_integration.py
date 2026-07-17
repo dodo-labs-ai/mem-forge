@@ -8,6 +8,8 @@ import pytest
 import pytest_asyncio
 
 from memforge.llm.structured import (
+    CandidateLedgerDecision,
+    CandidateLedgerResponse,
     ContradictionDecision,
     ContradictionResponse,
     MemoryEquivalenceResponse,
@@ -15,6 +17,7 @@ from memforge.llm.structured import (
     ReconciliationDecision,
     ReconciliationResponse,
 )
+from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.evidence import (
     EvidenceContentProvenance,
@@ -301,6 +304,29 @@ class _OutboxDrainer:
         return (candidate,) if candidate is not None else ()
 
 
+class _AuditedOutboxDrainer(_OutboxDrainer):
+    def __init__(self, database: Database) -> None:
+        super().__init__(database)
+        self.audit_logger = MemoryAuditLogger(database)
+
+    def operation_context(self, **fields):
+        return self.audit_logger.default_context.child(**fields)
+
+    async def record_audit_event(self, event_type: str, status: str, **fields) -> None:
+        await self.audit_logger.emit(event_type, status, **fields)
+
+
+class _CandidateLedgerClient:
+    def __init__(self, response: CandidateLedgerResponse) -> None:
+        self.response = response
+        self.calls = 0
+
+    async def select_memory_candidates(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        self.calls += 1
+        return self.response
+
+
 class _FailingOutboxDrainer(_OutboxDrainer):
     async def attempt_lifecycle_vector_delivery(
         self, lifecycle_plan_id: str
@@ -326,6 +352,158 @@ class _EquivalentMemoryStore(_OutboxDrainer):
     ) -> tuple[Memory, ...]:
         del memory, kwargs
         return (self.target,)
+
+
+@pytest.mark.asyncio
+async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
+    db: Database,
+) -> None:
+    projection = _projection(
+        run_id="projection-candidate-ledger-1",
+        body="The payroll trigger remained OPEN and was not processed.",
+    )
+    observation_id = projection.observations[0].id
+    canonical = RawMemory(
+        content=projection.observation_revisions[0].content,
+        memory_type="fact",
+        evidence_quote=projection.observation_revisions[0].content,
+        source_observation_id=observation_id,
+    )
+    duplicate = RawMemory(
+        content="  # Page\n\nThe   payroll trigger remained OPEN and was not processed. ",
+        memory_type="fact",
+        evidence_quote=projection.observation_revisions[0].content,
+        source_observation_id=observation_id,
+    )
+    adapters = build_sqlite_adapters(db, object())
+    store = _AuditedOutboxDrainer(db)
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=store,
+        structured_llm_client=None,
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=[canonical, duplicate],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content=projection.observation_revisions[0].content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
+
+    async with db.db.execute("SELECT content FROM memories") as cursor:
+        rows = await cursor.fetchall()
+    events = await db.list_memory_audit_events(event_type="candidate_ledger_completed")
+
+    assert stats["added"] == 1
+    assert stats["skipped"] == 1
+    assert [row["content"] for row in rows] == [canonical.content]
+    assert len(events) == 1
+    assert events[0].source_id == "src-1"
+    assert events[0].doc_id == "confluence-123"
+    assert events[0].payload == {
+        "input_count": 2,
+        "semantic_input_count": 1,
+        "selected_count": 1,
+        "dropped_exact_count": 1,
+        "dropped_redundant_count": 0,
+        "drops": [
+            {
+                "candidate_content_hash": content_hash(duplicate.content),
+                "candidate_source_observation_id": observation_id,
+                "canonical_content_hash": content_hash(canonical.content),
+                "canonical_source_observation_id": observation_id,
+                "method": "exact_content",
+                "reason": "normalized content is identical",
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_incomplete_candidate_ledger_is_audited_and_writes_no_memory(
+    db: Database,
+) -> None:
+    projection = _projection(
+        run_id="projection-candidate-ledger-failed",
+        body="The trigger remained OPEN. The trigger was not processed.",
+    )
+    observation_id = projection.observations[0].id
+    client = _CandidateLedgerClient(
+        CandidateLedgerResponse(
+            decisions=[CandidateLedgerDecision(index=0, action="KEEP")]
+        )
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_AuditedOutboxDrainer(db),
+        structured_llm_client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="candidate ledger failed closed: invalid_ledger"):
+        await engine.apply_projected_lifecycle(
+            projection=projection,
+            doc_id="confluence-123",
+            raw_memories=[
+                RawMemory(
+                    content="The trigger remained OPEN.",
+                    memory_type="fact",
+                    evidence_quote="The trigger remained OPEN.",
+                    source_observation_id=observation_id,
+                ),
+                RawMemory(
+                    content="The trigger was not processed.",
+                    memory_type="fact",
+                    evidence_quote="The trigger was not processed.",
+                    source_observation_id=observation_id,
+                ),
+            ],
+            doc_type="ticket",
+            project_key="ENG",
+            repo_identifier=None,
+            entity_ids=[],
+            document_content=projection.observation_revisions[0].content,
+            update_mode="full_document",
+            changed_hunks=None,
+            update_plan_stats=None,
+            source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+        )
+
+    async with db.db.execute("SELECT COUNT(*) AS total FROM memories") as cursor:
+        row = await cursor.fetchone()
+    events = await db.list_memory_audit_events(event_type="candidate_ledger_failed")
+
+    assert row["total"] == 0
+    assert client.calls == 2
+    assert len(events) == 1
+    assert events[0].status == "failed"
+    assert events[0].reason == "invalid_ledger"
+    assert events[0].payload["input_count"] == 2
+    assert events[0].payload["semantic_input_count"] == 2
+    assert events[0].payload["selected_count"] == 0
+    assert events[0].payload["fingerprints_truncated"] is False
+    assert events[0].payload["candidate_fingerprints"] == [
+        {
+            "content_hash": content_hash("The trigger remained OPEN."),
+            "source_observation_id": observation_id,
+        },
+        {
+            "content_hash": content_hash("The trigger was not processed."),
+            "source_observation_id": observation_id,
+        },
+    ]
 
 
 class _SemanticEquivalentClient:

@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from memforge.llm.structured import (
     AgentSessionAuthorityResponse,
+    CandidateLedgerResponse,
     ContradictionResponse,
     EntityValidationResponse,
     EnrichmentResponse,
@@ -499,6 +500,8 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
             )
         if schema is ReconciliationResponse:
             return CompletionResponse('{"decisions":[{"action":"ADD","index":0,"reason":"new"}]}')
+        if schema is CandidateLedgerResponse:
+            return CompletionResponse('{"decisions":[{"index":0,"action":"KEEP"}]}')
         if schema is ContradictionResponse:
             return CompletionResponse(
                 '{"decisions":[{"pair_index":0,"classification":"unrelated","reason":"different topic"}]}'
@@ -525,6 +528,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     )
 
     assert (await client.enrich_document("prompt", max_tokens=64000)).summary == "Summary"
+    assert (await client.select_memory_candidates("prompt")).decisions[0].action == "KEEP"
     assert (await client.reconcile_memories("prompt")).decisions[0].action == "ADD"
     assert (await client.detect_contradictions("prompt")).decisions[0].classification == "unrelated"
     assert (await client.classify_memory_equivalence("prompt")).equivalent is True
@@ -534,6 +538,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
 
     assert [call["response_format"] for call in calls] == [
         EnrichmentResponse,
+        CandidateLedgerResponse,
         ReconciliationResponse,
         ContradictionResponse,
         MemoryEquivalenceResponse,
