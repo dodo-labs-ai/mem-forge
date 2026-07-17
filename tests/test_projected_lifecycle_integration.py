@@ -936,6 +936,39 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
 
     await db._validate_projected_support_invariant_unlocked(plan)
 
+    second = _projection(
+        run_id="projection-multi-unit-rebind",
+        body="A7 is removed.\n\nThe page now names an owner.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+
+    [rebound] = await engine._rebind_noop_evidence_to_current_revision(
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.NOOP,
+                memory_id=incumbent.id,
+                reason="claim remains valid in this Unit",
+            ),
+        ),
+        incumbents={incumbent.id: incumbent},
+        projection=second,
+    )
+
+    assert rebound.action is ReconcileAction.NOOP
+    assert rebound.memory is not None
+    assert rebound.memory.source_observation_id == first.observations[0].id
+
 
 @pytest.mark.asyncio
 async def test_incremental_noop_rebinds_exact_unchanged_claim_without_new_extraction(

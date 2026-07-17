@@ -456,6 +456,11 @@ class MemoryEngine:
             revision.observation_id: revision
             for revision in projection.observation_revisions
         }
+        current_unit_reference_ids = (
+            await self.db.get_source_unit_support_reference_ids(
+                projection.source_units[0].id
+            )
+        )
         rebound: list[ReconcileOperation] = []
         for operation in operations:
             if (
@@ -465,9 +470,17 @@ class MemoryEngine:
             ):
                 rebound.append(operation)
                 continue
-            support = await self.db.get_active_memory_support_evidence(
+            source_support = await self.db.get_active_memory_support_evidence(
                 operation.memory_id,
                 source_id=projection.source_id,
+            )
+            scoped_reference_ids = frozenset(
+                current_unit_reference_ids.get(operation.memory_id, ())
+            )
+            support = tuple(
+                item
+                for item in source_support
+                if item.reference_id in scoped_reference_ids
             )
             stale = [
                 item
