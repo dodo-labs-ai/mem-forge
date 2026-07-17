@@ -466,3 +466,53 @@ async def test_invalid_replacement_without_candidate_index_retries_only_reconcil
     assert [operation.action for operation in result.operations] == [
         ReconcileAction.SUPERSEDE
     ]
+
+
+@pytest.mark.asyncio
+async def test_persistent_replacement_without_candidate_is_deferred_to_review() -> None:
+    incumbent = _memory("mem-existing", "Service uses PostgreSQL 15.")
+
+    class PersistentlyInvalidClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def reconcile_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            self.calls += 1
+            return ReconciliationResponse(
+                decisions=[
+                    ReconciliationDecision(
+                        index=0,
+                        action="ADD",
+                        reason="New version claim",
+                    ),
+                    ReconciliationDecision(
+                        action="SUPERSEDE",
+                        memory_id=incumbent.id,
+                        reason="Version changed but no candidate was selected",
+                    ),
+                ]
+            )
+
+    client = PersistentlyInvalidClient()
+    result = await reconcile_memories(
+        new_extractions=[
+            RawMemory(content="Service uses PostgreSQL 16.", memory_type="fact")
+        ],
+        existing_memories=[incumbent],
+        doc_type="design",
+        structured_llm_client=client,
+        updated_document="# Design\n\nService uses PostgreSQL 16.",
+        include_metadata=True,
+    )
+
+    assert result.failure is None
+    assert client.calls == 2
+    assert [operation.action for operation in result.operations] == [
+        ReconcileAction.ADD,
+        ReconcileAction.DELETE,
+    ]
+    review_operation = result.operations[1]
+    assert review_operation.memory_id == incumbent.id
+    assert review_operation.flag_for_review is True
+    assert "unresolved replacement without a candidate" in review_operation.reason

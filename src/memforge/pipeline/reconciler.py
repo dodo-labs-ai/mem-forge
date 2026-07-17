@@ -220,7 +220,24 @@ async def reconcile_memories(
                     )
                 except ValueError as exc:
                     if validation_attempt + 1 >= RECONCILIATION_BATCH_VALIDATION_ATTEMPTS:
-                        raise
+                        deferred_decisions = _defer_unresolved_replacements_to_review(
+                            batch_decisions,
+                            batch,
+                        )
+                        if deferred_decisions == batch_decisions:
+                            raise
+                        _validate_complete_reconciliation_batch(
+                            deferred_decisions,
+                            batch,
+                            new_extraction_count=len(new_extractions),
+                        )
+                        logger.warning(
+                            "Reconciliation replacement remained incomplete: %s — "
+                            "deferring the unresolved incumbent to review",
+                            exc,
+                        )
+                        batch_decisions = deferred_decisions
+                        break
                     logger.warning(
                         "Reconciliation batch validation failed: %s — retrying only this batch",
                         exc,
@@ -267,6 +284,41 @@ def _return_result(
     if include_metadata:
         return ReconciliationResult(operations=operations, failure=failure)
     return operations
+
+
+def _defer_unresolved_replacements_to_review(
+    decisions: list[dict],
+    incumbents: list[Memory],
+) -> list[dict]:
+    """Preserve an unresolved replacement as a non-destructive review proposal."""
+
+    incumbent_ids = {memory.id for memory in incumbents}
+    deferred: list[dict] = []
+    for decision in decisions:
+        action = str(decision.get("action", "")).upper()
+        memory_id = decision.get("memory_id")
+        if (
+            action in {"UPDATE", "SUPERSEDE"}
+            and memory_id in incumbent_ids
+            and not isinstance(decision.get("index"), int)
+        ):
+            reason = str(decision.get("reason") or "model proposed an incomplete replacement")
+            deferred.append(
+                {
+                    **decision,
+                    "action": "DELETE",
+                    "index": None,
+                    "updated_content": None,
+                    "reason": (
+                        "unresolved replacement without a candidate; review required: "
+                        f"{reason}"
+                    ),
+                    "flag_for_review": True,
+                }
+            )
+            continue
+        deferred.append(decision)
+    return deferred
 
 
 def _parse_decisions(
