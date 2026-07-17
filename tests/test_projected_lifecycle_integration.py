@@ -835,12 +835,40 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
         ),
     )
     await db.record_source_projection(other)
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="confluence-456",
+            source="src-1",
+            source_url="https://example.test/456",
+            title="Independent Page",
+            space_or_project="ENG",
+            author=None,
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash="independent-page-hash",
+            token_count=10,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
+    await db.add_memory_source(
+        incumbent.id,
+        "confluence-456",
+        "confluence",
+        "A7 is removed.",
+        source_updated_at=now,
+    )
     other_observation = other.observations[0]
     other_revision = other.observation_revisions[0]
     other_unit = EvidenceUnit(
         id="eu-multi-unit-other",
         source_id="src-1",
-        doc_id="confluence-123",
+        doc_id="confluence-456",
         doc_revision_id=other.source_unit_revisions[0].id,
         source_type="confluence",
         source_anchor=other_observation.id,
@@ -945,6 +973,18 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
             for revision in first.observation_revisions
         },
     )
+    second = replace(
+        second,
+        observations=other.observations + second.observations,
+        observation_revisions=(
+            other.observation_revisions + second.observation_revisions
+        ),
+        source_units=other.source_units + second.source_units,
+        source_unit_revisions=(
+            other.source_unit_revisions + second.source_unit_revisions
+        ),
+        relations=other.relations + second.relations,
+    )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
         relational=adapters.relational,
@@ -962,12 +1002,18 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
             ),
         ),
         incumbents={incumbent.id: incumbent},
+        unit_support=await db.get_source_unit_support_reference_ids(
+            first.source_units[0].id
+        ),
         projection=second,
     )
 
     assert rebound.action is ReconcileAction.NOOP
     assert rebound.memory is not None
     assert rebound.memory.source_observation_id == first.observations[0].id
+    assert other_reference.id in (
+        await db.get_active_memory_support_reference_ids(incumbent.id)
+    )
 
 
 @pytest.mark.asyncio
