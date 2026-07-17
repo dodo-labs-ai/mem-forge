@@ -2335,6 +2335,106 @@ async def test_enabled_source_tombstone_retires_last_supported_incumbent(db: Dat
 
 
 @pytest.mark.asyncio
+async def test_exact_scope_reentry_restores_historical_revision_without_reextraction(
+    db: Database,
+) -> None:
+    body = "A7 applies only to regular payroll."
+    initial = _projection(run_id="projection-before-scope-removal", body=body)
+    raw = RawMemory(
+        content=body,
+        memory_type="decision",
+        confidence=0.95,
+        evidence_quote=body,
+        extraction_context=body,
+        evidence_anchor="projection_batch",
+        source_observation_id=initial.observations[0].id,
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+    original_document = await db.get_document("confluence-123")
+    assert original_document is not None
+
+    first = await engine.apply_projected_lifecycle(
+        projection=initial,
+        doc_id="confluence-123",
+        raw_memories=[raw],
+        doc_type="document",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content=body,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    [memory] = await db.list_memories(source="src-1", status="active")
+    assert first["added"] == 1
+
+    await db.enable_lifecycle_gate("src-1")
+    tombstone = project_source_unit_tombstone(
+        source_type="confluence",
+        run_id="projection-scope-removal",
+        source_unit=initial.source_units[0],
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision
+            for revision in initial.observation_revisions
+        },
+        reason="not_returned_by_authoritative_snapshot",
+    )
+    await engine.apply_projected_tombstone(
+        projection=tombstone,
+        doc_id="confluence-123",
+        reason="source Unit removed by authoritative discovery",
+    )
+    await db.delete_projected_document("confluence-123")
+    await db.restore_document_snapshot(original_document)
+
+    reentry = _projection(
+        run_id="projection-exact-scope-reentry",
+        body=body,
+        prior=tombstone.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in tombstone.observation_revisions
+        },
+    )
+    assert reentry.source_unit_revisions[0].id == initial.source_unit_revisions[0].id
+
+    access_mismatch = await engine.restore_exact_projected_revision(
+        projection=reentry,
+        doc_id="confluence-123",
+        project_key="ENG",
+        repo_identifier="different-access-boundary",
+        scope_transition={"id": "scope-return-to-original-selector"},
+    )
+    still_retired = await db.get_memory(memory.id)
+    assert access_mismatch is None
+    assert still_retired is not None and still_retired.status == "retired"
+
+    restored = await engine.restore_exact_projected_revision(
+        projection=reentry,
+        doc_id="confluence-123",
+        project_key="ENG",
+        repo_identifier=None,
+        scope_transition={"id": "scope-return-to-original-selector"},
+    )
+
+    current = await db.get_memory(memory.id)
+    support = await db.get_active_memory_support_evidence(memory.id, source_id="src-1")
+    assert restored == {"reactivated": 1, "reattached": 1, "vector_delivery_pending": 0}
+    assert current is not None and current.status == "active"
+    assert len(support) == 1
+    assert support[0].anchor.observation_revision_id == initial.observation_revisions[0].id
+
+
+@pytest.mark.asyncio
 async def test_gated_source_tombstone_only_opens_review(db: Database) -> None:
     initial = _projection(run_id="projection-before-gated-delete", body="A7 is removed.")
     await db.record_source_projection(initial)

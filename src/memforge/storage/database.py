@@ -91,6 +91,8 @@ from memforge.memory.lifecycle_plan import (
     build_unprovable_cutover_resolution,
     CutoverFindingReason,
     CutoverFindingStatus,
+    ExactRevisionReplay,
+    ExactRevisionReplayClaim,
     LifecycleCutoverFinding,
     LifecycleBackfillJob,
     LifecycleBackfillJobStatus,
@@ -6064,6 +6066,123 @@ class Database:
             values[row["memory_id"]].append(row["evidence_reference_id"])
         return {memory_id: tuple(reference_ids) for memory_id, reference_ids in values.items()}
 
+    async def get_exact_revision_replay(
+        self,
+        *,
+        source_id: str,
+        source_unit_id: str,
+        target_unit_revision_id: str,
+        observation_revision_ids: tuple[str, ...],
+    ) -> ExactRevisionReplay | None:
+        """Return the latest complete claim ledger for an immutable revision.
+
+        The result is replay authority, not semantic recall. Every referenced
+        Support must still resolve through the same Source, Unit, and exact
+        Observation revisions supplied by the caller.
+        """
+
+        async with self.db.execute(
+            """SELECT id, payload_json
+                 FROM lifecycle_plans
+                WHERE source_id = ? AND source_unit_id = ?
+                  AND target_unit_revision_id = ? AND status = 'applied'
+                ORDER BY applied_at DESC, created_at DESC, id DESC
+                LIMIT 1""",
+            (source_id, source_unit_id, target_unit_revision_id),
+        ) as cursor:
+            plan_row = await cursor.fetchone()
+        if plan_row is None:
+            return None
+
+        payload = json.loads(str(plan_row["payload_json"]))
+        stale_guard = payload.get("stale_guard")
+        if not isinstance(stale_guard, Mapping):
+            raise ValueError("exact revision replay plan lacks a stale guard")
+        recorded_revision_ids = stale_guard.get("observation_revision_ids")
+        if not isinstance(recorded_revision_ids, list) or {
+            str(value) for value in recorded_revision_ids
+        } != set(observation_revision_ids):
+            raise ValueError("exact revision replay Observation ledger mismatch")
+
+        raw_mutations = payload.get("mutations")
+        if not isinstance(raw_mutations, list):
+            raise ValueError("exact revision replay plan lacks a mutation ledger")
+        references_by_memory: dict[str, set[str]] = defaultdict(set)
+        for raw_mutation in raw_mutations:
+            if not isinstance(raw_mutation, Mapping) or raw_mutation.get("mutation_type") != "attach_support":
+                continue
+            memory_id = raw_mutation.get("memory_id")
+            reference_ids = raw_mutation.get("evidence_reference_ids")
+            if not isinstance(memory_id, str) or not memory_id:
+                raise ValueError("exact revision replay contains an invalid Memory id")
+            if not isinstance(reference_ids, list) or any(
+                not isinstance(reference_id, str) or not reference_id
+                for reference_id in reference_ids
+            ):
+                raise ValueError("exact revision replay contains invalid Evidence references")
+            references_by_memory[memory_id].update(reference_ids)
+
+        claims: list[ExactRevisionReplayClaim] = []
+        expected_revision_ids = set(observation_revision_ids)
+        for memory_id, reference_id_set in sorted(references_by_memory.items()):
+            reference_ids = tuple(sorted(reference_id_set))
+            placeholders = ", ".join("?" for _ in reference_ids)
+            rows = await self.db.execute_fetchall(
+                f"""SELECT er.id AS reference_id, er.role,
+                           er.observation_revision_id, so.source_unit_id,
+                           eu.source_id, eu.source_lineage_id,
+                           msa.access_context_hash
+                      FROM evidence_references er
+                      JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                      JOIN source_observations so ON so.id = er.observation_id
+                      JOIN memory_support_assertions msa
+                        ON msa.memory_id = ?
+                       AND msa.evidence_reference_id = er.id
+                       AND msa.source_id = ?
+                     WHERE er.id IN ({placeholders})
+                     ORDER BY er.id""",
+                (memory_id, source_id, *reference_ids),
+            )
+            if len(rows) != len(reference_ids):
+                raise ValueError("exact revision replay Evidence ledger is incomplete")
+            access_hashes = {str(row["access_context_hash"]) for row in rows}
+            if len(access_hashes) != 1 or any(
+                str(row["reference_id"]) not in reference_id_set
+                or str(row["role"]) == EvidenceRole.CONTEXT.value
+                or str(row["observation_revision_id"]) not in expected_revision_ids
+                or str(row["source_unit_id"]) != source_unit_id
+                or str(row["source_id"]) != source_id
+                or str(row["source_lineage_id"]) != source_unit_id
+                for row in rows
+            ):
+                raise ValueError("exact revision replay Evidence authority mismatch")
+            async with self.db.execute(
+                "SELECT * FROM memories WHERE id = ?",
+                (memory_id,),
+            ) as cursor:
+                memory_row = await cursor.fetchone()
+            if memory_row is None:
+                raise ValueError("exact revision replay Memory is missing")
+            claims.append(
+                ExactRevisionReplayClaim(
+                    memory_id=memory_id,
+                    content_hash=str(memory_row["content_hash"]),
+                    status=str(memory_row["status"]),
+                    retirement_reason=memory_row["retirement_reason"],
+                    evidence_reference_ids=reference_ids,
+                    access_context_hash=next(iter(access_hashes)),
+                    memory_version=_lifecycle_memory_version(memory_row),
+                )
+            )
+        return ExactRevisionReplay(
+            lifecycle_plan_id=str(plan_row["id"]),
+            source_id=source_id,
+            source_unit_id=source_unit_id,
+            target_unit_revision_id=target_unit_revision_id,
+            observation_revision_ids=tuple(sorted(observation_revision_ids)),
+            claims=tuple(claims),
+        )
+
     async def _memory_support_set_hash_unlocked(self, memory_id: str) -> str:
         values: list[tuple[str, str, str]] = []
         async with self.db.execute(
@@ -6547,14 +6666,28 @@ class Database:
             expected_content_hash = mutation.payload.get("expected_content_hash")
             if not isinstance(expected_content_hash, str) or not expected_content_hash:
                 raise ValueError("reactivate_memory requires expected_content_hash")
+            expected_retirement_reason = mutation.payload.get(
+                "expected_retirement_reason",
+                "source_rebaseline",
+            )
+            if (
+                not isinstance(expected_retirement_reason, str)
+                or not expected_retirement_reason
+            ):
+                raise ValueError("reactivate_memory requires expected_retirement_reason")
             cursor = await self.db.execute(
                 """UPDATE memories
                       SET status = 'active', retirement_reason = NULL,
                           retired_at = NULL, valid_until = NULL, updated_at = ?
                     WHERE id = ? AND status = 'retired'
-                      AND retirement_reason = 'source_rebaseline'
+                      AND retirement_reason = ?
                       AND content_hash = ?""",
-                (now, mutation.memory_id, expected_content_hash),
+                (
+                    now,
+                    mutation.memory_id,
+                    expected_retirement_reason,
+                    expected_content_hash,
+                ),
             )
             if cursor.rowcount != 1:
                 raise ValueError("reactivate Memory stale guard failed")

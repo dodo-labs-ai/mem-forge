@@ -58,6 +58,7 @@ from memforge.memory.index_payloads import (
     document_embedding_text,
     embedding_text_hash,
 )
+from memforge.memory.lifecycle_plan import AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON
 from memforge.llm.providers import is_litellm_provider_model
 from memforge.memory.project_resolver import resolve_project_key
 from memforge.source_projection import (
@@ -1970,6 +1971,87 @@ class GeneSyncOrchestrator:
             if name:
                 entity_names.append(name)
 
+        repo_identifier = normalized.source_semantics.get("repo_identifier")
+
+        # An explicit selector transition may return an immutable historical
+        # revision that this Source Unit already materialized. Replaying that
+        # exact applied claim ledger is deterministic and avoids asking the
+        # extractor to rediscover a different subset of unchanged facts.
+        if scope_transition is not None:
+            try:
+                replay_stats = await self.memory_engine.restore_exact_projected_revision(
+                    projection=projection,
+                    doc_id=doc_id,
+                    project_key=project_key,
+                    repo_identifier=repo_identifier,
+                    scope_transition=scope_transition,
+                    expected_source_activity_epoch=expected_source_activity_epoch,
+                )
+            except Exception:
+                await self._restore_document_processing_snapshot(
+                    doc_id=doc_id,
+                    existing_doc=existing_doc,
+                    document_vector_snapshot=document_vector_snapshot,
+                )
+                raise
+            if replay_stats is not None:
+                replay_metadata = DocumentMetadata(
+                    doc_id=doc_id,
+                    summary=enrichment.summary,
+                    tags=enrichment.tags,
+                    entities=[
+                        Entity(
+                            id=eid,
+                            canonical_name=name,
+                            tags=[],
+                            display_name=name,
+                        )
+                        for eid, name in zip(entity_ids, entity_names)
+                    ],
+                    doc_type=enrichment.doc_type,
+                    complexity=enrichment.complexity,
+                    enriched_at=now,
+                )
+                await self.db.upsert_metadata(replay_metadata)
+                await self._insert_changelog(
+                    ChangelogEntry(
+                        id=None,
+                        doc_id=doc_id,
+                        change_type=change_type,
+                        previous_version=previous_version,
+                        current_version=item.version,
+                        content_diff=None,
+                        ai_change_summary=(
+                            f"Document '{item.title}' returned to an exact historical Source revision."
+                        ),
+                        detected_at=now,
+                        title=item.title,
+                        source=source_id,
+                    )
+                )
+                await self._finalize_projected_document_moves(
+                    predecessor_docs=lineage_predecessor_docs,
+                    current_doc_id=doc_id,
+                    metadata=replay_metadata,
+                    source_unit_id=source_unit.id,
+                )
+                stats["memory_supports_added"] = replay_stats.get("reattached", 0)
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "phase": "processing",
+                            "event": "document_processed",
+                            "title": item.title,
+                        }
+                    )
+                logger.info(
+                    "Restored exact historical Source revision for %s (%s): %d Memories reactivated",
+                    item.title,
+                    doc_id,
+                    replay_stats.get("reactivated", 0),
+                )
+                return stats
+
         # ------------------------------------------------------------------
         # 6e. Get existing memories for those entities (context for Call 2)
         # ------------------------------------------------------------------
@@ -2061,7 +2143,6 @@ class GeneSyncOrchestrator:
         # 8. Bind claims to revision-pinned evidence and apply one complete,
         # stale-guarded Lifecycle Plan for this Source Unit.
         # ------------------------------------------------------------------
-        repo_identifier = normalized.source_semantics.get("repo_identifier")
         source_updated_at = _source_updated_at_for_item(item, normalized.source_semantics)
         uploader_user_id = normalized.source_semantics.get("uploader_user_id")
         actor_user_id = (
@@ -2884,7 +2965,7 @@ class GeneSyncOrchestrator:
                 lifecycle_result = await self.memory_engine.apply_projected_tombstone(
                     projection=tombstone,
                     doc_id=doc_id,
-                    reason="source Unit removed by authoritative discovery",
+                    reason=AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON,
                     expected_source_activity_epoch=expected_source_activity_epoch,
                 )
                 await self.db.record_source_projection(

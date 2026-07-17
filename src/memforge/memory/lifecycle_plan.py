@@ -189,6 +189,11 @@ class LifecycleVectorDeliveryState(str, Enum):
     PENDING = "pending"
 
 
+AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON = (
+    "source Unit removed by authoritative discovery"
+)
+
+
 @dataclass(frozen=True, slots=True)
 class LifecycleVectorDeliveryResult:
     """Outcome of one best-effort delivery pass over durable vector tasks."""
@@ -285,6 +290,31 @@ class LifecycleReview:
     reason: str | None = None
     created_at: str | None = None
     resolved_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExactRevisionReplayClaim:
+    """One previously materialized claim pinned to an exact Source revision."""
+
+    memory_id: str
+    content_hash: str
+    status: str
+    retirement_reason: str | None
+    evidence_reference_ids: tuple[str, ...]
+    access_context_hash: str
+    memory_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExactRevisionReplay:
+    """Canonical applied claim ledger for one immutable Source Unit revision."""
+
+    lifecycle_plan_id: str
+    source_id: str
+    source_unit_id: str
+    target_unit_revision_id: str
+    observation_revision_ids: tuple[str, ...]
+    claims: tuple[ExactRevisionReplayClaim, ...]
 
 
 class IncumbentDisposition(str, Enum):
