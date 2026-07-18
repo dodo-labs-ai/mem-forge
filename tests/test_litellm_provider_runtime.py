@@ -23,6 +23,18 @@ def test_llm_base_url_env_can_be_cleared_for_provider_env_auth(monkeypatch):
     assert config.llm.embedding_base_url == ""
 
 
+def test_memory_extraction_output_budget_has_an_independent_env_override(monkeypatch):
+    from memforge.config import AppConfig
+
+    monkeypatch.setenv("MEMFORGE_ENRICHMENT_MAX_TOKENS", "4096")
+    monkeypatch.setenv("MEMFORGE_MEMORY_EXTRACTION_MAX_TOKENS", "24576")
+
+    config = AppConfig()
+
+    assert config.llm.enrichment_max_tokens == 4096
+    assert config.llm.memory_extraction_max_tokens == 24576
+
+
 @pytest.mark.asyncio
 async def test_structured_client_omits_empty_base_url_and_api_key(monkeypatch):
     from memforge.llm import structured
