@@ -4085,6 +4085,52 @@ async def test_complete_source_scope_transition_forces_snapshot_and_applies(db: 
 
 
 @pytest.mark.asyncio
+async def test_scope_transition_reenters_same_durable_run_on_worker_retry(db: Database):
+    source_id = "src-scope-transition-worker-retry"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Architecture",
+        config_json=json.dumps({"spaces": ["NEW"]}),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    created = await db.create_projection_scope_transition(
+        ProjectionScopeTransition(
+            id="scope-transition-worker-retry",
+            source_id=source_id,
+            previous_scope={"sync_mode": "space", "spaces": ["OLD"]},
+            target_scope={"sync_mode": "space", "spaces": ["NEW"]},
+        )
+    )
+    await db.start_projection_scope_transition(
+        created.id,
+        run_id="source-sync-run",
+    )
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=None,
+        enricher=None,
+        memory_extractor=None,
+        memory_engine=None,
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(
+        SinceRecordingEmptyGene(),
+        "Architecture",
+        source_id,
+        lifecycle_cycle_id="source-sync-run:attempt:2",
+        scope_transition_run_id="source-sync-run",
+    )
+    transition = (await db.list_projection_scope_transitions(source_id))[0]
+
+    assert state.last_sync_status == "success"
+    assert transition.status is ProjectionScopeTransitionStatus.APPLIED
+    assert transition.run_id == "source-sync-run"
+
+
+@pytest.mark.asyncio
 async def test_partial_conversation_scope_transition_preserves_old_membership(db: Database):
     source_id = "src-scope-transition-partial"
     await db.upsert_source(
@@ -5463,6 +5509,7 @@ async def test_source_sync_worker_gives_each_retry_attempt_a_new_lifecycle_cycle
     class RetryRuntimeProvider:
         def __init__(self) -> None:
             self.lifecycle_cycle_ids: list[str] = []
+            self.scope_transition_run_ids: list[str] = []
 
         async def build_sync_runtime(self, db, config, **kwargs):
             del db, config, kwargs
@@ -5470,6 +5517,7 @@ async def test_source_sync_worker_gives_each_retry_attempt_a_new_lifecycle_cycle
 
         async def run_source_sync(self, **kwargs):
             self.lifecycle_cycle_ids.append(str(kwargs["lifecycle_cycle_id"]))
+            self.scope_transition_run_ids.append(str(kwargs["scope_transition_run_id"]))
             if len(self.lifecycle_cycle_ids) == 1:
                 raise RuntimeError("retry this attempt")
             return SyncState(
@@ -5505,6 +5553,10 @@ async def test_source_sync_worker_gives_each_retry_attempt_a_new_lifecycle_cycle
     assert provider.lifecycle_cycle_ids == [
         f"{enqueued.run_id}:attempt:1",
         f"{enqueued.run_id}:attempt:2",
+    ]
+    assert provider.scope_transition_run_ids == [
+        enqueued.run_id,
+        enqueued.run_id,
     ]
 
 
