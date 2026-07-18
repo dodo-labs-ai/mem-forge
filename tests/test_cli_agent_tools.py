@@ -3,6 +3,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -938,6 +939,47 @@ def test_local_agent_cloud_github_sync_pushes_remote_gh_scope(monkeypatch):
     assert len(process_calls) == 1
     assert process_calls[0][1]["source_id"] == "src-from-cloud"
     assert process_calls[0][1]["sync_snapshot_id"] == "laj-sync:attempt:1"
+
+
+def test_local_agent_cloud_github_sync_reports_failed_paths_for_retry_diagnostics(monkeypatch):
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
+    monkeypatch.setattr(main.subprocess, "run", _fake_github_remote_run)
+
+    def github_content(_repo, _ref, relative_path):
+        if relative_path.endswith("Überblick.md"):
+            raise click.ClickException("temporary GitHub API failure")
+        return b"# Durable document\n\nBody"
+
+    monkeypatch.setattr(main, "_github_content", github_content)
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-sync-failed-path",
+            "attempt_count": 1,
+            "workspace_id": "ws-from-job-payload",
+            "operation": "github_repo_sync",
+            "source_id": "src-from-cloud",
+            "payload": {
+                "repo_url": "https://github.wdf.sap.corp/example/public-howtos",
+                "ref": "main",
+                "include_extensions": ["md"],
+                "limit": 2,
+            },
+        },
+        _cloud_test_client(),
+    )
+
+    assert payload["counts"] == {"selected": 3, "pushed": 2, "failed": 1}
+    assert payload["retryable"] is True
+    assert payload["error"] == (
+        "1 document(s) failed to push: "
+        "Payroll Processing V2/Überblick.md: temporary GitHub API failure"
+    )
+    assert not [
+        call for call in FakeToolClient.calls
+        if call[0] == "start_source_processing"
+    ]
 
 
 def test_local_agent_cloud_github_sync_requires_job_workspace(monkeypatch):
