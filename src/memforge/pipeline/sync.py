@@ -928,8 +928,19 @@ class GeneSyncOrchestrator:
 
                 return stats
 
-            tasks = [_process_one(item) for item in items]
-            results = await asyncio.gather(*tasks)
+            item_tasks = [asyncio.create_task(_process_one(item)) for item in items]
+            try:
+                results = await asyncio.gather(*item_tasks)
+            except BaseException:
+                # The sync run owns every per-item task.  A child cancellation
+                # is propagated by gather without cancelling its siblings, so
+                # drain them explicitly before the caller may release runtime
+                # resources such as the source database bundle.
+                for task in item_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*item_tasks, return_exceptions=True)
+                raise
 
             # Aggregate stats
             for r in results:
