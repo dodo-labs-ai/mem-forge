@@ -587,8 +587,8 @@ class TestContradictionErrorResilience:
         assert stats["checked"] == 1
 
     @pytest.mark.asyncio
-    async def test_invalid_pair_index_ignored(self, seeded_db):
-        """LLM returning an out-of-range pair_index should be silently skipped."""
+    async def test_unexpected_pair_index_fails_closed(self, seeded_db):
+        """An out-of-range pair index cannot be mixed with durable decisions."""
         s = seeded_db
         db = s["db"]
 
@@ -610,13 +610,19 @@ class TestContradictionErrorResilience:
             structured_llm_client=mock_client,
         )
 
-        # Only pair_index=0 is valid (1 pair checked)
-        assert stats["contradictions"] == 1
+        assert stats["contradictions"] == 0
         assert stats["checked"] == 1
+        assert await db.get_pending_review_for_challenger(s["mem_run_pg"].id) is None
+        async with db.db.execute(
+            "SELECT COUNT(*) FROM relation_runs WHERE evidence_unit_id LIKE 'eu-contradiction-%'"
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 0
+        async with db.db.execute("SELECT COUNT(*) FROM memory_contradictions") as cursor:
+            assert (await cursor.fetchone())[0] == 0
 
     @pytest.mark.asyncio
-    async def test_empty_llm_response_handled(self, seeded_db):
-        """LLM returning empty array should produce zero contradictions."""
+    async def test_empty_llm_response_fails_closed(self, seeded_db):
+        """An empty response cannot silently classify prompted pairs as unrelated."""
         s = seeded_db
         db = s["db"]
 
@@ -633,7 +639,14 @@ class TestContradictionErrorResilience:
 
         assert stats["contradictions"] == 0
         assert stats["temporal"] == 0
-        assert stats["checked"] == 1  # pair was checked, just no conflicts found
+        assert stats["checked"] == 1
+        assert await db.get_pending_review_for_challenger(s["mem_run_pg"].id) is None
+        async with db.db.execute(
+            "SELECT COUNT(*) FROM relation_runs WHERE evidence_unit_id LIKE 'eu-contradiction-%'"
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 0
+        async with db.db.execute("SELECT COUNT(*) FROM memory_contradictions") as cursor:
+            assert (await cursor.fetchone())[0] == 0
 
     @pytest.mark.asyncio
     async def test_superseded_memory_excluded_from_candidates(self, seeded_db):
