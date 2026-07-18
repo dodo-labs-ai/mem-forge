@@ -1900,7 +1900,14 @@ def _push_github_profile_to_source(
         "failed": failed,
     }
     if failed:
-        payload["error"] = "one or more documents failed to push"
+        examples = "; ".join(
+            f"{item.get('relative_path')}: {item.get('error')}"
+            for item in failed[:3]
+        )
+        payload["error"] = (
+            f"{len(failed)} document(s) failed to push"
+            + (f": {examples}" if examples else "")
+        )
     if not failed:
         sync_result = client.start_source_processing(
             source_id=source_id,
