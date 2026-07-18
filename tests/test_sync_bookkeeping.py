@@ -8807,6 +8807,66 @@ async def test_item_processing_is_bounded_by_max_concurrent(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_sync_cancels_and_drains_sibling_items_when_one_item_is_cancelled(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_id = "src-cancelled-item-siblings"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Board",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release_siblings = asyncio.Event()
+    siblings_started = asyncio.Event()
+    active_siblings = 0
+    gene = BlockingFetchGene(item_count=3, release=asyncio.Event())
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=DocumentVisibleEnricher(db, source_id),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=3,
+    )
+
+    async def process_item(**kwargs) -> dict:
+        nonlocal active_siblings
+        item = kwargs["item"]
+        if item.item_id == "jira-0":
+            await siblings_started.wait()
+            raise asyncio.CancelledError
+
+        active_siblings += 1
+        if active_siblings == 2:
+            siblings_started.set()
+        try:
+            await release_siblings.wait()
+            return {"updated": False, "memories_extracted": 0}
+        finally:
+            active_siblings -= 1
+
+    monkeypatch.setattr(orchestrator, "_process_item", process_item)
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await orchestrator.sync_gene(
+                gene=gene,
+                source_name="Jira Board",
+                source_id=source_id,
+            )
+        await asyncio.sleep(0)
+        assert active_siblings == 0
+    finally:
+        release_siblings.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
 async def test_running_progress_reports_extracted_memories(db: Database):
     source_id = "src-running-memory-progress"
     await db.upsert_source(
