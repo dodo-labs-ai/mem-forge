@@ -40,7 +40,7 @@ from memforge.models import (
     content_hash as compute_content_hash,
 )
 from memforge.retrieval.document_index import DocumentVectorIndex
-from memforge.pipeline.sync_memory import SyncMemoryObserver
+from memforge.pipeline.sync_memory import ProcessMemoryReclaimer, SyncMemoryObserver
 
 from memforge.pipeline.document_units import ExtractionContextPacker, UnitizationPolicy, unitize_markdown
 from memforge.pipeline.document_update import (
@@ -439,6 +439,7 @@ class GeneSyncOrchestrator:
         extraction_pool: ExtractionWorkPool | None = None,
         document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
         memory_observer: SyncMemoryObserver | None = None,
+        memory_reclaimer: ProcessMemoryReclaimer | None = None,
         source_projection_adapter: SourceProjectionAdapter | None = None,
     ) -> None:
         self.db = db
@@ -455,6 +456,7 @@ class GeneSyncOrchestrator:
         self.extraction_pool = extraction_pool
         self.document_lifecycle_admission = document_lifecycle_admission
         self.memory_observer = memory_observer
+        self.memory_reclaimer = memory_reclaimer or ProcessMemoryReclaimer()
         self.source_projection_adapter = source_projection_adapter or DEFAULT_SOURCE_PROJECTION_ADAPTER
 
         self._llm_semaphore = asyncio.Semaphore(self.max_concurrent)
@@ -1240,6 +1242,16 @@ class GeneSyncOrchestrator:
                     doc_id=doc_id,
                     ok=lifecycle_ok,
                     error=lifecycle_error,
+                )
+                reclaim_result = self.memory_reclaimer.reclaim()
+                self._memory_sample(
+                    "document_memory_reclaimed",
+                    source_id=source_id,
+                    run_id=run_id,
+                    doc_id=doc_id,
+                    ok=lifecycle_ok,
+                    error=lifecycle_error,
+                    **reclaim_result,
                 )
 
     async def _process_item_admitted(

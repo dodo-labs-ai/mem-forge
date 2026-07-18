@@ -7,6 +7,8 @@ doc_id are useful in logs but inappropriate as metric labels.
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import json
 import logging
 import os
@@ -25,6 +27,51 @@ logger = logging.getLogger("memforge.pipeline.sync.memory")
 class MemorySample:
     rss_mb: float | None
     peak_rss_mb: float | None
+
+
+class ProcessMemoryReclaimer:
+    """Release document-scoped Python and glibc allocation high-water marks."""
+
+    def __init__(self, *, collector: Any | None = None, malloc_trim: Any | None = None) -> None:
+        self._collector = collector or (lambda: gc.collect(2))
+        self._malloc_trim = malloc_trim if malloc_trim is not None else self._resolve_malloc_trim()
+
+    def reclaim(self) -> dict[str, object]:
+        collected_objects = 0
+        collection_error_class: str | None = None
+        try:
+            collected_objects = int(self._collector())
+        except Exception as exc:
+            collection_error_class = type(exc).__name__
+
+        heap_trim_supported = self._malloc_trim is not None
+        heap_trimmed = False
+        trim_error_class: str | None = None
+        if self._malloc_trim is not None:
+            try:
+                heap_trimmed = bool(self._malloc_trim(0))
+            except Exception as exc:
+                trim_error_class = type(exc).__name__
+
+        return {
+            "collected_objects": collected_objects,
+            "collection_error_class": collection_error_class,
+            "heap_trim_supported": heap_trim_supported,
+            "heap_trimmed": heap_trimmed,
+            "trim_error_class": trim_error_class,
+        }
+
+    @staticmethod
+    def _resolve_malloc_trim() -> Any | None:
+        if not sys.platform.startswith("linux"):
+            return None
+        try:
+            malloc_trim = ctypes.CDLL(None).malloc_trim
+            malloc_trim.argtypes = [ctypes.c_size_t]
+            malloc_trim.restype = ctypes.c_int
+            return malloc_trim
+        except (AttributeError, OSError):
+            return None
 
 
 class ProcessMemorySampler:

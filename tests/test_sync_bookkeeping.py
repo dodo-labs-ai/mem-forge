@@ -3503,6 +3503,19 @@ class ConstantMemorySampler:
         return MemorySample(rss_mb=self.rss, peak_rss_mb=self.rss)
 
 
+class RecordingMemoryReclaimer:
+    def __init__(self):
+        self.calls = 0
+
+    def reclaim(self):
+        self.calls += 1
+        return {
+            "collected_objects": 3,
+            "heap_trim_supported": True,
+            "heap_trimmed": True,
+        }
+
+
 async def _insert_source_and_doc(db: Database, source_id: str) -> None:
     await db.upsert_source(
         id=source_id,
@@ -3746,6 +3759,60 @@ async def test_sync_memory_observer_records_discovery_and_document_stages(db: Da
     assert discovery["indexed_doc_count"] == 0
     assert discovery["full_sync"] is True
     assert "after_source_support" not in stages
+
+
+@pytest.mark.asyncio
+async def test_document_lifecycle_reclaims_process_memory_after_each_document(
+    db: Database,
+):
+    source_id = "src-sync-memory-reclaim"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Board",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    log = RecordingSyncMemoryLogger()
+    observer = SyncMemoryObserver(
+        sampler=ConstantMemorySampler(),
+        logger=log,
+    )
+    reclaimer = RecordingMemoryReclaimer()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=InstantEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        source_support_detector=RecordingSourceSupportDetector(),
+        max_concurrent=1,
+        memory_observer=observer,
+        memory_reclaimer=reclaimer,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=BlockingFetchGene(item_count=2, release=release),
+        source_name="Jira Board",
+        source_id=source_id,
+        force_full_sync=True,
+    )
+
+    assert state.last_sync_status == "success"
+    assert reclaimer.calls == 2
+    reclaimed = [
+        event
+        for _level, event in log.records
+        if event["stage"] == "document_memory_reclaimed"
+    ]
+    assert len(reclaimed) == 2
+    assert all(event["collected_objects"] == 3 for event in reclaimed)
+    assert all(event["heap_trim_supported"] is True for event in reclaimed)
+    assert all(event["heap_trimmed"] is True for event in reclaimed)
 
 
 @pytest.mark.asyncio
