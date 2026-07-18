@@ -399,6 +399,16 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
             assert workspace_id == "default"
             return None
 
+        async def list_lifecycle_backfill_jobs(
+            self,
+            source_id: str,
+            *,
+            limit: int = 20,
+        ) -> list:
+            assert source_id == "src-neutral"
+            assert limit == 1
+            return []
+
         async def get_active_source_access_transition(self, source_id: str):
             assert source_id == "src-neutral"
             return None
@@ -438,6 +448,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
     }
     assert source["doc_count"] == 3
     assert source["memory_count"] == 7
+    assert source["lifecycle_maintenance"] is None
     assert source["pinned_for_me"] is False
     assert source["client"] is None
     assert source["access_policy"] == "private"
