@@ -269,6 +269,9 @@ class SourceProjection:
     relations: tuple[SourceRelation, ...]
     deltas: tuple[RevisionDelta, ...]
     checkpoint: Mapping[str, object]
+    # Partial projections retain exact prior revisions for observations that
+    # the provider did not return; this run annotation never mutates revision identity.
+    carried_observation_revision_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_unique("observation", tuple(item.id for item in self.observations))
@@ -279,6 +282,30 @@ class SourceProjection:
         observations_by_id = {item.id: item for item in self.observations}
         observation_revisions_by_id = {item.id: item for item in self.observation_revisions}
         unit_revisions_by_id = {item.id: item for item in self.source_unit_revisions}
+        carried_revision_ids = set(self.carried_observation_revision_ids)
+        if len(carried_revision_ids) != len(self.carried_observation_revision_ids):
+            raise ValueError("carried Observation Revision ids must be unique")
+        if carried_revision_ids and self.coverage is not ProjectionCoverage.PARTIAL_PROJECTION:
+            raise ValueError("carried Observation Revisions require partial projection coverage")
+        absent_observation_revision_ids = {
+            revision.id
+            for revision in self.observation_revisions
+            if revision.observation_id not in observations_by_id
+        }
+        if carried_revision_ids != absent_observation_revision_ids:
+            raise ValueError(
+                "carried Observation Revision ids must exactly identify revisions without projected Observations"
+            )
+        carried_revision_unit_ids: dict[str, str] = {}
+        for unit_revision in self.source_unit_revisions:
+            if len(set(unit_revision.observation_revision_ids)) != len(unit_revision.observation_revision_ids):
+                raise ValueError("Source Unit Revision has duplicate Observation Revision membership")
+            for revision_id in carried_revision_ids.intersection(unit_revision.observation_revision_ids):
+                if revision_id in carried_revision_unit_ids:
+                    raise ValueError("carried Observation Revision must belong to exactly one Source Unit Revision")
+                carried_revision_unit_ids[revision_id] = unit_revision.source_unit_id
+        if carried_revision_ids != set(carried_revision_unit_ids):
+            raise ValueError("carried Observation Revision must belong to a Source Unit Revision")
         if any(item.source_id != self.source_id for item in self.source_units):
             raise ValueError("all source units must belong to the projection source")
         if any(item.source_unit_id not in unit_ids for item in self.observations):
@@ -288,7 +315,7 @@ class SourceProjection:
         for item in self.observation_revisions:
             if item.observation_id in observations_by_id:
                 continue
-            if not item.metadata.get("carried_forward"):
+            if item.id not in carried_revision_unit_ids:
                 raise ValueError("every Observation Revision must reference a projected Observation")
         for unit_revision in self.source_unit_revisions:
             if unit_revision.source_unit_id not in unit_ids:
@@ -298,7 +325,7 @@ class SourceProjection:
                 if observation_revision is None:
                     raise ValueError("Source Unit Revision references an unknown Observation Revision")
                 observation = observations_by_id.get(observation_revision.observation_id)
-                carried_unit_id = observation_revision.metadata.get("source_unit_id")
+                carried_unit_id = carried_revision_unit_ids.get(observation_revision.id)
                 if (observation is not None and observation.source_unit_id != unit_revision.source_unit_id) or (
                     observation is None and carried_unit_id != unit_revision.source_unit_id
                 ):
@@ -476,6 +503,7 @@ def source_projection_to_payload(projection: SourceProjection) -> dict[str, obje
             for item in projection.deltas
         ],
         "checkpoint": dict(projection.checkpoint),
+        "carried_observation_revision_ids": list(projection.carried_observation_revision_ids),
     }
 
 
@@ -583,6 +611,9 @@ def source_projection_from_payload(payload: Mapping[str, object]) -> SourceProje
             for item in mappings("deltas")
         ),
         checkpoint=_mapping(payload.get("checkpoint")),
+        carried_observation_revision_ids=tuple(
+            str(value) for value in payload.get("carried_observation_revision_ids", [])
+        ),
     )
 
 

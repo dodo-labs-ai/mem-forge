@@ -259,6 +259,7 @@ def project_source_item(
     )
     observations: list[SourceObservation] = []
     revisions: list[SourceObservationRevision] = []
+    carried_revision_ids: list[str] = []
     for value in observations_input:
         observation_id = _stable_id("obs", unit_id, value.observation_type, value.provider_key)
         semantic_hash = _canonical_hash(value.semantic_value)
@@ -273,35 +274,33 @@ def project_source_item(
                 locator=dict(value.locator),
             )
         )
+        projected_revision = SourceObservationRevision(
+            id=revision_id,
+            observation_id=observation_id,
+            semantic_hash=semantic_hash,
+            content=value.content,
+            observed_at=value.observed_at,
+            metadata={**dict(value.metadata), "provider_key": value.provider_key},
+        )
+        prior_revision = prior_observation_revisions.get(observation_id)
+        # Revision identity is semantic. Operational metadata enrichment under
+        # an unchanged semantic hash must preserve the exact immutable row.
         revisions.append(
-            SourceObservationRevision(
-                id=revision_id,
-                observation_id=observation_id,
-                semantic_hash=semantic_hash,
-                content=value.content,
-                observed_at=value.observed_at,
-                metadata={**dict(value.metadata), "provider_key": value.provider_key},
+            prior_revision
+            if (
+                prior_revision is not None
+                and prior_revision.observation_id == observation_id
+                and prior_revision.semantic_hash == semantic_hash
             )
+            else projected_revision
         )
     if coverage is ProjectionCoverage.PARTIAL_PROJECTION:
         projected_observation_ids = {item.observation_id for item in revisions}
         for observation_id, revision in prior_observation_revisions.items():
             if observation_id in projected_observation_ids:
                 continue
-            revisions.append(
-                SourceObservationRevision(
-                    id=revision.id,
-                    observation_id=revision.observation_id,
-                    semantic_hash=revision.semantic_hash,
-                    content=revision.content,
-                    observed_at=revision.observed_at,
-                    metadata={
-                        **dict(revision.metadata),
-                        "carried_forward": True,
-                        "source_unit_id": unit_id,
-                    },
-                )
-            )
+            revisions.append(revision)
+            carried_revision_ids.append(revision.id)
     observation_hashes = sorted((item.observation_id, item.semantic_hash) for item in revisions)
     semantic_hash = _canonical_hash(observation_hashes)
     location_hash = _canonical_hash(unit.locator)
@@ -407,6 +406,7 @@ def project_source_item(
         relations=relations,
         deltas=(delta,),
         checkpoint={"item_id": item.item_id, "version": item.version},
+        carried_observation_revision_ids=tuple(carried_revision_ids),
     )
 
 
