@@ -337,24 +337,44 @@ class EntityResolver:
                 return
 
             entities = await db.get_all_entities()
-            self._entity_by_id = {entity.id: entity for entity in entities}
+            current_by_id = {entity.id: entity for entity in entities}
             if not entities:
+                self._entity_embeddings.clear()
+                self._entity_by_id.clear()
                 self._embeddings_loaded = True
                 return
 
-            # Batch embed all entity canonical names
-            names = [e.canonical_name for e in entities]
+            unchanged_ids = {
+                entity.id
+                for entity in entities
+                if entity.id in self._entity_embeddings
+                and self._entity_by_id.get(entity.id) is not None
+                and self._entity_by_id[entity.id].canonical_name == entity.canonical_name
+            }
+            self._entity_embeddings = {
+                entity_id: vector
+                for entity_id, vector in self._entity_embeddings.items()
+                if entity_id in unchanged_ids
+            }
+            self._entity_by_id = current_by_id
+            changed_entities = [
+                entity for entity in entities if entity.id not in unchanged_ids
+            ]
+            if not changed_entities:
+                self._embeddings_loaded = True
+                return
+
             try:
                 from memforge.retrieval.embeddings import embed_texts
 
                 vectors = await asyncio.to_thread(
                     embed_texts,
-                    names,
+                    [entity.canonical_name for entity in changed_entities],
                     self.embed_cfg["base_url"],
                     self.embed_cfg["api_key"],
                     self.embed_cfg["model"],
                 )
-                for entity, vector in zip(entities, vectors):
+                for entity, vector in zip(changed_entities, vectors):
                     self._entity_embeddings[entity.id] = vector
             except Exception as e:
                 logger.warning("Failed to embed entity names: %s", e)
@@ -504,9 +524,7 @@ class EntityResolver:
             )
 
     def invalidate_cache(self) -> None:
-        """Clear cached entity embeddings (call after new entities are created)."""
-        self._entity_embeddings.clear()
-        self._entity_by_id.clear()
+        """Mark the entity index stale while retaining reusable embeddings."""
         self._embeddings_loaded = False
 
 

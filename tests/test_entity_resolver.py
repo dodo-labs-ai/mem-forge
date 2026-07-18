@@ -245,3 +245,44 @@ class TestEntityTags:
 
         assert results == [1, 1, 1]
         assert max_active_full_loads == 1
+
+    @pytest.mark.asyncio
+    async def test_embedding_cache_refresh_embeds_only_new_or_changed_entities(self, monkeypatch):
+        class FakeDb:
+            def __init__(self) -> None:
+                self.entities = [
+                    Entity(id=1, canonical_name="pay api", display_name="pay-api"),
+                    Entity(id=2, canonical_name="auth service", display_name="auth-service"),
+                ]
+
+            async def get_all_entities(self):
+                return list(self.entities)
+
+        db = FakeDb()
+        batches: list[list[str]] = []
+
+        def fake_embed_texts(names, base_url, api_key, model):
+            del base_url, api_key, model
+            batches.append(list(names))
+            return [[float(len(name)), 0.0] for name in names]
+
+        monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
+        resolver = EntityResolver(
+            db=db,  # type: ignore[arg-type]
+            embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        )
+
+        await resolver._load_entity_embeddings(db)  # type: ignore[arg-type]
+        db.entities = [
+            Entity(id=1, canonical_name="pay service", display_name="pay-service"),
+            db.entities[1],
+            Entity(id=3, canonical_name="memory forge", display_name="MemForge"),
+        ]
+        resolver.invalidate_cache()
+        await resolver._load_entity_embeddings(db)  # type: ignore[arg-type]
+
+        assert batches == [
+            ["pay api", "auth service"],
+            ["pay service", "memory forge"],
+        ]
+        assert set(resolver._entity_embeddings) == {1, 2, 3}
