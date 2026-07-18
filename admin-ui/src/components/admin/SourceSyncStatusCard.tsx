@@ -2,7 +2,11 @@ import { useEffect, useState } from "react";
 import { AlertCircle, Check, Loader2, RotateCw } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { SourceSyncActivity } from "@/views/sources/sourceSyncActivity";
-import { presentSourceSyncActivity } from "@/views/sources/sourceSyncActivity";
+import {
+  presentSourceSyncActivity,
+  sourceSyncActivityIsVisible,
+  sourceSyncActivityPolicy,
+} from "@/views/sources/sourceSyncActivity";
 
 export function SourceSyncStatusCard({
   activity,
@@ -23,12 +27,10 @@ export function SourceSyncStatusCard({
   }, [activity?.finishedAt]);
 
   if (!activity) return null;
-  if (activity.state === "success" && activity.finishedAt) {
-    const age = nowMs - new Date(activity.finishedAt).getTime();
-    if (age > 30_000) return null;
-  }
+  if (!sourceSyncActivityIsVisible(activity, nowMs)) return null;
 
   const presentation = presentSourceSyncActivity(activity, sourceName, itemLabel);
+  const policy = sourceSyncActivityPolicy(activity);
   const active = ["queued", "active", "recovering"].includes(activity.state);
   const failed = activity.state === "failed" || activity.state === "partial";
   const Icon = active ? Loader2 : failed ? AlertCircle : Check;
@@ -54,7 +56,7 @@ export function SourceSyncStatusCard({
         <Icon className={cn("size-3.5 shrink-0", active && "animate-spin text-foreground")} />
         <span className={cn("shrink-0 font-medium", !failed && "text-foreground")}>{presentation.message}</span>
         {presentation.detail && <span className="min-w-0 truncate text-xs opacity-80">{presentation.detail}</span>}
-        {failed && onRetry && (
+        {failed && policy.canRetry && onRetry && (
           <button type="button" onClick={onRetry} className="ml-auto" aria-label="Retry sync">
             <RotateCw className="size-3.5" />
           </button>
@@ -63,7 +65,7 @@ export function SourceSyncStatusCard({
       {active && (
         <div
           role="progressbar"
-          aria-label={`${sourceName} sync progress`}
+          aria-label={`${sourceName} activity progress`}
           aria-valuemin={determinate ? 0 : undefined}
           aria-valuemax={determinate ? presentation.total : undefined}
           aria-valuenow={determinate ? Math.min(presentation.completed ?? 0, presentation.total!) : undefined}

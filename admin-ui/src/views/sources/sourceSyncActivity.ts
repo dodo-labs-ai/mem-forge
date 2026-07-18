@@ -1,9 +1,12 @@
 import type {
   LocalAgentJobStatusResponse,
+  SourceLifecycleMaintenance,
   SyncProgressSnapshot,
   SyncProgressUnit,
   SyncStatus,
 } from "../../api/types.js";
+
+export type SourceSyncActivityKind = "sync" | "memory_maintenance";
 
 export type SourceSyncActivityState =
   | "queued"
@@ -14,6 +17,7 @@ export type SourceSyncActivityState =
   | "failed";
 
 export interface SourceSyncActivity {
+  kind: SourceSyncActivityKind;
   state: SourceSyncActivityState;
   progress?: SyncProgressSnapshot;
   error?: {
@@ -32,11 +36,19 @@ export interface SourceSyncPresentation {
   total?: number;
 }
 
+export interface SourceSyncActivityPolicy {
+  activeRowLabel: string;
+  busyActionLabel: string;
+  busyAriaLabel: string;
+  canRetry: boolean;
+}
+
 export function sourceSyncActivityFromLocalJob(job: LocalAgentJobStatusResponse): SourceSyncActivity {
   const leaseExpired = job.status === "leased"
     && job.leased_until != null
     && new Date(job.leased_until).getTime() <= Date.now();
   return {
+    kind: "sync",
     state: job.status === "queued"
       ? "queued"
       : job.status === "leased"
@@ -52,6 +64,7 @@ export function sourceSyncActivityFromLocalJob(job: LocalAgentJobStatusResponse)
 
 export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivity {
   return {
+    kind: "sync",
     state: sync.status === "pending"
       ? "queued"
       : sync.status === "running"
@@ -65,28 +78,52 @@ export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivi
   };
 }
 
-export function selectSourceSyncActivity(
-  sync: SyncStatus | null | undefined,
-  localJob: LocalAgentJobStatusResponse | null | undefined,
+export function sourceSyncActivityFromLifecycleMaintenance(
+  maintenance: SourceLifecycleMaintenance,
+): SourceSyncActivity {
+  return {
+    kind: "memory_maintenance",
+    state: maintenance.status === "queued"
+      ? "queued"
+      : maintenance.status === "running"
+        ? "active"
+        : maintenance.status === "completed" ? "success" : "failed",
+    startedAt: maintenance.started_at ?? maintenance.created_at,
+    updatedAt: maintenance.finished_at ?? maintenance.started_at ?? maintenance.created_at,
+    finishedAt: maintenance.finished_at,
+  };
+}
+
+export function selectSourceSyncActivity({
+  sync,
+  localJob,
+  lifecycleMaintenance,
   pending = false,
-): SourceSyncActivity | undefined {
+}: {
+  sync?: SyncStatus | null;
+  localJob?: LocalAgentJobStatusResponse | null;
+  lifecycleMaintenance?: SourceLifecycleMaintenance | null;
+  pending?: boolean;
+}): SourceSyncActivity | undefined {
+  if (lifecycleMaintenance && ["queued", "running"].includes(lifecycleMaintenance.status)) {
+    return sourceSyncActivityFromLifecycleMaintenance(lifecycleMaintenance);
+  }
   if (sync && ["pending", "running", "recovering"].includes(sync.status)) {
     return sourceSyncActivityFromStatus(sync);
   }
   if (localJob && ["queued", "leased"].includes(localJob.status)) {
     return sourceSyncActivityFromLocalJob(localJob);
   }
-  if (pending) return { state: "queued" };
-  if (sync && localJob) {
-    const serverActivity = sourceSyncActivityFromStatus(sync);
-    const localActivity = sourceSyncActivityFromLocalJob(localJob);
-    return activityTime(localActivity) > activityTime(serverActivity)
-      ? localActivity
-      : serverActivity;
-  }
-  if (sync) return sourceSyncActivityFromStatus(sync);
-  if (localJob) return sourceSyncActivityFromLocalJob(localJob);
-  return undefined;
+  if (pending) return { kind: "sync", state: "queued" };
+
+  const terminalActivities = [
+    sync ? sourceSyncActivityFromStatus(sync) : undefined,
+    localJob ? sourceSyncActivityFromLocalJob(localJob) : undefined,
+    lifecycleMaintenance
+      ? sourceSyncActivityFromLifecycleMaintenance(lifecycleMaintenance)
+      : undefined,
+  ].filter((activity): activity is SourceSyncActivity => activity != null);
+  return terminalActivities.sort((left, right) => activityTime(right) - activityTime(left))[0];
 }
 
 function activityTime(activity: SourceSyncActivity): number {
@@ -98,11 +135,59 @@ function activityTime(activity: SourceSyncActivity): number {
   return Number.NEGATIVE_INFINITY;
 }
 
+export function sourceSyncActivityBlocksActions(
+  activity: SourceSyncActivity | undefined,
+): boolean {
+  return Boolean(activity && ["queued", "active", "recovering"].includes(activity.state));
+}
+
+export function sourceSyncActivityPolicy(
+  activity: SourceSyncActivity,
+): SourceSyncActivityPolicy {
+  return activity.kind === "memory_maintenance"
+    ? {
+        activeRowLabel: "Updating memories",
+        busyActionLabel: "Updating",
+        busyAriaLabel: "Memory maintenance in progress",
+        canRetry: false,
+      }
+    : {
+        activeRowLabel: "Syncing now",
+        busyActionLabel: "Syncing",
+        busyAriaLabel: "Sync in progress",
+        canRetry: true,
+      };
+}
+
+export function sourceSyncActivityIsVisible(
+  activity: SourceSyncActivity,
+  nowMs = Date.now(),
+): boolean {
+  if (activity.state !== "success" || !activity.finishedAt) return true;
+  const finishedAtMs = new Date(activity.finishedAt).getTime();
+  return !Number.isFinite(finishedAtMs) || nowMs - finishedAtMs <= 30_000;
+}
+
 export function presentSourceSyncActivity(
   activity: SourceSyncActivity,
   sourceName: string,
   fallbackItems: string,
 ): SourceSyncPresentation {
+  if (activity.kind === "memory_maintenance") {
+    if (activity.state === "queued") {
+      return { message: "Waiting to update memories", detail: "Queued" };
+    }
+    if (activity.state === "active" || activity.state === "recovering") {
+      return { message: "Updating memories", detail: "Working" };
+    }
+    if (activity.state === "success") {
+      return { message: "Memories updated", detail: "Complete" };
+    }
+    return {
+      message: "Memory update needs attention",
+      detail: "Memory maintenance failed. Review the maintenance details.",
+    };
+  }
   if (activity.state === "queued") {
     return { message: "Waiting to sync", detail: "Queued" };
   }

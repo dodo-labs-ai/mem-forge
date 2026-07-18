@@ -45,7 +45,10 @@ import {
   type ResolvedBySource,
 } from "./projectGrouping";
 import { SourceRow } from "./SourceRow";
-import { selectSourceSyncActivity } from "./sourceSyncActivity";
+import {
+  selectSourceSyncActivity,
+  sourceSyncActivityBlocksActions,
+} from "./sourceSyncActivity";
 import { organizeSourceGroups, type SourceListSortMode } from "./sourceListOrganization";
 import { localAgentSyncOperation } from "./localAgentSources";
 import {
@@ -264,6 +267,9 @@ export function SourcesPage() {
       const terminal = new Set(["success", "partial", "failed"]);
       return sources.some((source) => {
         if (source.access_state === "changing" && source.access_transition?.status !== "failed") {
+          return true;
+        }
+        if (["queued", "running"].includes(source.lifecycle_maintenance?.status ?? "")) {
           return true;
         }
         const status = source.sync?.status;
@@ -717,15 +723,13 @@ export function SourcesPage() {
                 >
                   {group.sources.map(({ source, memory_count }) => {
                     const localAgentJob = localAgentJobBySource[source.id] ?? currentLocalJobBySource[source.id];
-                    const syncActivity = selectSourceSyncActivity(
-                      source.sync,
-                      localAgentJob,
-                      pendingSyncIds.has(source.id),
-                    );
-                    const isSyncing =
-                      ["pending", "running", "recovering"].includes(source.sync?.status ?? "") ||
-                      pendingSyncIds.has(source.id) ||
-                      Boolean(localAgentJob && ["queued", "leased"].includes(localAgentJob.status));
+                    const syncActivity = selectSourceSyncActivity({
+                      sync: source.sync,
+                      localJob: localAgentJob,
+                      lifecycleMaintenance: source.lifecycle_maintenance,
+                      pending: pendingSyncIds.has(source.id),
+                    });
+                    const isSourceBusy = sourceSyncActivityBlocksActions(syncActivity);
                     const isDeleting = deleteSource.isPending && sourcePendingDelete?.id === source.id;
                     const isUpdatingStatus =
                       setSourceStatus.isPending &&
@@ -754,7 +758,6 @@ export function SourcesPage() {
                         key={`${groupKey}:${source.id}`}
                         source={source}
                         perGroupMemoryCount={memory_count}
-                        isSyncing={isSyncing}
                         syncActivity={syncActivity}
                         isDeleting={isDeleting}
                         isUpdatingStatus={isUpdatingStatus}
@@ -810,8 +813,9 @@ export function SourcesPage() {
                                 setOpenMenuSourceId(null);
                                 setAccessSource(source);
                               }}
-                              disableForceResync={isSyncing || isDeleting || source.status === "paused"}
-                              disableToggleStatus={isSyncing || isDeleting || isUpdatingStatus}
+                              disableMutatingActions={isSourceBusy || isDeleting}
+                              disableForceResync={isSourceBusy || isDeleting || source.status === "paused"}
+                              disableToggleStatus={isSourceBusy || isDeleting || isUpdatingStatus}
                               isUpdatingStatus={isUpdatingStatus}
                           />
                         }
@@ -912,6 +916,7 @@ function SourceActionsMenu({
   onForceResync,
   onToggleStatus,
   onChangeAccess,
+  disableMutatingActions,
   disableForceResync,
   disableToggleStatus,
   isUpdatingStatus,
@@ -924,6 +929,7 @@ function SourceActionsMenu({
   onForceResync: () => void;
   onToggleStatus: () => void;
   onChangeAccess: () => void;
+  disableMutatingActions: boolean;
   disableForceResync: boolean;
   disableToggleStatus: boolean;
   isUpdatingStatus: boolean;
@@ -1023,7 +1029,8 @@ function SourceActionsMenu({
             <button
               type="button"
               role="menuitem"
-              className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm hover:bg-muted"
+              disabled={disableMutatingActions}
+              className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
               onClick={onChangeAccess}
             >
               <LockKeyhole className="mt-0.5 size-4" />
@@ -1078,7 +1085,8 @@ function SourceActionsMenu({
               <button
                 type="button"
                 role="menuitem"
-                className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
+                disabled={disableMutatingActions}
+                className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-60"
                 onClick={onDelete}
               >
                 <Trash2 className="mt-0.5 size-4" />

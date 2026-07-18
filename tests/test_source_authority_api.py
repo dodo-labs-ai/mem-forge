@@ -10,6 +10,10 @@ from fastapi import Request
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
+from memforge.memory.lifecycle_plan import (
+    LifecycleBackfillJob,
+    LifecycleBackfillJobStatus,
+)
 from memforge.models import (
     ContentItem,
     Memory,
@@ -359,6 +363,50 @@ def test_source_creator_can_manage_and_receives_redacted_config(tmp_path):
         assert source["config"]["pat_configured"] is True
         assert "pat" not in source["config"]
         assert "pat_encrypted" not in source["config"]
+    finally:
+        asyncio.run(database.close())
+
+
+def test_source_list_projects_active_lifecycle_maintenance(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        owner_headers = {
+            "x-test-user": "owner-user",
+            "x-test-workspace-role": "member",
+        }
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/sources",
+                headers=owner_headers,
+                json=_confluence_payload(),
+            )
+            assert created.status_code == 200, created.text
+            source_id = created.json()["id"]
+            now = datetime.now(timezone.utc).isoformat()
+            asyncio.run(
+                database.create_lifecycle_backfill_job(
+                    LifecycleBackfillJob(
+                        id="maintenance-job",
+                        source_id=source_id,
+                        status=LifecycleBackfillJobStatus.QUEUED,
+                        created_at=now,
+                    )
+                )
+            )
+            asyncio.run(database.start_lifecycle_backfill_job("maintenance-job"))
+
+            listed = client.get("/api/sources", headers=owner_headers)
+
+        assert listed.status_code == 200, listed.text
+        source = listed.json()["data"][0]
+        assert source["lifecycle_maintenance"] == {
+            "status": "running",
+            "created_at": now,
+            "started_at": source["lifecycle_maintenance"]["started_at"],
+            "finished_at": None,
+        }
+        assert source["lifecycle_maintenance"]["started_at"] is not None
     finally:
         asyncio.run(database.close())
 
