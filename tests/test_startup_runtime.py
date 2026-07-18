@@ -77,6 +77,39 @@ async def test_sync_runtime_wires_structured_llm_client_into_memory_engine(db, t
 
 
 @pytest.mark.asyncio
+async def test_direct_sync_runtime_uses_configured_process_document_admission(
+    db,
+    tmp_path,
+    monkeypatch,
+):
+    """Maintenance callers must inherit the same process memory admission as workers."""
+    from memforge import runtime
+
+    monkeypatch.setattr(runtime, "get_chroma_collection", lambda **kwargs: FakeCollection())
+    config = _config(tmp_path)
+    config.sync.max_document_lifecycles = 1
+
+    sync_runtime = await runtime.build_sync_runtime(db, config)
+    second_runtime = await runtime.build_sync_runtime(db, config)
+
+    assert sync_runtime.document_lifecycle_admission is runtime.get_process_document_lifecycle_admission(1)
+    assert second_runtime.document_lifecycle_admission is sync_runtime.document_lifecycle_admission
+
+    explicit_admission = runtime.DocumentLifecycleAdmission(2)
+    explicitly_admitted_runtime = await runtime.build_sync_runtime(
+        db,
+        config,
+        document_lifecycle_admission=explicit_admission,
+    )
+    assert explicitly_admitted_runtime.document_lifecycle_admission is explicit_admission
+
+    unlimited_config = _config(tmp_path)
+    unlimited_config.sync.max_document_lifecycles = 0
+    unlimited_runtime = await runtime.build_sync_runtime(db, unlimited_config)
+    assert unlimited_runtime.document_lifecycle_admission is None
+
+
+@pytest.mark.asyncio
 async def test_sync_runtime_bounds_structured_request_timeout(db, tmp_path, monkeypatch):
     """Long-running sync model calls should fail as document errors, not hang forever."""
     from memforge import runtime

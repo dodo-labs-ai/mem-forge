@@ -145,6 +145,12 @@ class SyncRuntime:
     memory_observer: SyncMemoryObserver | None = None
     orchestrator_factory: Callable[["SyncRuntime"], GeneSyncOrchestrator] | None = None
 
+    def __post_init__(self) -> None:
+        if self.document_lifecycle_admission is None:
+            self.document_lifecycle_admission = get_process_document_lifecycle_admission(
+                max(0, int(self.config.sync.max_document_lifecycles))
+            )
+
     def orchestrator(self) -> GeneSyncOrchestrator:
         if self.orchestrator_factory is not None:
             return self.orchestrator_factory(self)
