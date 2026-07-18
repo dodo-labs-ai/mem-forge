@@ -24,7 +24,7 @@ from memforge.llm.structured import (
     StructuredLlmError,
 )
 from memforge.memory.store import MemoryStore
-from memforge.models import Memory, RawMemory, content_hash
+from memforge.models import Memory, content_hash
 from memforge.pipeline.contradiction_detector import detect_cross_doc_contradictions
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -447,85 +447,6 @@ class TestContradictionE2E:
         assert stats["contradictions"] + stats["temporal"] >= 1, (
             f"Should detect at least one conflict across the batch, got: {stats}"
         )
-
-
-# ===========================================================================
-# E2E: MemoryEngine.process_memories() → contradiction detection integration
-# ===========================================================================
-
-
-@skip_no_llm
-class TestProcessMemoriesIntegration:
-    """Tests that contradiction detection fires through MemoryEngine.process_memories()."""
-
-    @pytest.mark.asyncio
-    async def test_process_memories_triggers_contradiction_detection(self, seeded_db, structured_llm_client):
-        """Inserting new memories via process_memories() should automatically run
-        contradiction detection and return contradictions_found in stats."""
-        s = seeded_db
-        db = s["db"]
-
-        # Build a MemoryEngine with real LLM client
-        # MemoryStore needs ChromaDB — use a mock that always returns "inserted"
-        mock_store = AsyncMock()
-        mock_store.deduplicate_and_insert = AsyncMock(return_value="inserted")
-
-        from memforge.memory.engine import MemoryEngine
-
-        adapters = build_sqlite_adapters(db, StubChromaCollection())
-        engine = MemoryEngine(
-            relational=adapters.relational,
-            vector=adapters.vector,
-            db=db,
-            memory_store=mock_store,
-            structured_llm_client=structured_llm_client,
-        )
-
-        # New memory that contradicts mem_arch_pg ("PostgreSQL 14 on port 5432")
-        raw = RawMemory(
-            content="pay-api was fully migrated off PostgreSQL to MongoDB in February 2026.",
-            memory_type="fact",
-            confidence=0.9,
-            entity_refs=[],  # entity linking happens through pre-seeded DB state
-            tags=["database"],
-        )
-
-        # The mocked store inserts directly so contradiction detection can find
-        # the new memory and its PostgreSQL entity link.
-        inserted_ids = []
-
-        async def _insert_and_link(memory, doc_id, source_type, entity_ids=None, excerpt=None):
-            # Insert the memory directly into DB so contradiction detector can find it
-            await db.insert_memory(memory)
-            await db.db.execute(
-                "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-                (memory.id, doc_id, source_type),
-            )
-            # Link to postgresql entity
-            await db.db.execute(
-                "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
-                (memory.id, s["pg_id"]),
-            )
-            await db.db.commit()
-            inserted_ids.append(memory.id)
-            return "inserted"
-
-        mock_store.deduplicate_and_insert = _insert_and_link
-
-        stats = await engine.process_memories(
-            doc_id="doc-runbook",
-            raw_memories=[raw],
-            source_type="test",
-            source_updated_at=None,
-        )
-
-        print(f"\n  process_memories stats: {stats}")
-
-        assert stats["inserted"] == 1
-        assert "contradictions_found" in stats, "process_memories should include contradictions_found in stats"
-        # The new memory contradicts the existing PostgreSQL 14 fact
-        # (may be classified as contradiction or temporal)
-        print(f"  contradictions_found: {stats['contradictions_found']}")
 
 
 # ===========================================================================

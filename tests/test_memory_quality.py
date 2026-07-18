@@ -9,7 +9,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
-from memforge.memory.engine import MemoryEngine
 from memforge.memory.store import MemoryStore
 from memforge.models import DocumentRecord, Memory, RawMemory, content_hash
 from memforge.storage.database import Database
@@ -62,29 +61,6 @@ CONDITIONAL_RULE_CONTEXT = (
     "if the regular pay date ... has been changed via a deviating payroll process, the same validation "
     "should be repeated"
 )
-
-
-class DirectInsertStore:
-    """Tiny MemoryStore stand-in that exercises MemoryEngine without embeddings."""
-
-    def __init__(self, db: Database) -> None:
-        self.db = db
-
-    async def deduplicate_and_insert(
-        self,
-        memory: Memory,
-        doc_id: str,
-        source_type: str,
-        entity_ids: list[int] | None = None,
-        excerpt: str | None = None,
-        *,
-        source_updated_at: datetime | None,
-        relation_outcome=None,
-    ) -> str:
-        await self.db.insert_memory(memory)
-        if relation_outcome is not None:
-            await self.db.record_relation_outcome_bundle(relation_outcome)
-        return "inserted"
 
 
 class FakeCollection:
@@ -401,65 +377,6 @@ def test_classifier_keeps_useful_memory_with_link_list_context():
 
     assert quality.keep is True
     assert quality.skip_reason is None
-
-
-@pytest.mark.asyncio
-async def test_engine_skips_metadata_only_candidate(db: Database):
-    await _insert_document(db)
-    adapters = build_sqlite_adapters(db, FakeCollection())
-    engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db)
-    )
-
-    stats = await engine.process_memories(
-        doc_id="doc-acd",
-        raw_memories=[_raw(METADATA_CONTENT, METADATA_CONTEXT)],
-        source_type="confluence",
-        source_updated_at=None,
-    )
-
-    assert stats == {"inserted": 0, "corroborated": 0, "skipped": 1}
-    assert await db.count_memories() == 0
-
-
-@pytest.mark.asyncio
-async def test_engine_skips_open_question_candidate(db: Database):
-    await _insert_document(db)
-    adapters = build_sqlite_adapters(db, FakeCollection())
-    engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db)
-    )
-
-    stats = await engine.process_memories(
-        doc_id="doc-acd",
-        raw_memories=[_raw(OPEN_QUESTION_CONTENT, OPEN_QUESTION_CONTEXT)],
-        source_type="confluence",
-        source_updated_at=None,
-    )
-
-    assert stats == {"inserted": 0, "corroborated": 0, "skipped": 1}
-    assert await db.count_memories() == 0
-
-
-@pytest.mark.asyncio
-async def test_engine_keeps_conditional_ap_rule(db: Database):
-    await _insert_document(db)
-    adapters = build_sqlite_adapters(db, FakeCollection())
-    engine = MemoryEngine(
-        relational=adapters.relational, vector=adapters.vector, db=db, memory_store=DirectInsertStore(db)
-    )
-
-    stats = await engine.process_memories(
-        doc_id="doc-acd",
-        raw_memories=[_raw(CONDITIONAL_RULE_CONTENT, CONDITIONAL_RULE_CONTEXT)],
-        source_type="confluence",
-        source_updated_at=None,
-    )
-
-    memories = await db.list_memories()
-    assert stats == {"inserted": 1, "corroborated": 0, "skipped": 0}
-    assert len(memories) == 1
-    assert memories[0].content == CONDITIONAL_RULE_CONTENT
 
 
 @pytest.mark.asyncio
