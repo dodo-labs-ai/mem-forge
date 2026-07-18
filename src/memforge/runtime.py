@@ -557,7 +557,7 @@ async def build_sync_runtime(
         model=llm.enrichment_model,
         base_url=llm.enrichment_base_url or None,
         api_key=llm.enrichment_api_key or None,
-        max_tokens=config.llm.enrichment_max_tokens,
+        max_tokens=config.llm.memory_extraction_max_tokens,
         request_timeout_s=llm.request_timeout_s,
         structured_llm_client=structured_llm_client,
     )

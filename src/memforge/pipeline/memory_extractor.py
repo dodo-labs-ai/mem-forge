@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from memforge.config import DEFAULT_ENRICHMENT_MAX_TOKENS
+from memforge.config import DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError
 from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.document_units import ExtractionContext
@@ -268,7 +268,7 @@ class MemoryExtractor:
         model: str = "claude-sonnet-4-20250514",
         base_url: str | None = None,
         api_key: str | None = None,
-        max_tokens: int = DEFAULT_ENRICHMENT_MAX_TOKENS,
+        max_tokens: int = DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS,
         request_timeout_s: float = 300.0,
         structured_llm_client=None,
     ) -> None:
