@@ -311,6 +311,13 @@ class LifecycleMutationType(str, Enum):
     REFRESH_MEMORY_INDEX = "refresh_memory_index"
 
 
+class ClaimIdentityPolicy(str, Enum):
+    """Authority that determines whether exact claims share one Memory identity."""
+
+    ORDINARY_EXTRACTION = "ordinary_extraction"
+    EXPLICIT_CONCEPT = "explicit_concept"
+
+
 DESTRUCTIVE_MUTATIONS = frozenset(
     {
         LifecycleMutationType.REMOVE_SUPPORT,

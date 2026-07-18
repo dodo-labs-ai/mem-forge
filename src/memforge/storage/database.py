@@ -89,6 +89,7 @@ from memforge.memory.evidence import (
 )
 from memforge.memory.lifecycle_plan import (
     build_unprovable_cutover_resolution,
+    ClaimIdentityPolicy,
     CutoverFindingReason,
     CutoverFindingStatus,
     LifecycleCutoverFinding,
@@ -6154,9 +6155,10 @@ class Database:
                     expected_source_activity_epoch=expected_source_activity_epoch,
                     _manage_transaction=False,
                 )
-                await self.apply_lifecycle_plan(
+                await self._apply_lifecycle_plan_with_identity_policy(
                     plan,
                     _manage_transaction=False,
+                    claim_identity_policy=ClaimIdentityPolicy.ORDINARY_EXTRACTION,
                 )
                 await self.db.commit()
             except Exception:
@@ -6214,9 +6216,10 @@ class Database:
                     projection,
                     _manage_transaction=False,
                 )
-                await self.apply_lifecycle_plan(
+                await self._apply_lifecycle_plan_with_identity_policy(
                     plan,
                     _manage_transaction=False,
+                    claim_identity_policy=ClaimIdentityPolicy.EXPLICIT_CONCEPT,
                 )
                 if relation_outcome is not None:
                     await self._record_relation_outcome_bundle_unlocked(relation_outcome)
@@ -6256,8 +6259,19 @@ class Database:
     async def apply_lifecycle_plan(
         self,
         plan: LifecyclePlan,
+    ) -> None:
+        await self._apply_lifecycle_plan_with_identity_policy(
+            plan,
+            _manage_transaction=True,
+            claim_identity_policy=ClaimIdentityPolicy.ORDINARY_EXTRACTION,
+        )
+
+    async def _apply_lifecycle_plan_with_identity_policy(
+        self,
+        plan: LifecyclePlan,
         *,
-        _manage_transaction: bool = True,
+        _manage_transaction: bool,
+        claim_identity_policy: ClaimIdentityPolicy,
     ) -> None:
         """Validate stale guards and commit the complete lifecycle plan once."""
 
@@ -6325,6 +6339,8 @@ class Database:
                     actual_version = _lifecycle_memory_version(memory_row)
                     if actual_version != expected_version:
                         raise ValueError(f"lifecycle plan Memory stale guard failed: {memory_id}")
+                if claim_identity_policy is ClaimIdentityPolicy.ORDINARY_EXTRACTION:
+                    await self._assert_no_active_exact_claim_conflicts_unlocked(plan)
 
                 now = _now_iso()
                 await self.db.execute(
@@ -6368,6 +6384,50 @@ class Database:
                 if _manage_transaction:
                     await self.db.rollback()
                 raise
+
+    async def _assert_no_active_exact_claim_conflicts_unlocked(
+        self,
+        plan: LifecyclePlan,
+    ) -> None:
+        """Fail stale CREATE plans after another Unit committed the exact claim."""
+
+        planned_claims: set[tuple[str, str, str | None, str | None]] = set()
+        for mutation in plan.mutations:
+            if mutation.mutation_type is not LifecycleMutationType.CREATE_MEMORY:
+                continue
+            raw = mutation.payload.get("memory")
+            if not isinstance(raw, Mapping):
+                raise ValueError("create_memory mutation requires memory payload")
+            claim = (
+                str(raw.get("content_hash") or content_hash(str(raw.get("content") or ""))),
+                str(raw.get("visibility") or "workspace"),
+                raw.get("owner_user_id")
+                if isinstance(raw.get("owner_user_id"), str)
+                else None,
+                raw.get("repo_identifier")
+                if isinstance(raw.get("repo_identifier"), str)
+                else None,
+            )
+            if claim in planned_claims:
+                raise ValueError("lifecycle plan contains duplicate exact claim creates")
+            planned_claims.add(claim)
+            async with self.db.execute(
+                """SELECT m.id FROM memories AS m
+                    WHERE m.content_hash = ? AND m.status = 'active'
+                      AND m.visibility = ? AND m.owner_user_id IS ?
+                      AND m.repo_identifier IS ? AND m.id <> ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM agent_claims AS ac
+                          WHERE ac.memory_id = m.id
+                      )
+                    ORDER BY m.created_at, m.id LIMIT 1""",
+                (*claim, mutation.memory_id),
+            ) as cursor:
+                if await cursor.fetchone() is not None:
+                    raise ValueError(
+                        "lifecycle plan exact claim stale guard failed: "
+                        "canonical active Memory now exists"
+                    )
 
     async def _validate_projected_support_invariant_unlocked(
         self,
@@ -8154,6 +8214,74 @@ class Database:
                 return None
             return self._row_to_memory(row)
 
+    async def find_active_exact_claim_candidate(
+        self,
+        memory_content_hash: str,
+        *,
+        visibility: str,
+        owner_user_id: str | None,
+        repo_identifier: str | None,
+        excluded_memory_ids: Sequence[str] = (),
+    ) -> Memory | None:
+        """Return the canonical active exact claim in the same access context."""
+
+        exclusions = tuple(dict.fromkeys(excluded_memory_ids))
+        exclusion_clause = ""
+        params: list[Any] = [
+            memory_content_hash,
+            visibility,
+            owner_user_id,
+            repo_identifier,
+        ]
+        if exclusions:
+            exclusion_clause = (
+                " AND m.id NOT IN (" + ", ".join("?" for _ in exclusions) + ")"
+            )
+            params.extend(exclusions)
+        async with self.db.execute(
+            """SELECT m.* FROM memories AS m
+                WHERE m.content_hash = ?
+                  AND m.status = 'active'
+                  AND m.visibility = ?
+                  AND m.owner_user_id IS ?
+                  AND m.repo_identifier IS ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_claims AS ac
+                      WHERE ac.memory_id = m.id
+                  )"""
+            + exclusion_clause
+            + " ORDER BY m.created_at, m.id LIMIT 1",
+            params,
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_memory(row) if row else None
+
+    async def list_active_ordinary_claim_memories(
+        self,
+        memory_ids: Sequence[str],
+    ) -> list[Memory]:
+        """Return active non-Agent-Claim Memories in caller-provided order."""
+
+        ordered_ids = tuple(dict.fromkeys(memory_ids))
+        if not ordered_ids:
+            return []
+        placeholders = ", ".join("?" for _ in ordered_ids)
+        rows: dict[str, Memory] = {}
+        async with self.db.execute(
+            f"""SELECT m.* FROM memories AS m
+                WHERE m.id IN ({placeholders})
+                  AND m.status = 'active'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_claims AS ac
+                      WHERE ac.memory_id = m.id
+                  )""",
+            ordered_ids,
+        ) as cursor:
+            async for row in cursor:
+                memory = self._row_to_memory(row)
+                rows[memory.id] = memory
+        return [rows[memory_id] for memory_id in ordered_ids if memory_id in rows]
+
     async def find_rebaseline_reactivation_candidate(
         self,
         memory_content_hash: str,
@@ -8165,14 +8293,18 @@ class Database:
         """Return the canonical exact claim retired only for source rebaseline."""
 
         async with self.db.execute(
-            """SELECT * FROM memories
-                WHERE content_hash = ?
-                  AND status = 'retired'
-                  AND retirement_reason = 'source_rebaseline'
-                  AND visibility = ?
-                  AND owner_user_id IS ?
-                  AND repo_identifier IS ?
-                ORDER BY created_at, id
+            """SELECT m.* FROM memories AS m
+                WHERE m.content_hash = ?
+                  AND m.status = 'retired'
+                  AND m.retirement_reason = 'source_rebaseline'
+                  AND m.visibility = ?
+                  AND m.owner_user_id IS ?
+                  AND m.repo_identifier IS ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_claims AS ac
+                      WHERE ac.memory_id = m.id
+                  )
+                ORDER BY m.created_at, m.id
                 LIMIT 1""",
             (
                 memory_content_hash,

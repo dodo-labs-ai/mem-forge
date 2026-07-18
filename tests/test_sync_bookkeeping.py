@@ -8040,6 +8040,20 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
             del args, kwargs
             return ()
 
+        async def find_access_compatible_exact_candidate(
+            self,
+            memory,
+            *,
+            excluded_memory_ids=frozenset(),
+        ):
+            return await self.db.find_active_exact_claim_candidate(
+                memory.content_hash,
+                visibility=memory.visibility,
+                owner_user_id=memory.owner_user_id,
+                repo_identifier=memory.repo_identifier,
+                excluded_memory_ids=tuple(sorted(excluded_memory_ids)),
+            )
+
         async def attempt_lifecycle_vector_delivery(self, lifecycle_plan_id: str):
             from memforge.memory.lifecycle_plan import (
                 LifecycleVectorDeliveryResult,

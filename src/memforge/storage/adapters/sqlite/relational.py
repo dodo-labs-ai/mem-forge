@@ -357,6 +357,29 @@ class SqliteRelationalStore:
     async def get_memory(self, memory_id: str) -> Memory | None:
         return await self._db.get_memory(memory_id)
 
+    async def find_active_exact_claim_candidate(
+        self,
+        content_hash: str,
+        *,
+        visibility: str,
+        owner_user_id: str | None,
+        repo_identifier: str | None,
+        excluded_memory_ids: Sequence[str] = (),
+    ) -> Memory | None:
+        return await self._db.find_active_exact_claim_candidate(
+            content_hash,
+            visibility=visibility,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            excluded_memory_ids=excluded_memory_ids,
+        )
+
+    async def list_active_ordinary_claim_memories(
+        self,
+        memory_ids: Sequence[str],
+    ) -> list[Memory]:
+        return await self._db.list_active_ordinary_claim_memories(memory_ids)
+
     async def find_rebaseline_reactivation_candidate(
         self,
         content_hash: str,

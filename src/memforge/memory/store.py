@@ -588,6 +588,22 @@ class MemoryStore:
         )
         return "inserted"
 
+    async def find_access_compatible_exact_candidate(
+        self,
+        memory: Memory,
+        *,
+        excluded_memory_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> Memory | None:
+        """Return an active exact claim without vector or model dependence."""
+
+        return await self.relational.find_active_exact_claim_candidate(
+            memory.content_hash,
+            visibility=memory.visibility,
+            owner_user_id=memory.owner_user_id,
+            repo_identifier=memory.repo_identifier,
+            excluded_memory_ids=tuple(sorted(excluded_memory_ids)),
+        )
+
     async def find_access_compatible_equivalence_candidates(
         self,
         memory: Memory,
@@ -624,13 +640,25 @@ class MemoryStore:
             None,
             DEDUP_CANDIDATE_LIMIT,
         )
+        candidate_ids = [
+            existing_id
+            for existing_id, score in candidates
+            if existing_id not in excluded_memory_ids
+            and self.vector.within_dedup_threshold(self.dedup_threshold, score)
+        ]
+        ordinary_by_id = {
+            candidate.id: candidate
+            for candidate in await self.relational.list_active_ordinary_claim_memories(
+                candidate_ids
+            )
+        }
         for existing_id, score in candidates:
             if existing_id in excluded_memory_ids:
                 continue
             if not self.vector.within_dedup_threshold(self.dedup_threshold, score):
                 continue
-            existing = await self.db.get_memory(existing_id)
-            if existing is None or existing.status != MemoryStatus.ACTIVE.value:
+            existing = ordinary_by_id.get(existing_id)
+            if existing is None:
                 continue
             if existing.visibility != memory.visibility:
                 continue
