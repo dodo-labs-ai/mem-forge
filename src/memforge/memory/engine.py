@@ -507,6 +507,49 @@ class MemoryEngine:
             "incumbent_content_hash": incumbent.content_hash,
         }
 
+    async def _find_canonical_equivalence_target(
+        self,
+        candidate: Memory,
+        *,
+        excluded_memory_ids: frozenset[str],
+        source_id: str,
+    ) -> tuple[Memory | None, dict[str, object] | None]:
+        """Resolve exact identity first, then bounded cross-source semantics."""
+
+        target = await self.memory_store.find_access_compatible_exact_candidate(
+            candidate,
+            excluded_memory_ids=excluded_memory_ids,
+        )
+        if target is not None:
+            proof = await self._claims_semantically_equivalent(candidate, target)
+            if proof is not None:
+                return target, proof
+
+        targets = await self.memory_store.find_access_compatible_equivalence_candidates(
+            candidate,
+            excluded_memory_ids=excluded_memory_ids,
+            excluded_source_id=source_id,
+        )
+        candidate_access = lifecycle_access_context_hash(
+            visibility=candidate.visibility,
+            owner_user_id=candidate.owner_user_id,
+            project_key=candidate.project_key,
+            repo_identifier=candidate.repo_identifier,
+        )
+        for target in targets:
+            target_access = lifecycle_access_context_hash(
+                visibility=target.visibility,
+                owner_user_id=target.owner_user_id,
+                project_key=target.project_key,
+                repo_identifier=target.repo_identifier,
+            )
+            if target_access != candidate_access:
+                continue
+            proof = await self._claims_semantically_equivalent(candidate, target)
+            if proof is not None:
+                return target, proof
+        return None, None
+
     async def apply_projected_lifecycle(
         self,
         *,
@@ -662,57 +705,30 @@ class MemoryEngine:
         )
         corroboration_targets: dict[str, Memory] = {}
         corroboration_proofs: dict[str, dict[str, object]] = {}
-        candidate_finder = getattr(
-            self.memory_store,
-            "find_access_compatible_equivalence_candidates",
-            None,
-        )
-        if candidate_finder is not None:
-            for operation in operations:
-                if operation.action is not ReconcileAction.ADD or operation.memory is None:
-                    continue
-                candidate = self._build_memory(
-                    operation.memory,
-                    project_key,
-                    visibility=visibility,
-                    owner_user_id=owner_user_id,
-                    repo_identifier=repo_identifier,
-                )
-                targets = await candidate_finder(
-                    candidate,
-                    excluded_memory_ids=frozenset(incumbents_by_id),
-                    excluded_source_id=scope.source_id,
-                )
-                target = None
-                for possible_target in targets:
-                    if lifecycle_access_context_hash(
-                        visibility=possible_target.visibility,
-                        owner_user_id=possible_target.owner_user_id,
-                        project_key=possible_target.project_key,
-                        repo_identifier=possible_target.repo_identifier,
-                    ) != lifecycle_access_context_hash(
-                        visibility=candidate.visibility,
-                        owner_user_id=candidate.owner_user_id,
-                        project_key=candidate.project_key,
-                        repo_identifier=candidate.repo_identifier,
-                    ):
-                        continue
-                    equivalence_proof = await self._claims_semantically_equivalent(
-                        candidate,
-                        possible_target,
-                    )
-                    if equivalence_proof is not None:
-                        target = possible_target
-                        break
-                if target is None:
-                    continue
-                claim_hash = content_hash(operation.memory.content.strip())
-                corroboration_targets[claim_hash] = target
-                corroboration_proofs[claim_hash] = equivalence_proof
-                all_support[target.id] = await self.db.get_active_memory_support_reference_ids(
-                    target.id
-                )
-                support_hashes[target.id] = await self.db.get_memory_support_set_hash(target.id)
+        for operation in operations:
+            if operation.action is not ReconcileAction.ADD or operation.memory is None:
+                continue
+            candidate = self._build_memory(
+                operation.memory,
+                project_key,
+                visibility=visibility,
+                owner_user_id=owner_user_id,
+                repo_identifier=repo_identifier,
+            )
+            target, equivalence_proof = await self._find_canonical_equivalence_target(
+                candidate,
+                excluded_memory_ids=frozenset(incumbents_by_id),
+                source_id=scope.source_id,
+            )
+            if target is None or equivalence_proof is None:
+                continue
+            claim_hash = content_hash(operation.memory.content.strip())
+            corroboration_targets[claim_hash] = target
+            corroboration_proofs[claim_hash] = equivalence_proof
+            all_support[target.id] = await self.db.get_active_memory_support_reference_ids(
+                target.id
+            )
+            support_hashes[target.id] = await self.db.get_memory_support_set_hash(target.id)
         evidence_memories = [
             operation.memory
             for operation in operations

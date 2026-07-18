@@ -266,6 +266,93 @@ async def test_projected_equivalence_crosses_project_relevance_boundary(db, monk
 
 
 @pytest.mark.asyncio
+async def test_projected_equivalence_excludes_explicit_agent_claim_identity(
+    db,
+    monkeypatch,
+):
+    now = datetime(2026, 7, 19, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-agent",
+        type="agent_session",
+        name="Agent Knowledge",
+        config_json="{}",
+        access_policy=PRIVATE,
+        owner_user_id="u-alice",
+    )
+    await db.upsert_agent_concept(
+        concept_id="concept-explicit-identity",
+        source_id="src-agent",
+        owner_user_id="u-alice",
+        workspace="/workspace",
+        repo_identifier="repo-a",
+        concept_type="decision",
+        concept_path="decisions/a7.md",
+        title="A7 handling",
+        markdown_body="A7 is retained.",
+        frontmatter={},
+        observed_at=now,
+    )
+    active = _mem(
+        "m-agent-active",
+        "A7 is retained.",
+        visibility=PRIVATE,
+        owner="u-alice",
+        project_key="RISK",
+    )
+    active.repo_identifier = "repo-a"
+    retired = _mem(
+        "m-agent-retired",
+        "A7 is retained.",
+        visibility=PRIVATE,
+        owner="u-alice",
+        project_key="RISK",
+        status="retired",
+    )
+    retired.repo_identifier = "repo-a"
+    retired.retirement_reason = "source_rebaseline"
+    for memory in (active, retired):
+        await db.insert_memory(memory)
+        await db.upsert_agent_claim(
+            claim_id=f"claim-{memory.id}",
+            concept_id="concept-explicit-identity",
+            display_anchor="A7 handling",
+            claim_text=memory.content,
+            memory_type=memory.memory_type,
+            tags=[],
+            confidence=memory.confidence,
+            memory_id=memory.id,
+            observed_at=now,
+        )
+    adapters = build_sqlite_adapters(
+        db,
+        memory_collection=_FakeColl(seeded=[active.id]),
+    )
+    store = MemoryStore(
+        adapters.relational,
+        adapters.keyword,
+        adapters.vector,
+        embed_cfg={},
+        dedup_threshold=0.08,
+    )
+
+    async def _stub_embed(_text):
+        return [0.1, 0.1, 0.1]
+
+    monkeypatch.setattr(store, "_embed", _stub_embed)
+    ordinary = _mem(
+        "m-ordinary",
+        "A7 is retained.",
+        visibility=PRIVATE,
+        owner="u-alice",
+        project_key="PAY",
+    )
+    ordinary.repo_identifier = "repo-a"
+
+    assert await store.find_access_compatible_exact_candidate(ordinary) is None
+    assert await store.find_access_compatible_equivalence_candidates(ordinary) == ()
+
+
+@pytest.mark.asyncio
 async def test_projected_equivalence_recalls_exact_rebaseline_retirement_without_vector(
     db,
     monkeypatch,

@@ -82,6 +82,113 @@ class RelationalStoreContract:
     async def test_get_unknown_id_returns_none(self, adapters: ContractAdapters) -> None:
         assert await adapters.relational.get_memory("missing") is None
 
+    async def test_active_exact_claim_candidate_is_access_scoped_and_excludable(
+        self,
+        adapters: ContractAdapters,
+    ) -> None:
+        store = adapters.relational
+        exact = make_memory(
+            "active-exact",
+            content="same active claim",
+            project_key="project-a",
+            repo_identifier="repo-a",
+        )
+        different_project = make_memory(
+            "active-exact-project-b",
+            content="same active claim",
+            project_key="project-b",
+            repo_identifier="repo-a",
+        )
+        wrong_repository = make_memory(
+            "active-other-repository",
+            content="same active claim",
+            project_key="project-a",
+            repo_identifier="repo-b",
+        )
+        private_owner_a = make_memory(
+            "active-private-owner-a",
+            content="same active claim",
+            visibility=Visibility.PRIVATE.value,
+            owner_user_id="owner-a",
+            project_key="project-a",
+            repo_identifier="repo-a",
+        )
+        private_owner_b = make_memory(
+            "active-private-owner-b",
+            content="same active claim",
+            visibility=Visibility.PRIVATE.value,
+            owner_user_id="owner-b",
+            project_key="project-a",
+            repo_identifier="repo-a",
+        )
+        retired = make_memory(
+            "retired-exact",
+            content="same active claim",
+            status="retired",
+            project_key="project-a",
+            repo_identifier="repo-a",
+        )
+        for memory in (
+            wrong_repository,
+            private_owner_a,
+            private_owner_b,
+            retired,
+            different_project,
+            exact,
+        ):
+            await store.insert_memory(memory)
+
+        candidate = await store.find_active_exact_claim_candidate(
+            exact.content_hash,
+            visibility=exact.visibility,
+            owner_user_id=exact.owner_user_id,
+            repo_identifier=exact.repo_identifier,
+        )
+        excluded = await store.find_active_exact_claim_candidate(
+            exact.content_hash,
+            visibility=exact.visibility,
+            owner_user_id=exact.owner_user_id,
+            repo_identifier=exact.repo_identifier,
+            excluded_memory_ids=(exact.id,),
+        )
+        private_candidate = await store.find_active_exact_claim_candidate(
+            exact.content_hash,
+            visibility=Visibility.PRIVATE.value,
+            owner_user_id="owner-a",
+            repo_identifier=exact.repo_identifier,
+        )
+        unknown_private_owner = await store.find_active_exact_claim_candidate(
+            exact.content_hash,
+            visibility=Visibility.PRIVATE.value,
+            owner_user_id="owner-c",
+            repo_identifier=exact.repo_identifier,
+        )
+
+        assert candidate is not None
+        assert candidate.id == exact.id
+        assert excluded is not None
+        assert excluded.id == different_project.id
+        assert private_candidate is not None
+        assert private_candidate.id == private_owner_a.id
+        assert unknown_private_owner is None
+
+    async def test_active_ordinary_claim_candidates_are_filtered_and_input_ordered(
+        self,
+        adapters: ContractAdapters,
+    ) -> None:
+        store = adapters.relational
+        first = make_memory("ordinary-first")
+        second = make_memory("ordinary-second")
+        retired = make_memory("ordinary-retired", status="retired")
+        for memory in (second, retired, first):
+            await store.insert_memory(memory)
+
+        candidates = await store.list_active_ordinary_claim_memories(
+            (first.id, retired.id, "missing", second.id, first.id),
+        )
+
+        assert [memory.id for memory in candidates] == [first.id, second.id]
+
     async def test_rebaseline_reactivation_candidate_is_exact_and_access_scoped(
         self,
         adapters: ContractAdapters,

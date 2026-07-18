@@ -103,6 +103,7 @@ def _projection(
     run_id: str,
     body: str,
     item_id: str = "confluence-123",
+    page_id: str = "123",
     source_id: str = "src-1",
     prior=None,
     prior_observations=None,
@@ -113,7 +114,7 @@ def _projection(
         source_url="https://example.test/123",
         last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc),
         version="2",
-        extra={"page_id": "123", "space_key": "ENG"},
+        extra={"page_id": page_id, "space_key": "ENG"},
     )
     raw = RawContent(item=item, body=body.encode(), content_type="text/html")
     normalized = NormalizedContent(item=item, markdown_body=body)
@@ -303,6 +304,20 @@ class _OutboxDrainer:
             repo_identifier=memory.repo_identifier,
         )
         return (candidate,) if candidate is not None else ()
+
+    async def find_access_compatible_exact_candidate(
+        self,
+        memory: Memory,
+        *,
+        excluded_memory_ids=frozenset(),
+    ) -> Memory | None:
+        return await self.db.find_active_exact_claim_candidate(
+            memory.content_hash,
+            visibility=memory.visibility,
+            owner_user_id=memory.owner_user_id,
+            repo_identifier=memory.repo_identifier,
+            excluded_memory_ids=tuple(sorted(excluded_memory_ids)),
+        )
 
 
 class _AuditedOutboxDrainer(_OutboxDrainer):
@@ -2061,6 +2076,498 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
     )
     assert len(support) == 1
     assert support[0].anchor.observation_revision_id == second.observation_revisions[0].id
+
+
+@pytest.mark.asyncio
+async def test_same_source_cross_unit_exact_claim_reuses_memory_id_and_preserves_both_lineages(
+    db: Database,
+) -> None:
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=None,
+    )
+    first = _projection(
+        run_id="projection-same-source-exact-1",
+        body="A7 is retained for regular payroll.",
+    )
+    first_raw = RawMemory(
+        content="A7 is retained for regular payroll.",
+        memory_type="decision",
+        confidence=0.95,
+        evidence_quote="A7 is retained for regular payroll.",
+        source_observation_id=first.observations[0].id,
+    )
+    first_stats = await engine.apply_projected_lifecycle(
+        projection=first,
+        doc_id="confluence-123",
+        raw_memories=[first_raw],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content="A7 is retained for regular payroll.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+    )
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc).isoformat()
+    await db.db.execute(
+        """INSERT INTO documents (
+               doc_id, source, source_url, title, space_or_project,
+               last_modified, version, content_hash, last_synced
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "confluence-456",
+            "src-1",
+            "https://example.test/456",
+            "Second page",
+            "ENG",
+            now,
+            "1",
+            "h2",
+            now,
+        ),
+    )
+    await db.db.commit()
+    second = _projection(
+        run_id="projection-same-source-exact-2",
+        body="A7 is retained for regular payroll.",
+        item_id="confluence-456",
+        page_id="456",
+    )
+    second_raw = replace(
+        first_raw,
+        source_observation_id=second.observations[0].id,
+    )
+
+    second_stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-456",
+        raw_memories=[second_raw],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content="A7 is retained for regular payroll.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc),
+    )
+
+    memories = await db.list_memories(source="src-1", status="active")
+    assert first_stats["added"] == 1
+    assert second_stats["added"] == 0
+    assert second_stats["corroborated"] == 1
+    assert len(memories) == 1
+    memory = memories[0]
+    assert {(source.source_id, source.doc_id) for source in await db.get_memory_sources(memory.id)} == {
+        ("src-1", "confluence-123"),
+        ("src-1", "confluence-456"),
+    }
+    lineage_rows = await db.db.execute_fetchall(
+        """SELECT COUNT(DISTINCT EU.SOURCE_LINEAGE_ID) AS lineage_count,
+                  COUNT(DISTINCT EU.DOC_ID) AS document_count
+             FROM MEMORY_SUPPORT_ASSERTIONS MSA
+             JOIN EVIDENCE_REFERENCES ER ON ER.ID = MSA.EVIDENCE_REFERENCE_ID
+             JOIN EVIDENCE_UNITS EU ON EU.ID = ER.EVIDENCE_UNIT_ID
+            WHERE MSA.MEMORY_ID = ? AND MSA.ACTIVE = 1""",
+        (memory.id,),
+    )
+    assert lineage_rows[0]["lineage_count"] == 2
+    assert lineage_rows[0]["document_count"] == 2
+    plan_rows = await db.db.execute_fetchall(
+        "SELECT payload_json FROM lifecycle_plans WHERE source_unit_id = ?",
+        (second.deltas[0].source_unit_id,),
+    )
+    assert len(plan_rows) == 1
+    payload = json.loads(str(plan_rows[0]["payload_json"]))
+    attach = next(
+        mutation
+        for mutation in payload["mutations"]
+        if mutation["mutation_type"] == "attach_support"
+    )
+    assert attach["memory_id"] == memory.id
+    assert attach["payload"]["equivalence_proof"]["method"] == "exact_content"
+
+
+@pytest.mark.asyncio
+async def test_cross_source_exact_claim_reuses_memory_without_llm_and_preserves_both_lineages(
+    db: Database,
+) -> None:
+    first = _projection(
+        run_id="projection-cross-source-exact-1",
+        body="A7 is retained for regular payroll.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(
+        db,
+        projection=first,
+        memory_content="A7 is retained for regular payroll.",
+    )
+    await db.upsert_source(
+        id="src-2",
+        type="confluence",
+        name="Independent Engineering",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc).isoformat()
+    await db.db.execute(
+        """INSERT INTO documents (
+               doc_id, source, source_url, title, space_or_project,
+               last_modified, version, content_hash, last_synced
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "confluence-456",
+            "src-2",
+            "https://example.test/456",
+            "Independent Page",
+            "ENG",
+            now,
+            "1",
+            "h2",
+            now,
+        ),
+    )
+    await db.db.commit()
+    second = _projection(
+        run_id="projection-cross-source-exact-2",
+        body="A7 is retained for regular payroll.",
+        item_id="confluence-456",
+        page_id="456",
+        source_id="src-2",
+    )
+    raw = RawMemory(
+        content="A7 is retained for regular payroll.",
+        memory_type="decision",
+        confidence=0.95,
+        evidence_quote="A7 is retained for regular payroll.",
+        source_observation_id=second.observations[0].id,
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=None,
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-456",
+        raw_memories=[raw],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content=raw.content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc),
+    )
+
+    memories = await db.list_memories(status="active")
+    assert stats["added"] == 0
+    assert stats["corroborated"] == 1
+    assert [memory.id for memory in memories] == [incumbent.id]
+    support = await db.get_active_memory_support_evidence(incumbent.id)
+    assert {item.source_id for item in support} == {"src-1", "src-2"}
+    assert {
+        item.anchor.observation_revision_id for item in support
+    } == {
+        first.observation_revisions[0].id,
+        second.observation_revisions[0].id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ordinary_exact_admission_preserves_agent_claim_identity(
+    db: Database,
+) -> None:
+    claim_text = "A7 is retained for regular payroll."
+    now = datetime(2026, 7, 15, 9, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-agent",
+        type="agent_session",
+        name="Agent Knowledge",
+        config_json="{}",
+        access_policy="private",
+        owner_user_id="owner-1",
+    )
+    await db.upsert_source(
+        id="src-private-doc",
+        type="confluence",
+        name="Private Engineering",
+        config_json="{}",
+        access_policy="private",
+        owner_user_id="owner-1",
+    )
+    await db.db.execute(
+        """INSERT INTO documents (
+               doc_id, source, source_url, title, space_or_project,
+               last_modified, version, content_hash, last_synced
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "private-confluence-123",
+            "src-private-doc",
+            "https://example.test/private/123",
+            "Private page",
+            "ENG",
+            now.isoformat(),
+            "1",
+            "private-hash",
+            now.isoformat(),
+        ),
+    )
+    agent_memory = Memory(
+        id="mem-agent-explicit-claim",
+        memory_type="decision",
+        content=claim_text,
+        content_hash=content_hash(claim_text),
+        visibility="private",
+        owner_user_id="owner-1",
+        project_key="ENG",
+        repo_identifier="repo-a",
+    )
+    await db.insert_memory(agent_memory)
+    await db.upsert_agent_concept(
+        concept_id="agent-concept-explicit",
+        source_id="src-agent",
+        owner_user_id="owner-1",
+        workspace="/workspace",
+        repo_identifier="repo-a",
+        concept_type="decision",
+        concept_path="decisions/a7.md",
+        title="A7 handling",
+        markdown_body=claim_text,
+        frontmatter={},
+        observed_at=now,
+    )
+    await db.upsert_agent_claim(
+        claim_id="agent-claim-explicit",
+        concept_id="agent-concept-explicit",
+        display_anchor="A7 handling",
+        claim_text=claim_text,
+        memory_type="decision",
+        tags=[],
+        confidence=0.95,
+        memory_id=agent_memory.id,
+        observed_at=now,
+    )
+
+    assert (
+        await db.find_active_exact_claim_candidate(
+            agent_memory.content_hash,
+            visibility=agent_memory.visibility,
+            owner_user_id=agent_memory.owner_user_id,
+            repo_identifier=agent_memory.repo_identifier,
+        )
+        is None
+    )
+
+    projection = _projection(
+        run_id="projection-private-doc-after-agent-claim",
+        body=claim_text,
+        item_id="private-confluence-123",
+        page_id="private-123",
+        source_id="src-private-doc",
+    )
+    raw = RawMemory(
+        content=claim_text,
+        memory_type="decision",
+        confidence=0.95,
+        evidence_quote=claim_text,
+        source_observation_id=projection.observations[0].id,
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=None,
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=projection,
+        doc_id="private-confluence-123",
+        raw_memories=[raw],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier="repo-a",
+        entity_ids=[],
+        document_content=claim_text,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=now,
+        user_id="owner-1",
+    )
+
+    ordinary_memory = await db.find_active_exact_claim_candidate(
+        agent_memory.content_hash,
+        visibility=agent_memory.visibility,
+        owner_user_id=agent_memory.owner_user_id,
+        repo_identifier=agent_memory.repo_identifier,
+    )
+    claim = await db.get_agent_claim("agent-claim-explicit")
+    exact_rows = await db.db.execute_fetchall(
+        """SELECT id FROM memories
+           WHERE content_hash = ? AND status = 'active'
+           ORDER BY id""",
+        (agent_memory.content_hash,),
+    )
+    assert stats["added"] == 1
+    assert ordinary_memory is not None
+    assert ordinary_memory.id != agent_memory.id
+    assert claim is not None
+    assert claim["memory_id"] == agent_memory.id
+    assert {row["id"] for row in exact_rows} == {
+        agent_memory.id,
+        ordinary_memory.id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_stale_parallel_cross_unit_create_fails_closed_before_duplicate_write(
+    db: Database,
+) -> None:
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc).isoformat()
+    await db.db.execute(
+        """INSERT INTO documents (
+               doc_id, source, source_url, title, space_or_project,
+               last_modified, version, content_hash, last_synced
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "confluence-456",
+            "src-1",
+            "https://example.test/456",
+            "Second page",
+            "ENG",
+            now,
+            "1",
+            "h2",
+            now,
+        ),
+    )
+    await db.db.commit()
+    projections = (
+        (
+            _projection(
+                run_id="projection-stale-exact-1",
+                body="A7 is retained for regular payroll.",
+            ),
+            "confluence-123",
+        ),
+        (
+            _projection(
+                run_id="projection-stale-exact-2",
+                body="A7 is retained for regular payroll.",
+                item_id="confluence-456",
+                page_id="456",
+            ),
+            "confluence-456",
+        ),
+    )
+
+    def plan_for(projection: SourceProjection, doc_id: str) -> LifecyclePlan:
+        raw = RawMemory(
+            content="A7 is retained for regular payroll.",
+            memory_type="decision",
+            confidence=0.95,
+            evidence_quote="A7 is retained for regular payroll.",
+            source_observation_id=projection.observations[0].id,
+        )
+        access_context_hash = lifecycle_access_context_hash(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key="ENG",
+            repo_identifier=None,
+        )
+        evidence = build_projected_claim_evidence(
+            projection=projection,
+            raw_memories=(raw,),
+            doc_id=doc_id,
+            source_type="confluence",
+            project_key="ENG",
+            visibility="workspace",
+            owner_user_id=None,
+            repo_identifier=None,
+            access_context_hash=access_context_hash,
+            extractor_run_id=projection.run_id,
+        )
+        delta = projection.deltas[0]
+        scope = ReconciliationScope(
+            id=f"scope:{projection.run_id}",
+            source_id=projection.source_id,
+            source_unit_id=delta.source_unit_id,
+            base_unit_revision_id=delta.previous_unit_revision_id,
+            target_unit_revision_id=delta.current_unit_revision_id,
+        )
+        return build_lifecycle_plan(
+            plan_id=lifecycle_plan_id(scope),
+            scope=scope,
+            gate_state=LifecycleGateState.GATED,
+            operations=(
+                ReconcileOperation(
+                    action=ReconcileAction.ADD,
+                    memory=raw,
+                ),
+            ),
+            incumbents={},
+            source_support_reference_ids={},
+            all_active_support_reference_ids={},
+            support_set_hashes={},
+            observation_revision_ids=tuple(
+                revision.id for revision in projection.observation_revisions
+            ),
+            new_evidence_reference_ids=(),
+            evidence_reference_ids_by_claim_hash=evidence.reference_ids_by_claim_hash,
+            defaults=NewMemoryDefaults(
+                visibility="workspace",
+                owner_user_id=None,
+                project_key="ENG",
+                repo_identifier=None,
+                doc_id=doc_id,
+                source_type="confluence",
+                access_context_hash=access_context_hash,
+            ),
+            evidence_units=evidence.units,
+            evidence_references=evidence.references,
+        )
+
+    first_projection, first_doc_id = projections[0]
+    second_projection, second_doc_id = projections[1]
+    first_plan = plan_for(first_projection, first_doc_id)
+    stale_second_plan = plan_for(second_projection, second_doc_id)
+
+    await db.apply_source_projection_lifecycle(first_projection, first_plan)
+    with pytest.raises(
+        ValueError,
+        match="exact claim stale guard failed",
+    ):
+        await db.apply_source_projection_lifecycle(
+            second_projection,
+            stale_second_plan,
+        )
+
+    memories = await db.list_memories(source="src-1", status="active")
+    assert len(memories) == 1
+    async with db.db.execute(
+        "SELECT COUNT(*) AS total FROM source_units WHERE id = ?",
+        (second_projection.deltas[0].source_unit_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row["total"] == 0
 
 
 @pytest.mark.asyncio
