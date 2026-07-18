@@ -101,6 +101,124 @@ def test_provider_prefixed_embedding_uses_litellm_without_empty_credentials(monk
     assert "api_key" not in captured
 
 
+def test_provider_prefixed_embedding_batches_inputs_at_transport_limit(monkeypatch):
+    from memforge.retrieval import embeddings
+
+    calls: list[list[str]] = []
+
+    def fake_embedding(**kwargs):
+        inputs = list(kwargs["input"])
+        if len(inputs) > 2048:
+            raise ValueError("Embedding Module: Invalid 'input': array length must be 2048 or less.")
+        calls.append(inputs)
+        return SimpleNamespace(
+            data=[
+                SimpleNamespace(index=index, embedding=[float(text.removeprefix("item-"))])
+                for index, text in enumerate(inputs)
+            ]
+        )
+
+    monkeypatch.setattr(embeddings.litellm, "embedding", fake_embedding)
+    texts = [f"item-{index}" for index in range(2049)]
+
+    vectors = embeddings.embed_texts(
+        texts,
+        base_url="",
+        api_key="",
+        model="provider/embedding-model",
+    )
+
+    assert [len(batch) for batch in calls] == [2048, 1]
+    assert vectors == [[float(index)] for index in range(2049)]
+
+
+def test_provider_prefixed_embedding_rejects_incomplete_batch_response(monkeypatch):
+    from memforge.retrieval import embeddings
+
+    monkeypatch.setattr(
+        embeddings.litellm,
+        "embedding",
+        lambda **_kwargs: SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[0.1, 0.2])]),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"Embedding response count does not match input count: expected 2, got 1",
+    ):
+        embeddings.embed_texts(
+            ["alpha", "beta"],
+            base_url="",
+            api_key="",
+            model="provider/embedding-model",
+        )
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        [
+            SimpleNamespace(index=0, embedding=[0.1]),
+            SimpleNamespace(index=0, embedding=[0.2]),
+        ],
+        [
+            SimpleNamespace(index=0, embedding=[0.1]),
+            SimpleNamespace(embedding=[0.2]),
+        ],
+        [
+            SimpleNamespace(index=0, embedding=[0.1]),
+            SimpleNamespace(index=2, embedding=[0.2]),
+        ],
+    ],
+    ids=["duplicate", "missing", "out_of_range"],
+)
+def test_provider_prefixed_embedding_rejects_invalid_response_indexes(
+    monkeypatch, data
+):
+    from memforge.retrieval import embeddings
+
+    monkeypatch.setattr(
+        embeddings.litellm,
+        "embedding",
+        lambda **_kwargs: SimpleNamespace(data=data),
+    )
+
+    with pytest.raises(ValueError, match=r"Embedding response indices"):
+        embeddings.embed_texts(
+            ["alpha", "beta"],
+            base_url="",
+            api_key="",
+            model="provider/embedding-model",
+        )
+
+
+def test_openai_compatible_http_embedding_rejects_invalid_response_indexes(
+    monkeypatch,
+):
+    from memforge.retrieval import embeddings
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": [
+                    {"index": 0, "embedding": [0.1]},
+                    {"index": 0, "embedding": [0.2]},
+                ]
+            }
+
+    monkeypatch.setattr(embeddings.httpx, "post", lambda *_args, **_kwargs: Response())
+
+    with pytest.raises(ValueError, match=r"Embedding response indices"):
+        embeddings.embed_texts(
+            ["alpha", "beta"],
+            base_url="https://embedding.example.test/v1",
+            api_key="key",
+            model="text-embedding-3-small",
+        )
+
+
 def test_retrieval_assist_models_follow_effective_llm_config() -> None:
     from memforge.config import AppConfig
     from memforge.runtime import EffectiveLlmConfig, _retrieval_config_for_llm

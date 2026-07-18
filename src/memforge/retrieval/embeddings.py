@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["embed_texts", "get_chroma_collection"]
 
+_EMBEDDING_INPUT_BATCH_LIMIT = 2048
+
 
 # ---------------------------------------------------------------------------
 # Embedding API (OpenAI-compatible)
@@ -39,6 +41,35 @@ def embed_texts(
     if not texts:
         return []
 
+    vectors: list[list[float]] = []
+    for start in range(0, len(texts), _EMBEDDING_INPUT_BATCH_LIMIT):
+        batch = texts[start : start + _EMBEDDING_INPUT_BATCH_LIMIT]
+        batch_vectors = _embed_text_batch(
+            batch,
+            base_url,
+            api_key,
+            model,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+        if len(batch_vectors) != len(batch):
+            raise ValueError(
+                "Embedding response count does not match input count: "
+                f"expected {len(batch)}, got {len(batch_vectors)}"
+            )
+        vectors.extend(batch_vectors)
+    return vectors
+
+
+def _embed_text_batch(
+    texts: list[str],
+    base_url: str,
+    api_key: str | None,
+    model: str,
+    *,
+    timeout: float,
+    max_retries: int,
+) -> list[list[float]]:
     if is_litellm_provider_model(model):
         response = litellm.embedding(
             model=model,
@@ -47,7 +78,7 @@ def embed_texts(
             num_retries=max_retries,
             **litellm_optional_kwargs(api_base=base_url or None, api_key=api_key),
         )
-        return _embedding_vectors(response)
+        return _embedding_vectors(response, expected_count=len(texts))
 
     url = f"{base_url.rstrip('/')}/embeddings"
     last_error = None
@@ -61,14 +92,12 @@ def embed_texts(
                 timeout=timeout,
             )
             resp.raise_for_status()
-            data = resp.json()
-            # Sort by index to guarantee order matches input
-            sorted_items = sorted(data["data"], key=lambda x: x["index"])
-            return [item["embedding"] for item in sorted_items]
+            return _embedding_vectors(resp.json(), expected_count=len(texts))
         except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException) as e:
             last_error = e
             if attempt < max_retries:
                 import time
+
                 delay = 2.0 * (2 ** attempt)
                 logger.warning(
                     "Embedding API call failed (attempt %d/%d): %s. Retrying in %.1fs...",
@@ -81,17 +110,30 @@ def embed_texts(
     raise last_error  # type: ignore[misc]
 
 
-def _embedding_vectors(response: object) -> list[list[float]]:
+def _embedding_vectors(
+    response: object,
+    *,
+    expected_count: int,
+) -> list[list[float]]:
     data = getattr(response, "data", None)
     if data is None and isinstance(response, dict):
         data = response.get("data")
     if not isinstance(data, list):
-        raise ValueError("LiteLLM embedding response is missing data")
+        raise ValueError("Embedding response is missing data")
+    if len(data) != expected_count:
+        raise ValueError(
+            "Embedding response count does not match input count: "
+            f"expected {expected_count}, got {len(data)}"
+        )
 
     def item_index(item: object) -> int:
         if isinstance(item, dict):
-            return int(item.get("index", 0))
-        return int(getattr(item, "index", 0))
+            if "index" not in item:
+                raise ValueError("Embedding response indices are incomplete")
+            return int(item["index"])
+        if not hasattr(item, "index"):
+            raise ValueError("Embedding response indices are incomplete")
+        return int(getattr(item, "index"))
 
     def item_embedding(item: object) -> list[float]:
         if isinstance(item, dict):
@@ -99,10 +141,22 @@ def _embedding_vectors(response: object) -> list[list[float]]:
         else:
             embedding = getattr(item, "embedding", None)
         if not isinstance(embedding, list):
-            raise ValueError("LiteLLM embedding item is missing embedding")
+            raise ValueError("Embedding response item is missing embedding")
         return embedding
 
-    return [item_embedding(item) for item in sorted(data, key=item_index)]
+    indexed_items = [(item_index(item), item) for item in data]
+    actual_indices = sorted(index for index, _item in indexed_items)
+    expected_indices = list(range(expected_count))
+    if actual_indices != expected_indices:
+        raise ValueError(
+            "Embedding response indices do not match inputs: "
+            f"expected {expected_indices[0] if expected_indices else 0}.."
+            f"{expected_indices[-1] if expected_indices else -1}"
+        )
+    return [
+        item_embedding(item)
+        for _index, item in sorted(indexed_items, key=lambda pair: pair[0])
+    ]
 
 
 # ---------------------------------------------------------------------------
