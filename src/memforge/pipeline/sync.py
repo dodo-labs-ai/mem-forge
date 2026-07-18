@@ -2969,47 +2969,6 @@ class GeneSyncOrchestrator:
 
         return deleted_count, failed_deletions
 
-    async def _retire_orphaned_memories(
-        self,
-        doc_id: str,
-        source_type: str,
-    ) -> int:
-        """Retire memories that are sourced only from the given document.
-
-        Memories with other source documents remain active. Memories with
-        no remaining sources are marked as retired.
-
-        Returns the count of retired memories.
-        """
-        retired_count = 0
-
-        try:
-            # Get all memories linked to this document, including corroborated support.
-            memories = await self.db.get_memories_by_source_doc(doc_id, support_kind=None)
-
-            for memory in memories:
-                # Check if this memory has sources beyond the deleted document
-                sources = await self.db.get_memory_sources(memory.id)
-                other_sources = [s for s in sources if s.doc_id != doc_id]
-
-                if not other_sources:
-                    await self.memory_store.retire_memory(memory.id, reason="source_deleted")
-                    retired_count += 1
-                    logger.debug(
-                        "Retired memory %s (sole source %s deleted)",
-                        memory.id,
-                        doc_id,
-                    )
-
-        except Exception as e:
-            logger.error(
-                "Error retiring memories for doc %s: %s",
-                doc_id,
-                e,
-            )
-
-        return retired_count
-
     # ==================================================================
     # Private: helpers
     # ==================================================================

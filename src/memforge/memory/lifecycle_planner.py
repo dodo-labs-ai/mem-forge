@@ -19,7 +19,14 @@ from memforge.memory.lifecycle_plan import (
     ReconciliationScope,
     StaleGuard,
 )
-from memforge.models import Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
+from memforge.models import (
+    Memory,
+    RawMemory,
+    ReconcileAction,
+    ReconcileOperation,
+    content_hash,
+    parse_memory_validity_date,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,6 +520,8 @@ def _serialize_mutation(mutation: LifecycleMutation) -> dict[str, object]:
 
 def _memory_payload(raw: RawMemory, defaults: NewMemoryDefaults) -> dict[str, object]:
     content = raw.content.strip()
+    valid_from = parse_memory_validity_date(raw.valid_from)
+    valid_until = parse_memory_validity_date(raw.valid_until)
     return {
         "content": content,
         "content_hash": content_hash(content),
@@ -524,6 +533,8 @@ def _memory_payload(raw: RawMemory, defaults: NewMemoryDefaults) -> dict[str, ob
         "project_key": defaults.project_key,
         "repo_identifier": defaults.repo_identifier,
         "extraction_context": raw.extraction_context,
+        "valid_from": valid_from.isoformat() if valid_from is not None else None,
+        "valid_until": valid_until.isoformat() if valid_until is not None else None,
         "entity_refs": list(raw.entity_refs),
         "entity_ids": list(defaults.entity_ids),
         "document_source": {

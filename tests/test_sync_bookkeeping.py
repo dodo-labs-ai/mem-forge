@@ -2616,19 +2616,17 @@ async def test_sync_gene_binds_document_store_at_pipeline_boundary(db: Database)
 
 
 class NoopMemoryEngine:
+    inserted = 0
+
     async def process_enrichment(self, *, doc_id, enrichment, doc_context=None):
         return []
-
-    async def process_memories(self, **kwargs):
-        return {"inserted": 0, "corroborated": 0, "skipped": 0}
 
     async def apply_projected_lifecycle(self, **kwargs):
         is_update = kwargs["projection"].deltas[0].previous_unit_revision_id is not None
         if not is_update:
-            result = await self.process_memories(**kwargs)
             return {
-                "added": result.get("inserted", 0),
-                "updated": result.get("corroborated", 0),
+                "added": self.inserted,
+                "updated": 0,
                 "superseded": 0,
                 "deleted": 0,
                 "noop": 0,
@@ -2666,15 +2664,15 @@ class CountingMemoryEngine(NoopMemoryEngine):
     def __init__(self, inserted: int):
         self.inserted = inserted
         self.enrichment_calls = 0
-        self.process_calls = 0
+        self.projected_lifecycle_calls = 0
 
     async def process_enrichment(self, *, doc_id, enrichment, doc_context=None):
         self.enrichment_calls += 1
         return []
 
-    async def process_memories(self, **kwargs):
-        self.process_calls += 1
-        return {"inserted": self.inserted, "corroborated": 0, "skipped": 0}
+    async def apply_projected_lifecycle(self, **kwargs):
+        self.projected_lifecycle_calls += 1
+        return await super().apply_projected_lifecycle(**kwargs)
 
 
 class RecordingMemoryEngine(NoopMemoryEngine):
@@ -8951,7 +8949,7 @@ async def test_document_vector_failure_happens_before_memory_mutations(db: Datab
 
     assert state.last_sync_status == "failed"
     assert memory_engine.enrichment_calls == 0
-    assert memory_engine.process_calls == 0
+    assert memory_engine.projected_lifecycle_calls == 0
     assert await db.get_document("jira-0") is None
     assert "jira-0" not in vector_store.upserted
 

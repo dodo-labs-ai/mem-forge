@@ -6542,6 +6542,8 @@ class Database:
                 entity_refs=[str(value) for value in raw.get("entity_refs", [])],
                 tags=[str(value) for value in raw.get("tags", [])],
                 confidence=float(raw.get("confidence", 0.7)),
+                valid_from=_parse_date(raw.get("valid_from")),
+                valid_until=_parse_date(raw.get("valid_until")),
                 extraction_context=(
                     str(raw.get("extraction_context"))
                     if raw.get("extraction_context") is not None

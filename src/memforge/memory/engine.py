@@ -11,8 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
-from datetime import date, datetime, timezone
-from hashlib import sha256
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from memforge.memory.candidate_ledger import (
@@ -21,20 +20,7 @@ from memforge.memory.candidate_ledger import (
     select_unique_memory_candidates,
 )
 from memforge.memory.entity_resolver import EntityResolver, insert_llm_alias, resolve_entity
-from memforge.memory.evidence import (
-    AuthorityCase,
-    EvidenceContentProvenance,
-    EvidenceRole,
-    EvidenceRelationRecord,
-    EvidenceUnit,
-    LifecycleAction,
-    MemoryRelationApplyService,
-    RelationCandidateRecord,
-    RelationOutcomeBundle,
-    RelationRunRecord,
-    RelationType,
-    relation_run_id_for,
-)
+from memforge.memory.evidence import EvidenceRole
 from memforge.memory.lifecycle_plan import ReconciliationScope
 from memforge.memory.lifecycle_planner import (
     NewMemoryDefaults,
@@ -52,6 +38,7 @@ from memforge.models import (
     ReconcileOperation,
     content_hash,
     generate_memory_id,
+    parse_memory_validity_date,
 )
 
 from memforge.storage.adapters.protocols import RelationalStore, VectorStore
@@ -192,167 +179,6 @@ class MemoryEngine:
 
         self.entity_resolver.invalidate_cache()
         return resolved_ids
-
-    # -------------------------------------------------------------------
-    # Process Call 2: Build memories, dedup, insert
-    # -------------------------------------------------------------------
-
-    async def process_memories(
-        self,
-        doc_id: str,
-        raw_memories: list[RawMemory],
-        source_type: str,
-        project_key: str | None = None,
-        repo_identifier: str | None = None,
-        entity_ids: list[int] | None = None,
-        *,
-        audit_context: Any | None = None,
-        user_id: str | None = None,
-        source_updated_at: datetime | None,
-    ) -> dict:
-        """Process extracted memories: build, dedup, and persist.
-
-        Returns stats dict with counts of inserted, corroborated, skipped.
-        """
-        stats = {"inserted": 0, "corroborated": 0, "skipped": 0}
-
-        for raw in raw_memories:
-            if not self._candidate_can_persist(raw, stats):
-                continue
-
-            unit = await self._document_evidence_unit(
-                doc_id=doc_id,
-                raw=raw,
-                source_type=source_type,
-                project_key=project_key,
-                repo_identifier=repo_identifier,
-                extractor_run_id=getattr(audit_context, "run_id", None),
-            )
-            if await self._evidence_unit_has_materialized_memory(unit):
-                stats["skipped"] += 1
-                continue
-            lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [])
-            if lifecycle.action is not LifecycleAction.CREATE_MEMORY or not lifecycle.created_memory_id:
-                await self._record_document_relation_outcome(
-                    unit=unit,
-                    relation_run_id=_document_relation_run_id(
-                        unit,
-                        LifecycleAction.CREATE_REVIEW,
-                        relation_type=RelationType.SUPPORTS,
-                    ),
-                    lifecycle_action=lifecycle.action,
-                    memory_id=None,
-                    status="review",
-                    review_case=lifecycle.review_case,
-                    audit={
-                        "source": "memory_engine.process_memories",
-                        "review_case": lifecycle.review_case.value if lifecycle.review_case else None,
-                    },
-                )
-                stats["skipped"] += 1
-                continue
-
-            # Build memory object
-            memory = Memory(
-                id=lifecycle.created_memory_id,
-                memory_type=raw.memory_type,
-                content=raw.content.strip(),
-                content_hash=content_hash(raw.content.strip()),
-                visibility=unit.visibility,
-                owner_user_id=unit.owner_user_id,
-                project_key=project_key,
-                repo_identifier=repo_identifier,
-                entity_refs=raw.entity_refs,
-                tags=raw.tags,
-                confidence=raw.confidence,
-                corroboration_count=1,
-                contradiction_count=0,
-                valid_from=_parse_date(raw.valid_from),
-                valid_until=_parse_date(raw.valid_until),
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-                status="active",
-                extraction_context=raw.extraction_context,
-            )
-
-            # Resolve entity refs to IDs for linking
-            # Filter first — Call 2's LLM sometimes outputs code names as entity_refs
-            from memforge.pipeline.entity_filter import filter_entities
-
-            ref_dicts = [{"name": name, "type": "unknown"} for name in raw.entity_refs]
-            filtered_refs, _ = filter_entities(ref_dicts)
-            filtered_ref_names = {d["name"] for d in filtered_refs}
-
-            memory_entity_ids: list[int] = []
-            for entity_name in raw.entity_refs:
-                if entity_name not in filtered_ref_names:
-                    continue
-                try:
-                    eid = await resolve_entity(entity_name, db=self.db)
-                    memory_entity_ids.append(eid)
-                except Exception as e:
-                    logger.warning("Failed to resolve entity %r: %s", entity_name, e)
-
-            # Dedup + insert (or corroborate)
-            result = await self.memory_store.deduplicate_and_insert(
-                memory=memory,
-                doc_id=doc_id,
-                source_type=source_type,
-                entity_ids=memory_entity_ids,
-                excerpt=raw.extraction_context,
-                source_updated_at=source_updated_at,
-                relation_outcome=self._document_relation_outcome_bundle(
-                    unit=unit,
-                    relation_run_id=_document_relation_run_id(
-                        unit,
-                        LifecycleAction.CREATE_MEMORY,
-                        relation_type=RelationType.SUPPORTS,
-                    ),
-                    lifecycle_action=lifecycle.action,
-                    memory_id=memory.id,
-                    status="applied",
-                    review_case=lifecycle.review_case,
-                    audit={"source": "memory_engine.process_memories"},
-                ),
-            )
-
-            if result == "inserted":
-                stats["inserted"] += 1
-                stats.setdefault("_inserted_ids", []).append(memory.id)
-            elif result == "corroborated":
-                stats["corroborated"] += 1
-            else:
-                stats["skipped"] += 1
-
-        # Cross-document contradiction detection
-        inserted_ids = stats.pop("_inserted_ids", [])
-        if inserted_ids and self.structured_llm_client:
-            from memforge.pipeline.contradiction_detector import detect_cross_doc_contradictions
-
-            contradiction_stats = await detect_cross_doc_contradictions(
-                new_memory_ids=inserted_ids,
-                doc_id=doc_id,
-                db=self.db,
-                memory_store=self.memory_store,
-                structured_llm_client=self.structured_llm_client,
-                llm_model=self.llm_model,
-                audit_context=audit_context,
-                actor_user_id=user_id,
-            )
-            stats["contradictions_found"] = contradiction_stats.get("contradictions", 0)
-
-        logger.info(
-            "Memory processing for %s: %d inserted, %d corroborated, %d skipped",
-            doc_id,
-            stats["inserted"],
-            stats["corroborated"],
-            stats["skipped"],
-        )
-        return stats
-
-    # -------------------------------------------------------------------
-    # Process with reconciliation (for document UPDATES)
-    # -------------------------------------------------------------------
 
     async def _active_projected_incumbents(
         self,
@@ -1242,8 +1068,8 @@ class MemoryEngine:
             confidence=raw.confidence,
             corroboration_count=1,
             contradiction_count=0,
-            valid_from=_parse_date(raw.valid_from),
-            valid_until=_parse_date(raw.valid_until),
+            valid_from=parse_memory_validity_date(raw.valid_from),
+            valid_until=parse_memory_validity_date(raw.valid_until),
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
             status="active",
@@ -1260,149 +1086,6 @@ class MemoryEngine:
             except Exception as e:
                 logger.warning("Failed to resolve entity %r: %s", name, e)
         return ids
-
-    async def _document_evidence_unit(
-        self,
-        *,
-        doc_id: str,
-        raw: RawMemory,
-        source_type: str,
-        project_key: str | None,
-        repo_identifier: str | None,
-        extractor_run_id: str | None,
-    ) -> EvidenceUnit:
-        document = await self.db.get_document(doc_id)
-        doc_revision_id = None
-        source_id = source_type
-        if document is not None:
-            doc_revision_id = document.content_hash or document.version
-            source_id = document.source or source_type
-        visibility, owner_user_id = await memory_visibility_for_document(
-            self.db,
-            doc_id=doc_id,
-        )
-        content = raw.content.strip()
-        evidence_id = _document_evidence_unit_id(
-            source_id=source_id,
-            doc_id=doc_id,
-            doc_revision_id=doc_revision_id,
-            source_type=source_type,
-            content=content,
-        )
-        return EvidenceUnit(
-            id=evidence_id,
-            source_id=source_id,
-            doc_id=doc_id,
-            doc_revision_id=doc_revision_id,
-            source_type=source_type,
-            source_anchor=evidence_id,
-            source_lineage_id=doc_id,
-            project_key=project_key,
-            visibility=visibility,
-            owner_user_id=owner_user_id,
-            repo_identifier=repo_identifier,
-            content=content,
-            excerpt=raw.extraction_context,
-            evidence_provenance=(
-                EvidenceContentProvenance.SOURCE_EXCERPT
-                if raw.extraction_context
-                else EvidenceContentProvenance.NO_EXCERPT
-            ),
-            source_metadata={
-                "memory_type": raw.memory_type,
-                "content_hash": content_hash(content),
-            },
-            observed_at=datetime.now(timezone.utc).isoformat(),
-            extractor_run_id=extractor_run_id,
-        )
-
-    async def _evidence_unit_has_materialized_memory(self, unit: EvidenceUnit) -> bool:
-        return await self.db.has_materialized_evidence_unit(unit.id)
-
-    async def _record_document_relation_outcome(
-        self,
-        *,
-        unit: EvidenceUnit,
-        relation_run_id: str,
-        lifecycle_action: LifecycleAction,
-        memory_id: str | None,
-        status: str,
-        review_case,
-        audit: dict[str, object],
-        candidates: list[RelationCandidateRecord] | None = None,
-        incomplete_mandatory_buckets: tuple[str, ...] = (),
-        candidate_count: int | None = None,
-    ) -> None:
-        await self.db.record_relation_outcome_bundle(
-            self._document_relation_outcome_bundle(
-                unit=unit,
-                relation_run_id=relation_run_id,
-                lifecycle_action=lifecycle_action,
-                memory_id=memory_id,
-                status=status,
-                review_case=review_case,
-                audit=audit,
-                candidates=candidates,
-                incomplete_mandatory_buckets=incomplete_mandatory_buckets,
-                candidate_count=candidate_count,
-            )
-        )
-
-    def _document_relation_outcome_bundle(
-        self,
-        *,
-        unit: EvidenceUnit,
-        relation_run_id: str,
-        lifecycle_action: LifecycleAction,
-        memory_id: str | None,
-        status: str,
-        review_case,
-        audit: dict[str, object],
-        candidates: list[RelationCandidateRecord] | None = None,
-        incomplete_mandatory_buckets: tuple[str, ...] = (),
-        candidate_count: int | None = None,
-    ) -> RelationOutcomeBundle:
-        candidates = candidates or []
-        run_audit = dict(audit)
-        relations: tuple[EvidenceRelationRecord, ...] = ()
-        if memory_id is not None:
-            relations = (
-                EvidenceRelationRecord(
-                    evidence_unit_id=unit.id,
-                    memory_id=memory_id,
-                    relation_type=RelationType.SUPPORTS,
-                    authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
-                    is_authoritative_support=True,
-                    source_lineage_id=unit.source_lineage_id,
-                    confidence=1.0,
-                    reason="Memory created from this source evidence unit.",
-                    excerpt=unit.excerpt,
-                    classifier_version="memory-engine-v1",
-                    relation_run_id=relation_run_id,
-                    created_at=datetime.now(timezone.utc).isoformat(),
-                ),
-            )
-        return RelationOutcomeBundle(
-            evidence_unit=unit,
-            relation_run=RelationRunRecord(
-                id=relation_run_id,
-                evidence_unit_id=unit.id,
-                access_context_hash=unit.access_context_hash,
-                candidate_count=len(candidates) if candidate_count is None else candidate_count,
-                mandatory_candidate_count=sum(1 for candidate in candidates if candidate.is_mandatory),
-                checked_candidate_count=sum(1 for candidate in candidates if candidate.was_checked),
-                incomplete_mandatory_buckets=incomplete_mandatory_buckets,
-                classifier_version="memory-engine-v1",
-                lifecycle_action=lifecycle_action,
-                review_case=review_case,
-                status=status,
-                result_memory_id=memory_id,
-                audit=run_audit,
-            ),
-            candidates=tuple(candidates),
-            relations=relations,
-        )
-
 
 def _observation_semantic_class(
     projection: SourceProjection,
@@ -1453,47 +1136,3 @@ def _candidate_fingerprints(
         }
         for candidate in candidates[:limit]
     ]
-
-
-def _document_evidence_unit_id(
-    *,
-    source_id: str,
-    doc_id: str,
-    doc_revision_id: str | None,
-    source_type: str,
-    content: str,
-) -> str:
-    digest = sha256(
-        "\x1f".join([source_id, doc_id, doc_revision_id or "", source_type, content_hash(content)]).encode("utf-8")
-    ).hexdigest()[:16]
-    return f"eu-doc-{digest}"
-
-
-def _document_relation_run_id(
-    unit: EvidenceUnit,
-    action: str | LifecycleAction,
-    *,
-    classifier_version: str = "memory-engine-v1",
-    candidate_memory_id: str | None = None,
-    relation_type: RelationType | None = None,
-    authority_case: AuthorityCase | None = None,
-) -> str:
-    return relation_run_id_for(
-        prefix="doc",
-        unit=unit,
-        action=action,
-        classifier_version=classifier_version,
-        candidate_memory_id=candidate_memory_id,
-        relation_type=relation_type,
-        authority_case=authority_case,
-    )
-
-
-def _parse_date(value: str | None) -> date | None:
-    """Parse an ISO date or datetime string into a calendar date."""
-    if not value:
-        return None
-    try:
-        return date.fromisoformat(value[:10])
-    except (ValueError, TypeError):
-        return None

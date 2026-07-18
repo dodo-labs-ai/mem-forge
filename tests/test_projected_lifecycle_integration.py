@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -428,6 +428,51 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
             }
         ],
     }
+
+
+@pytest.mark.asyncio
+async def test_projected_create_persists_validity_as_dates(db: Database) -> None:
+    projection = _projection(
+        run_id="projection-validity",
+        body="The policy is effective during June 2026.",
+    )
+    revision = projection.observation_revisions[0]
+    raw = RawMemory(
+        content="The policy is effective during June 2026.",
+        memory_type="fact",
+        evidence_quote=revision.content,
+        source_observation_id=projection.observations[0].id,
+        valid_from="2026-06-01",
+        valid_until="2026-06-30T12:00:00+08:00",
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=None,
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=[raw],
+        doc_type="document",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content=revision.content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
+
+    [memory] = await db.list_memories()
+    assert stats["added"] == 1
+    assert memory.valid_from == date(2026, 6, 1)
+    assert memory.valid_until == date(2026, 6, 30)
 
 
 @pytest.mark.asyncio
@@ -2674,6 +2719,78 @@ async def test_projected_quality_consumes_typed_observation_semantics(
     assert stats["added"] == 0
     assert stats["skipped"] == 1
     assert await db.count_memories() == 0
+
+
+@pytest.mark.parametrize(
+    ("run_id", "content", "context", "expected_added", "expected_skipped"),
+    [
+        (
+            "projection-quality-metadata",
+            "The ACD document was authored by Alice and last modified on 2026-06-01.",
+            "Author: Alice; Last modified: 2026-06-01",
+            0,
+            1,
+        ),
+        (
+            "projection-quality-open-question",
+            "The team should discuss whether the payroll cutoff moves to Thursday.",
+            "Open question for the next design discussion.",
+            0,
+            1,
+        ),
+        (
+            "projection-quality-conditional-rule",
+            "The AP result is recalculated only when the retro trigger remains OPEN.",
+            "The rule is conditional on the trigger remaining OPEN.",
+            1,
+            0,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_projected_lifecycle_enforces_candidate_quality_before_persistence(
+    db: Database,
+    run_id: str,
+    content: str,
+    context: str,
+    expected_added: int,
+    expected_skipped: int,
+) -> None:
+    projection = _projection(run_id=run_id, body=content)
+    revision = projection.observation_revisions[0]
+    raw = RawMemory(
+        content=content,
+        memory_type="fact",
+        extraction_context=context,
+        evidence_quote=revision.content,
+        source_observation_id=projection.observations[0].id,
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=[raw],
+        doc_type="document",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content=revision.content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+
+    assert stats["added"] == expected_added
+    assert stats["skipped"] == expected_skipped
+    assert await db.count_memories() == expected_added
 
 
 @pytest.mark.asyncio
