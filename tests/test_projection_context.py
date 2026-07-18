@@ -157,6 +157,21 @@ def test_one_large_document_is_range_sliced_without_creating_finer_source_units(
     assert "line-0299" in rendered
 
 
+def test_default_large_page_batches_bound_primary_output_pressure() -> None:
+    body = "durable meeting decision\n" * 6_000
+    projection = _confluence_projection(body)
+
+    batches = plan_projection_extraction_batches(projection)
+
+    assert len(body) > 120_000
+    assert len(batches) >= 5
+    assert all(len(batch.primary_markdown) <= 30_000 for batch in batches)
+    assert {batch.source_unit_id for batch in batches} == {projection.source_units[0].id}
+    assert {batch.primary_observation_ids for batch in batches} == {
+        (projection.observations[0].id,)
+    }
+
+
 @pytest.mark.asyncio
 async def test_projection_batch_extractor_rejects_claim_grounded_only_in_context() -> None:
     projection = _jira_projection(3)

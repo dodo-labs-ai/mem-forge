@@ -34,7 +34,7 @@ def plan_projection_extraction_batches(
     projection: SourceProjection,
     *,
     max_primary_observations: int = 8,
-    max_primary_chars: int = 60_000,
+    max_primary_chars: int = 30_000,
     max_context_chars: int = 20_000,
     primary_overlap_chars: int = 2_000,
 ) -> tuple[ProjectionExtractionBatch, ...]:

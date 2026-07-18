@@ -208,6 +208,7 @@ class RuntimeProvider(Protocol):
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_job_id: str | None = None,
         lifecycle_cycle_id: str | None = None,
+        scope_transition_run_id: str | None = None,
     ) -> SyncState: ...
 
 
@@ -267,6 +268,7 @@ class DefaultRuntimeProvider:
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_job_id: str | None = None,
         lifecycle_cycle_id: str | None = None,
+        scope_transition_run_id: str | None = None,
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -280,6 +282,7 @@ class DefaultRuntimeProvider:
             execution_mode=execution_mode,
             lifecycle_job_id=lifecycle_job_id,
             lifecycle_cycle_id=lifecycle_cycle_id,
+            scope_transition_run_id=scope_transition_run_id,
         )
 
 
@@ -631,6 +634,7 @@ async def run_source_sync(
     execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
     lifecycle_job_id: str | None = None,
     lifecycle_cycle_id: str | None = None,
+    scope_transition_run_id: str | None = None,
 ) -> SyncState:
     await authorize_source_sync_maintenance(
         db,
@@ -687,6 +691,7 @@ async def run_source_sync(
             "reprocess_doc_ids": reprocess_doc_ids,
             "source_activity_epoch": source_activity_epoch,
             "lifecycle_cycle_id": lifecycle_cycle_id,
+            "scope_transition_run_id": scope_transition_run_id,
         }
         if execution_mode is not SourceSyncMode.NORMAL:
             sync_kwargs["execution_mode"] = execution_mode
@@ -963,6 +968,7 @@ class SourceSyncWorker:
                 lifecycle_cycle_id=(
                     f"{run.run_id}:attempt:{run.lease_attempt_count}"
                 ),
+                scope_transition_run_id=run.run_id,
             )
             if final_state is None:
                 final_state = SyncState(
