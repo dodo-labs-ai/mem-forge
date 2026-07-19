@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Mapping
 
@@ -48,6 +48,23 @@ BUILTIN_SPECIALIZED_SOURCE_TYPES = frozenset(
     }
 )
 
+_JIRA_OPERATIONAL_HISTORY_FIELDS = frozenset(
+    {
+        "assignee",
+        "due date",
+        "duedate",
+        "fix version",
+        "fix version/s",
+        "fixversion",
+        "labels",
+        "priority",
+        "rank",
+        "resolution",
+        "sprint",
+        "status",
+    }
+)
+
 def source_run_projection_coverage(
     *,
     source_type: str | None = None,
@@ -78,6 +95,7 @@ class _ObservationInput:
     semantic_value: object
     locator: Mapping[str, object]
     observed_at: str | None = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
 
 
 class GeneSourceProjectionAdapter:
@@ -197,6 +215,7 @@ def project_source_item(
 
     prior_observation_revisions = prior_observation_revisions or {}
     native = _native_payload(raw)
+    projected_scope = dict(scope or {})
     unit_type, provider_key, observations_input, relations_input, coverage, locator = _project_native(
         source_id=source_id,
         source_type=source_type,
@@ -204,7 +223,12 @@ def project_source_item(
         native=native,
         normalized=normalized,
     )
-    projected_scope = dict(scope or {})
+    coverage = _provider_authoritative_unit_coverage(
+        source_type=source_type,
+        native=native,
+        coverage=coverage,
+        projected_scope=projected_scope,
+    )
     if source_type == "teams":
         locator = _teams_scope_attested_locator(
             locator=locator,
@@ -235,6 +259,7 @@ def project_source_item(
     )
     observations: list[SourceObservation] = []
     revisions: list[SourceObservationRevision] = []
+    carried_revision_ids: list[str] = []
     for value in observations_input:
         observation_id = _stable_id("obs", unit_id, value.observation_type, value.provider_key)
         semantic_hash = _canonical_hash(value.semantic_value)
@@ -249,35 +274,33 @@ def project_source_item(
                 locator=dict(value.locator),
             )
         )
+        projected_revision = SourceObservationRevision(
+            id=revision_id,
+            observation_id=observation_id,
+            semantic_hash=semantic_hash,
+            content=value.content,
+            observed_at=value.observed_at,
+            metadata={**dict(value.metadata), "provider_key": value.provider_key},
+        )
+        prior_revision = prior_observation_revisions.get(observation_id)
+        # Revision identity is semantic. Operational metadata enrichment under
+        # an unchanged semantic hash must preserve the exact immutable row.
         revisions.append(
-            SourceObservationRevision(
-                id=revision_id,
-                observation_id=observation_id,
-                semantic_hash=semantic_hash,
-                content=value.content,
-                observed_at=value.observed_at,
-                metadata={"provider_key": value.provider_key},
+            prior_revision
+            if (
+                prior_revision is not None
+                and prior_revision.observation_id == observation_id
+                and prior_revision.semantic_hash == semantic_hash
             )
+            else projected_revision
         )
     if coverage is ProjectionCoverage.PARTIAL_PROJECTION:
         projected_observation_ids = {item.observation_id for item in revisions}
         for observation_id, revision in prior_observation_revisions.items():
             if observation_id in projected_observation_ids:
                 continue
-            revisions.append(
-                SourceObservationRevision(
-                    id=revision.id,
-                    observation_id=revision.observation_id,
-                    semantic_hash=revision.semantic_hash,
-                    content=revision.content,
-                    observed_at=revision.observed_at,
-                    metadata={
-                        **dict(revision.metadata),
-                        "carried_forward": True,
-                        "source_unit_id": unit_id,
-                    },
-                )
-            )
+            revisions.append(revision)
+            carried_revision_ids.append(revision.id)
     observation_hashes = sorted((item.observation_id, item.semantic_hash) for item in revisions)
     semantic_hash = _canonical_hash(observation_hashes)
     location_hash = _canonical_hash(unit.locator)
@@ -383,6 +406,7 @@ def project_source_item(
         relations=relations,
         deltas=(delta,),
         checkpoint={"item_id": item.item_id, "version": item.version},
+        carried_observation_revision_ids=tuple(carried_revision_ids),
     )
 
 
@@ -471,16 +495,40 @@ def _teams_scope_attested_locator(
     return result
 
 
+def _provider_authoritative_unit_coverage(
+    *,
+    source_type: str,
+    native: object,
+    coverage: ProjectionCoverage,
+    projected_scope: Mapping[str, object],
+) -> ProjectionCoverage:
+    """Apply run authority only where the provider unit contract supports it."""
+
+    if coverage.proves_absence or projected_scope.get("authoritative_snapshot") is not True:
+        return coverage
+    if (
+        source_type == "teams"
+        and isinstance(native, Mapping)
+        and native.get("package_kind") == "teams_window_document"
+        and isinstance(native.get("raw_payload"), Mapping)
+    ):
+        # A force-full local collection attempt is validated against its
+        # immutable package manifest before replay. That source-wide proof also
+        # makes each canonical window package a complete snapshot of its unit.
+        return ProjectionCoverage.COMPLETE_SNAPSHOT
+    return coverage
+
+
 def _teams_partition_scope_fingerprint(scope: Mapping[str, object]) -> str:
     values: dict[str, object] = {}
-    for field, default in (
+    for field_name, default in (
         ("conversation_gap_minutes", 60),
         ("max_block_messages", 100),
     ):
         try:
-            values[field] = int(scope.get(field, default))
+            values[field_name] = int(scope.get(field_name, default))
         except (TypeError, ValueError):
-            values[field] = default
+            values[field_name] = default
     return projection_scope_fingerprint(values)
 
 
@@ -680,6 +728,11 @@ def _project_native(
                     history,
                     {"issue_key": issue_key},
                     str(history.get("created") or "") or None,
+                    {
+                        "semantic_class": _jira_changelog_semantic_class(
+                            history
+                        )
+                    },
                 )
             )
         changelog_total = changelog.get("total")
@@ -921,6 +974,22 @@ def _project_native(
             "source_type": source_type,
         },
     )
+
+
+def _jira_changelog_semantic_class(history: Mapping[str, object]) -> str:
+    items = history.get("items")
+    history_items = items if isinstance(items, list) else []
+    fields = {
+        " ".join(str(item.get("field") or "").strip().lower().split())
+        for item in history_items
+        if isinstance(item, Mapping)
+    }
+    fields.discard("")
+    if fields and fields.issubset({"attachment"}):
+        return "attachment_event"
+    if fields and fields.issubset(_JIRA_OPERATIONAL_HISTORY_FIELDS):
+        return "operational_transition"
+    return "domain_transition"
 
 
 def _native_payload(raw: RawContent) -> object:

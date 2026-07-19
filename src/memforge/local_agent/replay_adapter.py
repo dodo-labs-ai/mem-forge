@@ -47,6 +47,17 @@ class LocalSourceReplayAdapter(ABC):
     package_kind: str
     authoritative_collection: bool = False
 
+    def rebaseline_snapshot_is_authoritative(
+        self,
+        *,
+        force_full_sync: bool,
+        input_snapshot_id: str | None,
+    ) -> bool:
+        """Return whether one immutable attempt defines the replay corpus."""
+
+        del force_full_sync
+        return bool(self.authoritative_collection and input_snapshot_id)
+
     def validate(
         self,
         body: bytes,
@@ -222,6 +233,16 @@ class JiraReplayAdapter(LocalSourceReplayAdapter):
 class TeamsReplayAdapter(LocalSourceReplayAdapter):
     source_type = "teams"
     package_kind = "teams_window_document"
+
+    def rebaseline_snapshot_is_authoritative(
+        self,
+        *,
+        force_full_sync: bool,
+        input_snapshot_id: str | None,
+    ) -> bool:
+        """Use a force-full attempt for cutover without changing normal sync."""
+
+        return bool(force_full_sync and input_snapshot_id)
 
     def derive_document_id(
         self,

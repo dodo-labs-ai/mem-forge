@@ -5,11 +5,13 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 
 from memforge.memory.evidence import (
+    ActiveSupportEvidence,
     EvidenceContentProvenance,
     EvidenceReference,
     EvidenceRole,
@@ -39,6 +41,7 @@ from memforge.memory.lifecycle_review import build_lifecycle_review_approval_pla
 from memforge.genes.local_markdown_gene import LocalMarkdownGene
 from memforge.memory.cutover import (
     list_agent_session_lifecycle_migration_candidates,
+    recover_stale_lifecycle_jobs,
     reconstruct_historical_source_projection,
     repair_lifecycle_cutover_finding,
     run_source_lifecycle_backfill,
@@ -50,14 +53,17 @@ from memforge.models import (
     ContentItem,
     DocumentRecord,
     Memory,
+    MemoryReview,
     NormalizedContent,
     RawContent,
     ReconcileAction,
     ReconcileOperation,
+    ReviewKind,
+    ReviewStatus,
     content_hash,
 )
 from memforge.pipeline.source_projection_adapters import project_source_item
-from memforge.source_activity import SourceActivityConflict
+from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.storage.database import Database, MIGRATIONS
 from memforge.storage.document_store import LocalDocumentStore
@@ -535,7 +541,9 @@ async def test_lifecycle_activity_heartbeat_prefers_completed_work_when_both_tas
 
 
 @pytest.mark.asyncio
-async def test_open_finding_blocks_gate_and_resolution_preserves_history(db: Database) -> None:
+async def test_resolved_finding_retry_preserves_history_and_enabled_gate(
+    db: Database,
+) -> None:
     finding = _finding()
     await db.upsert_lifecycle_cutover_finding(finding)
 
@@ -571,10 +579,42 @@ async def test_open_finding_blocks_gate_and_resolution_preserves_history(db: Dat
         source_unit_id="unit-page-1",
     )
     gate = await db.enable_lifecycle_gate("src-1")
+    await db.upsert_lifecycle_cutover_finding(finding)
 
     assert resolved.status is CutoverFindingStatus.RESOLVED
     assert resolved.created_at == (await db.get_lifecycle_cutover_finding(finding.id)).created_at
     assert gate.state is LifecycleGateState.ENABLED
+    assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
+    assert (
+        await db.get_lifecycle_cutover_finding(finding.id)
+    ).status is CutoverFindingStatus.RESOLVED
+
+
+@pytest.mark.asyncio
+async def test_finding_upsert_rejects_identity_or_status_change(db: Database) -> None:
+    finding = _finding()
+    await db.upsert_lifecycle_cutover_finding(finding)
+
+    await db.upsert_lifecycle_cutover_finding(
+        replace(finding, reason=CutoverFindingReason.AMBIGUOUS_OBSERVATION)
+    )
+    evolved = await db.get_lifecycle_cutover_finding(finding.id)
+    assert evolved is not None
+    assert evolved.reason is CutoverFindingReason.AMBIGUOUS_OBSERVATION
+    assert evolved.status is CutoverFindingStatus.OPEN
+
+    with pytest.raises(ValueError, match="finding identity"):
+        await db.upsert_lifecycle_cutover_finding(
+            replace(finding, memory_id="mem-different")
+        )
+    with pytest.raises(ValueError, match="open findings"):
+        await db.upsert_lifecycle_cutover_finding(
+            replace(
+                finding,
+                id="finding-resolved-insert",
+                status=CutoverFindingStatus.RESOLVED,
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -733,6 +773,41 @@ async def test_lifecycle_plan_applies_support_removal_and_retirement_atomically(
     memory = await db.get_memory("mem-legacy")
     assert memory is not None and memory.status == "retired"
     assert await db.get_lifecycle_plan_status(plan.id) == "applied"
+
+
+@pytest.mark.asyncio
+async def test_terminal_lifecycle_mutation_stales_pending_memory_reviews(
+    db: Database,
+) -> None:
+    challenger = Memory(
+        id="mem-review-challenger",
+        memory_type="fact",
+        content="Independent challenger",
+        content_hash=content_hash("Independent challenger"),
+    )
+    await db.insert_memory(challenger)
+    await db.insert_memory_review(
+        MemoryReview(
+            id="review-terminal-incumbent",
+            kind=ReviewKind.CROSS_SOURCE_CONFLICT.value,
+            status=ReviewStatus.PENDING.value,
+            incumbent_memory_id="mem-legacy",
+            challenger_memory_id=challenger.id,
+        )
+    )
+    reference = await _persist_support_lineage(db)
+    await db.enable_lifecycle_gate("src-1")
+    plan = _retirement_plan(
+        reference,
+        await db.get_memory_support_set_hash("mem-legacy"),
+    )
+
+    await db.apply_lifecycle_plan(plan)
+
+    review = await db.get_memory_review("review-terminal-incumbent")
+    assert review is not None
+    assert review.status == ReviewStatus.STALE.value
+    assert review.resolved_at is not None
 
 
 @pytest.mark.asyncio
@@ -966,6 +1041,44 @@ async def test_mutation_failure_rolls_back_source_projection_with_the_plan(db: D
 
 
 @pytest.mark.asyncio
+async def test_stale_source_activity_epoch_rejects_projected_lifecycle_commit(
+    db: Database,
+) -> None:
+    active_reference = await _persist_support_lineage(db)
+    await db.enable_lifecycle_gate("src-1")
+    lease = await db.acquire_source_activity(
+        activity_id="sync-before-rebaseline",
+        source_id="src-1",
+        kind=SourceActivityKind.SYNC,
+    )
+    await db.create_source_rebaseline_job(
+        LifecycleBackfillJob(
+            id="rebaseline-fence",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    projection = replace(_projection(), run_id="projection-from-stale-worker")
+    plan = replace(
+        _retirement_plan(
+            active_reference,
+            await db.get_memory_support_set_hash("mem-legacy"),
+        ),
+        id="plan-from-stale-worker",
+    )
+
+    with pytest.raises(SourceActivityConflict, match="source activity"):
+        await db.apply_source_projection_lifecycle(
+            projection,
+            plan,
+            expected_source_activity_epoch=lease.epoch,
+        )
+
+    assert await db.get_source_projection(projection.run_id) is None
+    assert await db.get_lifecycle_plan_status(plan.id) is None
+
+
+@pytest.mark.asyncio
 async def test_memory_version_stale_guard_rejects_concurrent_incumbent_change(
     db: Database,
 ) -> None:
@@ -1029,6 +1142,142 @@ async def test_backfill_maps_exact_document_lineage_and_enables_gate(db: Databas
     assert result.finding_count == 0
     assert result.gate_enabled is True
     assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("current_revision_id", "expected_mapped", "expected_findings"),
+    (("obsrev-supported", 1, 0), ("obsrev-newer", 0, 1)),
+)
+async def test_backfill_trusts_existing_active_support_only_at_current_revision(
+    current_revision_id: str,
+    expected_mapped: int,
+    expected_findings: int,
+) -> None:
+    finding = LifecycleCutoverFinding(
+        id="finding-supported",
+        source_id="src-1",
+        memory_id="mem-supported",
+        reason=CutoverFindingReason.AMBIGUOUS_OBSERVATION,
+        status=CutoverFindingStatus.OPEN,
+        available_provenance={"documents": [{"doc_id": "legacy-doc"}]},
+        mapping_attempt={"strategy": "legacy"},
+    )
+    support = ActiveSupportEvidence(
+        memory_id="mem-supported",
+        source_id="src-1",
+        reference_id="ref-supported",
+        evidence_unit_id="unit-evidence-supported",
+        role=EvidenceRole.PRIMARY,
+        anchor=SourceAnchor(
+            kind=AnchorKind.WHOLE_OBSERVATION,
+            observation_id="obs-supported",
+            observation_revision_id="obsrev-supported",
+        ),
+        excerpt="Exact supported claim",
+    )
+
+    class SupportedDb:
+        def __init__(self) -> None:
+            self.resolved: list[tuple[str, str, str]] = []
+            self.enabled: list[str] = []
+            self.gated: list[str] = []
+            self.upserted: list[LifecycleCutoverFinding] = []
+            self.finding_id: str | None = None
+
+        async def list_legacy_memory_provenance(self, source_id: str):
+            assert source_id == "src-1"
+            return [
+                SimpleNamespace(
+                    memory_id="mem-supported",
+                    doc_id="legacy-doc",
+                    source_type="jira",
+                    excerpt="ambiguous legacy excerpt",
+                )
+            ]
+
+        async def get_lifecycle_cutover_finding(self, finding_id: str):
+            assert finding_id.startswith("finding-")
+            self.finding_id = finding_id
+            return replace(finding, id=finding_id)
+
+        async def get_active_memory_support_evidence(self, memory_id: str, *, source_id: str):
+            assert (memory_id, source_id) == ("mem-supported", "src-1")
+            return (support,)
+
+        async def get_evidence_unit(self, evidence_unit_id: str):
+            assert evidence_unit_id == support.evidence_unit_id
+            return replace(
+                _unit(),
+                id=evidence_unit_id,
+                source_lineage_id="unit-supported",
+            )
+
+        async def get_current_source_observation_revisions(self, source_unit_id: str):
+            assert source_unit_id == "unit-supported"
+            return {"obs-supported": SimpleNamespace(id=current_revision_id)}
+
+        async def resolve_lifecycle_cutover_finding(
+            self,
+            finding_id: str,
+            *,
+            observation_id: str,
+            source_unit_id: str,
+            source_activity=None,
+        ):
+            assert source_activity is None
+            self.resolved.append((finding_id, observation_id, source_unit_id))
+            return finding
+
+        async def enable_lifecycle_gate(self, source_id: str, *, source_activity=None) -> None:
+            assert source_activity is None
+            self.enabled.append(source_id)
+
+        async def find_source_unit_by_document_id(self, *_args):
+            if current_revision_id == "obsrev-supported":
+                raise AssertionError("current supported Memory must not use legacy provenance")
+            return None
+
+        async def upsert_lifecycle_cutover_finding(
+            self,
+            cutover_finding: LifecycleCutoverFinding,
+            *,
+            source_activity=None,
+        ) -> None:
+            assert source_activity is None
+            self.upserted.append(cutover_finding)
+
+        async def gate_destructive_lifecycle(
+            self,
+            source_id: str,
+            *,
+            reason: str,
+            source_activity=None,
+        ) -> None:
+            assert source_activity is None
+            assert reason == "1 open lifecycle cutover finding(s)"
+            self.gated.append(source_id)
+
+    database = SupportedDb()
+
+    result = await run_source_lifecycle_backfill(database, "src-1")
+
+    assert result.scanned_memories == 1
+    assert result.mapped_memories == expected_mapped
+    assert result.finding_count == expected_findings
+    assert result.gate_enabled is (expected_findings == 0)
+    if expected_findings == 0:
+        assert database.resolved == [
+            (database.finding_id, "obs-supported", "unit-supported")
+        ]
+        assert database.enabled == ["src-1"]
+        assert database.upserted == []
+        assert database.gated == []
+    else:
+        assert database.resolved == []
+        assert database.enabled == []
+        assert len(database.upserted) == 1
+        assert database.gated == ["src-1"]
 
 
 @pytest.mark.asyncio
@@ -1658,6 +1907,7 @@ async def test_recover_stale_lifecycle_backfill_job_fails_expired_job_atomically
         ("2000-01-01T00:00:00+00:00", job.id),
     )
     await db.db.commit()
+    fenced_epoch = await db.get_source_activity_epoch("src-1")
 
     recovered = await db.recover_stale_lifecycle_backfill_job(
         job.id,
@@ -1666,10 +1916,489 @@ async def test_recover_stale_lifecycle_backfill_job_fails_expired_job_atomically
 
     assert recovered.status is LifecycleBackfillJobStatus.FAILED
     assert recovered.error == "operator recovered expired lifecycle job"
+    assert await db.get_source_activity_epoch("src-1") == fenced_epoch + 1
     assert await db.get_active_lifecycle_backfill_job("src-1") is None
     assert not await db.release_source_activity(
         activity_id=job.id,
         capability=job.id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_rebaseline_rejects_recovered_maintenance_epoch(
+    db: Database,
+) -> None:
+    job = await db.create_source_rebaseline_job(
+        LifecycleBackfillJob(
+            id="sqlite-rebaseline-stale-epoch",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    activity = await db.renew_source_activity(
+        activity_id=job.id,
+        capability=job.id,
+    )
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", job.id),
+    )
+    await db.db.commit()
+    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
+
+    with pytest.raises(SourceActivityConflict, match="source activity"):
+        await db.rebaseline_source_lifecycle(
+            "src-1",
+            source_activity=activity,
+        )
+
+    assert await db.get_source_projection("projection-run-1") is not None
+
+
+@pytest.mark.asyncio
+async def test_backfill_rejects_recovered_maintenance_authority(
+    db: Database,
+) -> None:
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-backfill-stale-authority",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", job.id),
+    )
+    await db.db.commit()
+    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
+    gate_before = await db.get_lifecycle_gate("src-1")
+
+    with pytest.raises(SourceActivityConflict, match="lease is not current"):
+        await run_source_lifecycle_backfill(
+            db,
+            "src-1",
+            lifecycle_job_id=job.id,
+        )
+
+    assert await db.get_lifecycle_gate("src-1") == gate_before
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_gate_rejects_recovered_maintenance_fence(
+    db: Database,
+) -> None:
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-gate-stale-fence",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    activity = await db.renew_source_activity(
+        activity_id=job.id,
+        capability=job.id,
+    )
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", job.id),
+    )
+    await db.db.commit()
+    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
+    gate_before = await db.get_lifecycle_gate("src-1")
+
+    with pytest.raises(SourceActivityConflict, match="source activity"):
+        await db.enable_lifecycle_gate("src-1", source_activity=activity)
+
+    assert await db.get_lifecycle_gate("src-1") == gate_before
+
+
+@pytest.mark.asyncio
+async def test_evidence_write_rejects_recovered_maintenance_fence(
+    db: Database,
+) -> None:
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-evidence-stale-fence",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    activity = await db.renew_source_activity(
+        activity_id=job.id,
+        capability=job.id,
+    )
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", job.id),
+    )
+    await db.db.commit()
+    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
+
+    with pytest.raises(SourceActivityConflict, match="source activity"):
+        await db.upsert_evidence_unit(_unit(), source_activity=activity)
+
+    assert await db.get_evidence_unit(_unit().id) is None
+
+
+@pytest.mark.asyncio
+async def test_document_write_rejects_recovered_maintenance_fence(
+    db: Database,
+) -> None:
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-document-stale-fence",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    activity = await db.renew_source_activity(
+        activity_id=job.id,
+        capability=job.id,
+    )
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", job.id),
+    )
+    await db.db.commit()
+    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
+    now = datetime(2026, 7, 19, tzinfo=timezone.utc)
+    document = DocumentRecord(
+        doc_id="doc-stale-fence",
+        source="src-1",
+        source_url=None,
+        title="Stale fenced document",
+        space_or_project=None,
+        author=None,
+        last_modified=now,
+        labels=[],
+        version="1",
+        content_hash="stale-fence-hash",
+        token_count=3,
+        raw_content_uri=None,
+        raw_content_type="text/plain",
+        normalized_content_uri=None,
+        pdf_content_uri=None,
+        last_synced=now,
+    )
+
+    with pytest.raises(SourceActivityConflict, match="source activity"):
+        await db.upsert_document(
+            document,
+            require_configured_source=True,
+            source_activity=activity,
+        )
+
+    assert await db.get_document(document.doc_id) is None
+
+
+@pytest.mark.asyncio
+async def test_evidence_reference_write_rejects_recovered_maintenance_fence(
+    db: Database,
+) -> None:
+    await db.upsert_evidence_unit(_unit())
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-reference-stale-fence",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    activity = await db.renew_source_activity(
+        activity_id=job.id,
+        capability=job.id,
+    )
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", job.id),
+    )
+    await db.db.commit()
+    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
+    reference = EvidenceReference(
+        role=EvidenceRole.PRIMARY,
+        anchor=SourceAnchor(
+            kind=AnchorKind.WHOLE_OBSERVATION,
+            observation_id="obs-page-1-body",
+            observation_revision_id="obsrev-page-1-v2",
+        ),
+        evidence_unit_id=_unit().id,
+    )
+
+    with pytest.raises(SourceActivityConflict, match="source activity"):
+        await db.record_evidence_references(
+            _unit().id,
+            (reference,),
+            source_activity=activity,
+        )
+
+
+@pytest.mark.asyncio
+async def test_support_write_rejects_recovered_maintenance_fence(
+    db: Database,
+) -> None:
+    await db.upsert_evidence_unit(_unit())
+    references = await db.record_evidence_references(
+        _unit().id,
+        (
+            EvidenceReference(
+                role=EvidenceRole.PRIMARY,
+                anchor=SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id="obs-page-1-body",
+                    observation_revision_id="obsrev-page-1-v2",
+                ),
+                evidence_unit_id=_unit().id,
+            ),
+        ),
+    )
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-support-stale-fence",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    activity = await db.renew_source_activity(
+        activity_id=job.id,
+        capability=job.id,
+    )
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", job.id),
+    )
+    await db.db.commit()
+    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
+    reference_id = references[0].id or ""
+
+    with pytest.raises(SourceActivityConflict, match="source activity"):
+        await db.upsert_memory_support_assertion(
+            MemorySupportAssertion(
+                id="support-stale-fence",
+                memory_id="mem-legacy",
+                evidence_reference_id=reference_id,
+                source_id="src-1",
+                access_context_hash="access-a",
+            ),
+            source_activity=activity,
+        )
+
+    assert reference_id not in await db.get_active_memory_support_reference_ids(
+        "mem-legacy"
+    )
+
+
+@pytest.mark.asyncio
+async def test_finding_write_rejects_recovered_maintenance_fence(
+    db: Database,
+) -> None:
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-finding-stale-fence",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    activity = await db.renew_source_activity(
+        activity_id=job.id,
+        capability=job.id,
+    )
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", job.id),
+    )
+    await db.db.commit()
+    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
+
+    with pytest.raises(SourceActivityConflict, match="source activity"):
+        await db.upsert_lifecycle_cutover_finding(
+            _finding(),
+            source_activity=activity,
+        )
+
+    assert await db.get_lifecycle_cutover_finding(_finding().id) is None
+
+
+@pytest.mark.asyncio
+async def test_finding_resolution_rejects_recovered_maintenance_fence(
+    db: Database,
+) -> None:
+    finding = _finding()
+    unit = _unit()
+    await db.upsert_lifecycle_cutover_finding(finding)
+    await db.upsert_evidence_unit(unit)
+    reference = EvidenceReference(
+        role=EvidenceRole.PRIMARY,
+        anchor=SourceAnchor(
+            kind=AnchorKind.WHOLE_OBSERVATION,
+            observation_id="obs-page-1-body",
+            observation_revision_id="obsrev-page-1-v2",
+        ),
+        evidence_unit_id=unit.id,
+    )
+    reference = replace(reference, id=evidence_reference_id_for(unit.id, reference))
+    await db.record_evidence_references(unit.id, (reference,))
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id="support-finding-stale-fence",
+            memory_id="mem-legacy",
+            evidence_reference_id=reference.id or "",
+            source_id="src-1",
+            access_context_hash="workspace",
+        )
+    )
+    job = await db.create_lifecycle_backfill_job(
+        LifecycleBackfillJob(
+            id="sqlite-finding-resolution-stale-fence",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(job.id)
+    activity = await db.renew_source_activity(
+        activity_id=job.id,
+        capability=job.id,
+    )
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", job.id),
+    )
+    await db.db.commit()
+    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
+
+    with pytest.raises(SourceActivityConflict, match="source activity"):
+        await db.resolve_lifecycle_cutover_finding(
+            finding.id,
+            observation_id="obs-page-1-body",
+            source_unit_id="unit-page-1",
+            source_activity=activity,
+        )
+
+    assert (await db.get_lifecycle_cutover_finding(finding.id)).status is (
+        CutoverFindingStatus.OPEN
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_stale_lifecycle_jobs_excludes_current_lease(
+    db: Database,
+) -> None:
+    await db.upsert_source(
+        id="src-current-maintenance",
+        type="confluence",
+        name="Current maintenance",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    stale = await db.create_source_rebaseline_job(
+        LifecycleBackfillJob(
+            id="sqlite-list-stale-lifecycle-job",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    current = await db.create_source_rebaseline_job(
+        LifecycleBackfillJob(
+            id="sqlite-list-current-lifecycle-job",
+            source_id="src-current-maintenance",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(stale.id)
+    await db.start_lifecycle_backfill_job(current.id)
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", stale.id),
+    )
+    await db.db.commit()
+
+    stale_ids = await db.list_stale_lifecycle_backfill_job_ids(limit=10)
+
+    assert stale_ids == (stale.id,)
+    await db.fail_lifecycle_backfill_job(current.id, error="test cleanup")
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_lifecycle_jobs_fails_orphaned_jobs(
+    db: Database,
+) -> None:
+    stale = await db.create_source_rebaseline_job(
+        LifecycleBackfillJob(
+            id="sqlite-sweep-stale-lifecycle-job",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(stale.id)
+    await db.db.execute(
+        "DELETE FROM source_activity_leases WHERE id = ?",
+        (stale.id,),
+    )
+    await db.db.commit()
+
+    recovered = await recover_stale_lifecycle_jobs(db)
+
+    assert tuple(job.id for job in recovered) == (stale.id,)
+    assert recovered[0].status is LifecycleBackfillJobStatus.FAILED
+    assert recovered[0].error == "source lifecycle maintenance lease expired before completion"
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_lifecycle_jobs_isolates_one_invalid_job(
+    db: Database,
+) -> None:
+    await db.upsert_source(
+        id="src-second-stale-maintenance",
+        type="confluence",
+        name="Second stale maintenance",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    invalid = await db.create_source_rebaseline_job(
+        LifecycleBackfillJob(
+            id="sqlite-sweep-invalid-lifecycle-job",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+    )
+    recoverable = await db.create_source_rebaseline_job(
+        LifecycleBackfillJob(
+            id="sqlite-sweep-recoverable-lifecycle-job",
+            source_id="src-second-stale-maintenance",
+            status=LifecycleBackfillJobStatus.QUEUED,
+            created_at="2026-01-02T00:00:00+00:00",
+        )
+    )
+    await db.start_lifecycle_backfill_job(invalid.id)
+    await db.start_lifecycle_backfill_job(recoverable.id)
+    await db.db.execute(
+        "UPDATE source_activity_leases "
+        "SET capability = ?, lease_until = ? WHERE id = ?",
+        ("invalid-capability", "2000-01-01T00:00:00+00:00", invalid.id),
+    )
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", recoverable.id),
+    )
+    await db.db.commit()
+
+    recovered = await recover_stale_lifecycle_jobs(db)
+
+    assert tuple(job.id for job in recovered) == (recoverable.id,)
+    assert (await db.get_lifecycle_backfill_job(invalid.id)).status is (
+        LifecycleBackfillJobStatus.RUNNING
+    )
+    assert (await db.get_lifecycle_backfill_job(recoverable.id)).status is (
+        LifecycleBackfillJobStatus.FAILED
     )
 
 
@@ -1848,6 +2577,7 @@ async def test_recover_stale_lifecycle_backfill_job_rolls_back_partial_failure(
            BEGIN SELECT RAISE(ABORT, 'forced recovery failure'); END"""
     )
     await db.db.commit()
+    fenced_epoch = await db.get_source_activity_epoch("src-1")
 
     with pytest.raises(sqlite3.IntegrityError, match="forced recovery failure"):
         await db.recover_stale_lifecycle_backfill_job(job.id, error="must roll back")
@@ -1855,6 +2585,7 @@ async def test_recover_stale_lifecycle_backfill_job_rolls_back_partial_failure(
     stored = await db.get_lifecycle_backfill_job(job.id)
     assert stored is not None
     assert stored.status is LifecycleBackfillJobStatus.RUNNING
+    assert await db.get_source_activity_epoch("src-1") == fenced_epoch
     async with db.db.execute(
         "SELECT COUNT(*) AS count FROM source_activity_leases WHERE id = ?",
         (job.id,),

@@ -196,6 +196,56 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_identity_does_not_merge_with_ordinary_exact_memory(bundle_stack):
+    db, store, _collection = bundle_stack
+    content = (
+        "Workspace source schedulers must start during app startup.\n"
+        "Applies: Workspace source scheduling in MemForge.\n"
+        "Why: This lets overdue schedules run without waiting for UI traffic."
+    )
+    ordinary = Memory(
+        id="mem-ordinary-exact-claim",
+        memory_type="procedure",
+        content=content,
+        content_hash=content_hash(content),
+        visibility=Visibility.PRIVATE.value,
+        owner_user_id="u-andrew",
+        project_key="UNSORTED",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+    )
+    await db.insert_memory(ordinary)
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+
+    result = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-agent-after-ordinary",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+
+    claim = await db.get_agent_claim(result.claim_id)
+    exact_rows = await db.db.execute_fetchall(
+        """SELECT id FROM memories
+           WHERE content_hash = ? AND status = 'active'
+           ORDER BY id""",
+        (ordinary.content_hash,),
+    )
+    assert result.outcome == "applied"
+    assert result.memory_id != ordinary.id
+    assert claim is not None
+    assert claim["memory_id"] == result.memory_id
+    assert {row["id"] for row in exact_rows} == {
+        ordinary.id,
+        result.memory_id,
+    }
+
+
+@pytest.mark.asyncio
 async def test_post_cutover_agent_claim_write_commits_source_projection_lineage(bundle_stack):
     db, store, _collection = bundle_stack
     source_id = "src-agent-sessions-codex"

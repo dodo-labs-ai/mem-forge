@@ -7,6 +7,8 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
+from memforge.memory.lifecycle_plan import LifecycleBackfillJob
+
 SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES = 1440
 SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES = 5
 SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES = 10080
@@ -95,6 +97,13 @@ class SourceAdminReader(Protocol):
         source_id: str,
         workspace_id: str = "default",
     ) -> Any | None: ...
+
+    async def list_lifecycle_backfill_jobs(
+        self,
+        source_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[LifecycleBackfillJob]: ...
 
     async def get_source(self, source_id: str) -> dict[str, Any] | None: ...
 

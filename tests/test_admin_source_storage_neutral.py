@@ -18,6 +18,8 @@ from memforge.memory.lifecycle_plan import (
     LifecycleCutoverFinding,
     LifecycleGate,
     LifecycleGateState,
+    LifecycleVectorDeliveryResult,
+    LifecycleVectorDeliveryState,
 )
 from memforge.models import DocumentRecord, SyncState
 from memforge.local_adapter import build_teams_doc_id
@@ -86,6 +88,27 @@ def _teams_document(now: datetime) -> DocumentRecord:
     )
 
 
+def _legacy_teams_document(now: datetime) -> DocumentRecord:
+    return DocumentRecord(
+        doc_id="teams-src-teams-legacy-window",
+        source="src-teams",
+        source_url="https://teams.example.test/legacy-window",
+        title="Legacy Conversation Window",
+        space_or_project="SFPAY",
+        author=None,
+        last_modified=now,
+        labels=[],
+        version="legacy-1",
+        content_hash="hash-legacy-window",
+        token_count=10,
+        raw_content_uri=None,
+        raw_content_type=None,
+        normalized_content_uri=None,
+        pdf_content_uri=None,
+        last_synced=now,
+    )
+
+
 async def _setup_completed_teams_local_replay(
     database: Database,
     *,
@@ -93,8 +116,11 @@ async def _setup_completed_teams_local_replay(
     snapshot_id: str | None,
     include_current_input: bool = True,
     include_current_document: bool = True,
+    include_legacy_document: bool = False,
     include_retired_input: bool = False,
     include_newer_noncurrent_version: bool = False,
+    run_status: str = "success",
+    force_full_sync: bool = False,
 ) -> dict[str, str]:
     await database.connect()
     await database.upsert_source(
@@ -109,6 +135,11 @@ async def _setup_completed_teams_local_replay(
     if include_current_document:
         await database.upsert_document(
             _teams_document(now),
+            require_configured_source=True,
+        )
+    if include_legacy_document:
+        await database.upsert_document(
+            _legacy_teams_document(now),
             require_configured_source=True,
         )
     artifacts: dict[str, str] = {}
@@ -251,6 +282,7 @@ async def _setup_completed_teams_local_replay(
     run = await database.enqueue_source_sync_run(
         source_id="src-teams",
         trigger="local_agent",
+        force_full_sync=force_full_sync,
         input_snapshot_id=snapshot_id,
         source_config_revision=local_agent_source_config_revision(source),
     )
@@ -260,18 +292,31 @@ async def _setup_completed_teams_local_replay(
         now=now,
     )
     assert leased is not None
-    completed = await database.complete_source_sync_run(
-        run.run_id,
-        worker_id="worker-a",
-        lease_attempt_count=leased.lease_attempt_count,
-        final_state=SyncState(
-            source="src-teams",
-            last_sync_at=now,
-            last_sync_status="success",
-        ),
-        completed_at=now,
+    final_state = SyncState(
+        source="src-teams",
+        last_sync_at=(now if run_status == "success" else None),
+        last_sync_status=run_status,
+        error_message=(None if run_status == "success" else "document lifecycle was gated"),
     )
-    assert completed is True
+    if run_status == "success":
+        terminal = await database.complete_source_sync_run(
+            run.run_id,
+            worker_id="worker-a",
+            lease_attempt_count=leased.lease_attempt_count,
+            final_state=final_state,
+            completed_at=now,
+        )
+    else:
+        terminal = await database.fail_source_sync_run(
+            run.run_id,
+            worker_id="worker-a",
+            lease_attempt_count=leased.lease_attempt_count,
+            error_message=final_state.error_message or "source sync failed",
+            final_state=final_state,
+            retryable=False,
+            failed_at=now,
+        )
+    assert terminal is True
     return artifacts
 
 
@@ -356,6 +401,16 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
             assert workspace_id == "default"
             return None
 
+        async def list_lifecycle_backfill_jobs(
+            self,
+            source_id: str,
+            *,
+            limit: int = 20,
+        ) -> list:
+            assert source_id == "src-neutral"
+            assert limit == 1
+            return []
+
         async def get_active_source_access_transition(self, source_id: str):
             assert source_id == "src-neutral"
             return None
@@ -395,6 +450,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
     }
     assert source["doc_count"] == 3
     assert source["memory_count"] == 7
+    assert source["lifecycle_maintenance"] is None
     assert source["pinned_for_me"] is False
     assert source["client"] is None
     assert source["access_policy"] == "private"
@@ -659,7 +715,13 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path, m
             assert workspace_id == "default"
             return None
 
-        async def enable_lifecycle_gate(self, source_id: str) -> LifecycleGate:
+        async def enable_lifecycle_gate(
+            self,
+            source_id: str,
+            *,
+            source_activity=None,
+        ) -> LifecycleGate:
+            assert source_activity is None
             self.gate = LifecycleGate(source_id=source_id, state=LifecycleGateState.ENABLED)
             return self.gate
 
@@ -811,6 +873,185 @@ def test_source_rebaseline_endpoint_is_confirmation_bound_and_completes_replay(t
         asyncio.run(database.close())
 
 
+def test_source_rebaseline_keeps_gate_closed_when_vector_delivery_is_pending(
+    tmp_path,
+    monkeypatch,
+):
+    class SuccessfulReplayProvider(DefaultRuntimeProvider):
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(last_sync_status="success", error_message=None)
+
+    class PendingVectorStore:
+        async def rebaseline_source_lifecycle(
+            self,
+            source_id: str,
+            *,
+            source_activity=None,
+        ):
+            assert source_id == "src-confluence"
+            assert source_activity is not None
+            await database.gate_destructive_lifecycle(
+                source_id,
+                reason="source rebaseline requires a complete successful replay",
+                source_activity=source_activity,
+            )
+            return []
+
+        async def attempt_lifecycle_vector_delivery(
+            self,
+            lifecycle_plan_id: str | None = None,
+            *,
+            source_id: str | None = None,
+        ) -> LifecycleVectorDeliveryResult:
+            assert lifecycle_plan_id is None
+            assert source_id == "src-confluence"
+            return LifecycleVectorDeliveryResult(
+                state=LifecycleVectorDeliveryState.PENDING,
+                attempted_tasks=1,
+                failed_tasks=1,
+                error_types=("APIConnectionError",),
+            )
+
+    database = Database(str(tmp_path / "rebaseline-pending-vector.db"))
+
+    async def setup() -> None:
+        await database.connect()
+        await database.upsert_source(
+            id="src-confluence",
+            type="confluence",
+            name="Confluence",
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="user-a",
+        )
+        await database.enable_lifecycle_gate("src-confluence")
+
+    asyncio.run(setup())
+    pending_store = PendingVectorStore()
+
+    async def build_pending_store(*args, **kwargs):
+        del args, kwargs
+        return pending_store
+
+    monkeypatch.setattr(
+        "memforge.server.admin_api._build_memory_store",
+        build_pending_store,
+    )
+    app = create_admin_app(
+        db=database,
+        config=_config(tmp_path),
+        runtime_provider=SuccessfulReplayProvider(),
+        principal_resolver=lambda request: "user-a",
+    )
+    try:
+        with TestClient(app) as client:
+            accepted = client.post(
+                "/api/sources/src-confluence/memory-lifecycle/rebaseline",
+                json={"confirm_source_id": "src-confluence"},
+            )
+            status = client.get("/api/sources/src-confluence/memory-lifecycle")
+
+        assert accepted.status_code == 202, accepted.text
+        assert status.status_code == 200, status.text
+        payload = status.json()
+        assert payload["jobs"][0]["status"] == "failed"
+        assert payload["gate"]["state"] == "gated"
+        assert "vector delivery remains pending" in payload["jobs"][0]["error"]
+    finally:
+        asyncio.run(database.close())
+
+
+def test_source_rebaseline_drains_vector_batches_before_enabling_gate(
+    tmp_path,
+    monkeypatch,
+):
+    class SuccessfulReplayProvider(DefaultRuntimeProvider):
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(last_sync_status="success", error_message=None)
+
+    class BatchedVectorStore:
+        def __init__(self) -> None:
+            self.delivery_calls = 0
+
+        async def rebaseline_source_lifecycle(
+            self,
+            source_id: str,
+            *,
+            source_activity=None,
+        ):
+            assert source_id == "src-confluence"
+            assert source_activity is not None
+            return []
+
+        async def attempt_lifecycle_vector_delivery(
+            self,
+            lifecycle_plan_id: str | None = None,
+            *,
+            source_id: str | None = None,
+        ) -> LifecycleVectorDeliveryResult:
+            assert lifecycle_plan_id is None
+            assert source_id == "src-confluence"
+            self.delivery_calls += 1
+            if self.delivery_calls == 1:
+                return LifecycleVectorDeliveryResult(
+                    state=LifecycleVectorDeliveryState.PENDING,
+                    attempted_tasks=100,
+                    delivered_tasks=100,
+                )
+            return LifecycleVectorDeliveryResult(
+                state=LifecycleVectorDeliveryState.DELIVERED,
+            )
+
+    database = Database(str(tmp_path / "rebaseline-vector-batches.db"))
+
+    async def setup() -> None:
+        await database.connect()
+        await database.upsert_source(
+            id="src-confluence",
+            type="confluence",
+            name="Confluence",
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="user-a",
+        )
+
+    asyncio.run(setup())
+    batched_store = BatchedVectorStore()
+
+    async def build_batched_store(*args, **kwargs):
+        del args, kwargs
+        return batched_store
+
+    monkeypatch.setattr(
+        "memforge.server.admin_api._build_memory_store",
+        build_batched_store,
+    )
+    app = create_admin_app(
+        db=database,
+        config=_config(tmp_path),
+        runtime_provider=SuccessfulReplayProvider(),
+        principal_resolver=lambda request: "user-a",
+    )
+    try:
+        with TestClient(app) as client:
+            accepted = client.post(
+                "/api/sources/src-confluence/memory-lifecycle/rebaseline",
+                json={"confirm_source_id": "src-confluence"},
+            )
+            status = client.get("/api/sources/src-confluence/memory-lifecycle")
+
+        assert accepted.status_code == 202, accepted.text
+        assert status.status_code == 200, status.text
+        payload = status.json()
+        assert payload["jobs"][0]["status"] == "completed"
+        assert payload["gate"]["state"] == "enabled"
+        assert batched_store.delivery_calls == 2
+    finally:
+        asyncio.run(database.close())
+
+
 def test_server_source_rebaseline_preflight_failure_never_resets_lifecycle(
     tmp_path,
     monkeypatch,
@@ -830,8 +1071,13 @@ def test_server_source_rebaseline_preflight_failure_never_resets_lifecycle(
         def __init__(self) -> None:
             self.reset_calls = 0
 
-        async def rebaseline_source_lifecycle(self, source_id: str):
-            del source_id
+        async def rebaseline_source_lifecycle(
+            self,
+            source_id: str,
+            *,
+            source_activity=None,
+        ):
+            del source_id, source_activity
             self.reset_calls += 1
 
     database = Database(str(tmp_path / "server-preflight-failure.db"))
@@ -885,13 +1131,31 @@ def test_server_source_rebaseline_preflight_failure_never_resets_lifecycle(
 
 
 def test_source_rebaseline_uses_post_fence_source_snapshot(tmp_path, monkeypatch):
+    events: list[str] = []
+
     class CapturingProvider(DefaultRuntimeProvider):
         def __init__(self) -> None:
             self.sources: list[dict] = []
 
         async def run_source_sync(self, **kwargs):
+            events.append("sync")
             self.sources.append(kwargs["source"])
             return SimpleNamespace(last_sync_status="success", error_message=None)
+
+    class ResetGuard:
+        def __init__(self) -> None:
+            self.source_activity = None
+
+        async def rebaseline_source_lifecycle(
+            self,
+            source_id: str,
+            *,
+            source_activity=None,
+        ):
+            assert source_id == "src-confluence"
+            events.append("reset")
+            self.source_activity = source_activity
+            return []
 
     database = Database(str(tmp_path / "post-fence-source.db"))
 
@@ -924,6 +1188,23 @@ def test_source_rebaseline_uses_post_fence_source_snapshot(tmp_path, monkeypatch
 
     monkeypatch.setattr(database, "get_source", stale_then_current)
     provider = CapturingProvider()
+    reset_guard = ResetGuard()
+
+    async def build_reset_guard(*args, **kwargs):
+        del args, kwargs
+        return reset_guard
+
+    monkeypatch.setattr(
+        "memforge.server.admin_api._build_memory_store",
+        build_reset_guard,
+    )
+    original_renew = database.renew_source_activity
+
+    async def capturing_renew(**kwargs):
+        events.append("renew")
+        return await original_renew(**kwargs)
+
+    monkeypatch.setattr(database, "renew_source_activity", capturing_renew)
     app = create_admin_app(
         db=database,
         config=_config(tmp_path),
@@ -943,11 +1224,15 @@ def test_source_rebaseline_uses_post_fence_source_snapshot(tmp_path, monkeypatch
             source["config"]["base_url"] == "https://current.example"
             for source in provider.sources
         )
+        assert reset_guard.source_activity.epoch == asyncio.run(
+            database.get_source_activity_epoch("src-confluence")
+        )
+        assert events[:4] == ["sync", "renew", "reset", "sync"]
     finally:
         asyncio.run(database.close())
 
 
-def test_source_rebaseline_returns_conflict_while_source_sync_is_active(tmp_path):
+def test_source_rebaseline_cancels_active_durable_sync_before_maintenance(tmp_path):
     database = Database(str(tmp_path / "rebaseline-active-sync.db"))
 
     async def setup() -> None:
@@ -960,12 +1245,14 @@ def test_source_rebaseline_returns_conflict_while_source_sync_is_active(tmp_path
             access_policy="workspace",
             owner_user_id="user-a",
         )
-        await database.enqueue_source_sync_run(
+        run = await database.enqueue_source_sync_run(
             source_id="src-confluence",
             trigger="manual",
+            force_full_sync=True,
         )
+        return run.run_id
 
-    asyncio.run(setup())
+    run_id = asyncio.run(setup())
     app = create_admin_app(
         db=database,
         config=_config(tmp_path),
@@ -978,11 +1265,13 @@ def test_source_rebaseline_returns_conflict_while_source_sync_is_active(tmp_path
                 json={"confirm_source_id": "src-confluence"},
             )
 
-        assert response.status_code == 409, response.text
-        assert "source sync run already active" in response.json()["detail"]
-        assert asyncio.run(
-            database.list_lifecycle_backfill_jobs("src-confluence")
-        ) == []
+        assert response.status_code == 202, response.text
+        cancelled = asyncio.run(database.get_source_sync_run(run_id))
+        assert cancelled is not None
+        assert cancelled.status == "failed"
+        assert cancelled.error_message is not None
+        assert cancelled.error_message.startswith("cancelled_by_source_lifecycle_maintenance:")
+        assert asyncio.run(database.list_lifecycle_backfill_jobs("src-confluence"))
     finally:
         asyncio.run(database.close())
 
@@ -1116,10 +1405,10 @@ def test_local_agent_lifecycle_backfill_repairs_from_durable_current_corpus(
         asyncio.run(database.close())
 
 
-def test_local_agent_source_rebaseline_fails_before_reset_without_successful_replay(tmp_path):
+def test_local_agent_source_rebaseline_fails_before_reset_without_terminal_replay(tmp_path):
     class UnexpectedReplayProvider(DefaultRuntimeProvider):
         async def run_source_sync(self, **kwargs):
-            raise AssertionError("local-agent rebaseline must not run without a successful replay")
+            raise AssertionError("local-agent rebaseline must not run without a terminal replay")
 
     database = Database(str(tmp_path / "local-agent-rebaseline-preflight.db"))
 
@@ -1149,11 +1438,11 @@ def test_local_agent_source_rebaseline_fails_before_reset_without_successful_rep
             )
 
         assert response.status_code == 409, response.text
-        assert response.json()["detail"] == "source_lifecycle_successful_local_replay_required"
+        assert response.json()["detail"] == "source_lifecycle_terminal_local_replay_required"
         jobs = asyncio.run(database.list_lifecycle_backfill_jobs("src-teams"))
         assert len(jobs) == 1
         assert jobs[0].status is LifecycleBackfillJobStatus.FAILED
-        assert jobs[0].error == "source_lifecycle_successful_local_replay_required"
+        assert jobs[0].error == "source_lifecycle_terminal_local_replay_required"
     finally:
         asyncio.run(database.close())
 
@@ -1261,6 +1550,100 @@ def test_teams_source_rebaseline_replays_current_corpus_across_attempt_bound_inp
         asyncio.run(database.close())
 
 
+def test_force_full_teams_rebaseline_uses_attempt_snapshot_when_old_index_is_a_superset(
+    tmp_path,
+):
+    class SnapshotReplayProvider(DefaultRuntimeProvider):
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def run_source_sync(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(last_sync_status="success", error_message=None)
+
+    database = Database(str(tmp_path / "force-full-teams-authoritative-rebaseline.db"))
+    cfg = _config(tmp_path)
+    document_store = LocalDocumentStore(cfg.storage.docs_path)
+
+    async def setup() -> dict[str, str]:
+        return await _setup_completed_teams_local_replay(
+            database,
+            snapshot_id="job-teams:attempt:1",
+            document_store=document_store,
+            include_legacy_document=True,
+            force_full_sync=True,
+        )
+
+    artifacts = asyncio.run(setup())
+    provider = SnapshotReplayProvider()
+    app = create_admin_app(
+        db=database,
+        config=cfg,
+        runtime_provider=provider,
+        principal_resolver=lambda request: "user-a",
+        document_store=document_store,
+    )
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                json={"confirm_source_id": "src-teams"},
+            )
+
+        assert response.status_code == 202, response.text
+        assert [call["execution_mode"] for call in provider.calls] == [
+            SourceSyncMode.REBASELINE_PREFLIGHT,
+            SourceSyncMode.REBASELINE_REPLAY,
+        ]
+        assert all(call["authoritative_snapshot"] is True for call in provider.calls)
+        for call in provider.calls:
+            [manifest] = call["source"]["config"]["local_agent_package_manifest"]
+            assert manifest["doc_id"] == _teams_doc_id()
+            assert manifest["package_uri"] == artifacts["current"]
+    finally:
+        asyncio.run(database.close())
+
+
+def test_incremental_teams_rebaseline_does_not_infer_old_index_deletion(tmp_path):
+    class UnexpectedReplayProvider(DefaultRuntimeProvider):
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            raise AssertionError("incremental Teams inputs must not delete old documents")
+
+    database = Database(str(tmp_path / "incremental-teams-nonauthoritative-rebaseline.db"))
+    cfg = _config(tmp_path)
+    document_store = LocalDocumentStore(cfg.storage.docs_path)
+
+    async def setup() -> None:
+        await _setup_completed_teams_local_replay(
+            database,
+            snapshot_id="job-teams:attempt:1",
+            document_store=document_store,
+            include_legacy_document=True,
+            force_full_sync=False,
+        )
+
+    asyncio.run(setup())
+    app = create_admin_app(
+        db=database,
+        config=cfg,
+        runtime_provider=UnexpectedReplayProvider(),
+        principal_resolver=lambda request: "user-a",
+        document_store=document_store,
+    )
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                json={"confirm_source_id": "src-teams"},
+            )
+
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == "source_lifecycle_local_replay_inputs_unavailable"
+    finally:
+        asyncio.run(database.close())
+
+
 def test_incremental_local_agent_source_rebaseline_replays_exact_current_corpus(tmp_path):
     class CurrentCorpusReplayProvider(DefaultRuntimeProvider):
         def __init__(self) -> None:
@@ -1316,6 +1699,95 @@ def test_incremental_local_agent_source_rebaseline_replays_exact_current_corpus(
         }
         assert manifest["input_sha256"]
         assert manifest["package_sha256"]
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_rebaseline_accepts_attested_terminal_full_sync_after_lifecycle_gate_failure(
+    tmp_path,
+):
+    class ReplayProvider(DefaultRuntimeProvider):
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def run_source_sync(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(last_sync_status="success", error_message=None)
+
+    database = Database(str(tmp_path / "failed-full-sync-rebaseline.db"))
+    cfg = _config(tmp_path)
+    document_store = LocalDocumentStore(cfg.storage.docs_path)
+
+    async def setup() -> None:
+        await _setup_completed_teams_local_replay(
+            database,
+            snapshot_id=None,
+            document_store=document_store,
+            run_status="failed",
+            force_full_sync=True,
+        )
+
+    asyncio.run(setup())
+    provider = ReplayProvider()
+    app = create_admin_app(
+        db=database,
+        config=cfg,
+        runtime_provider=provider,
+        principal_resolver=lambda request: "user-a",
+        document_store=document_store,
+    )
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                json={"confirm_source_id": "src-teams"},
+            )
+
+        assert response.status_code == 202, response.text
+        assert [call["execution_mode"] for call in provider.calls] == [
+            SourceSyncMode.REBASELINE_PREFLIGHT,
+            SourceSyncMode.REBASELINE_REPLAY,
+        ]
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_rebaseline_rejects_failed_incremental_input_boundary(tmp_path):
+    class UnexpectedReplayProvider(DefaultRuntimeProvider):
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            raise AssertionError("failed incremental inputs must not be replayed")
+
+    database = Database(str(tmp_path / "failed-incremental-rebaseline.db"))
+    cfg = _config(tmp_path)
+    document_store = LocalDocumentStore(cfg.storage.docs_path)
+
+    async def setup() -> None:
+        await _setup_completed_teams_local_replay(
+            database,
+            snapshot_id=None,
+            document_store=document_store,
+            run_status="failed",
+            force_full_sync=False,
+        )
+
+    asyncio.run(setup())
+    app = create_admin_app(
+        db=database,
+        config=cfg,
+        runtime_provider=UnexpectedReplayProvider(),
+        principal_resolver=lambda request: "user-a",
+        document_store=document_store,
+    )
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                json={"confirm_source_id": "src-teams"},
+            )
+
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == "source_lifecycle_terminal_local_replay_required"
     finally:
         asyncio.run(database.close())
 
@@ -1626,6 +2098,108 @@ def test_teams_rebaseline_rejects_unattested_empty_attempt(tmp_path):
         asyncio.run(database.close())
 
 
+def test_document_collection_rebaseline_accepts_completed_empty_snapshot(tmp_path):
+    class EmptyReplayProvider(DefaultRuntimeProvider):
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def run_source_sync(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(last_sync_status="success", error_message=None)
+
+    database = Database(str(tmp_path / "empty-authoritative-snapshot-rebaseline.db"))
+    cfg = _config(tmp_path)
+    document_store = LocalDocumentStore(cfg.storage.docs_path)
+
+    async def setup() -> None:
+        await database.connect()
+        await database.upsert_source(
+            id="src-markdown",
+            type="local_markdown",
+            name="Local Markdown",
+            config_json='{"root":"/tmp/vault","vault_id":"vault-a"}',
+            access_policy="workspace",
+            owner_user_id="user-a",
+        )
+        now = datetime.now(timezone.utc)
+        await database.upsert_document(
+            DocumentRecord(
+                doc_id="local-markdown-old-document",
+                source="src-markdown",
+                source_url="file:///tmp/vault/old.md",
+                title="Old document",
+                space_or_project="vault-a",
+                author=None,
+                last_modified=now,
+                labels=[],
+                version="old-version",
+                content_hash="old-hash",
+                token_count=10,
+                raw_content_uri=None,
+                raw_content_type=None,
+                normalized_content_uri=None,
+                pdf_content_uri=None,
+                last_synced=now,
+            ),
+            require_configured_source=True,
+        )
+        source = await database.get_source("src-markdown")
+        assert source is not None
+        run = await database.enqueue_source_sync_run(
+            source_id="src-markdown",
+            trigger="local_agent",
+            force_full_sync=True,
+            input_snapshot_id="job-markdown:attempt:1",
+            source_config_revision=local_agent_source_config_revision(source),
+        )
+        leased = await database.lease_next_source_sync_run(
+            worker_id="worker-a",
+            lease_seconds=60,
+            now=now,
+        )
+        assert leased is not None
+        assert await database.complete_source_sync_run(
+            run.run_id,
+            worker_id="worker-a",
+            lease_attempt_count=leased.lease_attempt_count,
+            final_state=SyncState(
+                source="src-markdown",
+                last_sync_at=now,
+                last_sync_status="success",
+            ),
+            completed_at=now,
+        )
+
+    asyncio.run(setup())
+    provider = EmptyReplayProvider()
+    app = create_admin_app(
+        db=database,
+        config=cfg,
+        runtime_provider=provider,
+        principal_resolver=lambda request: "user-a",
+        document_store=document_store,
+    )
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/sources/src-markdown/memory-lifecycle/rebaseline",
+                json={"confirm_source_id": "src-markdown"},
+            )
+
+        assert response.status_code == 202, response.text
+        assert [call["execution_mode"] for call in provider.calls] == [
+            SourceSyncMode.REBASELINE_PREFLIGHT,
+            SourceSyncMode.REBASELINE_REPLAY,
+        ]
+        assert all(call["authoritative_snapshot"] is True for call in provider.calls)
+        assert all(
+            call["source"]["config"]["local_agent_package_manifest"] == []
+            for call in provider.calls
+        )
+    finally:
+        asyncio.run(database.close())
+
+
 def test_source_lifecycle_finding_repair_returns_exact_lineage_and_gate_state(
     tmp_path,
     monkeypatch,
@@ -1674,6 +2248,7 @@ def test_source_lifecycle_finding_repair_returns_exact_lineage_and_gate_state(
         observation_id: str,
         evidence_quote: str | None,
         operator_id: str | None,
+        lifecycle_job_id: str | None,
     ):
         assert isinstance(db, FakeRepairStore)
         assert (source_id, finding_id, observation_id) == (
@@ -1683,6 +2258,7 @@ def test_source_lifecycle_finding_repair_returns_exact_lineage_and_gate_state(
         )
         assert evidence_quote == "exact source quote"
         assert operator_id == "user-a"
+        assert lifecycle_job_id
         return LifecycleCutoverFinding(
             id=finding_id,
             source_id=source_id,
@@ -1695,9 +2271,10 @@ def test_source_lifecycle_finding_repair_returns_exact_lineage_and_gate_state(
             source_unit_id="unit-1",
         )
 
-    async def fake_backfill(db, source_id: str):
+    async def fake_backfill(db, source_id: str, *, lifecycle_job_id: str | None):
         assert isinstance(db, FakeRepairStore)
         assert source_id == "src-neutral"
+        assert lifecycle_job_id
         return SimpleNamespace(
             gate_enabled=True,
             finding_count=0,

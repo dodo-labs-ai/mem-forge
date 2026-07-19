@@ -72,6 +72,41 @@ async def test_sync_runtime_wires_structured_llm_client_into_memory_engine(db, t
     assert sync_runtime.structured_llm_client is captured["client"]
     assert sync_runtime.memory_engine.structured_llm_client is captured["client"]
     assert sync_runtime.memory_engine.llm_model == "claude-sonnet-4-20250514"
+    assert sync_runtime.enricher.max_tokens == 8192
+    assert sync_runtime.memory_extractor.max_tokens == 32768
+
+
+@pytest.mark.asyncio
+async def test_direct_sync_runtime_uses_configured_process_document_admission(
+    db,
+    tmp_path,
+    monkeypatch,
+):
+    """Maintenance callers must inherit the same process memory admission as workers."""
+    from memforge import runtime
+
+    monkeypatch.setattr(runtime, "get_chroma_collection", lambda **kwargs: FakeCollection())
+    config = _config(tmp_path)
+    config.sync.max_document_lifecycles = 1
+
+    sync_runtime = await runtime.build_sync_runtime(db, config)
+    second_runtime = await runtime.build_sync_runtime(db, config)
+
+    assert sync_runtime.document_lifecycle_admission is runtime.get_process_document_lifecycle_admission(1)
+    assert second_runtime.document_lifecycle_admission is sync_runtime.document_lifecycle_admission
+
+    explicit_admission = runtime.DocumentLifecycleAdmission(2)
+    explicitly_admitted_runtime = await runtime.build_sync_runtime(
+        db,
+        config,
+        document_lifecycle_admission=explicit_admission,
+    )
+    assert explicitly_admitted_runtime.document_lifecycle_admission is explicit_admission
+
+    unlimited_config = _config(tmp_path)
+    unlimited_config.sync.max_document_lifecycles = 0
+    unlimited_runtime = await runtime.build_sync_runtime(db, unlimited_config)
+    assert unlimited_runtime.document_lifecycle_admission is None
 
 
 @pytest.mark.asyncio
@@ -1830,6 +1865,8 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             self.auth_calls += 1
 
     class FakeRuntime:
+        lifecycle_cycle_id = None
+
         def orchestrator(self):
             return self
 
@@ -1843,12 +1880,22 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             force_full_sync=False,
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
+            source_activity_epoch=None,
+            lifecycle_cycle_id=None,
+            scope_transition_run_id=None,
         ):
-            del authoritative_snapshot, reprocess_doc_ids
+            del (
+                authoritative_snapshot,
+                reprocess_doc_ids,
+                source_activity_epoch,
+                scope_transition_run_id,
+            )
+            self.lifecycle_cycle_id = lifecycle_cycle_id
             await gene.authenticate()
             return SyncState(source=source_id, last_sync_status="success")
 
     gene = FakeGene()
+    fake_runtime = FakeRuntime()
     monkeypatch.setattr(runtime, "create_gene", lambda **_kwargs: gene)
 
     await db.upsert_source(
@@ -1864,10 +1911,12 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
         db=db,
         config=_config(tmp_path),
         source={"id": "src-agent-sessions", "type": "agent_session", "name": "Agent Sessions", "config": {}},
-        runtime=FakeRuntime(),
+        runtime=fake_runtime,
+        lifecycle_cycle_id="source-sync-run-1",
     )
 
     assert gene.auth_calls == 1
+    assert fake_runtime.lifecycle_cycle_id == "source-sync-run-1"
 
 
 @pytest.mark.asyncio
@@ -1947,8 +1996,17 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             force_full_sync=False,
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
+            source_activity_epoch=None,
+            lifecycle_cycle_id=None,
+            scope_transition_run_id=None,
         ):
-            del authoritative_snapshot, reprocess_doc_ids
+            del (
+                authoritative_snapshot,
+                reprocess_doc_ids,
+                source_activity_epoch,
+                lifecycle_cycle_id,
+                scope_transition_run_id,
+            )
             self.gene = gene
             return SyncState(source=source_id, last_sync_status="success")
 
@@ -2411,6 +2469,191 @@ async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_source_scope_update_terminates_durable_pending_run(db, tmp_path, monkeypatch):
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_secrets import prepare_source_config_for_storage
+
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
+    source_id = "src-confluence-pending-rescope"
+    old_config = {
+        "base_url": "https://wiki.example",
+        "sync_mode": "page_tree",
+        "page_tree_root": "5695886009",
+        "include_children": True,
+        "spaces": ["SFPAY"],
+    }
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Pending rescope",
+        config_json=json.dumps(
+            prepare_source_config_for_storage(
+                {**old_config, "pat": "confluence-pat-secret"},
+                secret_fields=("pat",),
+            )
+        ),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    pending = await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="manual",
+    )
+    config = _config(tmp_path)
+    config.sync.worker_enabled = False
+    config.sync.scheduler_enabled = False
+    app = create_admin_app(db=db, config=config)
+
+    with TestClient(app) as client:
+        response = client.put(
+            f"/api/sources/{source_id}",
+            json={
+                "config": {
+                    **old_config,
+                    "page_tree_root": "5625394036",
+                },
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    cancelled = await db.get_source_sync_run(pending.run_id)
+    assert cancelled is not None
+    assert cancelled.status == "failed"
+    assert cancelled.error_message == "cancelled_by_source_change"
+    transition = await db.get_open_projection_scope_transition(source_id)
+    assert transition is not None
+    assert transition.target_scope["page_tree_root"] == "5625394036"
+
+
+@pytest.mark.asyncio
+async def test_jira_advanced_jql_update_terminates_pending_run(db, tmp_path, monkeypatch):
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_secrets import prepare_source_config_for_storage
+
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
+    source_id = "src-jira-advanced-pending"
+    old_config = {
+        "base_url": "https://jira.example",
+        "auth_mode": "pat",
+        "query_mode": "advanced",
+        "jql": "key = PAY-1",
+        "include_comments": True,
+    }
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Advanced pending",
+        config_json=json.dumps(
+            prepare_source_config_for_storage(
+                {**old_config, "pat": "jira-pat-secret"},
+                secret_fields=("pat",),
+            )
+        ),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    pending = await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="manual",
+    )
+    config = _config(tmp_path)
+    config.sync.worker_enabled = False
+    config.sync.scheduler_enabled = False
+    app = create_admin_app(db=db, config=config)
+
+    with TestClient(app) as client:
+        response = client.put(
+            f"/api/sources/{source_id}",
+            json={"config": {**old_config, "jql": "key = PAY-2"}},
+        )
+
+    assert response.status_code == 200, response.text
+    cancelled = await db.get_source_sync_run(pending.run_id)
+    assert cancelled is not None
+    assert cancelled.status == "failed"
+    transition = await db.get_open_projection_scope_transition(source_id)
+    assert transition is not None
+    assert transition.previous_scope["jql"] == "key = PAY-1"
+    assert transition.target_scope["jql"] == "key = PAY-2"
+
+
+@pytest.mark.asyncio
+async def test_repeated_source_scope_update_creates_a_new_transition_cycle(
+    db,
+    tmp_path,
+    monkeypatch,
+):
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_projection import ProjectionCoverage
+    from memforge.source_secrets import prepare_source_config_for_storage
+
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
+    source_id = "src-confluence-repeated-rescope"
+
+    def config(root: str) -> dict[str, object]:
+        return {
+            "base_url": "https://wiki.example",
+            "sync_mode": "page_tree",
+            "page_tree_root": root,
+            "include_children": True,
+            "spaces": ["SFPAY"],
+        }
+
+    stored_config = prepare_source_config_for_storage(
+        {**config("root-a"), "pat": "confluence-pat-secret"},
+        secret_fields=("pat",),
+    )
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Repeated rescope",
+        config_json=json.dumps(stored_config),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    async def complete_open_transition(run_id: str) -> str:
+        transition = await db.get_open_projection_scope_transition(source_id)
+        assert transition is not None
+        await db.start_projection_scope_transition(transition.id, run_id=run_id)
+        await db.complete_projection_scope_transition(
+            transition.id,
+            run_id=run_id,
+            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+        )
+        return transition.id
+
+    with TestClient(app) as client:
+        first = client.put(
+            f"/api/sources/{source_id}",
+            json={"name": "Repeated rescope", "config": config("root-b")},
+        )
+    assert first.status_code == 200
+    first_a_to_b = await complete_open_transition("run-a-to-b-1")
+
+    with TestClient(app) as client:
+        reverse = client.put(
+            f"/api/sources/{source_id}",
+            json={"name": "Repeated rescope", "config": config("root-a")},
+        )
+    assert reverse.status_code == 200
+    await complete_open_transition("run-b-to-a")
+
+    with TestClient(app) as client:
+        repeated = client.put(
+            f"/api/sources/{source_id}",
+            json={"name": "Repeated rescope", "config": config("root-b")},
+        )
+    assert repeated.status_code == 200
+    second_a_to_b = await db.get_open_projection_scope_transition(source_id)
+
+    assert second_a_to_b is not None
+    assert second_a_to_b.id != first_a_to_b
+    assert len(await db.list_projection_scope_transitions(source_id)) == 3
+
+
+@pytest.mark.asyncio
 async def test_manual_sync_returns_conflict_during_lifecycle_maintenance(
     db,
     tmp_path,
@@ -2622,6 +2865,7 @@ async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds
 
 @pytest.mark.asyncio
 async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_path):
+    from memforge.local_agent.source_contract import local_agent_source_config_revision
     from memforge.server.admin_api import create_admin_app
     from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 
@@ -2639,7 +2883,7 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
 
     class FakeSyncService:
         def __init__(self):
-            self.enqueued: list[tuple[str, str, bool]] = []
+            self.enqueued: list[dict[str, object]] = []
 
         def is_running(self, source_id: str):
             return False
@@ -2653,9 +2897,19 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
             workspace_id: str = "default",
             input_snapshot_id: str | None = None,
             source_config_revision: str | None = None,
+            predecessor_activity_id: str | None = None,
         ):
-            del workspace_id, input_snapshot_id, source_config_revision
-            self.enqueued.append((enqueued_source_id, trigger, force_full_sync))
+            del workspace_id
+            self.enqueued.append(
+                {
+                    "source_id": enqueued_source_id,
+                    "trigger": trigger,
+                    "force_full_sync": force_full_sync,
+                    "input_snapshot_id": input_snapshot_id,
+                    "source_config_revision": source_config_revision,
+                    "predecessor_activity_id": predecessor_activity_id,
+                }
+            )
 
             class Run:
                 run_id = "run-local-process"
@@ -2696,7 +2950,18 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
         "status": "pending",
         "coalesced": False,
     }
-    assert fake_sync_service.enqueued == [(source_id, "local_agent", True)]
+    assert fake_sync_service.enqueued == [
+        {
+            "source_id": source_id,
+            "trigger": "local_agent",
+            "force_full_sync": True,
+            "input_snapshot_id": "test-job:attempt:1",
+            "source_config_revision": local_agent_source_config_revision(
+                await db.get_source(source_id)
+            ),
+            "predecessor_activity_id": "test-job",
+        }
+    ]
 
 
 @pytest.mark.asyncio

@@ -145,6 +145,12 @@ class SyncRuntime:
     memory_observer: SyncMemoryObserver | None = None
     orchestrator_factory: Callable[["SyncRuntime"], GeneSyncOrchestrator] | None = None
 
+    def __post_init__(self) -> None:
+        if self.document_lifecycle_admission is None:
+            self.document_lifecycle_admission = get_process_document_lifecycle_admission(
+                max(0, int(self.config.sync.max_document_lifecycles))
+            )
+
     def orchestrator(self) -> GeneSyncOrchestrator:
         if self.orchestrator_factory is not None:
             return self.orchestrator_factory(self)
@@ -207,6 +213,8 @@ class RuntimeProvider(Protocol):
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_job_id: str | None = None,
+        lifecycle_cycle_id: str | None = None,
+        scope_transition_run_id: str | None = None,
     ) -> SyncState: ...
 
 
@@ -265,6 +273,8 @@ class DefaultRuntimeProvider:
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_job_id: str | None = None,
+        lifecycle_cycle_id: str | None = None,
+        scope_transition_run_id: str | None = None,
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -277,6 +287,8 @@ class DefaultRuntimeProvider:
             reprocess_doc_ids=reprocess_doc_ids,
             execution_mode=execution_mode,
             lifecycle_job_id=lifecycle_job_id,
+            lifecycle_cycle_id=lifecycle_cycle_id,
+            scope_transition_run_id=scope_transition_run_id,
         )
 
 
@@ -551,7 +563,7 @@ async def build_sync_runtime(
         model=llm.enrichment_model,
         base_url=llm.enrichment_base_url or None,
         api_key=llm.enrichment_api_key or None,
-        max_tokens=config.llm.enrichment_max_tokens,
+        max_tokens=config.llm.memory_extraction_max_tokens,
         request_timeout_s=llm.request_timeout_s,
         structured_llm_client=structured_llm_client,
     )
@@ -627,6 +639,8 @@ async def run_source_sync(
     reprocess_doc_ids: frozenset[str] | None = None,
     execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
     lifecycle_job_id: str | None = None,
+    lifecycle_cycle_id: str | None = None,
+    scope_transition_run_id: str | None = None,
 ) -> SyncState:
     await authorize_source_sync_maintenance(
         db,
@@ -634,16 +648,18 @@ async def run_source_sync(
         lifecycle_job_id=lifecycle_job_id,
     )
     activity_id = None
+    source_activity_epoch: int | None = None
     heartbeat_task: asyncio.Task[None] | None = None
     if lifecycle_job_id is None:
         activity_id = f"source-sync-{uuid.uuid4().hex}"
         try:
-            await db.acquire_source_activity(
+            activity_lease = await db.acquire_source_activity(
                 activity_id=activity_id,
                 source_id=str(source["id"]),
                 kind=SourceActivityKind.SYNC,
                 lease_seconds=300,
             )
+            source_activity_epoch = activity_lease.epoch
         except SourceActivityConflict as exc:
             raise SourceLifecycleMaintenanceError(str(exc)) from exc
 
@@ -656,6 +672,11 @@ async def run_source_sync(
                 )
 
         heartbeat_task = asyncio.create_task(heartbeat_activity())
+    else:
+        source_activity_epoch = await db.get_source_activity_epoch(str(source["id"]))
+    lifecycle_cycle_id = lifecycle_cycle_id or lifecycle_job_id or activity_id
+    if lifecycle_cycle_id is None:
+        lifecycle_cycle_id = f"source-sync-cycle-{uuid.uuid4().hex}"
     try:
         runtime = runtime or await build_sync_runtime(db, config)
         secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
@@ -674,6 +695,9 @@ async def run_source_sync(
             "force_full_sync": force_full_sync,
             "authoritative_snapshot": authoritative_snapshot,
             "reprocess_doc_ids": reprocess_doc_ids,
+            "source_activity_epoch": source_activity_epoch,
+            "lifecycle_cycle_id": lifecycle_cycle_id,
+            "scope_transition_run_id": scope_transition_run_id,
         }
         if execution_mode is not SourceSyncMode.NORMAL:
             sync_kwargs["execution_mode"] = execution_mode
@@ -947,6 +971,10 @@ class SourceSyncWorker:
                 progress_callback=None,
                 force_full_sync=run.force_full_sync,
                 authoritative_snapshot=authoritative_collection,
+                lifecycle_cycle_id=(
+                    f"{run.run_id}:attempt:{run.lease_attempt_count}"
+                ),
+                scope_transition_run_id=run.run_id,
             )
             if final_state is None:
                 final_state = SyncState(
@@ -972,6 +1000,19 @@ class SourceSyncWorker:
                 if not failed:
                     raise SourceSyncLeaseLost(f"source sync lease lost before failure update for run {run.run_id}")
                 return run
+            try:
+                await runtime.memory_store.attempt_lifecycle_vector_delivery(
+                    source_id=run.source_id
+                )
+            except Exception:
+                # The relational lifecycle graph is already authoritative.
+                # Delivery stays durable in the outbox and must never turn a
+                # successful source run into a failed extraction transaction.
+                logger.exception(
+                    "Source sync completed with lifecycle vector delivery still pending "
+                    "for source %s",
+                    run.source_id,
+                )
             completed = await self.db.complete_source_sync_run(
                 run.run_id,
                 worker_id=self.worker_id,
@@ -1069,6 +1110,7 @@ class SyncService:
         workspace_id: str = "default",
         input_snapshot_id: str | None = None,
         source_config_revision: str | None = None,
+        predecessor_activity_id: str | None = None,
     ) -> SourceSyncRun:
         source = await self._ensure_source_can_sync(source_id)
         current_config_revision = (
@@ -1086,6 +1128,7 @@ class SyncService:
             force_full_sync=force_full_sync,
             input_snapshot_id=input_snapshot_id,
             source_config_revision=effective_config_revision,
+            predecessor_activity_id=predecessor_activity_id,
         )
 
     async def start_source(self, source_id: str, *, force_full_sync: bool = False) -> asyncio.Task:
@@ -1175,6 +1218,10 @@ class SyncService:
             except asyncio.CancelledError:
                 pass
         self.progress.pop(source_id, None)
+        await self.db.cancel_pending_source_sync_run(
+            source_id=source_id,
+            error_message="cancelled_by_source_change",
+        )
 
     async def shutdown(self) -> None:
         source_ids = list(self.tasks)

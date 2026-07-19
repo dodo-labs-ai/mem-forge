@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import TYPE_CHECKING
@@ -104,15 +104,39 @@ def _iter_prompt_sized_pair_batches(
         end = min(len(pairs), start + batch_size)
         while end > start:
             batch = pairs[start:end]
-            prompt = CONTRADICTION_PROMPT.format(
-                pairs_json=_pairs_json(batch, pair_index_offset=start)
-            )
+            prompt = CONTRADICTION_PROMPT.format(pairs_json=_pairs_json(batch, pair_index_offset=start))
             if len(prompt) <= MAX_CONTRADICTION_PROMPT_CHARS or len(batch) == 1:
                 batches.append((start, batch))
                 break
             end = start + max(1, len(batch) // 2)
         start = end
     return batches
+
+
+def _validated_batch_decisions(
+    decisions: list,
+    *,
+    batch_start: int,
+    batch_size: int,
+) -> list[dict]:
+    serialized = [decision.model_dump() for decision in decisions]
+    expected_indices = set(range(batch_start, batch_start + batch_size))
+    actual_indices = [int(decision["pair_index"]) for decision in serialized]
+    index_counts = Counter(actual_indices)
+    duplicate_indices = {index for index, count in index_counts.items() if count > 1}
+    actual_index_set = set(actual_indices)
+    missing_indices = expected_indices - actual_index_set
+    unexpected_indices = actual_index_set - expected_indices
+    if len(serialized) != batch_size or duplicate_indices or missing_indices or unexpected_indices:
+        raise StructuredLlmError(
+            "contradiction decision coverage invalid: "
+            f"expected_count={batch_size}, "
+            f"actual_count={len(serialized)}, "
+            f"missing_count={len(missing_indices)}, "
+            f"duplicate_count={len(duplicate_indices)}, "
+            f"unexpected_count={len(unexpected_indices)}"
+        )
+    return serialized
 
 
 async def detect_cross_doc_contradictions(
@@ -224,7 +248,13 @@ async def detect_cross_doc_contradictions(
                 max_tokens=DEFAULT_ENRICHMENT_MAX_TOKENS,
                 model=llm_model,
             )
-            decisions.extend(decision.model_dump() for decision in response.decisions)
+            decisions.extend(
+                _validated_batch_decisions(
+                    response.decisions,
+                    batch_start=batch_start,
+                    batch_size=len(batch),
+                )
+            )
         classifications = {
             "contradiction": 0,
             "temporal": 0,
@@ -471,11 +501,7 @@ async def _build_cross_doc_relation_outcome_bundles(
             )
             if classification not in {"contradiction", "temporal"}:
                 continue
-            relation_type = (
-                RelationType.CONTRADICTS
-                if classification == "contradiction"
-                else RelationType.REFINES
-            )
+            relation_type = RelationType.CONTRADICTS if classification == "contradiction" else RelationType.REFINES
             decision = RelationDecision(
                 candidate_memory_id=incumbent.id,
                 relation_type=relation_type,

@@ -14,7 +14,16 @@ from memforge.models import slugify
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DocumentStore", "LocalDocumentStore", "StoredDocumentArtifact"]
+__all__ = [
+    "ArtifactNotOwnedError",
+    "DocumentStore",
+    "LocalDocumentStore",
+    "StoredDocumentArtifact",
+]
+
+
+class ArtifactNotOwnedError(ValueError):
+    """The requested artifact URI is outside this store's ownership boundary."""
 
 
 @dataclass(frozen=True)
@@ -166,5 +175,5 @@ class LocalDocumentStore:
         path = candidate.resolve()
         docs_root = self._root.expanduser().resolve()
         if path != docs_root and docs_root not in path.parents:
-            raise ValueError("artifact URI is outside the document store")
+            raise ArtifactNotOwnedError("artifact URI is outside the document store")
         path.unlink(missing_ok=True)

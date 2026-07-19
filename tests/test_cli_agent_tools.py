@@ -3,6 +3,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -938,6 +939,47 @@ def test_local_agent_cloud_github_sync_pushes_remote_gh_scope(monkeypatch):
     assert len(process_calls) == 1
     assert process_calls[0][1]["source_id"] == "src-from-cloud"
     assert process_calls[0][1]["sync_snapshot_id"] == "laj-sync:attempt:1"
+
+
+def test_local_agent_cloud_github_sync_reports_failed_paths_for_retry_diagnostics(monkeypatch):
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
+    monkeypatch.setattr(main.subprocess, "run", _fake_github_remote_run)
+
+    def github_content(_repo, _ref, relative_path):
+        if relative_path.endswith("Überblick.md"):
+            raise click.ClickException("temporary GitHub API failure")
+        return b"# Durable document\n\nBody"
+
+    monkeypatch.setattr(main, "_github_content", github_content)
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-sync-failed-path",
+            "attempt_count": 1,
+            "workspace_id": "ws-from-job-payload",
+            "operation": "github_repo_sync",
+            "source_id": "src-from-cloud",
+            "payload": {
+                "repo_url": "https://github.wdf.sap.corp/example/public-howtos",
+                "ref": "main",
+                "include_extensions": ["md"],
+                "limit": 2,
+            },
+        },
+        _cloud_test_client(),
+    )
+
+    assert payload["counts"] == {"selected": 3, "pushed": 2, "failed": 1}
+    assert payload["retryable"] is True
+    assert payload["error"] == (
+        "1 document(s) failed to push: "
+        "Payroll Processing V2/Überblick.md: temporary GitHub API failure"
+    )
+    assert not [
+        call for call in FakeToolClient.calls
+        if call[0] == "start_source_processing"
+    ]
 
 
 def test_local_agent_cloud_github_sync_requires_job_workspace(monkeypatch):
@@ -2125,6 +2167,141 @@ def test_local_agent_cloud_teams_sync_fails_closed_when_projection_inventory_is_
     assert not [
         call for call in FakeToolClient.calls if call[0] in {"push_teams_window_package", "start_source_processing"}
     ]
+
+
+def test_local_agent_cloud_teams_sync_quarantines_only_opaque_legacy_inventory(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from memforge.local_agent.teams_ledger import build_teams_window_id
+
+    conversation_id = "19:conversation@thread.tacv2"
+    source_id = "src-teams"
+    current_window_id = build_teams_window_id(
+        source_id=source_id,
+        conversation_id=conversation_id,
+        root_or_anchor_message_id="1783500000000",
+        window_type="thread",
+    )
+
+    async def fake_collect(job, *, source_id, limit, report_progress=None):
+        return {
+            "documents": [
+                {
+                    "conversation_id": conversation_id,
+                    "root_message_id": "1783500000000",
+                    "window_id": current_window_id,
+                    "window_type": "thread",
+                    "revision_hash": "sha256:revision-1",
+                    "title": "Thread window",
+                    "source_url": "https://teams.example.test/window",
+                    "last_modified": "2026-07-08T09:24:57Z",
+                    "raw_payload": {
+                        "messages": [
+                            {"id": "1783500000000", "content": "Thread window"}
+                        ]
+                    },
+                    "raw_hash": "sha256:raw-1",
+                    "message_count": 1,
+                }
+            ],
+            "poll_audits": [
+                {
+                    "raw_conversation_id": conversation_id,
+                    "pagination_complete": True,
+                    "access_probe_status": "ok",
+                    "stop_reason": "no_backward_link",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        main,
+        "_collect_teams_documents_from_cloud_job",
+        fake_collect,
+        raising=False,
+    )
+    FakeToolClient.reset({})
+    opaque_document_id = "teams-src-teams-legacy-opaque-document"
+    reconstructed_document_id = "teams-src-teams-reconstructed-document"
+    FakeToolClient.projection_inventory_response = {
+        "units": [
+            {
+                "source_unit_id": "unit-opaque",
+                "unit_type": "teams_window",
+                "provider_key": opaque_document_id,
+                "locator": {
+                    "conversation_id": conversation_id,
+                    "document_id": opaque_document_id,
+                    "window_id": opaque_document_id,
+                },
+            },
+            {
+                "source_unit_id": "unit-reconstructed",
+                "unit_type": "teams_window",
+                "provider_key": reconstructed_document_id,
+                "locator": {
+                    "conversation_id": conversation_id,
+                    "document_id": reconstructed_document_id,
+                    "window_id": current_window_id,
+                    "observed_from": "2026-07-08T09:00:00+00:00",
+                    "observed_to": "2026-07-08T09:30:00+00:00",
+                },
+            },
+        ]
+    }
+
+    result = main._run_cloud_teams_sync_job(
+        {
+            "job_id": "laj-teams-legacy-inventory",
+            "workspace_id": "ws-from-cloud",
+            "operation": "teams_sync",
+            "attempt_count": 1,
+            "source_id": source_id,
+            "payload": {
+                "conversation_ids": [conversation_id],
+                "audit_log_path": str(tmp_path / "teams-audit.jsonl"),
+                "force_full_sync": True,
+            },
+        },
+        _cloud_test_client(),
+    )
+
+    assert "error" not in result
+    assert result["counts"] == {
+        "selected": 1,
+        "pushed": 1,
+        "failed": 0,
+        "skipped_existing": 0,
+        "polls": 1,
+        "inventory_findings": 1,
+    }
+    assert result["inventory_findings"] == [
+        {
+            "source_unit_id": "unit-opaque",
+            "reason": "canonical_teams_window_identity_unavailable",
+        }
+    ]
+    pushes = [
+        call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"
+    ]
+    assert [call[1]["window_id"] for call in pushes] == [current_window_id]
+    assert any(
+        call[0] == "start_source_processing" for call in FakeToolClient.calls
+    )
+    audit_events = [
+        json.loads(line)
+        for line in (tmp_path / "teams-audit.jsonl").read_text().splitlines()
+    ]
+    assert {
+        "event": "teams_projection_inventory_finding",
+        "source_unit_id": "unit-opaque",
+        "reason": "canonical_teams_window_identity_unavailable",
+    }.items() <= next(
+        event
+        for event in audit_events
+        if event.get("event") == "teams_projection_inventory_finding"
+    ).items()
 
 
 def test_local_agent_cloud_teams_sync_replays_revision_until_server_projection_is_confirmed(

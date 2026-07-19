@@ -27,6 +27,7 @@ from memforge.local_agent.source_contract import (
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
     local_agent_sync_operation,
+    source_sync_input_metadata_with_artifact_attestation,
 )
 from memforge.storage.admin_source import is_pause_only_source_update
 from memforge.source_activity import (
@@ -88,6 +89,7 @@ from memforge.memory.evidence import (
 )
 from memforge.memory.lifecycle_plan import (
     build_unprovable_cutover_resolution,
+    ClaimIdentityPolicy,
     CutoverFindingReason,
     CutoverFindingStatus,
     LifecycleCutoverFinding,
@@ -372,6 +374,8 @@ def _source_sync_run_from_row(row: Mapping[str, Any], *, coalesced: bool = False
         ),
         source_config_revision=data.get("source_config_revision"),
         rerun_source_config_revision=data.get("rerun_source_config_revision"),
+        predecessor_activity_id=data.get("predecessor_activity_id"),
+        rerun_predecessor_activity_id=data.get("rerun_predecessor_activity_id"),
         coalesced=coalesced,
         lease_owner=data.get("lease_owner"),
         lease_expires_at=_parse_dt(data.get("lease_expires_at")),
@@ -1228,6 +1232,8 @@ CREATE TABLE IF NOT EXISTS source_sync_runs (
     rerun_input_generation_watermark INTEGER,
     source_config_revision TEXT,
     rerun_source_config_revision TEXT,
+    predecessor_activity_id TEXT,
+    rerun_predecessor_activity_id TEXT,
     lease_owner             TEXT,
     lease_expires_at        TEXT,
     lease_attempt_count     INTEGER NOT NULL DEFAULT 0,
@@ -1398,7 +1404,6 @@ CREATE INDEX IF NOT EXISTS idx_agent_concepts_owner_repo ON agent_concepts(owner
 CREATE INDEX IF NOT EXISTS idx_agent_claims_concept ON agent_claims(concept_id);
 CREATE INDEX IF NOT EXISTS idx_agent_claims_memory ON agent_claims(memory_id);
 CREATE INDEX IF NOT EXISTS idx_relation_runs_result_memory ON relation_runs(result_memory_id);
-
 -- Cross-document contradiction tracking
 CREATE TABLE IF NOT EXISTS memory_contradictions (
     memory_id_a    TEXT NOT NULL REFERENCES memories(id),
@@ -2753,6 +2758,51 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ON source_activity_leases(source_id, lease_until)",
         ],
     ),
+    (
+        59,
+        "Track source sync predecessor activity",
+        [
+            "ALTER TABLE source_sync_runs ADD COLUMN predecessor_activity_id TEXT",
+            "ALTER TABLE source_sync_runs ADD COLUMN rerun_predecessor_activity_id TEXT",
+        ],
+    ),
+    (
+        60,
+        "Add immutable exact revision replay ledgers",
+        [
+            """CREATE TABLE IF NOT EXISTS lifecycle_replay_ledgers (
+                lifecycle_plan_id TEXT PRIMARY KEY REFERENCES lifecycle_plans(id) ON DELETE CASCADE,
+                claim_count INTEGER NOT NULL CHECK (claim_count >= 0),
+                created_at TEXT NOT NULL,
+                invalidated_at TEXT,
+                invalidation_reason TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS lifecycle_replay_claims (
+                lifecycle_plan_id TEXT NOT NULL REFERENCES lifecycle_replay_ledgers(lifecycle_plan_id) ON DELETE CASCADE,
+                memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                content_hash TEXT NOT NULL,
+                evidence_reference_ids_json TEXT NOT NULL,
+                access_context_hash TEXT NOT NULL,
+                PRIMARY KEY (lifecycle_plan_id, memory_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_lifecycle_plans_exact_replay
+                ON lifecycle_plans(
+                    source_id, source_unit_id, target_unit_revision_id, status
+                )""",
+            """CREATE INDEX IF NOT EXISTS idx_lifecycle_replay_claims_memory
+                ON lifecycle_replay_claims(memory_id)""",
+        ],
+    ),
+    (
+        61,
+        "Remove exact revision replay ledgers",
+        [
+            "DROP INDEX IF EXISTS idx_lifecycle_replay_claims_memory",
+            "DROP INDEX IF EXISTS idx_lifecycle_plans_exact_replay",
+            "DROP TABLE IF EXISTS lifecycle_replay_claims",
+            "DROP TABLE IF EXISTS lifecycle_replay_ledgers",
+        ],
+    ),
 ]
 
 
@@ -3256,14 +3306,20 @@ class Database:
         doc: DocumentRecord,
         *,
         require_configured_source: bool = False,
+        source_activity: SourceActivityLease | None = None,
     ) -> None:
         async with self._write_lock:
-            await self._assert_document_source_writable_unlocked(
-                doc.source,
-                require_configured_source=require_configured_source,
-            )
-            await self.db.execute(
-                """INSERT INTO documents (
+            try:
+                await self._assert_document_source_writable_unlocked(
+                    doc.source,
+                    require_configured_source=require_configured_source,
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    doc.source,
+                    source_activity,
+                )
+                await self.db.execute(
+                    """INSERT INTO documents (
                     doc_id, source, source_url, title, space_or_project,
                     author, last_modified, labels, version, content_hash,
                     token_count, raw_content_uri, raw_content_type,
@@ -3283,7 +3339,7 @@ class Database:
                     last_synced=excluded.last_synced,
                     client=COALESCE(excluded.client, documents.client),
                     updated_at=excluded.updated_at""",
-                (
+                    (
                     doc.doc_id,
                     doc.source,
                     doc.source_url,
@@ -3302,10 +3358,17 @@ class Database:
                     doc.last_synced.isoformat(),
                     doc.client,
                     _now_iso(),
-                ),
-            )
-            await self._refresh_metadata_fts_for_doc_unlocked(doc.doc_id)
-            await self.db.commit()
+                    ),
+                )
+                await self._refresh_metadata_fts_for_doc_unlocked(doc.doc_id)
+                await self._assert_source_activity_fence_unlocked(
+                    doc.source,
+                    source_activity,
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def get_document(self, doc_id: str) -> DocumentRecord | None:
         async with self.db.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,)) as cursor:
@@ -3911,6 +3974,18 @@ class Database:
                     (doc_id,),
                 ) as cursor:
                     document_row = await cursor.fetchone()
+                async with self.db.execute(
+                    "SELECT 1 FROM memory_support_assertions msa "
+                    "JOIN evidence_references er ON er.id = msa.evidence_reference_id "
+                    "JOIN evidence_units eu ON eu.id = er.evidence_unit_id "
+                    "WHERE msa.active = 1 AND eu.doc_id = ? LIMIT 1",
+                    (doc_id,),
+                ) as cursor:
+                    active_projected_support = await cursor.fetchone()
+                if active_projected_support is not None:
+                    raise ValueError(
+                        "active projected support remains; apply a Lifecycle Plan before deleting the document"
+                    )
                 if document_row is not None:
                     source_id = str(document_row["source"])
                     for artifact_uri in dict.fromkeys(
@@ -4137,6 +4212,7 @@ class Database:
         self,
         projection: SourceProjection,
         *,
+        expected_source_activity_epoch: int | None = None,
         _manage_transaction: bool = True,
     ) -> None:
         """Persist one complete provider-neutral projection atomically.
@@ -4159,6 +4235,18 @@ class Database:
                     "UPDATE sources SET status = status WHERE id = ?",
                     (projection.source_id,),
                 )
+                if expected_source_activity_epoch is not None:
+                    async with self.db.execute(
+                        "SELECT activity_epoch FROM sources WHERE id = ?",
+                        (projection.source_id,),
+                    ) as cursor:
+                        source_epoch = await cursor.fetchone()
+                    current_epoch = int(source_epoch["activity_epoch"] or 0)
+                    if current_epoch != expected_source_activity_epoch:
+                        raise SourceActivityConflict(
+                            "source activity epoch changed: "
+                            f"expected {expected_source_activity_epoch}, current {current_epoch}"
+                        )
                 async with self.db.execute(
                     "SELECT payload_hash FROM source_projection_runs WHERE id = ?",
                     (projection.run_id,),
@@ -4887,11 +4975,59 @@ class Database:
             audited_at=row["audited_at"],
         )
 
-    async def enable_lifecycle_gate(self, source_id: str) -> LifecycleGate:
+    async def _assert_source_activity_fence_unlocked(
+        self,
+        source_id: str,
+        source_activity: SourceActivityLease | None,
+    ) -> None:
+        if source_activity is None:
+            return
+        if source_activity.source_id != source_id:
+            raise SourceActivityConflict("source activity fence source mismatch")
+        source_lock = await self.db.execute(
+            "UPDATE sources SET status = status WHERE id = ?",
+            (source_id,),
+        )
+        if source_lock.rowcount != 1:
+            raise SourceActivityConflict(f"Source not found: {source_id}")
+        async with self.db.execute(
+            "SELECT activity_epoch FROM sources WHERE id = ?",
+            (source_id,),
+        ) as cursor:
+            source = await cursor.fetchone()
+        async with self.db.execute(
+            """SELECT source_id, capability, epoch, lease_until
+               FROM source_activity_leases WHERE id = ?""",
+            (source_activity.id,),
+        ) as cursor:
+            lease = await cursor.fetchone()
+        if (
+            source is None
+            or int(source["activity_epoch"] or 0) != source_activity.epoch
+            or lease is None
+            or str(lease["source_id"]) != source_id
+            or lease["capability"] != source_activity.capability
+            or int(lease["epoch"]) != source_activity.epoch
+            or str(lease["lease_until"]) <= _now_iso()
+        ):
+            raise SourceActivityConflict(
+                f"source activity fence is not current: {source_activity.id}"
+            )
+
+    async def enable_lifecycle_gate(
+        self,
+        source_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> LifecycleGate:
         """Enable destructive lifecycle only after the durable audit closes."""
 
         async with self._write_lock:
             try:
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 async with self.db.execute(
                     """SELECT COUNT(*) AS count
                        FROM lifecycle_cutover_findings
@@ -4930,35 +5066,87 @@ class Database:
                         updated_at=excluded.updated_at""",
                     (source_id, now, now, now),
                 )
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
                 raise
         return await self.get_lifecycle_gate(source_id)
 
-    async def gate_destructive_lifecycle(self, source_id: str, *, reason: str) -> LifecycleGate:
+    async def gate_destructive_lifecycle(
+        self,
+        source_id: str,
+        *,
+        reason: str,
+        source_activity: SourceActivityLease | None = None,
+    ) -> LifecycleGate:
         now = _now_iso()
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO source_lifecycle_gates (
-                    source_id, state, reason, audited_at, enabled_at, updated_at
-                ) VALUES (?, 'gated', ?, ?, NULL, ?)
-                ON CONFLICT(source_id) DO UPDATE SET
-                    state='gated', reason=excluded.reason,
-                    audited_at=excluded.audited_at, updated_at=excluded.updated_at""",
-                (source_id, reason, now, now),
-            )
-            await self.db.commit()
+            try:
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
+                await self.db.execute(
+                    """INSERT INTO source_lifecycle_gates (
+                        source_id, state, reason, audited_at, enabled_at, updated_at
+                    ) VALUES (?, 'gated', ?, ?, NULL, ?)
+                    ON CONFLICT(source_id) DO UPDATE SET
+                        state='gated', reason=excluded.reason,
+                        audited_at=excluded.audited_at, updated_at=excluded.updated_at""",
+                    (source_id, reason, now, now),
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
         return await self.get_lifecycle_gate(source_id)
 
     async def upsert_lifecycle_cutover_finding(
         self,
         finding: LifecycleCutoverFinding,
+        *,
+        source_activity: SourceActivityLease | None = None,
     ) -> None:
+        if finding.status is not CutoverFindingStatus.OPEN:
+            raise ValueError("lifecycle finding upsert accepts only open findings")
         now = _now_iso()
         created_at = finding.created_at or now
         async with self._write_lock:
             try:
+                await self._assert_source_activity_fence_unlocked(
+                    finding.source_id,
+                    source_activity,
+                )
+                async with self.db.execute(
+                    """SELECT source_id, memory_id, reason, status
+                       FROM lifecycle_cutover_findings WHERE id = ?""",
+                    (finding.id,),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if existing is not None and (
+                    str(existing["source_id"]) != finding.source_id
+                    or str(existing["memory_id"]) != finding.memory_id
+                ):
+                    raise ValueError("lifecycle finding identity mismatch")
+                if (
+                    existing is not None
+                    and CutoverFindingStatus(str(existing["status"]))
+                    is CutoverFindingStatus.RESOLVED
+                ):
+                    await self._assert_source_activity_fence_unlocked(
+                        finding.source_id,
+                        source_activity,
+                    )
+                    await self.db.commit()
+                    return
                 await self.db.execute(
                     """INSERT INTO lifecycle_cutover_findings (
                         id, source_id, memory_id, reason, status,
@@ -4966,6 +5154,7 @@ class Database:
                         observation_id, source_unit_id, created_at, updated_at, resolved_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
+                        reason=excluded.reason,
                         available_provenance_json=excluded.available_provenance_json,
                         mapping_attempt_json=excluded.mapping_attempt_json,
                         updated_at=excluded.updated_at
@@ -4993,6 +5182,10 @@ class Database:
                         state='gated', reason=excluded.reason,
                         audited_at=excluded.audited_at, updated_at=excluded.updated_at""",
                     (finding.source_id, now, now),
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    finding.source_id,
+                    source_activity,
                 )
                 await self.db.commit()
             except Exception:
@@ -5033,6 +5226,28 @@ class Database:
         self,
         job: LifecycleBackfillJob,
     ) -> LifecycleBackfillJob:
+        return await self._create_lifecycle_backfill_job(
+            job,
+            cancel_active_sync=False,
+        )
+
+    async def create_source_rebaseline_job(
+        self,
+        job: LifecycleBackfillJob,
+    ) -> LifecycleBackfillJob:
+        """Atomically fence active sync work and admit destructive maintenance."""
+
+        return await self._create_lifecycle_backfill_job(
+            job,
+            cancel_active_sync=True,
+        )
+
+    async def _create_lifecycle_backfill_job(
+        self,
+        job: LifecycleBackfillJob,
+        *,
+        cancel_active_sync: bool,
+    ) -> LifecycleBackfillJob:
         if job.status is not LifecycleBackfillJobStatus.QUEUED:
             raise ValueError("new lifecycle backfill job must be queued")
         now = _now_iso()
@@ -5051,7 +5266,7 @@ class Database:
                     (job.source_id,),
                 ) as cursor:
                     active_run = await cursor.fetchone()
-                if active_run is not None:
+                if active_run is not None and not cancel_active_sync:
                     raise ValueError(
                         f"source sync run already active: {active_run['run_id']}"
                     )
@@ -5115,6 +5330,21 @@ class Database:
                     raise ValueError(
                         f"source lifecycle job already active: {active['id']}"
                     )
+                if active_run is not None:
+                    await self._cancel_source_sync_run_for_maintenance_unlocked(
+                        str(active_run["run_id"]),
+                        maintenance_job_id=job.id,
+                    )
+                if cancel_active_sync:
+                    # A normal sync holds this lease in addition to its durable
+                    # SourceSyncRun lease.  Revoking only SYNC leaves collection
+                    # and agent-patch state machines independent; the epoch bump
+                    # below fences any already-computed stale lifecycle commit.
+                    await self.db.execute(
+                        "DELETE FROM source_activity_leases "
+                        "WHERE source_id = ? AND kind = ?",
+                        (job.source_id, SourceActivityKind.SYNC.value),
+                    )
                 await self._acquire_source_activity_unlocked(
                     activity_id=job.id,
                     source_id=job.source_id,
@@ -5137,6 +5367,64 @@ class Database:
         stored = await self.get_lifecycle_backfill_job(job.id)
         assert stored is not None
         return stored
+
+    async def _cancel_source_sync_run_for_maintenance_unlocked(
+        self,
+        run_id: str,
+        *,
+        maintenance_job_id: str,
+    ) -> None:
+        now = _now_iso()
+        cursor = await self.db.execute(
+            """UPDATE source_sync_runs
+               SET status = 'failed',
+                   input_snapshot_id = CASE
+                       WHEN rerun_requested = 1
+                       THEN COALESCE(rerun_input_snapshot_id, input_snapshot_id)
+                       ELSE input_snapshot_id
+                   END,
+                   input_generation_watermark = CASE
+                       WHEN rerun_requested = 1
+                       THEN COALESCE(
+                           rerun_input_generation_watermark,
+                           input_generation_watermark
+                       )
+                       ELSE input_generation_watermark
+                   END,
+                   source_config_revision = CASE
+                       WHEN rerun_requested = 1
+                       THEN COALESCE(rerun_source_config_revision, source_config_revision)
+                       ELSE source_config_revision
+                   END,
+                   predecessor_activity_id = CASE
+                       WHEN rerun_requested = 1
+                       THEN COALESCE(
+                           rerun_predecessor_activity_id,
+                           predecessor_activity_id
+                       )
+                       ELSE predecessor_activity_id
+                   END,
+                   rerun_requested = 0,
+                   rerun_input_snapshot_id = NULL,
+                   rerun_input_generation_watermark = NULL,
+                   rerun_source_config_revision = NULL,
+                   rerun_predecessor_activity_id = NULL,
+                   lease_owner = NULL,
+                   lease_expires_at = NULL,
+                   next_attempt_at = NULL,
+                   error_message = ?,
+                   completed_at = ?,
+                   updated_at = ?
+               WHERE run_id = ? AND status IN ('pending', 'running')""",
+            (
+                f"cancelled_by_source_lifecycle_maintenance:{maintenance_job_id}",
+                now,
+                now,
+                run_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(f"source sync run changed during maintenance admission: {run_id}")
 
     async def _acquire_source_activity_unlocked(
         self,
@@ -5486,6 +5774,14 @@ class Database:
                         raise SourceActivityConflict(
                             f"source lifecycle activity lease changed during recovery: {job_id}"
                         )
+                fenced = await self.db.execute(
+                    """UPDATE sources
+                       SET activity_epoch = COALESCE(activity_epoch, 0) + 1
+                       WHERE id = ?""",
+                    (source_id,),
+                )
+                if fenced.rowcount != 1:
+                    raise ValueError(f"Source not found: {source_id}")
                 cursor = await self.db.execute(
                     """UPDATE lifecycle_backfill_jobs
                        SET status = 'failed', error = ?, completed_at = ?, updated_at = ?
@@ -5501,6 +5797,27 @@ class Database:
         stored = await self.get_lifecycle_backfill_job(job_id)
         assert stored is not None
         return stored
+
+    async def list_stale_lifecycle_backfill_job_ids(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[str, ...]:
+        """List active lifecycle jobs whose execution lease has expired or disappeared."""
+
+        now_iso = _now_iso()
+        bounded_limit = max(1, min(int(limit), 1000))
+        rows = await self.db.execute_fetchall(
+            """SELECT job.id
+               FROM lifecycle_backfill_jobs job
+               LEFT JOIN source_activity_leases lease ON lease.id = job.id
+               WHERE job.status IN ('queued', 'running')
+                 AND (lease.id IS NULL OR lease.lease_until <= ?)
+               ORDER BY job.created_at, job.id
+               LIMIT ?""",
+            (now_iso, bounded_limit),
+        )
+        return tuple(str(row["id"]) for row in rows)
 
     async def get_lifecycle_backfill_job(
         self,
@@ -5545,6 +5862,7 @@ class Database:
         *,
         observation_id: str,
         source_unit_id: str,
+        source_activity: SourceActivityLease | None = None,
     ) -> LifecycleCutoverFinding:
         async with self._write_lock:
             try:
@@ -5555,6 +5873,11 @@ class Database:
                     finding = await cursor.fetchone()
                 if finding is None:
                     raise LookupError(f"unknown lifecycle cutover finding: {finding_id}")
+                source_id = str(finding["source_id"])
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 async with self.db.execute(
                     """SELECT 1
                        FROM memory_support_assertions msa
@@ -5580,6 +5903,10 @@ class Database:
                            updated_at = ?, resolved_at = ?
                        WHERE id = ? AND status = 'open'""",
                     (observation_id, source_unit_id, now, now, finding_id),
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
                 )
                 await self.db.commit()
             except Exception:
@@ -5726,6 +6053,10 @@ class Database:
                 )
                 if cursor.rowcount != 1:
                     raise ValueError("unprovable retirement Memory stale guard failed")
+                await self._stale_pending_memory_reviews_unlocked(
+                    (str(finding["memory_id"]),),
+                    now=now,
+                )
                 await self._rebuild_memory_fts_unlocked(
                     str(finding["memory_id"]),
                     search_visible_statuses=set(allowed_search_statuses()),
@@ -5763,6 +6094,8 @@ class Database:
         self,
         evidence_unit_id: str,
         references: Sequence[EvidenceReference],
+        *,
+        source_activity: SourceActivityLease | None = None,
     ) -> tuple[EvidenceReference, ...]:
         revision_ids = {item.anchor.observation_revision_id for item in references}
         if revision_ids:
@@ -5786,6 +6119,18 @@ class Database:
         )
         async with self._write_lock:
             try:
+                async with self.db.execute(
+                    "SELECT source_id FROM evidence_units WHERE id = ?",
+                    (evidence_unit_id,),
+                ) as cursor:
+                    evidence_unit = await cursor.fetchone()
+                if evidence_unit is None:
+                    raise ValueError("evidence reference requires a persisted Evidence Unit")
+                source_id = str(evidence_unit["source_id"])
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 for item in persisted:
                     anchor = item.anchor
                     await self.db.execute(
@@ -5806,15 +6151,28 @@ class Database:
                             _now_iso(),
                         ),
                     )
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
                 raise
         return persisted
 
-    async def upsert_memory_support_assertion(self, assertion: MemorySupportAssertion) -> None:
+    async def upsert_memory_support_assertion(
+        self,
+        assertion: MemorySupportAssertion,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
         async with self._write_lock:
             try:
+                await self._assert_source_activity_fence_unlocked(
+                    assertion.source_id,
+                    source_activity,
+                )
                 async with self.db.execute(
                     """SELECT er.role, eu.source_id AS evidence_source_id
                        FROM evidence_references er
@@ -5849,6 +6207,10 @@ class Database:
                         assertion.created_at or now,
                         assertion.removed_at,
                     ),
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    assertion.source_id,
+                    source_activity,
                 )
                 await self.db.commit()
             except Exception:
@@ -5963,6 +6325,8 @@ class Database:
         self,
         projection: SourceProjection,
         plan: LifecyclePlan,
+        *,
+        expected_source_activity_epoch: int | None = None,
     ) -> None:
         """Advance Source Projection and Memory lifecycle in one transaction."""
 
@@ -5980,11 +6344,13 @@ class Database:
             try:
                 await self.record_source_projection(
                     projection,
+                    expected_source_activity_epoch=expected_source_activity_epoch,
                     _manage_transaction=False,
                 )
-                await self.apply_lifecycle_plan(
+                await self._apply_lifecycle_plan_with_identity_policy(
                     plan,
                     _manage_transaction=False,
+                    claim_identity_policy=ClaimIdentityPolicy.ORDINARY_EXTRACTION,
                 )
                 await self.db.commit()
             except Exception:
@@ -6042,9 +6408,10 @@ class Database:
                     projection,
                     _manage_transaction=False,
                 )
-                await self.apply_lifecycle_plan(
+                await self._apply_lifecycle_plan_with_identity_policy(
                     plan,
                     _manage_transaction=False,
+                    claim_identity_policy=ClaimIdentityPolicy.EXPLICIT_CONCEPT,
                 )
                 if relation_outcome is not None:
                     await self._record_relation_outcome_bundle_unlocked(relation_outcome)
@@ -6084,8 +6451,19 @@ class Database:
     async def apply_lifecycle_plan(
         self,
         plan: LifecyclePlan,
+    ) -> None:
+        await self._apply_lifecycle_plan_with_identity_policy(
+            plan,
+            _manage_transaction=True,
+            claim_identity_policy=ClaimIdentityPolicy.ORDINARY_EXTRACTION,
+        )
+
+    async def _apply_lifecycle_plan_with_identity_policy(
+        self,
+        plan: LifecyclePlan,
         *,
-        _manage_transaction: bool = True,
+        _manage_transaction: bool,
+        claim_identity_policy: ClaimIdentityPolicy,
     ) -> None:
         """Validate stale guards and commit the complete lifecycle plan once."""
 
@@ -6153,6 +6531,8 @@ class Database:
                     actual_version = _lifecycle_memory_version(memory_row)
                     if actual_version != expected_version:
                         raise ValueError(f"lifecycle plan Memory stale guard failed: {memory_id}")
+                if claim_identity_policy is ClaimIdentityPolicy.ORDINARY_EXTRACTION:
+                    await self._assert_no_active_exact_claim_conflicts_unlocked(plan)
 
                 now = _now_iso()
                 await self.db.execute(
@@ -6197,6 +6577,50 @@ class Database:
                     await self.db.rollback()
                 raise
 
+    async def _assert_no_active_exact_claim_conflicts_unlocked(
+        self,
+        plan: LifecyclePlan,
+    ) -> None:
+        """Fail stale CREATE plans after another Unit committed the exact claim."""
+
+        planned_claims: set[tuple[str, str, str | None, str | None]] = set()
+        for mutation in plan.mutations:
+            if mutation.mutation_type is not LifecycleMutationType.CREATE_MEMORY:
+                continue
+            raw = mutation.payload.get("memory")
+            if not isinstance(raw, Mapping):
+                raise ValueError("create_memory mutation requires memory payload")
+            claim = (
+                str(raw.get("content_hash") or content_hash(str(raw.get("content") or ""))),
+                str(raw.get("visibility") or "workspace"),
+                raw.get("owner_user_id")
+                if isinstance(raw.get("owner_user_id"), str)
+                else None,
+                raw.get("repo_identifier")
+                if isinstance(raw.get("repo_identifier"), str)
+                else None,
+            )
+            if claim in planned_claims:
+                raise ValueError("lifecycle plan contains duplicate exact claim creates")
+            planned_claims.add(claim)
+            async with self.db.execute(
+                """SELECT m.id FROM memories AS m
+                    WHERE m.content_hash = ? AND m.status = 'active'
+                      AND m.visibility = ? AND m.owner_user_id IS ?
+                      AND m.repo_identifier IS ? AND m.id <> ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM agent_claims AS ac
+                          WHERE ac.memory_id = m.id
+                      )
+                    ORDER BY m.created_at, m.id LIMIT 1""",
+                (*claim, mutation.memory_id),
+            ) as cursor:
+                if await cursor.fetchone() is not None:
+                    raise ValueError(
+                        "lifecycle plan exact claim stale guard failed: "
+                        "canonical active Memory now exists"
+                    )
+
     async def _validate_projected_support_invariant_unlocked(
         self,
         plan: LifecyclePlan,
@@ -6206,7 +6630,9 @@ class Database:
         Review-only plans intentionally preserve the incumbent while a human
         decides; their contested support is represented by the durable review.
         Every applied non-review plan must leave each surviving same-source
-        assertion pinned to an Observation that is current in this Source Unit.
+        assertion pinned to an Observation current in its own stable Source
+        Unit. A newly activated Memory must additionally gain support in the
+        plan's current Unit.
         """
 
         if any(
@@ -6219,9 +6645,15 @@ class Database:
             for mutation in plan.mutations
             if mutation.mutation_type is LifecycleMutationType.CREATE_MEMORY
         }
+        reactivated_ids = {
+            mutation.memory_id
+            for mutation in plan.mutations
+            if mutation.mutation_type is LifecycleMutationType.REACTIVATE_MEMORY
+        }
         candidate_ids = (
             set(plan.coverage_proof.mandatory_incumbent_ids)
             | created_ids
+            | reactivated_ids
             | {
                 mutation.memory_id
                 for mutation in plan.mutations
@@ -6237,30 +6669,39 @@ class Database:
             if memory is None or memory["status"] != "active":
                 continue
             async with self.db.execute(
-                """SELECT COUNT(*) AS total,
+                """SELECT SUM(CASE
+                              WHEN so.source_unit_id = ?
+                               AND eu.source_lineage_id = so.source_unit_id
+                               AND eu.source_id = msa.source_id
+                               AND so.source_id = msa.source_id
+                               AND su.source_id = msa.source_id
+                               AND er.observation_revision_id = so.current_revision_id
+                              THEN 1 ELSE 0 END) AS current_scope_total,
                           SUM(CASE
-                              WHEN eu.source_lineage_id = ?
-                               AND so.source_unit_id = ?
+                              WHEN eu.source_lineage_id = so.source_unit_id
+                               AND eu.source_id = msa.source_id
+                               AND so.source_id = msa.source_id
+                               AND su.source_id = msa.source_id
                                AND er.observation_revision_id = so.current_revision_id
                               THEN 0 ELSE 1 END) AS invalid
                    FROM memory_support_assertions msa
                    JOIN evidence_references er ON er.id = msa.evidence_reference_id
                    JOIN evidence_units eu ON eu.id = er.evidence_unit_id
                    JOIN source_observations so ON so.id = er.observation_id
+                   JOIN source_units su ON su.id = so.source_unit_id
                    WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1""",
                 (
-                    plan.scope.source_unit_id,
                     plan.scope.source_unit_id,
                     memory_id,
                     plan.scope.source_id,
                 ),
             ) as cursor:
                 support = await cursor.fetchone()
-            total = int(support["total"] or 0)
+            current_scope_total = int(support["current_scope_total"] or 0)
             invalid = int(support["invalid"] or 0)
-            if memory_id in created_ids and total == 0:
+            if memory_id in created_ids | reactivated_ids and current_scope_total == 0:
                 raise ValueError(
-                    f"projected lifecycle created active Memory without source support: {memory_id}"
+                    f"projected lifecycle activated Memory without source support: {memory_id}"
                 )
             if invalid:
                 raise ValueError(
@@ -6353,6 +6794,8 @@ class Database:
                 entity_refs=[str(value) for value in raw.get("entity_refs", [])],
                 tags=[str(value) for value in raw.get("tags", [])],
                 confidence=float(raw.get("confidence", 0.7)),
+                valid_from=_parse_date(raw.get("valid_from")),
+                valid_until=_parse_date(raw.get("valid_until")),
                 extraction_context=(
                     str(raw.get("extraction_context"))
                     if raw.get("extraction_context") is not None
@@ -6388,6 +6831,40 @@ class Database:
                 memory.id,
                 LifecycleVectorOperation.UPSERT,
                 now=now,
+            )
+            return
+        if mutation_type is LifecycleMutationType.REACTIVATE_MEMORY:
+            expected_content_hash = mutation.payload.get("expected_content_hash")
+            if not isinstance(expected_content_hash, str) or not expected_content_hash:
+                raise ValueError("reactivate_memory requires expected_content_hash")
+            expected_retirement_reason = mutation.payload.get(
+                "expected_retirement_reason",
+                "source_rebaseline",
+            )
+            if (
+                not isinstance(expected_retirement_reason, str)
+                or not expected_retirement_reason
+            ):
+                raise ValueError("reactivate_memory requires expected_retirement_reason")
+            cursor = await self.db.execute(
+                """UPDATE memories
+                      SET status = 'active', retirement_reason = NULL,
+                          retired_at = NULL, valid_until = NULL, updated_at = ?
+                    WHERE id = ? AND status = 'retired'
+                      AND retirement_reason = ?
+                      AND content_hash = ?""",
+                (
+                    now,
+                    mutation.memory_id,
+                    expected_retirement_reason,
+                    expected_content_hash,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("reactivate Memory stale guard failed")
+            await self._rebuild_memory_fts_unlocked(
+                mutation.memory_id,
+                search_visible_statuses=set(allowed_search_statuses()),
             )
             return
         if mutation_type is LifecycleMutationType.ATTACH_SUPPORT:
@@ -6499,6 +6976,10 @@ class Database:
             )
             if cursor.rowcount != 1:
                 raise ValueError("supersede Memory stale guard failed")
+            await self._stale_pending_memory_reviews_unlocked(
+                (mutation.memory_id,),
+                now=now,
+            )
             await self._rebuild_memory_fts_unlocked(
                 mutation.memory_id,
                 search_visible_statuses=set(allowed_search_statuses()),
@@ -6532,6 +7013,10 @@ class Database:
             )
             if cursor.rowcount != 1:
                 raise ValueError("retire Memory stale guard failed")
+            await self._stale_pending_memory_reviews_unlocked(
+                (mutation.memory_id,),
+                now=now,
+            )
             await self._rebuild_memory_fts_unlocked(
                 mutation.memory_id,
                 search_visible_statuses=set(allowed_search_statuses()),
@@ -6590,6 +7075,33 @@ class Database:
             )
             return
         raise ValueError(f"unsupported lifecycle mutation: {mutation_type.value}")
+
+    async def _stale_pending_memory_reviews_unlocked(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        now: str,
+    ) -> None:
+        """Close review work whose decision target left an actionable lifecycle."""
+        unique_ids = tuple(sorted(set(memory_ids)))
+        if not unique_ids:
+            return
+        placeholders = ", ".join("?" for _ in unique_ids)
+        await self.db.execute(
+            f"""UPDATE memory_reviews
+                   SET status = 'stale', resolved_at = COALESCE(resolved_at, ?)
+                 WHERE status = 'pending'
+                   AND (
+                       incumbent_memory_id IN ({placeholders})
+                       OR challenger_memory_id IN ({placeholders})
+                       OR id IN (
+                           SELECT review_id
+                             FROM memory_review_related_challengers
+                            WHERE challenger_memory_id IN ({placeholders})
+                       )
+                   )""",
+            (now, *unique_ids, *unique_ids, *unique_ids),
+        )
 
     async def _enqueue_lifecycle_vector_task_unlocked(
         self,
@@ -6723,7 +7235,7 @@ class Database:
             cursor = await self.db.execute(
                 """UPDATE lifecycle_vector_outbox
                    SET status = 'completed', attempts = attempts + 1,
-                       error = NULL, updated_at = ?
+                       updated_at = ?
                    WHERE id = ? AND status IN ('pending', 'failed')""",
                 (_now_iso(), task_id),
             )
@@ -6731,7 +7243,7 @@ class Database:
                 cursor = await self.db.execute(
                     """UPDATE source_deletion_vector_outbox
                        SET status = 'completed', attempts = attempts + 1,
-                           error = NULL, updated_at = ?
+                           updated_at = ?
                        WHERE id = ? AND status IN ('pending', 'failed')""",
                     (_now_iso(), task_id),
                 )
@@ -6744,7 +7256,7 @@ class Database:
             cursor = await self.db.execute(
                 """UPDATE lifecycle_vector_outbox
                    SET status = 'failed', attempts = attempts + 1,
-                       error = ?, updated_at = ?
+                       error = COALESCE(error, ?), updated_at = ?
                    WHERE id = ? AND status IN ('pending', 'failed')""",
                 (error[:4000], _now_iso(), task_id),
             )
@@ -6752,7 +7264,7 @@ class Database:
                 cursor = await self.db.execute(
                     """UPDATE source_deletion_vector_outbox
                        SET status = 'failed', attempts = attempts + 1,
-                           error = ?, updated_at = ?
+                           error = COALESCE(error, ?), updated_at = ?
                        WHERE id = ? AND status IN ('pending', 'failed')""",
                     (error[:4000], _now_iso(), task_id),
                 )
@@ -6806,50 +7318,67 @@ class Database:
     # Memories
     # ==================================================================
 
-    async def upsert_evidence_unit(self, unit: EvidenceUnit) -> None:
+    async def upsert_evidence_unit(
+        self,
+        unit: EvidenceUnit,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
         """Persist one scoped evidence item before relation classification."""
         metadata_json = json.dumps(dict(unit.source_metadata), sort_keys=True)
         provenance = unit.evidence_provenance.value
         async with self._write_lock:
-            now = _now_iso()
-            await self.db.execute(
-                """INSERT INTO evidence_units (
-                    id, source_id, doc_id, doc_revision_id, source_type, client,
-                    repo_identifier, source_anchor, source_lineage_id,
-                    source_metadata_json, project_key, visibility, owner_user_id,
-                    observed_at, extractor_run_id, access_context_hash, content,
-                    excerpt, evidence_provenance, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    observed_at=excluded.observed_at,
-                    extractor_run_id=excluded.extractor_run_id,
-                    access_context_hash=excluded.access_context_hash,
-                    updated_at=excluded.updated_at""",
-                (
-                    unit.id,
+            try:
+                await self._assert_source_activity_fence_unlocked(
                     unit.source_id,
-                    unit.doc_id,
-                    unit.doc_revision_id,
-                    unit.source_type,
-                    unit.client,
-                    unit.repo_identifier,
-                    unit.source_anchor,
-                    unit.source_lineage_id,
-                    metadata_json,
-                    _normalize_project_key(unit.project_key),
-                    unit.visibility,
-                    unit.owner_user_id,
-                    unit.observed_at,
-                    unit.extractor_run_id,
-                    unit.access_context_hash,
-                    unit.content,
-                    unit.excerpt,
-                    provenance,
-                    now,
-                    now,
-                ),
-            )
-            await self.db.commit()
+                    source_activity,
+                )
+                now = _now_iso()
+                await self.db.execute(
+                    """INSERT INTO evidence_units (
+                        id, source_id, doc_id, doc_revision_id, source_type, client,
+                        repo_identifier, source_anchor, source_lineage_id,
+                        source_metadata_json, project_key, visibility, owner_user_id,
+                        observed_at, extractor_run_id, access_context_hash, content,
+                        excerpt, evidence_provenance, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        observed_at=excluded.observed_at,
+                        extractor_run_id=excluded.extractor_run_id,
+                        access_context_hash=excluded.access_context_hash,
+                        updated_at=excluded.updated_at""",
+                    (
+                        unit.id,
+                        unit.source_id,
+                        unit.doc_id,
+                        unit.doc_revision_id,
+                        unit.source_type,
+                        unit.client,
+                        unit.repo_identifier,
+                        unit.source_anchor,
+                        unit.source_lineage_id,
+                        metadata_json,
+                        _normalize_project_key(unit.project_key),
+                        unit.visibility,
+                        unit.owner_user_id,
+                        unit.observed_at,
+                        unit.extractor_run_id,
+                        unit.access_context_hash,
+                        unit.content,
+                        unit.excerpt,
+                        provenance,
+                        now,
+                        now,
+                    ),
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    unit.source_id,
+                    source_activity,
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def get_evidence_unit(self, evidence_unit_id: str) -> EvidenceUnit | None:
         async with self.db.execute(
@@ -7929,6 +8458,108 @@ class Database:
                 return None
             return self._row_to_memory(row)
 
+    async def find_active_exact_claim_candidate(
+        self,
+        memory_content_hash: str,
+        *,
+        visibility: str,
+        owner_user_id: str | None,
+        repo_identifier: str | None,
+        excluded_memory_ids: Sequence[str] = (),
+    ) -> Memory | None:
+        """Return the canonical active exact claim in the same access context."""
+
+        exclusions = tuple(dict.fromkeys(excluded_memory_ids))
+        exclusion_clause = ""
+        params: list[Any] = [
+            memory_content_hash,
+            visibility,
+            owner_user_id,
+            repo_identifier,
+        ]
+        if exclusions:
+            exclusion_clause = (
+                " AND m.id NOT IN (" + ", ".join("?" for _ in exclusions) + ")"
+            )
+            params.extend(exclusions)
+        async with self.db.execute(
+            """SELECT m.* FROM memories AS m
+                WHERE m.content_hash = ?
+                  AND m.status = 'active'
+                  AND m.visibility = ?
+                  AND m.owner_user_id IS ?
+                  AND m.repo_identifier IS ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_claims AS ac
+                      WHERE ac.memory_id = m.id
+                  )"""
+            + exclusion_clause
+            + " ORDER BY m.created_at, m.id LIMIT 1",
+            params,
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_memory(row) if row else None
+
+    async def list_active_ordinary_claim_memories(
+        self,
+        memory_ids: Sequence[str],
+    ) -> list[Memory]:
+        """Return active non-Agent-Claim Memories in caller-provided order."""
+
+        ordered_ids = tuple(dict.fromkeys(memory_ids))
+        if not ordered_ids:
+            return []
+        placeholders = ", ".join("?" for _ in ordered_ids)
+        rows: dict[str, Memory] = {}
+        async with self.db.execute(
+            f"""SELECT m.* FROM memories AS m
+                WHERE m.id IN ({placeholders})
+                  AND m.status = 'active'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_claims AS ac
+                      WHERE ac.memory_id = m.id
+                  )""",
+            ordered_ids,
+        ) as cursor:
+            async for row in cursor:
+                memory = self._row_to_memory(row)
+                rows[memory.id] = memory
+        return [rows[memory_id] for memory_id in ordered_ids if memory_id in rows]
+
+    async def find_rebaseline_reactivation_candidate(
+        self,
+        memory_content_hash: str,
+        *,
+        visibility: str,
+        owner_user_id: str | None,
+        repo_identifier: str | None,
+    ) -> Memory | None:
+        """Return the canonical exact claim retired only for source rebaseline."""
+
+        async with self.db.execute(
+            """SELECT m.* FROM memories AS m
+                WHERE m.content_hash = ?
+                  AND m.status = 'retired'
+                  AND m.retirement_reason = 'source_rebaseline'
+                  AND m.visibility = ?
+                  AND m.owner_user_id IS ?
+                  AND m.repo_identifier IS ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_claims AS ac
+                      WHERE ac.memory_id = m.id
+                  )
+                ORDER BY m.created_at, m.id
+                LIMIT 1""",
+            (
+                memory_content_hash,
+                visibility,
+                owner_user_id,
+                repo_identifier,
+            ),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_memory(row) if row else None
+
     async def get_memories_by_source_doc(
         self,
         doc_id: str,
@@ -8522,6 +9153,10 @@ class Database:
                 old_id,
             ),
         )
+        await self._stale_pending_memory_reviews_unlocked(
+            (old_id,),
+            now=now,
+        )
         await self._rebuild_memory_fts_unlocked(
             new_memory.id,
             search_visible_statuses=set(allowed_search_statuses()),
@@ -8904,6 +9539,14 @@ class Database:
         async with self._write_lock:
             now = _now_iso()
             today = _today_iso()
+            async with self.db.execute(
+                """SELECT id FROM memories
+                   WHERE status = 'active'
+                     AND valid_until IS NOT NULL
+                     AND valid_until < ?""",
+                (today,),
+            ) as rows:
+                expiring_ids = tuple([str(row["id"]) async for row in rows])
             cursor = await self.db.execute(
                 """UPDATE memories SET
                     status = 'retired', retirement_reason = 'expired',
@@ -8912,6 +9555,10 @@ class Database:
                    AND valid_until IS NOT NULL
                    AND valid_until < ?""",
                 (now, now, today),
+            )
+            await self._stale_pending_memory_reviews_unlocked(
+                expiring_ids,
+                now=now,
             )
             await self.db.commit()
             return cursor.rowcount
@@ -9548,6 +10195,10 @@ class Database:
                    WHERE id = ?""",
                     (new_memory.id, now, now, replacement_reason, replacement_kind, now, old_id),
                 )
+                await self._stale_pending_memory_reviews_unlocked(
+                    (old_id,),
+                    now=now,
+                )
                 await self.db.execute(
                     """INSERT INTO agent_claims (
                     id, concept_id, display_anchor, claim_text, memory_type,
@@ -9922,6 +10573,10 @@ class Database:
                     corroboration_count = ?, updated_at = ?
                    WHERE id = ?""",
                 (retire_reason, now, total_count, now, memory_id),
+            )
+            await self._stale_pending_memory_reviews_unlocked(
+                (memory_id,),
+                now=now,
             )
         else:
             await self.db.execute(
@@ -11788,7 +12443,12 @@ class Database:
                 await self.db.rollback()
                 raise
 
-    async def rebaseline_source_lifecycle(self, source_id: str) -> SourceLifecycleResetResult:
+    async def rebaseline_source_lifecycle(
+        self,
+        source_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> SourceLifecycleResetResult:
         """Reset derived source lifecycle while preserving source identity and content.
 
         This is an explicit recovery operation for replayable sources. It keeps
@@ -11800,9 +12460,9 @@ class Database:
 
         async with self._write_lock:
             try:
-                await self.db.execute(
-                    "UPDATE sources SET status = status WHERE id = ?",
-                    (source_id,),
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
                 )
                 async with self.db.execute(
                     "SELECT type FROM sources WHERE id = ?",
@@ -11823,8 +12483,11 @@ class Database:
                     doc_ids = [str(row[0]) async for row in cursor]
                 memory_ids: set[str] = set()
                 async with self.db.execute(
-                    "SELECT DISTINCT memory_id FROM memory_sources WHERE source_id = ?",
-                    (source_id,),
+                    """SELECT DISTINCT ms.memory_id
+                         FROM memory_sources ms
+                         LEFT JOIN documents d ON d.doc_id = ms.doc_id
+                        WHERE ms.source_id = ? OR d.source = ?""",
+                    (source_id, source_id),
                 ) as cursor:
                     async for row in cursor:
                         memory_ids.add(str(row[0]))
@@ -11929,7 +12592,12 @@ class Database:
                 )
                 await self.db.execute("DELETE FROM source_units WHERE source_id = ?", (source_id,))
                 await self.db.execute("DELETE FROM projection_scope_transitions WHERE source_id = ?", (source_id,))
-                await self.db.execute("DELETE FROM memory_sources WHERE source_id = ?", (source_id,))
+                await self.db.execute(
+                    """DELETE FROM memory_sources
+                        WHERE source_id = ?
+                           OR doc_id IN (SELECT doc_id FROM documents WHERE source = ?)""",
+                    (source_id, source_id),
+                )
                 for doc_id in doc_ids:
                     await self.db.execute("DELETE FROM memory_search_metadata_fts WHERE doc_id = ?", (doc_id,))
                     await self.db.execute("DELETE FROM memory_search_metadata_alias_fts WHERE doc_id = ?", (doc_id,))
@@ -11989,6 +12657,10 @@ class Database:
                 await self.db.execute(
                     "UPDATE sources SET last_sync = NULL WHERE id = ?",
                     (source_id,),
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
                 )
                 await self.db.commit()
                 return SourceLifecycleResetResult(
@@ -12469,6 +13141,7 @@ class Database:
         force_full_sync: bool = False,
         input_snapshot_id: str | None = None,
         source_config_revision: str | None = None,
+        predecessor_activity_id: str | None = None,
     ) -> SourceSyncRun:
         for _attempt in range(3):
             async with self._write_lock:
@@ -12480,6 +13153,7 @@ class Database:
                         force_full_sync=force_full_sync,
                         input_snapshot_id=input_snapshot_id,
                         source_config_revision=source_config_revision,
+                        predecessor_activity_id=predecessor_activity_id,
                     )
                     await self.db.commit()
                     return run
@@ -12500,11 +13174,15 @@ class Database:
         force_full_sync: bool = False,
         input_snapshot_id: str | None = None,
         source_config_revision: str | None = None,
+        predecessor_activity_id: str | None = None,
         now: str | None = None,
     ) -> SourceSyncRun:
         now_iso = now or _now_iso()
         normalized_snapshot_id = _non_empty_string(input_snapshot_id)
         normalized_config_revision = _non_empty_string(source_config_revision)
+        normalized_predecessor_activity_id = _non_empty_string(
+            predecessor_activity_id
+        )
         source_lock = await self.db.execute(
             "UPDATE sources SET status = status WHERE id = ?",
             (source_id,),
@@ -12610,6 +13288,15 @@ class Database:
                            WHEN status = 'running' AND ? AND ? IS NOT NULL THEN ?
                            ELSE rerun_source_config_revision
                        END,
+                       predecessor_activity_id = CASE
+                           WHEN status = 'pending' AND ? IS NOT NULL THEN ?
+                           ELSE predecessor_activity_id
+                       END,
+                       rerun_predecessor_activity_id = CASE
+                           WHEN status = 'pending' THEN NULL
+                           WHEN status = 'running' AND ? THEN ?
+                           ELSE rerun_predecessor_activity_id
+                       END,
                        updated_at = ?
                    WHERE run_id = ? AND status IN ('pending', 'running')""",
                 (
@@ -12627,6 +13314,10 @@ class Database:
                     int(mark_rerun),
                     normalized_config_revision,
                     normalized_config_revision,
+                    normalized_predecessor_activity_id,
+                    normalized_predecessor_activity_id,
+                    int(mark_rerun),
+                    normalized_predecessor_activity_id,
                     now_iso,
                     existing["run_id"],
                 ),
@@ -12645,8 +13336,9 @@ class Database:
             """INSERT INTO source_sync_runs (
                 run_id, workspace_id, source_id, trigger, status,
                 force_full_sync, input_snapshot_id, input_generation_watermark,
-                source_config_revision, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)""",
+                source_config_revision, predecessor_activity_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id,
                 workspace_id,
@@ -12656,6 +13348,7 @@ class Database:
                 normalized_snapshot_id,
                 input_generation_watermark,
                 normalized_config_revision,
+                normalized_predecessor_activity_id,
                 now_iso,
                 now_iso,
             ),
@@ -12675,6 +13368,41 @@ class Database:
         ) as cursor:
             row = await cursor.fetchone()
         return _source_sync_run_from_row(row) if row else None
+
+    async def cancel_pending_source_sync_run(
+        self,
+        *,
+        source_id: str,
+        error_message: str,
+    ) -> bool:
+        """Terminate an unleased durable run so source configuration can change."""
+
+        cancelled_at = _now_iso()
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE source_sync_runs
+                   SET status = 'failed',
+                       rerun_requested = 0,
+                       rerun_input_snapshot_id = NULL,
+                       rerun_input_generation_watermark = NULL,
+                       rerun_source_config_revision = NULL,
+                       rerun_predecessor_activity_id = NULL,
+                       lease_owner = NULL,
+                       lease_expires_at = NULL,
+                       next_attempt_at = NULL,
+                       error_message = ?,
+                       completed_at = ?,
+                       updated_at = ?
+                   WHERE source_id = ? AND status = 'pending'""",
+                (
+                    error_message,
+                    cancelled_at,
+                    cancelled_at,
+                    source_id,
+                ),
+            )
+            await self.db.commit()
+        return bool(cursor.rowcount)
 
     async def get_latest_source_sync_run(
         self,
@@ -12705,9 +13433,15 @@ class Database:
         lease_expires_at = _utc_iso(lease_started_at + timedelta(seconds=lease_seconds))
         conditions = [
             "((status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) "
-            "OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))"
+            "OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))",
+            "NOT EXISTS ("
+            "SELECT 1 FROM source_activity_leases predecessor "
+            "WHERE predecessor.id = source_sync_runs.predecessor_activity_id "
+            "AND predecessor.source_id = source_sync_runs.source_id "
+            "AND predecessor.kind = 'external_collection' "
+            "AND predecessor.lease_until > ?)",
         ]
-        params: list[Any] = [lease_started_iso, lease_started_iso]
+        params: list[Any] = [lease_started_iso, lease_started_iso, lease_started_iso]
         if workspace_id is not None:
             conditions.append("workspace_id = ?")
             params.append(workspace_id)
@@ -12739,6 +13473,13 @@ class Database:
                        (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
                        OR
                        (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM source_activity_leases predecessor
+                       WHERE predecessor.id = ?
+                         AND predecessor.source_id = ?
+                         AND predecessor.kind = 'external_collection'
+                         AND predecessor.lease_until > ?
                      )""",
                 (
                     worker_id,
@@ -12748,6 +13489,9 @@ class Database:
                     lease_started_iso,
                     row["run_id"],
                     lease_started_iso,
+                    lease_started_iso,
+                    row["predecessor_activity_id"],
+                    row["source_id"],
                     lease_started_iso,
                 ),
             )
@@ -12950,6 +13694,14 @@ class Database:
                            )
                            ELSE source_config_revision
                        END,
+                       predecessor_activity_id = CASE
+                           WHEN ? AND rerun_requested = 1
+                           THEN COALESCE(
+                               rerun_predecessor_activity_id,
+                               predecessor_activity_id
+                           )
+                           ELSE predecessor_activity_id
+                       END,
                        rerun_requested = CASE WHEN ? THEN 0 ELSE rerun_requested END,
                        rerun_input_snapshot_id = CASE
                            WHEN ? THEN NULL ELSE rerun_input_snapshot_id
@@ -12959,6 +13711,9 @@ class Database:
                        END,
                        rerun_source_config_revision = CASE
                            WHEN ? THEN NULL ELSE rerun_source_config_revision
+                       END,
+                       rerun_predecessor_activity_id = CASE
+                           WHEN ? THEN NULL ELSE rerun_predecessor_activity_id
                        END,
                        lease_owner = NULL,
                        lease_expires_at = NULL,
@@ -12971,6 +13726,8 @@ class Database:
                      AND lease_expires_at > ?""",
                 (
                     status,
+                    int(retryable),
+                    int(retryable),
                     int(retryable),
                     int(retryable),
                     int(retryable),
@@ -13030,8 +13787,9 @@ class Database:
             """INSERT INTO source_sync_runs (
                 run_id, workspace_id, source_id, trigger, status,
                 force_full_sync, input_snapshot_id, input_generation_watermark,
-                source_config_revision, created_at, updated_at
-            ) VALUES (?, ?, ?, 'rerun', 'pending', ?, ?, ?, ?, ?, ?)""",
+                source_config_revision, predecessor_activity_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, 'rerun', 'pending', ?, ?, ?, ?, ?, ?, ?)""",
             (
                 successor_id,
                 completed["workspace_id"],
@@ -13040,6 +13798,7 @@ class Database:
                 completed["rerun_input_snapshot_id"],
                 completed["rerun_input_generation_watermark"],
                 completed["rerun_source_config_revision"],
+                completed["rerun_predecessor_activity_id"],
                 now,
                 now,
             ),
@@ -13188,6 +13947,72 @@ class Database:
             async for row in cursor:
                 results.append(_source_sync_input_from_row(row))
         return results
+
+    async def attest_source_sync_input_artifact(
+        self,
+        *,
+        source_id: str,
+        input_id: str,
+        package_sha256: str,
+        expected_activity_epoch: int | None = None,
+    ) -> SourceSyncInput:
+        """Atomically fill or verify a retained input's own package hash."""
+        async with self._write_lock:
+            try:
+                source_lock = await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (source_id,),
+                )
+                if source_lock.rowcount != 1:
+                    raise ValueError(f"Source not found: {source_id}")
+                async with self.db.execute(
+                    """SELECT id FROM lifecycle_backfill_jobs
+                       WHERE source_id = ? AND status IN ('queued', 'running')
+                       ORDER BY created_at LIMIT 1""",
+                    (source_id,),
+                ) as cursor:
+                    lifecycle_job = await cursor.fetchone()
+                if lifecycle_job is not None:
+                    raise SourceActivityConflict(
+                        f"source lifecycle maintenance active: {lifecycle_job['id']}"
+                    )
+                if expected_activity_epoch is not None:
+                    async with self.db.execute(
+                        "SELECT activity_epoch FROM sources WHERE id = ?",
+                        (source_id,),
+                    ) as cursor:
+                        epoch_row = await cursor.fetchone()
+                    current_epoch = int(epoch_row["activity_epoch"] or 0)
+                    if current_epoch != expected_activity_epoch:
+                        raise SourceActivityConflict(
+                            "source activity epoch changed: "
+                            f"expected {expected_activity_epoch}, current {current_epoch}"
+                        )
+                async with self.db.execute(
+                    "SELECT * FROM source_sync_inputs WHERE input_id = ? AND source_id = ?",
+                    (input_id, source_id),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if existing is None:
+                    raise ValueError(f"Source sync input not found: {input_id}")
+                current = _source_sync_input_from_row(existing)
+                metadata = source_sync_input_metadata_with_artifact_attestation(
+                    current.metadata,
+                    package_sha256=package_sha256,
+                    input_id=input_id,
+                )
+                async with self.db.execute(
+                    """UPDATE source_sync_inputs SET metadata_json = ?
+                       WHERE input_id = ? AND source_id = ?""",
+                    (json.dumps(metadata, sort_keys=True), input_id, source_id),
+                ) as cursor:
+                    if cursor.rowcount != 1:
+                        raise ValueError(f"Source sync input not found: {input_id}")
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return replace(current, metadata=metadata)
 
     async def _record_source_sync_snapshot_item_unlocked(
         self,

@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import {
   presentSourceSyncActivity,
   selectSourceSyncActivity,
+  sourceSyncActivityBlocksActions,
   sourceSyncActivityFromLocalJob,
+  sourceSyncActivityIsVisible,
+  sourceSyncActivityPolicy,
 } from "../src/views/sources/sourceSyncActivity.js";
 import { teamsConversationCount } from "../src/views/sources/teamsSourceConfig.js";
 import type { LocalAgentJobStatusResponse, SyncStatus } from "../src/api/types.js";
@@ -39,6 +42,7 @@ assert.deepEqual(
 assert.deepEqual(
   presentSourceSyncActivity(
     {
+      kind: "sync",
       state: "active",
       progress: {
         schema_version: 1,
@@ -55,6 +59,7 @@ assert.deepEqual(
 assert.deepEqual(
   presentSourceSyncActivity(
     {
+      kind: "sync",
       state: "active",
       progress: {
         schema_version: 1,
@@ -85,30 +90,32 @@ const activeServerRun: SyncStatus = {
     progress: { completed: 4, total: 10, unit: "page" },
   },
 };
-assert.equal(selectSourceSyncActivity(activeServerRun, localJob)?.progress?.phase, "processing");
+assert.equal(selectSourceSyncActivity({
+  sync: activeServerRun,
+  localJob,
+})?.progress?.phase, "processing");
 
 assert.deepEqual(
-  selectSourceSyncActivity(
-    {
+  selectSourceSyncActivity({
+    sync: {
       ...activeServerRun,
       status: "success",
       finished_at: "2026-07-08T09:00:00Z",
     },
-    null,
-    true,
-  ),
-  { state: "queued" },
+    pending: true,
+  }),
+  { kind: "sync", state: "queued" },
 );
 
 assert.equal(
-  selectSourceSyncActivity(
-    {
+  selectSourceSyncActivity({
+    sync: {
       ...activeServerRun,
       status: "success",
       started_at: "2026-07-08T08:00:00Z",
       finished_at: "2026-07-08T09:00:00Z",
     },
-    {
+    localJob: {
       ...localJob,
       status: "failed",
       created_at: "2026-07-08T10:00:00Z",
@@ -116,9 +123,74 @@ assert.equal(
       finished_at: "2026-07-08T10:01:00Z",
       last_error: "collection failed",
     },
-  )?.state,
+  })?.state,
   "failed",
 );
+
+const activeMaintenance = selectSourceSyncActivity({
+  sync: {
+    ...activeServerRun,
+    status: "partial",
+    finished_at: "2026-07-08T10:00:00Z",
+  },
+  lifecycleMaintenance: {
+    status: "running",
+    created_at: "2026-07-08T11:00:00Z",
+    started_at: "2026-07-08T11:01:00Z",
+  },
+});
+assert.deepEqual(
+  presentSourceSyncActivity(activeMaintenance!, "GitHub", "files"),
+  { message: "Updating memories", detail: "Working" },
+);
+assert.equal(activeMaintenance?.kind, "memory_maintenance");
+assert.equal(sourceSyncActivityBlocksActions(activeMaintenance), true);
+assert.deepEqual(sourceSyncActivityPolicy(activeMaintenance!), {
+  activeRowLabel: "Updating memories",
+  busyActionLabel: "Updating",
+  busyAriaLabel: "Memory maintenance in progress",
+  canRetry: false,
+});
+
+const completedMaintenance = selectSourceSyncActivity({
+  lifecycleMaintenance: {
+    status: "completed",
+    created_at: "2026-07-08T11:00:00Z",
+    started_at: "2026-07-08T11:01:00Z",
+    finished_at: "2026-07-08T11:02:00Z",
+  },
+});
+assert.equal(
+  sourceSyncActivityIsVisible(
+    completedMaintenance!,
+    new Date("2026-07-08T11:02:29Z").getTime(),
+  ),
+  true,
+);
+assert.equal(
+  sourceSyncActivityIsVisible(
+    completedMaintenance!,
+    new Date("2026-07-08T11:02:31Z").getTime(),
+  ),
+  false,
+);
+
+const failedMaintenance = selectSourceSyncActivity({
+  lifecycleMaintenance: {
+    status: "failed",
+    created_at: "2026-07-08T11:00:00Z",
+    finished_at: "2026-07-08T11:02:00Z",
+  },
+});
+assert.deepEqual(
+  presentSourceSyncActivity(failedMaintenance!, "GitHub", "files"),
+  {
+    message: "Memory update needs attention",
+    detail: "Memory maintenance failed. Review the maintenance details.",
+  },
+);
+assert.equal(sourceSyncActivityBlocksActions(failedMaintenance), false);
+assert.equal(sourceSyncActivityPolicy(failedMaintenance!).canRetry, false);
 
 assert.equal(
   sourceSyncActivityFromLocalJob({
@@ -131,6 +203,7 @@ assert.equal(
 assert.deepEqual(
   presentSourceSyncActivity(
     {
+      kind: "sync",
       state: "failed",
       error: {
         message: "request failed for /Users/alice/private?token=secret",
@@ -146,6 +219,7 @@ assert.deepEqual(
 assert.deepEqual(
   presentSourceSyncActivity(
     {
+      kind: "sync",
       state: "failed",
       error: { message: "Embedding provider unreachable: connection refused" },
     },

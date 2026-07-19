@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import json
 
-from memforge.pipeline.sync_memory import MemorySample, ProcessMemorySampler, SyncMemoryObserver
+from memforge.pipeline.sync_memory import (
+    MemorySample,
+    ProcessMemoryReclaimer,
+    ProcessMemorySampler,
+    SyncMemoryObserver,
+)
 
 
 class SequenceSampler:
@@ -31,6 +36,42 @@ def test_process_memory_sampler_parses_proc_status_rss_and_hwm():
     sample = ProcessMemorySampler._sample_from_proc_status("Name:\tpython\nVmRSS:\t2048 kB\nVmHWM:\t4096 kB\n")
 
     assert sample == MemorySample(rss_mb=2.0, peak_rss_mb=4.0)
+
+
+def test_process_memory_reclaimer_collects_cycles_and_trims_glibc_heap():
+    trim_calls = []
+    reclaimer = ProcessMemoryReclaimer(
+        collector=lambda: 7,
+        malloc_trim=lambda pad: trim_calls.append(pad) or 1,
+    )
+
+    result = reclaimer.reclaim()
+
+    assert result == {
+        "collected_objects": 7,
+        "collection_error_class": None,
+        "heap_trim_supported": True,
+        "heap_trimmed": True,
+        "trim_error_class": None,
+    }
+    assert trim_calls == [0]
+
+
+def test_process_memory_reclaimer_never_breaks_document_completion():
+    def fail():
+        raise RuntimeError("allocator probe failed")
+
+    reclaimer = ProcessMemoryReclaimer(
+        collector=fail,
+        malloc_trim=lambda _pad: fail(),
+    )
+
+    result = reclaimer.reclaim()
+
+    assert result["collection_error_class"] == "RuntimeError"
+    assert result["heap_trim_supported"] is True
+    assert result["heap_trimmed"] is False
+    assert result["trim_error_class"] == "RuntimeError"
 
 
 def test_sync_memory_observer_emits_compact_json_with_deltas_and_sequence():

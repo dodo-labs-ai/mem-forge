@@ -14,6 +14,10 @@ import { sourceActionLayout } from "./sourceActions";
 import { SourceReadinessAlert } from "./SourceReadinessAlert";
 import { isLocalAgentBackedSource } from "./localAgentSources";
 import type { SourceSyncActivity } from "./sourceSyncActivity";
+import {
+  sourceSyncActivityBlocksActions,
+  sourceSyncActivityPolicy,
+} from "./sourceSyncActivity";
 import { teamsConversationCount } from "./teamsSourceConfig";
 
 /**
@@ -48,7 +52,6 @@ const DEFAULT_CAPABILITIES: SourceCapabilities = {
 export function SourceRow({
   source,
   perGroupMemoryCount,
-  isSyncing,
   syncActivity,
   isDeleting,
   isUpdatingStatus = false,
@@ -71,7 +74,6 @@ export function SourceRow({
 }: {
   source: Source;
   perGroupMemoryCount: number;
-  isSyncing: boolean;
   syncActivity?: SourceSyncActivity;
   isDeleting: boolean;
   isUpdatingStatus?: boolean;
@@ -110,6 +112,8 @@ export function SourceRow({
     ? displayedItemCount === 1 ? "conversation" : "conversations"
     : itemLabel;
   const durableSyncLabel = activeSyncLabel(source.sync?.status);
+  const isSourceBusy = sourceSyncActivityBlocksActions(syncActivity);
+  const activityPolicy = syncActivity ? sourceSyncActivityPolicy(syncActivity) : null;
 
   return (
     <div
@@ -150,7 +154,7 @@ export function SourceRow({
               </span>
               <span>
                 {syncActivity && ["queued", "active", "recovering"].includes(syncActivity.state)
-                  ? "Syncing now"
+                  ? activityPolicy?.activeRowLabel
                   : durableSyncLabel ?? <LastSyncDetails source={source} itemLabel={itemLabel} />}
               </span>
               {source.sync_schedule?.enabled && (
@@ -214,7 +218,7 @@ export function SourceRow({
               type="button"
               variant="outline"
               aria-label={`Configure ${source.name}`}
-              disabled={isDeleting}
+              disabled={isSourceBusy || isDeleting}
               onClick={onConfigure}
             >
               <SlidersHorizontal className="size-4" />
@@ -224,23 +228,23 @@ export function SourceRow({
           {capabilities.can_sync && !isManaged && (
             <Button
               type="button"
-              disabled={isSyncing || isDeleting || isPaused}
+              disabled={isSourceBusy || isDeleting || isPaused}
               onClick={onSync}
               title={isPaused ? pausedSyncHint : undefined}
               aria-label={
                 isPaused
                   ? pausedSyncHint
-                  : isSyncing
-                    ? "Sync in progress"
+                  : isSourceBusy
+                    ? activityPolicy?.busyAriaLabel
                     : sourceActionLayout.primary.sync.label
               }
             >
-              {isSyncing ? (
+              {isSourceBusy ? (
                 <Loader2 className="size-4 animate-spin" />
               ) : (
                 <RefreshCw className="size-4" />
               )}
-              {isSyncing ? "Syncing" : sourceActionLayout.primary.sync.label}
+              {isSourceBusy ? activityPolicy?.busyActionLabel : sourceActionLayout.primary.sync.label}
             </Button>
           )}
           {actionsMenu}

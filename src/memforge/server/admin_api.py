@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, is_dataclass
+import hashlib
 import json
 import logging
 import os
@@ -69,6 +70,7 @@ from memforge.models import (
     MemoryType,
     MemoryReview,
     Project,
+    SourceSyncInput,
     SourceExecutionKind,
     UNSORTED_PROJECT_KEY,
     canonicalize_entity_name,
@@ -129,14 +131,13 @@ from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
     execution_owner_user_id,
     is_local_agent_backed_source,
-    local_agent_authoritative_snapshot_id,
-    local_agent_collection_is_authoritative,
+    local_agent_collection_attempt_id,
+    local_agent_rebaseline_snapshot_is_authoritative,
     local_agent_semantic_input_sha256,
     local_agent_completion_status,
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
     local_agent_sync_operation,
-    local_agent_sync_snapshot_id,
     source_with_sync_inputs,
     validate_local_agent_replay_package,
 )
@@ -2405,6 +2406,91 @@ def get_runtime_provider(request: Request) -> RuntimeProvider:
 # ---------------------------------------------------------------------------
 
 
+def _validate_local_source_replay_artifact_identity(
+    *,
+    source_type: str,
+    source_id: str,
+    body: bytes,
+    expected_doc_id: str,
+    expected_version: str,
+    expected_input_sha256: str,
+    expected_package_sha256: str,
+) -> Mapping[str, Any]:
+    """Validate one immutable package and its provider-derived document identity."""
+    from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
+
+    try:
+        package = validate_local_agent_replay_package(
+            source_type,
+            body,
+            expected_doc_id=expected_doc_id,
+            expected_version=expected_version,
+            expected_input_sha256=expected_input_sha256,
+            expected_package_sha256=expected_package_sha256,
+        )
+        derived_doc_id = get_local_source_replay_adapter(
+            source_type
+        ).derive_document_id(
+            source_id=source_id,
+            package=package,
+        )
+    except ValueError as exc:
+        raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
+    if derived_doc_id != expected_doc_id:
+        raise ValueError("source_lifecycle_local_replay_artifact_invalid")
+    return package
+
+
+async def _attest_retained_local_source_input(
+    *,
+    db: Any,
+    artifact_store: DocumentArtifactStore,
+    source_type: str,
+    source_id: str,
+    retained_input: SourceSyncInput,
+    expected_activity_epoch: int,
+) -> tuple[SourceSyncInput, str]:
+    """Validate and attest a legacy retained artifact without trusting a duplicate upload."""
+    metadata = retained_input.metadata
+    manifest_entry = metadata.get("manifest_entry")
+    if not isinstance(manifest_entry, Mapping):
+        raise ValueError("source_lifecycle_local_replay_artifact_invalid")
+    top_level_hash = str(metadata.get("package_sha256") or "").strip()
+    manifest_hash = str(manifest_entry.get("package_sha256") or "").strip()
+    if top_level_hash and manifest_hash and top_level_hash != manifest_hash:
+        raise ValueError(
+            "source sync input artifact attestation conflict: "
+            f"{retained_input.input_id}"
+        )
+    package_hash = top_level_hash or manifest_hash
+    if top_level_hash and manifest_hash:
+        return retained_input, package_hash
+    try:
+        body = artifact_store.read_artifact(retained_input.raw_uri)
+    except Exception as exc:
+        raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
+    package_hash = hashlib.sha256(body).hexdigest()
+    expected_doc_id = str(
+        manifest_entry.get("doc_id") or metadata.get("doc_id") or ""
+    )
+    _validate_local_source_replay_artifact_identity(
+        source_type=source_type,
+        source_id=source_id,
+        body=body,
+        expected_doc_id=expected_doc_id,
+        expected_version=str(manifest_entry.get("version") or ""),
+        expected_input_sha256=retained_input.raw_sha256,
+        expected_package_sha256=package_hash,
+    )
+    attested = await db.attest_source_sync_input_artifact(
+        source_id=source_id,
+        input_id=retained_input.input_id,
+        package_sha256=package_hash,
+        expected_activity_epoch=expected_activity_epoch,
+    )
+    return attested, package_hash
+
+
 def create_admin_app(
     db: Database | None = None,
     config: AppConfig | None = None,
@@ -3841,25 +3927,27 @@ def create_admin_app(
     ) -> tuple[dict[str, Any], bool]:
         """Build an exact current-corpus replay for local collection sources."""
 
-        from memforge.local_agent.replay_adapter import (
-            get_local_source_replay_adapter,
-        )
-
         source_id = str(source["id"])
         if local_agent_sync_operation(source["type"], source.get("config")) is None:
             return source, False
         latest_run = await db.get_latest_source_sync_run(source_id=source_id)
-        if latest_run is None or latest_run.status != "success":
-            raise ValueError("source_lifecycle_successful_local_replay_required")
+        if latest_run is None or latest_run.status not in {"success", "failed"}:
+            raise ValueError("source_lifecycle_terminal_local_replay_required")
+        if latest_run.status == "failed" and not latest_run.force_full_sync:
+            raise ValueError("source_lifecycle_terminal_local_replay_required")
         if latest_run.source_config_revision != local_agent_source_config_revision(source):
             raise ValueError("source_lifecycle_local_replay_config_changed")
-        authoritative_collection = local_agent_collection_is_authoritative(source["type"])
+        authoritative_snapshot = local_agent_rebaseline_snapshot_is_authoritative(
+            source["type"],
+            force_full_sync=latest_run.force_full_sync,
+            input_snapshot_id=latest_run.input_snapshot_id,
+        )
         inputs = await db.list_source_sync_inputs(
             source_id=source_id,
             workspace_id=latest_run.workspace_id,
-            input_snapshot_id=(latest_run.input_snapshot_id if authoritative_collection else None),
+            input_snapshot_id=(latest_run.input_snapshot_id if authoritative_snapshot else None),
         )
-        if not authoritative_collection:
+        if not authoritative_snapshot:
             if latest_run.input_generation_watermark is None:
                 raise ValueError("source_lifecycle_local_replay_inputs_unavailable")
             inputs = [
@@ -3871,7 +3959,7 @@ def create_admin_app(
             source,
             inputs,
             authoritative_snapshot=True,
-            preserve_version_history=not authoritative_collection,
+            preserve_version_history=not authoritative_snapshot,
         )
         manifest = replay_source.get("config", {}).get("local_agent_package_manifest") or []
         manifest_by_doc_version = {
@@ -3887,23 +3975,27 @@ def create_admin_app(
         manifest_doc_ids = {doc_id for doc_id, _version in manifest_by_doc_version}
         current_document_versions = await db.list_indexed_document_versions(source_id)
         current_doc_ids = set(current_document_versions)
-        if (
-            (not authoritative_collection and not current_doc_ids)
-            or (authoritative_collection and manifest_doc_ids != current_doc_ids)
-            or not current_doc_ids.issubset(manifest_doc_ids)
-        ):
-            raise ValueError("source_lifecycle_local_replay_inputs_unavailable")
-        try:
-            selected_manifest = [
-                manifest_by_doc_version[(doc_id, current_document_versions[doc_id])]
-                for doc_id in sorted(current_doc_ids)
-            ]
-        except KeyError as exc:
-            raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
-        replay_adapter = get_local_source_replay_adapter(str(source["type"]))
+        if authoritative_snapshot:
+            if len(manifest) != len(inputs) or len(manifest_doc_ids) != len(manifest):
+                raise ValueError("source_lifecycle_local_replay_inputs_unavailable")
+            selected_manifest = sorted(
+                manifest,
+                key=lambda entry: str(entry.get("doc_id") or ""),
+            )
+        else:
+            if not current_doc_ids or not current_doc_ids.issubset(manifest_doc_ids):
+                raise ValueError("source_lifecycle_local_replay_inputs_unavailable")
+            try:
+                selected_manifest = [
+                    manifest_by_doc_version[(doc_id, current_document_versions[doc_id])]
+                    for doc_id in sorted(current_doc_ids)
+                ]
+            except KeyError as exc:
+                raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
         for entry in selected_manifest:
             doc_id = str(entry["doc_id"])
-            if str(entry.get("version") or "") != current_document_versions[doc_id]:
+            expected_version = str(entry.get("version") or "")
+            if not authoritative_snapshot and expected_version != current_document_versions[doc_id]:
                 raise ValueError("source_lifecycle_local_replay_artifact_invalid")
             package_sha256 = str(entry.get("package_sha256") or "").strip()
             if not package_sha256:
@@ -3912,23 +4004,15 @@ def create_admin_app(
                 body = document_store.read_artifact(str(entry["package_uri"]))
             except Exception as exc:
                 raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
-            package = validate_local_agent_replay_package(
-                str(source["type"]),
-                body,
+            _validate_local_source_replay_artifact_identity(
+                source_type=str(source["type"]),
+                source_id=source_id,
+                body=body,
                 expected_doc_id=doc_id,
-                expected_version=current_document_versions[doc_id],
+                expected_version=expected_version,
                 expected_input_sha256=str(entry.get("input_sha256") or ""),
                 expected_package_sha256=package_sha256,
             )
-            try:
-                derived_doc_id = replay_adapter.derive_document_id(
-                    source_id=source_id,
-                    package=package,
-                )
-            except ValueError as exc:
-                raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
-            if derived_doc_id != doc_id:
-                raise ValueError("source_lifecycle_local_replay_artifact_invalid")
         replay_source["config"]["local_agent_package_manifest"] = selected_manifest
         return replay_source, True
 
@@ -3955,6 +4039,7 @@ def create_admin_app(
                         source_id=source_id,
                         source_type=str(source["type"]),
                         document_id=document_id,
+                        lifecycle_job_id=job_id,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -4116,8 +4201,16 @@ def create_admin_app(
                     f"{preflight.last_sync_status}: "
                     f"{preflight.error_message or 'unknown error'}"
                 )
+            activity = await db.renew_source_activity(
+                activity_id=job_id,
+                capability=job_id,
+                lease_seconds=900,
+            )
             memory_store = await _build_memory_store(db, config, runtime_provider)
-            await memory_store.rebaseline_source_lifecycle(source_id)
+            await memory_store.rebaseline_source_lifecycle(
+                source_id,
+                source_activity=activity,
+            )
             state = await runtime_provider.run_source_sync(
                 db=db,
                 config=config,
@@ -4132,7 +4225,28 @@ def create_admin_app(
                     "source rebaseline replay failed: "
                     f"{state.last_sync_status}: {state.error_message or 'unknown error'}"
                 )
-            audit = await run_source_lifecycle_backfill(db, source_id)
+            while True:
+                vector_delivery = await memory_store.attempt_lifecycle_vector_delivery(
+                    source_id=source_id
+                )
+                if not vector_delivery.pending:
+                    break
+                # A source maintenance fence prevents new lifecycle tasks for
+                # this source. Keep draining bounded store batches only while
+                # the previous pass made monotonic progress.
+                if vector_delivery.delivered_tasks:
+                    continue
+                error_types = ",".join(vector_delivery.error_types) or "pending_tasks"
+                raise RuntimeError(
+                    "source rebaseline vector delivery remains pending: "
+                    f"failed_tasks={vector_delivery.failed_tasks} "
+                    f"error_types={error_types}"
+                )
+            audit = await run_source_lifecycle_backfill(
+                db,
+                source_id,
+                lifecycle_job_id=job_id,
+            )
             if not audit.gate_enabled or audit.finding_count:
                 raise RuntimeError(f"source rebaseline audit left {audit.finding_count} open finding(s)")
             await db.complete_lifecycle_backfill_job(
@@ -4185,9 +4299,8 @@ def create_admin_app(
                 status_code=409,
                 detail="agent_session_requires_managed_claim_lineage_repair",
             )
-        await sync_service.cancel_source(source_id)
         try:
-            job = await db.create_lifecycle_backfill_job(
+            job = await db.create_source_rebaseline_job(
                 LifecycleBackfillJob(
                     id=f"source-rebaseline-{uuid.uuid4().hex}",
                     source_id=source_id,
@@ -4196,6 +4309,7 @@ def create_admin_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await sync_service.cancel_source(source_id)
         fenced_source = await db.get_source(source_id)
         if fenced_source is None:
             await db.fail_lifecycle_backfill_job(
@@ -4299,8 +4413,13 @@ def create_admin_app(
                 observation_id=body.observation_id,
                 evidence_quote=body.evidence_quote,
                 operator_id=resolve_request_principal(request),
+                lifecycle_job_id=job.id,
             )
-            backfill_result = await run_source_lifecycle_backfill(db, source_id)
+            backfill_result = await run_source_lifecycle_backfill(
+                db,
+                source_id,
+                lifecycle_job_id=job.id,
+            )
             await db.complete_lifecycle_backfill_job(
                 job.id,
                 scanned_memories=backfill_result.scanned_memories,
@@ -4390,10 +4509,13 @@ def create_admin_app(
                     pass
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         memory_store = await _build_memory_store(db, config, runtime_provider)
-        try:
-            await memory_store.drain_lifecycle_vector_outbox(plan.id)
-        except Exception:
-            logger.exception("Lifecycle review %s applied but vector delivery remains pending", review_id)
+        delivery = await memory_store.attempt_lifecycle_vector_delivery(plan.id)
+        if delivery.pending:
+            logger.warning(
+                "Lifecycle review %s applied but vector delivery remains pending error_types=%s",
+                review_id,
+                delivery.error_types,
+            )
         approved = await db.get_lifecycle_review(review_id)
         assert approved is not None
         return {
@@ -4982,6 +5104,14 @@ def create_admin_app(
                     status_code=409,
                     detail="projection_scope_transition_active",
                 )
+        predecessor_scope_transition_id = None
+        if scope_changed:
+            previous_scope_transitions = await db.list_projection_scope_transitions(
+                source_id,
+                limit=1,
+            )
+            if previous_scope_transitions:
+                predecessor_scope_transition_id = previous_scope_transitions[0].id
         auth_secret_changed = req.config is not None and _jira_auth_secret_changed(
             existing["type"],
             req.config,
@@ -5002,6 +5132,7 @@ def create_admin_app(
                     source_id,
                     previous_projection_scope,
                     target_projection_scope,
+                    predecessor_transition_id=predecessor_scope_transition_id,
                 ),
                 source_id=source_id,
                 previous_scope=previous_projection_scope,
@@ -5203,7 +5334,7 @@ def create_admin_app(
         if current_source is None:
             raise HTTPException(status_code=404, detail="Source not found")
         try:
-            snapshot_id = local_agent_authoritative_snapshot_id(
+            input_snapshot_id = local_agent_collection_attempt_id(
                 current_source["type"],
                 req.local_agent_job_id if req else None,
                 req.local_agent_attempt_count if req else None,
@@ -5211,14 +5342,6 @@ def create_admin_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        input_snapshot_id = (
-            local_agent_sync_snapshot_id(
-                req.local_agent_job_id if req else None,
-                req.local_agent_attempt_count if req else None,
-            )
-            if current_source["type"] == "teams"
-            else snapshot_id
-        )
         current_source = await db.get_source(source_id)
         if current_source is None:
             raise HTTPException(status_code=404, detail="Source not found")
@@ -5240,6 +5363,9 @@ def create_admin_app(
                 ),
                 input_snapshot_id=input_snapshot_id,
                 source_config_revision=str(lease_payload["source_config_revision"]),
+                predecessor_activity_id=(
+                    req.local_agent_job_id if req else None
+                ),
             )
         except SourcePausedError:
             raise _source_paused_http_error()
@@ -5383,7 +5509,7 @@ def create_admin_app(
                 detail=f"source lifecycle maintenance active: {lifecycle_job.id}",
             )
         try:
-            snapshot_id = local_agent_authoritative_snapshot_id(
+            input_snapshot_id = local_agent_collection_attempt_id(
                 source_type,
                 req.local_agent_job_id,
                 req.local_agent_attempt_count,
@@ -5391,15 +5517,6 @@ def create_admin_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-        input_snapshot_id = (
-            local_agent_sync_snapshot_id(
-                req.local_agent_job_id,
-                req.local_agent_attempt_count,
-            )
-            if source_type == TEAMS_SOURCE_TYPE
-            else snapshot_id
-        )
 
         try:
             if source_type == GITHUB_REPO_SOURCE_TYPE:
@@ -5418,7 +5535,7 @@ def create_admin_app(
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                     document_store=artifact_store,
-                    sync_snapshot_id=snapshot_id,
+                    sync_snapshot_id=input_snapshot_id,
                 )
             elif source_type == JIRA_SOURCE_TYPE:
                 result = await submit_jira_package(
@@ -5544,8 +5661,28 @@ def create_admin_app(
                 await discard_unretained_package()
                 raise
             if retained_input.raw_uri != package_uri:
+                try:
+                    retained_input, retained_package_hash = (
+                        await _attest_retained_local_source_input(
+                            db=db,
+                            artifact_store=artifact_store,
+                            source_type=source_type,
+                            source_id=source_id,
+                            retained_input=retained_input,
+                            expected_activity_epoch=int(
+                                lease_payload["source_activity_epoch"]
+                            ),
+                        )
+                    )
+                except ValueError as exc:
+                    await discard_unretained_package()
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                except Exception:
+                    await discard_unretained_package()
+                    raise
                 await discard_unretained_package()
                 result["package_uri"] = retained_input.raw_uri
+                result["package_sha256"] = retained_package_hash
 
         public_result = dict(result)
         public_result.pop("package_manifest_entry", None)

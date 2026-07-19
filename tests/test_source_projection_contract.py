@@ -199,6 +199,110 @@ def test_projection_rejects_cross_unit_observation_revision_lineage() -> None:
         )
 
 
+def test_projection_requires_explicit_carry_for_revision_without_observation() -> None:
+    revision = SourceObservationRevision(
+        id="obsrev-carried",
+        observation_id="obs-not-projected",
+        semantic_hash="body-hash",
+        content="body",
+    )
+    unit = SourceUnit("unit-1", "src-1", "page", "page-1")
+    unit_revision = SourceUnitRevision(
+        id="unitrev-1",
+        source_unit_id=unit.id,
+        semantic_hash="unit-hash",
+        observation_revision_ids=(revision.id,),
+    )
+
+    with pytest.raises(ValueError, match="exactly identify"):
+        SourceProjection(
+            run_id="run-missing-carry",
+            source_id="src-1",
+            source_type="jira",
+            scope={},
+            coverage=ProjectionCoverage.PARTIAL_PROJECTION,
+            observations=(),
+            observation_revisions=(revision,),
+            source_units=(unit,),
+            source_unit_revisions=(unit_revision,),
+            relations=(),
+            deltas=(),
+            checkpoint={},
+        )
+
+
+def test_complete_projection_rejects_carried_observation_revision() -> None:
+    revision = SourceObservationRevision(
+        id="obsrev-carried",
+        observation_id="obs-not-projected",
+        semantic_hash="body-hash",
+        content="body",
+    )
+    unit = SourceUnit("unit-1", "src-1", "page", "page-1")
+    unit_revision = SourceUnitRevision(
+        id="unitrev-1",
+        source_unit_id=unit.id,
+        semantic_hash="unit-hash",
+        observation_revision_ids=(revision.id,),
+    )
+
+    with pytest.raises(ValueError, match="partial projection"):
+        SourceProjection(
+            run_id="run-invalid-complete-carry",
+            source_id="src-1",
+            source_type="jira",
+            scope={},
+            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+            observations=(),
+            observation_revisions=(revision,),
+            source_units=(unit,),
+            source_unit_revisions=(unit_revision,),
+            relations=(),
+            deltas=(),
+            checkpoint={},
+            carried_observation_revision_ids=(revision.id,),
+        )
+
+
+def test_projection_rejects_duplicate_observation_revision_membership() -> None:
+    observation = SourceObservation(
+        id="obs-1",
+        source_id="src-1",
+        source_unit_id="unit-1",
+        observation_type="body",
+        provider_key="page-1:body",
+    )
+    revision = SourceObservationRevision(
+        id="obsrev-1",
+        observation_id=observation.id,
+        semantic_hash="body-hash",
+        content="body",
+    )
+    unit = SourceUnit("unit-1", "src-1", "page", "page-1")
+    unit_revision = SourceUnitRevision(
+        id="unitrev-1",
+        source_unit_id=unit.id,
+        semantic_hash="unit-hash",
+        observation_revision_ids=(revision.id, revision.id),
+    )
+
+    with pytest.raises(ValueError, match="duplicate Observation Revision membership"):
+        SourceProjection(
+            run_id="run-duplicate-membership",
+            source_id="src-1",
+            source_type="confluence",
+            scope={},
+            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+            observations=(observation,),
+            observation_revisions=(revision,),
+            source_units=(unit,),
+            source_unit_revisions=(unit_revision,),
+            relations=(),
+            deltas=(),
+            checkpoint={},
+        )
+
+
 def test_projection_rejects_delta_anchor_outside_projected_revision() -> None:
     observation = SourceObservation(
         id="obs-1",

@@ -99,10 +99,13 @@ def canonical_projection_scope(source_type: str, config: Mapping[str, Any]) -> d
             scope.pop("page_tree_root", None)
             scope.pop("include_children", None)
     if source_type == "jira":
-        query_mode = str(scope.get("query_mode") or "projects").lower()
+        query_mode = str(scope.get("query_mode") or "simple").lower()
+        query_mode = "advanced" if query_mode == "advanced" else "simple"
         scope["query_mode"] = query_mode
-        if query_mode == "jql":
+        if query_mode == "advanced":
             scope.pop("projects", None)
+            scope.pop("jql_filter", None)
+            scope.pop("issue_types", None)
         else:
             scope.pop("jql", None)
     return scope
@@ -124,14 +127,17 @@ def projection_scope_transition_id(
     source_id: str,
     previous_scope: Mapping[str, object],
     target_scope: Mapping[str, object],
+    *,
+    predecessor_transition_id: str | None = None,
 ) -> str:
-    """Return a retry-stable identity for one exact scope transition."""
+    """Return a retry-stable identity for one scope-transition cycle."""
 
     payload = json.dumps(
         {
             "source_id": source_id,
             "previous_scope": dict(previous_scope),
             "target_scope": dict(target_scope),
+            "predecessor_transition_id": predecessor_transition_id,
         },
         sort_keys=True,
         separators=(",", ":"),

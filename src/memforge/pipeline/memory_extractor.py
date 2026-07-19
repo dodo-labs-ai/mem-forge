@@ -9,10 +9,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from memforge.config import DEFAULT_ENRICHMENT_MAX_TOKENS
+from memforge.config import DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError
 from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.document_units import ExtractionContext
+from memforge.pipeline.document_update import DEFAULT_MAX_DIFF_CHARS
 from memforge.pipeline.projection_context import ProjectionExtractionBatch
 
 if TYPE_CHECKING:
@@ -32,7 +33,7 @@ EXTRACTION_QUOTE_MAX_CHARS = 200
 EXTRACTION_TAG_MIN = 2
 EXTRACTION_TAG_MAX = 5
 DOC_CONTENT_CHAR_CAP = 100_000
-CHANGED_HUNK_CHAR_CAP = 40_000
+CHANGED_HUNK_CHAR_CAP = DEFAULT_MAX_DIFF_CHARS
 UPDATED_DOC_CHAR_CAP = 100_000
 EXISTING_MEMORIES_WINDOW = 30
 EXISTING_MEMORIES_WINDOW_CHANGE = 50
@@ -243,7 +244,9 @@ The following observations are CONTEXT only. Use them to resolve references and 
 {context_observations}
 </context_observations>
 
-Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required. Prefer an empty memories array over weak or transient claims. Do not emit source metadata, routine status, questions, or secrets. Preserve conditions and source language.
+Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required.
+
+Prefer an empty memories array over weak or transient claims. Do not emit records that only say an item was created, updated, uploaded, attached, assigned, labeled, ranked, moved, reprioritized, or passed through a routine workflow status. Do not emit revision history, source metadata, routing fields, questions, or secrets. An attachment-upload event is provenance, not authority about the attachment's contents; only separately supplied attachment-content evidence may support a claim. Preserve durable resolution rationale and settled outcomes, conditions, and source language.
 
 Return ONLY a JSON object with a "memories" array."""
 
@@ -265,7 +268,7 @@ class MemoryExtractor:
         model: str = "claude-sonnet-4-20250514",
         base_url: str | None = None,
         api_key: str | None = None,
-        max_tokens: int = DEFAULT_ENRICHMENT_MAX_TOKENS,
+        max_tokens: int = DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS,
         request_timeout_s: float = 300.0,
         structured_llm_client=None,
     ) -> None:
@@ -467,6 +470,7 @@ class MemoryExtractor:
             return result
         kept = []
         primary_content = dict(batch.primary_content_by_observation_id)
+        context_by_primary = dict(batch.context_observation_ids_by_primary)
         for memory in result.memories:
             quote = (memory.evidence_quote or memory.extraction_context or "").strip()
             if not quote or quote not in batch.primary_markdown:
@@ -490,9 +494,10 @@ class MemoryExtractor:
             memory.extraction_context = quote[:EXTRACTION_QUOTE_MAX_CHARS]
             memory.source_observation_id = source_observation_id
             required_ids = tuple(dict.fromkeys(memory.required_source_observation_ids))
+            allowed_context_ids = context_by_primary.get(source_observation_id, ())
             if (
                 source_observation_id in required_ids
-                or any(item not in batch.context_observation_ids for item in required_ids)
+                or any(item not in allowed_context_ids for item in required_ids)
             ):
                 continue
             memory.required_source_observation_ids = list(required_ids)
