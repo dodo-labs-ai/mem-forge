@@ -120,7 +120,9 @@ class FakeToolClient:
                 {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
             )
         )
-        return self.response
+        if self.response.get("error") or self.response.get("run_id"):
+            return self.response
+        return {"run_id": "run-test"}
 
     def push_local_markdown_document(self, **kwargs):
         self.calls.append(
@@ -924,6 +926,7 @@ def test_local_agent_cloud_github_sync_pushes_remote_gh_scope(monkeypatch):
 
     assert payload["operation"] == "github_repo_sync"
     assert payload["source_id"] == "src-from-cloud"
+    assert payload["source_sync_run_id"] == "run-test"
     assert payload["counts"] == {"selected": 1, "pushed": 1, "failed": 0}
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
     assert len(push_calls) == 1
@@ -973,13 +976,9 @@ def test_local_agent_cloud_github_sync_reports_failed_paths_for_retry_diagnostic
     assert payload["counts"] == {"selected": 3, "pushed": 2, "failed": 1}
     assert payload["retryable"] is True
     assert payload["error"] == (
-        "1 document(s) failed to push: "
-        "Payroll Processing V2/Überblick.md: temporary GitHub API failure"
+        "1 document(s) failed to push: Payroll Processing V2/Überblick.md: temporary GitHub API failure"
     )
-    assert not [
-        call for call in FakeToolClient.calls
-        if call[0] == "start_source_processing"
-    ]
+    assert not [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
 
 
 def test_local_agent_cloud_github_sync_requires_job_workspace(monkeypatch):
@@ -1142,6 +1141,7 @@ def test_local_agent_cloud_local_markdown_sync_pushes_workspace_source(monkeypat
 
     assert payload["operation"] == "local_markdown_sync"
     assert payload["source_id"] == "src-local"
+    assert payload["source_sync_run_id"] == "run-test"
     assert payload["counts"]["pushed"] == 2
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_local_markdown_document"]
     assert len(push_calls) == 2
@@ -1282,6 +1282,7 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
 
     assert payload["operation"] == "jira_sync"
     assert payload["counts"] == {"selected": 1, "pushed": 1, "failed": 0}
+    assert payload["source_sync_run_id"] == "run-test"
     upload_calls = [call for call in FakeToolClient.calls if call[0] == "upload_jira_session"]
     assert upload_calls == [
         (
@@ -1763,6 +1764,7 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     assert payload["messages"] == 3
     assert payload["conversations"] == 1
     assert payload["sync_started"] is True
+    assert payload["source_sync_run_id"] == "run-test"
     assert [item["phase"] for item in progress] == [
         "connecting",
         "uploading",
@@ -2196,11 +2198,7 @@ def test_local_agent_cloud_teams_sync_quarantines_only_opaque_legacy_inventory(
                     "title": "Thread window",
                     "source_url": "https://teams.example.test/window",
                     "last_modified": "2026-07-08T09:24:57Z",
-                    "raw_payload": {
-                        "messages": [
-                            {"id": "1783500000000", "content": "Thread window"}
-                        ]
-                    },
+                    "raw_payload": {"messages": [{"id": "1783500000000", "content": "Thread window"}]},
                     "raw_hash": "sha256:raw-1",
                     "message_count": 1,
                 }
@@ -2282,25 +2280,16 @@ def test_local_agent_cloud_teams_sync_quarantines_only_opaque_legacy_inventory(
             "reason": "canonical_teams_window_identity_unavailable",
         }
     ]
-    pushes = [
-        call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"
-    ]
+    pushes = [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
     assert [call[1]["window_id"] for call in pushes] == [current_window_id]
-    assert any(
-        call[0] == "start_source_processing" for call in FakeToolClient.calls
-    )
-    audit_events = [
-        json.loads(line)
-        for line in (tmp_path / "teams-audit.jsonl").read_text().splitlines()
-    ]
+    assert any(call[0] == "start_source_processing" for call in FakeToolClient.calls)
+    audit_events = [json.loads(line) for line in (tmp_path / "teams-audit.jsonl").read_text().splitlines()]
     assert {
         "event": "teams_projection_inventory_finding",
         "source_unit_id": "unit-opaque",
         "reason": "canonical_teams_window_identity_unavailable",
     }.items() <= next(
-        event
-        for event in audit_events
-        if event.get("event") == "teams_projection_inventory_finding"
+        event for event in audit_events if event.get("event") == "teams_projection_inventory_finding"
     ).items()
 
 
@@ -2443,6 +2432,7 @@ def test_local_agent_cloud_teams_sync_retries_window_when_processing_was_not_acc
     )
 
     assert second["sync_started"] is True
+    assert second["source_sync_run_id"] == "run-accepted"
     assert second["counts"]["pushed"] == 1
     assert second["counts"]["skipped_existing"] == 0
     assert len([call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]) == 1

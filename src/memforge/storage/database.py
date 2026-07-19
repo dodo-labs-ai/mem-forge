@@ -111,6 +111,12 @@ from memforge.memory.lifecycle_plan import (
 )
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
+from memforge.memory.review_contract import (
+    CrossSourceReviewMemorySnapshot,
+    CrossSourceReviewSupportSnapshot,
+    validate_cross_source_review_write,
+    validate_pending_review_retry,
+)
 from memforge.retrieval.access_predicate import visible_sql
 from memforge.retrieval.metadata_text import metadata_alias_text, metadata_compact_text
 from memforge.source_access import infer_legacy_source_access
@@ -173,6 +179,7 @@ def _legacy_agent_session_client(source_id: str) -> str:
     if suffix.startswith("codex"):
         return "codex"
     return suffix.rsplit("-", 1)[0]
+
 
 # The three current outcomes an uploaded agent-session window can record.
 # Knowledge completeness ("how much was kept vs dropped as no_output") is read
@@ -369,9 +376,7 @@ def _source_sync_run_from_row(row: Mapping[str, Any], *, coalesced: bool = False
         input_snapshot_id=data.get("input_snapshot_id"),
         rerun_input_snapshot_id=data.get("rerun_input_snapshot_id"),
         input_generation_watermark=data.get("input_generation_watermark"),
-        rerun_input_generation_watermark=data.get(
-            "rerun_input_generation_watermark"
-        ),
+        rerun_input_generation_watermark=data.get("rerun_input_generation_watermark"),
         source_config_revision=data.get("source_config_revision"),
         rerun_source_config_revision=data.get("rerun_source_config_revision"),
         predecessor_activity_id=data.get("predecessor_activity_id"),
@@ -2863,9 +2868,7 @@ class Database:
                 async with self.db.execute("PRAGMA table_info(memories)") as cursor:
                     memory_columns = {str(row[1]) async for row in cursor}
                 if "memory_level" in memory_columns:
-                    async with self.db.execute(
-                        "SELECT id FROM memories WHERE memory_level = 'consolidated'"
-                    ) as cursor:
+                    async with self.db.execute("SELECT id FROM memories WHERE memory_level = 'consolidated'") as cursor:
                         consolidated_memory_ids = [str(row[0]) async for row in cursor]
                     for memory_id in consolidated_memory_ids:
                         await self.purge_memory(memory_id)
@@ -2888,9 +2891,7 @@ class Database:
                     memory_columns = {str(row[1]) async for row in cursor}
                 for column_name in ("curation_cluster_id", "memory_level"):
                     if column_name in memory_columns:
-                        await self.db.execute(
-                            f"ALTER TABLE memories DROP COLUMN {column_name}"
-                        )
+                        await self.db.execute(f"ALTER TABLE memories DROP COLUMN {column_name}")
             if version == 26:
                 await self._backfill_relation_run_snapshot_audit()
             if version in (30, 31):
@@ -2941,17 +2942,12 @@ class Database:
                     or not explicit_owner
                     or explicit_state not in {"active", "changing", "orphaned_private"}
                 ):
-                    raise RuntimeError(
-                        f"source access metadata is incomplete or invalid: {source_id}"
-                    )
+                    raise RuntimeError(f"source access metadata is incomplete or invalid: {source_id}")
                 continue
 
-            if (
-                str(source.get("type") or "") == "agent_session"
-                and not (
-                    str(source.get("created_by_user_id") or "").strip()
-                    or str(source.get("execution_owner_user_id") or "").strip()
-                )
+            if str(source.get("type") or "") == "agent_session" and not (
+                str(source.get("created_by_user_id") or "").strip()
+                or str(source.get("execution_owner_user_id") or "").strip()
             ):
                 # Pre-access coding Sources were shared per client and may not
                 # have Source-level provenance. Migration 45 derives their
@@ -2972,13 +2968,9 @@ class Database:
                     source_id=source_id,
                     source_type=str(source.get("type") or ""),
                     provenance_owner_user_id=(
-                        source.get("created_by_user_id")
-                        or source.get("execution_owner_user_id")
+                        source.get("created_by_user_id") or source.get("execution_owner_user_id")
                     ),
-                    memory_access=(
-                        (str(row.get("visibility") or ""), row.get("owner_user_id"))
-                        for row in access_rows
-                    ),
+                    memory_access=((str(row.get("visibility") or ""), row.get("owner_user_id")) for row in access_rows),
                 )
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
@@ -2998,9 +2990,7 @@ class Database:
         or fall back to a legacy shared Source.
         """
 
-        async with self.db.execute(
-            "SELECT * FROM sources WHERE type = 'agent_session' ORDER BY id"
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM sources WHERE type = 'agent_session' ORDER BY id") as cursor:
             legacy_sources = [dict(row) async for row in cursor]
 
         for source in legacy_sources:
@@ -3018,12 +3008,8 @@ class Database:
             if not client:
                 client = _legacy_agent_session_client(source_id)
             if not client:
-                raise RuntimeError(
-                    f"cannot partition legacy agent-session source without client: {source_id}"
-                )
-            if source_owner and source_id == _agent_session_source_id_for_owner(
-                client, source_owner
-            ):
+                raise RuntimeError(f"cannot partition legacy agent-session source without client: {source_id}")
+            if source_owner and source_id == _agent_session_source_id_for_owner(client, source_owner):
                 continue
 
             async with self.db.execute(
@@ -3054,16 +3040,10 @@ class Database:
                             if str(row["owner_user_id"] or "").strip()
                         }
                     if len(memory_owners) > 1:
-                        raise RuntimeError(
-                            "agent-session document has multiple owners during migration: "
-                            f"{doc_id}"
-                        )
+                        raise RuntimeError(f"agent-session document has multiple owners during migration: {doc_id}")
                     owner = next(iter(memory_owners), source_owner)
                 if not owner:
-                    raise RuntimeError(
-                        "cannot partition legacy agent-session document without an owner: "
-                        f"{doc_id}"
-                    )
+                    raise RuntimeError(f"cannot partition legacy agent-session document without an owner: {doc_id}")
                 document_owners[doc_id] = owner
 
             owners = {owner for owner in document_owners.values() if owner}
@@ -3086,9 +3066,7 @@ class Database:
             if source_owner:
                 owners.add(source_owner)
             if not owners:
-                raise RuntimeError(
-                    f"cannot partition legacy agent-session source without owner evidence: {source_id}"
-                )
+                raise RuntimeError(f"cannot partition legacy agent-session source without owner evidence: {source_id}")
 
             for owner in sorted(owners):
                 target_source_id = _agent_session_source_id_for_owner(client, owner)
@@ -3125,9 +3103,7 @@ class Database:
                         source.get("created_at") or _now_iso(),
                     ),
                 )
-                owned_doc_ids = [
-                    doc_id for doc_id, doc_owner in document_owners.items() if doc_owner == owner
-                ]
+                owned_doc_ids = [doc_id for doc_id, doc_owner in document_owners.items() if doc_owner == owner]
                 for doc_id in owned_doc_ids:
                     await self.db.execute(
                         "UPDATE documents SET source = ? WHERE doc_id = ?",
@@ -3340,24 +3316,24 @@ class Database:
                     client=COALESCE(excluded.client, documents.client),
                     updated_at=excluded.updated_at""",
                     (
-                    doc.doc_id,
-                    doc.source,
-                    doc.source_url,
-                    doc.title,
-                    doc.space_or_project,
-                    doc.author,
-                    doc.last_modified.isoformat(),
-                    json.dumps(doc.labels),
-                    doc.version,
-                    doc.content_hash,
-                    doc.token_count,
-                    doc.raw_content_uri,
-                    doc.raw_content_type,
-                    doc.normalized_content_uri,
-                    doc.pdf_content_uri,
-                    doc.last_synced.isoformat(),
-                    doc.client,
-                    _now_iso(),
+                        doc.doc_id,
+                        doc.source,
+                        doc.source_url,
+                        doc.title,
+                        doc.space_or_project,
+                        doc.author,
+                        doc.last_modified.isoformat(),
+                        json.dumps(doc.labels),
+                        doc.version,
+                        doc.content_hash,
+                        doc.token_count,
+                        doc.raw_content_uri,
+                        doc.raw_content_type,
+                        doc.normalized_content_uri,
+                        doc.pdf_content_uri,
+                        doc.last_synced.isoformat(),
+                        doc.client,
+                        _now_iso(),
                     ),
                 )
                 await self._refresh_metadata_fts_for_doc_unlocked(doc.doc_id)
@@ -3578,9 +3554,16 @@ class Database:
                     created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    job_id, workspace_id, source_id, source_type, operation,
+                    job_id,
+                    workspace_id,
+                    source_id,
+                    source_type,
+                    operation,
                     json.dumps(dict(payload), sort_keys=True),
-                    created_by_user_id, execution_owner_user_id, now_iso, now_iso,
+                    created_by_user_id,
+                    execution_owner_user_id,
+                    now_iso,
+                    now_iso,
                 ),
             )
             await self.db.commit()
@@ -3616,9 +3599,7 @@ class Database:
                 ) as cursor:
                     lifecycle_job = await cursor.fetchone()
                 if lifecycle_job is not None:
-                    raise ValueError(
-                        f"source lifecycle maintenance active: {lifecycle_job['id']}"
-                    )
+                    raise ValueError(f"source lifecycle maintenance active: {lifecycle_job['id']}")
             except Exception:
                 await self.db.rollback()
                 raise
@@ -3648,13 +3629,8 @@ class Database:
                         )
                         await self.db.commit()
                     return str(existing["job_id"]), False
-                same_revision = existing_payload.get(
-                    "source_config_revision"
-                ) == payload.get("source_config_revision")
-                if same_revision and (
-                    not requested_force
-                    or bool(existing_payload.get("force_full_sync"))
-                ):
+                same_revision = existing_payload.get("source_config_revision") == payload.get("source_config_revision")
+                if same_revision and (not requested_force or bool(existing_payload.get("force_full_sync"))):
                     return str(existing["job_id"]), False
             await self.db.execute(
                 """INSERT INTO local_agent_jobs (
@@ -3663,18 +3639,23 @@ class Database:
                     created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    job_id, workspace_id, source_id, source_type, operation,
-                    json.dumps(dict(payload), sort_keys=True), created_by_user_id,
-                    execution_owner_user_id, now_iso, now_iso,
+                    job_id,
+                    workspace_id,
+                    source_id,
+                    source_type,
+                    operation,
+                    json.dumps(dict(payload), sort_keys=True),
+                    created_by_user_id,
+                    execution_owner_user_id,
+                    now_iso,
+                    now_iso,
                 ),
             )
             await self.db.commit()
         return job_id, True
 
     async def get_local_agent_job(self, job_id: str) -> dict[str, Any] | None:
-        async with self.db.execute(
-            "SELECT * FROM local_agent_jobs WHERE job_id = ?", (job_id,)
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM local_agent_jobs WHERE job_id = ?", (job_id,)) as cursor:
             row = await cursor.fetchone()
         return _local_agent_job_from_row(row) if row else None
 
@@ -3756,8 +3737,13 @@ class Database:
                                AND active.job_id <> local_agent_jobs.job_id
                          )""",
                     (
-                        user_id, leased_until, now_iso, row["job_id"], user_id,
-                        now_iso, now_iso,
+                        user_id,
+                        leased_until,
+                        now_iso,
+                        row["job_id"],
+                        user_id,
+                        now_iso,
+                        now_iso,
                     ),
                 )
                 if cursor.rowcount:
@@ -3831,8 +3817,14 @@ class Database:
                    WHERE job_id = ? AND status = 'leased'
                      AND lease_owner_user_id = ? AND attempt_count = ?""",
                 (
-                    stored_status, json.dumps(dict(result), sort_keys=True), error,
-                    finished_at, now_iso, job_id, user_id, attempt_count,
+                    stored_status,
+                    json.dumps(dict(result), sort_keys=True),
+                    error,
+                    finished_at,
+                    now_iso,
+                    job_id,
+                    user_id,
+                    attempt_count,
                 ),
             )
             await self.db.commit()
@@ -3878,8 +3870,7 @@ class Database:
                 owner = str(row.get("execution_owner_user_id") or "").strip()
                 expected_due = str(row["sync_schedule_next_at"])
                 interval = int(
-                    row.get("sync_schedule_interval_minutes")
-                    or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+                    row.get("sync_schedule_interval_minutes") or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
                 )
                 if not owner:
                     await self.db.execute(
@@ -3896,10 +3887,13 @@ class Database:
                         ),
                     )
                     continue
-                job_id = "laj-schedule-" + uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"memforge:{workspace_id}:{row['id']}:{expected_due}",
-                ).hex
+                job_id = (
+                    "laj-schedule-"
+                    + uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"memforge:{workspace_id}:{row['id']}:{expected_due}",
+                    ).hex
+                )
                 cursor = await self.db.execute(
                     """UPDATE sources SET sync_schedule_next_at = ?,
                        sync_schedule_updated_at = ?
@@ -3921,9 +3915,16 @@ class Database:
                             created_at, updated_at
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
-                            job_id, workspace_id, row["id"], row["type"], operation,
+                            job_id,
+                            workspace_id,
+                            row["id"],
+                            row["type"],
+                            operation,
                             json.dumps(local_agent_sync_job_payload(row), sort_keys=True),
-                            owner, owner, due_at, due_at,
+                            owner,
+                            owner,
+                            due_at,
+                            due_at,
                         ),
                     )
                     enqueued += 1
@@ -4869,9 +4870,7 @@ class Database:
             params.append(cursor)
         params.append(limit + 1)
         rows = await self.db.execute_fetchall(
-            "SELECT su.* FROM source_units su WHERE "
-            + " AND ".join(conditions)
-            + " ORDER BY su.id LIMIT ?",
+            "SELECT su.* FROM source_units su WHERE " + " AND ".join(conditions) + " ORDER BY su.id LIMIT ?",
             tuple(params),
         )
         has_more = len(rows) > limit
@@ -5010,9 +5009,7 @@ class Database:
             or int(lease["epoch"]) != source_activity.epoch
             or str(lease["lease_until"]) <= _now_iso()
         ):
-            raise SourceActivityConflict(
-                f"source activity fence is not current: {source_activity.id}"
-            )
+            raise SourceActivityConflict(f"source activity fence is not current: {source_activity.id}")
 
     async def enable_lifecycle_gate(
         self,
@@ -5132,14 +5129,12 @@ class Database:
                 ) as cursor:
                     existing = await cursor.fetchone()
                 if existing is not None and (
-                    str(existing["source_id"]) != finding.source_id
-                    or str(existing["memory_id"]) != finding.memory_id
+                    str(existing["source_id"]) != finding.source_id or str(existing["memory_id"]) != finding.memory_id
                 ):
                     raise ValueError("lifecycle finding identity mismatch")
                 if (
                     existing is not None
-                    and CutoverFindingStatus(str(existing["status"]))
-                    is CutoverFindingStatus.RESOLVED
+                    and CutoverFindingStatus(str(existing["status"])) is CutoverFindingStatus.RESOLVED
                 ):
                     await self._assert_source_activity_fence_unlocked(
                         finding.source_id,
@@ -5215,9 +5210,7 @@ class Database:
             status_clause = " AND status = ?"
             params.append(status.value)
         rows = await self.db.execute_fetchall(
-            "SELECT * FROM lifecycle_cutover_findings WHERE source_id = ?"
-            + status_clause
-            + " ORDER BY created_at, id",
+            "SELECT * FROM lifecycle_cutover_findings WHERE source_id = ?" + status_clause + " ORDER BY created_at, id",
             tuple(params),
         )
         return [self._row_to_lifecycle_cutover_finding(row) for row in rows]
@@ -5267,9 +5260,7 @@ class Database:
                 ) as cursor:
                     active_run = await cursor.fetchone()
                 if active_run is not None and not cancel_active_sync:
-                    raise ValueError(
-                        f"source sync run already active: {active_run['run_id']}"
-                    )
+                    raise ValueError(f"source sync run already active: {active_run['run_id']}")
                 async with self.db.execute(
                     """SELECT job_id FROM local_agent_jobs
                        WHERE source_id = ? AND status IN ('queued', 'leased')
@@ -5278,10 +5269,7 @@ class Database:
                 ) as cursor:
                     active_local_job = await cursor.fetchone()
                 if active_local_job is not None:
-                    raise ValueError(
-                        "local agent job already active: "
-                        f"{active_local_job['job_id']}"
-                    )
+                    raise ValueError(f"local agent job already active: {active_local_job['job_id']}")
                 async with self.db.execute(
                     """SELECT operation_id FROM source_access_transitions
                        WHERE source_id = ?
@@ -5291,10 +5279,7 @@ class Database:
                 ) as cursor:
                     active_access = await cursor.fetchone()
                 if active_access is not None:
-                    raise ValueError(
-                        "source access transition already active: "
-                        f"{active_access['operation_id']}"
-                    )
+                    raise ValueError(f"source access transition already active: {active_access['operation_id']}")
                 async with self.db.execute(
                     "SELECT source_id, status FROM lifecycle_backfill_jobs WHERE id = ?",
                     (job.id,),
@@ -5327,9 +5312,7 @@ class Database:
                 ) as cursor:
                     active = await cursor.fetchone()
                 if active is not None:
-                    raise ValueError(
-                        f"source lifecycle job already active: {active['id']}"
-                    )
+                    raise ValueError(f"source lifecycle job already active: {active['id']}")
                 if active_run is not None:
                     await self._cancel_source_sync_run_for_maintenance_unlocked(
                         str(active_run["run_id"]),
@@ -5341,8 +5324,7 @@ class Database:
                     # and agent-patch state machines independent; the epoch bump
                     # below fences any already-computed stale lifecycle commit.
                     await self.db.execute(
-                        "DELETE FROM source_activity_leases "
-                        "WHERE source_id = ? AND kind = ?",
+                        "DELETE FROM source_activity_leases WHERE source_id = ? AND kind = ?",
                         (job.source_id, SourceActivityKind.SYNC.value),
                     )
                 await self._acquire_source_activity_unlocked(
@@ -5449,9 +5431,7 @@ class Database:
             raise SourceActivityConflict(f"Source not found: {source_id}")
         epoch = int(source["activity_epoch"] or 0)
         if expected_epoch is not None and epoch != expected_epoch:
-            raise SourceActivityConflict(
-                f"source activity epoch changed: expected {expected_epoch}, current {epoch}"
-            )
+            raise SourceActivityConflict(f"source activity epoch changed: expected {expected_epoch}, current {epoch}")
         # Expiry removes admission authority. Purge stale rows while holding
         # the Source write boundary so a deterministic job/activity id can be
         # reacquired after a crash without colliding with its old primary key.
@@ -5468,15 +5448,9 @@ class Database:
         ) as cursor:
             active = await cursor.fetchone()
         if active is not None and str(active["id"]) != activity_id:
-            raise SourceActivityConflict(
-                f"source activity already active: {active['id']} ({active['kind']})"
-            )
+            raise SourceActivityConflict(f"source activity already active: {active['id']} ({active['kind']})")
         if active is not None:
-            if (
-                str(active["kind"]) != kind.value
-                or int(active["epoch"]) != epoch
-                or active["capability"] != capability
-            ):
+            if str(active["kind"]) != kind.value or int(active["epoch"]) != epoch or active["capability"] != capability:
                 raise SourceActivityConflict("source activity retry identity mismatch")
             await self.db.execute(
                 "UPDATE source_activity_leases SET lease_until = ?, updated_at = ? WHERE id = ?",
@@ -5570,9 +5544,7 @@ class Database:
             )
             if cursor.rowcount != 1:
                 await self.db.rollback()
-                raise SourceActivityConflict(
-                    f"source activity lease is not current: {activity_id}"
-                )
+                raise SourceActivityConflict(f"source activity lease is not current: {activity_id}")
             async with self.db.execute(
                 "SELECT source_id, kind, epoch FROM source_activity_leases WHERE id = ?",
                 (activity_id,),
@@ -5656,9 +5628,7 @@ class Database:
             )
             if lease_cursor.rowcount != 1:
                 await self.db.rollback()
-                raise SourceActivityConflict(
-                    f"source lifecycle activity lease is not current: {job_id}"
-                )
+                raise SourceActivityConflict(f"source lifecycle activity lease is not current: {job_id}")
             await self.db.commit()
         stored = await self.get_lifecycle_backfill_job(job_id)
         assert stored is not None
@@ -5687,9 +5657,7 @@ class Database:
             )
             if lease_cursor.rowcount != 1:
                 await self.db.rollback()
-                raise SourceActivityConflict(
-                    f"source lifecycle activity lease is not current: {job_id}"
-                )
+                raise SourceActivityConflict(f"source lifecycle activity lease is not current: {job_id}")
             await self.db.commit()
         stored = await self.get_lifecycle_backfill_job(job_id)
         assert stored is not None
@@ -5745,29 +5713,19 @@ class Database:
                 }:
                     raise ValueError("lifecycle backfill job changed during stale recovery")
                 if str(job["source_id"]) != source_id:
-                    raise SourceActivityConflict(
-                        f"source lifecycle activity retry identity mismatch: {job_id}"
-                    )
+                    raise SourceActivityConflict(f"source lifecycle activity retry identity mismatch: {job_id}")
                 async with self.db.execute(
                     "SELECT source_id, capability, lease_until FROM source_activity_leases WHERE id = ?",
                     (job_id,),
                 ) as cursor:
                     lease = await cursor.fetchone()
                 if lease is not None:
-                    if (
-                        str(lease["source_id"]) != str(job["source_id"])
-                        or lease["capability"] != job_id
-                    ):
-                        raise SourceActivityConflict(
-                            f"source lifecycle activity retry identity mismatch: {job_id}"
-                        )
+                    if str(lease["source_id"]) != str(job["source_id"]) or lease["capability"] != job_id:
+                        raise SourceActivityConflict(f"source lifecycle activity retry identity mismatch: {job_id}")
                     if str(lease["lease_until"]) > now_iso:
-                        raise SourceActivityConflict(
-                            f"source lifecycle activity lease is still current: {job_id}"
-                        )
+                        raise SourceActivityConflict(f"source lifecycle activity lease is still current: {job_id}")
                     lease_cursor = await self.db.execute(
-                        "DELETE FROM source_activity_leases "
-                        "WHERE id = ? AND capability = ? AND lease_until <= ?",
+                        "DELETE FROM source_activity_leases WHERE id = ? AND capability = ? AND lease_until <= ?",
                         (job_id, job_id, now_iso),
                     )
                     if lease_cursor.rowcount != 1:
@@ -6174,6 +6132,13 @@ class Database:
                     source_activity,
                 )
                 async with self.db.execute(
+                    "SELECT id FROM memories WHERE id = ?",
+                    (assertion.memory_id,),
+                ) as cursor:
+                    memory = await cursor.fetchone()
+                if memory is None:
+                    raise ValueError("support assertion references unknown Memory")
+                async with self.db.execute(
                     """SELECT er.role, eu.source_id AS evidence_source_id
                        FROM evidence_references er
                        JOIN evidence_units eu ON eu.id = er.evidence_unit_id
@@ -6398,9 +6363,7 @@ class Database:
             if mutation.mutation_type is LifecycleMutationType.RETIRE_MEMORY
         }
         if memory_id not in created_memory_ids | retired_memory_ids:
-            raise ValueError(
-                "agent claim must reference a Memory created or retired by its Lifecycle Plan"
-            )
+            raise ValueError("agent claim must reference a Memory created or retired by its Lifecycle Plan")
         observed = _utc_iso(observed_at)
         async with self._write_lock:
             try:
@@ -6593,12 +6556,8 @@ class Database:
             claim = (
                 str(raw.get("content_hash") or content_hash(str(raw.get("content") or ""))),
                 str(raw.get("visibility") or "workspace"),
-                raw.get("owner_user_id")
-                if isinstance(raw.get("owner_user_id"), str)
-                else None,
-                raw.get("repo_identifier")
-                if isinstance(raw.get("repo_identifier"), str)
-                else None,
+                raw.get("owner_user_id") if isinstance(raw.get("owner_user_id"), str) else None,
+                raw.get("repo_identifier") if isinstance(raw.get("repo_identifier"), str) else None,
             )
             if claim in planned_claims:
                 raise ValueError("lifecycle plan contains duplicate exact claim creates")
@@ -6617,8 +6576,7 @@ class Database:
             ) as cursor:
                 if await cursor.fetchone() is not None:
                     raise ValueError(
-                        "lifecycle plan exact claim stale guard failed: "
-                        "canonical active Memory now exists"
+                        "lifecycle plan exact claim stale guard failed: canonical active Memory now exists"
                     )
 
     async def _validate_projected_support_invariant_unlocked(
@@ -6635,10 +6593,7 @@ class Database:
         plan's current Unit.
         """
 
-        if any(
-            mutation.mutation_type is LifecycleMutationType.CREATE_REVIEW
-            for mutation in plan.mutations
-        ):
+        if any(mutation.mutation_type is LifecycleMutationType.CREATE_REVIEW for mutation in plan.mutations):
             return
         created_ids = {
             mutation.memory_id
@@ -6700,13 +6655,9 @@ class Database:
             current_scope_total = int(support["current_scope_total"] or 0)
             invalid = int(support["invalid"] or 0)
             if memory_id in created_ids | reactivated_ids and current_scope_total == 0:
-                raise ValueError(
-                    f"projected lifecycle activated Memory without source support: {memory_id}"
-                )
+                raise ValueError(f"projected lifecycle activated Memory without source support: {memory_id}")
             if invalid:
-                raise ValueError(
-                    f"projected lifecycle left stale or ambiguous source support: {memory_id}"
-                )
+                raise ValueError(f"projected lifecycle left stale or ambiguous source support: {memory_id}")
 
     async def _stage_lifecycle_evidence_unlocked(
         self,
@@ -6797,9 +6748,7 @@ class Database:
                 valid_from=_parse_date(raw.get("valid_from")),
                 valid_until=_parse_date(raw.get("valid_until")),
                 extraction_context=(
-                    str(raw.get("extraction_context"))
-                    if raw.get("extraction_context") is not None
-                    else None
+                    str(raw.get("extraction_context")) if raw.get("extraction_context") is not None else None
                 ),
             )
             await self._insert_memory_unlocked(memory)
@@ -6819,11 +6768,7 @@ class Database:
                     memory.id,
                     doc_id,
                     source_type,
-                    (
-                        str(document_source.get("excerpt"))
-                        if document_source.get("excerpt") is not None
-                        else None
-                    ),
+                    (str(document_source.get("excerpt")) if document_source.get("excerpt") is not None else None),
                     source_updated_at=_parse_dt(document_source.get("source_updated_at")),
                 )
             await self._enqueue_lifecycle_vector_task_unlocked(
@@ -6841,10 +6786,7 @@ class Database:
                 "expected_retirement_reason",
                 "source_rebaseline",
             )
-            if (
-                not isinstance(expected_retirement_reason, str)
-                or not expected_retirement_reason
-            ):
+            if not isinstance(expected_retirement_reason, str) or not expected_retirement_reason:
                 raise ValueError("reactivate_memory requires expected_retirement_reason")
             cursor = await self.db.execute(
                 """UPDATE memories
@@ -6885,9 +6827,10 @@ class Database:
                     raise ValueError("attach_support requires support-granting evidence")
                 if reference["source_id"] != mutation.source_id:
                     raise ValueError("attach_support evidence belongs to another source")
-                support_id = "support-" + hashlib.sha256(
-                    f"{mutation.memory_id}\x1f{reference_id}".encode("utf-8")
-                ).hexdigest()[:20]
+                support_id = (
+                    "support-"
+                    + hashlib.sha256(f"{mutation.memory_id}\x1f{reference_id}".encode("utf-8")).hexdigest()[:20]
+                )
                 await self.db.execute(
                     """INSERT INTO memory_support_assertions (
                         id, memory_id, evidence_reference_id, source_id,
@@ -7111,9 +7054,9 @@ class Database:
         *,
         now: str,
     ) -> None:
-        task_id = "lvout-" + hashlib.sha256(
-            f"{plan_id}\x1f{memory_id}\x1f{operation.value}".encode("utf-8")
-        ).hexdigest()[:20]
+        task_id = (
+            "lvout-" + hashlib.sha256(f"{plan_id}\x1f{memory_id}\x1f{operation.value}".encode("utf-8")).hexdigest()[:20]
+        )
         await self.db.execute(
             """INSERT OR IGNORE INTO lifecycle_vector_outbox (
                    id, lifecycle_plan_id, memory_id, operation, status,
@@ -7130,9 +7073,7 @@ class Database:
         return json.loads(row["payload_json"]) if row is not None else None
 
     async def get_lifecycle_review(self, review_id: str) -> LifecycleReview | None:
-        async with self.db.execute(
-            "SELECT * FROM lifecycle_reviews WHERE id = ?", (review_id,)
-        ) as cursor:
+        async with self.db.execute("SELECT * FROM lifecycle_reviews WHERE id = ?", (review_id,)) as cursor:
             row = await cursor.fetchone()
         return self._row_to_lifecycle_review(row) if row is not None else None
 
@@ -7164,8 +7105,7 @@ class Database:
             raise ValueError("direct lifecycle review resolution must be rejected or stale")
         async with self._write_lock:
             cursor = await self.db.execute(
-                "UPDATE lifecycle_reviews SET status = ?, resolved_at = ? "
-                "WHERE id = ? AND status = 'pending'",
+                "UPDATE lifecycle_reviews SET status = ?, resolved_at = ? WHERE id = ? AND status = 'pending'",
                 (status.value, _now_iso(), review_id),
             )
             if cursor.rowcount != 1:
@@ -8478,9 +8418,7 @@ class Database:
             repo_identifier,
         ]
         if exclusions:
-            exclusion_clause = (
-                " AND m.id NOT IN (" + ", ".join("?" for _ in exclusions) + ")"
-            )
+            exclusion_clause = " AND m.id NOT IN (" + ", ".join("?" for _ in exclusions) + ")"
             params.extend(exclusions)
         async with self.db.execute(
             """SELECT m.* FROM memories AS m
@@ -8853,7 +8791,9 @@ class Database:
             now = _now_iso()
             await self.db.execute(
                 """UPDATE memories SET
-                    superseded_by = NULL, status = 'retired',
+                    superseded_by = NULL, superseded_at = NULL,
+                    replacement_reason = NULL, replacement_kind = NULL,
+                    status = 'retired',
                     retirement_reason = 'privacy_removed',
                     retired_at = COALESCE(retired_at, ?), updated_at = ?
                    WHERE superseded_by = ?""",
@@ -9185,8 +9125,7 @@ class Database:
             gate = await cursor.fetchone()
         if gate is not None and gate["state"] == LifecycleGateState.ENABLED.value:
             raise ValueError(
-                "direct configured-source Memory write rejected after cutover; "
-                "projected lifecycle required"
+                "direct configured-source Memory write rejected after cutover; projected lifecycle required"
             )
 
     async def supersede_memory_with_source_and_relation(
@@ -9694,11 +9633,7 @@ class Database:
                 record["source_type"],
                 record["title"] or "",
                 record["doc_id"] or "",
-                " ".join(
-                    part
-                    for part in (record["space_or_project"] or "", record["source_url"] or "")
-                    if part
-                ),
+                " ".join(part for part in (record["space_or_project"] or "", record["source_url"] or "") if part),
                 record["source_name"] or "",
                 labels_text,
             ),
@@ -9773,9 +9708,7 @@ class Database:
         await self.db.execute("DELETE FROM memory_search_metadata_fts")
         await self.db.execute("DELETE FROM memory_search_metadata_alias_fts")
         await self.db.execute("DELETE FROM memory_search_metadata_trigram")
-        rows = await self.db.execute_fetchall(
-            "SELECT memory_id, doc_id FROM memory_sources ORDER BY memory_id, doc_id"
-        )
+        rows = await self.db.execute_fetchall("SELECT memory_id, doc_id FROM memory_sources ORDER BY memory_id, doc_id")
         for row in rows:
             await self._refresh_memory_metadata_fts_unlocked(
                 row["memory_id"],
@@ -10729,11 +10662,7 @@ class Database:
             (entity_id,),
         ) as cursor:
             async for row in cursor:
-                alias_text = " ".join(
-                    part
-                    for part in (row["alias"] or "", row["alias_normalized"] or "")
-                    if part
-                )
+                alias_text = " ".join(part for part in (row["alias"] or "", row["alias_normalized"] or "") if part)
                 await self.db.execute(
                     """INSERT INTO entity_alias_search_fts (
                            entity_id,
@@ -10996,15 +10925,11 @@ class Database:
             }
         )
         binding_json = json.dumps(dict(project_binding)) if project_binding else None
-        if (
-            projection_scope_transition is not None
-            and projection_scope_transition.source_id != id
-        ):
+        if projection_scope_transition is not None and projection_scope_transition.source_id != id:
             raise ValueError("projection scope transition source mismatch")
         if (
             projection_scope_transition is not None
-            and projection_scope_transition.status
-            is not ProjectionScopeTransitionStatus.PENDING
+            and projection_scope_transition.status is not ProjectionScopeTransitionStatus.PENDING
         ):
             raise ValueError("new projection scope transition must be pending")
         async with self._write_lock:
@@ -11030,9 +10955,7 @@ class Database:
                     ) as cursor:
                         lifecycle_job = await cursor.fetchone()
                     if lifecycle_job is not None:
-                        raise ValueError(
-                            f"source lifecycle maintenance active: {lifecycle_job['id']}"
-                        )
+                        raise ValueError(f"source lifecycle maintenance active: {lifecycle_job['id']}")
                     async with self.db.execute(
                         """SELECT run_id FROM source_sync_runs
                            WHERE source_id = ? AND status IN ('pending', 'running')
@@ -11042,9 +10965,7 @@ class Database:
                         active_run = await cursor.fetchone()
                     if active_run is not None:
                         current_creator = current_source["created_by_user_id"]
-                        current_execution_owner = current_source[
-                            "execution_owner_user_id"
-                        ]
+                        current_execution_owner = current_source["execution_owner_user_id"]
                         pause_only = is_pause_only_source_update(
                             current={
                                 "type": current_source["type"],
@@ -11062,20 +10983,16 @@ class Database:
                                 "name": name,
                                 "config": config_json,
                                 "project_binding": binding_json,
-                                "created_by_user_id": current_creator
-                                or created_by_user_id,
+                                "created_by_user_id": current_creator or created_by_user_id,
                                 "owner_user_id": owner_user_id,
                                 "access_policy": access_policy,
                                 "access_state": access_state,
-                                "execution_owner_user_id": current_execution_owner
-                                or execution_owner_user_id,
+                                "execution_owner_user_id": current_execution_owner or execution_owner_user_id,
                             },
                             requested_status=status,
                         )
                         if not pause_only:
-                            raise ValueError(
-                                f"source sync run already active: {active_run['run_id']}"
-                            )
+                            raise ValueError(f"source sync run already active: {active_run['run_id']}")
             except Exception:
                 await self.db.rollback()
                 raise
@@ -11138,10 +11055,7 @@ class Database:
                         (id,),
                     ) as cursor:
                         open_transition = await cursor.fetchone()
-                    if (
-                        open_transition is not None
-                        and open_transition["id"] != projection_scope_transition.id
-                    ):
+                    if open_transition is not None and open_transition["id"] != projection_scope_transition.id:
                         raise ValueError("projection_scope_transition_active")
                     await self.db.execute(
                         """INSERT OR IGNORE INTO projection_scope_transitions (
@@ -11168,9 +11082,7 @@ class Database:
                         or stored_transition["previous_scope_json"] != previous_json
                         or stored_transition["target_scope_json"] != target_json
                     ):
-                        raise ValueError(
-                            "projection scope transition retry identity mismatch"
-                        )
+                        raise ValueError("projection scope transition retry identity mismatch")
                 stale_metadata_rows = await self.db.execute_fetchall(
                     """SELECT 1
                      FROM memory_search_metadata_fts
@@ -11227,9 +11139,7 @@ class Database:
                 ) as cursor:
                     lifecycle_job = await cursor.fetchone()
                 if lifecycle_job is not None:
-                    raise ValueError(
-                        f"source lifecycle maintenance active: {lifecycle_job['id']}"
-                    )
+                    raise ValueError(f"source lifecycle maintenance active: {lifecycle_job['id']}")
                 async with self.db.execute(
                     """SELECT run_id FROM source_sync_runs
                        WHERE source_id = ? AND status IN ('pending', 'running')
@@ -11238,12 +11148,9 @@ class Database:
                 ) as cursor:
                     active_run = await cursor.fetchone()
                 if active_run is not None:
-                    raise ValueError(
-                        f"source sync run already active: {active_run['run_id']}"
-                    )
+                    raise ValueError(f"source sync run already active: {active_run['run_id']}")
                 async with self.db.execute(
-                    "SELECT * FROM source_access_transitions "
-                    "WHERE source_id = ? AND idempotency_key = ?",
+                    "SELECT * FROM source_access_transitions WHERE source_id = ? AND idempotency_key = ?",
                     (source_id, idempotency_key),
                 ) as cursor:
                     existing = await cursor.fetchone()
@@ -11276,8 +11183,7 @@ class Database:
                     raise RuntimeError("source_access_transition_already_active")
 
                 async with self.db.execute(
-                    "SELECT COUNT(DISTINCT memory_id) AS total "
-                    "FROM memory_sources WHERE source_id = ?",
+                    "SELECT COUNT(DISTINCT memory_id) AS total FROM memory_sources WHERE source_id = ?",
                     (source_id,),
                 ) as cursor:
                     count_row = await cursor.fetchone()
@@ -11403,8 +11309,7 @@ class Database:
                     (operation_id,),
                 ) as cursor:
                     split_by_target = {
-                        str(row["target_memory_id"]): str(row["original_memory_id"])
-                        async for row in cursor
+                        str(row["target_memory_id"]): str(row["original_memory_id"]) async for row in cursor
                     }
                 target_by_original = {
                     original_memory_id: target_memory_id
@@ -11492,13 +11397,9 @@ class Database:
                     if not reverting and memory_id in split_by_target:
                         affected_ids.extend([split_by_target[memory_id], memory_id])
                         continue
-                    context_matches = (
-                        memory.visibility == target_visibility
-                        and memory.owner_user_id == target_owner
-                    )
+                    context_matches = memory.visibility == target_visibility and memory.owner_user_id == target_owner
                     async with self.db.execute(
-                        "SELECT COUNT(*) AS total FROM memory_sources "
-                        "WHERE memory_id = ? AND source_id <> ?",
+                        "SELECT COUNT(*) AS total FROM memory_sources WHERE memory_id = ? AND source_id <> ?",
                         (memory_id, source_id),
                     ) as cursor:
                         other_row = await cursor.fetchone()
@@ -11506,10 +11407,13 @@ class Database:
 
                     target_memory_id = memory_id
                     if not context_matches and has_other_support:
-                        target_memory_id = "mem-access-" + uuid.uuid5(
-                            uuid.NAMESPACE_URL,
-                            f"{operation_id}:{source_id}:{memory_id}",
-                        ).hex[:24]
+                        target_memory_id = (
+                            "mem-access-"
+                            + uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                f"{operation_id}:{source_id}:{memory_id}",
+                            ).hex[:24]
+                        )
                         if await self.get_memory(target_memory_id) is None:
                             target_memory = replace(
                                 memory,
@@ -11533,8 +11437,7 @@ class Database:
                             (operation_id, source_id, memory_id, target_memory_id),
                         )
                         await self.db.execute(
-                            "UPDATE memory_sources SET memory_id = ? "
-                            "WHERE memory_id = ? AND source_id = ?",
+                            "UPDATE memory_sources SET memory_id = ? WHERE memory_id = ? AND source_id = ?",
                             (target_memory_id, memory_id, source_id),
                         )
                         await self.db.execute(
@@ -11980,8 +11883,7 @@ class Database:
             if row is None:
                 return False
             interval_minutes = int(
-                row["sync_schedule_interval_minutes"]
-                or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+                row["sync_schedule_interval_minutes"] or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
             )
             next_at = claim_time + timedelta(minutes=interval_minutes)
             updated_at = _now_iso()
@@ -12033,9 +11935,7 @@ class Database:
         ) as cursor:
             return await cursor.fetchone() is not None
 
-    async def set_source_pinned_for_user(
-        self, source_id: str, user_id: str, pinned: bool
-    ) -> None:
+    async def set_source_pinned_for_user(self, source_id: str, user_id: str, pinned: bool) -> None:
         async with self._write_lock:
             if pinned:
                 await self.db.execute(
@@ -12061,9 +11961,7 @@ class Database:
             return SOURCE_LIST_DEFAULT_SORT_MODE
         return validate_source_list_sort_mode(str(row["sort_mode"]))
 
-    async def set_source_list_sort_mode(
-        self, user_id: str, sort_mode: SourceListSortMode
-    ) -> None:
+    async def set_source_list_sort_mode(self, user_id: str, sort_mode: SourceListSortMode) -> None:
         normalized = validate_source_list_sort_mode(sort_mode)
         async with self._write_lock:
             await self.db.execute(
@@ -12347,9 +12245,7 @@ class Database:
                     ) as cursor:
                         lifecycle_job = await cursor.fetchone()
                     if lifecycle_job is not None:
-                        raise ValueError(
-                            f"source lifecycle maintenance active: {lifecycle_job['id']}"
-                        )
+                        raise ValueError(f"source lifecycle maintenance active: {lifecycle_job['id']}")
                     async with self.db.execute(
                         """SELECT run_id FROM source_sync_runs
                            WHERE source_id = ? AND status IN ('pending', 'running')
@@ -12358,9 +12254,7 @@ class Database:
                     ) as cursor:
                         active_run = await cursor.fetchone()
                     if active_run is not None:
-                        raise ValueError(
-                            f"source sync run already active: {active_run['run_id']}"
-                        )
+                        raise ValueError(f"source sync run already active: {active_run['run_id']}")
                 await self.db.execute(
                     "UPDATE sources SET status = 'deleting' WHERE id = ?",
                     (source_id,),
@@ -12508,9 +12402,7 @@ class Database:
                 if source is None:
                     raise LookupError(f"source {source_id!r} not found")
                 if str(source["type"]) == "agent_session":
-                    raise ValueError(
-                        "agent_session requires managed claim lineage repair, not source rebaseline"
-                    )
+                    raise ValueError("agent_session requires managed claim lineage repair, not source rebaseline")
                 doc_ids: list[str] = []
                 async with self.db.execute(
                     "SELECT doc_id FROM documents WHERE source = ?",
@@ -13216,9 +13108,7 @@ class Database:
         now_iso = now or _now_iso()
         normalized_snapshot_id = _non_empty_string(input_snapshot_id)
         normalized_config_revision = _non_empty_string(source_config_revision)
-        normalized_predecessor_activity_id = _non_empty_string(
-            predecessor_activity_id
-        )
+        normalized_predecessor_activity_id = _non_empty_string(predecessor_activity_id)
         source_lock = await self.db.execute(
             "UPDATE sources SET status = status WHERE id = ?",
             (source_id,),
@@ -13251,9 +13141,7 @@ class Database:
         ) as cursor:
             lifecycle_job = await cursor.fetchone()
         if lifecycle_job is not None:
-            raise SourceActivityConflict(
-                f"source lifecycle maintenance active: {lifecycle_job['id']}"
-            )
+            raise SourceActivityConflict(f"source lifecycle maintenance active: {lifecycle_job['id']}")
         async with self.db.execute(
             """SELECT MAX(input_generation) AS watermark
                FROM source_sync_inputs
@@ -13484,9 +13372,7 @@ class Database:
 
         async with self._write_lock:
             async with self.db.execute(
-                "SELECT * FROM source_sync_runs WHERE "
-                + " AND ".join(conditions)
-                + " ORDER BY created_at LIMIT 1",
+                "SELECT * FROM source_sync_runs WHERE " + " AND ".join(conditions) + " ORDER BY created_at LIMIT 1",
                 params,
             ) as cursor:
                 row = await cursor.fetchone()
@@ -13874,9 +13760,7 @@ class Database:
                 ) as cursor:
                     lifecycle_job = await cursor.fetchone()
                 if lifecycle_job is not None:
-                    raise SourceActivityConflict(
-                        f"source lifecycle maintenance active: {lifecycle_job['id']}"
-                    )
+                    raise SourceActivityConflict(f"source lifecycle maintenance active: {lifecycle_job['id']}")
                 if expected_activity_epoch is not None:
                     async with self.db.execute(
                         "SELECT activity_epoch FROM sources WHERE id = ?",
@@ -14009,9 +13893,7 @@ class Database:
                 ) as cursor:
                     lifecycle_job = await cursor.fetchone()
                 if lifecycle_job is not None:
-                    raise SourceActivityConflict(
-                        f"source lifecycle maintenance active: {lifecycle_job['id']}"
-                    )
+                    raise SourceActivityConflict(f"source lifecycle maintenance active: {lifecycle_job['id']}")
                 if expected_activity_epoch is not None:
                     async with self.db.execute(
                         "SELECT activity_epoch FROM sources WHERE id = ?",
@@ -14466,17 +14348,25 @@ class Database:
         """
         async with self._write_lock:
             try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                if review.kind == "cross_source_conflict":
+                    memories, supports = await self._load_cross_source_review_snapshots_unlocked(review)
+                    validate_cross_source_review_write(
+                        review,
+                        relation_outcome,
+                        memories=memories,
+                        supports=supports,
+                    )
                 async with self.db.execute(
-                    "SELECT status FROM memory_reviews WHERE id = ?",
+                    "SELECT * FROM memory_reviews WHERE id = ?",
                     (review.id,),
                 ) as cursor:
                     existing_review = await cursor.fetchone()
                 if existing_review is not None:
-                    if existing_review["status"] != "pending":
-                        raise RuntimeError(
-                            f"memory review {review.id} already exists with status "
-                            f"{existing_review['status']}"
-                        )
+                    validate_pending_review_retry(
+                        review,
+                        self._row_to_review(existing_review),
+                    )
                     await self._record_relation_outcome_bundle_unlocked(relation_outcome)
                     await self.db.commit()
                     return review.id
@@ -14511,6 +14401,101 @@ class Database:
                 await self.db.rollback()
                 raise
         return review.id
+
+    async def _load_cross_source_review_snapshots_unlocked(
+        self,
+        review: MemoryReview,
+    ) -> tuple[
+        tuple[CrossSourceReviewMemorySnapshot, ...],
+        tuple[CrossSourceReviewSupportSnapshot, ...],
+    ]:
+        memory_ids = (
+            review.incumbent_memory_id,
+            review.challenger_memory_id,
+        )
+        async with self.db.execute(
+            """SELECT id, status, superseded_by, updated_at, visibility,
+                      owner_user_id, repo_identifier, project_key
+                 FROM memories
+                WHERE id IN (?, ?)""",
+            memory_ids,
+        ) as cursor:
+            memory_rows = await cursor.fetchall()
+        memories = tuple(
+            CrossSourceReviewMemorySnapshot(
+                memory_id=str(row["id"]),
+                status=str(row["status"]),
+                superseded_by=row["superseded_by"],
+                updated_at=row["updated_at"],
+                visibility=str(row["visibility"]),
+                owner_user_id=row["owner_user_id"],
+                repo_identifier=row["repo_identifier"],
+                project_key=row["project_key"],
+            )
+            for row in memory_rows
+        )
+
+        async with self.db.execute(
+            """SELECT MSA.memory_id,
+                      MSA.source_id AS assertion_source_id,
+                      MSA.access_context_hash AS assertion_access_context_hash,
+                      ER.evidence_unit_id,
+                      EU.source_id AS evidence_source_id,
+                      EU.source_lineage_id AS evidence_source_lineage_id,
+                      EU.visibility AS evidence_visibility,
+                      EU.owner_user_id AS evidence_owner_user_id,
+                      EU.repo_identifier AS evidence_repo_identifier,
+                      EU.project_key AS evidence_project_key,
+                      EU.access_context_hash AS evidence_access_context_hash,
+                      ER.observation_id,
+                      SO.source_id AS observation_source_id,
+                      ER.observation_revision_id,
+                      SO.current_revision_id AS current_observation_revision_id,
+                      SO.source_unit_id,
+                      SU.source_id AS source_unit_source_id,
+                      S.access_policy AS source_access_policy,
+                      S.owner_user_id AS source_owner_user_id
+                 FROM memory_support_assertions MSA
+                 JOIN evidence_references ER
+                   ON ER.id = MSA.evidence_reference_id
+                 JOIN evidence_units EU
+                   ON EU.id = ER.evidence_unit_id
+                 JOIN source_observations SO
+                   ON SO.id = ER.observation_id
+                 JOIN source_units SU
+                   ON SU.id = SO.source_unit_id
+                 JOIN sources S
+                   ON S.id = MSA.source_id
+                WHERE MSA.memory_id IN (?, ?) AND MSA.active = 1
+                ORDER BY MSA.memory_id, MSA.id""",
+            memory_ids,
+        ) as cursor:
+            support_rows = await cursor.fetchall()
+        supports = tuple(
+            CrossSourceReviewSupportSnapshot(
+                memory_id=str(row["memory_id"]),
+                assertion_source_id=str(row["assertion_source_id"]),
+                assertion_access_context_hash=str(row["assertion_access_context_hash"]),
+                evidence_unit_id=str(row["evidence_unit_id"]),
+                evidence_source_id=str(row["evidence_source_id"]),
+                evidence_source_lineage_id=row["evidence_source_lineage_id"],
+                evidence_visibility=str(row["evidence_visibility"]),
+                evidence_owner_user_id=row["evidence_owner_user_id"],
+                evidence_repo_identifier=row["evidence_repo_identifier"],
+                evidence_project_key=row["evidence_project_key"],
+                evidence_access_context_hash=row["evidence_access_context_hash"],
+                observation_id=str(row["observation_id"]),
+                observation_source_id=str(row["observation_source_id"]),
+                observation_revision_id=str(row["observation_revision_id"]),
+                current_observation_revision_id=row["current_observation_revision_id"],
+                source_unit_id=str(row["source_unit_id"]),
+                source_unit_source_id=str(row["source_unit_source_id"]),
+                source_access_policy=str(row["source_access_policy"]),
+                source_owner_user_id=str(row["source_owner_user_id"]),
+            )
+            for row in support_rows
+        )
+        return memories, supports
 
     async def get_memory_review(self, review_id: str) -> MemoryReview | None:
         async with self.db.execute(

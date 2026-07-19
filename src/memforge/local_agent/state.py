@@ -180,6 +180,7 @@ def _compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "detail",
         "status_code",
         "sync_started",
+        "source_sync_run_id",
         "sync_error",
         "audit_log_path",
         "operation",

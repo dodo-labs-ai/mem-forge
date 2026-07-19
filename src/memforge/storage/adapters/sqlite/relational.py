@@ -20,6 +20,7 @@ from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.evidence import (
     ActiveSupportEvidence,
     EvidenceReference,
+    EvidenceUnit,
     MemorySupportAssertion,
     RelationOutcomeBundle,
 )
@@ -195,11 +196,7 @@ def _entity_link_fts_query(tokens: Sequence[str]) -> str:
 
 
 def _entity_link_fts_token_set(tokens: Sequence[str]) -> set[str]:
-    return {
-        token
-        for token in tokens
-        if token not in _ENTITY_LINK_STOPWORDS and len(token) >= 3
-    }
+    return {token for token in tokens if token not in _ENTITY_LINK_STOPWORDS and len(token) >= 3}
 
 
 def _explicit_entity_terms(explicit_entities: Sequence[str]) -> dict[str, str]:
@@ -462,16 +459,10 @@ class SqliteRelationalStore:
     async def start_projection_scope_transition(self, transition_id: str, *, run_id: str):
         return await self._db.start_projection_scope_transition(transition_id, run_id=run_id)
 
-    async def complete_projection_scope_transition(
-        self, transition_id: str, *, run_id: str, coverage
-    ):
-        return await self._db.complete_projection_scope_transition(
-            transition_id, run_id=run_id, coverage=coverage
-        )
+    async def complete_projection_scope_transition(self, transition_id: str, *, run_id: str, coverage):
+        return await self._db.complete_projection_scope_transition(transition_id, run_id=run_id, coverage=coverage)
 
-    async def fail_projection_scope_transition(
-        self, transition_id: str, *, run_id: str, coverage, error: str
-    ):
+    async def fail_projection_scope_transition(self, transition_id: str, *, run_id: str, coverage, error: str):
         return await self._db.fail_projection_scope_transition(
             transition_id, run_id=run_id, coverage=coverage, error=error
         )
@@ -715,6 +706,9 @@ class SqliteRelationalStore:
             references,
             source_activity=source_activity,
         )
+
+    async def get_evidence_unit(self, evidence_unit_id: str) -> EvidenceUnit | None:
+        return await self._db.get_evidence_unit(evidence_unit_id)
 
     async def upsert_memory_support_assertion(
         self,
@@ -963,10 +957,7 @@ class SqliteRelationalStore:
 
             sql = (
                 "SELECT DISTINCT m.id "
-                "FROM memories m "
-                + (" ".join(joins) + " " if joins else "")
-                + "WHERE "
-                + " AND ".join(clauses)
+                "FROM memories m " + (" ".join(joins) + " " if joins else "") + "WHERE " + " AND ".join(clauses)
             )
             try:
                 async with self._db.db.execute(sql, params) as cursor:
@@ -1177,10 +1168,7 @@ class SqliteRelationalStore:
                 if channel == "explicit":
                     matched_explicit_terms.add(str(row["match_key"]))
                 score = _ENTITY_LINK_CHANNEL_SCORE[channel]
-                activates_graph = (
-                    _ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH[channel]
-                    and visible_memory_count > 0
-                )
+                activates_graph = _ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH[channel] and visible_memory_count > 0
                 candidate = EntityLinkCandidate(
                     entity_id=entity_id,
                     canonical_name=str(row["canonical_name"]),
@@ -1199,9 +1187,7 @@ class SqliteRelationalStore:
                     candidates[entity_id] = candidate
                     continue
 
-                contributing_channels = tuple(
-                    dict.fromkeys((*existing.contributing_channels, channel))
-                )
+                contributing_channels = tuple(dict.fromkeys((*existing.contributing_channels, channel)))
                 if score > existing.score:
                     candidates[entity_id] = EntityLinkCandidate(
                         entity_id=existing.entity_id,
@@ -1259,10 +1245,7 @@ class SqliteRelationalStore:
                     contributing_channels=(channel,),
                     score=_ENTITY_LINK_CHANNEL_SCORE[channel],
                     matched_text=str(row["matched_text"]),
-                    activates_graph=(
-                        _ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH[channel]
-                        and visible_memory_count > 0
-                    ),
+                    activates_graph=(_ENTITY_LINK_CHANNEL_ACTIVATES_GRAPH[channel] and visible_memory_count > 0),
                     visible_memory_count=visible_memory_count,
                     visible_source_count=visible_source_count,
                     specificity=_entity_specificity(visible_memory_count),
@@ -1271,9 +1254,7 @@ class SqliteRelationalStore:
                 if existing is None:
                     candidates[entity_id] = candidate
                 else:
-                    contributing_channels = tuple(
-                        dict.fromkeys((*existing.contributing_channels, channel))
-                    )
+                    contributing_channels = tuple(dict.fromkeys((*existing.contributing_channels, channel)))
                     if candidate.score > existing.score:
                         candidates[entity_id] = EntityLinkCandidate(
                             entity_id=existing.entity_id,
@@ -1313,9 +1294,7 @@ class SqliteRelationalStore:
             ),
         )[:max_candidates]
         unmatched_explicit_entities = tuple(
-            raw_value
-            for normalized, raw_value in explicit_terms.items()
-            if normalized not in matched_explicit_terms
+            raw_value for normalized, raw_value in explicit_terms.items() if normalized not in matched_explicit_terms
         )
         return EntityLinkResult(
             candidates=tuple(ranked),
@@ -1384,10 +1363,7 @@ class SqliteRelationalStore:
             has_source_row_join=has_source_row_join,
             disabled_source_ids=disabled_source_ids,
         )
-        count_select = (
-            "COUNT(DISTINCT m.id) AS visible_memory_count, "
-            f"{source_count_expr} AS visible_source_count"
-        )
+        count_select = f"COUNT(DISTINCT m.id) AS visible_memory_count, {source_count_expr} AS visible_source_count"
         where_sql = " AND ".join(clauses)
         sql = (
             "WITH matched_aliases(entity_id, matched_alias, alias_normalized, match_key) AS ("
@@ -1472,10 +1448,7 @@ class SqliteRelationalStore:
             has_source_row_join=has_source_row_join,
             disabled_source_ids=disabled_source_ids,
         )
-        count_select = (
-            "COUNT(DISTINCT m.id) AS visible_memory_count, "
-            f"{source_count_expr} AS visible_source_count"
-        )
+        count_select = f"COUNT(DISTINCT m.id) AS visible_memory_count, {source_count_expr} AS visible_source_count"
         where_sql = " AND ".join(clauses)
         sql = (
             "WITH matched_aliases AS ("
