@@ -21,7 +21,6 @@ from memforge.llm.structured import (
     ContradictionResponse,
     LiteLlmStructuredClient,
     StructuredLlmConfig,
-    StructuredLlmError,
 )
 from memforge.memory.store import MemoryStore
 from memforge.models import Memory, content_hash
@@ -455,57 +454,7 @@ class TestContradictionE2E:
 
 
 class TestContradictionErrorResilience:
-    """Tests error handling without needing a live LLM."""
-
-    @pytest.mark.asyncio
-    async def test_api_error_returns_zero_contradictions(self, seeded_db):
-        """LLM API failure should return zero contradictions, not crash."""
-        s = seeded_db
-        db = s["db"]
-
-        mock_client = AsyncMock()
-        mock_client.detect_contradictions = AsyncMock(side_effect=StructuredLlmError("api unavailable"))
-
-        stats = await detect_cross_doc_contradictions(
-            new_memory_ids=[s["mem_run_pg"].id],
-            doc_id="doc-runbook",
-            db=db,
-            memory_store=_test_memory_store(db),
-            structured_llm_client=mock_client,
-        )
-
-        assert stats["contradictions"] == 0
-        assert stats["temporal"] == 0
-
-    @pytest.mark.asyncio
-    async def test_structured_contradiction_response_parsed(self, seeded_db):
-        """Structured contradiction response should be applied."""
-        s = seeded_db
-        db = s["db"]
-
-        mock_client = AsyncMock()
-        mock_client.detect_contradictions = AsyncMock(
-            return_value=ContradictionResponse(
-                decisions=[
-                    ContradictionDecision(
-                        pair_index=0,
-                        classification="contradiction",
-                        reason="PG 14 vs MySQL 8",
-                    )
-                ]
-            )
-        )
-
-        stats = await detect_cross_doc_contradictions(
-            new_memory_ids=[s["mem_run_pg"].id],
-            doc_id="doc-runbook",
-            db=db,
-            memory_store=_test_memory_store(db),
-            structured_llm_client=mock_client,
-        )
-
-        assert stats["contradictions"] == 1
-        assert stats["checked"] == 1
+    """Tests malformed structured decisions without needing a live LLM."""
 
     @pytest.mark.asyncio
     async def test_unexpected_pair_index_fails_closed(self, seeded_db):

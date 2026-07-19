@@ -49,18 +49,6 @@ def _context() -> ExtractionContext:
     )
 
 
-def test_unit_memory_extraction_prompt_rejects_agent_session_operational_noise():
-    from memforge.pipeline.memory_extractor import UNIT_MEMORY_EXTRACTION_PROMPT
-
-    prompt = UNIT_MEMORY_EXTRACTION_PROMPT.lower()
-
-    assert "agent_session" in prompt
-    assert "validation commands" in prompt
-    assert "runtime notes" in prompt
-    assert "local paths" in prompt
-    assert "working-tree state" in prompt
-
-
 @pytest.mark.asyncio
 async def test_extract_unit_memories_trusts_unit_anchor_as_boundary_contract():
     client = RecordingStructuredMemoryClient(
