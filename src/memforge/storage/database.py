@@ -2808,6 +2808,14 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "DROP TABLE IF EXISTS lifecycle_replay_ledgers",
         ],
     ),
+    (
+        62,
+        "Reset legacy directional contradiction summaries",
+        [
+            "DELETE FROM memory_contradictions",
+            "UPDATE memories SET contradiction_count = 0 WHERE contradiction_count <> 0",
+        ],
+    ),
 ]
 
 
@@ -14285,19 +14293,53 @@ class Database:
         reason: str | None = None,
     ) -> None:
         """Record a contradiction between two memories and increment their counts."""
+        if memory_id_a == memory_id_b:
+            raise ValueError("contradiction requires two distinct Memories")
+        memory_id_a, memory_id_b = sorted((memory_id_a, memory_id_b))
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT OR IGNORE INTO memory_contradictions
-                   (memory_id_a, memory_id_b, classification, reason)
-                   VALUES (?, ?, ?, ?)""",
-                (memory_id_a, memory_id_b, classification, reason),
-            )
-            if classification == "contradiction":
-                await self.db.execute(
-                    "UPDATE memories SET contradiction_count = contradiction_count + 1 WHERE id IN (?, ?)",
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                async with self.db.execute(
+                    """SELECT classification
+                         FROM memory_contradictions
+                        WHERE memory_id_a = ? AND memory_id_b = ?""",
                     (memory_id_a, memory_id_b),
-                )
-            await self.db.commit()
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                increment = False
+                if existing is None:
+                    await self.db.execute(
+                        """INSERT INTO memory_contradictions
+                           (memory_id_a, memory_id_b, classification, reason)
+                           VALUES (?, ?, ?, ?)""",
+                        (memory_id_a, memory_id_b, classification, reason),
+                    )
+                    increment = classification == "contradiction"
+                elif (
+                    existing["classification"] != "contradiction"
+                    and classification == "contradiction"
+                ):
+                    await self.db.execute(
+                        """UPDATE memory_contradictions
+                              SET classification = ?, reason = ?
+                            WHERE memory_id_a = ? AND memory_id_b = ?""",
+                        (
+                            classification,
+                            reason,
+                            memory_id_a,
+                            memory_id_b,
+                        ),
+                    )
+                    increment = True
+                if increment:
+                    await self.db.execute(
+                        "UPDATE memories SET contradiction_count = contradiction_count + 1 WHERE id IN (?, ?)",
+                        (memory_id_a, memory_id_b),
+                    )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     # ==================================================================
     # Memory reviews
