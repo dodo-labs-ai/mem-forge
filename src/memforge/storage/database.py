@@ -3306,14 +3306,20 @@ class Database:
         doc: DocumentRecord,
         *,
         require_configured_source: bool = False,
+        source_activity: SourceActivityLease | None = None,
     ) -> None:
         async with self._write_lock:
-            await self._assert_document_source_writable_unlocked(
-                doc.source,
-                require_configured_source=require_configured_source,
-            )
-            await self.db.execute(
-                """INSERT INTO documents (
+            try:
+                await self._assert_document_source_writable_unlocked(
+                    doc.source,
+                    require_configured_source=require_configured_source,
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    doc.source,
+                    source_activity,
+                )
+                await self.db.execute(
+                    """INSERT INTO documents (
                     doc_id, source, source_url, title, space_or_project,
                     author, last_modified, labels, version, content_hash,
                     token_count, raw_content_uri, raw_content_type,
@@ -3333,7 +3339,7 @@ class Database:
                     last_synced=excluded.last_synced,
                     client=COALESCE(excluded.client, documents.client),
                     updated_at=excluded.updated_at""",
-                (
+                    (
                     doc.doc_id,
                     doc.source,
                     doc.source_url,
@@ -3352,10 +3358,17 @@ class Database:
                     doc.last_synced.isoformat(),
                     doc.client,
                     _now_iso(),
-                ),
-            )
-            await self._refresh_metadata_fts_for_doc_unlocked(doc.doc_id)
-            await self.db.commit()
+                    ),
+                )
+                await self._refresh_metadata_fts_for_doc_unlocked(doc.doc_id)
+                await self._assert_source_activity_fence_unlocked(
+                    doc.source,
+                    source_activity,
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def get_document(self, doc_id: str) -> DocumentRecord | None:
         async with self.db.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,)) as cursor:
@@ -4962,11 +4975,59 @@ class Database:
             audited_at=row["audited_at"],
         )
 
-    async def enable_lifecycle_gate(self, source_id: str) -> LifecycleGate:
+    async def _assert_source_activity_fence_unlocked(
+        self,
+        source_id: str,
+        source_activity: SourceActivityLease | None,
+    ) -> None:
+        if source_activity is None:
+            return
+        if source_activity.source_id != source_id:
+            raise SourceActivityConflict("source activity fence source mismatch")
+        source_lock = await self.db.execute(
+            "UPDATE sources SET status = status WHERE id = ?",
+            (source_id,),
+        )
+        if source_lock.rowcount != 1:
+            raise SourceActivityConflict(f"Source not found: {source_id}")
+        async with self.db.execute(
+            "SELECT activity_epoch FROM sources WHERE id = ?",
+            (source_id,),
+        ) as cursor:
+            source = await cursor.fetchone()
+        async with self.db.execute(
+            """SELECT source_id, capability, epoch, lease_until
+               FROM source_activity_leases WHERE id = ?""",
+            (source_activity.id,),
+        ) as cursor:
+            lease = await cursor.fetchone()
+        if (
+            source is None
+            or int(source["activity_epoch"] or 0) != source_activity.epoch
+            or lease is None
+            or str(lease["source_id"]) != source_id
+            or lease["capability"] != source_activity.capability
+            or int(lease["epoch"]) != source_activity.epoch
+            or str(lease["lease_until"]) <= _now_iso()
+        ):
+            raise SourceActivityConflict(
+                f"source activity fence is not current: {source_activity.id}"
+            )
+
+    async def enable_lifecycle_gate(
+        self,
+        source_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> LifecycleGate:
         """Enable destructive lifecycle only after the durable audit closes."""
 
         async with self._write_lock:
             try:
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 async with self.db.execute(
                     """SELECT COUNT(*) AS count
                        FROM lifecycle_cutover_findings
@@ -5005,35 +5066,79 @@ class Database:
                         updated_at=excluded.updated_at""",
                     (source_id, now, now, now),
                 )
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
                 raise
         return await self.get_lifecycle_gate(source_id)
 
-    async def gate_destructive_lifecycle(self, source_id: str, *, reason: str) -> LifecycleGate:
+    async def gate_destructive_lifecycle(
+        self,
+        source_id: str,
+        *,
+        reason: str,
+        source_activity: SourceActivityLease | None = None,
+    ) -> LifecycleGate:
         now = _now_iso()
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO source_lifecycle_gates (
-                    source_id, state, reason, audited_at, enabled_at, updated_at
-                ) VALUES (?, 'gated', ?, ?, NULL, ?)
-                ON CONFLICT(source_id) DO UPDATE SET
-                    state='gated', reason=excluded.reason,
-                    audited_at=excluded.audited_at, updated_at=excluded.updated_at""",
-                (source_id, reason, now, now),
-            )
-            await self.db.commit()
+            try:
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
+                await self.db.execute(
+                    """INSERT INTO source_lifecycle_gates (
+                        source_id, state, reason, audited_at, enabled_at, updated_at
+                    ) VALUES (?, 'gated', ?, ?, NULL, ?)
+                    ON CONFLICT(source_id) DO UPDATE SET
+                        state='gated', reason=excluded.reason,
+                        audited_at=excluded.audited_at, updated_at=excluded.updated_at""",
+                    (source_id, reason, now, now),
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
         return await self.get_lifecycle_gate(source_id)
 
     async def upsert_lifecycle_cutover_finding(
         self,
         finding: LifecycleCutoverFinding,
+        *,
+        source_activity: SourceActivityLease | None = None,
     ) -> None:
         now = _now_iso()
         created_at = finding.created_at or now
         async with self._write_lock:
             try:
+                await self._assert_source_activity_fence_unlocked(
+                    finding.source_id,
+                    source_activity,
+                )
+                async with self.db.execute(
+                    "SELECT status FROM lifecycle_cutover_findings WHERE id = ?",
+                    (finding.id,),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if (
+                    existing is not None
+                    and CutoverFindingStatus(str(existing["status"]))
+                    is CutoverFindingStatus.RESOLVED
+                ):
+                    await self._assert_source_activity_fence_unlocked(
+                        finding.source_id,
+                        source_activity,
+                    )
+                    await self.db.commit()
+                    return
                 await self.db.execute(
                     """INSERT INTO lifecycle_cutover_findings (
                         id, source_id, memory_id, reason, status,
@@ -5068,6 +5173,10 @@ class Database:
                         state='gated', reason=excluded.reason,
                         audited_at=excluded.audited_at, updated_at=excluded.updated_at""",
                     (finding.source_id, now, now),
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    finding.source_id,
+                    source_activity,
                 )
                 await self.db.commit()
             except Exception:
@@ -5744,6 +5853,7 @@ class Database:
         *,
         observation_id: str,
         source_unit_id: str,
+        source_activity: SourceActivityLease | None = None,
     ) -> LifecycleCutoverFinding:
         async with self._write_lock:
             try:
@@ -5754,6 +5864,11 @@ class Database:
                     finding = await cursor.fetchone()
                 if finding is None:
                     raise LookupError(f"unknown lifecycle cutover finding: {finding_id}")
+                source_id = str(finding["source_id"])
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 async with self.db.execute(
                     """SELECT 1
                        FROM memory_support_assertions msa
@@ -5779,6 +5894,10 @@ class Database:
                            updated_at = ?, resolved_at = ?
                        WHERE id = ? AND status = 'open'""",
                     (observation_id, source_unit_id, now, now, finding_id),
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
                 )
                 await self.db.commit()
             except Exception:
@@ -5962,6 +6081,8 @@ class Database:
         self,
         evidence_unit_id: str,
         references: Sequence[EvidenceReference],
+        *,
+        source_activity: SourceActivityLease | None = None,
     ) -> tuple[EvidenceReference, ...]:
         revision_ids = {item.anchor.observation_revision_id for item in references}
         if revision_ids:
@@ -5985,6 +6106,18 @@ class Database:
         )
         async with self._write_lock:
             try:
+                async with self.db.execute(
+                    "SELECT source_id FROM evidence_units WHERE id = ?",
+                    (evidence_unit_id,),
+                ) as cursor:
+                    evidence_unit = await cursor.fetchone()
+                if evidence_unit is None:
+                    raise ValueError("evidence reference requires a persisted Evidence Unit")
+                source_id = str(evidence_unit["source_id"])
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 for item in persisted:
                     anchor = item.anchor
                     await self.db.execute(
@@ -6005,15 +6138,28 @@ class Database:
                             _now_iso(),
                         ),
                     )
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
                 raise
         return persisted
 
-    async def upsert_memory_support_assertion(self, assertion: MemorySupportAssertion) -> None:
+    async def upsert_memory_support_assertion(
+        self,
+        assertion: MemorySupportAssertion,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
         async with self._write_lock:
             try:
+                await self._assert_source_activity_fence_unlocked(
+                    assertion.source_id,
+                    source_activity,
+                )
                 async with self.db.execute(
                     """SELECT er.role, eu.source_id AS evidence_source_id
                        FROM evidence_references er
@@ -6048,6 +6194,10 @@ class Database:
                         assertion.created_at or now,
                         assertion.removed_at,
                     ),
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    assertion.source_id,
+                    source_activity,
                 )
                 await self.db.commit()
             except Exception:
@@ -7120,50 +7270,67 @@ class Database:
     # Memories
     # ==================================================================
 
-    async def upsert_evidence_unit(self, unit: EvidenceUnit) -> None:
+    async def upsert_evidence_unit(
+        self,
+        unit: EvidenceUnit,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
         """Persist one scoped evidence item before relation classification."""
         metadata_json = json.dumps(dict(unit.source_metadata), sort_keys=True)
         provenance = unit.evidence_provenance.value
         async with self._write_lock:
-            now = _now_iso()
-            await self.db.execute(
-                """INSERT INTO evidence_units (
-                    id, source_id, doc_id, doc_revision_id, source_type, client,
-                    repo_identifier, source_anchor, source_lineage_id,
-                    source_metadata_json, project_key, visibility, owner_user_id,
-                    observed_at, extractor_run_id, access_context_hash, content,
-                    excerpt, evidence_provenance, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    observed_at=excluded.observed_at,
-                    extractor_run_id=excluded.extractor_run_id,
-                    access_context_hash=excluded.access_context_hash,
-                    updated_at=excluded.updated_at""",
-                (
-                    unit.id,
+            try:
+                await self._assert_source_activity_fence_unlocked(
                     unit.source_id,
-                    unit.doc_id,
-                    unit.doc_revision_id,
-                    unit.source_type,
-                    unit.client,
-                    unit.repo_identifier,
-                    unit.source_anchor,
-                    unit.source_lineage_id,
-                    metadata_json,
-                    _normalize_project_key(unit.project_key),
-                    unit.visibility,
-                    unit.owner_user_id,
-                    unit.observed_at,
-                    unit.extractor_run_id,
-                    unit.access_context_hash,
-                    unit.content,
-                    unit.excerpt,
-                    provenance,
-                    now,
-                    now,
-                ),
-            )
-            await self.db.commit()
+                    source_activity,
+                )
+                now = _now_iso()
+                await self.db.execute(
+                    """INSERT INTO evidence_units (
+                        id, source_id, doc_id, doc_revision_id, source_type, client,
+                        repo_identifier, source_anchor, source_lineage_id,
+                        source_metadata_json, project_key, visibility, owner_user_id,
+                        observed_at, extractor_run_id, access_context_hash, content,
+                        excerpt, evidence_provenance, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        observed_at=excluded.observed_at,
+                        extractor_run_id=excluded.extractor_run_id,
+                        access_context_hash=excluded.access_context_hash,
+                        updated_at=excluded.updated_at""",
+                    (
+                        unit.id,
+                        unit.source_id,
+                        unit.doc_id,
+                        unit.doc_revision_id,
+                        unit.source_type,
+                        unit.client,
+                        unit.repo_identifier,
+                        unit.source_anchor,
+                        unit.source_lineage_id,
+                        metadata_json,
+                        _normalize_project_key(unit.project_key),
+                        unit.visibility,
+                        unit.owner_user_id,
+                        unit.observed_at,
+                        unit.extractor_run_id,
+                        unit.access_context_hash,
+                        unit.content,
+                        unit.excerpt,
+                        provenance,
+                        now,
+                        now,
+                    ),
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    unit.source_id,
+                    source_activity,
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def get_evidence_unit(self, evidence_unit_id: str) -> EvidenceUnit | None:
         async with self.db.execute(
@@ -12204,7 +12371,12 @@ class Database:
                 await self.db.rollback()
                 raise
 
-    async def rebaseline_source_lifecycle(self, source_id: str) -> SourceLifecycleResetResult:
+    async def rebaseline_source_lifecycle(
+        self,
+        source_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> SourceLifecycleResetResult:
         """Reset derived source lifecycle while preserving source identity and content.
 
         This is an explicit recovery operation for replayable sources. It keeps
@@ -12216,9 +12388,9 @@ class Database:
 
         async with self._write_lock:
             try:
-                await self.db.execute(
-                    "UPDATE sources SET status = status WHERE id = ?",
-                    (source_id,),
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
                 )
                 async with self.db.execute(
                     "SELECT type FROM sources WHERE id = ?",
@@ -12413,6 +12585,10 @@ class Database:
                 await self.db.execute(
                     "UPDATE sources SET last_sync = NULL WHERE id = ?",
                     (source_id,),
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
                 )
                 await self.db.commit()
                 return SourceLifecycleResetResult(

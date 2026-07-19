@@ -48,6 +48,7 @@ from memforge.source_projection import (
     SourceUnitRevision,
 )
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
+from memforge.source_activity import SourceActivityLease
 from memforge.storage.adapters.context import AccessScope
 
 
@@ -163,10 +164,16 @@ class RelationalStore(Protocol):
         doc: DocumentRecord,
         *,
         require_configured_source: bool = False,
+        source_activity: SourceActivityLease | None = None,
     ) -> None: ...
     async def get_document(self, doc_id: str) -> DocumentRecord | None: ...
     async def delete_projected_document(self, doc_id: str) -> None: ...
-    async def rebaseline_source_lifecycle(self, source_id: str) -> SourceLifecycleResetResult: ...
+    async def rebaseline_source_lifecycle(
+        self,
+        source_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> SourceLifecycleResetResult: ...
     async def rebind_projected_document_support(
         self,
         old_doc_id: str,
@@ -256,11 +263,24 @@ class RelationalStore(Protocol):
     async def count_active_source_memories(self, source_id: str) -> int: ...
     async def count_active_source_memories_without_support(self, source_id: str) -> int: ...
     async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate: ...
-    async def enable_lifecycle_gate(self, source_id: str) -> LifecycleGate: ...
-    async def gate_destructive_lifecycle(self, source_id: str, *, reason: str) -> LifecycleGate: ...
+    async def enable_lifecycle_gate(
+        self,
+        source_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> LifecycleGate: ...
+    async def gate_destructive_lifecycle(
+        self,
+        source_id: str,
+        *,
+        reason: str,
+        source_activity: SourceActivityLease | None = None,
+    ) -> LifecycleGate: ...
     async def upsert_lifecycle_cutover_finding(
         self,
         finding: LifecycleCutoverFinding,
+        *,
+        source_activity: SourceActivityLease | None = None,
     ) -> None: ...
     async def get_lifecycle_cutover_finding(
         self,
@@ -323,6 +343,7 @@ class RelationalStore(Protocol):
         *,
         observation_id: str,
         source_unit_id: str,
+        source_activity: SourceActivityLease | None = None,
     ) -> LifecycleCutoverFinding: ...
     async def retire_unprovable_lifecycle_cutover_finding(
         self,
@@ -337,8 +358,15 @@ class RelationalStore(Protocol):
         self,
         evidence_unit_id: str,
         references: Sequence[EvidenceReference],
+        *,
+        source_activity: SourceActivityLease | None = None,
     ) -> tuple[EvidenceReference, ...]: ...
-    async def upsert_memory_support_assertion(self, assertion: MemorySupportAssertion) -> None: ...
+    async def upsert_memory_support_assertion(
+        self,
+        assertion: MemorySupportAssertion,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None: ...
     async def get_memory_support_set_hash(self, memory_id: str) -> str: ...
     async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]: ...
     async def get_active_memory_support_evidence(

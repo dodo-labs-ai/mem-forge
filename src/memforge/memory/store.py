@@ -53,6 +53,7 @@ from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
+from memforge.source_activity import SourceActivityLease
 from memforge.source_projection import SourceProjection
 
 logger = logging.getLogger(__name__)
@@ -1881,11 +1882,19 @@ class MemoryStore:
         )
         return retired_ids
 
-    async def rebaseline_source_lifecycle(self, source_id: str) -> list[str]:
+    async def rebaseline_source_lifecycle(
+        self,
+        source_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> list[str]:
         """Reset replayable source derivations and remove retired vectors."""
 
         context = self._operation_context(source_id=source_id)
-        result = await self.relational.rebaseline_source_lifecycle(source_id)
+        result = await self.relational.rebaseline_source_lifecycle(
+            source_id,
+            source_activity=source_activity,
+        )
         retired_ids = list(result.retired_memory_ids)
         if result.retired_search_cleanup_required:
             # SQLite records these external vector deletes in the durable

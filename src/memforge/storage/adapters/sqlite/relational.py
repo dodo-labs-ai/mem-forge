@@ -47,6 +47,7 @@ from memforge.models import (
 )
 from memforge.retrieval.access_predicate import visible_sql
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
+from memforge.source_activity import SourceActivityLease
 from memforge.source_projection import (
     SourceObservationRevision,
     SourceProjection,
@@ -403,10 +404,12 @@ class SqliteRelationalStore:
         doc: DocumentRecord,
         *,
         require_configured_source: bool = False,
+        source_activity: SourceActivityLease | None = None,
     ) -> None:
         await self._db.upsert_document(
             doc,
             require_configured_source=require_configured_source,
+            source_activity=source_activity,
         )
 
     async def get_document(self, doc_id: str) -> DocumentRecord | None:
@@ -415,8 +418,16 @@ class SqliteRelationalStore:
     async def delete_projected_document(self, doc_id: str) -> None:
         await self._db.delete_projected_document(doc_id)
 
-    async def rebaseline_source_lifecycle(self, source_id: str) -> SourceLifecycleResetResult:
-        return await self._db.rebaseline_source_lifecycle(source_id)
+    async def rebaseline_source_lifecycle(
+        self,
+        source_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> SourceLifecycleResetResult:
+        return await self._db.rebaseline_source_lifecycle(
+            source_id,
+            source_activity=source_activity,
+        )
 
     async def rebind_projected_document_support(
         self,
@@ -538,14 +549,40 @@ class SqliteRelationalStore:
     async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate:
         return await self._db.get_lifecycle_gate(source_id)
 
-    async def enable_lifecycle_gate(self, source_id: str) -> LifecycleGate:
-        return await self._db.enable_lifecycle_gate(source_id)
+    async def enable_lifecycle_gate(
+        self,
+        source_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> LifecycleGate:
+        return await self._db.enable_lifecycle_gate(
+            source_id,
+            source_activity=source_activity,
+        )
 
-    async def gate_destructive_lifecycle(self, source_id: str, *, reason: str) -> LifecycleGate:
-        return await self._db.gate_destructive_lifecycle(source_id, reason=reason)
+    async def gate_destructive_lifecycle(
+        self,
+        source_id: str,
+        *,
+        reason: str,
+        source_activity: SourceActivityLease | None = None,
+    ) -> LifecycleGate:
+        return await self._db.gate_destructive_lifecycle(
+            source_id,
+            reason=reason,
+            source_activity=source_activity,
+        )
 
-    async def upsert_lifecycle_cutover_finding(self, finding: LifecycleCutoverFinding) -> None:
-        await self._db.upsert_lifecycle_cutover_finding(finding)
+    async def upsert_lifecycle_cutover_finding(
+        self,
+        finding: LifecycleCutoverFinding,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
+        await self._db.upsert_lifecycle_cutover_finding(
+            finding,
+            source_activity=source_activity,
+        )
 
     async def get_lifecycle_cutover_finding(
         self,
@@ -640,11 +677,13 @@ class SqliteRelationalStore:
         *,
         observation_id: str,
         source_unit_id: str,
+        source_activity: SourceActivityLease | None = None,
     ) -> LifecycleCutoverFinding:
         return await self._db.resolve_lifecycle_cutover_finding(
             finding_id,
             observation_id=observation_id,
             source_unit_id=source_unit_id,
+            source_activity=source_activity,
         )
 
     async def retire_unprovable_lifecycle_cutover_finding(
@@ -668,11 +707,25 @@ class SqliteRelationalStore:
         self,
         evidence_unit_id: str,
         references: Sequence[EvidenceReference],
+        *,
+        source_activity: SourceActivityLease | None = None,
     ) -> tuple[EvidenceReference, ...]:
-        return await self._db.record_evidence_references(evidence_unit_id, references)
+        return await self._db.record_evidence_references(
+            evidence_unit_id,
+            references,
+            source_activity=source_activity,
+        )
 
-    async def upsert_memory_support_assertion(self, assertion: MemorySupportAssertion) -> None:
-        await self._db.upsert_memory_support_assertion(assertion)
+    async def upsert_memory_support_assertion(
+        self,
+        assertion: MemorySupportAssertion,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
+        await self._db.upsert_memory_support_assertion(
+            assertion,
+            source_activity=source_activity,
+        )
 
     async def get_memory_support_set_hash(self, memory_id: str) -> str:
         return await self._db.get_memory_support_set_hash(memory_id)
