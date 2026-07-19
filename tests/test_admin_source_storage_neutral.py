@@ -18,6 +18,8 @@ from memforge.memory.lifecycle_plan import (
     LifecycleCutoverFinding,
     LifecycleGate,
     LifecycleGateState,
+    LifecycleVectorDeliveryResult,
+    LifecycleVectorDeliveryState,
 )
 from memforge.models import DocumentRecord, SyncState
 from memforge.local_adapter import build_teams_doc_id
@@ -867,6 +869,179 @@ def test_source_rebaseline_endpoint_is_confirmation_bound_and_completes_replay(t
         assert provider.calls[1]["force_full_sync"] is True
         assert provider.calls[1]["execution_mode"] is SourceSyncMode.REBASELINE_REPLAY
         assert provider.calls[1]["lifecycle_job_id"] == jobs[0].id
+    finally:
+        asyncio.run(database.close())
+
+
+def test_source_rebaseline_keeps_gate_closed_when_vector_delivery_is_pending(
+    tmp_path,
+    monkeypatch,
+):
+    class SuccessfulReplayProvider(DefaultRuntimeProvider):
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(last_sync_status="success", error_message=None)
+
+    class PendingVectorStore:
+        async def rebaseline_source_lifecycle(
+            self,
+            source_id: str,
+            *,
+            source_activity=None,
+        ):
+            assert source_id == "src-confluence"
+            assert source_activity is not None
+            return []
+
+        async def attempt_lifecycle_vector_delivery(
+            self,
+            lifecycle_plan_id: str | None = None,
+            *,
+            source_id: str | None = None,
+        ) -> LifecycleVectorDeliveryResult:
+            assert lifecycle_plan_id is None
+            assert source_id == "src-confluence"
+            return LifecycleVectorDeliveryResult(
+                state=LifecycleVectorDeliveryState.PENDING,
+                attempted_tasks=1,
+                failed_tasks=1,
+                error_types=("APIConnectionError",),
+            )
+
+    database = Database(str(tmp_path / "rebaseline-pending-vector.db"))
+
+    async def setup() -> None:
+        await database.connect()
+        await database.upsert_source(
+            id="src-confluence",
+            type="confluence",
+            name="Confluence",
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="user-a",
+        )
+
+    asyncio.run(setup())
+    pending_store = PendingVectorStore()
+
+    async def build_pending_store(*args, **kwargs):
+        del args, kwargs
+        return pending_store
+
+    monkeypatch.setattr(
+        "memforge.server.admin_api._build_memory_store",
+        build_pending_store,
+    )
+    app = create_admin_app(
+        db=database,
+        config=_config(tmp_path),
+        runtime_provider=SuccessfulReplayProvider(),
+        principal_resolver=lambda request: "user-a",
+    )
+    try:
+        with TestClient(app) as client:
+            accepted = client.post(
+                "/api/sources/src-confluence/memory-lifecycle/rebaseline",
+                json={"confirm_source_id": "src-confluence"},
+            )
+            status = client.get("/api/sources/src-confluence/memory-lifecycle")
+
+        assert accepted.status_code == 202, accepted.text
+        assert status.status_code == 200, status.text
+        payload = status.json()
+        assert payload["jobs"][0]["status"] == "failed"
+        assert payload["gate"]["state"] == "gated"
+        assert "vector delivery remains pending" in payload["jobs"][0]["error"]
+    finally:
+        asyncio.run(database.close())
+
+
+def test_source_rebaseline_drains_vector_batches_before_enabling_gate(
+    tmp_path,
+    monkeypatch,
+):
+    class SuccessfulReplayProvider(DefaultRuntimeProvider):
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(last_sync_status="success", error_message=None)
+
+    class BatchedVectorStore:
+        def __init__(self) -> None:
+            self.delivery_calls = 0
+
+        async def rebaseline_source_lifecycle(
+            self,
+            source_id: str,
+            *,
+            source_activity=None,
+        ):
+            assert source_id == "src-confluence"
+            assert source_activity is not None
+            return []
+
+        async def attempt_lifecycle_vector_delivery(
+            self,
+            lifecycle_plan_id: str | None = None,
+            *,
+            source_id: str | None = None,
+        ) -> LifecycleVectorDeliveryResult:
+            assert lifecycle_plan_id is None
+            assert source_id == "src-confluence"
+            self.delivery_calls += 1
+            if self.delivery_calls == 1:
+                return LifecycleVectorDeliveryResult(
+                    state=LifecycleVectorDeliveryState.PENDING,
+                    attempted_tasks=100,
+                    delivered_tasks=100,
+                )
+            return LifecycleVectorDeliveryResult(
+                state=LifecycleVectorDeliveryState.DELIVERED,
+            )
+
+    database = Database(str(tmp_path / "rebaseline-vector-batches.db"))
+
+    async def setup() -> None:
+        await database.connect()
+        await database.upsert_source(
+            id="src-confluence",
+            type="confluence",
+            name="Confluence",
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="user-a",
+        )
+
+    asyncio.run(setup())
+    batched_store = BatchedVectorStore()
+
+    async def build_batched_store(*args, **kwargs):
+        del args, kwargs
+        return batched_store
+
+    monkeypatch.setattr(
+        "memforge.server.admin_api._build_memory_store",
+        build_batched_store,
+    )
+    app = create_admin_app(
+        db=database,
+        config=_config(tmp_path),
+        runtime_provider=SuccessfulReplayProvider(),
+        principal_resolver=lambda request: "user-a",
+    )
+    try:
+        with TestClient(app) as client:
+            accepted = client.post(
+                "/api/sources/src-confluence/memory-lifecycle/rebaseline",
+                json={"confirm_source_id": "src-confluence"},
+            )
+            status = client.get("/api/sources/src-confluence/memory-lifecycle")
+
+        assert accepted.status_code == 202, accepted.text
+        assert status.status_code == 200, status.text
+        payload = status.json()
+        assert payload["jobs"][0]["status"] == "completed"
+        assert payload["gate"]["state"] == "enabled"
+        assert batched_store.delivery_calls == 2
     finally:
         asyncio.run(database.close())
 

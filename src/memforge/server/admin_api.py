@@ -4225,6 +4225,23 @@ def create_admin_app(
                     "source rebaseline replay failed: "
                     f"{state.last_sync_status}: {state.error_message or 'unknown error'}"
                 )
+            while True:
+                vector_delivery = await memory_store.attempt_lifecycle_vector_delivery(
+                    source_id=source_id
+                )
+                if not vector_delivery.pending:
+                    break
+                # A source maintenance fence prevents new lifecycle tasks for
+                # this source. Keep draining bounded store batches only while
+                # the previous pass made monotonic progress.
+                if vector_delivery.delivered_tasks:
+                    continue
+                error_types = ",".join(vector_delivery.error_types) or "pending_tasks"
+                raise RuntimeError(
+                    "source rebaseline vector delivery remains pending: "
+                    f"failed_tasks={vector_delivery.failed_tasks} "
+                    f"error_types={error_types}"
+                )
             audit = await run_source_lifecycle_backfill(
                 db,
                 source_id,
