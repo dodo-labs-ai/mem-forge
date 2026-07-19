@@ -386,6 +386,25 @@ class MemoryStore:
                     )
 
         failed_tasks = len(selected_tasks) - delivered_tasks
+        if failed_tasks and not delivered_tasks:
+            try:
+                remaining_tasks = await self.relational.list_lifecycle_vector_tasks(
+                    source_id=source_id,
+                    lifecycle_plan_id=lifecycle_plan_id,
+                    limit=1,
+                )
+            except Exception as exc:
+                error_types.append(type(exc).__name__)
+            else:
+                if not remaining_tasks:
+                    # Another source-scoped consumer may have completed the
+                    # durable task after this batch listed it. Vector
+                    # operations are idempotent, so an empty durable remainder
+                    # is successful delivery rather than a false failure.
+                    return LifecycleVectorDeliveryResult(
+                        state=LifecycleVectorDeliveryState.DELIVERED,
+                        attempted_tasks=len(selected_tasks),
+                    )
         state = (
             LifecycleVectorDeliveryState.PENDING
             if failed_tasks or more_work

@@ -891,6 +891,11 @@ def test_source_rebaseline_keeps_gate_closed_when_vector_delivery_is_pending(
         ):
             assert source_id == "src-confluence"
             assert source_activity is not None
+            await database.gate_destructive_lifecycle(
+                source_id,
+                reason="source rebaseline requires a complete successful replay",
+                source_activity=source_activity,
+            )
             return []
 
         async def attempt_lifecycle_vector_delivery(
@@ -920,6 +925,7 @@ def test_source_rebaseline_keeps_gate_closed_when_vector_delivery_is_pending(
             access_policy="workspace",
             owner_user_id="user-a",
         )
+        await database.enable_lifecycle_gate("src-confluence")
 
     asyncio.run(setup())
     pending_store = PendingVectorStore()
