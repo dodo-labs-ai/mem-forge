@@ -17,13 +17,27 @@ from memforge.memory.evidence import (
     AuthorityCase,
     CandidateBucket,
     CandidatePage,
+    EvidenceContentProvenance,
+    EvidenceReference,
+    EvidenceRole,
+    EvidenceUnit,
     LifecycleAction,
+    MemorySupportAssertion,
     RelationType,
     ReviewCase,
 )
 from memforge.memory.store import MemoryStore
-from memforge.models import Memory, content_hash, generate_deterministic_review_id
+from memforge.models import (
+    ContentItem,
+    Memory,
+    NormalizedContent,
+    RawContent,
+    content_hash,
+    generate_deterministic_review_id,
+)
 from memforge.pipeline.contradiction_detector import detect_cross_doc_contradictions
+from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
@@ -53,6 +67,93 @@ async def _insert_document(db: Database, doc_id: str, *, source: str = "src-1") 
     )
 
 
+async def _seed_projected_support(
+    db: Database,
+    *,
+    memory: Memory,
+    doc_id: str,
+    source_id: str,
+) -> None:
+    """Persist the current Source Projection evidence behind one Memory."""
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name=source_id,
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="test-owner",
+    )
+    item = ContentItem(
+        item_id=doc_id,
+        title=doc_id,
+        source_url=f"http://test/{doc_id}",
+        last_modified=datetime.now(timezone.utc),
+        version="1",
+        extra={"page_id": doc_id, "space_key": "TEST"},
+    )
+    projection = project_source_item(
+        source_id=source_id,
+        source_type="confluence",
+        run_id=f"projection-{memory.id}",
+        item=item,
+        raw=RawContent(
+            item=item,
+            body=memory.content.encode(),
+            content_type="text/plain",
+        ),
+        normalized=NormalizedContent(item=item, markdown_body=memory.content),
+    )
+    await db.record_source_projection(projection)
+    observation = projection.observations[0]
+    revision = next(
+        item
+        for item in projection.observation_revisions
+        if item.observation_id == observation.id
+    )
+    unit = EvidenceUnit(
+        id=f"eu-{memory.id}",
+        source_id=source_id,
+        doc_id=doc_id,
+        doc_revision_id=projection.source_unit_revisions[0].id,
+        source_type="confluence",
+        source_anchor=observation.id,
+        source_lineage_id=projection.source_units[0].id,
+        project_key=memory.project_key,
+        visibility=memory.visibility,
+        owner_user_id=memory.owner_user_id,
+        repo_identifier=memory.repo_identifier,
+        content=revision.content,
+        excerpt=memory.content,
+        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        access_context_hash="workspace-test",
+    )
+    await db.upsert_evidence_unit(unit)
+    reference = (
+        await db.record_evidence_references(
+            unit.id,
+            (
+                EvidenceReference(
+                    role=EvidenceRole.PRIMARY,
+                    anchor=SourceAnchor(
+                        kind=AnchorKind.WHOLE_OBSERVATION,
+                        observation_id=observation.id,
+                        observation_revision_id=revision.id,
+                    ),
+                ),
+            ),
+        )
+    )[0]
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id=f"support-{memory.id}",
+            memory_id=memory.id,
+            evidence_reference_id=reference.id or "",
+            source_id=source_id,
+            access_context_hash="workspace-test",
+        )
+    )
+
+
 @pytest.fixture
 async def db(tmp_path):
     """Create a test database with schema initialized."""
@@ -67,8 +168,8 @@ async def db(tmp_path):
 async def seeded_db(db):
     """Database with two documents, shared entities, and memories from each."""
     # Create two source documents (schema requires many NOT NULL columns)
-    await _insert_document(db, "doc-aaa")
-    await _insert_document(db, "doc-bbb")
+    await _insert_document(db, "doc-aaa", source="src-a")
+    await _insert_document(db, "doc-bbb", source="src-b")
 
     # Create a shared entity
     entity_id = await db.upsert_entity("postgresql", display_name="PostgreSQL", tags=["technology"])
@@ -76,9 +177,12 @@ async def seeded_db(db):
     # Memory from doc-aaa: "pay-api uses PostgreSQL 14 on port 5432"
     mem_a = _make_memory("mem-aaaa0001", "pay-api uses PostgreSQL 14 on port 5432")
     await db.insert_memory(mem_a)
-    await db.db.execute(
-        "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-        (mem_a.id, "doc-aaa", "confluence"),
+    await db.add_memory_source(
+        mem_a.id,
+        "doc-aaa",
+        "confluence",
+        mem_a.content,
+        source_updated_at=None,
     )
     await db.db.execute(
         "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
@@ -88,9 +192,12 @@ async def seeded_db(db):
     # Memory from doc-bbb: "pay-api migrated to MySQL 8 in Q1 2026"
     mem_b = _make_memory("mem-bbbb0001", "pay-api migrated to MySQL 8 in Q1 2026")
     await db.insert_memory(mem_b)
-    await db.db.execute(
-        "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-        (mem_b.id, "doc-bbb", "confluence"),
+    await db.add_memory_source(
+        mem_b.id,
+        "doc-bbb",
+        "confluence",
+        mem_b.content,
+        source_updated_at=None,
     )
     await db.db.execute(
         "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
@@ -101,9 +208,12 @@ async def seeded_db(db):
     other_entity_id = await db.upsert_entity("kafka", display_name="Kafka", tags=["technology"])
     mem_c = _make_memory("mem-cccc0001", "Kafka retention is set to 7 days")
     await db.insert_memory(mem_c)
-    await db.db.execute(
-        "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-        (mem_c.id, "doc-aaa", "confluence"),
+    await db.add_memory_source(
+        mem_c.id,
+        "doc-aaa",
+        "confluence",
+        mem_c.content,
+        source_updated_at=None,
     )
     await db.db.execute(
         "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
@@ -111,7 +221,18 @@ async def seeded_db(db):
     )
 
     await db.db.commit()
-
+    await _seed_projected_support(
+        db,
+        memory=mem_a,
+        doc_id="doc-aaa",
+        source_id="src-a",
+    )
+    await _seed_projected_support(
+        db,
+        memory=mem_b,
+        doc_id="doc-bbb",
+        source_id="src-b",
+    )
     return db, entity_id, mem_a, mem_b, mem_c
 
 
@@ -163,7 +284,7 @@ def _make_memory(mem_id: str, content: str) -> Memory:
         memory_type="fact",
         content=content,
         content_hash=content_hash(content),
-        project_key=None,
+        project_key="TEST",
         entity_refs=[],
         tags=[],
         confidence=0.9,
@@ -596,10 +717,84 @@ class TestRecordContradiction:
         await db.record_contradiction(mem_a.id, mem_b.id, "contradiction", "second")  # ignored
 
         m_a = await db.get_memory(mem_a.id)
-        # Only incremented once because second INSERT was ignored,
-        # but UPDATE runs both times — this is a potential bug to verify
-        # The INSERT OR IGNORE prevents the row, but the UPDATE still fires
-        assert m_a.contradiction_count >= 1
+        assert m_a.contradiction_count == 1
+
+    @pytest.mark.asyncio
+    async def test_reverse_pair_retry_is_idempotent(self, seeded_db):
+        db, _, mem_a, mem_b, _ = seeded_db
+
+        await db.record_contradiction(
+            mem_a.id,
+            mem_b.id,
+            "contradiction",
+            "first",
+        )
+        await db.record_contradiction(
+            mem_b.id,
+            mem_a.id,
+            "contradiction",
+            "reverse retry",
+        )
+
+        assert (await db.get_memory(mem_a.id)).contradiction_count == 1
+        assert (await db.get_memory(mem_b.id)).contradiction_count == 1
+        async with db.db.execute(
+            "SELECT COUNT(*) FROM memory_contradictions"
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_temporal_pair_upgrades_to_contradiction_once(self, seeded_db):
+        db, _, mem_a, mem_b, _ = seeded_db
+
+        await db.record_contradiction(
+            mem_b.id,
+            mem_a.id,
+            "temporal",
+            "initial temporal relation",
+        )
+        await db.record_contradiction(
+            mem_a.id,
+            mem_b.id,
+            "contradiction",
+            "confirmed conflict",
+        )
+        await db.record_contradiction(
+            mem_b.id,
+            mem_a.id,
+            "temporal",
+            "late downgrade retry",
+        )
+
+        assert (await db.get_memory(mem_a.id)).contradiction_count == 1
+        assert (await db.get_memory(mem_b.id)).contradiction_count == 1
+        async with db.db.execute(
+            """SELECT classification, reason
+                 FROM memory_contradictions"""
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert tuple(row) == ("contradiction", "confirmed conflict")
+
+    @pytest.mark.asyncio
+    async def test_self_contradiction_is_rejected(self, seeded_db):
+        db, _, mem_a, _, _ = seeded_db
+
+        with pytest.raises(
+            ValueError,
+            match="contradiction requires two distinct Memories",
+        ):
+            await db.record_contradiction(
+                mem_a.id,
+                mem_a.id,
+                "contradiction",
+                "invalid self pair",
+            )
+
+        assert (await db.get_memory(mem_a.id)).contradiction_count == 0
+        async with db.db.execute(
+            "SELECT COUNT(*) FROM memory_contradictions"
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 0
 
     @pytest.mark.asyncio
     async def test_record_persists_to_table(self, seeded_db):
@@ -617,6 +812,40 @@ class TestRecordContradiction:
         assert row["classification"] == "contradiction"
         assert row["reason"] == "DB mismatch"
         assert row["resolution"] == "pending"
+
+
+class TestContradictionSummaryMigration:
+    @pytest.mark.asyncio
+    async def test_legacy_directional_rows_are_reset_once(self, seeded_db):
+        db, _, mem_a, mem_b, _ = seeded_db
+
+        await db.db.executemany(
+            """INSERT INTO memory_contradictions (
+                   memory_id_a, memory_id_b, classification, reason
+               ) VALUES (?, ?, ?, ?)""",
+            [
+                (mem_a.id, mem_b.id, "contradiction", "legacy forward"),
+                (mem_b.id, mem_a.id, "contradiction", "legacy reverse"),
+            ],
+        )
+        await db.db.execute(
+            "UPDATE memories SET contradiction_count = 2 WHERE id IN (?, ?)",
+            (mem_a.id, mem_b.id),
+        )
+        await db.db.execute("DELETE FROM schema_migrations WHERE version = 62")
+        await db.db.commit()
+
+        await db._run_migrations()
+        await db._run_migrations()
+
+        async with db.db.execute("SELECT COUNT(*) FROM memory_contradictions") as cursor:
+            assert (await cursor.fetchone())[0] == 0
+        assert (await db.get_memory(mem_a.id)).contradiction_count == 0
+        assert (await db.get_memory(mem_b.id)).contradiction_count == 0
+        async with db.db.execute(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version = 62"
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -682,9 +911,9 @@ class TestDetectCrossDocContradictions:
             """SELECT rr.*
                FROM relation_runs rr
                JOIN relation_candidates rc ON rc.relation_run_id = rr.id
-               WHERE rr.evidence_unit_id LIKE 'eu-contradiction-%'
+               WHERE rr.evidence_unit_id = ?
                  AND rc.memory_id = ?""",
-            (mem_a.id,),
+            (f"eu-{mem_b.id}", mem_a.id),
         ) as cursor:
             relation_runs = [dict(row) async for row in cursor]
         assert len(relation_runs) == 1
@@ -693,7 +922,9 @@ class TestDetectCrossDocContradictions:
         assert evidence_unit is not None
         assert evidence_unit.doc_id == "doc-bbb"
         assert evidence_unit.source_type == "confluence"
-        assert evidence_unit.source_metadata["challenger_memory_id"] == mem_b.id
+        assert evidence_unit.source_id == "src-b"
+        assert evidence_unit.source_lineage_id
+        assert evidence_unit.access_context_hash == "workspace-test"
         assert review.id == generate_deterministic_review_id(
             kind="cross_source_conflict",
             incumbent_memory_id=mem_a.id,
@@ -710,6 +941,125 @@ class TestDetectCrossDocContradictions:
         assert [(candidate.memory_id, candidate.bucket, candidate.was_checked) for candidate in candidates] == [
             (mem_a.id, CandidateBucket.SHARED_ENTITIES, True)
         ]
+
+    @pytest.mark.asyncio
+    async def test_each_conflicting_incumbent_gets_a_deterministic_review(
+        self,
+        seeded_db,
+        memory_store,
+        monkeypatch,
+    ):
+        db, entity_id, mem_a, mem_b, _ = seeded_db
+        await _insert_document(db, "doc-ddd", source="src-d")
+        mem_d = _make_memory(
+            "mem-dddd0001",
+            "pay-api still uses PostgreSQL 13",
+        )
+        await db.insert_memory(mem_d)
+        await db.add_memory_source(
+            mem_d.id,
+            "doc-ddd",
+            "confluence",
+            mem_d.content,
+            source_updated_at=None,
+        )
+        await db.db.execute(
+            "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
+            (mem_d.id, entity_id),
+        )
+        await db.db.commit()
+        await _seed_projected_support(
+            db,
+            memory=mem_d,
+            doc_id="doc-ddd",
+            source_id="src-d",
+        )
+
+        async def two_candidates(*args, **kwargs):
+            del args, kwargs
+            return CandidatePage(
+                candidates=(mem_a, mem_d),
+                complete=True,
+                requested_limit=200,
+            )
+
+        monkeypatch.setattr(db, "get_cross_doc_candidates", two_candidates)
+        mock_client = AsyncMock()
+        mock_client.detect_contradictions = AsyncMock(
+            return_value=_mock_contradiction_response(
+                [
+                    {
+                        "pair_index": 0,
+                        "classification": "contradiction",
+                        "reason": "first conflict",
+                    },
+                    {
+                        "pair_index": 1,
+                        "classification": "contradiction",
+                        "reason": "second conflict",
+                    },
+                ]
+            )
+        )
+
+        for _ in range(2):
+            stats = await detect_cross_doc_contradictions(
+                new_memory_ids=[mem_b.id],
+                doc_id="doc-bbb",
+                db=db,
+                memory_store=memory_store,
+                structured_llm_client=mock_client,
+            )
+            assert stats["contradictions"] == 2
+
+        async with db.db.execute(
+            """SELECT id, incumbent_memory_id
+                 FROM memory_reviews
+                WHERE challenger_memory_id = ?
+                ORDER BY incumbent_memory_id""",
+            (mem_b.id,),
+        ) as cursor:
+            reviews = [dict(row) async for row in cursor]
+        assert [review["incumbent_memory_id"] for review in reviews] == [
+            mem_a.id,
+            mem_d.id,
+        ]
+
+        async with db.db.execute(
+            """SELECT id
+                 FROM relation_runs
+                WHERE evidence_unit_id = ?
+                  AND review_case = ?""",
+            (f"eu-{mem_b.id}", ReviewCase.CROSS_SOURCE_CONFLICT.value),
+        ) as cursor:
+            relation_runs = [dict(row) async for row in cursor]
+        assert len(relation_runs) == 1
+        relation_run_id = relation_runs[0]["id"]
+        evidence_unit = await db.get_evidence_unit(f"eu-{mem_b.id}")
+        assert evidence_unit is not None
+        assert {
+            review["id"]
+            for review in reviews
+        } == {
+            generate_deterministic_review_id(
+                kind="cross_source_conflict",
+                incumbent_memory_id=incumbent_id,
+                challenger_memory_id=mem_b.id,
+                relation_run_id=relation_run_id,
+                evidence_unit_id=evidence_unit.id,
+                review_case=ReviewCase.CROSS_SOURCE_CONFLICT.value,
+            )
+            for incumbent_id in (mem_a.id, mem_d.id)
+        }
+        relations = await db.get_evidence_relations(evidence_unit.id)
+        assert {
+            relation.memory_id
+            for relation in relations
+            if relation.relation_type is RelationType.CONTRADICTS
+        } == {mem_a.id, mem_d.id}
+        assert (await db.get_memory(mem_a.id)).contradiction_count == 1
+        assert (await db.get_memory(mem_b.id)).contradiction_count == 2
+        assert (await db.get_memory(mem_d.id)).contradiction_count == 1
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -763,7 +1113,8 @@ class TestDetectCrossDocContradictions:
         assert stats == {"contradictions": 0, "temporal": 0, "checked": 2, "truncated": 0}
         assert await db.get_pending_review_for_challenger(mem_b.id) is None
         async with db.db.execute(
-            "SELECT COUNT(*) FROM relation_runs WHERE evidence_unit_id LIKE 'eu-contradiction-%'"
+            "SELECT COUNT(*) FROM relation_runs WHERE evidence_unit_id = ?",
+            (f"eu-{mem_b.id}",),
         ) as cursor:
             assert (await cursor.fetchone())[0] == 0
         async with db.db.execute("SELECT COUNT(*) FROM memory_contradictions") as cursor:
@@ -894,8 +1245,9 @@ class TestDetectCrossDocContradictions:
         assert (await db.get_memory(mem_b.id)).status == "active"
         async with db.db.execute(
             """SELECT * FROM relation_runs
-               WHERE evidence_unit_id LIKE 'eu-contradiction-%'
-               ORDER BY started_at DESC LIMIT 1"""
+               WHERE evidence_unit_id = ?
+               ORDER BY started_at DESC LIMIT 1""",
+            (f"eu-{mem_b.id}",),
         ) as cursor:
             run = await cursor.fetchone()
         assert run is not None
@@ -906,6 +1258,44 @@ class TestDetectCrossDocContradictions:
         assert [
             (candidate.memory_id, candidate.bucket_complete, candidate.was_checked) for candidate in candidates
         ] == [(mem_a.id, False, False)]
+
+        async def complete_candidates(*args, **kwargs):
+            del args, kwargs
+            return CandidatePage(
+                candidates=(mem_a,),
+                complete=True,
+                requested_limit=1,
+            )
+
+        monkeypatch.setattr(db, "get_cross_doc_candidates", complete_candidates)
+        complete_client = AsyncMock()
+        complete_client.detect_contradictions = AsyncMock(
+            return_value=_mock_contradiction_response(
+                [
+                    {
+                        "pair_index": 0,
+                        "classification": "contradiction",
+                        "reason": "confirmed conflict",
+                    }
+                ]
+            )
+        )
+        retry_stats = await detect_cross_doc_contradictions(
+            new_memory_ids=[mem_b.id],
+            doc_id="doc-bbb",
+            db=db,
+            memory_store=memory_store,
+            structured_llm_client=complete_client,
+        )
+        assert retry_stats["contradictions"] == 1
+        review = await db.get_pending_review_for_challenger(mem_b.id)
+        assert review is not None
+        assert review.incumbent_memory_id == mem_a.id
+        async with db.db.execute(
+            "SELECT COUNT(*) FROM relation_runs WHERE evidence_unit_id = ?",
+            (f"eu-{mem_b.id}",),
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 2
 
     @pytest.mark.asyncio
     async def test_total_pair_cap_and_batching_bound_llm_prompt_size(self, seeded_db, memory_store, monkeypatch):
@@ -985,175 +1375,56 @@ class TestDetectCrossDocContradictions:
         async with db.db.execute(
             """SELECT status, review_case
                FROM relation_runs
-               WHERE evidence_unit_id LIKE 'eu-contradiction-%'
-               ORDER BY started_at DESC LIMIT 1"""
+               WHERE evidence_unit_id = ?
+               ORDER BY started_at DESC LIMIT 1""",
+            (f"eu-{mem_b.id}",),
         ) as cursor:
             run = await cursor.fetchone()
         assert run is not None
         assert run["status"] == "review_required"
         assert run["review_case"] == ReviewCase.MANDATORY_INCOMPLETE.value
 
-    @pytest.mark.asyncio
-    async def test_pair_cap_records_incomplete_run_for_skipped_challenger(self, seeded_db, memory_store, monkeypatch):
-        db, entity_id, mem_a, mem_b, _ = seeded_db
-        skipped = _make_memory("mem-skip0001", "pay-api has an unverified runtime version")
-        await db.insert_memory(skipped)
-        await db.db.execute(
-            "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-            (skipped.id, "doc-bbb", "confluence"),
-        )
-        await db.db.execute(
-            "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
-            (skipped.id, entity_id),
-        )
-        await db.db.commit()
-
-        async def exact_cap_candidates(
-            memory_id,
-            entity_ids,
-            doc_id,
-            *,
-            owner_user_id=None,
-            visibility=None,
-            project_key=None,
-            excluded_source_ids=(),
-            limit=200,
-        ):
-            del (
-                memory_id,
-                entity_ids,
-                doc_id,
-                owner_user_id,
-                visibility,
-                project_key,
-                excluded_source_ids,
-            )
-            return CandidatePage(candidates=(mem_a,)[:limit], complete=True, requested_limit=limit)
-
-        monkeypatch.setattr(db, "get_cross_doc_candidates", exact_cap_candidates)
         monkeypatch.setattr(
             "memforge.pipeline.contradiction_detector.MAX_CONTRADICTION_PAIRS_PER_RUN",
-            1,
+            10,
             raising=False,
         )
-
-        mock_client = AsyncMock()
-        mock_client.detect_contradictions = AsyncMock(
-            return_value=_mock_contradiction_response(
-                [{"pair_index": 0, "classification": "unrelated", "reason": "no conflict"}]
-            )
+        monkeypatch.setattr(
+            "memforge.pipeline.contradiction_detector.CONTRADICTION_LLM_BATCH_SIZE",
+            20,
+            raising=False,
         )
-
-        stats = await detect_cross_doc_contradictions(
-            new_memory_ids=[mem_b.id, skipped.id],
-            doc_id="doc-bbb",
-            db=db,
-            memory_store=memory_store,
-            structured_llm_client=mock_client,
-        )
-
-        assert stats["checked"] == 1
-        assert stats["truncated"] == 1
-        async with db.db.execute(
-            """SELECT status, review_case, audit_json
-               FROM relation_runs
-               WHERE review_case = ?
-               ORDER BY started_at DESC LIMIT 1""",
-            (ReviewCase.MANDATORY_INCOMPLETE.value,),
-        ) as cursor:
-            run = await cursor.fetchone()
-        assert run is not None
-        assert run["status"] == "review_required"
-        assert skipped.id in run["audit_json"]
-
-    @pytest.mark.asyncio
-    async def test_multiple_contradictions_create_one_review_per_challenger(self, seeded_db, memory_store):
-        """One challenger can conflict with several memories but needs one decision row."""
-        db, entity_id, _, mem_b, _ = seeded_db
-        now = datetime.now(timezone.utc).isoformat()
-        await db.db.execute(
-            """INSERT INTO documents
-               (doc_id, source, source_url, title, space_or_project, last_modified, version, content_hash, last_synced)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("doc-ccc", "src-1", "http://test/c", "Legacy DB Doc", "TEST", now, "1", "hash3", now),
-        )
-        mem_d = _make_memory("mem-dddd0001", "pay-api still uses PostgreSQL 13")
-        await db.insert_memory(mem_d)
-        await db.db.execute(
-            "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-            (mem_d.id, "doc-ccc", "confluence"),
-        )
-        await db.db.execute(
-            "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
-            (mem_d.id, entity_id),
-        )
-        await db.db.commit()
-
-        mock_client = AsyncMock()
-        mock_client.detect_contradictions = AsyncMock(
+        complete_client = AsyncMock()
+        complete_client.detect_contradictions = AsyncMock(
             return_value=_mock_contradiction_response(
                 [
-                    {"pair_index": 0, "classification": "contradiction", "reason": "first conflict"},
-                    {"pair_index": 1, "classification": "contradiction", "reason": "second conflict"},
+                    {
+                        "pair_index": index,
+                        "classification": "unrelated",
+                        "reason": "no conflict",
+                    }
+                    for index in range(len(candidates))
                 ]
             )
         )
-
-        stats = await detect_cross_doc_contradictions(
+        complete_stats = await detect_cross_doc_contradictions(
             new_memory_ids=[mem_b.id],
             doc_id="doc-bbb",
             db=db,
             memory_store=memory_store,
-            structured_llm_client=mock_client,
+            structured_llm_client=complete_client,
         )
-
-        assert stats["contradictions"] == 2
-        reviews = await db.list_memory_reviews(status="pending")
-        challenger_reviews = [r for r in reviews if r.challenger_memory_id == mem_b.id]
-        assert len(challenger_reviews) == 1
-
-    @pytest.mark.asyncio
-    async def test_multiple_challengers_from_same_doc_get_independent_reviews(self, seeded_db, memory_store):
-        """Each active challenger keeps an independently resolvable review finding."""
-        db, entity_id, mem_a, mem_b, _ = seeded_db
-        mem_e = _make_memory("mem-eeee0001", "pay-api now uses PostgreSQL 16")
-        await db.insert_memory(mem_e)
-        await db.db.execute(
-            "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-            (mem_e.id, "doc-bbb", "confluence"),
-        )
-        await db.db.execute(
-            "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
-            (mem_e.id, entity_id),
-        )
-        await db.db.commit()
-
-        mock_client = AsyncMock()
-        mock_client.detect_contradictions = AsyncMock(
-            return_value=_mock_contradiction_response(
-                [
-                    {"pair_index": 0, "classification": "contradiction", "reason": "first challenger"},
-                    {"pair_index": 1, "classification": "contradiction", "reason": "second challenger"},
-                ]
-            )
-        )
-
-        stats = await detect_cross_doc_contradictions(
-            new_memory_ids=[mem_b.id, mem_e.id],
-            doc_id="doc-bbb",
-            db=db,
-            memory_store=memory_store,
-            structured_llm_client=mock_client,
-        )
-
-        assert stats["contradictions"] == 2
-        reviews = await db.list_memory_reviews(status="pending")
-        assert len(reviews) == 2
-        assert {review.incumbent_memory_id for review in reviews} == {mem_a.id}
-        assert {review.challenger_memory_id for review in reviews} == {mem_b.id, mem_e.id}
-        assert all(review.kind == "cross_source_conflict" for review in reviews)
-        assert (await db.get_memory(mem_b.id)).status == "active"
-        assert (await db.get_memory(mem_e.id)).status == "active"
+        assert complete_stats == {
+            "contradictions": 0,
+            "temporal": 0,
+            "checked": len(candidates),
+            "truncated": 0,
+        }
+        async with db.db.execute(
+            "SELECT COUNT(*) FROM relation_runs WHERE evidence_unit_id = ?",
+            (f"eu-{mem_b.id}",),
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 2
 
     @pytest.mark.asyncio
     async def test_temporal_detected_not_contradiction(self, seeded_db, memory_store):
@@ -1182,6 +1453,99 @@ class TestDetectCrossDocContradictions:
 
         m_a = await db.get_memory(mem_a.id)
         assert m_a.contradiction_count == 0
+        assert await db.get_pending_review_for_challenger(mem_b.id) is None
+        async with db.db.execute(
+            """SELECT id, lifecycle_action, review_case
+                 FROM relation_runs
+                WHERE evidence_unit_id = ?
+                ORDER BY started_at DESC LIMIT 1""",
+            (f"eu-{mem_b.id}",),
+        ) as cursor:
+            run = await cursor.fetchone()
+        assert run is not None
+        assert run["lifecycle_action"] == LifecycleAction.NONE.value
+        assert run["review_case"] is None
+        relations = await db.get_evidence_relations(f"eu-{mem_b.id}")
+        assert [
+            (relation.memory_id, relation.relation_type, relation.authority_case)
+            for relation in relations
+        ] == [
+            (
+                mem_a.id,
+                RelationType.REFINES,
+                AuthorityCase.INDEPENDENT_REFINEMENT,
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stale_primary_support_fails_closed_before_relation_write(
+        self,
+        seeded_db,
+        memory_store,
+    ):
+        db, _, _, mem_b, _ = seeded_db
+        item = ContentItem(
+            item_id="doc-bbb",
+            title="doc-bbb",
+            source_url="http://test/doc-bbb",
+            last_modified=datetime.now(timezone.utc),
+            version="2",
+            extra={"page_id": "doc-bbb", "space_key": "TEST"},
+        )
+        await db.record_source_projection(
+            project_source_item(
+                source_id="src-b",
+                source_type="confluence",
+                run_id="projection-doc-bbb-new-revision",
+                item=item,
+                raw=RawContent(
+                    item=item,
+                    body=b"Current source revision no longer carries the old claim.",
+                    content_type="text/plain",
+                ),
+                normalized=NormalizedContent(
+                    item=item,
+                    markdown_body="Current source revision no longer carries the old claim.",
+                ),
+            )
+        )
+        client = AsyncMock()
+        client.detect_contradictions = AsyncMock(
+            return_value=_mock_contradiction_response(
+                [
+                    {
+                        "pair_index": 0,
+                        "classification": "temporal",
+                        "reason": "stale evidence must not be reused",
+                    }
+                ]
+            )
+        )
+
+        stats = await detect_cross_doc_contradictions(
+            new_memory_ids=[mem_b.id],
+            doc_id="doc-bbb",
+            db=db,
+            memory_store=memory_store,
+            structured_llm_client=client,
+        )
+
+        assert stats == {
+            "contradictions": 0,
+            "temporal": 0,
+            "checked": 1,
+            "truncated": 0,
+        }
+        async with db.db.execute(
+            "SELECT COUNT(*) FROM relation_runs WHERE evidence_unit_id = ?",
+            (f"eu-{mem_b.id}",),
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 0
+        failures = await db.list_memory_audit_events(
+            event_type="contradiction_detection_failed"
+        )
+        assert len(failures) == 1
+        assert failures[0].reason == "runtime_failure"
 
     @pytest.mark.asyncio
     async def test_no_candidates_skips_llm(self, seeded_db, memory_store):
@@ -1304,9 +1668,9 @@ class TestDetectCrossDocContradictions:
             """SELECT rr.*
                FROM relation_runs rr
                JOIN relation_candidates rc ON rc.relation_run_id = rr.id
-               WHERE rr.evidence_unit_id LIKE 'eu-contradiction-%'
+               WHERE rr.evidence_unit_id = ?
                  AND rc.memory_id = ?""",
-            (mem_a.id,),
+            (f"eu-{mem_b.id}", mem_a.id),
         ) as cursor:
             relation_runs = [dict(row) async for row in cursor]
         assert len(relation_runs) == 1

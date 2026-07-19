@@ -12,7 +12,6 @@ import json
 import logging
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from hashlib import sha256
 from typing import TYPE_CHECKING
 
 from memforge.config import DEFAULT_ENRICHMENT_MAX_TOKENS
@@ -20,8 +19,8 @@ from memforge.llm.structured import StructuredLlmError
 from memforge.memory.evidence import (
     AuthorityCase,
     CandidateBucket,
-    EvidenceContentProvenance,
     EvidenceRelationRecord,
+    EvidenceRole,
     EvidenceUnit,
     LifecycleAction,
     RelationCandidateRecord,
@@ -264,7 +263,10 @@ async def detect_cross_doc_contradictions(
         }
 
         decisions_by_pair: dict[int, dict] = {}
-        challengers_for_review: dict[str, tuple[Memory, Memory, str, str]] = {}
+        review_targets_by_challenger: dict[
+            str,
+            list[tuple[Memory, Memory, str, str]],
+        ] = defaultdict(list)
         contradictions_to_record: list[tuple[str, str, str, str]] = []
         temporal_to_record: list[tuple[str, str, str, str]] = []
         for dec in decisions:
@@ -283,9 +285,8 @@ async def detect_cross_doc_contradictions(
             }
 
             if classification == "contradiction":
-                challengers_for_review.setdefault(
-                    mem_a.id,
-                    (mem_a, mem_b, reason, classification),
+                review_targets_by_challenger[mem_a.id].append(
+                    (mem_a, mem_b, reason, classification)
                 )
                 contradictions_to_record.append((mem_a.id, mem_b.id, "contradiction", reason))
                 logger.info(
@@ -296,10 +297,6 @@ async def detect_cross_doc_contradictions(
                 )
 
             elif classification == "temporal":
-                challengers_for_review.setdefault(
-                    mem_a.id,
-                    (mem_a, mem_b, reason, classification),
-                )
                 temporal_to_record.append((mem_a.id, mem_b.id, "temporal", reason))
                 logger.info(
                     "TEMPORAL: %s vs %s — %s",
@@ -316,25 +313,32 @@ async def detect_cross_doc_contradictions(
             candidate_bucket_complete_by_challenger=candidate_bucket_complete_by_challenger,
         )
         for challenger_id, bundle in relation_outcomes.items():
-            review_target = challengers_for_review.get(challenger_id)
-            if review_target is not None and bundle.relation_run.lifecycle_action is LifecycleAction.CREATE_REVIEW:
-                challenger, incumbent, reason, classification = review_target
-                await _record_cross_source_review(
-                    challenger=challenger,
-                    incumbent=incumbent,
-                    reason=reason,
-                    classification=classification,
-                    db=db,
-                    relation_outcome=bundle,
-                )
-                for record in [item for item in contradictions_to_record if item[0] == challenger_id]:
-                    await db.record_contradiction(*record)
-                    stats["contradictions"] += 1
+            review_targets = review_targets_by_challenger.get(challenger_id, ())
+            if (
+                review_targets
+                and bundle.relation_run.lifecycle_action
+                is LifecycleAction.CREATE_REVIEW
+                and bundle.relation_run.review_case
+                is ReviewCase.CROSS_SOURCE_CONFLICT
+            ):
+                for challenger, incumbent, reason, classification in review_targets:
+                    await _record_cross_source_review(
+                        challenger=challenger,
+                        incumbent=incumbent,
+                        reason=reason,
+                        classification=classification,
+                        db=db,
+                        relation_outcome=bundle,
+                    )
             else:
                 await db.record_relation_outcome_bundle(bundle)
-                for record in [item for item in contradictions_to_record if item[0] == challenger_id]:
-                    await db.record_contradiction(*record)
-                    stats["contradictions"] += 1
+            for record in [
+                item
+                for item in contradictions_to_record
+                if item[0] == challenger_id
+            ]:
+                await db.record_contradiction(*record)
+                stats["contradictions"] += 1
         for record in temporal_to_record:
             await db.record_contradiction(*record)
             stats["temporal"] += 1
@@ -479,11 +483,50 @@ async def _build_cross_doc_relation_outcome_bundles(
         _, challenger, _ = challenger_pairs[0]
         bucket_complete = candidate_bucket_complete_by_challenger.get(challenger.id, True)
         unit = await _cross_doc_evidence_unit(db=db, challenger=challenger, doc_id=doc_id)
-        relation_run_id = _cross_doc_relation_run_id(unit)
+        classified_pairs = [
+            (
+                pair_index,
+                incumbent,
+                str(decisions_by_pair.get(pair_index, {}).get("classification") or "unrelated"),
+                str(decisions_by_pair.get(pair_index, {}).get("reason") or ""),
+            )
+            for pair_index, _, incumbent in challenger_pairs
+        ]
+        has_contradiction = any(
+            classification == "contradiction"
+            for _, _, classification, _ in classified_pairs
+        )
+        has_temporal = any(
+            classification == "temporal"
+            for _, _, classification, _ in classified_pairs
+        )
+        if not bucket_complete:
+            lifecycle_action = LifecycleAction.CREATE_REVIEW
+            review_case = ReviewCase.MANDATORY_INCOMPLETE
+        elif has_contradiction:
+            lifecycle_action = LifecycleAction.CREATE_REVIEW
+            review_case = ReviewCase.CROSS_SOURCE_CONFLICT
+        else:
+            lifecycle_action = LifecycleAction.NONE
+            review_case = None
+        identity_relation_type = None
+        identity_authority_case = None
+        if bucket_complete and has_contradiction:
+            identity_relation_type = RelationType.CONTRADICTS
+            identity_authority_case = AuthorityCase.CROSS_SOURCE_CONFLICT
+        elif bucket_complete and has_temporal:
+            identity_relation_type = RelationType.REFINES
+            identity_authority_case = AuthorityCase.INDEPENDENT_REFINEMENT
+        relation_run_id = _cross_doc_relation_run_id(
+            unit,
+            action=lifecycle_action,
+            relation_type=identity_relation_type,
+            authority_case=identity_authority_case,
+        )
 
-        for candidate_rank, (pair_index, _, incumbent) in enumerate(challenger_pairs):
-            classification = str(decisions_by_pair.get(pair_index, {}).get("classification") or "unrelated")
-            reason = str(decisions_by_pair.get(pair_index, {}).get("reason") or "")
+        for candidate_rank, (_, incumbent, classification, reason) in enumerate(
+            classified_pairs
+        ):
             candidate_records.append(
                 RelationCandidateRecord(
                     relation_run_id=relation_run_id,
@@ -502,10 +545,15 @@ async def _build_cross_doc_relation_outcome_bundles(
             if classification not in {"contradiction", "temporal"}:
                 continue
             relation_type = RelationType.CONTRADICTS if classification == "contradiction" else RelationType.REFINES
+            authority_case = (
+                AuthorityCase.CROSS_SOURCE_CONFLICT
+                if classification == "contradiction"
+                else AuthorityCase.INDEPENDENT_REFINEMENT
+            )
             decision = RelationDecision(
                 candidate_memory_id=incumbent.id,
                 relation_type=relation_type,
-                authority_case=AuthorityCase.CROSS_SOURCE_CONFLICT,
+                authority_case=authority_case,
                 confidence=1.0,
                 reason=reason,
                 evidence_excerpt=None,
@@ -519,7 +567,7 @@ async def _build_cross_doc_relation_outcome_bundles(
                     evidence_unit_id=unit.id,
                     memory_id=incumbent.id,
                     relation_type=relation_type,
-                    authority_case=AuthorityCase.CROSS_SOURCE_CONFLICT,
+                    authority_case=authority_case,
                     is_authoritative_support=False,
                     source_lineage_id=unit.source_lineage_id,
                     confidence=1.0,
@@ -531,18 +579,6 @@ async def _build_cross_doc_relation_outcome_bundles(
                 )
             )
 
-        if decisions:
-            # Cross-source classification has no destructive authority.  Even a
-            # temporal relation is only a review finding until a human supplies
-            # an explicit source-authority decision.
-            lifecycle_action = LifecycleAction.CREATE_REVIEW
-            review_case = ReviewCase.CROSS_SOURCE_CONFLICT
-        elif not bucket_complete:
-            lifecycle_action = LifecycleAction.CREATE_REVIEW
-            review_case = ReviewCase.MANDATORY_INCOMPLETE
-        else:
-            lifecycle_action = LifecycleAction.NONE
-            review_case = None
         relation_run = RelationRunRecord(
             id=relation_run_id,
             evidence_unit_id=unit.id,
@@ -587,7 +623,11 @@ async def _record_truncated_cross_doc_candidate_page(
     db: Database,
 ) -> None:
     unit = await _cross_doc_evidence_unit(db=db, challenger=challenger, doc_id=doc_id)
-    relation_run_id = _cross_doc_relation_run_id(unit)
+    relation_run_id = _cross_doc_relation_run_id(
+        unit,
+        relation_type=None,
+        authority_case=None,
+    )
     candidate_records = tuple(
         RelationCandidateRecord(
             relation_run_id=relation_run_id,
@@ -633,63 +673,60 @@ async def _record_truncated_cross_doc_candidate_page(
 
 
 async def _cross_doc_evidence_unit(*, db: Database, challenger: Memory, doc_id: str) -> EvidenceUnit:
-    sources = await db.get_memory_sources(challenger.id)
-    source = next((item for item in sources if item.doc_id == doc_id), sources[0] if sources else None)
     document = await db.get_document(doc_id)
-    source_id = document.source if document is not None and document.source else "unknown"
-    source_type = source.source_type if source is not None else "unknown"
-    doc_revision_id = None
-    if document is not None:
-        doc_revision_id = document.content_hash or document.version
-    unit_id = _cross_doc_evidence_unit_id(
-        source_id=source_id,
-        doc_id=doc_id,
-        doc_revision_id=doc_revision_id,
-        challenger_memory_id=challenger.id,
+    if document is None or not document.source:
+        raise ValueError("cross-document relation requires an authoritative source document")
+    support = await db.get_active_memory_support_evidence(
+        challenger.id,
+        source_id=document.source,
     )
-    return EvidenceUnit(
-        id=unit_id,
-        source_id=source_id,
-        doc_id=doc_id,
-        doc_revision_id=doc_revision_id,
-        source_type=source_type,
-        source_anchor=challenger.id,
-        source_lineage_id=doc_id,
-        project_key=challenger.project_key,
-        visibility=challenger.visibility,
-        owner_user_id=challenger.owner_user_id,
-        repo_identifier=challenger.repo_identifier,
-        content=challenger.content,
-        excerpt=None,
-        evidence_provenance=EvidenceContentProvenance.NO_EXCERPT,
-        source_metadata={
-            "challenger_memory_id": challenger.id,
-            "detection": "cross_doc_contradiction",
-        },
-        observed_at=datetime.now(timezone.utc).isoformat(),
-    )
+    primary_support_by_unit: dict[str, list] = defaultdict(list)
+    for item in support:
+        if item.role is EvidenceRole.PRIMARY:
+            primary_support_by_unit[item.evidence_unit_id].append(item)
+    units: list[EvidenceUnit] = []
+    for evidence_unit_id, primary_support in primary_support_by_unit.items():
+        unit = await db.get_evidence_unit(evidence_unit_id)
+        if (
+            unit is None
+            or unit.source_id != document.source
+            or unit.doc_id != doc_id
+            or not unit.access_context_hash
+            or not unit.source_lineage_id
+        ):
+            continue
+        current_revisions = await db.get_current_source_observation_revisions(
+            unit.source_lineage_id
+        )
+        if any(
+            (
+                current := current_revisions.get(item.anchor.observation_id)
+            ) is not None
+            and current.id == item.anchor.observation_revision_id
+            for item in primary_support
+        ):
+            units.append(unit)
+    if len(units) != 1:
+        raise ValueError(
+            "cross-document relation requires exactly one current primary Support Evidence Unit"
+        )
+    return units[0]
 
 
-def _cross_doc_evidence_unit_id(
+def _cross_doc_relation_run_id(
+    unit: EvidenceUnit,
     *,
-    source_id: str,
-    doc_id: str,
-    doc_revision_id: str | None,
-    challenger_memory_id: str,
+    action: LifecycleAction = LifecycleAction.CREATE_REVIEW,
+    relation_type: RelationType | None = RelationType.CONTRADICTS,
+    authority_case: AuthorityCase | None = AuthorityCase.CROSS_SOURCE_CONFLICT,
 ) -> str:
-    digest = sha256("\x1f".join([source_id, doc_id, doc_revision_id or "", challenger_memory_id]).encode()).hexdigest()
-    return f"eu-contradiction-{digest[:16]}"
-
-
-def _cross_doc_relation_run_id(unit: EvidenceUnit, memory_id: str | None = None) -> str:
     return relation_run_id_for(
         prefix="contradiction",
         unit=unit,
-        action=LifecycleAction.CREATE_REVIEW,
+        action=action,
         classifier_version="cross-doc-contradiction-v1",
-        candidate_memory_id=memory_id,
-        relation_type=RelationType.CONTRADICTS,
-        authority_case=AuthorityCase.CROSS_SOURCE_CONFLICT,
+        relation_type=relation_type,
+        authority_case=authority_case,
         bucket=CandidateBucket.SHARED_ENTITIES,
     )
 
