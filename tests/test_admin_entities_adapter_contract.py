@@ -136,6 +136,10 @@ def test_entity_admin_routes_use_adapter_methods_without_sqlite_db(tmp_path: Pat
             "/api/entities/merge",
             json={"source_id": 2, "target_id": 1},
         )
+        self_merge_response = client.post(
+            "/api/entities/merge",
+            json={"source_id": 1, "target_id": 1},
+        )
         memory_detail_response = client.get("/api/memories/mem-1")
 
     assert list_response.status_code == 200, list_response.text
@@ -150,5 +154,7 @@ def test_entity_admin_routes_use_adapter_methods_without_sqlite_db(tmp_path: Pat
     assert database.removed_aliases == [(1, "payroll zone")]
     assert merge_response.status_code == 200, merge_response.text
     assert merge_response.json()["merged"]["target_name"] == "Payroll Area"
+    assert self_merge_response.status_code == 400, self_merge_response.text
+    assert self_merge_response.json()["detail"] == "Source and target entities must differ"
     assert memory_detail_response.status_code == 200, memory_detail_response.text
     assert memory_detail_response.json()["entity_refs"] == ["Payroll Area"]

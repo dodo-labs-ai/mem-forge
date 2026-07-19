@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -429,6 +430,156 @@ async def test_link_query_entities_alias_fts_refreshes_after_remove_alias(db):
 
     result = await store.link_query_entities("pcc engine validation", scope=_scope(), limit=5)
     assert result.candidates == ()
+
+
+@pytest.mark.asyncio
+async def test_upsert_entity_rolls_back_after_cancellation(db, monkeypatch):
+    refresh_started = asyncio.Event()
+    original_refresh = db._refresh_entity_alias_search_unlocked
+
+    async def refresh_then_block(entity_id: int) -> None:
+        await original_refresh(entity_id)
+        refresh_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(db, "_refresh_entity_alias_search_unlocked", refresh_then_block)
+    upsert = asyncio.create_task(
+        db.upsert_entity("cancelled entity", "Cancelled Entity", ["product"])
+    )
+    await refresh_started.wait()
+    upsert.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await upsert
+
+    monkeypatch.setattr(db, "_refresh_entity_alias_search_unlocked", original_refresh)
+    assert await db.get_entity_by_canonical("cancelled entity") is None
+
+    entity_id = await db.upsert_entity("committed entity", "Committed Entity", ["product"])
+    assert await db.get_entity(entity_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_upsert_entity_rolls_back_after_fts_refresh_failure(db, monkeypatch):
+    original_refresh = db._refresh_entity_alias_search_unlocked
+
+    async def refresh_then_fail(entity_id: int) -> None:
+        await original_refresh(entity_id)
+        raise RuntimeError("entity alias search refresh failed")
+
+    monkeypatch.setattr(db, "_refresh_entity_alias_search_unlocked", refresh_then_fail)
+
+    with pytest.raises(RuntimeError, match="entity alias search refresh failed"):
+        await db.upsert_entity("failed entity", "Failed Entity", ["product"])
+
+    monkeypatch.setattr(db, "_refresh_entity_alias_search_unlocked", original_refresh)
+    assert await db.get_entity_by_canonical("failed entity") is None
+
+    entity_id = await db.upsert_entity("recovered entity", "Recovered Entity", ["product"])
+    assert await db.get_entity(entity_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_remove_entity_alias_rolls_back_after_cancellation(db, monkeypatch):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-alias-cancelled"))
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.insert_alias("PCC Engine", "pcc engine", entity_id, "admin_manual")
+    await db.link_memory_entity("m-alias-cancelled", entity_id)
+    refresh_started = asyncio.Event()
+    original_refresh = db._refresh_entity_alias_search_unlocked
+
+    async def refresh_then_block(refresh_entity_id: int) -> None:
+        await original_refresh(refresh_entity_id)
+        refresh_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(db, "_refresh_entity_alias_search_unlocked", refresh_then_block)
+    removal = asyncio.create_task(
+        db.remove_entity_alias(entity_id=entity_id, alias_normalized="pcc engine")
+    )
+    await refresh_started.wait()
+    removal.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await removal
+
+    monkeypatch.setattr(db, "_refresh_entity_alias_search_unlocked", original_refresh)
+    alias = await db.get_entity_by_alias("pcc engine")
+    assert alias is not None
+    assert alias.canonical_id == entity_id
+    assert (
+        await store.link_query_entities("pcc engine validation", scope=_scope(), limit=5)
+    ).candidates
+
+    assert await db.remove_entity_alias(
+        entity_id=entity_id,
+        alias_normalized="pcc engine",
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_entities_reads_source_and_target_inside_write_lock(db):
+    source_id = await db.upsert_entity("old payroll name", "Old Payroll Name", ["product"])
+    target_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+
+    await db._write_lock.acquire()
+    merge = asyncio.create_task(db.merge_entities(source_id=source_id, target_id=target_id))
+    try:
+        await asyncio.sleep(0)
+        assert not merge.done()
+        await db.db.execute(
+            "UPDATE entities SET canonical_name = ?, display_name = ? WHERE id = ?",
+            ("current payroll name", "Current Payroll Name", source_id),
+        )
+        await db.db.commit()
+    finally:
+        db._write_lock.release()
+
+    result = await merge
+
+    assert result["source_name"] == "current payroll name"
+    merged_alias = await db.get_entity_by_alias("current payroll name")
+    assert merged_alias is not None
+    assert merged_alias.canonical_id == target_id
+
+
+@pytest.mark.asyncio
+async def test_merge_entities_rolls_back_partial_work_after_cancellation(db, monkeypatch):
+    await db.insert_memory(_memory("m-merge-cancelled"))
+    source_id = await db.upsert_entity("old payroll name", "Old Payroll Name", ["product"])
+    target_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    await db.link_memory_entity("m-merge-cancelled", source_id)
+    await db.insert_alias("Old Payroll Alias", "old payroll alias", source_id, "admin_manual")
+    refresh_started = asyncio.Event()
+
+    async def block_refresh(_entity_id: int) -> None:
+        refresh_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(db, "_refresh_entity_alias_search_unlocked", block_refresh)
+    merge = asyncio.create_task(db.merge_entities(source_id=source_id, target_id=target_id))
+    await refresh_started.wait()
+    merge.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await merge
+
+    assert await db.get_entity(source_id) is not None
+    assert await db.get_memory_entity_ids("m-merge-cancelled") == [source_id]
+    alias = await db.get_entity_by_alias("old payroll alias")
+    assert alias is not None
+    assert alias.canonical_id == source_id
+
+
+@pytest.mark.asyncio
+async def test_merge_entities_rejects_self_merge_without_mutation(db):
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+
+    with pytest.raises(ValueError, match="Source and target entities must differ"):
+        await db.merge_entities(source_id=entity_id, target_id=entity_id)
+
+    assert await db.get_entity(entity_id) is not None
 
 
 @pytest.mark.asyncio

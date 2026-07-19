@@ -3420,6 +3420,11 @@ def create_admin_app(
         All memory_entities rows, aliases, and document references pointing to
         source_id are moved to target_id. The source entity is then deleted.
         """
+        if req.source_id == req.target_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Source and target entities must differ",
+            )
         try:
             merged = await db.merge_entities(
                 source_id=req.source_id,

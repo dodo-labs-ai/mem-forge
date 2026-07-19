@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -129,6 +130,63 @@ async def _relation_runs_for_memory(db: Database, memory_id: str) -> list[dict]:
         async for row in cursor:
             rows.append(dict(row))
     return rows
+
+
+@pytest.mark.asyncio
+async def test_upsert_agent_concept_rolls_back_after_cancellation(bundle_stack, monkeypatch):
+    db, _store, _collection = bundle_stack
+    observed_at = datetime(2026, 7, 19, tzinfo=timezone.utc)
+    concept = {
+        "concept_id": "concept-cancelled-upsert",
+        "source_id": "src-agent-sessions-codex",
+        "owner_user_id": "u-andrew",
+        "workspace": "/workspace/memforge-cloud",
+        "repo_identifier": "github.tools.sap/hcm/memforge-cloud",
+        "concept_type": "decision",
+        "concept_path": "decisions/cancellation.md",
+        "frontmatter": {},
+        "observed_at": observed_at,
+    }
+    await db.upsert_agent_concept(
+        **concept,
+        title="Original title",
+        markdown_body="Original body",
+    )
+    original_commit = db.db.commit
+    commit_started = asyncio.Event()
+
+    async def block_commit() -> None:
+        commit_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(db.db, "commit", block_commit)
+    update = asyncio.create_task(
+        db.upsert_agent_concept(
+            **concept,
+            title="Cancelled title",
+            markdown_body="Cancelled body",
+        )
+    )
+    await commit_started.wait()
+    update.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await update
+
+    monkeypatch.setattr(db.db, "commit", original_commit)
+    stored = await db.get_agent_concept(concept["concept_id"])
+    assert stored is not None
+    assert stored["title"] == "Original title"
+    assert stored["markdown_body"] == "Original body"
+
+    await db.upsert_agent_concept(
+        **concept,
+        title="Committed title",
+        markdown_body="Committed body",
+    )
+    committed = await db.get_agent_concept(concept["concept_id"])
+    assert committed is not None
+    assert committed["title"] == "Committed title"
 
 
 @pytest.mark.asyncio
