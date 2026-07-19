@@ -1815,8 +1815,14 @@ async def test_source_rebaseline_preserves_failed_vector_cleanup_for_retry(db: D
 @pytest.mark.asyncio
 async def test_memory_store_rebaseline_drains_only_its_source_vector_tasks() -> None:
     class _Relational:
-        async def rebaseline_source_lifecycle(self, source_id: str) -> SourceLifecycleResetResult:
+        async def rebaseline_source_lifecycle(
+            self,
+            source_id: str,
+            *,
+            source_activity=None,
+        ) -> SourceLifecycleResetResult:
             assert source_id == "src-1"
+            assert source_activity is None
             return SourceLifecycleResetResult(
                 retired_memory_ids=("mem-1",),
                 retired_search_cleanup_required=True,

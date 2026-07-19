@@ -713,7 +713,13 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path, m
             assert workspace_id == "default"
             return None
 
-        async def enable_lifecycle_gate(self, source_id: str) -> LifecycleGate:
+        async def enable_lifecycle_gate(
+            self,
+            source_id: str,
+            *,
+            source_activity=None,
+        ) -> LifecycleGate:
+            assert source_activity is None
             self.gate = LifecycleGate(source_id=source_id, state=LifecycleGateState.ENABLED)
             return self.gate
 
@@ -884,8 +890,13 @@ def test_server_source_rebaseline_preflight_failure_never_resets_lifecycle(
         def __init__(self) -> None:
             self.reset_calls = 0
 
-        async def rebaseline_source_lifecycle(self, source_id: str):
-            del source_id
+        async def rebaseline_source_lifecycle(
+            self,
+            source_id: str,
+            *,
+            source_activity=None,
+        ):
+            del source_id, source_activity
             self.reset_calls += 1
 
     database = Database(str(tmp_path / "server-preflight-failure.db"))
@@ -939,13 +950,31 @@ def test_server_source_rebaseline_preflight_failure_never_resets_lifecycle(
 
 
 def test_source_rebaseline_uses_post_fence_source_snapshot(tmp_path, monkeypatch):
+    events: list[str] = []
+
     class CapturingProvider(DefaultRuntimeProvider):
         def __init__(self) -> None:
             self.sources: list[dict] = []
 
         async def run_source_sync(self, **kwargs):
+            events.append("sync")
             self.sources.append(kwargs["source"])
             return SimpleNamespace(last_sync_status="success", error_message=None)
+
+    class ResetGuard:
+        def __init__(self) -> None:
+            self.source_activity = None
+
+        async def rebaseline_source_lifecycle(
+            self,
+            source_id: str,
+            *,
+            source_activity=None,
+        ):
+            assert source_id == "src-confluence"
+            events.append("reset")
+            self.source_activity = source_activity
+            return []
 
     database = Database(str(tmp_path / "post-fence-source.db"))
 
@@ -978,6 +1007,23 @@ def test_source_rebaseline_uses_post_fence_source_snapshot(tmp_path, monkeypatch
 
     monkeypatch.setattr(database, "get_source", stale_then_current)
     provider = CapturingProvider()
+    reset_guard = ResetGuard()
+
+    async def build_reset_guard(*args, **kwargs):
+        del args, kwargs
+        return reset_guard
+
+    monkeypatch.setattr(
+        "memforge.server.admin_api._build_memory_store",
+        build_reset_guard,
+    )
+    original_renew = database.renew_source_activity
+
+    async def capturing_renew(**kwargs):
+        events.append("renew")
+        return await original_renew(**kwargs)
+
+    monkeypatch.setattr(database, "renew_source_activity", capturing_renew)
     app = create_admin_app(
         db=database,
         config=_config(tmp_path),
@@ -997,6 +1043,10 @@ def test_source_rebaseline_uses_post_fence_source_snapshot(tmp_path, monkeypatch
             source["config"]["base_url"] == "https://current.example"
             for source in provider.sources
         )
+        assert reset_guard.source_activity.epoch == asyncio.run(
+            database.get_source_activity_epoch("src-confluence")
+        )
+        assert events[:4] == ["sync", "renew", "reset", "sync"]
     finally:
         asyncio.run(database.close())
 
@@ -2017,6 +2067,7 @@ def test_source_lifecycle_finding_repair_returns_exact_lineage_and_gate_state(
         observation_id: str,
         evidence_quote: str | None,
         operator_id: str | None,
+        lifecycle_job_id: str | None,
     ):
         assert isinstance(db, FakeRepairStore)
         assert (source_id, finding_id, observation_id) == (
@@ -2026,6 +2077,7 @@ def test_source_lifecycle_finding_repair_returns_exact_lineage_and_gate_state(
         )
         assert evidence_quote == "exact source quote"
         assert operator_id == "user-a"
+        assert lifecycle_job_id
         return LifecycleCutoverFinding(
             id=finding_id,
             source_id=source_id,
@@ -2038,9 +2090,10 @@ def test_source_lifecycle_finding_repair_returns_exact_lineage_and_gate_state(
             source_unit_id="unit-1",
         )
 
-    async def fake_backfill(db, source_id: str):
+    async def fake_backfill(db, source_id: str, *, lifecycle_job_id: str | None):
         assert isinstance(db, FakeRepairStore)
         assert source_id == "src-neutral"
+        assert lifecycle_job_id
         return SimpleNamespace(
             gate_enabled=True,
             finding_count=0,

@@ -4039,6 +4039,7 @@ def create_admin_app(
                         source_id=source_id,
                         source_type=str(source["type"]),
                         document_id=document_id,
+                        lifecycle_job_id=job_id,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -4200,8 +4201,16 @@ def create_admin_app(
                     f"{preflight.last_sync_status}: "
                     f"{preflight.error_message or 'unknown error'}"
                 )
+            activity = await db.renew_source_activity(
+                activity_id=job_id,
+                capability=job_id,
+                lease_seconds=900,
+            )
             memory_store = await _build_memory_store(db, config, runtime_provider)
-            await memory_store.rebaseline_source_lifecycle(source_id)
+            await memory_store.rebaseline_source_lifecycle(
+                source_id,
+                source_activity=activity,
+            )
             state = await runtime_provider.run_source_sync(
                 db=db,
                 config=config,
@@ -4216,7 +4225,11 @@ def create_admin_app(
                     "source rebaseline replay failed: "
                     f"{state.last_sync_status}: {state.error_message or 'unknown error'}"
                 )
-            audit = await run_source_lifecycle_backfill(db, source_id)
+            audit = await run_source_lifecycle_backfill(
+                db,
+                source_id,
+                lifecycle_job_id=job_id,
+            )
             if not audit.gate_enabled or audit.finding_count:
                 raise RuntimeError(f"source rebaseline audit left {audit.finding_count} open finding(s)")
             await db.complete_lifecycle_backfill_job(
@@ -4383,8 +4396,13 @@ def create_admin_app(
                 observation_id=body.observation_id,
                 evidence_quote=body.evidence_quote,
                 operator_id=resolve_request_principal(request),
+                lifecycle_job_id=job.id,
             )
-            backfill_result = await run_source_lifecycle_backfill(db, source_id)
+            backfill_result = await run_source_lifecycle_backfill(
+                db,
+                source_id,
+                lifecycle_job_id=job.id,
+            )
             await db.complete_lifecycle_backfill_job(
                 job.id,
                 scanned_memories=backfill_result.scanned_memories,
