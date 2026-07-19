@@ -53,10 +53,13 @@ from memforge.models import (
     ContentItem,
     DocumentRecord,
     Memory,
+    MemoryReview,
     NormalizedContent,
     RawContent,
     ReconcileAction,
     ReconcileOperation,
+    ReviewKind,
+    ReviewStatus,
     content_hash,
 )
 from memforge.pipeline.source_projection_adapters import project_source_item
@@ -582,9 +585,30 @@ async def test_resolved_finding_retry_preserves_history_and_enabled_gate(
     assert resolved.created_at == (await db.get_lifecycle_cutover_finding(finding.id)).created_at
     assert gate.state is LifecycleGateState.ENABLED
     assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
-    assert (
-        await db.get_lifecycle_cutover_finding(finding.id)
-    ).status is CutoverFindingStatus.RESOLVED
+    assert (await db.get_lifecycle_cutover_finding(finding.id)).status is CutoverFindingStatus.RESOLVED
+
+
+@pytest.mark.asyncio
+async def test_finding_upsert_rejects_identity_or_status_change(db: Database) -> None:
+    finding = _finding()
+    await db.upsert_lifecycle_cutover_finding(finding)
+
+    await db.upsert_lifecycle_cutover_finding(replace(finding, reason=CutoverFindingReason.AMBIGUOUS_OBSERVATION))
+    evolved = await db.get_lifecycle_cutover_finding(finding.id)
+    assert evolved is not None
+    assert evolved.reason is CutoverFindingReason.AMBIGUOUS_OBSERVATION
+    assert evolved.status is CutoverFindingStatus.OPEN
+
+    with pytest.raises(ValueError, match="finding identity"):
+        await db.upsert_lifecycle_cutover_finding(replace(finding, memory_id="mem-different"))
+    with pytest.raises(ValueError, match="open findings"):
+        await db.upsert_lifecycle_cutover_finding(
+            replace(
+                finding,
+                id="finding-resolved-insert",
+                status=CutoverFindingStatus.RESOLVED,
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -746,6 +770,38 @@ async def test_lifecycle_plan_applies_support_removal_and_retirement_atomically(
 
 
 @pytest.mark.asyncio
+async def test_terminal_lifecycle_mutation_stales_pending_memory_reviews(
+    db: Database,
+) -> None:
+    challenger = Memory(
+        id="mem-review-challenger",
+        memory_type="fact",
+        content="Independent challenger",
+        content_hash=content_hash("Independent challenger"),
+    )
+    await db.insert_memory(challenger)
+    await db.insert_memory_review(
+        MemoryReview(
+            id="review-terminal-incumbent",
+            kind=ReviewKind.CROSS_SOURCE_CONFLICT.value,
+            status=ReviewStatus.PENDING.value,
+            incumbent_memory_id="mem-legacy",
+            challenger_memory_id=challenger.id,
+        )
+    )
+    reference = await _persist_support_lineage(db)
+    await db.enable_lifecycle_gate("src-1")
+    plan = _retirement_plan(reference, await db.get_memory_support_set_hash("mem-legacy"))
+
+    await db.apply_lifecycle_plan(plan)
+
+    review = await db.get_memory_review("review-terminal-incumbent")
+    assert review is not None
+    assert review.status == ReviewStatus.STALE.value
+    assert review.resolved_at is not None
+
+
+@pytest.mark.asyncio
 async def test_gated_review_approval_applies_proposal_and_resolves_review_atomically(
     db: Database,
 ) -> None:
@@ -806,9 +862,7 @@ async def test_gated_review_approval_applies_proposal_and_resolves_review_atomic
     assert approved is not None and approved.status is LifecycleReviewStatus.APPROVED
     assert retired is not None and retired.status == "retired"
     tasks = await db.list_lifecycle_vector_tasks(source_id="src-1")
-    assert {(task.memory_id, task.operation.value) for task in tasks} == {
-        (incumbent.id, "delete")
-    }
+    assert {(task.memory_id, task.operation.value) for task in tasks} == {(incumbent.id, "delete")}
 
 
 @pytest.mark.asyncio
@@ -1202,9 +1256,7 @@ async def test_backfill_trusts_existing_active_support_only_at_current_revision(
     assert result.finding_count == expected_findings
     assert result.gate_enabled is (expected_findings == 0)
     if expected_findings == 0:
-        assert database.resolved == [
-            (database.finding_id, "obs-supported", "unit-supported")
-        ]
+        assert database.resolved == [(database.finding_id, "obs-supported", "unit-supported")]
         assert database.enabled == ["src-1"]
         assert database.upserted == []
         assert database.gated == []
@@ -1565,19 +1617,19 @@ async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: D
         item=item,
         body=json.dumps(
             {
-                    "messages": [
-                        {
-                            "id": "message-1",
-                            "content": "Repeated quote",
-                            "attachments": [],
-                            "time": "2026-07-15T10:00:00Z",
-                        },
-                        {
-                            "id": "message-2",
-                            "content": "Repeated quote",
-                            "attachments": [],
-                            "time": "2026-07-15T10:01:00Z",
-                        },
+                "messages": [
+                    {
+                        "id": "message-1",
+                        "content": "Repeated quote",
+                        "attachments": [],
+                        "time": "2026-07-15T10:00:00Z",
+                    },
+                    {
+                        "id": "message-2",
+                        "content": "Repeated quote",
+                        "attachments": [],
+                        "time": "2026-07-15T10:01:00Z",
+                    },
                 ]
             }
         ).encode(),
@@ -2123,9 +2175,7 @@ async def test_support_write_rejects_recovered_maintenance_fence(
             source_activity=activity,
         )
 
-    assert reference_id not in await db.get_active_memory_support_reference_ids(
-        "mem-legacy"
-    )
+    assert reference_id not in await db.get_active_memory_support_reference_ids("mem-legacy")
 
 
 @pytest.mark.asyncio
@@ -2215,9 +2265,7 @@ async def test_finding_resolution_rejects_recovered_maintenance_fence(
             source_activity=activity,
         )
 
-    assert (await db.get_lifecycle_cutover_finding(finding.id)).status is (
-        CutoverFindingStatus.OPEN
-    )
+    assert (await db.get_lifecycle_cutover_finding(finding.id)).status is (CutoverFindingStatus.OPEN)
 
 
 @pytest.mark.asyncio
@@ -2316,8 +2364,7 @@ async def test_recover_stale_lifecycle_jobs_isolates_one_invalid_job(
     await db.start_lifecycle_backfill_job(invalid.id)
     await db.start_lifecycle_backfill_job(recoverable.id)
     await db.db.execute(
-        "UPDATE source_activity_leases "
-        "SET capability = ?, lease_until = ? WHERE id = ?",
+        "UPDATE source_activity_leases SET capability = ?, lease_until = ? WHERE id = ?",
         ("invalid-capability", "2000-01-01T00:00:00+00:00", invalid.id),
     )
     await db.db.execute(
@@ -2329,12 +2376,8 @@ async def test_recover_stale_lifecycle_jobs_isolates_one_invalid_job(
     recovered = await recover_stale_lifecycle_jobs(db)
 
     assert tuple(job.id for job in recovered) == (recoverable.id,)
-    assert (await db.get_lifecycle_backfill_job(invalid.id)).status is (
-        LifecycleBackfillJobStatus.RUNNING
-    )
-    assert (await db.get_lifecycle_backfill_job(recoverable.id)).status is (
-        LifecycleBackfillJobStatus.FAILED
-    )
+    assert (await db.get_lifecycle_backfill_job(invalid.id)).status is (LifecycleBackfillJobStatus.RUNNING)
+    assert (await db.get_lifecycle_backfill_job(recoverable.id)).status is (LifecycleBackfillJobStatus.FAILED)
 
 
 @pytest.mark.asyncio
