@@ -551,7 +551,13 @@ class TestHardPurge:
             (memory.id, dependent.id, "contradiction", "test"),
         )
         await db.db.execute(
-            "UPDATE memories SET superseded_by = ? WHERE id = ?",
+            """UPDATE memories SET
+                status = 'superseded',
+                superseded_by = ?,
+                superseded_at = '2026-07-19T00:00:00+00:00',
+                replacement_reason = 'explicit replacement',
+                replacement_kind = 'supersession'
+               WHERE id = ?""",
             (memory.id, dependent.id),
         )
         await db.db.commit()
@@ -574,4 +580,7 @@ class TestHardPurge:
         stored_dependent = await db.get_memory(dependent.id)
         assert stored_dependent.status == "retired"
         assert stored_dependent.superseded_by is None
+        assert stored_dependent.superseded_at is None
+        assert stored_dependent.replacement_reason is None
+        assert stored_dependent.replacement_kind is None
         assert stored_dependent.retirement_reason == "privacy_removed"
