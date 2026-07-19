@@ -11,25 +11,16 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
-from datetime import date, datetime, timezone
-from hashlib import sha256
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from memforge.memory.entity_resolver import EntityResolver, insert_llm_alias, resolve_entity
-from memforge.memory.evidence import (
-    AuthorityCase,
-    EvidenceContentProvenance,
-    EvidenceRole,
-    EvidenceRelationRecord,
-    EvidenceUnit,
-    LifecycleAction,
-    MemoryRelationApplyService,
-    RelationCandidateRecord,
-    RelationOutcomeBundle,
-    RelationRunRecord,
-    RelationType,
-    relation_run_id_for,
+from memforge.memory.candidate_ledger import (
+    CandidateLedgerError,
+    CandidateLedgerResult,
+    select_unique_memory_candidates,
 )
+from memforge.memory.entity_resolver import EntityResolver, insert_llm_alias, resolve_entity
+from memforge.memory.evidence import EvidenceRole
 from memforge.memory.lifecycle_plan import ReconciliationScope
 from memforge.memory.lifecycle_planner import (
     NewMemoryDefaults,
@@ -47,6 +38,7 @@ from memforge.models import (
     ReconcileOperation,
     content_hash,
     generate_memory_id,
+    parse_memory_validity_date,
 )
 
 from memforge.storage.adapters.protocols import RelationalStore, VectorStore
@@ -75,6 +67,9 @@ MEMORY_SUPPORT_VALIDATION_PROMPT = """Determine whether the current evidence sti
 Return supported=true only when the claim's truth conditions remain entailed by the current
 Primary and every current Required observation. A change in scope, subject, condition,
 polarity, or applicability means supported=false.
+When supported=true and the previous Primary quote is no longer present verbatim, return
+evidence_quote as one exact, non-empty substring copied from the current Primary observation
+that directly supports the claim. Never paraphrase evidence_quote.
 
 <case_json>
 {case_json}
@@ -185,167 +180,6 @@ class MemoryEngine:
         self.entity_resolver.invalidate_cache()
         return resolved_ids
 
-    # -------------------------------------------------------------------
-    # Process Call 2: Build memories, dedup, insert
-    # -------------------------------------------------------------------
-
-    async def process_memories(
-        self,
-        doc_id: str,
-        raw_memories: list[RawMemory],
-        source_type: str,
-        project_key: str | None = None,
-        repo_identifier: str | None = None,
-        entity_ids: list[int] | None = None,
-        *,
-        audit_context: Any | None = None,
-        user_id: str | None = None,
-        source_updated_at: datetime | None,
-    ) -> dict:
-        """Process extracted memories: build, dedup, and persist.
-
-        Returns stats dict with counts of inserted, corroborated, skipped.
-        """
-        stats = {"inserted": 0, "corroborated": 0, "skipped": 0}
-
-        for raw in raw_memories:
-            if not self._candidate_can_persist(raw, stats):
-                continue
-
-            unit = await self._document_evidence_unit(
-                doc_id=doc_id,
-                raw=raw,
-                source_type=source_type,
-                project_key=project_key,
-                repo_identifier=repo_identifier,
-                extractor_run_id=getattr(audit_context, "run_id", None),
-            )
-            if await self._evidence_unit_has_materialized_memory(unit):
-                stats["skipped"] += 1
-                continue
-            lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [])
-            if lifecycle.action is not LifecycleAction.CREATE_MEMORY or not lifecycle.created_memory_id:
-                await self._record_document_relation_outcome(
-                    unit=unit,
-                    relation_run_id=_document_relation_run_id(
-                        unit,
-                        LifecycleAction.CREATE_REVIEW,
-                        relation_type=RelationType.SUPPORTS,
-                    ),
-                    lifecycle_action=lifecycle.action,
-                    memory_id=None,
-                    status="review",
-                    review_case=lifecycle.review_case,
-                    audit={
-                        "source": "memory_engine.process_memories",
-                        "review_case": lifecycle.review_case.value if lifecycle.review_case else None,
-                    },
-                )
-                stats["skipped"] += 1
-                continue
-
-            # Build memory object
-            memory = Memory(
-                id=lifecycle.created_memory_id,
-                memory_type=raw.memory_type,
-                content=raw.content.strip(),
-                content_hash=content_hash(raw.content.strip()),
-                visibility=unit.visibility,
-                owner_user_id=unit.owner_user_id,
-                project_key=project_key,
-                repo_identifier=repo_identifier,
-                entity_refs=raw.entity_refs,
-                tags=raw.tags,
-                confidence=raw.confidence,
-                corroboration_count=1,
-                contradiction_count=0,
-                valid_from=_parse_date(raw.valid_from),
-                valid_until=_parse_date(raw.valid_until),
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-                status="active",
-                extraction_context=raw.extraction_context,
-            )
-
-            # Resolve entity refs to IDs for linking
-            # Filter first — Call 2's LLM sometimes outputs code names as entity_refs
-            from memforge.pipeline.entity_filter import filter_entities
-
-            ref_dicts = [{"name": name, "type": "unknown"} for name in raw.entity_refs]
-            filtered_refs, _ = filter_entities(ref_dicts)
-            filtered_ref_names = {d["name"] for d in filtered_refs}
-
-            memory_entity_ids: list[int] = []
-            for entity_name in raw.entity_refs:
-                if entity_name not in filtered_ref_names:
-                    continue
-                try:
-                    eid = await resolve_entity(entity_name, db=self.db)
-                    memory_entity_ids.append(eid)
-                except Exception as e:
-                    logger.warning("Failed to resolve entity %r: %s", entity_name, e)
-
-            # Dedup + insert (or corroborate)
-            result = await self.memory_store.deduplicate_and_insert(
-                memory=memory,
-                doc_id=doc_id,
-                source_type=source_type,
-                entity_ids=memory_entity_ids,
-                excerpt=raw.extraction_context,
-                source_updated_at=source_updated_at,
-                relation_outcome=self._document_relation_outcome_bundle(
-                    unit=unit,
-                    relation_run_id=_document_relation_run_id(
-                        unit,
-                        LifecycleAction.CREATE_MEMORY,
-                        relation_type=RelationType.SUPPORTS,
-                    ),
-                    lifecycle_action=lifecycle.action,
-                    memory_id=memory.id,
-                    status="applied",
-                    review_case=lifecycle.review_case,
-                    audit={"source": "memory_engine.process_memories"},
-                ),
-            )
-
-            if result == "inserted":
-                stats["inserted"] += 1
-                stats.setdefault("_inserted_ids", []).append(memory.id)
-            elif result == "corroborated":
-                stats["corroborated"] += 1
-            else:
-                stats["skipped"] += 1
-
-        # Cross-document contradiction detection
-        inserted_ids = stats.pop("_inserted_ids", [])
-        if inserted_ids and self.structured_llm_client:
-            from memforge.pipeline.contradiction_detector import detect_cross_doc_contradictions
-
-            contradiction_stats = await detect_cross_doc_contradictions(
-                new_memory_ids=inserted_ids,
-                doc_id=doc_id,
-                db=self.db,
-                memory_store=self.memory_store,
-                structured_llm_client=self.structured_llm_client,
-                llm_model=self.llm_model,
-                audit_context=audit_context,
-                actor_user_id=user_id,
-            )
-            stats["contradictions_found"] = contradiction_stats.get("contradictions", 0)
-
-        logger.info(
-            "Memory processing for %s: %d inserted, %d corroborated, %d skipped",
-            doc_id,
-            stats["inserted"],
-            stats["corroborated"],
-            stats["skipped"],
-        )
-        return stats
-
-    # -------------------------------------------------------------------
-    # Process with reconciliation (for document UPDATES)
-    # -------------------------------------------------------------------
-
     async def _active_projected_incumbents(
         self,
         *,
@@ -433,6 +267,7 @@ class MemoryEngine:
         *,
         operations: tuple[ReconcileOperation, ...],
         incumbents: dict[str, Memory],
+        unit_support: Mapping[str, tuple[str, ...]],
         projection: SourceProjection,
     ) -> tuple[ReconcileOperation, ...]:
         """Carry an exact, still-present claim forward without re-extracting it.
@@ -457,9 +292,17 @@ class MemoryEngine:
             ):
                 rebound.append(operation)
                 continue
-            support = await self.db.get_active_memory_support_evidence(
+            source_support = await self.db.get_active_memory_support_evidence(
                 operation.memory_id,
                 source_id=projection.source_id,
+            )
+            scoped_reference_ids = frozenset(
+                unit_support.get(operation.memory_id, ())
+            )
+            support = tuple(
+                item
+                for item in source_support
+                if item.reference_id in scoped_reference_ids
             )
             stale = [
                 item
@@ -492,18 +335,14 @@ class MemoryEngine:
                     f"{operation.memory_id}"
                 )
             selected = primary[0]
-            if (
+            primary_needs_validation = (
                 selected in stale
                 and (
                     not selected.excerpt
                     or selected.excerpt
                     not in current_revisions[selected.anchor.observation_id].content
                 )
-            ):
-                raise RuntimeError(
-                    "NOOP incumbent lacks exact current-revision PRIMARY evidence: "
-                    f"{operation.memory_id}"
-                )
+            )
             required_observation_ids = sorted(
                 {
                     item.anchor.observation_id
@@ -516,7 +355,8 @@ class MemoryEngine:
                 item for item in stale if item.role is EvidenceRole.REQUIRED
             ]
             support_validation: dict[str, object] = {}
-            if stale_required:
+            current_primary_quote = selected.excerpt or ""
+            if primary_needs_validation or stale_required:
                 validator = getattr(
                     self.structured_llm_client,
                     "validate_memory_support",
@@ -524,7 +364,15 @@ class MemoryEngine:
                 )
                 if validator is None:
                     raise RuntimeError(
-                        "revised REQUIRED evidence needs structured semantic validation: "
+                        "revised evidence needs structured semantic validation: "
+                        f"{operation.memory_id}"
+                    )
+                current_primary = current_revisions.get(
+                    selected.anchor.observation_id
+                )
+                if current_primary is None:
+                    raise RuntimeError(
+                        "NOOP incumbent current PRIMARY observation is unavailable: "
                         f"{operation.memory_id}"
                     )
                 validation = await validator(
@@ -532,9 +380,8 @@ class MemoryEngine:
                         case_json=json.dumps(
                             {
                                 "memory_claim": incumbent.content,
-                                "primary": current_revisions[
-                                    selected.anchor.observation_id
-                                ].content,
+                                "previous_primary_quote": selected.excerpt,
+                                "primary": current_primary.content,
                                 "required": [
                                     current_revisions[item.anchor.observation_id].content
                                     for item in stale_required
@@ -552,6 +399,7 @@ class MemoryEngine:
                     "model": self.llm_model,
                     "supported": bool(validation.supported),
                     "reason": validation.reason,
+                    "primary_observation_id": selected.anchor.observation_id,
                     "required_observation_ids": sorted(
                         item.anchor.observation_id for item in stale_required
                     ),
@@ -569,6 +417,19 @@ class MemoryEngine:
                         )
                     )
                     continue
+                if primary_needs_validation:
+                    current_primary_quote = str(
+                        getattr(validation, "evidence_quote", "") or ""
+                    ).strip()
+                    if (
+                        not current_primary_quote
+                        or current_primary_quote not in current_primary.content
+                    ):
+                        raise RuntimeError(
+                            "NOOP incumbent support validation lacks exact current "
+                            "PRIMARY evidence: "
+                            f"{operation.memory_id}"
+                        )
             rebound.append(
                 ReconcileOperation(
                     action=operation.action,
@@ -578,8 +439,8 @@ class MemoryEngine:
                         memory_type=incumbent.memory_type,
                         confidence=incumbent.confidence,
                         tags=list(incumbent.tags),
-                        extraction_context=selected.excerpt,
-                        evidence_quote=selected.excerpt,
+                        extraction_context=current_primary_quote,
+                        evidence_quote=current_primary_quote,
                         evidence_anchor="revalidated_noop",
                         source_observation_id=selected.anchor.observation_id,
                         required_source_observation_ids=required_observation_ids,
@@ -646,6 +507,49 @@ class MemoryEngine:
             "incumbent_content_hash": incumbent.content_hash,
         }
 
+    async def _find_canonical_equivalence_target(
+        self,
+        candidate: Memory,
+        *,
+        excluded_memory_ids: frozenset[str],
+        source_id: str,
+    ) -> tuple[Memory | None, dict[str, object] | None]:
+        """Resolve exact identity first, then bounded cross-source semantics."""
+
+        target = await self.memory_store.find_access_compatible_exact_candidate(
+            candidate,
+            excluded_memory_ids=excluded_memory_ids,
+        )
+        if target is not None:
+            proof = await self._claims_semantically_equivalent(candidate, target)
+            if proof is not None:
+                return target, proof
+
+        targets = await self.memory_store.find_access_compatible_equivalence_candidates(
+            candidate,
+            excluded_memory_ids=excluded_memory_ids,
+            excluded_source_id=source_id,
+        )
+        candidate_access = lifecycle_access_context_hash(
+            visibility=candidate.visibility,
+            owner_user_id=candidate.owner_user_id,
+            project_key=candidate.project_key,
+            repo_identifier=candidate.repo_identifier,
+        )
+        for target in targets:
+            target_access = lifecycle_access_context_hash(
+                visibility=target.visibility,
+                owner_user_id=target.owner_user_id,
+                project_key=target.project_key,
+                repo_identifier=target.repo_identifier,
+            )
+            if target_access != candidate_access:
+                continue
+            proof = await self._claims_semantically_equivalent(candidate, target)
+            if proof is not None:
+                return target, proof
+        return None, None
+
     async def apply_projected_lifecycle(
         self,
         *,
@@ -662,6 +566,7 @@ class MemoryEngine:
         update_plan_stats: dict[str, Any] | None,
         source_updated_at: datetime | None,
         user_id: str | None = None,
+        expected_source_activity_epoch: int | None = None,
     ) -> dict[str, int]:
         """Reconcile a complete Source Unit ledger and atomically apply one plan."""
 
@@ -685,6 +590,7 @@ class MemoryEngine:
 
         stats = {
             "added": 0,
+            "reactivated": 0,
             "corroborated": 0,
             "updated": 0,
             "superseded": 0,
@@ -692,11 +598,26 @@ class MemoryEngine:
             "noop": 0,
             "pending_review": 0,
             "skipped": 0,
+            "vector_delivery_pending": 0,
         }
         filtered_memories: list[RawMemory] = []
         for raw in raw_memories:
-            if self._candidate_can_persist(raw, stats):
+            if self._candidate_can_persist(
+                raw,
+                stats,
+                observation_semantic_class=_observation_semantic_class(
+                    projection,
+                    raw.source_observation_id,
+                ),
+            ):
                 filtered_memories.append(raw)
+        quality_candidate_count = len(filtered_memories)
+        filtered_memories = await self._select_projected_candidates(
+            projection=projection,
+            doc_id=doc_id,
+            candidates=filtered_memories,
+        )
+        stats["skipped"] += quality_candidate_count - len(filtered_memories)
 
         incumbents, unit_support = await self._active_projected_incumbents(
             doc_id=doc_id,
@@ -761,6 +682,7 @@ class MemoryEngine:
         operations = await self._rebind_noop_evidence_to_current_revision(
             operations=operations,
             incumbents=incumbents_by_id,
+            unit_support=unit_support,
             projection=projection,
         )
         gate = await self.db.get_lifecycle_gate(scope.source_id)
@@ -783,57 +705,30 @@ class MemoryEngine:
         )
         corroboration_targets: dict[str, Memory] = {}
         corroboration_proofs: dict[str, dict[str, object]] = {}
-        candidate_finder = getattr(
-            self.memory_store,
-            "find_access_compatible_equivalence_candidates",
-            None,
-        )
-        if candidate_finder is not None:
-            for operation in operations:
-                if operation.action is not ReconcileAction.ADD or operation.memory is None:
-                    continue
-                candidate = self._build_memory(
-                    operation.memory,
-                    project_key,
-                    visibility=visibility,
-                    owner_user_id=owner_user_id,
-                    repo_identifier=repo_identifier,
-                )
-                targets = await candidate_finder(
-                    candidate,
-                    excluded_memory_ids=frozenset(incumbents_by_id),
-                    excluded_source_id=scope.source_id,
-                )
-                target = None
-                for possible_target in targets:
-                    if lifecycle_access_context_hash(
-                        visibility=possible_target.visibility,
-                        owner_user_id=possible_target.owner_user_id,
-                        project_key=possible_target.project_key,
-                        repo_identifier=possible_target.repo_identifier,
-                    ) != lifecycle_access_context_hash(
-                        visibility=candidate.visibility,
-                        owner_user_id=candidate.owner_user_id,
-                        project_key=candidate.project_key,
-                        repo_identifier=candidate.repo_identifier,
-                    ):
-                        continue
-                    equivalence_proof = await self._claims_semantically_equivalent(
-                        candidate,
-                        possible_target,
-                    )
-                    if equivalence_proof is not None:
-                        target = possible_target
-                        break
-                if target is None:
-                    continue
-                claim_hash = content_hash(operation.memory.content.strip())
-                corroboration_targets[claim_hash] = target
-                corroboration_proofs[claim_hash] = equivalence_proof
-                all_support[target.id] = await self.db.get_active_memory_support_reference_ids(
-                    target.id
-                )
-                support_hashes[target.id] = await self.db.get_memory_support_set_hash(target.id)
+        for operation in operations:
+            if operation.action is not ReconcileAction.ADD or operation.memory is None:
+                continue
+            candidate = self._build_memory(
+                operation.memory,
+                project_key,
+                visibility=visibility,
+                owner_user_id=owner_user_id,
+                repo_identifier=repo_identifier,
+            )
+            target, equivalence_proof = await self._find_canonical_equivalence_target(
+                candidate,
+                excluded_memory_ids=frozenset(incumbents_by_id),
+                source_id=scope.source_id,
+            )
+            if target is None or equivalence_proof is None:
+                continue
+            claim_hash = content_hash(operation.memory.content.strip())
+            corroboration_targets[claim_hash] = target
+            corroboration_proofs[claim_hash] = equivalence_proof
+            all_support[target.id] = await self.db.get_active_memory_support_reference_ids(
+                target.id
+            )
+            support_hashes[target.id] = await self.db.get_memory_support_set_hash(target.id)
         evidence_memories = [
             operation.memory
             for operation in operations
@@ -887,19 +782,24 @@ class MemoryEngine:
             evidence_units=projected_evidence.units,
             evidence_references=projected_evidence.references,
         )
-        await self.db.apply_source_projection_lifecycle(projection, plan)
-        await self.memory_store.drain_lifecycle_vector_outbox(plan.id)
+        await self.db.apply_source_projection_lifecycle(
+            projection,
+            plan,
+            expected_source_activity_epoch=expected_source_activity_epoch,
+        )
+        delivery = await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)
+        stats["vector_delivery_pending"] = int(delivery.pending)
 
-        created_memory_ids = [
+        activated_memory_ids = [
             mutation.memory_id
             for mutation in plan.mutations
-            if mutation.mutation_type.value == "create_memory"
+            if mutation.mutation_type.value in {"create_memory", "reactivate_memory"}
         ]
-        if created_memory_ids and self.structured_llm_client:
+        if activated_memory_ids and self.structured_llm_client:
             from memforge.pipeline.contradiction_detector import detect_cross_doc_contradictions
 
             contradiction_stats = await detect_cross_doc_contradictions(
-                new_memory_ids=created_memory_ids,
+                new_memory_ids=activated_memory_ids,
                 doc_id=doc_id,
                 db=self.db,
                 memory_store=self.memory_store,
@@ -912,6 +812,8 @@ class MemoryEngine:
         for mutation in plan.mutations:
             if mutation.mutation_type.value == "create_memory":
                 stats["added"] += 1
+            elif mutation.mutation_type.value == "reactivate_memory":
+                stats["reactivated"] += 1
             elif mutation.mutation_type.value == "supersede_memory":
                 stats["superseded"] += 1
             elif mutation.mutation_type.value == "retire_memory":
@@ -933,12 +835,85 @@ class MemoryEngine:
         )
         return stats
 
+    async def _select_projected_candidates(
+        self,
+        *,
+        projection: SourceProjection,
+        doc_id: str,
+        candidates: list[RawMemory],
+    ) -> list[RawMemory]:
+        """Select one complete within-revision candidate ledger before writes."""
+
+        try:
+            result = await select_unique_memory_candidates(
+                candidates,
+                structured_llm_client=self.structured_llm_client,
+                llm_model=self.llm_model,
+            )
+        except CandidateLedgerError as exc:
+            await self._record_candidate_ledger_audit(
+                projection=projection,
+                doc_id=doc_id,
+                status="failed",
+                reason=exc.error_type,
+                payload={
+                    "input_count": exc.input_count,
+                    "semantic_input_count": exc.semantic_input_count,
+                    "selected_count": 0,
+                    "candidate_fingerprints": _candidate_fingerprints(candidates),
+                    "fingerprints_truncated": len(candidates) > 200,
+                },
+                error=str(exc),
+            )
+            raise RuntimeError(
+                f"candidate ledger failed closed: {exc.error_type}: {exc}"
+            ) from exc
+
+        if result.semantic_input_count > 1 or result.dropped_exact_count:
+            await self._record_candidate_ledger_audit(
+                projection=projection,
+                doc_id=doc_id,
+                status="committed",
+                reason="complete_candidate_ledger",
+                payload=_candidate_ledger_audit_payload(result),
+            )
+        return list(result.candidates)
+
+    async def _record_candidate_ledger_audit(
+        self,
+        *,
+        projection: SourceProjection,
+        doc_id: str,
+        status: str,
+        reason: str,
+        payload: dict[str, Any],
+        error: str | None = None,
+    ) -> None:
+        context = self.memory_store.operation_context(
+            run_id=projection.run_id,
+            source_id=projection.source_id,
+            doc_id=doc_id,
+        )
+        await self.memory_store.record_audit_event(
+            "candidate_ledger_completed" if status == "committed" else "candidate_ledger_failed",
+            status,
+            context=context,
+            doc_id=doc_id,
+            source_id=projection.source_id,
+            decision="select_unique_candidates",
+            reason=reason,
+            payload=payload,
+            error=error,
+        )
+
     async def apply_projected_tombstone(
         self,
         *,
         projection: SourceProjection,
         doc_id: str,
         reason: str,
+        lifecycle_cycle_id: str,
+        expected_source_activity_epoch: int | None = None,
     ) -> dict[str, int | bool]:
         """Apply an authoritative Source Unit tombstone without an LLM call.
 
@@ -950,14 +925,48 @@ class MemoryEngine:
 
         if len(projection.deltas) != 1 or not projection.coverage.proves_absence:
             raise ValueError("projected tombstone requires one absence-proving Revision Delta")
+        if not lifecycle_cycle_id.strip():
+            raise ValueError("projected tombstone requires lifecycle cycle identity")
         delta = projection.deltas[0]
         scope = ReconciliationScope(
-            id=f"tombstone:{delta.source_unit_id}:{delta.current_unit_revision_id or 'removed'}",
+            id=(
+                f"tombstone:{lifecycle_cycle_id}:{delta.source_unit_id}:"
+                f"{delta.current_unit_revision_id or 'removed'}"
+            ),
             source_id=projection.source_id,
             source_unit_id=delta.source_unit_id,
             base_unit_revision_id=delta.previous_unit_revision_id,
             target_unit_revision_id=delta.current_unit_revision_id,
         )
+        plan_id = lifecycle_plan_id(scope)
+        applied_payload = await self.db.get_lifecycle_plan_payload(plan_id)
+        if applied_payload is not None:
+            stored_scope = applied_payload.get("scope")
+            mutations = applied_payload.get("mutations")
+            if (
+                not isinstance(stored_scope, Mapping)
+                or stored_scope.get("id") != scope.id
+                or stored_scope.get("source_id") != scope.source_id
+                or stored_scope.get("source_unit_id") != scope.source_unit_id
+                or stored_scope.get("target_unit_revision_id")
+                != scope.target_unit_revision_id
+                or not isinstance(mutations, list)
+            ):
+                raise ValueError("applied tombstone lifecycle ledger is malformed")
+            mutation_types = [
+                mutation.get("mutation_type")
+                for mutation in mutations
+                if isinstance(mutation, Mapping)
+            ]
+            if len(mutation_types) != len(mutations):
+                raise ValueError("applied tombstone lifecycle mutation ledger is malformed")
+            await self.memory_store.attempt_lifecycle_vector_delivery(plan_id)
+            pending_review = mutation_types.count("create_review")
+            return {
+                "retired": mutation_types.count("retire_memory"),
+                "pending_review": pending_review,
+                "can_delete_document": pending_review == 0,
+            }
         source_type = projection.source_type
         incumbents, unit_support = await self._active_projected_incumbents(
             doc_id=doc_id,
@@ -983,7 +992,7 @@ class MemoryEngine:
         }
         visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
         plan = build_lifecycle_plan(
-            plan_id=lifecycle_plan_id(scope),
+            plan_id=plan_id,
             scope=scope,
             gate_state=gate.state,
             operations=operations,
@@ -1008,8 +1017,12 @@ class MemoryEngine:
                 ),
             ),
         )
-        await self.db.apply_source_projection_lifecycle(projection, plan)
-        await self.memory_store.drain_lifecycle_vector_outbox(plan.id)
+        await self.db.apply_source_projection_lifecycle(
+            projection,
+            plan,
+            expected_source_activity_epoch=expected_source_activity_epoch,
+        )
+        await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)
         pending_review = sum(
             mutation.mutation_type.value == "create_review" for mutation in plan.mutations
         )
@@ -1022,9 +1035,18 @@ class MemoryEngine:
             "can_delete_document": pending_review == 0,
         }
 
-    def _candidate_can_persist(self, raw: RawMemory, stats: dict | None = None) -> bool:
+    def _candidate_can_persist(
+        self,
+        raw: RawMemory,
+        stats: dict | None = None,
+        *,
+        observation_semantic_class: str | None = None,
+    ) -> bool:
         """Return whether a raw candidate should be persisted, updating stats when skipped."""
-        quality = classify_memory_candidate(raw)
+        quality = classify_memory_candidate(
+            raw,
+            observation_semantic_class=observation_semantic_class,
+        )
         if quality.keep:
             return True
 
@@ -1062,8 +1084,8 @@ class MemoryEngine:
             confidence=raw.confidence,
             corroboration_count=1,
             contradiction_count=0,
-            valid_from=_parse_date(raw.valid_from),
-            valid_until=_parse_date(raw.valid_until),
+            valid_from=parse_memory_validity_date(raw.valid_from),
+            valid_until=parse_memory_validity_date(raw.valid_until),
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
             status="active",
@@ -1081,187 +1103,52 @@ class MemoryEngine:
                 logger.warning("Failed to resolve entity %r: %s", name, e)
         return ids
 
-    async def _document_evidence_unit(
-        self,
-        *,
-        doc_id: str,
-        raw: RawMemory,
-        source_type: str,
-        project_key: str | None,
-        repo_identifier: str | None,
-        extractor_run_id: str | None,
-    ) -> EvidenceUnit:
-        document = await self.db.get_document(doc_id)
-        doc_revision_id = None
-        source_id = source_type
-        if document is not None:
-            doc_revision_id = document.content_hash or document.version
-            source_id = document.source or source_type
-        visibility, owner_user_id = await memory_visibility_for_document(
-            self.db,
-            doc_id=doc_id,
-        )
-        content = raw.content.strip()
-        evidence_id = _document_evidence_unit_id(
-            source_id=source_id,
-            doc_id=doc_id,
-            doc_revision_id=doc_revision_id,
-            source_type=source_type,
-            content=content,
-        )
-        return EvidenceUnit(
-            id=evidence_id,
-            source_id=source_id,
-            doc_id=doc_id,
-            doc_revision_id=doc_revision_id,
-            source_type=source_type,
-            source_anchor=evidence_id,
-            source_lineage_id=doc_id,
-            project_key=project_key,
-            visibility=visibility,
-            owner_user_id=owner_user_id,
-            repo_identifier=repo_identifier,
-            content=content,
-            excerpt=raw.extraction_context,
-            evidence_provenance=(
-                EvidenceContentProvenance.SOURCE_EXCERPT
-                if raw.extraction_context
-                else EvidenceContentProvenance.NO_EXCERPT
-            ),
-            source_metadata={
-                "memory_type": raw.memory_type,
-                "content_hash": content_hash(content),
-            },
-            observed_at=datetime.now(timezone.utc).isoformat(),
-            extractor_run_id=extractor_run_id,
-        )
+def _observation_semantic_class(
+    projection: SourceProjection,
+    observation_id: str | None,
+) -> str | None:
+    if observation_id is None:
+        return None
+    for revision in projection.observation_revisions:
+        if revision.observation_id != observation_id:
+            continue
+        value = revision.metadata.get("semantic_class")
+        return str(value) if isinstance(value, str) and value else None
+    return None
 
-    async def _evidence_unit_has_materialized_memory(self, unit: EvidenceUnit) -> bool:
-        return await self.db.has_materialized_evidence_unit(unit.id)
 
-    async def _record_document_relation_outcome(
-        self,
-        *,
-        unit: EvidenceUnit,
-        relation_run_id: str,
-        lifecycle_action: LifecycleAction,
-        memory_id: str | None,
-        status: str,
-        review_case,
-        audit: dict[str, object],
-        candidates: list[RelationCandidateRecord] | None = None,
-        incomplete_mandatory_buckets: tuple[str, ...] = (),
-        candidate_count: int | None = None,
-    ) -> None:
-        await self.db.record_relation_outcome_bundle(
-            self._document_relation_outcome_bundle(
-                unit=unit,
-                relation_run_id=relation_run_id,
-                lifecycle_action=lifecycle_action,
-                memory_id=memory_id,
-                status=status,
-                review_case=review_case,
-                audit=audit,
-                candidates=candidates,
-                incomplete_mandatory_buckets=incomplete_mandatory_buckets,
-                candidate_count=candidate_count,
-            )
-        )
-
-    def _document_relation_outcome_bundle(
-        self,
-        *,
-        unit: EvidenceUnit,
-        relation_run_id: str,
-        lifecycle_action: LifecycleAction,
-        memory_id: str | None,
-        status: str,
-        review_case,
-        audit: dict[str, object],
-        candidates: list[RelationCandidateRecord] | None = None,
-        incomplete_mandatory_buckets: tuple[str, ...] = (),
-        candidate_count: int | None = None,
-    ) -> RelationOutcomeBundle:
-        candidates = candidates or []
-        run_audit = dict(audit)
-        relations: tuple[EvidenceRelationRecord, ...] = ()
-        if memory_id is not None:
-            relations = (
-                EvidenceRelationRecord(
-                    evidence_unit_id=unit.id,
-                    memory_id=memory_id,
-                    relation_type=RelationType.SUPPORTS,
-                    authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
-                    is_authoritative_support=True,
-                    source_lineage_id=unit.source_lineage_id,
-                    confidence=1.0,
-                    reason="Memory created from this source evidence unit.",
-                    excerpt=unit.excerpt,
-                    classifier_version="memory-engine-v1",
-                    relation_run_id=relation_run_id,
-                    created_at=datetime.now(timezone.utc).isoformat(),
+def _candidate_ledger_audit_payload(result: CandidateLedgerResult) -> dict[str, Any]:
+    return {
+        "input_count": result.input_count,
+        "semantic_input_count": result.semantic_input_count,
+        "selected_count": len(result.candidates),
+        "dropped_exact_count": result.dropped_exact_count,
+        "dropped_redundant_count": result.dropped_redundant_count,
+        "drops": [
+            {
+                "candidate_content_hash": content_hash(drop.candidate.content),
+                "candidate_source_observation_id": drop.candidate.source_observation_id,
+                "canonical_content_hash": content_hash(drop.canonical_candidate.content),
+                "canonical_source_observation_id": (
+                    drop.canonical_candidate.source_observation_id
                 ),
-            )
-        return RelationOutcomeBundle(
-            evidence_unit=unit,
-            relation_run=RelationRunRecord(
-                id=relation_run_id,
-                evidence_unit_id=unit.id,
-                access_context_hash=unit.access_context_hash,
-                candidate_count=len(candidates) if candidate_count is None else candidate_count,
-                mandatory_candidate_count=sum(1 for candidate in candidates if candidate.is_mandatory),
-                checked_candidate_count=sum(1 for candidate in candidates if candidate.was_checked),
-                incomplete_mandatory_buckets=incomplete_mandatory_buckets,
-                classifier_version="memory-engine-v1",
-                lifecycle_action=lifecycle_action,
-                review_case=review_case,
-                status=status,
-                result_memory_id=memory_id,
-                audit=run_audit,
-            ),
-            candidates=tuple(candidates),
-            relations=relations,
-        )
+                "method": drop.method,
+                "reason": drop.reason[:240],
+            }
+            for drop in result.drops
+        ],
+    }
 
-def _document_evidence_unit_id(
+
+def _candidate_fingerprints(
+    candidates: list[RawMemory],
     *,
-    source_id: str,
-    doc_id: str,
-    doc_revision_id: str | None,
-    source_type: str,
-    content: str,
-) -> str:
-    digest = sha256(
-        "\x1f".join([source_id, doc_id, doc_revision_id or "", source_type, content_hash(content)]).encode("utf-8")
-    ).hexdigest()[:16]
-    return f"eu-doc-{digest}"
-
-
-def _document_relation_run_id(
-    unit: EvidenceUnit,
-    action: str | LifecycleAction,
-    *,
-    classifier_version: str = "memory-engine-v1",
-    candidate_memory_id: str | None = None,
-    relation_type: RelationType | None = None,
-    authority_case: AuthorityCase | None = None,
-) -> str:
-    return relation_run_id_for(
-        prefix="doc",
-        unit=unit,
-        action=action,
-        classifier_version=classifier_version,
-        candidate_memory_id=candidate_memory_id,
-        relation_type=relation_type,
-        authority_case=authority_case,
-    )
-
-
-def _parse_date(value: str | None) -> date | None:
-    """Parse an ISO date or datetime string into a calendar date."""
-    if not value:
-        return None
-    try:
-        return date.fromisoformat(value[:10])
-    except (ValueError, TypeError):
-        return None
+    limit: int = 200,
+) -> list[dict[str, str | None]]:
+    return [
+        {
+            "content_hash": content_hash(candidate.content),
+            "source_observation_id": candidate.source_observation_id,
+        }
+        for candidate in candidates[:limit]
+    ]

@@ -22,7 +22,11 @@ class MemoryCandidateQuality:
     skip_reason: str | None = None
 
 
-def classify_memory_candidate(raw: RawMemory) -> MemoryCandidateQuality:
+def classify_memory_candidate(
+    raw: RawMemory,
+    *,
+    observation_semantic_class: str | None = None,
+) -> MemoryCandidateQuality:
     """Classify whether a raw memory is useful enough to persist."""
     content = _normalize(raw.content)
     context = _normalize(raw.extraction_context or "")
@@ -33,6 +37,10 @@ def classify_memory_candidate(raw: RawMemory) -> MemoryCandidateQuality:
         return MemoryCandidateQuality(keep=False, skip_reason="self_referential")
     if _is_reference_only(content, context):
         return MemoryCandidateQuality(keep=False, skip_reason="reference_only")
+    if _is_attachment_event_only(content, observation_semantic_class):
+        return MemoryCandidateQuality(keep=False, skip_reason="attachment_event_only")
+    if observation_semantic_class == "operational_transition":
+        return MemoryCandidateQuality(keep=False, skip_reason="operational_history_only")
     if _is_metadata_only(content, context):
         return MemoryCandidateQuality(keep=False, skip_reason="metadata_only")
     if _is_open_question(content, context):
@@ -114,6 +122,19 @@ def _is_reference_only(content: str, context: str) -> bool:
         or re.search(r"\breferences?\b", content)
     )
     return content_is_link_sentence or (context_is_link_list and content_describes_link)
+
+
+def _is_attachment_event_only(
+    content: str,
+    observation_semantic_class: str | None,
+) -> bool:
+    """Drop upload bookkeeping; only a separate attachment artifact grants authority."""
+    unstructured_upload_event = bool(
+        re.search(r"\battachment id\b", content)
+        and
+        re.search(r"\b(?:attached|uploaded|added (?:an? )?attachment)\b", content)
+    )
+    return observation_semantic_class == "attachment_event" or unstructured_upload_event
 
 
 def _is_open_question(content: str, context: str) -> bool:

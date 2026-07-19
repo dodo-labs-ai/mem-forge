@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -22,6 +23,7 @@ from memforge.source_projection import (
     SourceUnit,
 )
 from memforge.source_projection_config import projection_scope_fingerprint
+from memforge.storage.database import Database
 
 
 NOW = datetime(2026, 7, 15, tzinfo=timezone.utc)
@@ -385,8 +387,146 @@ def test_partial_jira_projection_carries_unreturned_prior_observations() -> None
     )
     assert partial.coverage is ProjectionCoverage.PARTIAL_PROJECTION
     assert carried.id == prior_comment.id
-    assert carried.metadata["carried_forward"] is True
+    assert carried == prior_comment
+    assert partial.carried_observation_revision_ids == (prior_comment.id,)
     assert partial.deltas[0].removed_observation_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_partial_jira_projection_reuses_immutable_carried_revision_in_store(tmp_path) -> None:
+    database = Database(str(tmp_path / "partial-jira.db"))
+    await database.connect()
+    await database.upsert_source(
+        id="src-j",
+        type="jira",
+        name="Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    try:
+        item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
+        first_raw, first_normalized = _inputs(
+            item,
+            _jira_payload(comments=[{"id": "501", "body": "Keep A7"}]),
+        )
+        first = project_source_item(
+            source_id="src-j",
+            source_type="jira",
+            run_id="run-j-full-store",
+            item=item,
+            raw=first_raw,
+            normalized=first_normalized,
+        )
+        await database.record_source_projection(first)
+
+        partial_raw, partial_normalized = _inputs(
+            item,
+            _jira_payload(field_overrides={"summary": "Payroll updated"}, comments_total=1),
+        )
+        partial = project_source_item(
+            source_id="src-j",
+            source_type="jira",
+            run_id="run-j-partial-store",
+            item=item,
+            raw=partial_raw,
+            normalized=partial_normalized,
+            prior_unit_revision=first.source_unit_revisions[0],
+            prior_observation_revisions={revision.observation_id: revision for revision in first.observation_revisions},
+        )
+
+        await database.record_source_projection(partial)
+
+        prior_comment = next(
+            revision for revision in first.observation_revisions if revision.observation_id != first.observations[0].id
+        )
+        stored = await database.get_source_projection(partial.run_id)
+        assert stored is not None
+        carried = next(
+            revision
+            for revision in stored.observation_revisions
+            if revision.observation_id == prior_comment.observation_id
+        )
+        assert carried == prior_comment
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_unchanged_jira_changelog_reuses_exact_prior_revision_in_store(tmp_path) -> None:
+    database = Database(str(tmp_path / "unchanged-jira.db"))
+    await database.connect()
+    await database.upsert_source(
+        id="src-j",
+        type="jira",
+        name="Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    try:
+        item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
+        raw, normalized = _inputs(
+            item,
+            _jira_payload(
+                histories=[
+                    {
+                        "id": "attachment",
+                        "items": [{"field": "Attachment"}],
+                    }
+                ]
+            ),
+        )
+        first = project_source_item(
+            source_id="src-j",
+            source_type="jira",
+            run_id="run-j-unchanged-first",
+            item=item,
+            raw=raw,
+            normalized=normalized,
+        )
+        original_changelog = next(
+            revision
+            for revision in first.observation_revisions
+            if revision.metadata.get("semantic_class") == "attachment_event"
+        )
+        stored_changelog = replace(
+            original_changelog,
+            metadata={"provider_key": "attachment"},
+        )
+        stored_first = replace(
+            first,
+            observation_revisions=tuple(
+                stored_changelog if revision.id == original_changelog.id else revision
+                for revision in first.observation_revisions
+            ),
+        )
+        await database.record_source_projection(stored_first)
+
+        second = project_source_item(
+            source_id="src-j",
+            source_type="jira",
+            run_id="run-j-unchanged-second",
+            item=item,
+            raw=raw,
+            normalized=normalized,
+            prior_unit_revision=stored_first.source_unit_revisions[0],
+            prior_observation_revisions={
+                revision.observation_id: revision
+                for revision in stored_first.observation_revisions
+            },
+        )
+
+        await database.record_source_projection(second)
+
+        projected_changelog = next(
+            revision
+            for revision in second.observation_revisions
+            if revision.observation_id == stored_changelog.observation_id
+        )
+        assert projected_changelog == stored_changelog
+    finally:
+        await database.close()
 
 
 def test_incomplete_embedded_jira_changelog_forces_partial_coverage() -> None:
@@ -428,6 +568,42 @@ def test_incomplete_local_agent_jira_changelog_forces_partial_coverage() -> None
     )
 
     assert projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
+
+
+def test_jira_projection_types_changelog_semantics_for_generic_quality_policy() -> None:
+    item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
+    raw, normalized = _inputs(
+        item,
+        _jira_payload(
+            histories=[
+                {"id": "attachment", "items": [{"field": "Attachment"}]},
+                {"id": "routing", "items": [{"field": "priority"}]},
+                {"id": "domain", "items": [{"field": "description"}]},
+            ]
+        ),
+    )
+
+    projection = project_source_item(
+        source_id="src-j",
+        source_type="jira",
+        run_id="run-j-typed-changelog",
+        item=item,
+        raw=raw,
+        normalized=normalized,
+    )
+
+    semantics = {
+        str(revision.metadata["provider_key"]): revision.metadata.get(
+            "semantic_class"
+        )
+        for revision in projection.observation_revisions
+        if str(revision.metadata["provider_key"]) in {"attachment", "routing", "domain"}
+    }
+    assert semantics == {
+        "attachment": "attachment_event",
+        "routing": "operational_transition",
+        "domain": "domain_transition",
+    }
 
 
 @pytest.mark.parametrize("source_type", ["jira", "teams"])
@@ -493,6 +669,7 @@ def test_operational_message_metadata_does_not_create_semantic_revision(source_t
     )
 
     assert second.source_unit_revisions[0].id == first.source_unit_revisions[0].id
+    assert second.observation_revisions == first.observation_revisions
     assert second.deltas[0].axes == frozenset()
     assert second.deltas[0].requires_extraction is False
 

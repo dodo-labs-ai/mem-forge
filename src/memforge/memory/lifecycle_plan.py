@@ -184,6 +184,31 @@ class LifecycleVectorTaskStatus(str, Enum):
     FAILED = "failed"
 
 
+class LifecycleVectorDeliveryState(str, Enum):
+    DELIVERED = "delivered"
+    PENDING = "pending"
+
+
+AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON = (
+    "source Unit removed by authoritative discovery"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleVectorDeliveryResult:
+    """Outcome of one best-effort delivery pass over durable vector tasks."""
+
+    state: LifecycleVectorDeliveryState
+    attempted_tasks: int = 0
+    delivered_tasks: int = 0
+    failed_tasks: int = 0
+    error_types: tuple[str, ...] = ()
+
+    @property
+    def pending(self) -> bool:
+        return self.state is LifecycleVectorDeliveryState.PENDING
+
+
 class LifecycleReviewStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
@@ -276,6 +301,7 @@ class IncumbentDisposition(str, Enum):
 
 class LifecycleMutationType(str, Enum):
     CREATE_MEMORY = "create_memory"
+    REACTIVATE_MEMORY = "reactivate_memory"
     ATTACH_SUPPORT = "attach_support"
     REMOVE_SUPPORT = "remove_support"
     SUPERSEDE_MEMORY = "supersede_memory"
@@ -283,6 +309,13 @@ class LifecycleMutationType(str, Enum):
     CREATE_REVIEW = "create_review"
     RESOLVE_REVIEW = "resolve_review"
     REFRESH_MEMORY_INDEX = "refresh_memory_index"
+
+
+class ClaimIdentityPolicy(str, Enum):
+    """Authority that determines whether exact claims share one Memory identity."""
+
+    ORDINARY_EXTRACTION = "ordinary_extraction"
+    EXPLICIT_CONCEPT = "explicit_concept"
 
 
 DESTRUCTIVE_MUTATIONS = frozenset(

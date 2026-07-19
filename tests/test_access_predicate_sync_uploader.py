@@ -4,7 +4,8 @@ carry the uploader through normalization into the persistence pipeline.
 This guards the production write path: receipt metadata alone is not enough,
 because the gene re-reads the package and feeds the sync pipeline. The
 normalized source_semantics has to expose the uploader so the sync pipeline can
-forward it to the memory engine, instead of falling back to LOCAL_DEV_USER_ID.
+forward it to the projected lifecycle boundary, instead of falling back to
+LOCAL_DEV_USER_ID.
 
 The orchestrator-driven test below is the regression gate: it runs the real
 GeneSyncOrchestrator against a real AgentSessionGene and watches what the
@@ -90,7 +91,7 @@ class _StubEnricher:
 
 
 class _SingleMemoryExtractor:
-    """Yields one RawMemory per call so the orchestrator reaches process_memories."""
+    """Yields one RawMemory so the orchestrator reaches projected lifecycle."""
 
     async def extract_memories(self, **kwargs):
         return MemoryExtractionResult(
@@ -287,12 +288,12 @@ async def test_agent_session_gene_exposes_explicit_source_updated_at(database_fi
 @pytest.mark.asyncio
 async def test_orchestrator_forwards_uploader_user_id_on_new_documents(database_fixture, tmp_path):
     """First sync (new docs): the orchestrator MUST forward each uploader's id
-    on its ``process_memories`` call.
+    on its ``apply_projected_lifecycle`` call.
 
     The spy engine records the kwargs the orchestrator passed; the assertion
     reads them back. If ``user_id=uploader_user_id`` is removed from the
-    new-document branch (sync.py around line 1048), the recorded ``user_id``
-    becomes ``None`` and this test fails.
+    new-document branch, the recorded ``user_id`` becomes ``None`` and this
+    test fails.
     """
     database = database_fixture
     cfg = _config(tmp_path)

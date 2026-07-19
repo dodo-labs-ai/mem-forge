@@ -48,6 +48,7 @@ from memforge.source_projection import (
     SourceUnitRevision,
 )
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
+from memforge.source_activity import SourceActivityLease
 from memforge.storage.adapters.context import AccessScope
 
 
@@ -136,22 +137,54 @@ class RelationalStore(Protocol):
 
     async def insert_memory(self, memory: Memory) -> str: ...
     async def get_memory(self, memory_id: str) -> Memory | None: ...
+    async def find_active_exact_claim_candidate(
+        self,
+        content_hash: str,
+        *,
+        visibility: str,
+        owner_user_id: str | None,
+        repo_identifier: str | None,
+        excluded_memory_ids: Sequence[str] = (),
+    ) -> Memory | None: ...
+    async def list_active_ordinary_claim_memories(
+        self,
+        memory_ids: Sequence[str],
+    ) -> list[Memory]: ...
+    async def find_rebaseline_reactivation_candidate(
+        self,
+        content_hash: str,
+        *,
+        visibility: str,
+        owner_user_id: str | None,
+        repo_identifier: str | None,
+    ) -> Memory | None: ...
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]: ...
     async def upsert_document(
         self,
         doc: DocumentRecord,
         *,
         require_configured_source: bool = False,
+        source_activity: SourceActivityLease | None = None,
     ) -> None: ...
     async def get_document(self, doc_id: str) -> DocumentRecord | None: ...
     async def delete_projected_document(self, doc_id: str) -> None: ...
-    async def rebaseline_source_lifecycle(self, source_id: str) -> SourceLifecycleResetResult: ...
+    async def rebaseline_source_lifecycle(
+        self,
+        source_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> SourceLifecycleResetResult: ...
     async def rebind_projected_document_support(
         self,
         old_doc_id: str,
         new_doc_id: str,
     ) -> None: ...
-    async def record_source_projection(self, projection: SourceProjection) -> None: ...
+    async def record_source_projection(
+        self,
+        projection: SourceProjection,
+        *,
+        expected_source_activity_epoch: int | None = None,
+    ) -> None: ...
     async def get_source_projection(self, run_id: str) -> SourceProjection | None: ...
     async def get_current_source_unit_revision(
         self,
@@ -230,11 +263,24 @@ class RelationalStore(Protocol):
     async def count_active_source_memories(self, source_id: str) -> int: ...
     async def count_active_source_memories_without_support(self, source_id: str) -> int: ...
     async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate: ...
-    async def enable_lifecycle_gate(self, source_id: str) -> LifecycleGate: ...
-    async def gate_destructive_lifecycle(self, source_id: str, *, reason: str) -> LifecycleGate: ...
+    async def enable_lifecycle_gate(
+        self,
+        source_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> LifecycleGate: ...
+    async def gate_destructive_lifecycle(
+        self,
+        source_id: str,
+        *,
+        reason: str,
+        source_activity: SourceActivityLease | None = None,
+    ) -> LifecycleGate: ...
     async def upsert_lifecycle_cutover_finding(
         self,
         finding: LifecycleCutoverFinding,
+        *,
+        source_activity: SourceActivityLease | None = None,
     ) -> None: ...
     async def get_lifecycle_cutover_finding(
         self,
@@ -247,6 +293,10 @@ class RelationalStore(Protocol):
         status: CutoverFindingStatus | None = None,
     ) -> list[LifecycleCutoverFinding]: ...
     async def create_lifecycle_backfill_job(
+        self,
+        job: LifecycleBackfillJob,
+    ) -> LifecycleBackfillJob: ...
+    async def create_source_rebaseline_job(
         self,
         job: LifecycleBackfillJob,
     ) -> LifecycleBackfillJob: ...
@@ -271,6 +321,11 @@ class RelationalStore(Protocol):
         *,
         error: str,
     ) -> LifecycleBackfillJob: ...
+    async def list_stale_lifecycle_backfill_job_ids(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[str, ...]: ...
     async def get_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob | None: ...
     async def get_active_lifecycle_backfill_job(
         self,
@@ -288,6 +343,7 @@ class RelationalStore(Protocol):
         *,
         observation_id: str,
         source_unit_id: str,
+        source_activity: SourceActivityLease | None = None,
     ) -> LifecycleCutoverFinding: ...
     async def retire_unprovable_lifecycle_cutover_finding(
         self,
@@ -302,8 +358,15 @@ class RelationalStore(Protocol):
         self,
         evidence_unit_id: str,
         references: Sequence[EvidenceReference],
+        *,
+        source_activity: SourceActivityLease | None = None,
     ) -> tuple[EvidenceReference, ...]: ...
-    async def upsert_memory_support_assertion(self, assertion: MemorySupportAssertion) -> None: ...
+    async def upsert_memory_support_assertion(
+        self,
+        assertion: MemorySupportAssertion,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None: ...
     async def get_memory_support_set_hash(self, memory_id: str) -> str: ...
     async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]: ...
     async def get_active_memory_support_evidence(
@@ -320,6 +383,8 @@ class RelationalStore(Protocol):
         self,
         projection: SourceProjection,
         plan: LifecyclePlan,
+        *,
+        expected_source_activity_epoch: int | None = None,
     ) -> None: ...
     async def apply_agent_claim_source_projection_lifecycle(
         self,

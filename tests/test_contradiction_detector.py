@@ -712,6 +712,72 @@ class TestDetectCrossDocContradictions:
         ]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("decisions", "error_fragment"),
+        [
+            (
+                [
+                    {"pair_index": 0, "classification": "contradiction", "reason": "first conflict"},
+                    {"pair_index": 0, "classification": "unrelated", "reason": "duplicate overwrite"},
+                    {"pair_index": 1, "classification": "contradiction", "reason": "second conflict"},
+                ],
+                "duplicate_count=1",
+            ),
+            (
+                [
+                    {"pair_index": 0, "classification": "unrelated", "reason": "one decision missing"},
+                ],
+                "missing_count=1",
+            ),
+        ],
+    )
+    async def test_invalid_pair_decision_coverage_fails_closed_before_relation_or_review_writes(
+        self, seeded_db, memory_store, decisions, error_fragment
+    ):
+        """Ambiguous structured coverage cannot split a Review from its relation snapshot."""
+        db, entity_id, mem_a, mem_b, _ = seeded_db
+        await _insert_document(db, "doc-ccc")
+        mem_d = _make_memory("mem-dddd0001", "pay-api still uses PostgreSQL 13")
+        await db.insert_memory(mem_d)
+        await db.db.execute(
+            "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
+            (mem_d.id, "doc-ccc", "confluence"),
+        )
+        await db.db.execute(
+            "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
+            (mem_d.id, entity_id),
+        )
+        await db.db.commit()
+
+        mock_client = AsyncMock()
+        mock_client.detect_contradictions = AsyncMock(return_value=_mock_contradiction_response(decisions))
+
+        stats = await detect_cross_doc_contradictions(
+            new_memory_ids=[mem_b.id],
+            doc_id="doc-bbb",
+            db=db,
+            memory_store=memory_store,
+            structured_llm_client=mock_client,
+        )
+
+        assert stats == {"contradictions": 0, "temporal": 0, "checked": 2, "truncated": 0}
+        assert await db.get_pending_review_for_challenger(mem_b.id) is None
+        async with db.db.execute(
+            "SELECT COUNT(*) FROM relation_runs WHERE evidence_unit_id LIKE 'eu-contradiction-%'"
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 0
+        async with db.db.execute("SELECT COUNT(*) FROM memory_contradictions") as cursor:
+            assert (await cursor.fetchone())[0] == 0
+        assert (await db.get_memory(mem_a.id)).contradiction_count == 0
+        assert (await db.get_memory(mem_b.id)).contradiction_count == 0
+        assert (await db.get_memory(mem_d.id)).contradiction_count == 0
+
+        audit_rows = await db.list_memory_audit_events(event_type="contradiction_detection_failed")
+        assert len(audit_rows) == 1
+        assert audit_rows[0].reason == "structured_output_failure"
+        assert error_fragment in audit_rows[0].error
+
+    @pytest.mark.asyncio
     async def test_relation_bundle_failure_does_not_record_contradiction_state(
         self, seeded_db, memory_store, monkeypatch
     ):
@@ -892,7 +958,16 @@ class TestDetectCrossDocContradictions:
         )
 
         mock_client = AsyncMock()
-        mock_client.detect_contradictions = AsyncMock(return_value=_mock_contradiction_response([]))
+        mock_client.detect_contradictions = AsyncMock(
+            side_effect=[
+                _mock_contradiction_response(
+                    [{"pair_index": 0, "classification": "unrelated", "reason": "no conflict"}]
+                ),
+                _mock_contradiction_response(
+                    [{"pair_index": 1, "classification": "unrelated", "reason": "no conflict"}]
+                ),
+            ]
+        )
 
         stats = await detect_cross_doc_contradictions(
             new_memory_ids=[mem_b.id],
@@ -963,7 +1038,11 @@ class TestDetectCrossDocContradictions:
         )
 
         mock_client = AsyncMock()
-        mock_client.detect_contradictions = AsyncMock(return_value=_mock_contradiction_response([]))
+        mock_client.detect_contradictions = AsyncMock(
+            return_value=_mock_contradiction_response(
+                [{"pair_index": 0, "classification": "unrelated", "reason": "no conflict"}]
+            )
+        )
 
         stats = await detect_cross_doc_contradictions(
             new_memory_ids=[mem_b.id, skipped.id],

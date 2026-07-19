@@ -12,6 +12,7 @@ from memforge.local_agent.state import LocalAgentStateStore
 from memforge.sync_progress import normalize_sync_progress_snapshot
 
 DEFAULT_CLOUD_JOB_LEASE_SECONDS = 60
+DEFAULT_CLOUD_JOB_LEASE_LIMIT = 1
 DEFAULT_CLOUD_JOB_HEARTBEAT_INTERVAL_SECONDS = 20
 DEFAULT_CLOUD_JOB_PROGRESS_FLUSH_SECONDS = 2
 
@@ -227,6 +228,7 @@ class LocalAgentRunner:
         try:
             response = _call_cloud_jobs_provider(
                 self.cloud_jobs_provider,
+                limit=DEFAULT_CLOUD_JOB_LEASE_LIMIT,
                 wait_seconds=wait_seconds,
                 lease_seconds=self.cloud_job_lease_seconds,
             )
@@ -254,6 +256,13 @@ class LocalAgentRunner:
                 error_type="CloudJobLeaseError",
             )
         valid_jobs = [job for job in jobs if isinstance(job, dict)]
+        if len(valid_jobs) > DEFAULT_CLOUD_JOB_LEASE_LIMIT:
+            return [], _cloud_job_failed_result(
+                "cloud-jobs:lease",
+                now.isoformat(),
+                "local-agent broker returned more than one leased job",
+                error_type="CloudJobLeaseError",
+            )
         finished_at = datetime.now(timezone.utc).isoformat()
         return valid_jobs, {
             "task_id": "cloud-jobs:lease",
@@ -436,6 +445,7 @@ def _call_cloud_job_heartbeat(
 def _call_cloud_jobs_provider(
     provider: Callable[..., dict[str, Any]],
     *,
+    limit: int,
     wait_seconds: int,
     lease_seconds: int,
 ) -> dict[str, Any]:
@@ -444,6 +454,8 @@ def _call_cloud_jobs_provider(
     except (TypeError, ValueError):
         return provider()
     kwargs: dict[str, Any] = {}
+    if "limit" in signature.parameters:
+        kwargs["limit"] = limit
     if "wait_seconds" in signature.parameters:
         kwargs["wait_seconds"] = wait_seconds
     if "lease_seconds" in signature.parameters:

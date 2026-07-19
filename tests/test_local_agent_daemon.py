@@ -354,6 +354,37 @@ def test_local_agent_leases_heartbeats_and_completes_cloud_job(tmp_path):
     assert report["counts"] == {"total": 2, "success": 2, "failed": 0}
 
 
+def test_local_agent_leases_only_the_job_it_is_ready_to_execute(tmp_path):
+    available = [
+        {"job_id": "laj-long-1", "source_id": "src-1", "attempt_count": 1},
+        {"job_id": "laj-long-2", "source_id": "src-2", "attempt_count": 1},
+    ]
+    lease_limits: list[int] = []
+    handled: list[str] = []
+
+    def lease_jobs(*, limit, wait_seconds, lease_seconds):
+        lease_limits.append(limit)
+        leased = available[:limit]
+        del available[:limit]
+        return {"jobs": leased}
+
+    runner = LocalAgentRunner(
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        cloud_job_handler=lambda job: handled.append(job["job_id"]) or {},
+        cloud_jobs_provider=lease_jobs,
+        cloud_job_completer=lambda *args: {"ok": True},
+        cloud_job_heartbeat=lambda *args: {"ok": True},
+    )
+
+    first = runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
+    second = runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
+
+    assert lease_limits == [1, 1]
+    assert handled == ["laj-long-1", "laj-long-2"]
+    assert first["results"][0]["payload"] == {"leased_count": 1}
+    assert second["results"][0]["payload"] == {"leased_count": 1}
+
+
 def test_local_agent_rejected_initial_heartbeat_never_runs_handler(tmp_path):
     completed: list[tuple[str, int, str, dict, str | None]] = []
     handled: list[str] = []
@@ -514,6 +545,10 @@ def test_local_agent_flushes_dirty_progress_before_lease_heartbeat():
 
 def test_local_agent_completion_failure_does_not_abort_following_job(tmp_path):
     completed: list[str] = []
+    available = [
+        {"job_id": "laj-1", "source_id": "src-1", "attempt_count": 1},
+        {"job_id": "laj-2", "source_id": "src-2", "attempt_count": 1},
+    ]
 
     def complete(job_id, attempt_count, status, result, error=None):
         if job_id == "laj-1":
@@ -521,24 +556,48 @@ def test_local_agent_completion_failure_does_not_abort_following_job(tmp_path):
         completed.append(job_id)
         return {"ok": True}
 
+    def lease_jobs(*, limit, **kwargs):
+        leased = available[:limit]
+        del available[:limit]
+        return {"jobs": leased}
+
     runner = LocalAgentRunner(
         state_store=LocalAgentStateStore(tmp_path / "state.json"),
         cloud_job_handler=lambda job: {"job": job["job_id"]},
+        cloud_jobs_provider=lease_jobs,
+        cloud_job_completer=complete,
+    )
+
+    first = runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
+    second = runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
+
+    assert completed == ["laj-2"]
+    assert first["counts"] == {"total": 2, "success": 1, "failed": 1}
+    assert first["results"][1]["error"] == "completion unavailable"
+    assert second["counts"] == {"total": 2, "success": 2, "failed": 0}
+
+
+def test_local_agent_rejects_broker_batch_that_could_expire_before_execution(
+    tmp_path,
+):
+    handled: list[str] = []
+    runner = LocalAgentRunner(
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        cloud_job_handler=lambda job: handled.append(job["job_id"]) or {},
         cloud_jobs_provider=lambda: {
             "jobs": [
                 {"job_id": "laj-1", "source_id": "src-1", "attempt_count": 1},
                 {"job_id": "laj-2", "source_id": "src-2", "attempt_count": 1},
             ]
         },
-        cloud_job_completer=complete,
     )
 
     report = runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
 
-    assert completed == ["laj-2"]
-    assert report["counts"] == {"total": 3, "success": 2, "failed": 1}
-    assert report["results"][1]["error"] == "completion unavailable"
-    assert report["results"][2]["status"] == "success"
+    assert handled == []
+    assert report["counts"] == {"total": 1, "success": 0, "failed": 1}
+    assert report["results"][0]["error_type"] == "CloudJobLeaseError"
+    assert "more than one leased job" in report["results"][0]["error"]
 
 
 def test_local_agent_rejects_job_without_attempt_count(tmp_path):

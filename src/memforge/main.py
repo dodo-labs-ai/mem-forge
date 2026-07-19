@@ -352,7 +352,8 @@ def _build_local_agent_runner(
         cloud_job_handler=lambda job, report_progress=None: _run_cloud_local_agent_job(
             job, client, browser=browser, report_progress=report_progress
         ),
-        cloud_jobs_provider=lambda wait_seconds=0, lease_seconds=60: client.lease_local_agent_jobs(
+        cloud_jobs_provider=lambda limit=1, wait_seconds=0, lease_seconds=60: client.lease_local_agent_jobs(
+            limit=limit,
             wait_seconds=wait_seconds,
             lease_seconds=lease_seconds,
         ),
@@ -1899,7 +1900,14 @@ def _push_github_profile_to_source(
         "failed": failed,
     }
     if failed:
-        payload["error"] = "one or more documents failed to push"
+        examples = "; ".join(
+            f"{item.get('relative_path')}: {item.get('error')}"
+            for item in failed[:3]
+        )
+        payload["error"] = (
+            f"{len(failed)} document(s) failed to push"
+            + (f": {examples}" if examples else "")
+        )
     if not failed:
         sync_result = client.start_source_processing(
             source_id=source_id,
@@ -2427,6 +2435,7 @@ def _run_cloud_teams_sync_job(
             }
 
     documents, poll_audits = _teams_collection_documents_and_polls(collection)
+    inventory_findings: list[dict[str, str]] = []
     try:
         configured_conversation_ids = set(_teams_direct_rest_config_from_cloud_payload(payload)["conversation_ids"])
         scope_attestation_documents = _teams_scope_attestation_documents(
@@ -2452,6 +2461,7 @@ def _run_cloud_teams_sync_job(
                     if isinstance(payload.get("projection_scope_transition"), dict)
                     else None
                 ),
+                findings=inventory_findings,
             )
             if not limit
             else iter(())
@@ -2466,7 +2476,6 @@ def _run_cloud_teams_sync_job(
     for poll in poll_audits:
         event = {"event": "teams_conversation_poll", "run_id": run_id, "source_id": source_id, **poll}
         write_teams_audit_event(audit_path, event)
-
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     skipped_existing: list[dict[str, Any]] = []
@@ -2593,6 +2602,17 @@ def _run_cloud_teams_sync_job(
             },
         )
 
+    for finding in inventory_findings:
+        write_teams_audit_event(
+            audit_path,
+            {
+                "event": "teams_projection_inventory_finding",
+                "run_id": run_id,
+                "source_id": source_id,
+                **finding,
+            },
+        )
+
     _report_local_agent_progress(
         report_progress,
         _sync_progress_snapshot(
@@ -2639,6 +2659,9 @@ def _run_cloud_teams_sync_job(
         "sync_started": sync_started,
         "audit_log_path": str(audit_path.expanduser()),
     }
+    if inventory_findings:
+        result["counts"]["inventory_findings"] = len(inventory_findings)
+        result["inventory_findings"] = list(inventory_findings)
     if lease_lost:
         result["error"] = "local agent lease is no longer current"
         result["error_type"] = "LocalAgentLeaseLost"
@@ -2675,6 +2698,7 @@ def _run_cloud_teams_sync_job(
             "pushed_windows": len(pushed),
             "failed_windows": len(failed),
             "skipped_existing_windows": len(skipped_existing),
+            "inventory_findings": len(inventory_findings),
             "polls": len(poll_audits),
             "sync_started": result["sync_started"],
             "sync_error": result.get("sync_error"),
@@ -2797,9 +2821,11 @@ def _iter_teams_inventory_tombstones(
     poll_audits: list[dict[str, Any]],
     configured_conversation_ids: set[str],
     scope_transition: dict[str, Any] | None,
+    findings: list[dict[str, str]] | None = None,
 ):
     """Page only relevant inventory slices and yield required tombstones."""
 
+    findings = findings if findings is not None else []
     plans = _teams_inventory_query_plans(
         poll_audits=poll_audits,
         configured_conversation_ids=configured_conversation_ids,
@@ -2827,7 +2853,11 @@ def _iter_teams_inventory_tombstones(
                     str(response.get("error") or "").strip() if isinstance(response, dict) else ""
                 ) or "server projection inventory response is invalid"
                 raise RuntimeError(error)
-            units = _validated_teams_projection_inventory_units(response.get("units"))
+            units = _validated_teams_projection_inventory_units(
+                response.get("units"),
+                source_id=source_id,
+                findings=findings,
+            )
             reconciled = _reconcile_teams_documents_with_server_inventory(
                 documents=current_documents,
                 poll_audits=poll_audits,
@@ -2906,8 +2936,15 @@ def _teams_scope_selector_values(scope: object) -> set[str]:
     return set(canonical_teams_conversation_ids(scope))
 
 
-def _validated_teams_projection_inventory_units(value: object) -> list[dict[str, Any]]:
+def _validated_teams_projection_inventory_units(
+    value: object,
+    *,
+    source_id: str,
+    findings: list[dict[str, str]],
+) -> list[dict[str, Any]]:
     """Validate the server-owned inventory before any destructive decision."""
+
+    from memforge.local_agent.teams_ledger import decode_teams_window_id
 
     if not isinstance(value, list):
         raise ValueError("units must be a list")
@@ -2917,17 +2954,59 @@ def _validated_teams_projection_inventory_units(value: object) -> list[dict[str,
             raise ValueError("unit must be an object")
         locator = unit.get("locator")
         provider_key = str(unit.get("provider_key") or "").strip()
+        source_unit_id = str(unit.get("source_unit_id") or "").strip()
         if (
             str(unit.get("unit_type") or "").strip() != "teams_window"
-            or not str(unit.get("source_unit_id") or "").strip()
+            or not source_unit_id
             or not provider_key
             or not isinstance(locator, dict)
             or not str(locator.get("conversation_id") or "").strip()
-            or str(locator.get("window_id") or "").strip() != provider_key
+        ):
+            raise ValueError("unit is missing canonical Teams window identity")
+        conversation_id = str(locator.get("conversation_id") or "").strip()
+        window_id = str(locator.get("window_id") or "").strip()
+        document_id = str(locator.get("document_id") or "").strip()
+        opaque_legacy_identity = bool(
+            document_id
+            and provider_key == document_id
+            and (not window_id or window_id == document_id)
+        )
+        if not window_id or not window_id.startswith(
+            ("teams-block:v1:", "teams-thread:v1:")
+        ):
+            if opaque_legacy_identity:
+                _record_teams_inventory_finding(findings, source_unit_id)
+                continue
+            raise ValueError("unit is missing canonical Teams window identity")
+        try:
+            decoded = decode_teams_window_id(window_id)
+        except ValueError as exc:
+            if opaque_legacy_identity:
+                _record_teams_inventory_finding(findings, source_unit_id)
+                continue
+            raise ValueError("unit is missing canonical Teams window identity") from exc
+        if (
+            decoded["source_id"] != source_id
+            or decoded["conversation_id"] != conversation_id
+            or provider_key not in {window_id, document_id}
         ):
             raise ValueError("unit is missing canonical Teams window identity")
         units.append(unit)
     return units
+
+
+def _record_teams_inventory_finding(
+    findings: list[dict[str, str]],
+    source_unit_id: str,
+) -> None:
+    if any(finding.get("source_unit_id") == source_unit_id for finding in findings):
+        return
+    findings.append(
+        {
+            "source_unit_id": source_unit_id,
+            "reason": "canonical_teams_window_identity_unavailable",
+        }
+    )
 
 
 def _reconcile_teams_documents_with_server_inventory(

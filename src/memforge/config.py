@@ -16,6 +16,7 @@ __all__ = ["AppConfig", "SyncConfig", "load_config"]
 
 DEFAULT_BASE_DIR = Path.home() / ".memforge"
 DEFAULT_ENRICHMENT_MAX_TOKENS = 8192
+DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS = 32768
 DEFAULT_RANK_WINDOW_SIZE = 50
 
 
@@ -53,6 +54,7 @@ class LlmConfig:
     enrichment_base_url: str = "https://api.anthropic.com"
     enrichment_api_key: str = ""
     enrichment_max_tokens: int = DEFAULT_ENRICHMENT_MAX_TOKENS
+    memory_extraction_max_tokens: int = DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
     enrichment_max_concurrent: int = 3
     request_timeout_s: float = 300.0
     llm_calls_per_minute: int = 30
@@ -141,6 +143,10 @@ class AppConfig:
         self.llm.enrichment_max_tokens = int(
             os.environ.get("MEMFORGE_ENRICHMENT_MAX_TOKENS")
             or self.llm.enrichment_max_tokens
+        )
+        self.llm.memory_extraction_max_tokens = int(
+            os.environ.get("MEMFORGE_MEMORY_EXTRACTION_MAX_TOKENS")
+            or self.llm.memory_extraction_max_tokens
         )
         self.llm.request_timeout_s = float(
             os.environ.get("MEMFORGE_LLM_REQUEST_TIMEOUT_SECONDS")

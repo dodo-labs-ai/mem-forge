@@ -14,6 +14,7 @@ from memforge.memory.evidence import (
     evidence_reference_id_for,
 )
 from memforge.models import RawMemory, content_hash
+from memforge.pipeline.projection_context import context_observation_ids_for
 from memforge.source_projection import AnchorKind, SourceAnchor, SourceProjection
 
 
@@ -127,11 +128,7 @@ def build_projected_claim_evidence(
         )
         units_by_id.setdefault(unit.id, unit)
 
-        context_ids = _context_observation_ids(
-            primary_id,
-            ordered_observation_ids,
-            projection=projection,
-        )
+        context_ids = context_observation_ids_for(projection, primary_id)
         required_ids = tuple(dict.fromkeys(raw.required_source_observation_ids))
         if primary_id in required_ids:
             raise ValueError("PRIMARY observation cannot also be REQUIRED")
@@ -195,31 +192,6 @@ def build_projected_claim_evidence(
         references=tuple(references_by_id.values()),
         reference_ids_by_claim_hash=reference_ids_by_claim_hash,
     )
-
-
-def _context_observation_ids(
-    primary_id: str,
-    ordered_ids: Sequence[str],
-    *,
-    projection: SourceProjection,
-) -> tuple[str, ...]:
-    if primary_id not in ordered_ids:
-        return ()
-    index = ordered_ids.index(primary_id)
-    candidates = []
-    if index > 0:
-        candidates.append(ordered_ids[index - 1])
-    if index + 1 < len(ordered_ids):
-        candidates.append(ordered_ids[index + 1])
-    for relation in projection.relations:
-        if relation.from_id == primary_id and relation.to_id in ordered_ids:
-            candidates.append(relation.to_id)
-        elif relation.to_id == primary_id and relation.from_id in ordered_ids:
-            candidates.append(relation.from_id)
-    if ordered_ids and ordered_ids[0] != primary_id:
-        candidates.append(ordered_ids[0])
-    return tuple(dict.fromkeys(candidates))
-
 
 def _stable_id(prefix: str, *values: object) -> str:
     digest = hashlib.sha256("\x1f".join(str(value) for value in values).encode("utf-8")).hexdigest()[:20]

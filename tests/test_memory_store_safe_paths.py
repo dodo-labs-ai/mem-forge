@@ -20,10 +20,14 @@ from memforge.memory.evidence import (
     RelationRunRecord,
     RelationType,
 )
-from memforge.memory.store import MemoryStore
-from memforge.memory.lifecycle_plan import LifecycleVectorTaskStatus
+from memforge.memory.lifecycle_plan import (
+    LifecycleVectorOperation,
+    LifecycleVectorTask,
+    LifecycleVectorTaskStatus,
+)
 from memforge.models import DocumentRecord, Memory, MemoryReview, MemorySource, content_hash
 from memforge.memory.review_service import ReviewKind, ReviewStatus
+from memforge.memory.store import MemoryStore
 from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -1625,6 +1629,136 @@ async def test_delete_document_rolls_back_sqlite_when_db_delete_fails_mid_transa
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_vector_delivery_attempt_is_bounded() -> None:
+    class Relational:
+        def __init__(self) -> None:
+            self.completed: list[str] = []
+
+        async def list_lifecycle_vector_tasks(self, **kwargs):
+            assert kwargs["limit"] == 101
+            return [
+                LifecycleVectorTask(
+                    id=f"task-{index}",
+                    lifecycle_plan_id="plan-1",
+                    memory_id=f"memory-{index}",
+                    operation=LifecycleVectorOperation.DELETE,
+                    status=LifecycleVectorTaskStatus.PENDING,
+                )
+                for index in range(101)
+            ]
+
+        async def complete_lifecycle_vector_task(self, task_id: str) -> None:
+            self.completed.append(task_id)
+
+        async def fail_lifecycle_vector_task(self, task_id: str, error: str) -> None:
+            raise AssertionError((task_id, error))
+
+    class Vector:
+        async def delete(self, memory_ids: list[str]) -> None:
+            assert len(memory_ids) == 1
+
+    relational = Relational()
+    store = object.__new__(MemoryStore)
+    store.relational = relational
+    store.vector = Vector()
+
+    result = await store.attempt_lifecycle_vector_delivery(lifecycle_plan_id="plan-1")
+
+    assert result.pending
+    assert result.attempted_tasks == 100
+    assert result.delivered_tasks == 100
+    assert result.failed_tasks == 0
+    assert len(relational.completed) == 100
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_vector_delivery_rechecks_after_concurrent_completion() -> None:
+    task = LifecycleVectorTask(
+        id="task-raced",
+        lifecycle_plan_id="plan-raced",
+        memory_id="memory-raced",
+        operation=LifecycleVectorOperation.DELETE,
+        status=LifecycleVectorTaskStatus.PENDING,
+    )
+
+    class Relational:
+        def __init__(self) -> None:
+            self.list_calls = 0
+
+        async def list_lifecycle_vector_tasks(self, **kwargs):
+            self.list_calls += 1
+            return [task] if self.list_calls == 1 else []
+
+        async def complete_lifecycle_vector_task(self, task_id: str) -> None:
+            assert task_id == task.id
+            raise ValueError("lifecycle vector task is not pending")
+
+        async def fail_lifecycle_vector_task(self, task_id: str, error: str) -> None:
+            assert task_id == task.id
+            raise ValueError("lifecycle vector task is not pending")
+
+    class Vector:
+        async def delete(self, memory_ids: list[str]) -> None:
+            assert memory_ids == [task.memory_id]
+
+    relational = Relational()
+    store = object.__new__(MemoryStore)
+    store.relational = relational
+    store.vector = Vector()
+
+    result = await store.attempt_lifecycle_vector_delivery(source_id="src-raced")
+
+    assert not result.pending
+    assert result.attempted_tasks == 1
+    assert result.delivered_tasks == 0
+    assert result.failed_tasks == 0
+    assert result.error_types == ()
+    assert relational.list_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_vector_delivery_retries_historical_failed_task() -> None:
+    task = LifecycleVectorTask(
+        id="task-retry",
+        lifecycle_plan_id="plan-retry",
+        memory_id="memory-retry",
+        operation=LifecycleVectorOperation.DELETE,
+        status=LifecycleVectorTaskStatus.FAILED,
+        attempts=1,
+        error="provider unavailable",
+    )
+
+    class Relational:
+        def __init__(self) -> None:
+            self.completed: list[str] = []
+
+        async def list_lifecycle_vector_tasks(self, **kwargs):
+            return [task]
+
+        async def complete_lifecycle_vector_task(self, task_id: str) -> None:
+            self.completed.append(task_id)
+
+        async def fail_lifecycle_vector_task(self, task_id: str, error: str) -> None:
+            raise AssertionError((task_id, error))
+
+    class Vector:
+        async def delete(self, memory_ids: list[str]) -> None:
+            assert memory_ids == [task.memory_id]
+
+    relational = Relational()
+    store = object.__new__(MemoryStore)
+    store.relational = relational
+    store.vector = Vector()
+
+    result = await store.attempt_lifecycle_vector_delivery(source_id="src-retry")
+
+    assert not result.pending
+    assert result.delivered_tasks == 1
+    assert result.failed_tasks == 0
+    assert relational.completed == [task.id]
+
+
+@pytest.mark.asyncio
 async def test_delete_source_cascade_keeps_durable_cleanup_when_memory_vector_delete_fails(db: Database):
     await db.upsert_source(
         "src-rollback", "confluence", "Rollback Source", "{}", access_policy="workspace", owner_user_id="dev"
@@ -1697,8 +1831,19 @@ async def test_delete_source_cascade_keeps_durable_cleanup_when_memory_vector_de
     assert cleanup.status is LifecycleVectorTaskStatus.FAILED
 
     retry_store = _store(db, RecordingCollection())
-    await retry_store.drain_lifecycle_vector_outbox(source_id="src-rollback")
+    delivery = await retry_store.attempt_lifecycle_vector_delivery(source_id="src-rollback")
+    assert not delivery.pending
     assert await db.list_lifecycle_vector_tasks(source_id="src-rollback") == []
+    async with db.db.execute(
+        "SELECT status, error FROM source_deletion_vector_outbox WHERE id = ?",
+        (cleanup.id,),
+    ) as cursor:
+        recovered = await cursor.fetchone()
+    assert recovered is not None
+    assert (recovered["status"], recovered["error"]) == (
+        "completed",
+        cleanup.error,
+    )
 
 
 @pytest.mark.asyncio

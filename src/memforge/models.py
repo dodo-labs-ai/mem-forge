@@ -50,6 +50,16 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def parse_memory_validity_date(value: str | None) -> date | None:
+    """Parse an extracted ISO date or datetime into a calendar date."""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value[:10])
+    except (TypeError, ValueError):
+        return None
+
+
 # Provenance documents written by direct user lifecycle operations are virtual:
 # they intentionally do not correspond to a configured Source row.
 VIRTUAL_DOCUMENT_SOURCE_IDS = frozenset({"user_memory", "user_correction"})
@@ -524,6 +534,8 @@ class SourceSyncRun:
     rerun_input_generation_watermark: int | None = None
     source_config_revision: str | None = None
     rerun_source_config_revision: str | None = None
+    predecessor_activity_id: str | None = None
+    rerun_predecessor_activity_id: str | None = None
     coalesced: bool = False
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None

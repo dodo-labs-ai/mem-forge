@@ -33,7 +33,12 @@ from memforge.memory.index_payloads import (
     memory_embedding_text,
 )
 from memforge.memory.lifecycle import allowed_search_statuses
-from memforge.memory.lifecycle_plan import LifecyclePlan, LifecycleVectorOperation
+from memforge.memory.lifecycle_plan import (
+    LifecyclePlan,
+    LifecycleVectorDeliveryResult,
+    LifecycleVectorDeliveryState,
+    LifecycleVectorOperation,
+)
 from memforge.memory.lifecycle_planner import lifecycle_access_context_hash
 from memforge.models import (
     Memory,
@@ -48,6 +53,7 @@ from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
+from memforge.source_activity import SourceActivityLease
 from memforge.source_projection import SourceProjection
 
 logger = logging.getLogger(__name__)
@@ -57,6 +63,7 @@ __all__ = ["MemoryStore"]
 DEDUP_CANDIDATE_LIMIT = 10
 AGENT_CLAIM_RECONCILE_LIMIT = 10
 AGENT_CLAIM_RECONCILE_SIMILARITY_FLOOR = 0.85
+LIFECYCLE_VECTOR_DELIVERY_BATCH_SIZE = 100
 
 
 def _writer_access_scope(memory: Memory) -> AccessScope:
@@ -293,20 +300,43 @@ class MemoryStore:
                     )
             raise
 
-    async def drain_lifecycle_vector_outbox(
+    async def attempt_lifecycle_vector_delivery(
         self,
         lifecycle_plan_id: str | None = None,
         *,
         source_id: str | None = None,
-    ) -> None:
-        """Deliver durable vector side effects within one explicit ownership scope."""
+    ) -> LifecycleVectorDeliveryResult:
+        """Attempt durable vector work without changing relational commit semantics.
 
-        tasks = await self.relational.list_lifecycle_vector_tasks(
-            source_id=source_id,
-            lifecycle_plan_id=lifecycle_plan_id,
-        )
-        first_error: Exception | None = None
-        for task in tasks:
+        Lifecycle plans commit their relational graph before this method runs.
+        A vector or embedding failure therefore remains a durable outbox concern:
+        callers receive ``PENDING`` and must not compensate the committed graph.
+        """
+
+        scope = lifecycle_plan_id or source_id or "all"
+        try:
+            tasks = await self.relational.list_lifecycle_vector_tasks(
+                source_id=source_id,
+                lifecycle_plan_id=lifecycle_plan_id,
+                limit=LIFECYCLE_VECTOR_DELIVERY_BATCH_SIZE + 1,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Lifecycle vector delivery lookup remains pending scope=%s error_type=%s",
+                scope,
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return LifecycleVectorDeliveryResult(
+                state=LifecycleVectorDeliveryState.PENDING,
+                error_types=(type(exc).__name__,),
+            )
+
+        more_work = len(tasks) > LIFECYCLE_VECTOR_DELIVERY_BATCH_SIZE
+        selected_tasks = tasks[:LIFECYCLE_VECTOR_DELIVERY_BATCH_SIZE]
+        delivered_tasks = 0
+        error_types: list[str] = []
+        for task in selected_tasks:
             try:
                 if task.operation is LifecycleVectorOperation.DELETE:
                     await self.vector.delete([task.memory_id])
@@ -331,11 +361,62 @@ class MemoryStore:
                         ],
                     )
                 await self.relational.complete_lifecycle_vector_task(task.id)
+                delivered_tasks += 1
             except Exception as exc:
-                await self.relational.fail_lifecycle_vector_task(task.id, str(exc))
-                first_error = first_error or exc
-        if first_error is not None:
-            raise first_error
+                error_types.append(type(exc).__name__)
+                try:
+                    await self.relational.fail_lifecycle_vector_task(task.id, str(exc))
+                except Exception as persistence_exc:
+                    error_types.append(type(persistence_exc).__name__)
+                    logger.warning(
+                        "Lifecycle vector task failure could not be persisted task=%s scope=%s "
+                        "error_type=%s persistence_error_type=%s",
+                        task.id,
+                        scope,
+                        type(exc).__name__,
+                        type(persistence_exc).__name__,
+                        exc_info=True,
+                    )
+                else:
+                    logger.warning(
+                        "Lifecycle vector task remains pending task=%s scope=%s error_type=%s",
+                        task.id,
+                        scope,
+                        type(exc).__name__,
+                    )
+
+        failed_tasks = len(selected_tasks) - delivered_tasks
+        if failed_tasks and not delivered_tasks:
+            try:
+                remaining_tasks = await self.relational.list_lifecycle_vector_tasks(
+                    source_id=source_id,
+                    lifecycle_plan_id=lifecycle_plan_id,
+                    limit=1,
+                )
+            except Exception as exc:
+                error_types.append(type(exc).__name__)
+            else:
+                if not remaining_tasks:
+                    # Another source-scoped consumer may have completed the
+                    # durable task after this batch listed it. Vector
+                    # operations are idempotent, so an empty durable remainder
+                    # is successful delivery rather than a false failure.
+                    return LifecycleVectorDeliveryResult(
+                        state=LifecycleVectorDeliveryState.DELIVERED,
+                        attempted_tasks=len(selected_tasks),
+                    )
+        state = (
+            LifecycleVectorDeliveryState.PENDING
+            if failed_tasks or more_work
+            else LifecycleVectorDeliveryState.DELIVERED
+        )
+        return LifecycleVectorDeliveryResult(
+            state=state,
+            attempted_tasks=len(selected_tasks),
+            delivered_tasks=delivered_tasks,
+            failed_tasks=failed_tasks,
+            error_types=tuple(dict.fromkeys(error_types)),
+        )
 
     # -------------------------------------------------------------------
     # Core: Deduplicate and Insert
@@ -527,6 +608,22 @@ class MemoryStore:
         )
         return "inserted"
 
+    async def find_access_compatible_exact_candidate(
+        self,
+        memory: Memory,
+        *,
+        excluded_memory_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> Memory | None:
+        """Return an active exact claim without vector or model dependence."""
+
+        return await self.relational.find_active_exact_claim_candidate(
+            memory.content_hash,
+            visibility=memory.visibility,
+            owner_user_id=memory.owner_user_id,
+            repo_identifier=memory.repo_identifier,
+            excluded_memory_ids=tuple(sorted(excluded_memory_ids)),
+        )
+
     async def find_access_compatible_equivalence_candidates(
         self,
         memory: Memory,
@@ -543,6 +640,19 @@ class MemoryStore:
         not a visibility boundary.
         """
 
+        compatible: list[Memory] = []
+        reactivation_candidate = await self.relational.find_rebaseline_reactivation_candidate(
+            memory.content_hash,
+            visibility=memory.visibility,
+            owner_user_id=memory.owner_user_id,
+            repo_identifier=memory.repo_identifier,
+        )
+        if (
+            reactivation_candidate is not None
+            and reactivation_candidate.id not in excluded_memory_ids
+        ):
+            compatible.append(reactivation_candidate)
+
         embedding = await self._embed(_memory_embedding_text(memory))
         candidates = await self.vector.query(
             embedding,
@@ -550,14 +660,25 @@ class MemoryStore:
             None,
             DEDUP_CANDIDATE_LIMIT,
         )
-        compatible: list[Memory] = []
+        candidate_ids = [
+            existing_id
+            for existing_id, score in candidates
+            if existing_id not in excluded_memory_ids
+            and self.vector.within_dedup_threshold(self.dedup_threshold, score)
+        ]
+        ordinary_by_id = {
+            candidate.id: candidate
+            for candidate in await self.relational.list_active_ordinary_claim_memories(
+                candidate_ids
+            )
+        }
         for existing_id, score in candidates:
             if existing_id in excluded_memory_ids:
                 continue
             if not self.vector.within_dedup_threshold(self.dedup_threshold, score):
                 continue
-            existing = await self.db.get_memory(existing_id)
-            if existing is None or existing.status != MemoryStatus.ACTIVE.value:
+            existing = ordinary_by_id.get(existing_id)
+            if existing is None:
                 continue
             if existing.visibility != memory.visibility:
                 continue
@@ -1160,7 +1281,7 @@ class MemoryStore:
                 concept_projection=concept_projection,
                 concept_markdown_body=concept_markdown_body,
             )
-            await self.drain_lifecycle_vector_outbox(lifecycle_plan.id)
+            await self.attempt_lifecycle_vector_delivery(lifecycle_plan.id)
             await self._emit(
                 "memory_insert_committed",
                 "committed",
@@ -1237,7 +1358,7 @@ class MemoryStore:
                 citations=citations,
                 concept_markdown_body=concept_markdown_body,
             )
-            await self.drain_lifecycle_vector_outbox(lifecycle_plan.id)
+            await self.attempt_lifecycle_vector_delivery(lifecycle_plan.id)
             await self._emit(
                 "memory_supersede_committed",
                 "committed",
@@ -1302,7 +1423,7 @@ class MemoryStore:
                 observed_at=observed_at,
                 concept_markdown_body=concept_markdown_body,
             )
-            await self.drain_lifecycle_vector_outbox(plan.id)
+            await self.attempt_lifecycle_vector_delivery(plan.id)
             await self._emit(
                 "memory_retire_committed",
                 "committed",
@@ -1750,24 +1871,26 @@ class MemoryStore:
             raise
         retired_ids = list(deletion_result.retired_memory_ids)
         if deletion_result.retired_search_cleanup_required:
-            try:
-                await self.drain_lifecycle_vector_outbox(source_id=source_id)
-            except Exception as exc:
+            delivery = await self.attempt_lifecycle_vector_delivery(source_id=source_id)
+            if delivery.pending:
                 # Relational deletion is already complete and authoritative.
                 # The independent outbox survives source-row deletion and is
                 # retried; never resurrect a partial copy of the deleted graph.
                 logger.warning(
-                    "Deferred source deletion vector cleanup for %s: %s",
+                    "Deferred source deletion vector cleanup for %s error_types=%s",
                     source_id,
-                    exc,
+                    delivery.error_types,
                 )
                 await self._emit(
                     "source_delete_vector_cleanup_deferred",
                     "failed",
                     context=context,
                     source_id=source_id,
-                    error=str(exc),
-                    payload={"retired_memory_ids": retired_ids},
+                    error=",".join(delivery.error_types),
+                    payload={
+                        "retired_memory_ids": retired_ids,
+                        "failed_tasks": delivery.failed_tasks,
+                    },
                 )
         await self._emit(
             "source_delete_cascade_committed",
@@ -1778,18 +1901,26 @@ class MemoryStore:
         )
         return retired_ids
 
-    async def rebaseline_source_lifecycle(self, source_id: str) -> list[str]:
+    async def rebaseline_source_lifecycle(
+        self,
+        source_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> list[str]:
         """Reset replayable source derivations and remove retired vectors."""
 
         context = self._operation_context(source_id=source_id)
-        result = await self.relational.rebaseline_source_lifecycle(source_id)
+        result = await self.relational.rebaseline_source_lifecycle(
+            source_id,
+            source_activity=source_activity,
+        )
         retired_ids = list(result.retired_memory_ids)
         if result.retired_search_cleanup_required:
             # SQLite records these external vector deletes in the durable
             # lifecycle outbox as part of the relational reset.  Retry earlier
             # failures for this source without coupling its job to another
             # source's pending vector work.
-            await self.drain_lifecycle_vector_outbox(source_id=source_id)
+            await self.attempt_lifecycle_vector_delivery(source_id=source_id)
         await self._emit(
             "source_rebaseline_committed",
             "committed",

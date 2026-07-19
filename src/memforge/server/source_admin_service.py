@@ -127,6 +127,16 @@ def _durable_sync_payload(run: Any) -> dict[str, Any]:
     }
 
 
+def _lifecycle_maintenance_payload(job: Any) -> dict[str, Any]:
+    status = getattr(job.status, "value", job.status)
+    return {
+        "status": str(status),
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "finished_at": job.completed_at,
+    }
+
+
 async def list_source_admin_rows(
     reader: SourceAdminReader,
     *,
@@ -164,6 +174,15 @@ async def list_source_admin_rows(
         row["doc_count"] = await reader.count_documents(source=source_id)
         row["access_transition"] = await reader.get_active_source_access_transition(
             source_id
+        )
+        lifecycle_jobs = await reader.list_lifecycle_backfill_jobs(
+            source_id,
+            limit=1,
+        )
+        row["lifecycle_maintenance"] = (
+            _lifecycle_maintenance_payload(lifecycle_jobs[0])
+            if lifecycle_jobs
+            else None
         )
         row.setdefault("client", None)
         durable_run = await reader.get_latest_source_sync_run(source_id=source_id)

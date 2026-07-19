@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping
@@ -38,13 +39,15 @@ from memforge.models import (
     content_hash,
 )
 from memforge.pipeline.source_projection_adapters import project_source_item
-from memforge.source_activity import SourceActivityConflict
+from memforge.source_activity import SourceActivityConflict, SourceActivityLease
 from memforge.source_projection import (
     AnchorKind,
     SourceAnchor,
     SourceObservationRevision,
     SourceProjection,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +75,49 @@ class HistoricalProjectionUnavailable(ValueError):
     def __init__(self, reason: HistoricalProjectionFailureReason) -> None:
         self.reason = reason
         super().__init__(reason.value)
+
+
+async def recover_stale_lifecycle_jobs(
+    db: Any,
+    *,
+    limit: int = 100,
+) -> tuple[LifecycleBackfillJob, ...]:
+    """Fail lifecycle maintenance jobs after their execution authority is gone."""
+
+    recovered: list[LifecycleBackfillJob] = []
+    for job_id in await db.list_stale_lifecycle_backfill_job_ids(limit=limit):
+        try:
+            recovered.append(
+                await db.recover_stale_lifecycle_backfill_job(
+                    job_id,
+                    error="source lifecycle maintenance lease expired before completion",
+                )
+            )
+        except SourceActivityConflict:
+            logger.info(
+                "Skipped stale lifecycle maintenance recovery after authority changed: %s",
+                job_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to recover stale lifecycle maintenance job %s",
+                job_id,
+            )
+    return tuple(recovered)
+
+
+async def _renew_lifecycle_authority(
+    db: Any,
+    job_id: str | None,
+) -> SourceActivityLease | None:
+    if job_id is None:
+        return None
+    lease = await db.renew_source_activity(
+        activity_id=job_id,
+        capability=job_id,
+        lease_seconds=900,
+    )
+    return lease
 
 
 async def _drain_task_despite_cancellation(task: asyncio.Future[Any]) -> Any:
@@ -170,15 +216,22 @@ async def list_agent_session_lifecycle_migration_candidates(
     return tuple(sorted(candidates, key=lambda candidate: candidate.source_id))
 
 
-async def _gate_active_support_invariant_violation(db: Any, source_id: str) -> None:
+async def _gate_active_support_invariant_violation(
+    db: Any,
+    source_id: str,
+    *,
+    lifecycle_job_id: str | None = None,
+) -> None:
     missing_support_count = await db.count_active_source_memories_without_support(source_id)
     if missing_support_count:
+        activity = await _renew_lifecycle_authority(db, lifecycle_job_id)
         await db.gate_destructive_lifecycle(
             source_id,
             reason=(
                 "lifecycle recovery detected "
                 f"{missing_support_count} active Memory support invariant violation(s)"
             ),
+            source_activity=activity,
         )
 
 
@@ -216,7 +269,11 @@ async def run_source_lifecycle_backfill_job(
         raise ValueError(f"lifecycle backfill job is already {job.status.value}")
     await db.start_lifecycle_backfill_job(job.id)
     try:
-        result = await run_source_lifecycle_backfill(db, source_id)
+        result = await run_source_lifecycle_backfill(
+            db,
+            source_id,
+            lifecycle_job_id=job.id,
+        )
         return await db.complete_lifecycle_backfill_job(
             job.id,
             scanned_memories=result.scanned_memories,
@@ -267,17 +324,29 @@ async def run_source_lifecycle_recovery_job(
         raise ValueError(f"lifecycle backfill job is already {job.status.value}")
     await db.start_lifecycle_backfill_job(job.id)
     try:
-        result = await run_source_lifecycle_backfill(db, source_id)
+        result = await run_source_lifecycle_backfill(
+            db,
+            source_id,
+            lifecycle_job_id=job.id,
+        )
         if result.finding_count and reconstruct_documents is not None:
             missing_projection_ids = await _missing_projection_document_ids(db, source_id)
             if missing_projection_ids:
                 await reconstruct_documents(missing_projection_ids)
-                result = await run_source_lifecycle_backfill(db, source_id)
+                result = await run_source_lifecycle_backfill(
+                    db,
+                    source_id,
+                    lifecycle_job_id=job.id,
+                )
         if result.finding_count and repair_projections is not None:
             target_document_ids = await _identifiable_finding_document_ids(db, source_id)
             if target_document_ids:
                 await repair_projections(target_document_ids)
-                result = await run_source_lifecycle_backfill(db, source_id)
+                result = await run_source_lifecycle_backfill(
+                    db,
+                    source_id,
+                    lifecycle_job_id=job.id,
+                )
         return await db.complete_lifecycle_backfill_job(
             job.id,
             scanned_memories=result.scanned_memories,
@@ -303,6 +372,7 @@ async def reconstruct_historical_source_projection(
     source_id: str,
     source_type: str,
     document_id: str,
+    lifecycle_job_id: str | None = None,
 ) -> SourceProjection:
     """Rebuild one missing projection from durable source-scoped content.
 
@@ -351,7 +421,12 @@ async def reconstruct_historical_source_projection(
             last_synced=observed_at,
             client="agent_session",
         )
-        await db.upsert_document(document, require_configured_source=True)
+        activity = await _renew_lifecycle_authority(db, lifecycle_job_id)
+        await db.upsert_document(
+            document,
+            require_configured_source=True,
+            source_activity=activity,
+        )
     content_type = document.raw_content_type or "application/octet-stream"
     artifact_failure_reason: HistoricalProjectionFailureReason | None = None
     artifact_failure_cause: FileNotFoundError | None = None
@@ -471,7 +546,11 @@ async def reconstruct_historical_source_projection(
             "document_version": document.version,
         },
     )
-    await db.record_source_projection(projection)
+    activity = await _renew_lifecycle_authority(db, lifecycle_job_id)
+    await db.record_source_projection(
+        projection,
+        expected_source_activity_epoch=activity.epoch if activity is not None else None,
+    )
     return projection
 
 
@@ -483,6 +562,7 @@ async def repair_lifecycle_cutover_finding(
     observation_id: str,
     evidence_quote: str | None = None,
     operator_id: str | None = None,
+    lifecycle_job_id: str | None = None,
 ) -> LifecycleCutoverFinding:
     """Resolve an ambiguous finding using one explicitly selected Observation."""
 
@@ -550,15 +630,23 @@ async def repair_lifecycle_cutover_finding(
             "operator_id": operator_id,
             "legacy_excerpt_replaced": bool(quote and quote != original_excerpt),
         },
+        lifecycle_job_id=lifecycle_job_id,
     )
+    activity = await _renew_lifecycle_authority(db, lifecycle_job_id)
     return await db.resolve_lifecycle_cutover_finding(
         finding_id,
         observation_id=observation_id,
         source_unit_id=source_unit_id,
+        source_activity=activity,
     )
 
 
-async def run_source_lifecycle_backfill(db: Any, source_id: str) -> CutoverBackfillResult:
+async def run_source_lifecycle_backfill(
+    db: Any,
+    source_id: str,
+    *,
+    lifecycle_job_id: str | None = None,
+) -> CutoverBackfillResult:
     """Map legacy Memory provenance to persisted Source Observation lineage.
 
     The service never uses similarity as lineage evidence. It accepts an exact
@@ -577,11 +665,48 @@ async def run_source_lifecycle_backfill(db: Any, source_id: str) -> CutoverBackf
     for memory_id, provenance_rows in sorted(by_memory.items()):
         finding_id = _stable_id("finding", source_id, memory_id)
         existing_finding = await db.get_lifecycle_cutover_finding(finding_id)
+        active_support = await db.get_active_memory_support_evidence(
+            memory_id,
+            source_id=source_id,
+        )
+        primary_support = next(
+            (item for item in active_support if item.role is EvidenceRole.PRIMARY),
+            None,
+        )
+        support_unit = (
+            await db.get_evidence_unit(primary_support.evidence_unit_id)
+            if primary_support is not None
+            else None
+        )
+        current_support_revision = None
+        if support_unit is not None and support_unit.source_lineage_id:
+            current_revisions = await db.get_current_source_observation_revisions(
+                support_unit.source_lineage_id
+            )
+            current_support_revision = current_revisions.get(
+                primary_support.anchor.observation_id
+            )
         if (
-            existing_finding is not None
-            and existing_finding.status is CutoverFindingStatus.RESOLVED
+            primary_support is not None
+            and support_unit is not None
+            and support_unit.source_id == source_id
+            and support_unit.source_lineage_id
+            and current_support_revision is not None
+            and current_support_revision.id
+            == primary_support.anchor.observation_revision_id
         ):
             mapped += 1
+            if (
+                existing_finding is not None
+                and existing_finding.status is CutoverFindingStatus.OPEN
+            ):
+                activity = await _renew_lifecycle_authority(db, lifecycle_job_id)
+                await db.resolve_lifecycle_cutover_finding(
+                    finding_id,
+                    observation_id=primary_support.anchor.observation_id,
+                    source_unit_id=support_unit.source_lineage_id,
+                    source_activity=activity,
+                )
             continue
         mapped_lineage: tuple[str, str] | None = None
         attempts: list[dict[str, object]] = []
@@ -620,6 +745,7 @@ async def run_source_lifecycle_backfill(db: Any, source_id: str) -> CutoverBackf
                 source_unit_id=source_unit.id,
                 observation_id=observation_id,
                 revision=revision,
+                lifecycle_job_id=lifecycle_job_id,
             )
             mapped_lineage = (observation_id, source_unit.id)
             attempts.append(
@@ -635,14 +761,17 @@ async def run_source_lifecycle_backfill(db: Any, source_id: str) -> CutoverBackf
         if mapped_lineage is not None:
             mapped += 1
             if existing_finding is not None and existing_finding.status is CutoverFindingStatus.OPEN:
+                activity = await _renew_lifecycle_authority(db, lifecycle_job_id)
                 await db.resolve_lifecycle_cutover_finding(
                     finding_id,
                     observation_id=mapped_lineage[0],
                     source_unit_id=mapped_lineage[1],
+                    source_activity=activity,
                 )
             continue
 
         findings += 1
+        activity = await _renew_lifecycle_authority(db, lifecycle_job_id)
         await db.upsert_lifecycle_cutover_finding(
             LifecycleCutoverFinding(
                 id=finding_id,
@@ -661,17 +790,23 @@ async def run_source_lifecycle_backfill(db: Any, source_id: str) -> CutoverBackf
                     ]
                 },
                 mapping_attempt={"strategy": "exact_document_locator_then_excerpt", "attempts": attempts},
-            )
+            ),
+            source_activity=activity,
         )
 
     gate_enabled = False
+    activity = await _renew_lifecycle_authority(db, lifecycle_job_id)
     if findings == 0:
-        await db.enable_lifecycle_gate(source_id)
+        await db.enable_lifecycle_gate(
+            source_id,
+            source_activity=activity,
+        )
         gate_enabled = True
     else:
         await db.gate_destructive_lifecycle(
             source_id,
             reason=f"{findings} open lifecycle cutover finding(s)",
+            source_activity=activity,
         )
     return CutoverBackfillResult(
         source_id=source_id,
@@ -714,7 +849,9 @@ async def _persist_backfill_lineage(
     observation_id: str,
     revision: SourceObservationRevision,
     repair_metadata: Mapping[str, object] | None = None,
+    lifecycle_job_id: str | None = None,
 ) -> None:
+    activity = await _renew_lifecycle_authority(db, lifecycle_job_id)
     evidence_unit_id = _stable_id("eu-backfill", source_id, memory_id, revision.id)
     access_hash = _access_context_hash(provenance)
     unit = EvidenceUnit(
@@ -739,7 +876,10 @@ async def _persist_backfill_lineage(
         },
         access_context_hash=access_hash,
     )
-    await db.upsert_evidence_unit(unit)
+    await db.upsert_evidence_unit(
+        unit,
+        source_activity=activity,
+    )
     references = await db.record_evidence_references(
         unit.id,
         (
@@ -753,6 +893,7 @@ async def _persist_backfill_lineage(
                 evidence_unit_id=unit.id,
             ),
         ),
+        source_activity=activity,
     )
     reference = references[0]
     await db.upsert_memory_support_assertion(
@@ -762,7 +903,8 @@ async def _persist_backfill_lineage(
             evidence_reference_id=reference.id or "",
             source_id=source_id,
             access_context_hash=access_hash,
-        )
+        ),
+        source_activity=activity,
     )
 
 
