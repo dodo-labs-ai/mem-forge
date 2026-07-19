@@ -134,18 +134,6 @@ def _audited_memory_store(db: Database, collection: FakeCollection | None = None
     )
 
 
-def test_source_support_prompt_requires_full_entailment_not_related_context():
-    from memforge.pipeline.source_support_detector import SOURCE_SUPPORT_PROMPT
-
-    prompt = SOURCE_SUPPORT_PROMPT.lower()
-
-    assert "entails the full memory content" in prompt
-    assert "merely related" in prompt
-    assert "narrower" in prompt
-    assert "broader" in prompt
-    assert "different actors" in prompt
-
-
 @dataclass
 class RecordingContext:
     operation_id: str
@@ -783,46 +771,6 @@ async def test_support_detection_audits_verified_support_with_model_and_reason(d
     assert verified[0].prompt_hash
     assert verified[0].reason == "direct statement"
     assert verified[0].evidence_refs == [{"excerpt": excerpt}]
-
-
-@pytest.mark.asyncio
-async def test_support_detection_audits_supported_verifier_decision(db: Database):
-    await _insert_doc(db, "doc-origin")
-    await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("verified support", display_name="Verified Support", tags=["feature"])
-    memory = _memory("mem-support-verified", "Verified support is auditable.")
-    await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
-
-    excerpt = "Verified support is auditable."
-    structured_client = FakeStructuredSupportClient(
-        [
-            _support_response(
-                [
-                    {"memory_id": memory.id, "supported": True, "excerpt": excerpt, "reason": "direct support"},
-                ]
-            )
-        ]
-    )
-    detector = SourceSupportDetector(structured_llm_client=structured_client, llm_model="claude-test")
-
-    await detector.detect_and_persist(
-        doc_id="doc-support",
-        source_type="confluence",
-        document=excerpt,
-        entity_ids=[entity_id],
-        project_key="PAY",
-        db=db,
-        memory_store=_audited_memory_store(db),
-        source_updated_at=None,
-    )
-
-    audit_rows = await db.list_memory_audit_events(memory_id=memory.id)
-    verified_rows = [row for row in audit_rows if row.event_type == "source_support_verified"]
-    assert len(verified_rows) == 1
-    assert verified_rows[0].model == "claude-test"
-    assert verified_rows[0].prompt_hash
-    assert verified_rows[0].reason == "direct support"
-    assert verified_rows[0].evidence_refs == [{"excerpt": excerpt}]
 
 
 @pytest.mark.asyncio

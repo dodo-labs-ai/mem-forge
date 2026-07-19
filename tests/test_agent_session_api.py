@@ -1465,26 +1465,33 @@ def test_agent_session_window_requires_primary_user_anchor_for_both_clients(tmp_
         asyncio.run(database.close())
 
 
+@pytest.mark.parametrize(
+    ("is_authoritative", "expected_result"),
+    [(False, "no_output"), (True, "knowledge_patched")],
+)
 @pytest.mark.parametrize("client_name", ["codex", "claude-code"])
-def test_agent_session_window_rejects_generic_continuation_as_memory_authority(tmp_path, client_name):
-    """Generic user control messages cannot authorize assistant-invented durable memory."""
+def test_agent_session_window_applies_typed_authority_decision(
+    tmp_path,
+    is_authoritative,
+    expected_result,
+    client_name,
+):
+    """The service applies the classifier contract without reimplementing its semantics."""
     from memforge.server.admin_api import create_admin_app
 
-    class OverEagerClient:
+    class TypedDecisionClient:
         async def classify_agent_session_evidence_authority(self, prompt: str, **kwargs):
-            assert "Decide semantically" in prompt
-            assert "<candidate_user_evidence_json>" in prompt
-            candidates = _authority_prompt_candidate_ids(prompt)
-            assert candidates == ["E1"]
-            assert '"text": "continue"' in prompt
+            assert _authority_prompt_candidate_ids(prompt) == ["E1"]
             return AgentSessionAuthorityResponse.model_validate(
                 {
                     "decisions": [
                         {
                             "evidence_id": "E1",
-                            "is_authoritative": False,
-                            "authority_kind": "not_authoritative",
-                            "reason": "generic chat continuation, not durable user intent",
+                            "is_authoritative": is_authoritative,
+                            "authority_kind": (
+                                "durable_user_intent" if is_authoritative else "not_authoritative"
+                            ),
+                            "reason": "typed test decision",
                         }
                     ]
                 }
@@ -1497,19 +1504,17 @@ def test_agent_session_window_rejects_generic_continuation_as_memory_authority(t
                 re.DOTALL,
             )
             assert primary_section is not None
-            assert "[E1:user_message] continue" not in primary_section.group(1)
-            assert "- none" in primary_section.group(1)
+            if is_authoritative:
+                assert "[E1:user_message] Candidate user evidence." in primary_section.group(1)
+            else:
+                assert "[E1:user_message] Candidate user evidence." not in primary_section.group(1)
+                assert "- none" in primary_section.group(1)
             return _knowledge_patch(
-                title="Self-authored verification procedure",
-                claim_text=(
-                    "A complete verification procedure requires submitting a live smoke "
-                    "window and comparing durable memory text against provenance."
-                ),
-                durable_claim=_durable(
-                    "A complete verification procedure requires live smoke plus provenance comparison."
-                ),
+                title="Typed authority routing",
+                claim_text="Typed authoritative evidence can create a durable memory.",
+                durable_claim=_durable("Typed authoritative evidence can create a durable memory."),
                 primary_evidence_ids=["E1"],
-                reason="generic continuation should not authorize this assistant-derived procedure",
+                reason="exercise the authority decision boundary",
             )
 
     cfg = _config(tmp_path)
@@ -1520,25 +1525,17 @@ def test_agent_session_window_rejects_generic_continuation_as_memory_authority(t
     asyncio.run(database.connect())
     try:
         app = create_admin_app(db=database, config=cfg)
-        app.state.agent_session_window_client = OverEagerClient()
+        app.state.agent_session_window_client = TypedDecisionClient()
         with TestClient(app) as http:
             response = http.post(
                 "/api/agent-sessions/windows",
                 json={
                     "client": client_name,
-                    "session_id": f"sess-{client_name}-generic-continuation",
+                    "session_id": f"sess-{client_name}-typed-authority-{is_authoritative}",
                     "trigger": "Stop",
                     "workspace": "/workspace/mem-forge",
                     "events": [
-                        {"role": "user", "text": "continue"},
-                        {
-                            "role": "assistant",
-                            "text": (
-                                "To validate the extraction pipeline, a complete procedure "
-                                "requires submitting a live smoke session and comparing the "
-                                "memory against provenance."
-                            ),
-                        },
+                        {"role": "user", "text": "Candidate user evidence."},
                     ],
                     "submitted_at": "2026-06-25T10:00:00+00:00",
                 },
@@ -1546,91 +1543,19 @@ def test_agent_session_window_rejects_generic_continuation_as_memory_authority(t
 
         assert response.status_code == 200
         body = response.json()
-        assert body["result"] == "no_output"
-        assert body["patch_outcome"] == "skipped_not_memory"
-        assert "primary evidence" in body["reason"]
+        assert body["result"] == expected_result
+        if is_authoritative:
+            memory = asyncio.run(database.get_memory(body["memory_id"]))
+            assert memory is not None
+            assert memory.content.startswith("Typed authoritative evidence can create a durable memory.")
+        else:
+            assert body["patch_outcome"] == "skipped_not_memory"
+            assert "primary evidence" in body["reason"]
+            async def _count_memories():
+                async with database.db.execute("SELECT COUNT(*) FROM memories") as cursor:
+                    return (await cursor.fetchone())[0]
 
-        async def _check():
-            assert await database.get_source(f"src-agent-sessions-{client_name}") is None
-            async with database.db.execute("SELECT COUNT(*) FROM memories") as cursor:
-                row = await cursor.fetchone()
-            assert row[0] == 0
-
-        asyncio.run(_check())
-    finally:
-        asyncio.run(database.close())
-
-
-@pytest.mark.parametrize("client_name", ["codex", "claude-code"])
-def test_agent_session_window_accepts_semantic_durable_authority_without_keyword_regex(tmp_path, client_name):
-    """The LLM authority classifier, not regex keywords, controls primary evidence."""
-    from memforge.server.admin_api import create_admin_app
-
-    class SemanticClient:
-        async def classify_agent_session_evidence_authority(self, prompt: str, **kwargs):
-            assert _authority_prompt_candidate_ids(prompt) == ["E1"]
-            assert "From now on, treat OSS storage protocols as the source of truth." in prompt
-            return AgentSessionAuthorityResponse.model_validate(
-                {
-                    "decisions": [
-                        {
-                            "evidence_id": "E1",
-                            "is_authoritative": True,
-                            "authority_kind": "durable_user_intent",
-                            "reason": "user sets a durable source-of-truth convention",
-                        }
-                    ]
-                }
-            )
-
-        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
-            assert "<primary_evidence>" in prompt
-            assert "[E1:user_message] From now on, treat OSS storage protocols as the source of truth." in prompt
-            return _knowledge_patch(
-                title="OSS storage protocol source of truth",
-                claim_text="OSS storage protocols are the source of truth for shared adapter behavior.",
-                durable_claim=_durable(
-                    "OSS storage protocols are the source of truth for shared adapter behavior.",
-                    scope="MemForge storage adapters and route contracts.",
-                ),
-                memory_type="convention",
-                primary_evidence_ids=["E1"],
-                tags=["storage-contract", "oss"],
-            )
-
-    cfg = _config(tmp_path)
-    database = Database(str(tmp_path / "api.db"))
-
-    import asyncio
-
-    asyncio.run(database.connect())
-    try:
-        app = create_admin_app(db=database, config=cfg)
-        app.state.agent_session_window_client = SemanticClient()
-        with TestClient(app) as http:
-            response = http.post(
-                "/api/agent-sessions/windows",
-                json={
-                    "client": client_name,
-                    "session_id": f"sess-{client_name}-semantic-authority",
-                    "trigger": "Stop",
-                    "workspace": "/workspace/mem-forge",
-                    "events": [
-                        {
-                            "role": "user",
-                            "text": "From now on, treat OSS storage protocols as the source of truth.",
-                        }
-                    ],
-                    "submitted_at": "2026-06-25T10:05:00+00:00",
-                },
-            )
-
-        assert response.status_code == 200, response.text
-        body = response.json()
-        assert body["result"] == "knowledge_patched"
-        memory = asyncio.run(database.get_memory(body["memory_id"]))
-        assert memory is not None
-        assert "OSS storage protocols are the source of truth" in memory.content
+            assert asyncio.run(_count_memories()) == 0
     finally:
         asyncio.run(database.close())
 

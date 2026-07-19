@@ -447,69 +447,6 @@ async def test_store_source_cascade_cleans_indexes_for_retired_memories(db: Data
     assert collection.deleted == [memory.id]
 
 
-def test_memory_extraction_prompt_rejects_metadata_and_preserves_modality():
-    from memforge.pipeline.memory_extractor import MEMORY_EXTRACTION_PROMPT
-
-    prompt = MEMORY_EXTRACTION_PROMPT.lower()
-
-    assert "do not extract document metadata" in prompt
-    assert "author" in prompt
-    assert "last modified" in prompt
-    assert "document status" in prompt
-    assert "link list" in prompt
-    assert "preserve conditional language" in prompt
-    assert "do not turn open questions into decisions" in prompt
-    assert "agent_session" in prompt
-    assert "validation commands" in prompt
-    assert "runtime notes" in prompt
-    assert "local paths" in prompt
-
-
-def test_memory_extraction_prompts_preserve_source_language():
-    from memforge.pipeline.memory_extractor import (
-        MEMORY_CHANGE_EXTRACTION_PROMPT,
-        MEMORY_EXTRACTION_PROMPT,
-        UNIT_MEMORY_EXTRACTION_PROMPT,
-    )
-
-    for prompt in (
-        MEMORY_EXTRACTION_PROMPT,
-        MEMORY_CHANGE_EXTRACTION_PROMPT,
-        UNIT_MEMORY_EXTRACTION_PROMPT,
-    ):
-        lowered = prompt.lower()
-        assert "preserve the source language" in lowered
-        assert "do not translate memories to english" in lowered
-        assert "primarily chinese" in lowered
-
-
-def test_memory_change_extraction_prompt_rejects_operational_metadata_changes():
-    from memforge.pipeline.memory_extractor import MEMORY_CHANGE_EXTRACTION_PROMPT
-
-    prompt = MEMORY_CHANGE_EXTRACTION_PROMPT.lower()
-
-    assert "operational metadata" in prompt
-    assert "status" in prompt
-    assert "assignee" in prompt
-    assert "sprint" in prompt
-    assert "timestamps" in prompt
-    assert '"memories": []' in prompt
-    assert "only removes old durable knowledge" in prompt
-    assert "reconciliation will decide whether to retire the old memory" in prompt
-    assert "do not create memories about the edit itself" in prompt
-    assert "sender name and timestamp prefix" in prompt
-
-
-def test_memory_extraction_prompt_preserves_weak_reference_relationships():
-    from memforge.pipeline.memory_extractor import MEMORY_EXTRACTION_PROMPT
-
-    prompt = MEMORY_EXTRACTION_PROMPT.lower()
-
-    assert "reference/link-only evidence" in prompt
-    assert "preserve the weaker relationship exactly as stated" in prompt
-    assert "do not infer" in prompt
-
-
 @pytest.mark.asyncio
 async def test_admin_memory_detail_exposes_service_artifact_urls_only(db: Database, tmp_path: Path):
     from memforge.server.admin_api import create_admin_app

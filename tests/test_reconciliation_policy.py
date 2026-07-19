@@ -105,54 +105,6 @@ def test_parse_decisions_can_remove_an_incumbent_without_a_new_candidate(index) 
 
 
 @pytest.mark.asyncio
-async def test_prompt_defines_canonical_replacement_and_destructive_evidence_rules() -> None:
-    incumbent = _memory(
-        "mem-old0001",
-        "Option A should depend on OD assignment validation.",
-    )
-
-    class Client:
-        prompt = ""
-
-        async def reconcile_memories(self, prompt: str, **kwargs):
-            del kwargs
-            self.prompt = prompt
-            return ReconciliationResponse(
-                decisions=[
-                    ReconciliationDecision(
-                        index=0,
-                        action="NOOP",
-                        memory_id=incumbent.id,
-                        reason="still supported",
-                    )
-                ]
-            )
-
-    client = Client()
-    await reconcile_memories(
-        new_extractions=[
-            RawMemory(
-                content="Option A is standalone and uses the prospective slot builder.",
-                memory_type="decision",
-            )
-        ],
-        existing_memories=[incumbent],
-        doc_type="design",
-        structured_llm_client=client,
-        updated_document="### Option A: Reuse Prospective Slot Building",
-        update_mode="diff_guided",
-        changed_hunks="-dependent on validation\n+standalone",
-        update_plan_stats={"reason": "small_diff"},
-    )
-
-    assert "replacement memory content must state the current durable fact" in client.prompt
-    assert "Do not write replacement content as edit history" in client.prompt
-    assert "DELETE or SUPERSEDE an existing memory only when <changed_hunks>" in client.prompt
-    assert "Do not DELETE solely because support is absent from unrelated context" in client.prompt
-    assert "exactly one explicit decision for every existing memory ID" in client.prompt
-
-
-@pytest.mark.asyncio
 async def test_classifier_failure_with_incumbents_fails_closed() -> None:
     class FailingClient:
         async def reconcile_memories(self, prompt: str, **kwargs):

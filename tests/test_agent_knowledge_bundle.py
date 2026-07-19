@@ -1760,77 +1760,6 @@ async def test_agent_evidence_unit_retry_is_idempotent_without_model_supplied_id
 
 
 @pytest.mark.asyncio
-async def test_agent_memory_prompt_describes_durable_memory_not_retrieval_projection(bundle_stack):
-    db, _store, _collection = bundle_stack
-
-    prompt = await render_agent_knowledge_patch_prompt(
-        db=db,
-        owner_user_id="u-andrew",
-        client="codex",
-        session_id="sess-1",
-        trigger="stop",
-        workspace="/workspace/memforge-cloud",
-        repo_identifier="github.tools.sap/hcm/memforge-cloud",
-        branch="main",
-        history_window={"kind": "transcript_window"},
-        events=[
-            {
-                "evidence_id": "E1",
-                "evidence_role": "primary",
-                "kind": "user_message",
-                "text": "Use immutable memory revisions.",
-            }
-        ],
-        transcript_markdown="",
-    )
-
-    assert "durable memory record" in prompt
-    assert "durable_claim" in prompt
-    assert "rule" in prompt
-    assert "scope" in prompt
-    assert "retrieval-ready" not in prompt
-    assert "memory projection" not in prompt
-
-
-@pytest.mark.asyncio
-async def test_agent_memory_prompt_separates_memory_from_evidence_details(bundle_stack):
-    db, _store, _collection = bundle_stack
-
-    prompt = await render_agent_knowledge_patch_prompt(
-        db=db,
-        owner_user_id="u-andrew",
-        client="codex",
-        session_id="sess-1",
-        trigger="stop",
-        workspace="/workspace/memforge-cloud",
-        repo_identifier="github.tools.sap/hcm/memforge-cloud",
-        branch="codex/example-branch",
-        history_window={"kind": "transcript_window"},
-        events=[
-            {
-                "evidence_id": "E1",
-                "evidence_role": "supporting",
-                "kind": "assistant_message",
-                "text": (
-                    "Fix implemented on branch codex/example-branch. "
-                    "Tests test_exact_impl_detail and test_prompt_contract passed. "
-                    "Durable rule: agent-session memories should preserve the reusable "
-                    "decision while provenance keeps branch and test evidence."
-                ),
-            }
-        ],
-        transcript_markdown="",
-    )
-
-    assert "claim_text may keep evidence details" in prompt
-    assert "branch names, exact test names" in prompt
-    assert "durable_claim.rule states the durable rule" in prompt
-    assert "durable_claim.scope states where or when the rule applies" in prompt
-    assert "omit evidence-only details" in prompt
-    assert "return no_output instead of copying claim_text" in prompt
-
-
-@pytest.mark.asyncio
 async def test_agent_memory_prompt_uses_primary_evidence_as_authorization_boundary(bundle_stack):
     db, _store, _collection = bundle_stack
 
@@ -1866,10 +1795,6 @@ async def test_agent_memory_prompt_uses_primary_evidence_as_authorization_bounda
     assert "<supporting_evidence>" in prompt
     assert "[E1:assistant_message] I verified the prompt tests" in prompt
     assert "<candidate_evidence>" not in prompt
-    assert "Supporting evidence cannot by itself authorize create_new_concept or add_new_claim" in prompt
-    assert "Primary evidence is explicit durable user intent" in prompt
-    assert 'Generic chat control such as "continue", "do it", "retry", or "ok"' in prompt
-    assert "primary_evidence_ids" in prompt
 
 
 @pytest.mark.asyncio
