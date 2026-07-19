@@ -610,6 +610,13 @@ class SqliteRelationalStore:
             error=error,
         )
 
+    async def list_stale_lifecycle_backfill_job_ids(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[str, ...]:
+        return await self._db.list_stale_lifecycle_backfill_job_ids(limit=limit)
+
     async def get_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob | None:
         return await self._db.get_lifecycle_backfill_job(job_id)
 

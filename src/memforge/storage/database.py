@@ -5656,6 +5656,14 @@ class Database:
                         raise SourceActivityConflict(
                             f"source lifecycle activity lease changed during recovery: {job_id}"
                         )
+                fenced = await self.db.execute(
+                    """UPDATE sources
+                       SET activity_epoch = COALESCE(activity_epoch, 0) + 1
+                       WHERE id = ?""",
+                    (source_id,),
+                )
+                if fenced.rowcount != 1:
+                    raise ValueError(f"Source not found: {source_id}")
                 cursor = await self.db.execute(
                     """UPDATE lifecycle_backfill_jobs
                        SET status = 'failed', error = ?, completed_at = ?, updated_at = ?
@@ -5671,6 +5679,27 @@ class Database:
         stored = await self.get_lifecycle_backfill_job(job_id)
         assert stored is not None
         return stored
+
+    async def list_stale_lifecycle_backfill_job_ids(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[str, ...]:
+        """List active lifecycle jobs whose execution lease has expired or disappeared."""
+
+        now_iso = _now_iso()
+        bounded_limit = max(1, min(int(limit), 1000))
+        rows = await self.db.execute_fetchall(
+            """SELECT job.id
+               FROM lifecycle_backfill_jobs job
+               LEFT JOIN source_activity_leases lease ON lease.id = job.id
+               WHERE job.status IN ('queued', 'running')
+                 AND (lease.id IS NULL OR lease.lease_until <= ?)
+               ORDER BY job.created_at, job.id
+               LIMIT ?""",
+            (now_iso, bounded_limit),
+        )
+        return tuple(str(row["id"]) for row in rows)
 
     async def get_lifecycle_backfill_job(
         self,
