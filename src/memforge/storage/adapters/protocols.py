@@ -301,6 +301,11 @@ class RelationalStore(Protocol):
         *,
         error: str,
     ) -> LifecycleBackfillJob: ...
+    async def list_stale_lifecycle_backfill_job_ids(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[str, ...]: ...
     async def get_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob | None: ...
     async def get_active_lifecycle_backfill_job(
         self,

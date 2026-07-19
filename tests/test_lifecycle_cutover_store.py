@@ -41,6 +41,7 @@ from memforge.memory.lifecycle_review import build_lifecycle_review_approval_pla
 from memforge.genes.local_markdown_gene import LocalMarkdownGene
 from memforge.memory.cutover import (
     list_agent_session_lifecycle_migration_candidates,
+    recover_stale_lifecycle_jobs,
     reconstruct_historical_source_projection,
     repair_lifecycle_cutover_finding,
     run_source_lifecycle_backfill,
@@ -1821,6 +1822,7 @@ async def test_recover_stale_lifecycle_backfill_job_fails_expired_job_atomically
         ("2000-01-01T00:00:00+00:00", job.id),
     )
     await db.db.commit()
+    fenced_epoch = await db.get_source_activity_epoch("src-1")
 
     recovered = await db.recover_stale_lifecycle_backfill_job(
         job.id,
@@ -1829,11 +1831,77 @@ async def test_recover_stale_lifecycle_backfill_job_fails_expired_job_atomically
 
     assert recovered.status is LifecycleBackfillJobStatus.FAILED
     assert recovered.error == "operator recovered expired lifecycle job"
+    assert await db.get_source_activity_epoch("src-1") == fenced_epoch + 1
     assert await db.get_active_lifecycle_backfill_job("src-1") is None
     assert not await db.release_source_activity(
         activity_id=job.id,
         capability=job.id,
     )
+
+
+@pytest.mark.asyncio
+async def test_list_stale_lifecycle_jobs_excludes_current_lease(
+    db: Database,
+) -> None:
+    await db.upsert_source(
+        id="src-current-maintenance",
+        type="confluence",
+        name="Current maintenance",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    stale = await db.create_source_rebaseline_job(
+        LifecycleBackfillJob(
+            id="sqlite-list-stale-lifecycle-job",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    current = await db.create_source_rebaseline_job(
+        LifecycleBackfillJob(
+            id="sqlite-list-current-lifecycle-job",
+            source_id="src-current-maintenance",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(stale.id)
+    await db.start_lifecycle_backfill_job(current.id)
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", stale.id),
+    )
+    await db.db.commit()
+
+    stale_ids = await db.list_stale_lifecycle_backfill_job_ids(limit=10)
+
+    assert stale_ids == (stale.id,)
+    await db.fail_lifecycle_backfill_job(current.id, error="test cleanup")
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_lifecycle_jobs_fails_orphaned_jobs(
+    db: Database,
+) -> None:
+    stale = await db.create_source_rebaseline_job(
+        LifecycleBackfillJob(
+            id="sqlite-sweep-stale-lifecycle-job",
+            source_id="src-1",
+            status=LifecycleBackfillJobStatus.QUEUED,
+        )
+    )
+    await db.start_lifecycle_backfill_job(stale.id)
+    await db.db.execute(
+        "DELETE FROM source_activity_leases WHERE id = ?",
+        (stale.id,),
+    )
+    await db.db.commit()
+
+    recovered = await recover_stale_lifecycle_jobs(db)
+
+    assert tuple(job.id for job in recovered) == (stale.id,)
+    assert recovered[0].status is LifecycleBackfillJobStatus.FAILED
+    assert recovered[0].error == "source lifecycle maintenance lease expired before completion"
 
 
 @pytest.mark.asyncio
@@ -2011,6 +2079,7 @@ async def test_recover_stale_lifecycle_backfill_job_rolls_back_partial_failure(
            BEGIN SELECT RAISE(ABORT, 'forced recovery failure'); END"""
     )
     await db.db.commit()
+    fenced_epoch = await db.get_source_activity_epoch("src-1")
 
     with pytest.raises(sqlite3.IntegrityError, match="forced recovery failure"):
         await db.recover_stale_lifecycle_backfill_job(job.id, error="must roll back")
@@ -2018,6 +2087,7 @@ async def test_recover_stale_lifecycle_backfill_job_rolls_back_partial_failure(
     stored = await db.get_lifecycle_backfill_job(job.id)
     assert stored is not None
     assert stored.status is LifecycleBackfillJobStatus.RUNNING
+    assert await db.get_source_activity_epoch("src-1") == fenced_epoch
     async with db.db.execute(
         "SELECT COUNT(*) AS count FROM source_activity_leases WHERE id = ?",
         (job.id,),

@@ -74,6 +74,24 @@ class HistoricalProjectionUnavailable(ValueError):
         super().__init__(reason.value)
 
 
+async def recover_stale_lifecycle_jobs(
+    db: Any,
+    *,
+    limit: int = 100,
+) -> tuple[LifecycleBackfillJob, ...]:
+    """Fail lifecycle maintenance jobs after their execution authority is gone."""
+
+    recovered: list[LifecycleBackfillJob] = []
+    for job_id in await db.list_stale_lifecycle_backfill_job_ids(limit=limit):
+        recovered.append(
+            await db.recover_stale_lifecycle_backfill_job(
+                job_id,
+                error="source lifecycle maintenance lease expired before completion",
+            )
+        )
+    return tuple(recovered)
+
+
 async def _drain_task_despite_cancellation(task: asyncio.Future[Any]) -> Any:
     while not task.done():
         try:
