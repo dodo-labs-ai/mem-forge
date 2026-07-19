@@ -9879,20 +9879,25 @@ class Database:
         """Insert or update a private agent-session concept."""
         observed = _utc_iso(observed_at)
         async with self._write_lock:
-            await self._upsert_agent_concept_unlocked(
-                concept_id=concept_id,
-                source_id=source_id,
-                owner_user_id=owner_user_id,
-                workspace=workspace,
-                repo_identifier=repo_identifier,
-                concept_type=concept_type,
-                concept_path=concept_path,
-                title=title,
-                markdown_body=markdown_body,
-                frontmatter=frontmatter,
-                observed=observed,
-            )
-            await self.db.commit()
+            try:
+                await self._upsert_agent_concept_unlocked(
+                    concept_id=concept_id,
+                    source_id=source_id,
+                    owner_user_id=owner_user_id,
+                    workspace=workspace,
+                    repo_identifier=repo_identifier,
+                    concept_type=concept_type,
+                    concept_path=concept_path,
+                    title=title,
+                    markdown_body=markdown_body,
+                    frontmatter=frontmatter,
+                    observed=observed,
+                )
+                await self.db.commit()
+            except BaseException:
+                rollback_task = asyncio.create_task(self.db.rollback())
+                await _drain_task_despite_cancellation(rollback_task)
+                raise
 
     async def _upsert_agent_concept_unlocked(
         self,
@@ -10663,22 +10668,30 @@ class Database:
         # Also write entity_type for backward compat (first tag or 'unknown')
         entity_type = tags[0] if tags else "unknown"
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO entities (canonical_name, entity_type, tags, display_name)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT(canonical_name) DO UPDATE SET
-                   entity_type=excluded.entity_type,
-                   tags=excluded.tags,
-                   display_name=excluded.display_name""",
-                (canonical_name, entity_type, tags_json, display_name),
-            )
-            async with self.db.execute("SELECT id FROM entities WHERE canonical_name = ?", (canonical_name,)) as cursor:
-                row = await cursor.fetchone()
-                assert row is not None
-                entity_id = int(row[0])
-            await self._refresh_entity_alias_search_unlocked(entity_id)
-            await self.db.commit()
-            return entity_id
+            try:
+                await self.db.execute(
+                    """INSERT INTO entities (canonical_name, entity_type, tags, display_name)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(canonical_name) DO UPDATE SET
+                       entity_type=excluded.entity_type,
+                       tags=excluded.tags,
+                       display_name=excluded.display_name""",
+                    (canonical_name, entity_type, tags_json, display_name),
+                )
+                async with self.db.execute(
+                    "SELECT id FROM entities WHERE canonical_name = ?",
+                    (canonical_name,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    assert row is not None
+                    entity_id = int(row[0])
+                await self._refresh_entity_alias_search_unlocked(entity_id)
+                await self.db.commit()
+                return entity_id
+            except BaseException:
+                rollback_task = asyncio.create_task(self.db.rollback())
+                await _drain_task_despite_cancellation(rollback_task)
+                raise
 
     async def _refresh_entity_alias_search_unlocked(self, entity_id: int) -> None:
         await self.db.execute(
@@ -10823,48 +10836,66 @@ class Database:
 
     async def merge_entities(self, *, source_id: int, target_id: int) -> dict:
         """Merge one entity into another and return source/target names."""
-        source = await self.get_entity(source_id)
-        if source is None:
-            raise LookupError("Source entity not found")
-        target = await self.get_entity(target_id)
-        if target is None:
-            raise LookupError("Target entity not found")
+        if source_id == target_id:
+            raise ValueError("Source and target entities must differ")
 
         async with self._write_lock:
-            await self.db.execute(
-                """UPDATE OR IGNORE memory_entities
-                   SET entity_id = ?
-                   WHERE entity_id = ?""",
-                (target_id, source_id),
-            )
-            await self.db.execute(
-                "DELETE FROM memory_entities WHERE entity_id = ?",
-                (source_id,),
-            )
-            await self.db.execute(
-                """UPDATE OR IGNORE entity_aliases
-                   SET canonical_id = ?
-                   WHERE canonical_id = ?""",
-                (target_id, source_id),
-            )
-            await self.db.execute(
-                "DELETE FROM entity_aliases WHERE canonical_id = ?",
-                (source_id,),
-            )
-            await self.db.execute(
-                """INSERT OR IGNORE INTO entity_aliases
-                   (alias, alias_normalized, canonical_id, source)
-                   VALUES (?, ?, ?, 'admin_manual')""",
-                (
-                    source.canonical_name,
-                    canonicalize_entity_name(source.canonical_name),
-                    target_id,
-                ),
-            )
-            await self.db.execute("DELETE FROM entities WHERE id = ?", (source_id,))
-            await self.db.execute("DELETE FROM entity_alias_search_fts WHERE entity_id = ?", (source_id,))
-            await self._refresh_entity_alias_search_unlocked(target_id)
-            await self.db.commit()
+            try:
+                async with self.db.execute(
+                    "SELECT * FROM entities WHERE id = ?",
+                    (source_id,),
+                ) as cursor:
+                    source_row = await cursor.fetchone()
+                if source_row is None:
+                    raise LookupError("Source entity not found")
+                source = _entity_from_row(dict(source_row))
+                async with self.db.execute(
+                    "SELECT * FROM entities WHERE id = ?",
+                    (target_id,),
+                ) as cursor:
+                    target_row = await cursor.fetchone()
+                if target_row is None:
+                    raise LookupError("Target entity not found")
+                target = _entity_from_row(dict(target_row))
+
+                await self.db.execute(
+                    """UPDATE OR IGNORE memory_entities
+                       SET entity_id = ?
+                       WHERE entity_id = ?""",
+                    (target_id, source_id),
+                )
+                await self.db.execute(
+                    "DELETE FROM memory_entities WHERE entity_id = ?",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    """UPDATE OR IGNORE entity_aliases
+                       SET canonical_id = ?
+                       WHERE canonical_id = ?""",
+                    (target_id, source_id),
+                )
+                await self.db.execute(
+                    "DELETE FROM entity_aliases WHERE canonical_id = ?",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    """INSERT OR IGNORE INTO entity_aliases
+                       (alias, alias_normalized, canonical_id, source)
+                       VALUES (?, ?, ?, 'admin_manual')""",
+                    (
+                        source.canonical_name,
+                        canonicalize_entity_name(source.canonical_name),
+                        target_id,
+                    ),
+                )
+                await self.db.execute("DELETE FROM entities WHERE id = ?", (source_id,))
+                await self.db.execute("DELETE FROM entity_alias_search_fts WHERE entity_id = ?", (source_id,))
+                await self._refresh_entity_alias_search_unlocked(target_id)
+                await self.db.commit()
+            except BaseException:
+                rollback_task = asyncio.create_task(self.db.rollback())
+                await _drain_task_despite_cancellation(rollback_task)
+                raise
 
         return {
             "source_id": source_id,
@@ -10875,14 +10906,19 @@ class Database:
 
     async def remove_entity_alias(self, *, entity_id: int, alias_normalized: str) -> bool:
         async with self._write_lock:
-            result = await self.db.execute(
-                "DELETE FROM entity_aliases WHERE alias_normalized = ? AND canonical_id = ?",
-                (alias_normalized, entity_id),
-            )
-            if result.rowcount > 0:
-                await self._refresh_entity_alias_search_unlocked(entity_id)
-            await self.db.commit()
-            return result.rowcount > 0
+            try:
+                result = await self.db.execute(
+                    "DELETE FROM entity_aliases WHERE alias_normalized = ? AND canonical_id = ?",
+                    (alias_normalized, entity_id),
+                )
+                if result.rowcount > 0:
+                    await self._refresh_entity_alias_search_unlocked(entity_id)
+                await self.db.commit()
+                return result.rowcount > 0
+            except BaseException:
+                rollback_task = asyncio.create_task(self.db.rollback())
+                await _drain_task_despite_cancellation(rollback_task)
+                raise
 
     async def insert_alias(
         self,
