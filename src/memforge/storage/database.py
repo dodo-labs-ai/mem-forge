@@ -2811,10 +2811,7 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
     (
         62,
         "Reset legacy directional contradiction summaries",
-        [
-            "DELETE FROM memory_contradictions",
-            "UPDATE memories SET contradiction_count = 0 WHERE contradiction_count <> 0",
-        ],
+        [],
     ),
 ]
 
@@ -2908,6 +2905,8 @@ class Database:
                 await self._migrate_source_access_policy_unlocked()
             if version == 45:
                 await self._partition_legacy_agent_session_sources_unlocked()
+            if version == 62:
+                await self._reset_legacy_contradiction_summaries_unlocked()
             await self.db.execute(
                 "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, _now_iso()),
@@ -2925,6 +2924,17 @@ class Database:
                     raise RuntimeError("failed to restore SQLite foreign key enforcement")
             logger.info("Applied migration %d: %s", version, description)
         await self._assert_memory_source_ids_resolved()
+
+    async def _reset_legacy_contradiction_summaries_unlocked(self) -> None:
+        """Discard directional summary residue without assuming every legacy cache column exists."""
+        await self.db.execute("DELETE FROM memory_contradictions")
+        async with self.db.execute("PRAGMA table_info(memories)") as cursor:
+            columns = {str(row[1]) async for row in cursor}
+        if "contradiction_count" in columns:
+            await self.db.execute(
+                "UPDATE memories SET contradiction_count = 0 "
+                "WHERE contradiction_count <> 0"
+            )
 
     async def _migrate_source_access_policy_unlocked(self) -> None:
         """Materialize legacy Source access without guessing.
