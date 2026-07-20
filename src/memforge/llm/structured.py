@@ -425,7 +425,7 @@ class SourceSupportStructuredClient(Protocol):
         self,
         prompt: str,
         *,
-        max_tokens: int = 1024,
+        max_tokens: int = 4096,
         model: str | None = None,
     ) -> AgentSessionAuthorityResponse:
         """Return semantic authority decisions for candidate user evidence."""
@@ -725,7 +725,7 @@ class LiteLlmStructuredClient:
         self,
         prompt: str,
         *,
-        max_tokens: int = 1024,
+        max_tokens: int = 4096,
         model: str | None = None,
     ) -> AgentSessionAuthorityResponse:
         return await self._call_schema(
