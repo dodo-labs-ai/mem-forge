@@ -141,6 +141,13 @@ export function sourceSyncActivityBlocksActions(
   return Boolean(activity && ["queued", "active", "recovering"].includes(activity.state));
 }
 
+export function sourceSyncActivityIsActionable(
+  activity: SourceSyncActivity,
+  canSync: boolean,
+): boolean {
+  return activity.kind !== "sync" || activity.state !== "failed" || canSync;
+}
+
 export function sourceSyncActivityPolicy(
   activity: SourceSyncActivity,
 ): SourceSyncActivityPolicy {

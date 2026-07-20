@@ -5,6 +5,7 @@ import {
   selectSourceSyncActivity,
   sourceSyncActivityBlocksActions,
   sourceSyncActivityFromLocalJob,
+  sourceSyncActivityIsActionable,
   sourceSyncActivityIsVisible,
   sourceSyncActivityPolicy,
 } from "../src/views/sources/sourceSyncActivity.js";
@@ -191,6 +192,38 @@ assert.deepEqual(
 );
 assert.equal(sourceSyncActivityBlocksActions(failedMaintenance), false);
 assert.equal(sourceSyncActivityPolicy(failedMaintenance!).canRetry, false);
+assert.equal(sourceSyncActivityIsActionable(failedMaintenance!, false), true);
+
+assert.equal(
+  sourceSyncActivityIsActionable(
+    {
+      kind: "sync",
+      state: "failed",
+    },
+    false,
+  ),
+  false,
+);
+assert.equal(
+  sourceSyncActivityIsActionable(
+    {
+      kind: "sync",
+      state: "failed",
+    },
+    true,
+  ),
+  true,
+);
+assert.equal(
+  sourceSyncActivityIsActionable(
+    {
+      kind: "sync",
+      state: "active",
+    },
+    false,
+  ),
+  true,
+);
 
 assert.equal(
   sourceSyncActivityFromLocalJob({

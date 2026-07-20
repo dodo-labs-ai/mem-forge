@@ -16,6 +16,7 @@ import { isLocalAgentBackedSource } from "./localAgentSources";
 import type { SourceSyncActivity } from "./sourceSyncActivity";
 import {
   sourceSyncActivityBlocksActions,
+  sourceSyncActivityIsActionable,
   sourceSyncActivityPolicy,
 } from "./sourceSyncActivity";
 import { teamsConversationCount } from "./teamsSourceConfig";
@@ -112,8 +113,14 @@ export function SourceRow({
     ? displayedItemCount === 1 ? "conversation" : "conversations"
     : itemLabel;
   const durableSyncLabel = activeSyncLabel(source.sync?.status);
-  const isSourceBusy = sourceSyncActivityBlocksActions(syncActivity);
-  const activityPolicy = syncActivity ? sourceSyncActivityPolicy(syncActivity) : null;
+  const actionableSyncActivity = syncActivity
+    && sourceSyncActivityIsActionable(syncActivity, capabilities.can_sync)
+    ? syncActivity
+    : undefined;
+  const isSourceBusy = sourceSyncActivityBlocksActions(actionableSyncActivity);
+  const activityPolicy = actionableSyncActivity
+    ? sourceSyncActivityPolicy(actionableSyncActivity)
+    : null;
 
   return (
     <div
@@ -153,7 +160,8 @@ export function SourceRow({
                 <span className="font-medium text-foreground">{perGroupMemoryCount}</span> memories
               </span>
               <span>
-                {syncActivity && ["queued", "active", "recovering"].includes(syncActivity.state)
+                {actionableSyncActivity
+                  && ["queued", "active", "recovering"].includes(actionableSyncActivity.state)
                   ? activityPolicy?.activeRowLabel
                   : durableSyncLabel ?? <LastSyncDetails source={source} itemLabel={itemLabel} />}
               </span>
@@ -292,7 +300,7 @@ export function SourceRow({
       )}
 
       <SourceSyncStatusCard
-        activity={syncActivity}
+        activity={actionableSyncActivity}
         sourceName={sourceLabel.name}
         itemLabel={itemLabel}
         onRetry={isPaused || !capabilities.can_sync ? undefined : onSync}
