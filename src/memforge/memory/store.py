@@ -629,7 +629,6 @@ class MemoryStore:
         memory: Memory,
         *,
         excluded_memory_ids: set[str] | frozenset[str] = frozenset(),
-        excluded_source_id: str | None = None,
         scope: AccessScope | None = None,
     ) -> tuple[Memory, ...]:
         """Return bounded access-compatible candidates for semantic proof.
@@ -694,10 +693,6 @@ class MemoryStore:
                 repo_identifier=memory.repo_identifier,
             ):
                 continue
-            if excluded_source_id is not None:
-                sources = await self.db.get_memory_sources(existing.id)
-                if any(source.source_id == excluded_source_id for source in sources):
-                    continue
             compatible.append(existing)
         return tuple(compatible)
 

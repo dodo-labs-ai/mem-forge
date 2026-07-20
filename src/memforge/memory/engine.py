@@ -457,7 +457,7 @@ class MemoryEngine:
         candidate: Memory,
         incumbent: Memory,
     ) -> dict[str, object] | None:
-        """Return an auditable semantic proof for cross-source identity reuse."""
+        """Return an auditable semantic proof for canonical Memory identity reuse."""
 
         if (
             candidate.content_hash == incumbent.content_hash
@@ -512,9 +512,8 @@ class MemoryEngine:
         candidate: Memory,
         *,
         excluded_memory_ids: frozenset[str],
-        source_id: str,
     ) -> tuple[Memory | None, dict[str, object] | None]:
-        """Resolve exact identity first, then bounded cross-source semantics."""
+        """Resolve exact identity first, then bounded access-compatible semantics."""
 
         target = await self.memory_store.find_access_compatible_exact_candidate(
             candidate,
@@ -528,7 +527,6 @@ class MemoryEngine:
         targets = await self.memory_store.find_access_compatible_equivalence_candidates(
             candidate,
             excluded_memory_ids=excluded_memory_ids,
-            excluded_source_id=source_id,
         )
         candidate_access = lifecycle_access_context_hash(
             visibility=candidate.visibility,
@@ -718,7 +716,6 @@ class MemoryEngine:
             target, equivalence_proof = await self._find_canonical_equivalence_target(
                 candidate,
                 excluded_memory_ids=frozenset(incumbents_by_id),
-                source_id=scope.source_id,
             )
             if target is None or equivalence_proof is None:
                 continue

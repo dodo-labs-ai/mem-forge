@@ -368,9 +368,11 @@ class _EquivalentMemoryStore(_OutboxDrainer):
     async def find_access_compatible_equivalence_candidates(
         self,
         memory: Memory,
-        **kwargs,
+        *,
+        excluded_memory_ids=frozenset(),
+        scope=None,
     ) -> tuple[Memory, ...]:
-        del memory, kwargs
+        del memory, excluded_memory_ids, scope
         return (self.target,)
 
 
@@ -2086,6 +2088,99 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
     )
     assert len(support) == 1
     assert support[0].anchor.observation_revision_id == second.observation_revisions[0].id
+
+
+@pytest.mark.asyncio
+async def test_same_source_cross_unit_semantic_equivalent_claim_reuses_memory_id(
+    db: Database,
+) -> None:
+    first = _projection(run_id="projection-same-source-semantic-1", body="A7 is removed.")
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    incumbent = await db.get_memory(incumbent.id)
+    assert incumbent is not None
+    await db.enable_lifecycle_gate("src-1")
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc).isoformat()
+    await db.db.execute(
+        """INSERT INTO documents (
+               doc_id, source, source_url, title, space_or_project,
+               last_modified, version, content_hash, last_synced
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "confluence-456",
+            "src-1",
+            "https://example.test/456",
+            "Independent confirmation",
+            "ENG",
+            now,
+            "1",
+            "h2",
+            now,
+        ),
+    )
+    await db.db.commit()
+    second = _projection(
+        run_id="projection-same-source-semantic-2",
+        body="A7 remains excluded.",
+        item_id="confluence-456",
+        page_id="456",
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_EquivalentMemoryStore(db, incumbent),
+        structured_llm_client=_SemanticEquivalentClient(),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-456",
+        raw_memories=[
+            RawMemory(
+                content="A7 remains excluded.",
+                memory_type="decision",
+                confidence=0.9,
+                evidence_quote="A7 remains excluded.",
+                source_observation_id=second.observations[0].id,
+            )
+        ],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content="A7 remains excluded.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc),
+    )
+
+    assert stats["added"] == 0
+    assert stats["corroborated"] == 1
+    assert len(await db.list_memories(source="src-1", status="active")) == 1
+    assert {
+        (source.source_id, source.doc_id)
+        for source in await db.get_memory_sources(incumbent.id)
+    } == {
+        ("src-1", "confluence-123"),
+        ("src-1", "confluence-456"),
+    }
+    supports = await db.get_active_memory_support_evidence(
+        incumbent.id,
+        source_id="src-1",
+    )
+    assert len(supports) == 2
+    lineage_rows = await db.db.execute_fetchall(
+        """SELECT COUNT(DISTINCT EU.SOURCE_LINEAGE_ID) AS lineage_count
+             FROM MEMORY_SUPPORT_ASSERTIONS MSA
+             JOIN EVIDENCE_REFERENCES ER ON ER.ID = MSA.EVIDENCE_REFERENCE_ID
+             JOIN EVIDENCE_UNITS EU ON EU.ID = ER.EVIDENCE_UNIT_ID
+            WHERE MSA.MEMORY_ID = ? AND MSA.ACTIVE = 1""",
+        (incumbent.id,),
+    )
+    assert lineage_rows[0]["lineage_count"] == 2
 
 
 @pytest.mark.asyncio
