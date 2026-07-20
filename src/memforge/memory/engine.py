@@ -512,8 +512,10 @@ class MemoryEngine:
         candidate: Memory,
         *,
         excluded_memory_ids: frozenset[str],
+        doc_id: str,
+        entity_ids: tuple[int, ...],
     ) -> tuple[Memory | None, dict[str, object] | None]:
-        """Resolve exact identity first, then bounded access-compatible semantics."""
+        """Resolve exact identity, then bounded multi-channel semantic candidates."""
 
         target = await self.memory_store.find_access_compatible_exact_candidate(
             candidate,
@@ -527,6 +529,8 @@ class MemoryEngine:
         targets = await self.memory_store.find_access_compatible_equivalence_candidates(
             candidate,
             excluded_memory_ids=excluded_memory_ids,
+            doc_id=doc_id,
+            entity_ids=entity_ids,
         )
         candidate_access = lifecycle_access_context_hash(
             visibility=candidate.visibility,
@@ -716,6 +720,8 @@ class MemoryEngine:
             target, equivalence_proof = await self._find_canonical_equivalence_target(
                 candidate,
                 excluded_memory_ids=frozenset(incumbents_by_id),
+                doc_id=doc_id,
+                entity_ids=tuple(entity_ids),
             )
             if target is None or equivalence_proof is None:
                 continue

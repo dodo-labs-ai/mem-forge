@@ -266,6 +266,121 @@ async def test_projected_equivalence_crosses_project_relevance_boundary(db, monk
 
 
 @pytest.mark.asyncio
+async def test_projected_equivalence_uses_shared_entities_when_strict_vector_recall_misses(
+    db,
+    monkeypatch,
+):
+    await _seed_doc(db, "d-incumbent")
+    await _seed_doc(db, "d-candidate")
+    incumbent = _mem(
+        "m-incumbent",
+        "The refresh interval is 15 minutes.",
+        project_key="RISK",
+    )
+    await db.insert_memory(incumbent)
+    await db.add_memory_source(
+        incumbent.id,
+        "d-incumbent",
+        "github_repo",
+        source_updated_at=None,
+    )
+    entity_id = await db.upsert_entity(
+        "GHLC-20260720-A",
+        "GHLC-20260720-A",
+        ["refresh-policy"],
+    )
+    await db.link_memory_entity(incumbent.id, entity_id)
+    adapters = build_sqlite_adapters(db, memory_collection=_FakeColl())
+    store = MemoryStore(
+        adapters.relational,
+        adapters.keyword,
+        adapters.vector,
+        embed_cfg={},
+        dedup_threshold=0.08,
+    )
+
+    async def _stub_embed(_text):
+        return [0.1, 0.1, 0.1]
+
+    monkeypatch.setattr(store, "_embed", _stub_embed)
+    candidate = _mem(
+        "m-candidate",
+        "Policy GHLC-20260720-A requires one refresh every 15 minutes.",
+        project_key="PAY",
+    )
+
+    candidates = await store.find_access_compatible_equivalence_candidates(
+        candidate,
+        doc_id="d-candidate",
+        entity_ids=(entity_id,),
+    )
+
+    assert [item.id for item in candidates] == [incumbent.id]
+
+
+@pytest.mark.asyncio
+async def test_projected_equivalence_filters_access_before_entity_candidate_limit(
+    db,
+    monkeypatch,
+):
+    entity_id = await db.upsert_entity(
+        "GHLC-20260720-A",
+        "GHLC-20260720-A",
+        ["refresh-policy"],
+    )
+    for index in range(10):
+        incompatible = _mem(
+            f"m-incompatible-{index}",
+            f"Incompatible claim {index}.",
+            visibility=PRIVATE,
+            owner="u-alice",
+            project_key="PAY",
+        )
+        incompatible.repo_identifier = f"repo-incompatible-{index}"
+        await db.insert_memory(incompatible)
+        await db.link_memory_entity(incompatible.id, entity_id)
+    compatible = _mem(
+        "m-compatible",
+        "The refresh interval is 15 minutes.",
+        visibility=PRIVATE,
+        owner="u-alice",
+        project_key="RISK",
+    )
+    compatible.repo_identifier = "repo-a"
+    await db.insert_memory(compatible)
+    await db.link_memory_entity(compatible.id, entity_id)
+    adapters = build_sqlite_adapters(db, memory_collection=_FakeColl())
+    store = MemoryStore(
+        adapters.relational,
+        adapters.keyword,
+        adapters.vector,
+        embed_cfg={},
+        dedup_threshold=0.08,
+    )
+
+    async def _stub_embed(_text):
+        return [0.1, 0.1, 0.1]
+
+    monkeypatch.setattr(store, "_embed", _stub_embed)
+    candidate = _mem(
+        "m-candidate",
+        "Policy GHLC-20260720-A requires one refresh every 15 minutes.",
+        visibility=PRIVATE,
+        owner="u-alice",
+        project_key="PAY",
+    )
+    candidate.repo_identifier = "repo-a"
+
+    candidates = await store.find_access_compatible_equivalence_candidates(
+        candidate,
+        doc_id="d-candidate",
+        entity_ids=(entity_id,),
+    )
+
+    assert [item.id for item in candidates] == [compatible.id]
+
+
+@pytest.mark.asyncio
 async def test_projected_equivalence_excludes_explicit_agent_claim_identity(
     db,
     monkeypatch,
@@ -323,6 +438,8 @@ async def test_projected_equivalence_excludes_explicit_agent_claim_identity(
             memory_id=memory.id,
             observed_at=now,
         )
+    entity_id = await db.upsert_entity("A7", "A7", ["payroll-result-slot"])
+    await db.link_memory_entity(active.id, entity_id)
     adapters = build_sqlite_adapters(
         db,
         memory_collection=_FakeColl(seeded=[active.id]),
@@ -349,7 +466,14 @@ async def test_projected_equivalence_excludes_explicit_agent_claim_identity(
     ordinary.repo_identifier = "repo-a"
 
     assert await store.find_access_compatible_exact_candidate(ordinary) is None
-    assert await store.find_access_compatible_equivalence_candidates(ordinary) == ()
+    assert (
+        await store.find_access_compatible_equivalence_candidates(
+            ordinary,
+            doc_id="d-ordinary",
+            entity_ids=(entity_id,),
+        )
+        == ()
+    )
 
 
 @pytest.mark.asyncio

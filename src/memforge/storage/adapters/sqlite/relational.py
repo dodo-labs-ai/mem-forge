@@ -378,6 +378,72 @@ class SqliteRelationalStore:
     ) -> list[Memory]:
         return await self._db.list_active_ordinary_claim_memories(memory_ids)
 
+    async def find_active_ordinary_claim_memories_by_entities(
+        self,
+        entity_ids: Sequence[int],
+        *,
+        visibility: str,
+        owner_user_id: str | None,
+        repo_identifier: str | None,
+        project_key: str | None,
+        excluded_memory_ids: Sequence[str] = (),
+        excluded_doc_id: str | None = None,
+        limit: int,
+    ) -> list[Memory]:
+        ids = tuple(dict.fromkeys(entity_ids))
+        if not ids or limit < 1:
+            return []
+        entity_placeholders = ", ".join("?" for _ in ids)
+        exclusions = tuple(dict.fromkeys(excluded_memory_ids))
+        exclusion_sql = ""
+        params: list[Any] = [
+            *ids,
+            visibility,
+            owner_user_id,
+            repo_identifier,
+        ]
+        if exclusions:
+            exclusion_sql = " AND m.id NOT IN (" + ", ".join("?" for _ in exclusions) + ")"
+            params.extend(exclusions)
+        doc_sql = ""
+        if excluded_doc_id is not None:
+            doc_sql = (
+                " AND NOT EXISTS ("
+                "SELECT 1 FROM memory_sources ms "
+                "WHERE ms.memory_id = m.id AND ms.doc_id = ?"
+                ")"
+            )
+            params.append(excluded_doc_id)
+        params.extend((project_key, project_key, limit))
+        rows = await self._db.db.execute_fetchall(
+            f"""SELECT m.id
+                  FROM memories m
+                  JOIN memory_entities me ON me.memory_id = m.id
+                 WHERE me.entity_id IN ({entity_placeholders})
+                   AND m.status = 'active'
+                   AND m.visibility = ?
+                   AND m.owner_user_id IS ?
+                   AND m.repo_identifier IS ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM agent_claims ac WHERE ac.memory_id = m.id
+                   )
+                   {exclusion_sql}
+                   {doc_sql}
+                 GROUP BY m.id
+                 ORDER BY CASE WHEN ? IS NOT NULL AND m.project_key = ?
+                               THEN 1 ELSE 0 END DESC,
+                          COUNT(DISTINCT me.entity_id) DESC,
+                          m.corroboration_count DESC,
+                          m.confidence DESC,
+                          m.updated_at DESC,
+                          m.id
+                 LIMIT ?""",
+            params,
+        )
+        return await self._db.list_active_ordinary_claim_memories(
+            [str(row["id"]) for row in rows]
+        )
+
     async def find_rebaseline_reactivation_candidate(
         self,
         content_hash: str,
