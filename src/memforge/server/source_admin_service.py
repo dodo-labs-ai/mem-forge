@@ -10,6 +10,12 @@ from memforge.local_agent.source_contract import (
     is_local_agent_backed_source,
     source_execution_descriptor,
 )
+from memforge.memory.lifecycle_plan import (
+    CutoverFindingStatus,
+    LifecycleBackfillJob,
+    LifecycleBackfillJobStatus,
+    LifecycleGateState,
+)
 from memforge.source_access import (
     SourceAccessPolicy,
     source_access_policy,
@@ -127,14 +133,42 @@ def _durable_sync_payload(run: Any) -> dict[str, Any]:
     }
 
 
-def _lifecycle_maintenance_payload(job: Any) -> dict[str, Any]:
-    status = getattr(job.status, "value", job.status)
+def _lifecycle_maintenance_payload(job: LifecycleBackfillJob) -> dict[str, Any]:
     return {
-        "status": str(status),
+        "status": job.status.value,
         "created_at": job.created_at,
         "started_at": job.started_at,
         "finished_at": job.completed_at,
     }
+
+
+async def _current_lifecycle_maintenance_payload(
+    reader: SourceAdminReader,
+    *,
+    source_id: str,
+    latest_job: LifecycleBackfillJob | None,
+) -> dict[str, Any] | None:
+    if latest_job is None:
+        return None
+    if latest_job.status is not LifecycleBackfillJobStatus.FAILED:
+        return _lifecycle_maintenance_payload(latest_job)
+
+    gate = await reader.get_lifecycle_gate(source_id)
+    if gate.state is not LifecycleGateState.ENABLED:
+        return _lifecycle_maintenance_payload(latest_job)
+    open_findings = await reader.list_lifecycle_cutover_findings(
+        source_id,
+        status=CutoverFindingStatus.OPEN,
+    )
+    if open_findings:
+        return _lifecycle_maintenance_payload(latest_job)
+    vector_tasks = await reader.list_lifecycle_vector_tasks(
+        source_id=source_id,
+        limit=1,
+    )
+    if vector_tasks:
+        return _lifecycle_maintenance_payload(latest_job)
+    return None
 
 
 async def list_source_admin_rows(
@@ -179,10 +213,10 @@ async def list_source_admin_rows(
             source_id,
             limit=1,
         )
-        row["lifecycle_maintenance"] = (
-            _lifecycle_maintenance_payload(lifecycle_jobs[0])
-            if lifecycle_jobs
-            else None
+        row["lifecycle_maintenance"] = await _current_lifecycle_maintenance_payload(
+            reader,
+            source_id=source_id,
+            latest_job=lifecycle_jobs[0] if lifecycle_jobs else None,
         )
         row.setdefault("client", None)
         durable_run = await reader.get_latest_source_sync_run(source_id=source_id)

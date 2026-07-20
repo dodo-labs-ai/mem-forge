@@ -7,7 +7,13 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
-from memforge.memory.lifecycle_plan import LifecycleBackfillJob
+from memforge.memory.lifecycle_plan import (
+    CutoverFindingStatus,
+    LifecycleBackfillJob,
+    LifecycleCutoverFinding,
+    LifecycleGate,
+    LifecycleVectorTask,
+)
 
 SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES = 1440
 SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES = 5
@@ -104,6 +110,23 @@ class SourceAdminReader(Protocol):
         *,
         limit: int = 20,
     ) -> list[LifecycleBackfillJob]: ...
+
+    async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate: ...
+
+    async def list_lifecycle_cutover_findings(
+        self,
+        source_id: str,
+        *,
+        status: CutoverFindingStatus | None = None,
+    ) -> list[LifecycleCutoverFinding]: ...
+
+    async def list_lifecycle_vector_tasks(
+        self,
+        *,
+        source_id: str | None = None,
+        lifecycle_plan_id: str | None = None,
+        limit: int = 100,
+    ) -> list[LifecycleVectorTask]: ...
 
     async def get_source(self, source_id: str) -> dict[str, Any] | None: ...
 
