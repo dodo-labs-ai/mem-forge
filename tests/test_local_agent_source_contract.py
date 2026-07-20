@@ -8,6 +8,7 @@ import pytest
 from memforge.genes.local_adapter_packages import has_package_manifest
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
+    SourceSyncRunReceiptError,
     execution_owner_user_id,
     is_local_agent_backed_source,
     local_agent_collection_attempt_id,
@@ -20,6 +21,8 @@ from memforge.local_agent.source_contract import (
     local_agent_sync_job_payload,
     local_agent_sync_operation,
     local_agent_sync_snapshot_id,
+    source_processing_receipt,
+    source_sync_run_id_from_completion,
     source_execution_descriptor,
     source_with_sync_inputs,
     validate_local_agent_replay_package,
@@ -42,6 +45,17 @@ def _canonical_payload_hash(payload: dict[str, object]) -> str:
             sort_keys=True,
         ).encode()
     ).hexdigest()
+
+
+def test_source_sync_run_receipt_is_required_on_both_sides_of_broker_handoff() -> None:
+    assert source_processing_receipt({"run_id": "run-1"}) == {"source_sync_run_id": "run-1"}
+    assert source_sync_run_id_from_completion({"source_sync_run_id": "run-1"}) == "run-1"
+    assert source_processing_receipt({"error": "temporarily unavailable"}) == {}
+
+    with pytest.raises(SourceSyncRunReceiptError, match="omitted run_id"):
+        source_processing_receipt({})
+    with pytest.raises(SourceSyncRunReceiptError, match="source_sync_run_id"):
+        source_sync_run_id_from_completion({})
 
 
 def _valid_jira_raw(*, summary: str = "Issue", comments: list[dict] | None = None) -> dict:
@@ -81,9 +95,7 @@ def test_local_agent_attempt_identity_and_retry_status_are_deterministic() -> No
     assert local_agent_sync_snapshot_id("job-1", 2) == "job-1:attempt:2"
     assert local_agent_completion_status("failed", retryable=True, attempt_count=4) == "queued"
     assert local_agent_completion_status("failed", retryable=True, attempt_count=5) == "failed"
-    assert local_agent_collection_attempt_id(
-        "jira", "job-1", 2, "job-1:attempt:2"
-    ) == "job-1:attempt:2"
+    assert local_agent_collection_attempt_id("jira", "job-1", 2, "job-1:attempt:2") == "job-1:attempt:2"
     assert local_agent_collection_attempt_id("teams", "job-1", 2) == "job-1:attempt:2"
     with pytest.raises(ValueError, match="does not match"):
         local_agent_collection_attempt_id("jira", "job-1", 2, "spoofed")

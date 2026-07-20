@@ -92,6 +92,46 @@ TEAMS_CONVERSATION_SELECTOR_FIELDS = (
 _TEAMS_CONVERSATION_ID_RE = re.compile(r"^19:[^\s@]+@[^\s@]+$")
 
 
+class SourceSyncRunReceiptError(ValueError):
+    """Raised when a successful local sync cannot identify its durable server run."""
+
+
+def source_processing_receipt(sync_result: object) -> dict[str, str]:
+    """Project the durable server-run identity returned after local collection.
+
+    An explicit server error has no receipt. Every non-error response must name
+    one durable SourceSyncRun so the broker cannot report success before the
+    server-side lifecycle transaction can be followed to completion.
+    """
+
+    if not isinstance(sync_result, Mapping):
+        raise SourceSyncRunReceiptError("successful source processing response must be an object")
+    if sync_result.get("error"):
+        return {}
+    run_id = _stable_execution_code(sync_result.get("run_id"))
+    if run_id is None:
+        raise SourceSyncRunReceiptError("successful source processing response omitted run_id")
+    return {"source_sync_run_id": run_id}
+
+
+def source_sync_run_id_from_completion(result: object) -> str:
+    """Return the immutable SourceSyncRun receipt from a successful broker result."""
+
+    if not isinstance(result, Mapping):
+        raise SourceSyncRunReceiptError("successful local-agent sync result must be an object")
+    run_id = _stable_execution_code(result.get("source_sync_run_id"))
+    if run_id is None:
+        raise SourceSyncRunReceiptError("successful local-agent sync result omitted source_sync_run_id")
+    return run_id
+
+
+def _stable_execution_code(value: object) -> str | None:
+    normalized = str(value or "").strip()
+    if not normalized or any(character.isspace() for character in normalized):
+        return None
+    return normalized
+
+
 def is_direct_teams_conversation_id(value: object) -> bool:
     """Return whether a selector is already a stable Teams conversation id."""
 
@@ -202,9 +242,7 @@ def local_agent_rebaseline_snapshot_is_authoritative(
     from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
 
     try:
-        adapter = get_local_source_replay_adapter(
-            str(source_type or "").strip().lower()
-        )
+        adapter = get_local_source_replay_adapter(str(source_type or "").strip().lower())
     except ValueError:
         return False
     return adapter.rebaseline_snapshot_is_authoritative(
@@ -375,9 +413,7 @@ def source_sync_input_metadata_with_artifact_attestation(
         if value
     }
     if declared_hashes and declared_hashes != {artifact_hash}:
-        raise ValueError(
-            f"source sync input artifact attestation conflict: {input_id}"
-        )
+        raise ValueError(f"source sync input artifact attestation conflict: {input_id}")
     result["package_sha256"] = artifact_hash
     manifest["package_sha256"] = artifact_hash
     result["manifest_entry"] = manifest
@@ -419,9 +455,7 @@ def source_with_sync_inputs(
     if latest_entries or authoritative_snapshot:
         config = dict(_source_config(source.get("config")))
         config["local_agent_package_manifest"] = (
-            historical_entries
-            if preserve_version_history
-            else list(latest_entries.values())
+            historical_entries if preserve_version_history else list(latest_entries.values())
         )
         projected["config"] = config
     return projected

@@ -108,6 +108,25 @@ def _finding() -> LifecycleCutoverFinding:
     )
 
 
+@pytest.mark.asyncio
+async def test_support_assertion_rejects_unknown_memory_with_adapter_contract_error(
+    db: Database,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="support assertion references unknown Memory",
+    ):
+        await db.upsert_memory_support_assertion(
+            MemorySupportAssertion(
+                id="support-unknown-memory",
+                memory_id="mem-missing",
+                evidence_reference_id="reference-not-read",
+                source_id="src-1",
+                access_context_hash="workspace",
+            )
+        )
+
+
 def _unit() -> EvidenceUnit:
     return EvidenceUnit(
         id="eu-backfill-1",
@@ -585,9 +604,7 @@ async def test_resolved_finding_retry_preserves_history_and_enabled_gate(
     assert resolved.created_at == (await db.get_lifecycle_cutover_finding(finding.id)).created_at
     assert gate.state is LifecycleGateState.ENABLED
     assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
-    assert (
-        await db.get_lifecycle_cutover_finding(finding.id)
-    ).status is CutoverFindingStatus.RESOLVED
+    assert (await db.get_lifecycle_cutover_finding(finding.id)).status is CutoverFindingStatus.RESOLVED
 
 
 @pytest.mark.asyncio
@@ -595,18 +612,14 @@ async def test_finding_upsert_rejects_identity_or_status_change(db: Database) ->
     finding = _finding()
     await db.upsert_lifecycle_cutover_finding(finding)
 
-    await db.upsert_lifecycle_cutover_finding(
-        replace(finding, reason=CutoverFindingReason.AMBIGUOUS_OBSERVATION)
-    )
+    await db.upsert_lifecycle_cutover_finding(replace(finding, reason=CutoverFindingReason.AMBIGUOUS_OBSERVATION))
     evolved = await db.get_lifecycle_cutover_finding(finding.id)
     assert evolved is not None
     assert evolved.reason is CutoverFindingReason.AMBIGUOUS_OBSERVATION
     assert evolved.status is CutoverFindingStatus.OPEN
 
     with pytest.raises(ValueError, match="finding identity"):
-        await db.upsert_lifecycle_cutover_finding(
-            replace(finding, memory_id="mem-different")
-        )
+        await db.upsert_lifecycle_cutover_finding(replace(finding, memory_id="mem-different"))
     with pytest.raises(ValueError, match="open findings"):
         await db.upsert_lifecycle_cutover_finding(
             replace(
@@ -871,9 +884,7 @@ async def test_gated_review_approval_applies_proposal_and_resolves_review_atomic
     assert approved is not None and approved.status is LifecycleReviewStatus.APPROVED
     assert retired is not None and retired.status == "retired"
     tasks = await db.list_lifecycle_vector_tasks(source_id="src-1")
-    assert {(task.memory_id, task.operation.value) for task in tasks} == {
-        (incumbent.id, "delete")
-    }
+    assert {(task.memory_id, task.operation.value) for task in tasks} == {(incumbent.id, "delete")}
 
 
 @pytest.mark.asyncio
@@ -1267,9 +1278,7 @@ async def test_backfill_trusts_existing_active_support_only_at_current_revision(
     assert result.finding_count == expected_findings
     assert result.gate_enabled is (expected_findings == 0)
     if expected_findings == 0:
-        assert database.resolved == [
-            (database.finding_id, "obs-supported", "unit-supported")
-        ]
+        assert database.resolved == [(database.finding_id, "obs-supported", "unit-supported")]
         assert database.enabled == ["src-1"]
         assert database.upserted == []
         assert database.gated == []
@@ -1630,19 +1639,19 @@ async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: D
         item=item,
         body=json.dumps(
             {
-                    "messages": [
-                        {
-                            "id": "message-1",
-                            "content": "Repeated quote",
-                            "attachments": [],
-                            "time": "2026-07-15T10:00:00Z",
-                        },
-                        {
-                            "id": "message-2",
-                            "content": "Repeated quote",
-                            "attachments": [],
-                            "time": "2026-07-15T10:01:00Z",
-                        },
+                "messages": [
+                    {
+                        "id": "message-1",
+                        "content": "Repeated quote",
+                        "attachments": [],
+                        "time": "2026-07-15T10:00:00Z",
+                    },
+                    {
+                        "id": "message-2",
+                        "content": "Repeated quote",
+                        "attachments": [],
+                        "time": "2026-07-15T10:01:00Z",
+                    },
                 ]
             }
         ).encode(),
@@ -2188,9 +2197,7 @@ async def test_support_write_rejects_recovered_maintenance_fence(
             source_activity=activity,
         )
 
-    assert reference_id not in await db.get_active_memory_support_reference_ids(
-        "mem-legacy"
-    )
+    assert reference_id not in await db.get_active_memory_support_reference_ids("mem-legacy")
 
 
 @pytest.mark.asyncio
@@ -2280,9 +2287,7 @@ async def test_finding_resolution_rejects_recovered_maintenance_fence(
             source_activity=activity,
         )
 
-    assert (await db.get_lifecycle_cutover_finding(finding.id)).status is (
-        CutoverFindingStatus.OPEN
-    )
+    assert (await db.get_lifecycle_cutover_finding(finding.id)).status is (CutoverFindingStatus.OPEN)
 
 
 @pytest.mark.asyncio
@@ -2381,8 +2386,7 @@ async def test_recover_stale_lifecycle_jobs_isolates_one_invalid_job(
     await db.start_lifecycle_backfill_job(invalid.id)
     await db.start_lifecycle_backfill_job(recoverable.id)
     await db.db.execute(
-        "UPDATE source_activity_leases "
-        "SET capability = ?, lease_until = ? WHERE id = ?",
+        "UPDATE source_activity_leases SET capability = ?, lease_until = ? WHERE id = ?",
         ("invalid-capability", "2000-01-01T00:00:00+00:00", invalid.id),
     )
     await db.db.execute(
@@ -2394,12 +2398,8 @@ async def test_recover_stale_lifecycle_jobs_isolates_one_invalid_job(
     recovered = await recover_stale_lifecycle_jobs(db)
 
     assert tuple(job.id for job in recovered) == (recoverable.id,)
-    assert (await db.get_lifecycle_backfill_job(invalid.id)).status is (
-        LifecycleBackfillJobStatus.RUNNING
-    )
-    assert (await db.get_lifecycle_backfill_job(recoverable.id)).status is (
-        LifecycleBackfillJobStatus.FAILED
-    )
+    assert (await db.get_lifecycle_backfill_job(invalid.id)).status is (LifecycleBackfillJobStatus.RUNNING)
+    assert (await db.get_lifecycle_backfill_job(recoverable.id)).status is (LifecycleBackfillJobStatus.FAILED)
 
 
 @pytest.mark.asyncio

@@ -136,20 +136,24 @@ def _jira_projection(
     description: str,
     comment_body: str = "Decision: retain A7",
     comments_truncated: bool = False,
+    source_id: str = "src-1",
+    item_id: str = "confluence-123",
+    issue_key: str = "PAY-12",
+    issue_id: str = "10012",
     prior=None,
     prior_observations=None,
 ):
     item = ContentItem(
-        item_id="confluence-123",
-        title="PAY-12",
-        source_url="https://jira.example.test/browse/PAY-12",
+        item_id=item_id,
+        title=issue_key,
+        source_url=f"https://jira.example.test/browse/{issue_key}",
         last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc),
         version="2",
-        extra={"issue_key": "PAY-12", "issue_id": "10012"},
+        extra={"issue_key": issue_key, "issue_id": issue_id},
     )
     payload = {
-        "id": "10012",
-        "key": "PAY-12",
+        "id": issue_id,
+        "key": issue_key,
         "fields": {
             "summary": "Payroll",
             "description": description,
@@ -168,7 +172,7 @@ def _jira_projection(
     if comments_truncated:
         payload["_comments_truncated"] = {"returned": 1, "total": 2}
     return project_source_item(
-        source_id="src-1",
+        source_id=source_id,
         source_type="jira",
         run_id=run_id,
         item=item,
@@ -3111,6 +3115,63 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
         source_updated_at=now,
     )
     await db.link_memory_entity(cross_source_memory.id, entity_id)
+    cross_source_projection = _jira_projection(
+        run_id="projection-cross-source",
+        description="A7 is removed.",
+        source_id="src-2",
+        item_id="jira-456",
+        issue_key="PAY-456",
+        issue_id="456",
+    )
+    await db.record_source_projection(cross_source_projection)
+    cross_source_observation = cross_source_projection.observations[0]
+    cross_source_revision = next(
+        item
+        for item in cross_source_projection.observation_revisions
+        if item.observation_id == cross_source_observation.id
+    )
+    cross_source_unit = EvidenceUnit(
+        id="eu-cross-source",
+        source_id="src-2",
+        doc_id="jira-456",
+        doc_revision_id=cross_source_projection.source_unit_revisions[0].id,
+        source_type="jira",
+        source_anchor=cross_source_observation.id,
+        source_lineage_id=cross_source_projection.source_units[0].id,
+        project_key="ENG",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        content=cross_source_revision.content,
+        excerpt="A7 is removed.",
+        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        access_context_hash="workspace-eng",
+    )
+    await db.upsert_evidence_unit(cross_source_unit)
+    cross_source_reference = (
+        await db.record_evidence_references(
+            cross_source_unit.id,
+            (
+                EvidenceReference(
+                    role=EvidenceRole.PRIMARY,
+                    anchor=SourceAnchor(
+                        kind=AnchorKind.WHOLE_OBSERVATION,
+                        observation_id=cross_source_observation.id,
+                        observation_revision_id=cross_source_revision.id,
+                    ),
+                ),
+            ),
+        )
+    )[0]
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id="support-cross-source",
+            memory_id=cross_source_memory.id,
+            evidence_reference_id=cross_source_reference.id or "",
+            source_id="src-2",
+            access_context_hash="workspace-eng",
+        )
+    )
 
     second = _projection(
         run_id="projection-2",

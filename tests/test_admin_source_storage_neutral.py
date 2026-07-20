@@ -181,7 +181,7 @@ async def _setup_completed_teams_local_replay(
                     "content": "Current decision",
                     "time": "2026-07-16T09:00:00+00:00",
                 }
-            ]
+            ],
         }
         payload_hash = _canonical_payload_hash(raw_payload)
         package_body = json.dumps(
@@ -478,6 +478,111 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
         "next_run_at": "2026-06-13T01:00:00+00:00",
         "updated_at": "2026-06-13T00:00:00+00:00",
     }
+
+
+def test_source_list_projects_a_retried_sync_as_a_fresh_attempt(tmp_path):
+    now = datetime.now(timezone.utc)
+    active_retry = SimpleNamespace(
+        run_id="run-retry",
+        status="running",
+        trigger="scheduled",
+        force_full_sync=False,
+        started_at=now,
+        completed_at=None,
+        next_attempt_at=None,
+        recovery_count=1,
+        error_message=None,
+        progress=None,
+        progress_revision=7,
+        progress_updated_at=None,
+        lease_expires_at=now.replace(year=now.year + 1),
+    )
+
+    class RetrySourceReader:
+        async def get_schedule_config(self) -> dict:
+            return {"enabled": False}
+
+        async def claim_due_scheduled_sources(self, **_: object) -> list[dict]:
+            return []
+
+        async def list_sources(self) -> list[dict]:
+            return [
+                {
+                    "id": "src-retry",
+                    "type": "confluence",
+                    "name": "Retry Source",
+                    "config": {},
+                    "status": "active",
+                    "access_policy": "workspace",
+                    "access_state": "active",
+                    "owner_user_id": "dev",
+                    "created_at": now.isoformat(),
+                    "sync_schedule": {
+                        "enabled": False,
+                        "interval_minutes": 1440,
+                        "next_run_at": None,
+                        "updated_at": None,
+                    },
+                }
+            ]
+
+        async def count_source_memories(self, *_: object, **__: object) -> int:
+            return 0
+
+        async def count_documents(self, *_: object, **__: object) -> int:
+            return 0
+
+        async def get_latest_source_sync_run(self, **_: object):
+            return active_retry
+
+        async def get_sync_history(self, **_: object) -> list[dict]:
+            raise AssertionError("active durable retry must win over history")
+
+        async def list_lifecycle_backfill_jobs(
+            self,
+            source_id: str,
+            *,
+            limit: int = 20,
+        ) -> list:
+            assert source_id == "src-retry"
+            assert limit == 1
+            return []
+
+        async def get_active_source_access_transition(self, source_id: str):
+            assert source_id == "src-retry"
+            return None
+
+        async def is_source_enabled_for_user(
+            self,
+            source_id: str,
+            user_id: str,
+        ) -> bool:
+            return True
+
+        async def is_source_pinned_for_user(
+            self,
+            source_id: str,
+            user_id: str,
+        ) -> bool:
+            return False
+
+    app = create_admin_app(
+        db=RetrySourceReader(),
+        config=_config(tmp_path),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/sources")
+
+    assert response.status_code == 200
+    sync = response.json()["data"][0]["sync"]
+    assert sync["run_id"] == "run-retry"
+    assert sync["status"] == "running"
+    assert sync["error_message"] is None
+    assert sync["progress"] is None
+    assert sync["progress_revision"] == 7
+    assert sync["progress_updated_at"] is None
+    assert sync["recovery_count"] == 1
 
 
 def test_source_projects_route_uses_storage_neutral_admin_reader(tmp_path):
@@ -1220,13 +1325,8 @@ def test_source_rebaseline_uses_post_fence_source_snapshot(tmp_path, monkeypatch
 
         assert response.status_code == 202, response.text
         assert len(provider.sources) == 2
-        assert all(
-            source["config"]["base_url"] == "https://current.example"
-            for source in provider.sources
-        )
-        assert reset_guard.source_activity.epoch == asyncio.run(
-            database.get_source_activity_epoch("src-confluence")
-        )
+        assert all(source["config"]["base_url"] == "https://current.example" for source in provider.sources)
+        assert reset_guard.source_activity.epoch == asyncio.run(database.get_source_activity_epoch("src-confluence"))
         assert events[:4] == ["sync", "renew", "reset", "sync"]
     finally:
         asyncio.run(database.close())
@@ -1387,13 +1487,8 @@ def test_local_agent_lifecycle_backfill_repairs_from_durable_current_corpus(
         assert provider.calls[0]["execution_mode"] is SourceSyncMode.PROJECTION_REPAIR
         jobs = asyncio.run(database.list_lifecycle_backfill_jobs("src-teams"))
         assert provider.calls[0]["lifecycle_job_id"] == jobs[0].id
-        [manifest] = provider.calls[0]["source"]["config"][
-            "local_agent_package_manifest"
-        ]
-        assert {
-            key: manifest[key]
-            for key in ("doc_id", "title", "version", "package_uri")
-        } == {
+        [manifest] = provider.calls[0]["source"]["config"]["local_agent_package_manifest"]
+        assert {key: manifest[key] for key in ("doc_id", "title", "version", "package_uri")} == {
             "doc_id": _teams_doc_id(),
             "title": "Conversation A",
             "version": "1",
@@ -1480,9 +1575,7 @@ def test_local_agent_source_rebaseline_fails_before_reset_when_snapshot_inputs_a
             )
 
         assert response.status_code == 409, response.text
-        assert response.json()["detail"] == (
-            "source_lifecycle_local_replay_inputs_unavailable"
-        )
+        assert response.json()["detail"] == ("source_lifecycle_local_replay_inputs_unavailable")
         jobs = asyncio.run(database.list_lifecycle_backfill_jobs("src-teams"))
         assert len(jobs) == 1
         assert jobs[0].status is LifecycleBackfillJobStatus.FAILED
@@ -1532,13 +1625,8 @@ def test_teams_source_rebaseline_replays_current_corpus_across_attempt_bound_inp
         assert len(provider.calls) == 2
         assert provider.calls[0]["execution_mode"] is SourceSyncMode.REBASELINE_PREFLIGHT
         assert provider.calls[1]["authoritative_snapshot"] is True
-        [manifest] = provider.calls[1]["source"]["config"][
-            "local_agent_package_manifest"
-        ]
-        assert {
-            key: manifest[key]
-            for key in ("doc_id", "title", "version", "package_uri")
-        } == {
+        [manifest] = provider.calls[1]["source"]["config"]["local_agent_package_manifest"]
+        assert {key: manifest[key] for key in ("doc_id", "title", "version", "package_uri")} == {
             "doc_id": _teams_doc_id(),
             "title": "Conversation A",
             "version": "1",
@@ -1685,13 +1773,8 @@ def test_incremental_local_agent_source_rebaseline_replays_exact_current_corpus(
         assert len(provider.calls) == 2
         assert provider.calls[0]["execution_mode"] is SourceSyncMode.REBASELINE_PREFLIGHT
         assert provider.calls[1]["authoritative_snapshot"] is True
-        [manifest] = provider.calls[1]["source"]["config"][
-            "local_agent_package_manifest"
-        ]
-        assert {
-            key: manifest[key]
-            for key in ("doc_id", "title", "version", "package_uri")
-        } == {
+        [manifest] = provider.calls[1]["source"]["config"]["local_agent_package_manifest"]
+        assert {key: manifest[key] for key in ("doc_id", "title", "version", "package_uri")} == {
             "doc_id": _teams_doc_id(),
             "title": "Conversation A",
             "version": "1",
@@ -1973,8 +2056,7 @@ def test_local_rebaseline_rejects_legacy_input_without_package_attestation(tmp_p
             document_store=document_store,
         )
         async with database.db.execute(
-            "SELECT input_id, metadata_json FROM source_sync_inputs "
-            "WHERE source_id = 'src-teams'"
+            "SELECT input_id, metadata_json FROM source_sync_inputs WHERE source_id = 'src-teams'"
         ) as cursor:
             row = await cursor.fetchone()
         metadata = json.loads(row["metadata_json"])
@@ -2001,12 +2083,8 @@ def test_local_rebaseline_rejects_legacy_input_without_package_attestation(tmp_p
             )
 
         assert response.status_code == 409, response.text
-        assert response.json()["detail"] == (
-            "source_lifecycle_local_replay_attestation_required"
-        )
-        [job] = asyncio.run(
-            database.list_lifecycle_backfill_jobs("src-teams")
-        )
+        assert response.json()["detail"] == ("source_lifecycle_local_replay_attestation_required")
+        [job] = asyncio.run(database.list_lifecycle_backfill_jobs("src-teams"))
         assert job.status is LifecycleBackfillJobStatus.FAILED
         assert job.error == "source_lifecycle_local_replay_attestation_required"
     finally:
@@ -2192,10 +2270,7 @@ def test_document_collection_rebaseline_accepts_completed_empty_snapshot(tmp_pat
             SourceSyncMode.REBASELINE_REPLAY,
         ]
         assert all(call["authoritative_snapshot"] is True for call in provider.calls)
-        assert all(
-            call["source"]["config"]["local_agent_package_manifest"] == []
-            for call in provider.calls
-        )
+        assert all(call["source"]["config"]["local_agent_package_manifest"] == [] for call in provider.calls)
     finally:
         asyncio.run(database.close())
 
@@ -2344,8 +2419,6 @@ def test_source_lifecycle_finding_repair_conflicts_with_active_source_sync(tmp_p
 
         assert response.status_code == 409, response.text
         assert "source sync run already active" in response.json()["detail"]
-        assert asyncio.run(
-            database.list_lifecycle_backfill_jobs("src-teams")
-        ) == []
+        assert asyncio.run(database.list_lifecycle_backfill_jobs("src-teams")) == []
     finally:
         asyncio.run(database.close())
