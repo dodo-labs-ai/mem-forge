@@ -1595,7 +1595,7 @@ class GeneSyncOrchestrator:
             else None
         )
 
-        requires_pdf_uri = gene.requires_pdf_artifact(
+        requires_pdf_uri = not raw.authoritative_empty and gene.requires_pdf_artifact(
             item=item,
             existing_doc=existing_doc,
             existing_hash=existing_hash,
@@ -1639,6 +1639,7 @@ class GeneSyncOrchestrator:
         pdf_uri = existing_doc.pdf_content_uri if unchanged and existing_doc else None
         should_fetch_pdf = (
             execution_mode is not SourceSyncMode.PROJECTION_REPAIR
+            and not raw.authoritative_empty
             and hasattr(gene, "fetch_pdf")
             and (projection_requires_extraction or requires_pdf_uri or not pdf_uri)
         )

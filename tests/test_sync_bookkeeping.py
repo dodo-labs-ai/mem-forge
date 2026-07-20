@@ -3226,6 +3226,23 @@ class MissingPdfGene(PdfBackfillGene):
         return None
 
 
+class AuthoritativeEmptyRequiredPdfGene(PdfBackfillGene):
+    async def fetch(self, item):
+        return RawContent(
+            item=item,
+            body=b"",
+            content_type="text/html",
+            authoritative_empty=True,
+            empty_evidence="test_provider_successful_empty_page",
+        )
+
+    async def normalize(self, raw):
+        return NormalizedContent(item=raw.item, markdown_body="")
+
+    async def fetch_pdf(self, item):
+        raise AssertionError("authoritative empty evidence must not request a PDF")
+
+
 class UnexpectedPdfExportGene(PdfBackfillGene):
     async def fetch_pdf(self, item):
         raise AssertionError("unchanged document with a stored PDF must not export again")
@@ -9375,6 +9392,47 @@ async def test_missing_required_confluence_pdf_fails_sync_without_hiding_gap(db:
         "1 Confluence document could not be imported. PDF export was unavailable for 1 document."
     )
     assert "Confluence PDF export did not produce a PDF" in state.failed_docs[0].error
+
+
+@pytest.mark.asyncio
+async def test_authoritative_empty_confluence_page_does_not_require_pdf(db: Database):
+    source_id = "src-authoritative-empty-confluence"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Architecture",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        enricher=ExplodingEnricher(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        vector_store=None,
+        embed_cfg={},
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=AuthoritativeEmptyRequiredPdfGene(item_count=1, release=release),
+        source_name="Architecture",
+        source_id=source_id,
+    )
+
+    document = await db.get_document("jira-0")
+    assert state.last_sync_status == "success"
+    assert state.docs_processed == 1
+    assert state.docs_failed == 0
+    assert document is not None
+    assert document.content_hash == content_hash("")
+    assert document.pdf_content_uri is None
 
 
 @pytest.mark.asyncio
