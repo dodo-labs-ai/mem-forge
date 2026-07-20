@@ -1244,6 +1244,7 @@ async def test_admin_sources_exposes_running_stored_counts_separately(db, tmp_pa
     await db.db.commit()
 
     class FakeSyncService:
+        workspace_id = "default"
         progress = {
             source_id: {
                 "started_at": "2026-05-28T07:01:00+00:00",
@@ -2436,6 +2437,8 @@ async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path
     )
 
     class FakeSyncService:
+        workspace_id = "default"
+
         def __init__(self):
             self.cancelled: list[str] = []
 
@@ -2821,6 +2824,8 @@ async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds
     )
 
     class FakeSyncService:
+        workspace_id = "default"
+
         def __init__(self):
             self.enqueued: list[tuple[str, str, bool]] = []
 
@@ -2833,11 +2838,10 @@ async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds
             *,
             trigger: str = "manual",
             force_full_sync: bool = False,
-            workspace_id: str = "default",
             input_snapshot_id: str | None = None,
             source_config_revision: str | None = None,
         ):
-            del workspace_id, input_snapshot_id, source_config_revision
+            del input_snapshot_id, source_config_revision
             self.enqueued.append((enqueued_source_id, trigger, force_full_sync))
 
             class Run:
@@ -2891,6 +2895,8 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
     )
 
     class FakeSyncService:
+        workspace_id = "default"
+
         def __init__(self):
             self.enqueued: list[dict[str, object]] = []
 
@@ -2903,12 +2909,10 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
             *,
             trigger: str = "manual",
             force_full_sync: bool = False,
-            workspace_id: str = "default",
             input_snapshot_id: str | None = None,
             source_config_revision: str | None = None,
             predecessor_activity_id: str | None = None,
         ):
-            del workspace_id
             self.enqueued.append(
                 {
                     "source_id": enqueued_source_id,
@@ -3113,11 +3117,16 @@ async def test_admin_app_starts_embedded_source_sync_worker_by_default(db, tmp_p
 
     config = _config(tmp_path)
     config.sync.worker_poll_seconds = 60
-    app = create_admin_app(db=db, config=config)
+    app = create_admin_app(
+        db=db,
+        config=config,
+        workspace_id="workspace-a",
+    )
 
     async with app.router.lifespan_context(app):
         worker_task = app.state.sync_worker_task
         assert app.state.sync_worker is not None
+        assert app.state.sync_worker.workspace_id == "workspace-a"
         assert worker_task is not None
         assert not worker_task.done()
 

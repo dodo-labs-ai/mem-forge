@@ -1262,6 +1262,43 @@ def test_local_adapter_push_is_idempotent_on_doc_id(tmp_path):
         asyncio.run(database.close())
 
 
+def test_local_adapter_push_attributes_input_to_app_workspace(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+            workspace_id="workspace-a",
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_local_markdown_source(client)["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "vault_id": "engineering",
+                    "relative_path": "notes/index.md",
+                    "markdown_body": "# Index\n\nTop level.",
+                    "process_now": False,
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        inputs = asyncio.run(
+            database.list_source_sync_inputs(
+                source_id=source_id,
+                workspace_id="workspace-a",
+            )
+        )
+        assert len(inputs) == 1
+        assert inputs[0].workspace_id == "workspace-a"
+    finally:
+        asyncio.run(database.close())
+
+
 def test_teams_adapter_push_writes_window_package(tmp_path):
     from memforge.local_agent.teams_ledger import build_teams_window_id
     from memforge.server.admin_api import create_admin_app

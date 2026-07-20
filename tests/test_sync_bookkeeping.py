@@ -5336,22 +5336,25 @@ async def test_scheduler_coalesces_active_due_source_and_advances_next_run(db: D
 
 @pytest.mark.asyncio
 async def test_scheduler_still_scans_server_sources_when_local_job_scan_fails(db: Database, monkeypatch):
-    server_scan_calls: list[tuple[int, set[str]]] = []
+    server_scan_calls: list[tuple[int, str, set[str]]] = []
 
     async def fail_local_scan(*, limit):
         raise RuntimeError("local broker unavailable")
 
-    async def record_server_scan(*, limit, exclude_source_ids):
-        server_scan_calls.append((limit, exclude_source_ids))
+    async def record_server_scan(*, limit, workspace_id, exclude_source_ids):
+        server_scan_calls.append((limit, workspace_id, exclude_source_ids))
         return []
 
     monkeypatch.setattr(db, "enqueue_due_local_agent_jobs", fail_local_scan)
     monkeypatch.setattr(db, "enqueue_due_source_sync_runs", record_server_scan)
-    scheduler = SyncScheduler(db, SyncService(db, AppConfig()))
+    scheduler = SyncScheduler(
+        db,
+        SyncService(db, AppConfig(), workspace_id="workspace-a"),
+    )
 
     await scheduler._sync_due_sources()
 
-    assert server_scan_calls == [(50, set())]
+    assert server_scan_calls == [(50, "workspace-a", set())]
 
 
 @pytest.mark.asyncio
@@ -5367,18 +5370,20 @@ async def test_scheduler_excludes_sources_without_sync_execution(
         access_policy="private",
         owner_user_id="dev",
     )
-    server_scan_calls: list[set[str]] = []
+    server_scan_calls: list[tuple[str, set[str]]] = []
 
-    async def record_server_scan(*, limit, exclude_source_ids):
+    async def record_server_scan(*, limit, workspace_id, exclude_source_ids):
         assert limit == 50
-        server_scan_calls.append(exclude_source_ids)
+        server_scan_calls.append((workspace_id, exclude_source_ids))
         return []
 
     monkeypatch.setattr(db, "enqueue_due_source_sync_runs", record_server_scan)
 
     await SyncScheduler(db, SyncService(db, AppConfig()))._sync_due_sources()
 
-    assert server_scan_calls == [{"src-agent-session-schedule-policy"}]
+    assert server_scan_calls == [
+        ("default", {"src-agent-session-schedule-policy"})
+    ]
 
 
 @pytest.mark.asyncio
@@ -5404,6 +5409,27 @@ async def test_sync_service_enqueue_source_creates_durable_run_without_local_tas
     assert run.force_full_sync is True
     assert run.status == "pending"
     assert service.tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_sync_service_attributes_durable_run_to_its_workspace(db: Database):
+    source_id = "src-workspace-attribution"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Workspace Attribution",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    service = SyncService(db, AppConfig(), workspace_id="workspace-a")
+
+    run = await service.enqueue_source(source_id, trigger="manual")
+
+    assert run.workspace_id == "workspace-a"
+    persisted = await db.get_source_sync_run(run.run_id)
+    assert persisted is not None
+    assert persisted.workspace_id == "workspace-a"
 
 
 @pytest.mark.asyncio
