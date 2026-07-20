@@ -195,7 +195,8 @@ _TOOL_RESULT_TYPES = {
     "custom_tool_call_output",
 }
 _MAX_CANONICAL_EVENT_TEXT_CHARS = 4_000
-AGENT_SESSION_AUTHORITY_CLASSIFIER_MAX_TOKENS = 1024
+AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE = 16
+AGENT_SESSION_AUTHORITY_CLASSIFIER_MAX_TOKENS = 4096
 
 
 def _now_iso() -> str:
@@ -439,29 +440,52 @@ async def _classify_agent_session_authority(
     branch: str | None,
     events: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    candidate_ids = _candidate_agent_session_authority_ids(events)
+    candidate_ids = [
+        str(event["evidence_id"])
+        for event in events
+        if event.get("authority_candidate") and event.get("evidence_id")
+    ]
     if not candidate_ids:
         return events
-    prompt = render_agent_session_authority_prompt(
-        owner_user_id=owner_user_id,
-        client=client,
-        session_id=session_id,
-        trigger=trigger,
-        workspace=workspace,
-        repo_identifier=repo_identifier,
-        branch=branch,
-        events=events,
+
+    decisions = []
+    for start in range(0, len(candidate_ids), AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE):
+        batch_ids = set(
+            candidate_ids[start : start + AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE]
+        )
+        batch_events = [
+            {
+                **event,
+                "authority_candidate": event.get("evidence_id") in batch_ids,
+            }
+            for event in events
+        ]
+        prompt = render_agent_session_authority_prompt(
+            owner_user_id=owner_user_id,
+            client=client,
+            session_id=session_id,
+            trigger=trigger,
+            workspace=workspace,
+            repo_identifier=repo_identifier,
+            branch=branch,
+            events=batch_events,
+        )
+        generated = await structured_llm_client.classify_agent_session_evidence_authority(
+            prompt,
+            max_tokens=AGENT_SESSION_AUTHORITY_CLASSIFIER_MAX_TOKENS,
+        )
+        response = (
+            generated
+            if isinstance(generated, AgentSessionAuthorityResponse)
+            else AgentSessionAuthorityResponse.model_validate(generated)
+        )
+        _apply_agent_session_authority_response(batch_events, response)
+        decisions.extend(response.decisions)
+
+    return _apply_agent_session_authority_response(
+        events,
+        AgentSessionAuthorityResponse(decisions=decisions),
     )
-    generated = await structured_llm_client.classify_agent_session_evidence_authority(
-        prompt,
-        max_tokens=AGENT_SESSION_AUTHORITY_CLASSIFIER_MAX_TOKENS,
-    )
-    response = (
-        generated
-        if isinstance(generated, AgentSessionAuthorityResponse)
-        else AgentSessionAuthorityResponse.model_validate(generated)
-    )
-    return _apply_agent_session_authority_response(events, response)
 
 
 def _agent_patch_primary_evidence_error(

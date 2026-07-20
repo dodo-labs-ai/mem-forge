@@ -10,6 +10,9 @@ from fastapi.testclient import TestClient
 
 from memforge.agent_knowledge import AgentKnowledgePatchProposal
 from memforge.agent_sessions import (
+    AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE,
+    AGENT_SESSION_AUTHORITY_CLASSIFIER_MAX_TOKENS,
+    _classify_agent_session_authority,
     _run_agent_patch_with_activity,
     agent_session_source_id,
     build_agent_session_doc_id,
@@ -101,11 +104,105 @@ def _authority_prompt_candidate_ids(prompt: str) -> list[str]:
     return [candidate["evidence_id"] for candidate in candidates]
 
 
+def _authority_prompt_context_ids(prompt: str) -> list[str]:
+    start_tag = "<supporting_context_json>"
+    end_tag = "</supporting_context_json>"
+    start = prompt.index(start_tag) + len(start_tag)
+    end = prompt.index(end_tag)
+    context = json.loads(prompt[start:end].strip())
+    return [event["evidence_id"] for event in context]
+
+
 def _authorized_events(*supporting_events: dict) -> list[dict]:
     return [
         {"role": "user", "text": "Keep the durable outcome from this window for future work."},
         *supporting_events,
     ]
+
+
+def test_agent_session_authority_classification_batches_candidates_with_full_context():
+    """Large authority sets stay bounded without losing surrounding event context."""
+    import asyncio
+
+    candidate_count = AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE + 3
+    events = canonicalize_agent_session_events(
+        [
+            *[
+                {
+                    "role": "user",
+                    "text": f"Durable candidate {index}.",
+                }
+                for index in range(candidate_count)
+            ],
+            {
+                "role": "assistant",
+                "text": "Shared supporting context.",
+            },
+        ]
+    )
+    all_ids = [event["evidence_id"] for event in events]
+    calls: list[dict] = []
+
+    class RecordingClassifierClient:
+        async def classify_agent_session_evidence_authority(self, prompt: str, **kwargs):
+            candidate_ids = _authority_prompt_candidate_ids(prompt)
+            context_ids = _authority_prompt_context_ids(prompt)
+            calls.append(
+                {
+                    "candidate_ids": candidate_ids,
+                    "context_ids": context_ids,
+                    "max_tokens": kwargs["max_tokens"],
+                }
+            )
+            return AgentSessionAuthorityResponse.model_validate(
+                {
+                    "decisions": [
+                        {
+                            "evidence_id": evidence_id,
+                            "is_authoritative": int(evidence_id[1:]) % 2 == 1,
+                            "authority_kind": (
+                                "durable_user_intent"
+                                if int(evidence_id[1:]) % 2 == 1
+                                else "not_authoritative"
+                            ),
+                            "reason": "deterministic batching contract fixture",
+                        }
+                        for evidence_id in candidate_ids
+                    ]
+                }
+            )
+
+    classified = asyncio.run(
+        _classify_agent_session_authority(
+            structured_llm_client=RecordingClassifierClient(),
+            owner_user_id="owner",
+            client="codex",
+            session_id="session",
+            trigger="Stop",
+            workspace="/workspace/mem-forge",
+            repo_identifier="github.com/shno-labs/mem-forge",
+            branch="main",
+            events=events,
+        )
+    )
+
+    assert [call["candidate_ids"] for call in calls] == [
+        all_ids[:AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE],
+        all_ids[
+            AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE : AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE
+            + 3
+        ],
+    ]
+    assert all(call["max_tokens"] == AGENT_SESSION_AUTHORITY_CLASSIFIER_MAX_TOKENS for call in calls)
+    assert all(
+        set(call["candidate_ids"]) | set(call["context_ids"]) == set(all_ids)
+        for call in calls
+    )
+    assert [
+        event["evidence_id"]
+        for event in classified
+        if event["evidence_role"] == "primary"
+    ] == [evidence_id for evidence_id in all_ids[:-1] if int(evidence_id[1:]) % 2 == 1]
 
 
 def test_agent_patch_cancels_mutation_when_activity_heartbeat_fails():
