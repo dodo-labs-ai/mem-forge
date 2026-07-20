@@ -374,6 +374,15 @@ def test_gene_metadata_declares_available_execution_kinds(tmp_path):
     assert genes["agent_session"]["execution_kinds"] == []
 
 
+def test_gene_execution_kinds_define_ordinary_sync_capability():
+    from memforge.genes import source_type_supports_sync
+
+    assert source_type_supports_sync("confluence") is True
+    assert source_type_supports_sync("teams") is True
+    assert source_type_supports_sync("agent_session") is False
+    assert source_type_supports_sync("unknown") is False
+
+
 def test_admin_source_create_encrypts_and_redacts_pat(tmp_path, monkeypatch):
     import sqlite3
 
@@ -1375,7 +1384,7 @@ async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(db, t
     assert memories_response.status_code == 200
     source = next(item for item in sources_response.json()["data"] if item["id"] == source_id)
     memories = memories_response.json()
-    assert source["sync"]["memories_extracted"] == 3
+    assert source["sync"] is None
     assert memories["total"] == 3
     assert source["memory_count"] == 3
     assert {item["id"] for item in memories["data"]} == {

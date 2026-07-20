@@ -4767,6 +4767,35 @@ async def test_run_all_active_sources_enqueues_durable_runs(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_run_all_active_sources_skips_sources_without_sync_execution(db: Database):
+    await db.upsert_source(
+        id="src-agent-session-no-sync",
+        type="agent_session",
+        name="Codex Session",
+        config_json="{}",
+        access_policy="private",
+        owner_user_id="dev",
+    )
+    await db.upsert_source(
+        id="src-server-sync",
+        type="jira",
+        name="Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+
+    await SyncService(db, AppConfig()).run_all_active_sources()
+
+    assert (
+        await db.get_latest_source_sync_run(source_id="src-agent-session-no-sync")
+    ) is None
+    run = await db.get_latest_source_sync_run(source_id="src-server-sync")
+    assert run is not None
+    assert run.status == "pending"
+
+
+@pytest.mark.asyncio
 async def test_source_sync_schedule_round_trips_and_claims_due_sources(db: Database):
     claim_time = datetime(2026, 6, 16, tzinfo=timezone.utc)
     due_at = claim_time - timedelta(minutes=1)
@@ -5307,13 +5336,13 @@ async def test_scheduler_coalesces_active_due_source_and_advances_next_run(db: D
 
 @pytest.mark.asyncio
 async def test_scheduler_still_scans_server_sources_when_local_job_scan_fails(db: Database, monkeypatch):
-    server_scan_calls: list[int] = []
+    server_scan_calls: list[tuple[int, set[str]]] = []
 
     async def fail_local_scan(*, limit):
         raise RuntimeError("local broker unavailable")
 
-    async def record_server_scan(*, limit):
-        server_scan_calls.append(limit)
+    async def record_server_scan(*, limit, exclude_source_ids):
+        server_scan_calls.append((limit, exclude_source_ids))
         return []
 
     monkeypatch.setattr(db, "enqueue_due_local_agent_jobs", fail_local_scan)
@@ -5322,7 +5351,34 @@ async def test_scheduler_still_scans_server_sources_when_local_job_scan_fails(db
 
     await scheduler._sync_due_sources()
 
-    assert server_scan_calls == [50]
+    assert server_scan_calls == [(50, set())]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_excludes_sources_without_sync_execution(
+    db: Database,
+    monkeypatch,
+):
+    await db.upsert_source(
+        id="src-agent-session-schedule-policy",
+        type="agent_session",
+        name="Codex Session",
+        config_json="{}",
+        access_policy="private",
+        owner_user_id="dev",
+    )
+    server_scan_calls: list[set[str]] = []
+
+    async def record_server_scan(*, limit, exclude_source_ids):
+        assert limit == 50
+        server_scan_calls.append(exclude_source_ids)
+        return []
+
+    monkeypatch.setattr(db, "enqueue_due_source_sync_runs", record_server_scan)
+
+    await SyncScheduler(db, SyncService(db, AppConfig()))._sync_due_sources()
+
+    assert server_scan_calls == [{"src-agent-session-schedule-policy"}]
 
 
 @pytest.mark.asyncio
@@ -5348,6 +5404,24 @@ async def test_sync_service_enqueue_source_creates_durable_run_without_local_tas
     assert run.force_full_sync is True
     assert run.status == "pending"
     assert service.tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_sync_service_rejects_source_without_sync_execution(db: Database):
+    source_id = "src-agent-session-service-policy"
+    await db.upsert_source(
+        id=source_id,
+        type="agent_session",
+        name="Codex Session",
+        config_json="{}",
+        access_policy="private",
+        owner_user_id="dev",
+    )
+
+    with pytest.raises(RuntimeError, match="does not support ordinary sync"):
+        await SyncService(db, AppConfig()).enqueue_source(source_id)
+
+    assert await db.get_latest_source_sync_run(source_id=source_id) is None
 
 
 @pytest.mark.asyncio
@@ -5623,6 +5697,45 @@ async def test_source_sync_worker_gives_each_retry_attempt_a_new_lifecycle_cycle
         enqueued.run_id,
         enqueued.run_id,
     ]
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_rejects_legacy_unsupported_run_without_runtime(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-agent-session-worker-policy"
+    await db.upsert_source(
+        id=source_id,
+        type="agent_session",
+        name="Codex Session",
+        config_json='{"documents_dir":"/missing/local-only-path"}',
+        access_policy="private",
+        owner_user_id="dev",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="manual",
+    )
+
+    class RejectRuntimeProvider:
+        async def build_sync_runtime(self, *args, **kwargs):
+            raise AssertionError("unsupported source reached runtime construction")
+
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(sync=SyncConfig(worker_max_attempts=1)),
+        runtime_provider=RejectRuntimeProvider(),
+        worker_id="worker-agent-session-policy",
+    )
+
+    await worker.run_once()
+
+    failed = await db.get_source_sync_run(enqueued.run_id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.next_attempt_at is None
+    assert failed.error_message is not None
+    assert "does not support ordinary sync" in failed.error_message
 
 
 @pytest.mark.asyncio

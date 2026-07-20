@@ -373,6 +373,75 @@ def test_source_creator_can_manage_and_receives_redacted_config(tmp_path):
         asyncio.run(database.close())
 
 
+def test_agent_session_rejects_ordinary_sync_and_hides_historical_sync_failure(tmp_path):
+    database = _connect_database(tmp_path)
+    source_id = "src-agent-session-sync-policy"
+    owner_headers = {
+        "x-test-user": "owner-user",
+        "x-test-workspace-role": "member",
+    }
+    try:
+        asyncio.run(
+            database.upsert_source(
+                id=source_id,
+                type="agent_session",
+                name="Codex Session",
+                config_json='{"documents_dir":"/missing/local-only-path"}',
+                access_policy="private",
+                owner_user_id="owner-user",
+            )
+        )
+        asyncio.run(
+            database.insert_sync_history(
+                source=source_id,
+                status="failed",
+                docs_processed=0,
+                docs_updated=0,
+                docs_failed=0,
+                memories_extracted=0,
+                error_message="Agent session documents directory does not exist",
+                failed_docs=None,
+                started_at="2026-07-15T06:57:00+00:00",
+                finished_at="2026-07-15T06:57:01+00:00",
+            )
+        )
+
+        with TestClient(_app(tmp_path, database)) as client:
+            listed = client.get("/api/sources", headers=owner_headers)
+            synced = client.post(
+                f"/api/sources/{source_id}/sync",
+                headers=owner_headers,
+            )
+            force_synced = client.post(
+                f"/api/sources/{source_id}/force-resync",
+                headers=owner_headers,
+            )
+            scheduled = client.put(
+                f"/api/sources/{source_id}/schedule",
+                headers=owner_headers,
+                json={"enabled": True, "interval_minutes": 60},
+            )
+            inventory = client.get(
+                f"/api/sources/{source_id}/projection-inventory",
+                headers=owner_headers,
+            )
+
+        assert listed.status_code == 200, listed.text
+        source = next(row for row in listed.json()["data"] if row["id"] == source_id)
+        assert source["capabilities"]["can_sync"] is False
+        assert source["capabilities"]["can_force_resync"] is False
+        assert source["sync"] is None
+        for response in (synced, force_synced, scheduled):
+            assert response.status_code == 409, response.text
+            assert response.json()["detail"] == "source_sync_not_supported"
+        assert inventory.status_code == 200, inventory.text
+        assert asyncio.run(database.get_latest_source_sync_run(source_id=source_id)) is None
+        history = asyncio.run(database.get_sync_history(source=source_id, limit=1))
+        assert history[0]["status"] == "failed"
+    finally:
+        asyncio.run(database.close())
+
+
 def test_source_list_projects_active_lifecycle_maintenance(tmp_path):
     database = _connect_database(tmp_path)
     try:

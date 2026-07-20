@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from memforge.genes import source_type_supports_sync
 from memforge.runtime import SyncService
 
 if TYPE_CHECKING:
@@ -136,7 +137,16 @@ class SyncScheduler:
         except Exception:
             logger.exception("Scheduled local-agent job scan failed")
         try:
-            await self.db.enqueue_due_source_sync_runs(limit=50)
+            unsupported_source_ids = {
+                str(source.get("id") or "")
+                for source in await self.db.list_sources()
+                if source.get("id")
+                and not source_type_supports_sync(str(source.get("type") or ""))
+            }
+            await self.db.enqueue_due_source_sync_runs(
+                limit=50,
+                exclude_source_ids=unsupported_source_ids,
+            )
         except Exception:
             logger.exception("Scheduled server source sync scan failed")
 
