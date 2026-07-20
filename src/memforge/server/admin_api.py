@@ -38,7 +38,12 @@ from memforge.auth.jira_auth import (
     canonical_jira_origin,
     effective_jira_auth_mode,
 )
-from memforge.genes import GENE_REGISTRY, create_gene, list_available_genes
+from memforge.genes import (
+    GENE_REGISTRY,
+    create_gene,
+    list_available_genes,
+    source_type_supports_sync,
+)
 from memforge.genes.atlassian_auth import (
     release_atlassian_request_limiter,
     require_https_base_url,
@@ -91,6 +96,7 @@ from memforge.runtime import (
     RuntimeHealthComponent,
     RuntimeProvider,
     SourceSyncWorker,
+    SourceSyncUnsupportedError,
     SyncService,
     SourceLifecycleMaintenanceError,
     SourcePausedError,
@@ -308,6 +314,11 @@ def _require_source_sync_execution(
         status_code=403,
         detail="local_agent_sync_execution_owner_forbidden",
     )
+
+
+def _require_source_sync_support(source: Mapping[str, Any]) -> None:
+    if not source_type_supports_sync(str(source.get("type") or "")):
+        raise HTTPException(status_code=409, detail="source_sync_not_supported")
 
 
 async def _require_current_local_agent_lease(
@@ -5291,6 +5302,7 @@ def create_admin_app(
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
 
         local_job = await _enqueue_local_source_collection_job(
             request,
@@ -5309,7 +5321,11 @@ def create_admin_app(
             )
         except SourcePausedError:
             raise _source_paused_http_error()
-        except (SourceLifecycleMaintenanceError, SourceActivityConflict) as exc:
+        except (
+            SourceLifecycleMaintenanceError,
+            SourceActivityConflict,
+            SourceSyncUnsupportedError,
+        ) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
             "ok": True,
@@ -5335,6 +5351,7 @@ def create_admin_app(
         if local_agent_sync_operation(source["type"], source.get("config")) is None:
             raise HTTPException(status_code=400, detail="source_is_not_local_agent_backed")
         _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
         current_source = await db.get_source(source_id)
         if current_source is None:
             raise HTTPException(status_code=404, detail="Source not found")
@@ -5374,7 +5391,11 @@ def create_admin_app(
             )
         except SourcePausedError:
             raise _source_paused_http_error()
-        except (SourceLifecycleMaintenanceError, SourceActivityConflict) as exc:
+        except (
+            SourceLifecycleMaintenanceError,
+            SourceActivityConflict,
+            SourceSyncUnsupportedError,
+        ) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
             "ok": True,
@@ -5396,6 +5417,7 @@ def create_admin_app(
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
 
         local_job = await _enqueue_local_source_collection_job(
             request,
@@ -5414,7 +5436,11 @@ def create_admin_app(
             )
         except SourcePausedError:
             raise _source_paused_http_error()
-        except (SourceLifecycleMaintenanceError, SourceActivityConflict) as exc:
+        except (
+            SourceLifecycleMaintenanceError,
+            SourceActivityConflict,
+            SourceSyncUnsupportedError,
+        ) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
             "ok": True,
@@ -5450,6 +5476,9 @@ def create_admin_app(
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         _require_source_management(request, source)
+        if req.enabled:
+            if not source_type_supports_sync(str(source.get("type") or "")):
+                raise HTTPException(status_code=409, detail="source_sync_not_supported")
         await db.set_source_sync_schedule(
             source_id,
             enabled=req.enabled,
@@ -5498,6 +5527,7 @@ def create_admin_app(
                 detail=(f"source {source_id} is type {source_type!r}, not a local adapter source"),
             )
         _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
         await _require_current_local_agent_lease(
             request,
             db,
