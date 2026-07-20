@@ -53,14 +53,20 @@ and the updated document content.
 For each new extraction, decide ONE action:
 
 - ADD: Genuinely new information not covered by any existing memory.
-- UPDATE: An existing memory covers the same fact but needs minor refinement.
-  Provide the merged current text. The core claim remains true. The old memory
-  will be preserved with a timestamp but hidden from default search.
+- UPDATE: An existing memory covers the same durable claim, but the new evidence
+  adds a real factual detail that must be present in the canonical text. Provide
+  the merged current text. This is not a wording cleanup: the durable information
+  carried by the Memory has increased. The old materialization will be preserved
+  with a timestamp but hidden from default search.
 - SUPERSEDE: An existing memory covers the same topic but is now materially wrong.
   The old fact was true before but is no longer. The new fact replaces the old meaning.
   The old memory will be preserved with a timestamp but hidden from search.
 - DELETE: An existing memory is demonstrably false or was extracted in error.
 - NOOP: The new extraction adds nothing beyond what existing memories capture.
+  Use NOOP when it is semantically equivalent to an incumbent, including
+  paraphrases, synonyms, reordered wording, stylistic rewrites, and extraction
+  wording variance. Preserve the incumbent memory ID even when the source text
+  or the newly extracted candidate is worded differently.
 
 Also audit EVERY existing memory in this batch against the updated document.
 You MUST return exactly one explicit decision for every existing memory ID:
@@ -113,6 +119,9 @@ Rules:
    "was removed", "the document changed", or "previously". Put that rationale in
    the reason field instead. Only mention a historical transition in memory
    content when the updated document itself says the transition is a durable fact.
+8. Never use UPDATE only to improve phrasing or to mirror a semantically
+   equivalent source rewrite. That is NOOP. UPDATE requires at least one durable
+   factual detail in updated_content that the incumbent did not already carry.
 
 Return a JSON object with a "decisions" array:
 {{
