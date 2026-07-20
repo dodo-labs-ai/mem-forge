@@ -23,6 +23,7 @@ from memforge.models import (
 from memforge.memory.evidence import (
     ActiveSupportEvidence,
     EvidenceReference,
+    EvidenceUnit,
     MemorySupportAssertion,
     RelationOutcomeBundle,
 )
@@ -361,6 +362,7 @@ class RelationalStore(Protocol):
         *,
         source_activity: SourceActivityLease | None = None,
     ) -> tuple[EvidenceReference, ...]: ...
+    async def get_evidence_unit(self, evidence_unit_id: str) -> EvidenceUnit | None: ...
     async def upsert_memory_support_assertion(
         self,
         assertion: MemorySupportAssertion,

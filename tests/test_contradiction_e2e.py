@@ -22,9 +22,24 @@ from memforge.llm.structured import (
     LiteLlmStructuredClient,
     StructuredLlmConfig,
 )
+from memforge.memory.evidence import (
+    EvidenceContentProvenance,
+    EvidenceReference,
+    EvidenceRole,
+    EvidenceUnit,
+    MemorySupportAssertion,
+)
 from memforge.memory.store import MemoryStore
-from memforge.models import Memory, content_hash
+from memforge.models import (
+    ContentItem,
+    Memory,
+    NormalizedContent,
+    RawContent,
+    content_hash,
+)
 from memforge.pipeline.contradiction_detector import detect_cross_doc_contradictions
+from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
@@ -88,7 +103,7 @@ def _make_memory(mem_id: str, content: str, mem_type: str = "fact") -> Memory:
         memory_type=mem_type,
         content=content,
         content_hash=content_hash(content),
-        project_key=None,
+        project_key="TEST",
         entity_refs=[],
         tags=[],
         confidence=0.9,
@@ -100,6 +115,151 @@ def _make_memory(mem_id: str, content: str, mem_type: str = "fact") -> Memory:
         updated_at=now,
         status="active",
         extraction_context=None,
+    )
+
+
+def _project_document(
+    *,
+    source_id: str,
+    doc_id: str,
+    body: str,
+):
+    item = ContentItem(
+        item_id=doc_id,
+        title=doc_id,
+        source_url=f"http://test/{doc_id}",
+        last_modified=datetime.now(timezone.utc),
+        version="1",
+        extra={"page_id": doc_id, "space_key": "TEST"},
+    )
+    return project_source_item(
+        source_id=source_id,
+        source_type="confluence",
+        run_id=f"projection-{doc_id}",
+        item=item,
+        raw=RawContent(
+            item=item,
+            body=body.encode(),
+            content_type="text/plain",
+        ),
+        normalized=NormalizedContent(item=item, markdown_body=body),
+    )
+
+
+async def _seed_support(
+    db: Database,
+    *,
+    memory: Memory,
+    source_id: str,
+    doc_id: str,
+    projection,
+) -> None:
+    observation = projection.observations[0]
+    revision = next(
+        item
+        for item in projection.observation_revisions
+        if item.observation_id == observation.id
+    )
+    unit = EvidenceUnit(
+        id=f"eu-{memory.id}",
+        source_id=source_id,
+        doc_id=doc_id,
+        doc_revision_id=projection.source_unit_revisions[0].id,
+        source_type="confluence",
+        source_anchor=observation.id,
+        source_lineage_id=projection.source_units[0].id,
+        project_key="TEST",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        content=revision.content,
+        excerpt=memory.content,
+        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        access_context_hash="workspace-test",
+    )
+    await db.upsert_evidence_unit(unit)
+    reference = (
+        await db.record_evidence_references(
+            unit.id,
+            (
+                EvidenceReference(
+                    role=EvidenceRole.PRIMARY,
+                    anchor=SourceAnchor(
+                        kind=AnchorKind.WHOLE_OBSERVATION,
+                        observation_id=observation.id,
+                        observation_revision_id=revision.id,
+                    ),
+                ),
+            ),
+        )
+    )[0]
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id=f"support-{memory.id}",
+            memory_id=memory.id,
+            evidence_reference_id=reference.id or "",
+            source_id=source_id,
+            access_context_hash="workspace-test",
+        )
+    )
+
+
+async def _persist_projected_memory(
+    db: Database,
+    *,
+    memory: Memory,
+    entity_id: int,
+    source_id: str,
+    doc_id: str,
+) -> None:
+    """Persist a claim whose current Observation contains the claim itself."""
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name=source_id,
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="e2e-owner",
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    await db.db.execute(
+        """INSERT INTO documents
+           (doc_id, source, source_url, title, space_or_project,
+            last_modified, version, content_hash, last_synced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            doc_id,
+            source_id,
+            f"http://test/{doc_id}",
+            doc_id,
+            "TEST",
+            now,
+            "1",
+            f"hash-{doc_id}",
+            now,
+        ),
+    )
+    await db.insert_memory(memory)
+    await db.add_memory_source(
+        memory.id,
+        doc_id,
+        "confluence",
+        memory.content,
+        source_updated_at=None,
+    )
+    await db.link_memory_entity(memory.id, entity_id)
+    projection = _project_document(
+        source_id=source_id,
+        doc_id=doc_id,
+        body=memory.content,
+    )
+    await db.record_source_projection(projection)
+    await _seed_support(
+        db,
+        memory=memory,
+        source_id=source_id,
+        doc_id=doc_id,
+        projection=projection,
     )
 
 
@@ -152,13 +312,25 @@ async def seeded_db(db):
     """
     now = datetime.now(timezone.utc).isoformat()
 
-    # Two source documents
-    for doc_id, title in [("doc-arch", "Architecture Doc"), ("doc-runbook", "Runbook")]:
+    # Two independent sources and their documents.
+    for source_id in ("src-arch", "src-runbook"):
+        await db.upsert_source(
+            id=source_id,
+            type="confluence",
+            name=source_id,
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="e2e-owner",
+        )
+    for doc_id, title, source_id in [
+        ("doc-arch", "Architecture Doc", "src-arch"),
+        ("doc-runbook", "Runbook", "src-runbook"),
+    ]:
         await db.db.execute(
             """INSERT INTO documents
                (doc_id, source, source_url, title, space_or_project, last_modified, version, content_hash, last_synced)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (doc_id, "test", f"http://test/{doc_id}", title, "TEST", now, "1", f"hash-{doc_id}", now),
+            (doc_id, source_id, f"http://test/{doc_id}", title, "TEST", now, "1", f"hash-{doc_id}", now),
         )
 
     # Shared entity: postgresql
@@ -170,9 +342,12 @@ async def seeded_db(db):
     # Memory from doc-arch: PostgreSQL fact
     mem_arch_pg = _make_memory("mem-arch-pg01", "pay-api uses PostgreSQL 14 on port 5432")
     await db.insert_memory(mem_arch_pg)
-    await db.db.execute(
-        "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-        (mem_arch_pg.id, "doc-arch", "test"),
+    await db.add_memory_source(
+        mem_arch_pg.id,
+        "doc-arch",
+        "confluence",
+        mem_arch_pg.content,
+        source_updated_at=None,
     )
     await db.db.execute(
         "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
@@ -182,9 +357,12 @@ async def seeded_db(db):
     # Memory from doc-arch: Kafka fact (no cross-doc overlap)
     mem_arch_kafka = _make_memory("mem-arch-kfk1", "Kafka retention is set to 7 days")
     await db.insert_memory(mem_arch_kafka)
-    await db.db.execute(
-        "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-        (mem_arch_kafka.id, "doc-arch", "test"),
+    await db.add_memory_source(
+        mem_arch_kafka.id,
+        "doc-arch",
+        "confluence",
+        mem_arch_kafka.content,
+        source_updated_at=None,
     )
     await db.db.execute(
         "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
@@ -194,9 +372,12 @@ async def seeded_db(db):
     # Memory from doc-runbook: contradicts PostgreSQL fact
     mem_run_pg = _make_memory("mem-run-pg001", "pay-api migrated to MySQL 8 in Q1 2026")
     await db.insert_memory(mem_run_pg)
-    await db.db.execute(
-        "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-        (mem_run_pg.id, "doc-runbook", "test"),
+    await db.add_memory_source(
+        mem_run_pg.id,
+        "doc-runbook",
+        "confluence",
+        mem_run_pg.content,
+        source_updated_at=None,
     )
     await db.db.execute(
         "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
@@ -204,6 +385,33 @@ async def seeded_db(db):
     )
 
     await db.db.commit()
+    arch_projection = _project_document(
+        source_id="src-arch",
+        doc_id="doc-arch",
+        body=f"{mem_arch_pg.content}\n\n{mem_arch_kafka.content}",
+    )
+    run_projection = _project_document(
+        source_id="src-runbook",
+        doc_id="doc-runbook",
+        body=mem_run_pg.content,
+    )
+    await db.record_source_projection(arch_projection)
+    await db.record_source_projection(run_projection)
+    for memory in (mem_arch_pg, mem_arch_kafka):
+        await _seed_support(
+            db,
+            memory=memory,
+            source_id="src-arch",
+            doc_id="doc-arch",
+            projection=arch_projection,
+        )
+    await _seed_support(
+        db,
+        memory=mem_run_pg,
+        source_id="src-runbook",
+        doc_id="doc-runbook",
+        projection=run_projection,
+    )
 
     return {
         "db": db,
@@ -304,20 +512,17 @@ class TestContradictionE2E:
             "mem-run-unrel1",
             "The PostgreSQL team meets every Wednesday at 3pm for backlog grooming.",
         )
-        await db.insert_memory(mem_unrelated)
-        await db.db.execute(
-            "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-            (mem_unrelated.id, "doc-runbook", "test"),
+        await _persist_projected_memory(
+            db,
+            memory=mem_unrelated,
+            entity_id=s["pg_id"],
+            source_id="src-run-unrelated",
+            doc_id="doc-run-unrelated",
         )
-        await db.db.execute(
-            "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
-            (mem_unrelated.id, s["pg_id"]),
-        )
-        await db.db.commit()
 
         stats = await detect_cross_doc_contradictions(
             new_memory_ids=[mem_unrelated.id],
-            doc_id="doc-runbook",
+            doc_id="doc-run-unrelated",
             db=db,
             memory_store=_test_memory_store(db),
             structured_llm_client=structured_llm_client,
@@ -340,20 +545,17 @@ class TestContradictionE2E:
             "mem-run-temp1",
             "pay-api PostgreSQL was upgraded from version 14 to version 16 in March 2026.",
         )
-        await db.insert_memory(mem_temporal)
-        await db.db.execute(
-            "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-            (mem_temporal.id, "doc-runbook", "test"),
+        await _persist_projected_memory(
+            db,
+            memory=mem_temporal,
+            entity_id=s["pg_id"],
+            source_id="src-run-temporal",
+            doc_id="doc-run-temporal",
         )
-        await db.db.execute(
-            "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
-            (mem_temporal.id, s["pg_id"]),
-        )
-        await db.db.commit()
 
         stats = await detect_cross_doc_contradictions(
             new_memory_ids=[mem_temporal.id],
-            doc_id="doc-runbook",
+            doc_id="doc-run-temporal",
             db=db,
             memory_store=_test_memory_store(db),
             structured_llm_client=structured_llm_client,
@@ -379,14 +581,22 @@ class TestContradictionE2E:
         # Add another existing memory in doc-arch about kafka
         # (mem_arch_kafka already exists: "Kafka retention is set to 7 days")
 
-        # New doc with two contradicting memories
+        # New source/doc with two contradicting memories
+        await db.upsert_source(
+            id="src-ops",
+            type="confluence",
+            name="src-ops",
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="e2e-owner",
+        )
         await db.db.execute(
             """INSERT INTO documents
                (doc_id, source, source_url, title, space_or_project, last_modified, version, content_hash, last_synced)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 "doc-ops",
-                "test",
+                "src-ops",
                 "http://test/doc-ops",
                 "Ops Runbook",
                 "TEST",
@@ -403,9 +613,12 @@ class TestContradictionE2E:
             "pay-api no longer uses PostgreSQL — it was fully replaced by CockroachDB in Q4 2025.",
         )
         await db.insert_memory(mem_ops_pg)
-        await db.db.execute(
-            "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-            (mem_ops_pg.id, "doc-ops", "test"),
+        await db.add_memory_source(
+            mem_ops_pg.id,
+            "doc-ops",
+            "confluence",
+            mem_ops_pg.content,
+            source_updated_at=None,
         )
         await db.db.execute(
             "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
@@ -418,15 +631,32 @@ class TestContradictionE2E:
             "Kafka retention was increased from 7 days to 30 days to meet compliance requirements.",
         )
         await db.insert_memory(mem_ops_kafka)
-        await db.db.execute(
-            "INSERT INTO memory_sources (memory_id, doc_id, source_type) VALUES (?, ?, ?)",
-            (mem_ops_kafka.id, "doc-ops", "test"),
+        await db.add_memory_source(
+            mem_ops_kafka.id,
+            "doc-ops",
+            "confluence",
+            mem_ops_kafka.content,
+            source_updated_at=None,
         )
         await db.db.execute(
             "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
             (mem_ops_kafka.id, s["kafka_id"]),
         )
         await db.db.commit()
+        ops_projection = _project_document(
+            source_id="src-ops",
+            doc_id="doc-ops",
+            body=f"{mem_ops_pg.content}\n\n{mem_ops_kafka.content}",
+        )
+        await db.record_source_projection(ops_projection)
+        for memory in (mem_ops_pg, mem_ops_kafka):
+            await _seed_support(
+                db,
+                memory=memory,
+                source_id="src-ops",
+                doc_id="doc-ops",
+                projection=ops_projection,
+            )
 
         stats = await detect_cross_doc_contradictions(
             new_memory_ids=[mem_ops_pg.id, mem_ops_kafka.id],
@@ -484,7 +714,8 @@ class TestContradictionErrorResilience:
         assert stats["checked"] == 1
         assert await db.get_pending_review_for_challenger(s["mem_run_pg"].id) is None
         async with db.db.execute(
-            "SELECT COUNT(*) FROM relation_runs WHERE evidence_unit_id LIKE 'eu-contradiction-%'"
+            "SELECT COUNT(*) FROM relation_runs WHERE evidence_unit_id = ?",
+            (f"eu-{s['mem_run_pg'].id}",),
         ) as cursor:
             assert (await cursor.fetchone())[0] == 0
         async with db.db.execute("SELECT COUNT(*) FROM memory_contradictions") as cursor:
@@ -512,7 +743,8 @@ class TestContradictionErrorResilience:
         assert stats["checked"] == 1
         assert await db.get_pending_review_for_challenger(s["mem_run_pg"].id) is None
         async with db.db.execute(
-            "SELECT COUNT(*) FROM relation_runs WHERE evidence_unit_id LIKE 'eu-contradiction-%'"
+            "SELECT COUNT(*) FROM relation_runs WHERE evidence_unit_id = ?",
+            (f"eu-{s['mem_run_pg'].id}",),
         ) as cursor:
             assert (await cursor.fetchone())[0] == 0
         async with db.db.execute("SELECT COUNT(*) FROM memory_contradictions") as cursor:
@@ -557,9 +789,6 @@ class TestContradictionErrorResilience:
 
         mem = await db.get_memory(s["mem_arch_pg"].id)
 
-        # INSERT OR IGNORE prevents the second row, but the UPDATE still fires
-        # This is a known behavior — count may be 2 due to the UPDATE running
-        # even when INSERT is ignored. Document the actual behavior.
         async with db.db.execute(
             "SELECT COUNT(*) FROM memory_contradictions WHERE memory_id_a = ? AND memory_id_b = ?",
             (s["mem_arch_pg"].id, s["mem_run_pg"].id),
@@ -567,9 +796,7 @@ class TestContradictionErrorResilience:
             row_count = (await cur.fetchone())[0]
         assert row_count == 1, "Should have exactly one contradiction row (INSERT OR IGNORE)"
 
-        # The contradiction_count may be 2 because UPDATE runs regardless of INSERT OR IGNORE.
-        # This documents the current behavior — if fixed, update this assertion.
-        assert mem.contradiction_count >= 1
+        assert mem.contradiction_count == 1
 
 
 # ===========================================================================

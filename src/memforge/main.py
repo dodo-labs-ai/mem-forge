@@ -48,6 +48,7 @@ from memforge.local_agent.folder_picker import FolderPickerCancelled, FolderPick
 from memforge.local_agent.source_contract import (
     TEAMS_TOMBSTONE_REASONS,
     local_agent_sync_snapshot_id,
+    source_processing_receipt,
 )
 from memforge.sync_progress import normalize_sync_progress_snapshot
 from memforge.storage.admin_source import (
@@ -1900,14 +1901,8 @@ def _push_github_profile_to_source(
         "failed": failed,
     }
     if failed:
-        examples = "; ".join(
-            f"{item.get('relative_path')}: {item.get('error')}"
-            for item in failed[:3]
-        )
-        payload["error"] = (
-            f"{len(failed)} document(s) failed to push"
-            + (f": {examples}" if examples else "")
-        )
+        examples = "; ".join(f"{item.get('relative_path')}: {item.get('error')}" for item in failed[:3])
+        payload["error"] = f"{len(failed)} document(s) failed to push" + (f": {examples}" if examples else "")
     if not failed:
         sync_result = client.start_source_processing(
             source_id=source_id,
@@ -1917,6 +1912,7 @@ def _push_github_profile_to_source(
             local_agent_attempt_count=local_agent_attempt_count,
         )
         payload["sync_started"] = not bool(sync_result.get("error"))
+        payload.update(source_processing_receipt(sync_result))
         if sync_result.get("error"):
             payload["error"] = "source processing failed to start"
             payload["sync_error"] = sync_result
@@ -2202,6 +2198,7 @@ def _run_cloud_jira_sync_job(
         "pushed": pushed,
         "failed": failed,
         "sync_started": bool(sync_result and not sync_result.get("error")),
+        **(source_processing_receipt(sync_result) if sync_result else {}),
     }
     sync_failed = isinstance(sync_result, dict) and bool(sync_result.get("error"))
     if sync_failed:
@@ -2657,6 +2654,7 @@ def _run_cloud_teams_sync_job(
         "failed": failed,
         "skipped_existing": skipped_existing,
         "sync_started": sync_started,
+        **(source_processing_receipt(sync_result) if sync_result else {}),
         "audit_log_path": str(audit_path.expanduser()),
     }
     if inventory_findings:
@@ -2967,13 +2965,9 @@ def _validated_teams_projection_inventory_units(
         window_id = str(locator.get("window_id") or "").strip()
         document_id = str(locator.get("document_id") or "").strip()
         opaque_legacy_identity = bool(
-            document_id
-            and provider_key == document_id
-            and (not window_id or window_id == document_id)
+            document_id and provider_key == document_id and (not window_id or window_id == document_id)
         )
-        if not window_id or not window_id.startswith(
-            ("teams-block:v1:", "teams-thread:v1:")
-        ):
+        if not window_id or not window_id.startswith(("teams-block:v1:", "teams-thread:v1:")):
             if opaque_legacy_identity:
                 _record_teams_inventory_finding(findings, source_unit_id)
                 continue
@@ -3719,6 +3713,7 @@ def _push_kb_profile_to_source(
             local_agent_attempt_count=local_agent_attempt_count,
         )
         payload["sync_started"] = not bool(sync_result.get("error"))
+        payload.update(source_processing_receipt(sync_result))
         if sync_result.get("error"):
             payload["error"] = "source processing failed to start"
             payload["sync_error"] = sync_result

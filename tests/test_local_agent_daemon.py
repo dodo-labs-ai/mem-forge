@@ -8,6 +8,7 @@ from click.testing import CliRunner
 
 import memforge.main as main
 from memforge.local_agent.runner import LocalAgentRunner
+from memforge.local_agent.source_contract import SourceSyncRunReceiptError
 from memforge.local_agent.state import LocalAgentStateStore
 from memforge.main import cli
 
@@ -101,26 +102,26 @@ def test_local_agent_state_preserves_sync_audit_summary(tmp_path):
         {
             "task_id": "cloud-job:laj-teams",
             "kind": "cloud_job",
-            "status": "failed",
+            "status": "success",
             "started_at": "2026-07-09T00:00:00+00:00",
             "finished_at": "2026-07-09T00:00:01+00:00",
-            "error": "source sync failed to start",
+            "error": None,
             "payload": {
                 "source_id": "src-teams",
                 "counts": {"selected": 1, "pushed": 1, "failed": 0, "skipped_existing": 0, "polls": 1},
                 "pushed": [{"window_id": "teams-thread:v1:opaque", "document_hash": "hash"}],
                 "failed": [],
                 "skipped_existing": [],
-                "sync_started": False,
-                "sync_error": {"error": "MemForge API unavailable"},
+                "sync_started": True,
+                "source_sync_run_id": "run-teams-1",
                 "audit_log_path": "/Users/example/.memforge/teams-sync-audit.jsonl",
             },
         },
     )
 
     stored = payload["tasks"]["cloud-job:laj-teams"]["last_result"]["payload"]
-    assert stored["sync_started"] is False
-    assert stored["sync_error"] == {"error": "MemForge API unavailable"}
+    assert stored["sync_started"] is True
+    assert stored["source_sync_run_id"] == "run-teams-1"
     assert stored["audit_log_path"].endswith("teams-sync-audit.jsonl")
     assert stored["pushed_count"] == 1
     assert stored["failed_count"] == 0
@@ -455,6 +456,37 @@ def test_local_agent_forwards_retryable_handler_failure_to_broker(tmp_path):
             "source processing failed to start",
         )
     ]
+
+
+def test_local_agent_treats_missing_source_run_receipt_as_retryable(tmp_path):
+    completed: list[tuple[str, int, str, dict, str | None]] = []
+
+    def missing_receipt(_job):
+        raise SourceSyncRunReceiptError("successful source processing response omitted run_id")
+
+    runner = LocalAgentRunner(
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        cloud_job_handler=missing_receipt,
+        cloud_jobs_provider=lambda: {
+            "jobs": [
+                {
+                    "job_id": "laj-missing-receipt",
+                    "operation": "teams_sync",
+                    "source_id": "src-teams",
+                    "attempt_count": 1,
+                }
+            ]
+        },
+        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: (
+            completed.append((job_id, attempt_count, status, result, error)) or {"ok": True}
+        ),
+    )
+
+    report = runner.run_once(now=datetime(2026, 7, 10, tzinfo=timezone.utc))
+
+    assert completed[0][2:4] == ("failed", {"retryable": True})
+    assert "omitted run_id" in str(completed[0][4])
+    assert report["results"][-1]["status"] == "failed"
 
 
 def test_local_agent_reports_handler_progress_through_heartbeat(tmp_path):

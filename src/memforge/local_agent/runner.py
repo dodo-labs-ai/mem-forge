@@ -8,6 +8,7 @@ import threading
 import time
 from typing import Any, Callable
 
+from memforge.local_agent.source_contract import SourceSyncRunReceiptError
 from memforge.local_agent.state import LocalAgentStateStore
 from memforge.sync_progress import normalize_sync_progress_snapshot
 
@@ -167,7 +168,9 @@ class LocalAgentRunner:
             error = str(payload.get("error") or "").strip()
             status = "failed" if error else "success"
             completion_status = "failed" if error else "succeeded"
-            completion_error = self._complete_cloud_job(job_id, attempt_count, completion_status, payload, error or None)
+            completion_error = self._complete_cloud_job(
+                job_id, attempt_count, completion_status, payload, error or None
+            )
             if completion_error:
                 return {
                     "task_id": task_id,
@@ -200,7 +203,12 @@ class LocalAgentRunner:
                 job_id,
                 attempt_count,
                 "failed",
-                {"retryable": isinstance(exc, (ConnectionError, TimeoutError))},
+                {
+                    "retryable": isinstance(
+                        exc,
+                        (ConnectionError, TimeoutError, SourceSyncRunReceiptError),
+                    )
+                },
                 error,
             )
             if completion_error:
@@ -292,6 +300,7 @@ class LocalAgentRunner:
                 return str(exc)
         return None
 
+
 def _runner_report(results: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "status": "ok",
@@ -305,10 +314,7 @@ def _runner_report(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _cloud_lease_failed(results: list[dict[str, Any]]) -> bool:
-    return any(
-        result.get("task_id") == "cloud-jobs:lease" and result.get("status") == "failed"
-        for result in results
-    )
+    return any(result.get("task_id") == "cloud-jobs:lease" and result.get("status") == "failed" for result in results)
 
 
 class _CloudJobLeaseHeartbeat:
