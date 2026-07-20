@@ -838,6 +838,8 @@ def test_agent_session_window_api_queues_service_owned_sync(tmp_path):
             )
 
     class FakeSyncService:
+        workspace_id = "default"
+
         def __init__(self):
             self.queued: list[str] = []
 

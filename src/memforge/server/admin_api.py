@@ -2402,6 +2402,11 @@ def get_sync_service(request: Request) -> SyncService:
     return request.app.state.sync_service
 
 
+def get_workspace_id(request: Request) -> str:
+    """FastAPI dependency: retrieve the app-scoped durable run namespace."""
+    return request.app.state.workspace_id
+
+
 def get_sync_scheduler(request: Request) -> SyncScheduler | None:
     """FastAPI dependency: retrieve the app-scoped scheduler."""
     return getattr(request.app.state, "sync_scheduler", None)
@@ -2511,6 +2516,7 @@ def create_admin_app(
     document_store: DocumentArtifactStore | None = None,
     local_agent_lease_validator: Callable[[Request, str, str, int, str], Awaitable[bool]] | None = None,
     local_agent_job_enqueuer: Callable[..., Awaitable[tuple[str, bool]]] | None = None,
+    workspace_id: str = "default",
 ) -> FastAPI:
     """Create and configure the MemForge Admin API FastAPI application.
 
@@ -2544,13 +2550,19 @@ def create_admin_app(
             app.state.db = db
 
         app.state.config = config
+        app.state.workspace_id = workspace_id
         app.state.document_store = document_store or LocalDocumentStore(config.storage.docs_path)
         app.state.runtime_provider = runtime_provider
         app.state.principal_resolver = principal_resolver
         app.state.workspace_role_resolver = workspace_role_resolver
         app.state.local_agent_lease_validator = local_agent_lease_validator
         app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
-        app.state.sync_service = SyncService(app.state.db, config, runtime_provider=runtime_provider)
+        app.state.sync_service = SyncService(
+            app.state.db,
+            config,
+            runtime_provider=runtime_provider,
+            workspace_id=workspace_id,
+        )
         app.state.sync_scheduler = None
         if config.sync.scheduler_enabled:
             app.state.sync_scheduler = SyncScheduler(app.state.db, app.state.sync_service)
@@ -2563,6 +2575,7 @@ def create_admin_app(
                 config,
                 runtime_provider=runtime_provider,
                 worker_id="embedded-admin-worker",
+                workspace_id=workspace_id,
             )
             app.state.sync_worker_task = asyncio.create_task(
                 app.state.sync_worker.run_forever(poll_seconds=config.sync.worker_poll_seconds)
@@ -2592,11 +2605,17 @@ def create_admin_app(
     )
     if db is not None:
         app.state.db = db
-        app.state.sync_service = SyncService(db, config, runtime_provider=runtime_provider)
+        app.state.sync_service = SyncService(
+            db,
+            config,
+            runtime_provider=runtime_provider,
+            workspace_id=workspace_id,
+        )
         app.state.sync_scheduler = SyncScheduler(db, app.state.sync_service) if config.sync.scheduler_enabled else None
         app.state.sync_worker = None
         app.state.sync_worker_task = None
     app.state.config = config
+    app.state.workspace_id = workspace_id
     app.state.document_store = document_store or LocalDocumentStore(config.storage.docs_path)
     app.state.runtime_provider = runtime_provider
     app.state.principal_resolver = principal_resolver
@@ -3701,6 +3720,7 @@ def create_admin_app(
             sync_service=sync_service,
             viewer_id=resolve_request_principal(request),
             viewer_role=resolve_request_workspace_role(request),
+            workspace_id=sync_service.workspace_id,
         )
 
         # Attach memory_count and sync status to each source
@@ -3751,6 +3771,7 @@ def create_admin_app(
             sync_service=sync_service,
             viewer_id=resolve_request_principal(request),
             viewer_role=resolve_request_workspace_role(request),
+            workspace_id=sync_service.workspace_id,
         )
         searchable: list[dict[str, Any]] = []
         for row in rows:
@@ -3940,13 +3961,18 @@ def create_admin_app(
         db: Database,
         source: dict[str, Any],
         document_store: DocumentArtifactStore,
+        *,
+        workspace_id: str,
     ) -> tuple[dict[str, Any], bool]:
         """Build an exact current-corpus replay for local collection sources."""
 
         source_id = str(source["id"])
         if local_agent_sync_operation(source["type"], source.get("config")) is None:
             return source, False
-        latest_run = await db.get_latest_source_sync_run(source_id=source_id)
+        latest_run = await db.get_latest_source_sync_run(
+            source_id=source_id,
+            workspace_id=workspace_id,
+        )
         if latest_run is None or latest_run.status not in {"success", "failed"}:
             raise ValueError("source_lifecycle_terminal_local_replay_required")
         if latest_run.status == "failed" and not latest_run.force_full_sync:
@@ -4040,6 +4066,7 @@ def create_admin_app(
         config: AppConfig,
         runtime_provider: RuntimeProvider,
         document_store: DocumentArtifactStore,
+        workspace_id: str,
     ) -> None:
         from memforge.memory.cutover import (
             reconstruct_historical_source_projection,
@@ -4069,7 +4096,10 @@ def create_admin_app(
             from memforge.pipeline.sync import SourceSyncMode
 
             latest_run = (
-                await db.get_latest_source_sync_run(source_id=source_id)
+                await db.get_latest_source_sync_run(
+                    source_id=source_id,
+                    workspace_id=workspace_id,
+                )
                 if hasattr(db, "get_latest_source_sync_run")
                 else None
             )
@@ -4081,6 +4111,7 @@ def create_admin_app(
                 db,
                 source,
                 document_store,
+                workspace_id=workspace_id,
             )
             state = await runtime_provider.run_source_sync(
                 db=db,
@@ -4141,6 +4172,7 @@ def create_admin_app(
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
         document_store: DocumentArtifactStore = Depends(get_document_store),
+        workspace_id: str = Depends(get_workspace_id),
     ):
         """Queue a conservative exact-lineage cutover audit for one source."""
 
@@ -4179,6 +4211,7 @@ def create_admin_app(
             config,
             runtime_provider,
             document_store,
+            workspace_id,
         )
         return {
             "source_id": source_id,
@@ -4338,6 +4371,7 @@ def create_admin_app(
                 db,
                 fenced_source,
                 document_store,
+                workspace_id=sync_service.workspace_id,
             )
         except Exception as exc:
             try:
@@ -5494,6 +5528,7 @@ def create_admin_app(
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
+        workspace_id: str = Depends(get_workspace_id),
     ):
         """Receive one local-source package pushed by the local daemon/adapter.
 
@@ -5671,6 +5706,7 @@ def create_admin_app(
                     }
                 retained_input = await db.create_source_sync_input(
                     source_id=source_id,
+                    workspace_id=workspace_id,
                     raw_uri=package_uri,
                     raw_sha256=raw_sha256,
                     raw_content_type="application/json",
@@ -6478,9 +6514,10 @@ def create_admin_app(
     async def read_current_local_agent_jobs(
         request: Request,
         db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
     ):
         jobs = await db.list_current_local_agent_jobs(
-            workspace_id="default",
+            workspace_id=workspace_id,
             user_id=resolve_request_principal(request),
         )
         return {"data": [_shape_local_agent_job(job) for job in jobs]}

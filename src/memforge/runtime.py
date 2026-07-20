@@ -1082,10 +1082,13 @@ class SyncService:
         db: "Database",
         config: AppConfig,
         runtime_provider: RuntimeProvider | None = None,
+        *,
+        workspace_id: str = "default",
     ) -> None:
         self.db = db
         self.config = config
         self.runtime_provider = runtime_provider or DefaultRuntimeProvider()
+        self.workspace_id = workspace_id
         self.tasks: dict[str, asyncio.Task] = {}
         self.progress: dict[str, dict] = {}
         max_active_sources = max(0, int(config.sync.max_active_sources))
@@ -1120,7 +1123,6 @@ class SyncService:
         *,
         trigger: str = "manual",
         force_full_sync: bool = False,
-        workspace_id: str = "default",
         input_snapshot_id: str | None = None,
         source_config_revision: str | None = None,
         predecessor_activity_id: str | None = None,
@@ -1136,7 +1138,7 @@ class SyncService:
         effective_config_revision = source_config_revision or current_config_revision
         return await self.db.enqueue_source_sync_run(
             source_id=source_id,
-            workspace_id=workspace_id,
+            workspace_id=self.workspace_id,
             trigger=trigger,
             force_full_sync=force_full_sync,
             input_snapshot_id=input_snapshot_id,

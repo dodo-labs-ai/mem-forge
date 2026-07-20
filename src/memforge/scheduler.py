@@ -145,6 +145,7 @@ class SyncScheduler:
             }
             await self.db.enqueue_due_source_sync_runs(
                 limit=50,
+                workspace_id=self.sync_service.workspace_id,
                 exclude_source_ids=unsupported_source_ids,
             )
         except Exception:

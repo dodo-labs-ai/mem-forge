@@ -189,6 +189,7 @@ async def list_source_admin_rows(
     sync_service: Any,
     viewer_id: str,
     viewer_role: str,
+    workspace_id: str,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     viewer_role = normalize_workspace_role(viewer_role)
@@ -235,7 +236,10 @@ async def list_source_admin_rows(
             row["sync"] = None
             rows.append(row)
             continue
-        durable_run = await reader.get_latest_source_sync_run(source_id=source_id)
+        durable_run = await reader.get_latest_source_sync_run(
+            source_id=source_id,
+            workspace_id=workspace_id,
+        )
         if durable_run is not None and durable_run.status in {"pending", "running"}:
             row["sync"] = _durable_sync_payload(durable_run)
         elif _sync_is_running(sync_service, source_id):
