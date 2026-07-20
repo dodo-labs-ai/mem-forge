@@ -16,7 +16,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from memforge.genes.base import Gene
-from memforge.models import GeneMetadata
+from memforge.models import GeneMetadata, SourceExecutionKind
 
 if TYPE_CHECKING:
     pass
@@ -26,6 +26,8 @@ __all__ = [
     "register_gene",
     "create_gene",
     "list_available_genes",
+    "source_type_execution_kinds",
+    "source_type_supports_sync",
     "Gene",
 ]
 
@@ -120,6 +122,19 @@ def list_available_genes() -> list[GeneMetadata]:
         cls.metadata()
         for _, cls in sorted(GENE_REGISTRY.items())
     ]
+
+
+def source_type_execution_kinds(source_type: str) -> tuple[SourceExecutionKind, ...]:
+    """Return the declared sync execution kinds for a registered source type."""
+    gene_cls = GENE_REGISTRY.get(str(source_type or "").strip())
+    if gene_cls is None:
+        return ()
+    return gene_cls.metadata().execution_kinds
+
+
+def source_type_supports_sync(source_type: str) -> bool:
+    """Whether the source type participates in the ordinary sync lifecycle."""
+    return bool(source_type_execution_kinds(source_type))
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from memforge.genes import source_type_supports_sync
 from memforge.local_agent.source_contract import (
     execution_owner_user_id,
     is_local_agent_backed_source,
@@ -72,6 +73,7 @@ def source_ownership_and_capabilities(
     )
     can_manage = can_manage_source(source, viewer_id=viewer_id, viewer_role=viewer_role)
     managed_source = _is_managed_source_type(str(source.get("type") or ""))
+    sync_supported = source_type_supports_sync(str(source.get("type") or ""))
     local_agent_backed = is_local_agent_backed_source(source)
     execution_owner = execution_owner_user_id(source)
     can_execute_locally = execution_owner is not None and execution_owner == viewer_id
@@ -89,10 +91,20 @@ def source_ownership_and_capabilities(
             can_execute_locally if local_agent_backed else can_manage and not managed_source
         ),
         "can_sync": (
-            can_execute_locally if local_agent_backed else can_manage and not managed_source
+            sync_supported
+            and (
+                can_execute_locally
+                if local_agent_backed
+                else can_manage and not managed_source
+            )
         ),
         "can_force_resync": (
-            can_execute_locally if local_agent_backed else can_manage and not managed_source
+            sync_supported
+            and (
+                can_execute_locally
+                if local_agent_backed
+                else can_manage and not managed_source
+            )
         ),
         "can_delete": can_manage and not managed_source,
         "can_change_access": can_manage,
@@ -219,6 +231,10 @@ async def list_source_admin_rows(
             latest_job=lifecycle_jobs[0] if lifecycle_jobs else None,
         )
         row.setdefault("client", None)
+        if not source_type_supports_sync(str(row.get("type") or "")):
+            row["sync"] = None
+            rows.append(row)
+            continue
         durable_run = await reader.get_latest_source_sync_run(source_id=source_id)
         if durable_run is not None and durable_run.status in {"pending", "running"}:
             row["sync"] = _durable_sync_payload(durable_run)
