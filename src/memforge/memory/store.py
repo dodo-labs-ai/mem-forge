@@ -10,6 +10,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from hashlib import sha256
+from itertools import zip_longest
 from typing import Any, Sequence
 
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
@@ -630,30 +631,54 @@ class MemoryStore:
         *,
         excluded_memory_ids: set[str] | frozenset[str] = frozenset(),
         scope: AccessScope | None = None,
+        doc_id: str | None = None,
+        entity_ids: Sequence[int] = (),
     ) -> tuple[Memory, ...]:
         """Return bounded access-compatible candidates for semantic proof.
 
-        Vector distance is candidate recall only. The engine must prove exact or
-        semantic equivalence before reusing an identity. Project is deliberately
-        absent from the access check because it is a relevance/ranking dimension,
-        not a visibility boundary.
+        Strict vector proximity is the primary recall channel. Shared-entity
+        candidates from other Source Units are a bounded fallback for equivalent
+        claims whose wording is too different for the dedup threshold. The engine
+        must still prove exact or semantic equivalence before reusing an identity.
         """
 
         compatible: list[Memory] = []
+        compatible_ids: set[str] = set()
+        candidate_access = lifecycle_access_context_hash(
+            visibility=memory.visibility,
+            owner_user_id=memory.owner_user_id,
+            project_key=memory.project_key,
+            repo_identifier=memory.repo_identifier,
+        )
+
+        def add_candidate(candidate: Memory | None) -> None:
+            if (
+                candidate is None
+                or candidate.id in excluded_memory_ids
+                or candidate.id in compatible_ids
+                or len(compatible) >= DEDUP_CANDIDATE_LIMIT
+                or lifecycle_access_context_hash(
+                    visibility=candidate.visibility,
+                    owner_user_id=candidate.owner_user_id,
+                    project_key=candidate.project_key,
+                    repo_identifier=candidate.repo_identifier,
+                )
+                != candidate_access
+            ):
+                return
+            compatible.append(candidate)
+            compatible_ids.add(candidate.id)
+
         reactivation_candidate = await self.relational.find_rebaseline_reactivation_candidate(
             memory.content_hash,
             visibility=memory.visibility,
             owner_user_id=memory.owner_user_id,
             repo_identifier=memory.repo_identifier,
         )
-        if (
-            reactivation_candidate is not None
-            and reactivation_candidate.id not in excluded_memory_ids
-        ):
-            compatible.append(reactivation_candidate)
+        add_candidate(reactivation_candidate)
 
         embedding = await self._embed(_memory_embedding_text(memory))
-        candidates = await self.vector.query(
+        vector_hits = await self.vector.query(
             embedding,
             scope or _writer_access_scope(memory),
             None,
@@ -661,7 +686,7 @@ class MemoryStore:
         )
         candidate_ids = [
             existing_id
-            for existing_id, score in candidates
+            for existing_id, score in vector_hits
             if existing_id not in excluded_memory_ids
             and self.vector.within_dedup_threshold(self.dedup_threshold, score)
         ]
@@ -671,7 +696,8 @@ class MemoryStore:
                 candidate_ids
             )
         }
-        for existing_id, score in candidates:
+        vector_candidates: list[Memory] = []
+        for existing_id, score in vector_hits:
             if existing_id in excluded_memory_ids:
                 continue
             if not self.vector.within_dedup_threshold(self.dedup_threshold, score):
@@ -693,7 +719,28 @@ class MemoryStore:
                 repo_identifier=memory.repo_identifier,
             ):
                 continue
-            compatible.append(existing)
+            vector_candidates.append(existing)
+
+        entity_candidates: Sequence[Memory] = ()
+        if doc_id and entity_ids:
+            entity_candidates = (
+                await self.relational.find_active_ordinary_claim_memories_by_entities(
+                    entity_ids,
+                    visibility=memory.visibility,
+                    owner_user_id=memory.owner_user_id,
+                    repo_identifier=memory.repo_identifier,
+                    project_key=memory.project_key,
+                    excluded_memory_ids=tuple(sorted(excluded_memory_ids)),
+                    excluded_doc_id=doc_id,
+                    limit=DEDUP_CANDIDATE_LIMIT,
+                )
+            )
+        for vector_candidate, entity_candidate in zip_longest(
+            vector_candidates,
+            entity_candidates,
+        ):
+            add_candidate(vector_candidate)
+            add_candidate(entity_candidate)
         return tuple(compatible)
 
     async def _dedup_support_relation_outcome_bundle(

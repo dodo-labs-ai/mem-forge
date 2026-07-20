@@ -371,8 +371,10 @@ class _EquivalentMemoryStore(_OutboxDrainer):
         *,
         excluded_memory_ids=frozenset(),
         scope=None,
+        doc_id=None,
+        entity_ids=(),
     ) -> tuple[Memory, ...]:
-        del memory, excluded_memory_ids, scope
+        del memory, excluded_memory_ids, scope, doc_id, entity_ids
         return (self.target,)
 
 
