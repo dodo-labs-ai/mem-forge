@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from memforge.config import AppConfig
 from memforge.auth import browser_session
-from memforge.genes import GENE_REGISTRY, create_gene
+from memforge.genes import GENE_REGISTRY, create_gene, source_type_supports_sync
 from memforge.llm.providers import is_litellm_provider_model
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.local_agent.source_contract import (
@@ -74,6 +74,10 @@ class SourceSyncLeaseLost(RuntimeError):
 
 class SourceSyncBoundaryError(RuntimeError):
     """Raised when a durable run no longer matches its captured input boundary."""
+
+
+class SourceSyncUnsupportedError(SourceSyncBoundaryError):
+    """Raised when a source type has no ordinary sync execution kind."""
 
 
 class SourceLifecycleMaintenanceError(SourceSyncBoundaryError, SourceActivityConflict):
@@ -928,6 +932,11 @@ class SourceSyncWorker:
                     )
                 return run
 
+            if not source_type_supports_sync(str(source.get("type") or "")):
+                raise SourceSyncUnsupportedError(
+                    f"Source type {source.get('type')!r} does not support ordinary sync"
+                )
+
             if (
                 run.source_config_revision is not None
                 and local_agent_source_config_revision(source) != run.source_config_revision
@@ -1098,6 +1107,10 @@ class SyncService:
             raise SourcePausedError(f"Source is paused: {source_id}")
         if source.get("status") != "active":
             raise SourceNotActiveError(f"Source is not active: {source_id} ({source.get('status')})")
+        if not source_type_supports_sync(str(source.get("type") or "")):
+            raise SourceSyncUnsupportedError(
+                f"Source type {source.get('type')!r} does not support ordinary sync"
+            )
         await authorize_source_sync_maintenance(self.db, source_id)
         return source
 
@@ -1185,7 +1198,7 @@ class SyncService:
         del delay_seconds
         try:
             run = await self.enqueue_source(source_id, trigger="request")
-        except (SourcePausedError, SourceNotActiveError):
+        except (SourcePausedError, SourceNotActiveError, SourceSyncUnsupportedError):
             return False
         return not run.coalesced
 
@@ -1194,7 +1207,10 @@ class SyncService:
         for source in sources:
             if source.get("status") != "active":
                 continue
-            await self.enqueue_source(source["id"], trigger="schedule_all")
+            try:
+                await self.enqueue_source(source["id"], trigger="schedule_all")
+            except SourceSyncUnsupportedError:
+                continue
 
     async def retire_expired_memories(self) -> int:
         runtime = await self.runtime_provider.build_sync_runtime(self.db, self.config)
