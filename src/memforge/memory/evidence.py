@@ -169,6 +169,13 @@ class LifecycleAction(str, Enum):
     RETIRE_MEMORY = "retire_memory"
 
 
+class RelationProjectionPlane(str, Enum):
+    """Owner of one update to the current Evidence Relation projection."""
+
+    LIFECYCLE = "lifecycle"
+    DISCOVERY = "discovery"
+
+
 class ReviewCase(str, Enum):
     LEGACY_LIMITED_EVIDENCE = "legacy_limited_evidence"
     MISSING_CONTENT_PROVENANCE = "missing_content_provenance"

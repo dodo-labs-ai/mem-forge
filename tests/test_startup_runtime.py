@@ -2711,6 +2711,8 @@ async def test_server_sync_routes_translate_atomic_activity_race_to_409(
     monkeypatch,
     route,
 ):
+    import httpx
+
     from memforge.server.admin_api import create_admin_app
     from memforge.source_activity import SourceActivityConflict
 
@@ -2729,8 +2731,12 @@ async def test_server_sync_routes_translate_atomic_activity_race_to_409(
 
     monkeypatch.setattr(db, "enqueue_source_sync_run", lose_enqueue_race)
     app = create_admin_app(db=db, config=_config(tmp_path))
-    with TestClient(app) as client:
-        response = client.post(f"/api/sources/{source_id}/{route}")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(f"/api/sources/{source_id}/{route}")
 
     assert response.status_code == 409
     assert response.json()["detail"] == "source activity started during enqueue"

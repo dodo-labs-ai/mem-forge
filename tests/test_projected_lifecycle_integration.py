@@ -20,13 +20,18 @@ from memforge.llm.structured import (
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.evidence import (
+    AuthorityCase,
     CandidateMemory,
     EvidenceContentProvenance,
+    EvidenceRelationRecord,
     EvidenceReference,
     EvidenceRole,
     EvidenceUnit,
+    LifecycleAction,
     MemorySupportAssertion,
     RelationDirection,
+    RelationOutcomeBundle,
+    RelationRunRecord,
     RelationType,
 )
 from memforge.memory.lifecycle_plan import (
@@ -3145,7 +3150,7 @@ async def test_stale_parallel_cross_unit_create_fails_closed_before_duplicate_wr
 
 
 @pytest.mark.asyncio
-async def test_new_projected_memory_persists_explicit_source_observation_support(
+async def test_projected_memory_support_survives_relation_work_retry_and_empty_completion(
     db: Database,
 ) -> None:
     projection = _jira_projection(
@@ -3261,6 +3266,86 @@ async def test_new_projected_memory_persists_explicit_source_observation_support
             lease_token=retried.lease_token or "",
             reason="expired worker must not finish",
         )
+    await db.db.rollback()
+
+    [completion] = await db.lease_relation_discovery_work(
+        worker_id="relation-worker-d",
+        limit=1,
+        lease_seconds=60,
+        max_attempts=4,
+    )
+    evidence_unit = await db.get_current_relation_evidence_unit(
+        memory.id,
+        source_id=completion.request.source_id,
+        source_unit_id=completion.request.source_unit_id,
+    )
+    assert evidence_unit is not None
+    support_run = RelationRunRecord(
+        id="relation-run-authoritative-support",
+        evidence_unit_id=evidence_unit.id,
+        access_context_hash=evidence_unit.access_context_hash,
+        candidate_count=0,
+        mandatory_candidate_count=0,
+        checked_candidate_count=0,
+        incomplete_mandatory_buckets=(),
+        classifier_version="source-projection-test-v1",
+        lifecycle_action=LifecycleAction.CREATE_MEMORY,
+        review_case=None,
+        status="applied",
+        result_memory_id=memory.id,
+        audit={"source": "source_projection"},
+    )
+    await db.record_relation_outcome_bundle(
+        RelationOutcomeBundle(
+            evidence_unit=evidence_unit,
+            relation_run=support_run,
+            relations=(
+                EvidenceRelationRecord(
+                    evidence_unit_id=evidence_unit.id,
+                    memory_id=memory.id,
+                    relation_type=RelationType.SUPPORTS,
+                    authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
+                    is_authoritative_support=True,
+                    source_lineage_id=evidence_unit.source_lineage_id,
+                    confidence=1.0,
+                    classifier_version="source-projection-test-v1",
+                    relation_run_id=support_run.id,
+                ),
+            ),
+        )
+    )
+    authoritative_relations = await db.get_evidence_relations(evidence_unit.id)
+    assert len(authoritative_relations) == 1
+    assert authoritative_relations[0].is_authoritative_support is True
+
+    completed_at = datetime(2026, 7, 15, 11, 1, tzinfo=timezone.utc).isoformat()
+    await db.complete_relation_discovery_work(
+        completion.request.id,
+        worker_id="relation-worker-d",
+        lease_token=completion.lease_token or "",
+        relation_outcome=RelationOutcomeBundle(
+            evidence_unit=evidence_unit,
+            relation_run=RelationRunRecord(
+                id="relation-run-empty-discovery",
+                evidence_unit_id=evidence_unit.id,
+                access_context_hash=evidence_unit.access_context_hash,
+                candidate_count=0,
+                mandatory_candidate_count=0,
+                checked_candidate_count=0,
+                incomplete_mandatory_buckets=(),
+                classifier_version="relation-discovery-test-v1",
+                lifecycle_action=LifecycleAction.NONE,
+                review_case=None,
+                status="checked",
+                result_memory_id=memory.id,
+                audit={"source": "relation_discovery"},
+                started_at=completed_at,
+                completed_at=completed_at,
+            ),
+        ),
+    )
+
+    assert await db.get_evidence_relations(evidence_unit.id) == authoritative_relations
 
 
 class _DeterministicRefinementClassifier:

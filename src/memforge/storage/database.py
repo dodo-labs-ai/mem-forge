@@ -82,6 +82,7 @@ from memforge.memory.evidence import (
     RelationCandidateRecord,
     RelationDirection,
     RelationOutcomeBundle,
+    RelationProjectionPlane,
     RelationRunRecord,
     RelationType,
     ReviewCase,
@@ -6473,7 +6474,10 @@ class Database:
                     claim_identity_policy=ClaimIdentityPolicy.EXPLICIT_CONCEPT,
                 )
                 if relation_outcome is not None:
-                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                    await self._record_relation_outcome_bundle_unlocked(
+                        relation_outcome,
+                        projection_plane=RelationProjectionPlane.LIFECYCLE,
+                    )
                 if concept_projection is not None:
                     await self._upsert_agent_concept_unlocked(
                         **concept_projection,
@@ -7542,6 +7546,7 @@ class Database:
                 )
                 await self._record_relation_outcome_bundle_unlocked(
                     relation_outcome,
+                    projection_plane=RelationProjectionPlane.DISCOVERY,
                     update_evidence_unit=False,
                 )
                 for review in reviews:
@@ -8498,7 +8503,10 @@ class Database:
         """Persist one complete relation outcome in a single transaction."""
         async with self._write_lock:
             try:
-                await self._record_relation_outcome_bundle_unlocked(bundle)
+                await self._record_relation_outcome_bundle_unlocked(
+                    bundle,
+                    projection_plane=RelationProjectionPlane.LIFECYCLE,
+                )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
@@ -8508,6 +8516,7 @@ class Database:
         self,
         bundle: RelationOutcomeBundle,
         *,
+        projection_plane: RelationProjectionPlane,
         update_evidence_unit: bool = True,
     ) -> None:
         bundle = _with_relation_snapshot_audit(bundle)
@@ -8621,10 +8630,15 @@ class Database:
                     candidate.reason,
                 ),
             )
-        await self.db.execute(
-            "DELETE FROM evidence_relations WHERE evidence_unit_id = ?",
-            (unit.id,),
-        )
+        preserve_authoritative_relations = projection_plane is RelationProjectionPlane.DISCOVERY
+        if preserve_authoritative_relations and any(
+            relation.is_authoritative_support for relation in bundle.relations
+        ):
+            raise ValueError("relation discovery cannot publish authoritative support")
+        relation_delete_sql = "DELETE FROM evidence_relations WHERE evidence_unit_id = ?"
+        if preserve_authoritative_relations:
+            relation_delete_sql += " AND is_authoritative_support = 0"
+        await self.db.execute(relation_delete_sql, (unit.id,))
         for relation in bundle.relations:
             validate_persisted_evidence_relation(relation)
             await self.db.execute(
@@ -8651,13 +8665,25 @@ class Database:
                     relation.created_at or now,
                 ),
             )
+            current_relation_insert = "INSERT INTO evidence_relations"
+            current_relation_values = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            current_relation_guard: tuple[object, ...] = ()
+            if preserve_authoritative_relations:
+                current_relation_values = (
+                    "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
+                    "WHERE NOT EXISTS ("
+                    "SELECT 1 FROM evidence_relations "
+                    "WHERE evidence_unit_id = ? AND memory_id = ? "
+                    "AND is_authoritative_support = 1)"
+                )
+                current_relation_guard = (relation.evidence_unit_id, relation.memory_id)
             await self.db.execute(
-                """INSERT INTO evidence_relations (
+                f"""{current_relation_insert} (
                             evidence_unit_id, memory_id, relation_type, relation_direction, authority_case,
                             is_authoritative_support, source_lineage_id, confidence,
                             reason, proposed_memory_content, excerpt, classifier_version,
                             relation_run_id, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        ) {current_relation_values}""",
                 (
                     relation.evidence_unit_id,
                     relation.memory_id,
@@ -8673,6 +8699,7 @@ class Database:
                     relation.classifier_version,
                     relation.relation_run_id,
                     relation.created_at or now,
+                    *current_relation_guard,
                 ),
             )
 
@@ -8889,7 +8916,10 @@ class Database:
                     search_visible_statuses=set(allowed_search_statuses()),
                 )
                 if relation_outcome is not None:
-                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                    await self._record_relation_outcome_bundle_unlocked(
+                        relation_outcome,
+                        projection_plane=RelationProjectionPlane.LIFECYCLE,
+                    )
                 if related_review_id is not None:
                     now = _now_iso()
                     async with self.db.execute(
@@ -9019,7 +9049,10 @@ class Database:
                     search_visible_statuses=set(allowed_search_statuses()),
                 )
                 if relation_outcome is not None:
-                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                    await self._record_relation_outcome_bundle_unlocked(
+                        relation_outcome,
+                        projection_plane=RelationProjectionPlane.LIFECYCLE,
+                    )
                 if concept_projection is not None:
                     await self._upsert_agent_concept_unlocked(**concept_projection, observed=observed)
                 await self._upsert_agent_claim_unlocked(
@@ -9498,7 +9531,10 @@ class Database:
                     reason=reason,
                     allowed_current_statuses=("active", "pending_review"),
                 )
-                await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                await self._record_relation_outcome_bundle_unlocked(
+                    relation_outcome,
+                    projection_plane=RelationProjectionPlane.LIFECYCLE,
+                )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
@@ -9733,7 +9769,10 @@ class Database:
                     support_kind=support_kind,
                     source_updated_at=source_updated_at,
                 )
-                await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                await self._record_relation_outcome_bundle_unlocked(
+                    relation_outcome,
+                    projection_plane=RelationProjectionPlane.LIFECYCLE,
+                )
                 await self.db.commit()
                 return outcome
             except Exception:
@@ -9959,7 +9998,10 @@ class Database:
                     search_visible_statuses=set(allowed_search_statuses()),
                 )
                 if relation_outcome is not None:
-                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                    await self._record_relation_outcome_bundle_unlocked(
+                        relation_outcome,
+                        projection_plane=RelationProjectionPlane.LIFECYCLE,
+                    )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
@@ -10984,7 +11026,10 @@ class Database:
                         observed=observed,
                     )
                 if relation_outcome is not None:
-                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                    await self._record_relation_outcome_bundle_unlocked(
+                        relation_outcome,
+                        projection_plane=RelationProjectionPlane.LIFECYCLE,
+                    )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
@@ -15116,12 +15161,18 @@ class Database:
                         review,
                         self._row_to_review(existing_review),
                     )
-                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                    await self._record_relation_outcome_bundle_unlocked(
+                        relation_outcome,
+                        projection_plane=RelationProjectionPlane.LIFECYCLE,
+                    )
                     await self.db.commit()
                     return review.id
 
                 now = _now_iso()
-                await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                await self._record_relation_outcome_bundle_unlocked(
+                    relation_outcome,
+                    projection_plane=RelationProjectionPlane.LIFECYCLE,
+                )
                 await self.db.execute(
                     """INSERT INTO memory_reviews (
                         id, kind, status, incumbent_memory_id, challenger_memory_id,
@@ -15367,7 +15418,10 @@ class Database:
                     ("pending_review", now, memory_id),
                 )
                 if relation_outcome is not None:
-                    await self._record_relation_outcome_bundle_unlocked(relation_outcome)
+                    await self._record_relation_outcome_bundle_unlocked(
+                        relation_outcome,
+                        projection_plane=RelationProjectionPlane.LIFECYCLE,
+                    )
                 if related_review_id is not None:
                     async with self.db.execute(
                         """SELECT review_id FROM memory_review_related_challengers
