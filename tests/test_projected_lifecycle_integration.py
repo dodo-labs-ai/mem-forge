@@ -266,6 +266,36 @@ class _DeleteClient:
         )
 
 
+class _UnexpectedReconciliationClient:
+    async def reconcile_memories(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        raise AssertionError("proven-disjoint incumbent must not require LLM reconciliation")
+
+
+class _RecordingAddClient:
+    def __init__(self, incumbent_id: str) -> None:
+        self.incumbent_id = incumbent_id
+        self.prompts: list[str] = []
+
+    async def reconcile_memories(self, prompt: str, **kwargs):
+        del kwargs
+        self.prompts.append(prompt)
+        return ReconciliationResponse(
+            decisions=[
+                ReconciliationDecision(
+                    index=0,
+                    action="ADD",
+                    reason="The changed observation states a separate durable claim.",
+                ),
+                ReconciliationDecision(
+                    action="NOOP",
+                    memory_id=self.incumbent_id,
+                    reason="The unchanged incumbent remains supported.",
+                ),
+            ]
+        )
+
+
 class _PersistentlyIndexlessReplacementClient:
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
@@ -1975,7 +2005,11 @@ async def _seed_jira_required_incumbent(
 
 
 @pytest.mark.asyncio
-async def test_partial_jira_projection_forces_disjoint_incumbent_keep(db: Database) -> None:
+async def test_partial_jira_projection_skips_llm_for_proven_disjoint_incumbent(
+    db: Database,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="memforge.memory.engine")
     first = _jira_projection(
         run_id="projection-jira-partial-fence-1",
         description="Initial issue description.",
@@ -2010,7 +2044,7 @@ async def test_partial_jira_projection_forces_disjoint_incumbent_keep(db: Databa
         vector=adapters.vector,
         db=db,
         memory_store=_OutboxDrainer(db),
-        structured_llm_client=_DeleteClient(incumbent.id),
+        structured_llm_client=_UnexpectedReconciliationClient(),
     )
 
     stats = await engine.apply_projected_lifecycle(
@@ -2032,7 +2066,110 @@ async def test_partial_jira_projection_forces_disjoint_incumbent_keep(db: Databa
     assert current is not None and current.status == "active"
     assert stats["deleted"] == 0
     assert stats["noop"] == 1
+    sample = json.loads(
+        next(
+            record.getMessage()
+            for record in caplog.records
+            if '"event":"projected_lifecycle_reconciliation"' in record.getMessage()
+        )
+    )
+    assert sample["reconciliation_incumbent_count"] == 1
+    assert sample["reconciliation_model_incumbent_count"] == 0
+    assert sample["reconciliation_disjoint_keep_count"] == 1
+    assert sample["reconciliation_llm_call_count"] == 0
     assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
+
+
+@pytest.mark.asyncio
+async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation(
+    db: Database,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caplog.set_level("INFO", logger="memforge.memory.engine")
+    first = _jira_projection(
+        run_id="projection-jira-new-candidate-1",
+        description="Initial issue description.",
+        comment_body="Decision: retain A7",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-jira-new-candidate-incumbent",
+        memory_content="Decision: retain A7",
+        observation_index=1,
+        source_type="jira",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    second = _jira_projection(
+        run_id="projection-jira-new-candidate-2",
+        description="Payroll validation requires approval before release.",
+        comment_body="Decision: retain A7",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    description = second.observations[0]
+    description_revision = next(
+        revision
+        for revision in second.observation_revisions
+        if revision.observation_id == description.id
+    )
+    candidate = RawMemory(
+        content="Payroll validation requires approval before release.",
+        memory_type="procedure",
+        evidence_quote="Payroll validation requires approval before release.",
+        source_observation_id=description.id,
+    )
+    client = _RecordingAddClient(incumbent.id)
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relational=adapters.relational,
+        vector=adapters.vector,
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=client,
+    )
+
+    async def unexpected_impact_scan(**kwargs):
+        del kwargs
+        raise AssertionError("new-candidate reconciliation must not pre-scan impacts")
+
+    monkeypatch.setattr(engine, "_projected_incumbent_impacts", unexpected_impact_scan)
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[candidate],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content=description_revision.content,
+        update_mode="diff_guided",
+        changed_hunks="Payroll validation requires approval before release.",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+
+    assert stats["added"] == 1
+    sample = json.loads(
+        next(
+            record.getMessage()
+            for record in caplog.records
+            if '"event":"projected_lifecycle_reconciliation"' in record.getMessage()
+        )
+    )
+    assert sample["reconciliation_incumbent_count"] == 1
+    assert sample["reconciliation_model_incumbent_count"] == 1
+    assert sample["reconciliation_disjoint_keep_count"] == 0
+    assert sample["reconciliation_llm_batch_count"] == 1
+    assert sample["reconciliation_llm_call_count"] == 1
+    assert len(client.prompts) == 1
+    assert incumbent.content in client.prompts[0]
 
 
 @pytest.mark.asyncio
