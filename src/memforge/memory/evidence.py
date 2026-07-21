@@ -22,6 +22,19 @@ class RelationType(str, Enum):
     NO_RELATION = "no_relation"
 
 
+class RelationDirection(str, Enum):
+    """Orientation of one Evidence-to-Memory semantic relation.
+
+    Historical relation rows predate this contract and therefore keep a NULL
+    direction. New REFINES rows must name an orientation; symmetric relations
+    use SYMMETRIC.
+    """
+
+    SYMMETRIC = "symmetric"
+    CHALLENGER_TO_CANDIDATE = "challenger_to_candidate"
+    CANDIDATE_TO_CHALLENGER = "candidate_to_challenger"
+
+
 class AuthorityCase(str, Enum):
     SAME_DOCUMENT_REVISION = "same_document_revision"
     SAME_SOURCE_LINEAGE = "same_source_lineage"
@@ -111,9 +124,7 @@ def validate_evidence_references(
     for item in references:
         anchor = item.anchor
         if anchor.observation_revision_id not in available_revision_ids:
-            raise ValueError(
-                f"unavailable observation revision: {anchor.observation_revision_id}"
-            )
+            raise ValueError(f"unavailable observation revision: {anchor.observation_revision_id}")
         identity = (
             item.role.value,
             anchor.kind.value,
@@ -322,12 +333,34 @@ class EvidenceRelationRecord:
     is_authoritative_support: bool
     source_lineage_id: str | None
     confidence: float | None
+    direction: RelationDirection | None = None
     reason: str | None = None
     proposed_memory_content: str | None = None
     excerpt: str | None = None
     classifier_version: str = ""
     relation_run_id: str = ""
     created_at: str | None = None
+
+
+def validate_persisted_evidence_relation(relation: EvidenceRelationRecord) -> None:
+    """Reject incomplete new relation writes while legacy NULL directions remain readable."""
+
+    persisted_types = {
+        RelationType.SUPPORTS,
+        RelationType.EQUIVALENT,
+        RelationType.REFINES,
+        RelationType.CONTRADICTS,
+    }
+    if relation.relation_type not in persisted_types:
+        raise ValueError(f"relation_type {relation.relation_type.value!r} is not a persisted evidence relation")
+    if relation.direction is None:
+        if relation.relation_type is RelationType.REFINES:
+            raise ValueError("new REFINES relations require a direction")
+        return
+    directional = relation.relation_type is RelationType.REFINES
+    symmetric = relation.direction is RelationDirection.SYMMETRIC
+    if directional == symmetric:
+        raise ValueError("REFINES must be directional and other relations symmetric")
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,6 +405,7 @@ class RelationOutcomeBundle:
     relation_run: RelationRunRecord
     candidates: tuple[RelationCandidateRecord, ...] = ()
     relations: tuple[EvidenceRelationRecord, ...] = ()
+    candidate_provenance: tuple[CandidateMemory, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,6 +453,7 @@ def evidence_relation_retry_identity(relation: EvidenceRelationRecord) -> tuple[
         bool(relation.is_authoritative_support),
         relation.source_lineage_id,
         relation.confidence,
+        relation.direction.value if relation.direction is not None else None,
         relation.reason,
         relation.proposed_memory_content,
         relation.excerpt,
@@ -811,10 +846,7 @@ class MemoryRelationApplyService:
             destructive_decisions = [decision for decision in decisions if self._is_destructive_candidate(decision)]
             if any(not decision.matched_bucket_complete for decision in destructive_decisions):
                 return ReviewCase.MANDATORY_INCOMPLETE
-            destructive_targets = {
-                decision.candidate_memory_id
-                for decision in destructive_decisions
-            }
+            destructive_targets = {decision.candidate_memory_id for decision in destructive_decisions}
             if len(destructive_targets) > 1:
                 return ReviewCase.MULTI_DESTRUCTIVE_MATCH
 
@@ -832,9 +864,8 @@ class MemoryRelationApplyService:
         return None
 
     def _is_destructive_candidate(self, decision: RelationDecision) -> bool:
-        return (
-            decision.relation_type in self._DESTRUCTIVE_RELATIONS
-            and is_destructive_authority(decision.authority_case)
+        return decision.relation_type in self._DESTRUCTIVE_RELATIONS and is_destructive_authority(
+            decision.authority_case
         )
 
     @staticmethod

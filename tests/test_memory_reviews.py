@@ -116,7 +116,9 @@ def review_service(db, memory_store) -> ReviewService:
 
 
 def _config(tmp_path: Path) -> AppConfig:
-    return AppConfig(base_dir=tmp_path / "memforge")
+    config = AppConfig(base_dir=tmp_path / "memforge")
+    config.sync.worker_enabled = False
+    return config
 
 
 # ---------------------------------------------------------------------------

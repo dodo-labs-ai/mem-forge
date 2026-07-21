@@ -12,6 +12,7 @@ from memforge.memory.relation_candidate_retrieval import (
     CrossDocumentCandidateSelection,
     CrossDocumentCandidateRetriever,
     RelationCandidateRetrievalPolicy,
+    StaleCandidateSelectionError,
 )
 
 
@@ -121,6 +122,7 @@ async def test_hybrid_discovery_reuses_lightweight_candidates_before_full_row_lo
         entity_ids=[7],
         doc_id="doc-new",
         actor_user_id="user-a",
+        source_id="src-new",
     )
 
     assert selection.candidate_ids == ("mem-b", "mem-c")
@@ -140,6 +142,7 @@ async def test_hybrid_discovery_reuses_lightweight_candidates_before_full_row_lo
         selection,
         challenger=challenger,
         doc_id="doc-new",
+        source_id="src-new",
     )
     assert relational.full_memory_ids == selection.candidate_ids
     assert materialized.candidate_ids == selection.candidate_ids
@@ -161,9 +164,52 @@ async def test_hybrid_discovery_reuses_lightweight_candidates_before_full_row_lo
         "mem-c",
     ]
     assert universe.candidates[0].bucket is CandidateBucket.HYBRID_DISCOVERY
-    assert universe.candidates[0].reason == (
-        "hybrid_discovery:shared_entities,semantic_vector_neighbors"
+    assert universe.candidates[0].reason == ("hybrid_discovery:shared_entities,semantic_vector_neighbors")
+
+
+@pytest.mark.asyncio
+async def test_selected_ledger_fails_closed_when_one_full_row_disappears() -> None:
+    class MissingFullRowRelational(_Relational):
+        async def list_active_memories(self, memory_ids):
+            loaded = await super().list_active_memories(memory_ids)
+            return loaded[:-1]
+
+    relational = MissingFullRowRelational()
+    retriever = CrossDocumentCandidateRetriever(
+        relational=relational,
+        keyword=_Keyword(),
+        vector=_Vector(),
+        policy=RelationCandidateRetrievalPolicy(
+            initial_budget=1,
+            expansion_step=1,
+            max_budget=4,
+            rank_window_size=4,
+        ),
     )
+    challenger = SimpleNamespace(
+        id="mem-new",
+        content="The service uses a bounded queue.",
+        memory_type="fact",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier="repo-a",
+        project_key="PAY",
+    )
+    selection = await retriever.retrieve(
+        challenger=challenger,
+        entity_ids=[7],
+        doc_id="doc-new",
+        actor_user_id="user-a",
+        source_id="src-new",
+    )
+
+    with pytest.raises(StaleCandidateSelectionError, match="could not be materialized"):
+        await retriever.load_selected_memories(
+            selection,
+            challenger=challenger,
+            doc_id="doc-new",
+            source_id="src-new",
+        )
 
 
 @pytest.mark.asyncio
@@ -200,7 +246,10 @@ async def test_worker_cancellation_is_not_downgraded_to_channel_failure() -> Non
             entity_ids=[7],
             doc_id="doc-new",
             actor_user_id="user-a",
+            source_id="src-new",
         )
+
+
 @pytest.mark.asyncio
 async def test_failed_discovery_channel_is_audited_without_making_it_mandatory() -> None:
     class BrokenKeyword(_Keyword):
@@ -233,6 +282,7 @@ async def test_failed_discovery_channel_is_audited_without_making_it_mandatory()
         entity_ids=[7],
         doc_id="doc-new",
         actor_user_id="user-a",
+        source_id="src-new",
     )
 
     assert selection.telemetry["channel_errors"] == [CandidateBucket.LEXICAL_BM25.value]
@@ -256,15 +306,19 @@ async def test_exact_postfilter_preserves_only_access_compatible_provenance() ->
     class ExactRelational:
         async def graph_search(self, entity_ids, scope, memory_types, limit, **kwargs):
             del entity_ids, scope, memory_types, limit, kwargs
-            return [(memory_id, 1.0) for memory_id in (
-                "eligible",
-                "same-doc",
-                "wrong-visibility",
-                "wrong-owner",
-                "wrong-repo",
-                "disabled-only",
-                "mixed-source",
-            )]
+            return [
+                (memory_id, 1.0)
+                for memory_id in (
+                    "eligible",
+                    "same-doc",
+                    "wrong-visibility",
+                    "wrong-owner",
+                    "wrong-repo",
+                    "disabled-only",
+                    "mixed-source",
+                    "same-and-cross-source",
+                )
+            ]
 
         async def list_active_candidate_memories(self, memory_ids):
             del memory_ids
@@ -277,6 +331,8 @@ async def test_exact_postfilter_preserves_only_access_compatible_provenance() ->
                 _candidate("disabled-only", source_id="src-disabled"),
                 _candidate("mixed-source", source_id="src-disabled"),
                 _candidate("mixed-source", source_id="src-enabled"),
+                _candidate("same-and-cross-source", source_id="src-new"),
+                _candidate("same-and-cross-source", source_id="src-other"),
             ]
 
     class EmptyKeyword:
@@ -311,10 +367,17 @@ async def test_exact_postfilter_preserves_only_access_compatible_provenance() ->
         entity_ids=[7],
         doc_id="doc-new",
         actor_user_id="user-a",
+        source_id="src-new",
         excluded_source_ids=("src-disabled",),
     )
 
-    assert set(selection.candidate_ids) == {"eligible", "mixed-source"}
+    assert set(selection.candidate_ids) == {
+        "eligible",
+        "mixed-source",
+        "same-and-cross-source",
+    }
+    selected = {item.memory.memory_id: item.memory for item in selection.discovery}
+    assert selected["same-and-cross-source"].source_id == "src-other"
 
 
 @pytest.mark.asyncio
@@ -329,10 +392,7 @@ async def test_large_memory_corpus_stays_behind_bounded_channel_windows() -> Non
         async def graph_search(self, entity_ids, scope, memory_types, limit, **kwargs):
             del entity_ids, scope, memory_types, kwargs
             self.graph_limit = limit
-            return [
-                (f"mem-{index:05d}", float(10_000 - index))
-                for index in range(10_000)
-            ]
+            return [(f"mem-{index:05d}", float(10_000 - index)) for index in range(10_000)]
 
         async def list_active_candidate_memories(self, memory_ids):
             self.provenance_ids = tuple(memory_ids)
@@ -347,10 +407,7 @@ async def test_large_memory_corpus_stays_behind_bounded_channel_windows() -> Non
             del scope, memory_types
             self.limit = limit
             self.query = query
-            return [
-                (f"mem-{index:05d}", float(10_000 - index))
-                for index in range(64, 10_064)
-            ]
+            return [(f"mem-{index:05d}", float(10_000 - index)) for index in range(64, 10_064)]
 
     class LargeVector:
         distance_metric = "cosine"
@@ -365,10 +422,7 @@ async def test_large_memory_corpus_stays_behind_bounded_channel_windows() -> Non
         async def query(self, embedding, scope, memory_types, limit):
             del embedding, scope, memory_types
             self.limit = limit
-            return [
-                (f"mem-{index:05d}", float(10_000 - index))
-                for index in range(32, 10_032)
-            ]
+            return [(f"mem-{index:05d}", float(10_000 - index)) for index in range(32, 10_032)]
 
     relational = LargeRelational()
     keyword = LargeKeyword()
@@ -393,6 +447,7 @@ async def test_large_memory_corpus_stays_behind_bounded_channel_windows() -> Non
         entity_ids=[7],
         doc_id="doc-new",
         actor_user_id="user-a",
+        source_id="src-new",
     )
 
     assert relational.graph_limit == 128

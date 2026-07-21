@@ -66,6 +66,12 @@ class RecordingCollection:
         return result
 
 
+def _api_config(tmp_path) -> AppConfig:
+    config = AppConfig(base_dir=tmp_path / "memforge")
+    config.sync.worker_enabled = False
+    return config
+
+
 @pytest.fixture
 async def db(tmp_path):
     database = Database(str(tmp_path / "lifecycle.db"))
@@ -500,7 +506,7 @@ async def test_create_memory_route_audits_request_principal_and_client(db: Datab
 
     app = create_admin_app(
         db=db,
-        config=AppConfig(base_dir=tmp_path / "memforge"),
+        config=_api_config(tmp_path),
         principal_resolver=lambda _request: "andrew.sun01@sap.com",
     )
 
@@ -548,7 +554,7 @@ async def test_create_memory_route_requires_provenance(db: Database, tmp_path, m
 
     app = create_admin_app(
         db=db,
-        config=AppConfig(base_dir=tmp_path / "memforge"),
+        config=_api_config(tmp_path),
         principal_resolver=lambda _request: "andrew.sun01@sap.com",
     )
 
@@ -577,7 +583,7 @@ async def test_create_memory_route_rejects_legacy_reason_field(db: Database, tmp
 
     app = create_admin_app(
         db=db,
-        config=AppConfig(base_dir=tmp_path / "memforge"),
+        config=_api_config(tmp_path),
         principal_resolver=lambda _request: "andrew.sun01@sap.com",
     )
 
@@ -604,7 +610,7 @@ async def test_retire_memory_route_returns_conflict_for_stale_content_hash(db: D
 
     memory = _memory("mem-retire-route", "Route guarded fact")
     await db.insert_memory(memory)
-    app = create_admin_app(db=db, config=AppConfig(base_dir=tmp_path / "memforge"))
+    app = create_admin_app(db=db, config=_api_config(tmp_path))
 
     with TestClient(app) as client:
         response = client.post(
@@ -627,7 +633,7 @@ async def test_retire_memory_route_audits_request_principal(db: Database, tmp_pa
     await db.insert_memory(memory)
     app = create_admin_app(
         db=db,
-        config=AppConfig(base_dir=tmp_path / "memforge"),
+        config=_api_config(tmp_path),
         principal_resolver=lambda _request: "andrew.sun01@sap.com",
     )
 
@@ -663,7 +669,7 @@ async def test_replace_memory_route_audits_request_principal(db: Database, tmp_p
     await db.insert_memory(memory)
     app = create_admin_app(
         db=db,
-        config=AppConfig(base_dir=tmp_path / "memforge"),
+        config=_api_config(tmp_path),
         principal_resolver=lambda _request: "andrew.sun01@sap.com",
     )
 

@@ -31,3 +31,8 @@
 - Continue the review/fix loop until both reviewers and the implementer approve the result, with no accepted blocker left open.
 - For cloud-impacting changes, CF deploy and detailed smoke testing are required before the goal can be considered complete. Record the deployment target, smoke commands or UI/API steps, and redacted evidence in the handoff log.
 - Open PRs for every repo with committed changes. The goal is not complete until the relevant PRs exist, verification evidence is recorded, and no required repo is left with uncommitted goal work.
+
+## Architecture Decision Ownership
+
+- Record shared Memory lifecycle, retrieval, and storage-contract decisions in an OSS `docs/adr` record as the canonical design source. This includes transaction boundaries and work/outbox semantics that every storage adapter must implement.
+- Do not duplicate shared semantics in a Cloud ADR. Update a Cloud ADR only for a material HANA, Cloud Foundry, or other cloud-only consequence; link the canonical OSS ADR and describe only how Cloud implements or constrains that shared contract.

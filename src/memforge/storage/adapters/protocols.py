@@ -16,6 +16,7 @@ from memforge.models import (
     Entity,
     EntityAlias,
     Memory,
+    MemoryReview,
     MemorySource,
     Project,
     SourceLifecycleResetResult,
@@ -39,6 +40,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleReviewStatus,
     LifecycleVectorTask,
 )
+from memforge.memory.relation_discovery_contract import RelationDiscoveryWork
 from memforge.source_projection import (
     ProjectionCoverage,
     ProjectionScopeTransition,
@@ -139,6 +141,15 @@ class RelationalStore(Protocol):
 
     async def insert_memory(self, memory: Memory) -> str: ...
     async def get_memory(self, memory_id: str) -> Memory | None: ...
+    async def get_memory_entity_ids(self, memory_id: str) -> list[int]: ...
+    async def get_current_relation_evidence_unit(
+        self,
+        memory_id: str,
+        *,
+        source_id: str,
+        source_unit_id: str,
+    ) -> EvidenceUnit | None: ...
+    async def list_disabled_source_ids_for_user(self, user_id: str) -> list[str]: ...
     async def list_active_memories(self, memory_ids: Sequence[str]) -> list[Memory]: ...
     async def list_active_candidate_memories(
         self,
@@ -451,6 +462,42 @@ class RelationalStore(Protocol):
     ) -> list[LifecycleVectorTask]: ...
     async def complete_lifecycle_vector_task(self, task_id: str) -> None: ...
     async def fail_lifecycle_vector_task(self, task_id: str, error: str) -> None: ...
+    async def has_ready_relation_discovery_work(self, *, max_attempts: int) -> bool: ...
+    async def lease_relation_discovery_work(
+        self,
+        *,
+        worker_id: str,
+        limit: int,
+        lease_seconds: int,
+        max_attempts: int,
+    ) -> list[RelationDiscoveryWork]: ...
+    async def complete_relation_discovery_work(
+        self,
+        work_id: str,
+        *,
+        worker_id: str,
+        lease_token: str,
+        relation_outcome: RelationOutcomeBundle,
+        reviews: Sequence[MemoryReview] = (),
+    ) -> None: ...
+    async def fail_relation_discovery_work(
+        self,
+        work_id: str,
+        *,
+        worker_id: str,
+        lease_token: str,
+        error: str,
+        next_attempt_at: str | None,
+        exhausted: bool,
+    ) -> None: ...
+    async def obsolete_relation_discovery_work(
+        self,
+        work_id: str,
+        *,
+        worker_id: str,
+        lease_token: str,
+        reason: str,
+    ) -> None: ...
     async def get_aliases_for_entity(self, entity_id: int) -> list[EntityAlias]: ...
     async def get_all_entities(self) -> list[Entity]: ...
     async def get_all_aliases(self) -> list[tuple[str, int]]: ...

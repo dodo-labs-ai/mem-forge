@@ -12,6 +12,7 @@ from memforge.memory.lifecycle_plan import (
 )
 from memforge.memory.lifecycle_planner import NewMemoryDefaults, build_lifecycle_plan
 from memforge.memory.lifecycle_review import build_lifecycle_review_approval_plan
+from memforge.memory.relation_discovery_contract import relation_discovery_request_id
 from memforge.models import Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
 
 
@@ -53,6 +54,8 @@ def _defaults() -> NewMemoryDefaults:
         doc_id="PAY-1",
         source_type="jira",
         access_context_hash="workspace-pay",
+        actor_user_id="reviewer-1",
+        entity_ids=(7, 11),
     )
 
 
@@ -121,6 +124,61 @@ def test_pending_review_builds_fresh_atomic_approval_plan() -> None:
         LifecycleMutationType.RESOLVE_REVIEW,
     ]
     assert approval.stale_guard.support_set_hashes == {"mem-old": "support-hash"}
+    [request] = approval.relation_discovery_requests
+    replacement_id = approval.coverage_proof.incumbent_decisions[0].replacement_memory_id
+    assert replacement_id is not None
+    assert request.id == relation_discovery_request_id(
+        lifecycle_plan_id=approval.id,
+        memory_id=replacement_id,
+        expected_content_hash=content_hash(_replacement().content.strip()),
+    )
+    assert request.memory_id == replacement_id
+    assert request.expected_content_hash == content_hash(_replacement().content.strip())
+    assert request.source_id == "src-1"
+    assert request.source_unit_id == "unit-1"
+    assert request.source_unit_revision_id == "unitrev-2"
+    assert request.doc_id == "PAY-1"
+    assert request.actor_user_id == "reviewer-1"
+    assert request.entity_ids == (7, 11)
+
+
+def test_pending_review_without_activation_does_not_enqueue_relation_discovery() -> None:
+    old = _memory()
+    original = build_lifecycle_plan(
+        plan_id="plan-delete-review",
+        scope=_scope(),
+        gate_state=LifecycleGateState.GATED,
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.DELETE,
+                memory_id=old.id,
+                reason="current source removed the claim",
+            ),
+        ),
+        incumbents={old.id: old},
+        source_support_reference_ids={old.id: ("eref-old",)},
+        all_active_support_reference_ids={old.id: ("eref-old",)},
+        support_set_hashes={old.id: "support-hash"},
+        observation_revision_ids=("obsrev-2",),
+        new_evidence_reference_ids=(),
+        defaults=_defaults(),
+    )
+    mutation = original.mutations[0]
+    review = LifecycleReview(
+        id=str(mutation.payload["review_id"]),
+        lifecycle_plan_id=original.id,
+        incumbent_memory_id=mutation.memory_id,
+        status=LifecycleReviewStatus.PENDING,
+        staged_evidence=mutation.payload["staged_evidence"],
+        reason=str(mutation.payload["reason"]),
+    )
+
+    approval = build_lifecycle_review_approval_plan(
+        review,
+        lifecycle_plan_to_payload(original),
+    )
+
+    assert approval.relation_discovery_requests == ()
 
 
 def test_enabled_local_replacement_is_create_attach_remove_supersede() -> None:

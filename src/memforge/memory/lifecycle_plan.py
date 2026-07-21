@@ -12,6 +12,7 @@ from memforge.memory.evidence import (
     EvidenceUnit,
     validate_evidence_references,
 )
+from memforge.memory.relation_discovery_contract import RelationDiscoveryRequest
 
 
 class LifecycleGateState(str, Enum):
@@ -124,11 +125,7 @@ def validate_unprovable_cutover_evidence(
         if not isinstance(item, Mapping) or set(item) != {"doc_id", "result"}:
             raise ValueError("unprovable retirement requires strict exact source provenance")
         doc_id = item.get("doc_id")
-        if (
-            not isinstance(doc_id, str)
-            or not doc_id.strip()
-            or item.get("result") != "source_unit_not_found"
-        ):
+        if not isinstance(doc_id, str) or not doc_id.strip() or item.get("result") != "source_unit_not_found":
             raise ValueError("unprovable retirement requires strict exact source provenance")
         attempt_ids.append(doc_id.strip())
 
@@ -189,9 +186,7 @@ class LifecycleVectorDeliveryState(str, Enum):
     PENDING = "pending"
 
 
-AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON = (
-    "source Unit removed by authoritative discovery"
-)
+AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON = "source Unit removed by authoritative discovery"
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,10 +391,14 @@ class LifecycleMutation:
     def __post_init__(self) -> None:
         if self.mutation_type is LifecycleMutationType.SUPERSEDE_MEMORY and not self.replacement_memory_id:
             raise ValueError("supersede mutation requires replacement_memory_id")
-        if self.mutation_type in {
-            LifecycleMutationType.ATTACH_SUPPORT,
-            LifecycleMutationType.REMOVE_SUPPORT,
-        } and not self.evidence_reference_ids:
+        if (
+            self.mutation_type
+            in {
+                LifecycleMutationType.ATTACH_SUPPORT,
+                LifecycleMutationType.REMOVE_SUPPORT,
+            }
+            and not self.evidence_reference_ids
+        ):
             raise ValueError("support mutation requires evidence_reference_ids")
 
 
@@ -413,6 +412,7 @@ class LifecyclePlan:
     mutations: tuple[LifecycleMutation, ...]
     evidence_units: tuple[EvidenceUnit, ...] = ()
     evidence_references: tuple[EvidenceReference, ...] = ()
+    relation_discovery_requests: tuple[RelationDiscoveryRequest, ...] = ()
 
     def validate(self) -> None:
         self.coverage_proof.validate()
@@ -431,15 +431,30 @@ class LifecyclePlan:
             raise ValueError("duplicate staged Evidence Unit")
         if any(item.source_id != self.scope.source_id for item in self.evidence_units):
             raise ValueError("staged Evidence Unit belongs to another source")
+        request_ids = {item.id for item in self.relation_discovery_requests}
+        if len(request_ids) != len(self.relation_discovery_requests):
+            raise ValueError("duplicate relation discovery request")
+        activated_memory_ids = {
+            item.memory_id
+            for item in self.mutations
+            if item.mutation_type
+            in {
+                LifecycleMutationType.CREATE_MEMORY,
+                LifecycleMutationType.REACTIVATE_MEMORY,
+            }
+        }
+        for request in self.relation_discovery_requests:
+            if request.source_id != self.scope.source_id:
+                raise ValueError("relation discovery request belongs to another source")
+            if request.source_unit_id != self.scope.source_unit_id:
+                raise ValueError("relation discovery request belongs to another Source Unit")
+            if request.memory_id not in activated_memory_ids:
+                raise ValueError("relation discovery request requires an activated Memory")
         for reference in self.evidence_references:
             if not reference.id or reference.evidence_unit_id not in unit_ids:
                 raise ValueError("staged Evidence Reference requires a staged Evidence Unit and stable id")
         references_by_unit = {
-            unit_id: tuple(
-                reference
-                for reference in self.evidence_references
-                if reference.evidence_unit_id == unit_id
-            )
+            unit_id: tuple(reference for reference in self.evidence_references if reference.evidence_unit_id == unit_id)
             for unit_id in unit_ids
         }
         available_revisions = set(self.stale_guard.observation_revision_ids)
@@ -486,19 +501,13 @@ def contested_supports_from_staged_evidence(
             raise ValueError("create_review proposed mutation must be an object")
         if raw_mutation.get("mutation_type") != LifecycleMutationType.REMOVE_SUPPORT.value:
             continue
-        if (
-            raw_mutation.get("memory_id") != incumbent_memory_id
-            or raw_mutation.get("source_id") != source_id
-        ):
+        if raw_mutation.get("memory_id") != incumbent_memory_id or raw_mutation.get("source_id") != source_id:
             raise ValueError("create_review remove_support targets another incumbent")
         reference_ids = raw_mutation.get("evidence_reference_ids")
-        if not isinstance(reference_ids, Sequence) or isinstance(
-            reference_ids, (str, bytes)
-        ):
+        if not isinstance(reference_ids, Sequence) or isinstance(reference_ids, (str, bytes)):
             raise ValueError("create_review remove_support requires evidence_reference_ids")
         if not reference_ids or not all(
-            isinstance(reference_id, str) and reference_id
-            for reference_id in reference_ids
+            isinstance(reference_id, str) and reference_id for reference_id in reference_ids
         ):
             raise ValueError("create_review remove_support requires stable evidence references")
         contested.update(
@@ -613,6 +622,20 @@ def lifecycle_plan_to_payload(plan: LifecyclePlan) -> dict[str, object]:
                 },
             }
             for item in plan.evidence_references
+        ],
+        "relation_discovery_requests": [
+            {
+                "id": item.id,
+                "memory_id": item.memory_id,
+                "expected_content_hash": item.expected_content_hash,
+                "source_id": item.source_id,
+                "source_unit_id": item.source_unit_id,
+                "source_unit_revision_id": item.source_unit_revision_id,
+                "doc_id": item.doc_id,
+                "actor_user_id": item.actor_user_id,
+                "entity_ids": list(item.entity_ids),
+            }
+            for item in plan.relation_discovery_requests
         ],
         "mutations": [
             {

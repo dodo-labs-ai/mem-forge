@@ -36,11 +36,13 @@ from memforge.memory.lifecycle_plan import (
     LifecycleReviewStatus,
     LifecycleVectorTask,
 )
+from memforge.memory.relation_discovery_contract import RelationDiscoveryWork
 from memforge.models import (
     DocumentRecord,
     Entity,
     EntityAlias,
     Memory,
+    MemoryReview,
     MemorySource,
     Project,
     SourceLifecycleResetResult,
@@ -460,12 +462,7 @@ class SqliteRelationalStore:
             params.extend(exclusions)
         doc_sql = ""
         if excluded_doc_id is not None:
-            doc_sql = (
-                " AND NOT EXISTS ("
-                "SELECT 1 FROM memory_sources ms "
-                "WHERE ms.memory_id = m.id AND ms.doc_id = ?"
-                ")"
-            )
+            doc_sql = " AND NOT EXISTS (SELECT 1 FROM memory_sources ms WHERE ms.memory_id = m.id AND ms.doc_id = ?)"
             params.append(excluded_doc_id)
         params.extend((project_key, project_key, limit))
         rows = await self._db.db.execute_fetchall(
@@ -493,9 +490,7 @@ class SqliteRelationalStore:
                  LIMIT ?""",
             params,
         )
-        return await self._db.list_active_ordinary_claim_memories(
-            [str(row["id"]) for row in rows]
-        )
+        return await self._db.list_active_ordinary_claim_memories([str(row["id"]) for row in rows])
 
     async def find_rebaseline_reactivation_candidate(
         self,
@@ -916,6 +911,25 @@ class SqliteRelationalStore:
     async def apply_lifecycle_plan(self, plan: LifecyclePlan) -> None:
         await self._db.apply_lifecycle_plan(plan)
 
+    async def get_memory_entity_ids(self, memory_id: str) -> list[int]:
+        return await self._db.get_memory_entity_ids(memory_id)
+
+    async def get_current_relation_evidence_unit(
+        self,
+        memory_id: str,
+        *,
+        source_id: str,
+        source_unit_id: str,
+    ) -> EvidenceUnit | None:
+        return await self._db.get_current_relation_evidence_unit(
+            memory_id,
+            source_id=source_id,
+            source_unit_id=source_unit_id,
+        )
+
+    async def list_disabled_source_ids_for_user(self, user_id: str) -> list[str]:
+        return await self._db.list_disabled_source_ids_for_user(user_id)
+
     async def get_lifecycle_plan_payload(
         self,
         lifecycle_plan_id: str,
@@ -958,6 +972,75 @@ class SqliteRelationalStore:
 
     async def fail_lifecycle_vector_task(self, task_id: str, error: str) -> None:
         await self._db.fail_lifecycle_vector_task(task_id, error)
+
+    async def lease_relation_discovery_work(
+        self,
+        *,
+        worker_id: str,
+        limit: int,
+        lease_seconds: int,
+        max_attempts: int,
+    ) -> list[RelationDiscoveryWork]:
+        return await self._db.lease_relation_discovery_work(
+            worker_id=worker_id,
+            limit=limit,
+            lease_seconds=lease_seconds,
+            max_attempts=max_attempts,
+        )
+
+    async def has_ready_relation_discovery_work(self, *, max_attempts: int) -> bool:
+        return await self._db.has_ready_relation_discovery_work(max_attempts=max_attempts)
+
+    async def complete_relation_discovery_work(
+        self,
+        work_id: str,
+        *,
+        worker_id: str,
+        lease_token: str,
+        relation_outcome: RelationOutcomeBundle,
+        reviews: Sequence[MemoryReview] = (),
+    ) -> None:
+        await self._db.complete_relation_discovery_work(
+            work_id,
+            worker_id=worker_id,
+            lease_token=lease_token,
+            relation_outcome=relation_outcome,
+            reviews=reviews,
+        )
+
+    async def fail_relation_discovery_work(
+        self,
+        work_id: str,
+        *,
+        worker_id: str,
+        lease_token: str,
+        error: str,
+        next_attempt_at: str | None,
+        exhausted: bool,
+    ) -> None:
+        await self._db.fail_relation_discovery_work(
+            work_id,
+            worker_id=worker_id,
+            lease_token=lease_token,
+            error=error,
+            next_attempt_at=next_attempt_at,
+            exhausted=exhausted,
+        )
+
+    async def obsolete_relation_discovery_work(
+        self,
+        work_id: str,
+        *,
+        worker_id: str,
+        lease_token: str,
+        reason: str,
+    ) -> None:
+        await self._db.obsolete_relation_discovery_work(
+            work_id,
+            worker_id=worker_id,
+            lease_token=lease_token,
+            reason=reason,
+        )
 
     async def get_aliases_for_entity(self, entity_id: int) -> list[EntityAlias]:
         return await self._db.get_aliases_for_entity(entity_id)

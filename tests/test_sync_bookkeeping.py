@@ -69,6 +69,10 @@ async def db(tmp_path):
     await database.close()
 
 
+async def _skip_retry_delay(_delay: float) -> None:
+    """Preserve retry attempts without turning contract tests into wall-clock tests."""
+
+
 @pytest.mark.asyncio
 async def test_expired_source_activity_can_be_reacquired_with_same_id(
     db: Database,
@@ -158,12 +162,15 @@ async def test_rebaseline_admission_atomically_cancels_active_run_and_fences_wor
     assert cancelled.error_message == "cancelled_by_source_lifecycle_maintenance:rebaseline-maintenance"
     assert await db.get_source_activity_epoch(source_id) == sync_activity.epoch + 1
 
-    assert await db.heartbeat_source_sync_run(
-        enqueued.run_id,
-        worker_id="worker-before-maintenance",
-        lease_attempt_count=leased.lease_attempt_count,
-        now=now + timedelta(seconds=1),
-    ) is False
+    assert (
+        await db.heartbeat_source_sync_run(
+            enqueued.run_id,
+            worker_id="worker-before-maintenance",
+            lease_attempt_count=leased.lease_attempt_count,
+            now=now + timedelta(seconds=1),
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -214,32 +221,41 @@ async def test_rebaseline_admission_rolls_back_run_cancel_when_other_activity_ow
     assert still_running.lease_attempt_count == leased.lease_attempt_count
     assert await db.get_source_activity_epoch(source_id) == collection.epoch
     assert await db.list_lifecycle_backfill_jobs(source_id) == []
-    assert await db.report_source_sync_run_progress(
-        enqueued.run_id,
-        worker_id="worker-before-maintenance",
-        lease_attempt_count=leased.lease_attempt_count,
-        progress={"schema_version": 1, "phase": "processing"},
-        now=now + timedelta(seconds=1),
-    ) is False
-    assert await db.complete_source_sync_run(
-        enqueued.run_id,
-        worker_id="worker-before-maintenance",
-        lease_attempt_count=leased.lease_attempt_count,
-        final_state=SyncState(
-            source=source_id,
-            last_sync_at=now + timedelta(seconds=1),
-            last_sync_status="success",
-        ),
-        completed_at=now + timedelta(seconds=1),
-    ) is False
-    assert await db.fail_source_sync_run(
-        enqueued.run_id,
-        worker_id="worker-before-maintenance",
-        lease_attempt_count=leased.lease_attempt_count,
-        error_message="late worker failure",
-        retryable=False,
-        failed_at=now + timedelta(seconds=1),
-    ) is False
+    assert (
+        await db.report_source_sync_run_progress(
+            enqueued.run_id,
+            worker_id="worker-before-maintenance",
+            lease_attempt_count=leased.lease_attempt_count,
+            progress={"schema_version": 1, "phase": "processing"},
+            now=now + timedelta(seconds=1),
+        )
+        is False
+    )
+    assert (
+        await db.complete_source_sync_run(
+            enqueued.run_id,
+            worker_id="worker-before-maintenance",
+            lease_attempt_count=leased.lease_attempt_count,
+            final_state=SyncState(
+                source=source_id,
+                last_sync_at=now + timedelta(seconds=1),
+                last_sync_status="success",
+            ),
+            completed_at=now + timedelta(seconds=1),
+        )
+        is False
+    )
+    assert (
+        await db.fail_source_sync_run(
+            enqueued.run_id,
+            worker_id="worker-before-maintenance",
+            lease_attempt_count=leased.lease_attempt_count,
+            error_message="late worker failure",
+            retryable=False,
+            failed_at=now + timedelta(seconds=1),
+        )
+        is False
+    )
 
 
 def test_local_agent_broker_has_its_own_forward_migration() -> None:
@@ -605,12 +621,8 @@ async def test_predecessor_activity_migration_upgrades_existing_sync_run_table(
     await database.close()
 
     with sqlite3.connect(path) as conn:
-        conn.execute(
-            "ALTER TABLE source_sync_runs DROP COLUMN predecessor_activity_id"
-        )
-        conn.execute(
-            "ALTER TABLE source_sync_runs DROP COLUMN rerun_predecessor_activity_id"
-        )
+        conn.execute("ALTER TABLE source_sync_runs DROP COLUMN predecessor_activity_id")
+        conn.execute("ALTER TABLE source_sync_runs DROP COLUMN rerun_predecessor_activity_id")
         conn.execute("DELETE FROM schema_migrations WHERE version = 59")
         conn.commit()
 
@@ -618,10 +630,7 @@ async def test_predecessor_activity_migration_upgrades_existing_sync_run_table(
     await upgraded.connect()
     try:
         columns = {
-            row["name"]
-            for row in await (
-                await upgraded.db.execute("PRAGMA table_info(source_sync_runs)")
-            ).fetchall()
+            row["name"] for row in await (await upgraded.db.execute("PRAGMA table_info(source_sync_runs)")).fetchall()
         }
     finally:
         await upgraded.close()
@@ -2280,10 +2289,7 @@ async def test_document_lifecycle_admission_does_not_prequeue_one_source_ahead_o
 
     admission = DocumentLifecycleAdmission(max_active=1)
     entered: asyncio.Queue[str] = asyncio.Queue()
-    releases = {
-        item_id: asyncio.Event()
-        for item_id in ("jira-a-0", "jira-a-1", "jira-a-2", "jira-b-0")
-    }
+    releases = {item_id: asyncio.Event() for item_id in ("jira-a-0", "jira-a-1", "jira-a-2", "jira-b-0")}
 
     def make_orchestrator() -> GeneSyncOrchestrator:
         return GeneSyncOrchestrator(
@@ -2637,6 +2643,7 @@ class NoopMemoryEngine:
     async def apply_projected_tombstone(self, **kwargs):
         return {"retired": 0, "pending_review": 0, "can_delete_document": True}
 
+
 class RecordingSourceSupportDetector:
     async def detect_and_persist(self, **kwargs):
         return {
@@ -2848,9 +2855,7 @@ class ProjectionBatchCandidateExtractor(ProjectionBatchRecordingExtractor):
                 RawMemory(
                     content=f"Durable claim from projection batch {index}.",
                     memory_type="fact",
-                    source_observation_id=next(
-                        iter(dict(batch.primary_content_by_observation_id))
-                    ),
+                    source_observation_id=next(iter(dict(batch.primary_content_by_observation_id))),
                 )
             ]
         )
@@ -2905,10 +2910,7 @@ async def test_unchanged_multi_observation_projection_skips_full_document_extrac
         raw=raw,
         normalized=normalized,
         prior_unit_revision=initial.source_unit_revisions[0],
-        prior_observation_revisions={
-            revision.observation_id: revision
-            for revision in initial.observation_revisions
-        },
+        prior_observation_revisions={revision.observation_id: revision for revision in initial.observation_revisions},
     )
     assert unchanged.deltas[0].changed_anchors == ()
     assert unchanged.deltas[0].added_observation_ids == ()
@@ -3820,11 +3822,7 @@ async def test_document_lifecycle_reclaims_process_memory_after_each_document(
 
     assert state.last_sync_status == "success"
     assert reclaimer.calls == 2
-    reclaimed = [
-        event
-        for _level, event in log.records
-        if event["stage"] == "document_memory_reclaimed"
-    ]
+    reclaimed = [event for _level, event in log.records if event["stage"] == "document_memory_reclaimed"]
     assert len(reclaimed) == 2
     assert all(event["collected_objects"] == 3 for event in reclaimed)
     assert all(event["heap_trim_supported"] is True for event in reclaimed)
@@ -3894,6 +3892,7 @@ async def test_sync_memory_observer_records_lifecycle_exit_when_document_fails(d
         memory_store=None,
         max_concurrent=1,
         memory_observer=observer,
+        retry_sleep=_skip_retry_delay,
     )
 
     state = await orchestrator.sync_gene(
@@ -4341,8 +4340,7 @@ async def test_teams_scope_transition_applies_after_removed_units_are_tombstoned
     assert transition.coverage.value == "tombstoned_delta"
     assert await db.list_indexed_doc_ids(source_id) == set()
     assert not any(
-        unit.unit_type == "teams_scope_attestation"
-        for unit in await db.list_current_source_units(source_id)
+        unit.unit_type == "teams_scope_attestation" for unit in await db.list_current_source_units(source_id)
     )
 
 
@@ -4805,9 +4803,7 @@ async def test_run_all_active_sources_skips_sources_without_sync_execution(db: D
 
     await SyncService(db, AppConfig()).run_all_active_sources()
 
-    assert (
-        await db.get_latest_source_sync_run(source_id="src-agent-session-no-sync")
-    ) is None
+    assert (await db.get_latest_source_sync_run(source_id="src-agent-session-no-sync")) is None
     run = await db.get_latest_source_sync_run(source_id="src-server-sync")
     assert run is not None
     assert run.status == "pending"
@@ -5399,9 +5395,7 @@ async def test_scheduler_excludes_sources_without_sync_execution(
 
     await SyncScheduler(db, SyncService(db, AppConfig()))._sync_due_sources()
 
-    assert server_scan_calls == [
-        ("default", {"src-agent-session-schedule-policy"})
-    ]
+    assert server_scan_calls == [("default", {"src-agent-session-schedule-policy"})]
 
 
 @pytest.mark.asyncio
@@ -6664,9 +6658,7 @@ async def test_rebaseline_admission_interrupts_an_inflight_durable_worker(
     assert job.status is LifecycleBackfillJobStatus.QUEUED
     assert terminal is not None
     assert terminal.status == "failed"
-    assert terminal.error_message == (
-        "cancelled_by_source_lifecycle_maintenance:rebaseline-during-worker"
-    )
+    assert terminal.error_message == ("cancelled_by_source_lifecycle_maintenance:rebaseline-during-worker")
 
 
 @pytest.mark.asyncio
@@ -6724,6 +6716,62 @@ async def test_source_sync_worker_run_forever_polls_until_cancelled(db: Database
     completed = await db.get_source_sync_run(enqueued.run_id)
     assert completed is not None
     assert completed.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_idle_source_sync_worker_skips_relation_runtime_without_ready_work(
+    db: Database,
+) -> None:
+    import memforge.runtime as runtime
+
+    class BlockingRuntimeProvider:
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            await asyncio.Event().wait()
+
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=BlockingRuntimeProvider(),
+        worker_id="worker-empty-relation-queue",
+    )
+
+    result = await asyncio.wait_for(worker.run_once(), timeout=0.1)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_interleaves_relation_work_during_source_backlog(
+    db: Database,
+    monkeypatch,
+) -> None:
+    import memforge.runtime as runtime
+
+    worker = runtime.SourceSyncWorker(db, AppConfig(), worker_id="worker-fairness")
+    source_runs = 0
+    relation_slices = 0
+
+    async def always_has_source_work():
+        nonlocal source_runs
+        source_runs += 1
+        if source_runs == 3:
+            raise asyncio.CancelledError
+        return object()
+
+    async def process_relation_slice():
+        nonlocal relation_slices
+        relation_slices += 1
+        return True
+
+    monkeypatch.setattr(worker, "run_once", always_has_source_work)
+    monkeypatch.setattr(worker, "_process_relation_discovery_once", process_relation_slice)
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker.run_forever(poll_seconds=0.01)
+
+    assert source_runs == 3
+    assert relation_slices == 2
 
 
 @pytest.mark.asyncio
@@ -7521,6 +7569,7 @@ async def test_rebaseline_preflight_fails_closed_on_empty_normalized_content(
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
+        retry_sleep=_skip_retry_delay,
     )
 
     state = await orchestrator.sync_gene(
@@ -7583,6 +7632,7 @@ async def test_rebaseline_preflight_rejects_truncated_jira_projection(
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
+        retry_sleep=_skip_retry_delay,
     )
     full_payload = {
         "id": "100000",
@@ -8088,9 +8138,7 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
     stored_memory = await db.get_memory(memory.id)
     assert stored_memory is not None
     assert stored_memory.status == "active"
-    assert [source.doc_id for source in await db.get_memory_sources(memory.id)] == [
-        "github-ref-a"
-    ]
+    assert [source.doc_id for source in await db.get_memory_sources(memory.id)] == ["github-ref-a"]
 
 
 @pytest.mark.asyncio
@@ -8130,11 +8178,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
                         "github_repo",
                         target_config,
                     ),
-                    predecessor_transition_id=(
-                        previous_transitions[0].id
-                        if previous_transitions
-                        else None
-                    ),
+                    predecessor_transition_id=(previous_transitions[0].id if previous_transitions else None),
                 ),
                 source_id=source_id,
                 previous_scope=canonical_projection_scope(
@@ -8217,13 +8261,9 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
                 LifecycleVectorDeliveryState,
             )
 
-            for task in await self.db.list_lifecycle_vector_tasks(
-                lifecycle_plan_id=lifecycle_plan_id
-            ):
+            for task in await self.db.list_lifecycle_vector_tasks(lifecycle_plan_id=lifecycle_plan_id):
                 await self.db.complete_lifecycle_vector_task(task.id)
-            return LifecycleVectorDeliveryResult(
-                state=LifecycleVectorDeliveryState.DELIVERED
-            )
+            return LifecycleVectorDeliveryResult(state=LifecycleVectorDeliveryState.DELIVERED)
 
         async def delete_projected_document(self, doc_id: str, **kwargs):
             del kwargs
@@ -8341,6 +8381,7 @@ async def test_full_document_extraction_failure_is_audited(db: Database):
         memory_engine=NoopMemoryEngine(),
         memory_store=memory_store,
         max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
     )
 
     state = await orchestrator.sync_gene(
@@ -8838,6 +8879,7 @@ async def test_partial_unit_extraction_failure_skips_reconciliation(db: Database
         memory_engine=memory_engine,
         memory_store=memory_store,
         max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
     )
 
     state = await orchestrator.sync_gene(
@@ -8907,6 +8949,7 @@ async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(d
         memory_engine=failing_engine,
         memory_store=None,
         max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
     )
     failed_state = await failed.sync_gene(
         gene=UpdatingDocumentGene(new_markdown, version="2"),
@@ -9097,6 +9140,10 @@ async def test_document_vector_failure_happens_before_memory_mutations(db: Datab
     release.set()
     memory_engine = CountingMemoryEngine(inserted=3)
     vector_store = FailingVectorStore()
+    retry_delays: list[float] = []
+
+    async def record_retry_delay(delay: float) -> None:
+        retry_delays.append(delay)
 
     def fake_embed_texts(texts, *args, **kwargs):
         return [[0.1, 0.2, 0.3] for _ in texts]
@@ -9113,6 +9160,7 @@ async def test_document_vector_failure_happens_before_memory_mutations(db: Datab
         vector_store=vector_store,
         embed_cfg={"base_url": "http://embedding", "api_key": "test", "model": "test"},
         max_concurrent=1,
+        retry_sleep=record_retry_delay,
     )
 
     state = await orchestrator.sync_gene(
@@ -9122,6 +9170,7 @@ async def test_document_vector_failure_happens_before_memory_mutations(db: Datab
     )
 
     assert state.last_sync_status == "failed"
+    assert retry_delays == [2, 4]
     assert memory_engine.enrichment_calls == 0
     assert memory_engine.projected_lifecycle_calls == 0
     assert await db.get_document("jira-0") is None
@@ -9381,6 +9430,7 @@ async def test_missing_required_confluence_pdf_fails_sync_without_hiding_gap(db:
         vector_store=None,
         embed_cfg={},
         max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
     )
 
     state = await orchestrator.sync_gene(
@@ -9465,6 +9515,7 @@ async def test_confluence_pdf_storage_failure_is_not_reported_as_export_failure(
         vector_store=None,
         embed_cfg={},
         max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
     )
 
     state = await orchestrator.sync_gene(
@@ -9611,6 +9662,7 @@ async def test_unchanged_stale_vector_fails_when_embedding_config_is_incomplete(
         vector_store=vector_store,
         embed_cfg={"base_url": "http://embedding", "api_key": "", "model": "test"},
         max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
     )
 
     state = await orchestrator.sync_gene(
@@ -9685,11 +9737,7 @@ async def test_embedding_connection_failure_is_reported_as_provider_unreachable(
     def fake_embed_texts(texts, *args, **kwargs):
         raise OSError("[Errno 111] Connection refused")
 
-    async def no_retry_delay(delay):
-        return None
-
     monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
-    monkeypatch.setattr("memforge.pipeline.sync.asyncio.sleep", no_retry_delay)
 
     orchestrator = GeneSyncOrchestrator(
         db=db,
@@ -9701,6 +9749,7 @@ async def test_embedding_connection_failure_is_reported_as_provider_unreachable(
         vector_store=FalseyVectorStore(),
         embed_cfg={"base_url": "https://embedding.example", "api_key": "test-key", "model": "test"},
         max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
     )
 
     state = await orchestrator.sync_gene(

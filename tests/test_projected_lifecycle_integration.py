@@ -11,25 +11,23 @@ import pytest_asyncio
 from memforge.llm.structured import (
     CandidateLedgerDecision,
     CandidateLedgerResponse,
-    ContradictionDecision,
-    ContradictionResponse,
-    MemoryEquivalenceResponse,
+    MemoryRelationDecision,
+    MemoryRelationResponse,
     MemorySupportValidationResponse,
     ReconciliationDecision,
     ReconciliationResponse,
 )
 from memforge.memory.audit import MemoryAuditLogger
-from memforge.memory.engine import (
-    MEMORY_EQUIVALENCE_PROMPT,
-    MemoryEngine,
-    _memory_equivalence_pair_json,
-)
+from memforge.memory.engine import MemoryEngine
 from memforge.memory.evidence import (
+    CandidateMemory,
     EvidenceContentProvenance,
     EvidenceReference,
     EvidenceRole,
     EvidenceUnit,
     MemorySupportAssertion,
+    RelationDirection,
+    RelationType,
 )
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
@@ -56,6 +54,17 @@ from memforge.memory.lifecycle_planner import (
 )
 from memforge.memory.store import MemoryStore
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
+from memforge.memory.relation_candidate_retrieval import (
+    CrossDocumentCandidateSelection,
+    RetrievedRelationCandidate,
+)
+from memforge.memory.relation_classifier import (
+    MemoryPairClassification,
+    MemoryPairClassificationPlan,
+    MemoryPairDecision,
+    MemoryRelationType,
+)
+from memforge.memory.relation_discovery import RelationDiscovery
 from memforge.models import (
     ContentItem,
     DocumentRecord,
@@ -199,6 +208,8 @@ def _jira_projection(
         prior_unit_revision=prior,
         prior_observation_revisions=prior_observations,
     )
+
+
 class _ReplacementClient:
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
@@ -216,18 +227,6 @@ class _ReplacementClient:
             ]
         )
 
-    async def detect_contradictions(self, prompt: str, **kwargs):
-        del prompt, kwargs
-        return ContradictionResponse(
-            decisions=[
-                ContradictionDecision(
-                    pair_index=0,
-                    classification="contradiction",
-                    reason="Independent source still says A7 is removed.",
-                )
-            ]
-        )
-
 
 class _NoopClient:
     def __init__(self, incumbent_id: str) -> None:
@@ -241,18 +240,6 @@ class _NoopClient:
                     action="NOOP",
                     memory_id=self.incumbent_id,
                     reason="The exact claim remains in the revised page.",
-                )
-            ]
-        )
-
-    async def detect_contradictions(self, prompt: str, **kwargs):
-        del prompt, kwargs
-        return ContradictionResponse(
-            decisions=[
-                ContradictionDecision(
-                    pair_index=0,
-                    classification="contradiction",
-                    reason="Independent source still says A7 is removed.",
                 )
             ]
         )
@@ -328,16 +315,10 @@ class _OutboxDrainer:
     def __init__(self, database: Database) -> None:
         self.db = database
 
-    async def attempt_lifecycle_vector_delivery(
-        self, lifecycle_plan_id: str
-    ) -> LifecycleVectorDeliveryResult:
-        for task in await self.db.list_lifecycle_vector_tasks(
-            lifecycle_plan_id=lifecycle_plan_id
-        ):
+    async def attempt_lifecycle_vector_delivery(self, lifecycle_plan_id: str) -> LifecycleVectorDeliveryResult:
+        for task in await self.db.list_lifecycle_vector_tasks(lifecycle_plan_id=lifecycle_plan_id):
             await self.db.complete_lifecycle_vector_task(task.id)
-        return LifecycleVectorDeliveryResult(
-            state=LifecycleVectorDeliveryState.DELIVERED
-        )
+        return LifecycleVectorDeliveryResult(state=LifecycleVectorDeliveryState.DELIVERED)
 
     async def find_access_compatible_equivalence_candidates(
         self,
@@ -392,9 +373,7 @@ class _CandidateLedgerClient:
 
 
 class _FailingOutboxDrainer(_OutboxDrainer):
-    async def attempt_lifecycle_vector_delivery(
-        self, lifecycle_plan_id: str
-    ) -> LifecycleVectorDeliveryResult:
+    async def attempt_lifecycle_vector_delivery(self, lifecycle_plan_id: str) -> LifecycleVectorDeliveryResult:
         del lifecycle_plan_id
         return LifecycleVectorDeliveryResult(
             state=LifecycleVectorDeliveryState.PENDING,
@@ -550,9 +529,7 @@ async def test_incomplete_candidate_ledger_is_audited_and_writes_no_memory(
     )
     observation_id = projection.observations[0].id
     client = _CandidateLedgerClient(
-        CandidateLedgerResponse(
-            decisions=[CandidateLedgerDecision(index=0, action="KEEP")]
-        )
+        CandidateLedgerResponse(decisions=[CandidateLedgerDecision(index=0, action="KEEP")])
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -617,21 +594,33 @@ async def test_incomplete_candidate_ledger_is_audited_and_writes_no_memory(
 
 
 class _SemanticEquivalentClient:
+    def __init__(self) -> None:
+        self.relation_calls = 0
+
     async def reconcile_memories(self, prompt: str, **kwargs):
         del prompt, kwargs
-        return ReconciliationResponse(
-            decisions=[ReconciliationDecision(action="ADD", index=0)]
-        )
+        return ReconciliationResponse(decisions=[ReconciliationDecision(action="ADD", index=0)])
 
-    async def classify_memory_equivalence(self, prompt: str, **kwargs):
+    async def classify_memory_relations(self, prompt: str, **kwargs):
         del kwargs
-        pair = prompt.split("<claim_pair>", 1)[1].split("</claim_pair>", 1)[0]
-        payload = json.loads(pair)
-        assert set(payload) == {"claim_a", "claim_b"}
-        assert set(payload.values()) == {"A7 is removed.", "A7 remains excluded."}
-        return MemoryEquivalenceResponse(
-            equivalent=True,
-            reason="Both claims state that A7 is excluded.",
+        self.relation_calls += 1
+        groups = prompt.split("<memory_pair_groups>\n", 1)[1].split(
+            "\n</memory_pair_groups>",
+            1,
+        )[0]
+        payload = json.loads(groups)
+        assert len(payload) == 1
+        assert payload[0]["challenger"]["content"] == "A7 remains excluded."
+        assert payload[0]["candidates"][0]["candidate"]["content"] == "A7 is removed."
+        return MemoryRelationResponse(
+            decisions=[
+                MemoryRelationDecision(
+                    pair_index=payload[0]["candidates"][0]["pair_index"],
+                    classification="equivalent",
+                    direction="symmetric",
+                    reason="Both claims state that A7 is excluded.",
+                )
+            ]
         )
 
 
@@ -650,10 +639,7 @@ class _SupportValidatingNoopClient(_NoopClient):
     async def validate_memory_support(self, prompt: str, **kwargs):
         del kwargs
         assert '"memory_claim"' in prompt
-        assert (
-            "A7 is retained for regular payroll." in prompt
-            or "A7 is removed." in prompt
-        )
+        assert "A7 is retained for regular payroll." in prompt or "A7 is removed." in prompt
         return MemorySupportValidationResponse(
             supported=self.supported,
             evidence_quote=self.evidence_quote,
@@ -682,23 +668,6 @@ def test_lifecycle_access_identity_treats_project_as_relevance_only() -> None:
     assert pay == risk
 
 
-def test_memory_equivalence_pair_payload_is_order_independent_and_neutral() -> None:
-    first = "The deployment policy permits at most three retry attempts."
-    second = "The maximum retry count permitted by the deployment policy is 3."
-
-    forward = _memory_equivalence_pair_json(first, second)
-    reverse = _memory_equivalence_pair_json(second, first)
-
-    assert forward == reverse
-    payload = json.loads(forward)
-    assert set(payload) == {"claim_a", "claim_b"}
-    assert set(payload.values()) == {first, second}
-    assert "document, case, or record states that P" in MEMORY_EQUIVALENCE_PROMPT
-    assert "neither claim is about the act, completeness, or authority of recording" in (
-        MEMORY_EQUIVALENCE_PROMPT
-    )
-
-
 async def _seed_incumbent_support(
     db: Database,
     *,
@@ -723,9 +692,7 @@ async def _seed_incumbent_support(
         source_updated_at=None,
     )
     observation = projection.observations[observation_index]
-    revisions_by_observation = {
-        item.observation_id: item for item in projection.observation_revisions
-    }
+    revisions_by_observation = {item.observation_id: item for item in projection.observation_revisions}
     revision = revisions_by_observation[observation.id]
     unit = EvidenceUnit(
         id=f"eu-{memory_id}",
@@ -786,9 +753,7 @@ async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> 
         run_id="projection-noop-2",
         body="A7 is removed.\n\nThe page now also documents rollout ownership.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     raw = RawMemory(
         content=incumbent.content,
@@ -833,12 +798,8 @@ async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> 
         incumbents={incumbent.id: incumbent},
         source_support_reference_ids={incumbent.id: old_support},
         all_active_support_reference_ids={incumbent.id: old_support},
-        support_set_hashes={
-            incumbent.id: await db.get_memory_support_set_hash(incumbent.id)
-        },
-        observation_revision_ids=tuple(
-            revision.id for revision in second.observation_revisions
-        ),
+        support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
+        observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
         new_evidence_reference_ids=(),
         evidence_reference_ids_by_claim_hash=evidence.reference_ids_by_claim_hash,
         defaults=NewMemoryDefaults(
@@ -878,9 +839,7 @@ async def test_noop_without_current_evidence_rolls_back_stale_support(db: Databa
         run_id="projection-stale-2",
         body="A7 is retained.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     delta = second.deltas[0]
     scope = ReconciliationScope(
@@ -904,12 +863,8 @@ async def test_noop_without_current_evidence_rolls_back_stale_support(db: Databa
         incumbents={incumbent.id: incumbent},
         source_support_reference_ids={incumbent.id: old_support},
         all_active_support_reference_ids={incumbent.id: old_support},
-        support_set_hashes={
-            incumbent.id: await db.get_memory_support_set_hash(incumbent.id)
-        },
-        observation_revision_ids=tuple(
-            revision.id for revision in second.observation_revisions
-        ),
+        support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
+        observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
         new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
@@ -961,10 +916,7 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
         run_id="projection-review-scope-2",
         body="A7 is retained.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     delta = second.deltas[0]
     scope = ReconciliationScope(
@@ -1004,9 +956,7 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
             reviewed.id: await db.get_memory_support_set_hash(reviewed.id),
             unrelated.id: await db.get_memory_support_set_hash(unrelated.id),
         },
-        observation_revision_ids=tuple(
-            revision.id for revision in second.observation_revisions
-        ),
+        observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
         new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
@@ -1025,9 +975,7 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
     current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
     assert current_unit is not None
     assert current_unit.id == first.source_unit_revisions[0].id
-    assert await db.get_lifecycle_review(
-        str(plan.mutations[0].payload["review_id"])
-    ) is None
+    assert await db.get_lifecycle_review(str(plan.mutations[0].payload["review_id"])) is None
 
 
 @pytest.mark.asyncio
@@ -1046,10 +994,7 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
         run_id="projection-reviewed-support-2",
         body="A7 is retained.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     delta = second.deltas[0]
     scope = ReconciliationScope(
@@ -1074,12 +1019,8 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
         incumbents={incumbent.id: incumbent},
         source_support_reference_ids={incumbent.id: old_support},
         all_active_support_reference_ids={incumbent.id: old_support},
-        support_set_hashes={
-            incumbent.id: await db.get_memory_support_set_hash(incumbent.id)
-        },
-        observation_revision_ids=tuple(
-            revision.id for revision in second.observation_revisions
-        ),
+        support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
+        observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
         new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
@@ -1098,9 +1039,7 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
     assert current_unit is not None
     assert current_unit.id == second.source_unit_revisions[0].id
     assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
-    review = await db.get_lifecycle_review(
-        str(plan.mutations[0].payload["review_id"])
-    )
+    review = await db.get_lifecycle_review(str(plan.mutations[0].payload["review_id"]))
     assert review is not None
     assert review.status is LifecycleReviewStatus.PENDING
 
@@ -1121,10 +1060,7 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
         run_id="projection-durable-review-2",
         body="A7 is retained.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     changed_delta = changed.deltas[0]
     review_plan = build_lifecycle_plan(
@@ -1148,12 +1084,8 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
         incumbents={incumbent.id: incumbent},
         source_support_reference_ids={incumbent.id: old_support},
         all_active_support_reference_ids={incumbent.id: old_support},
-        support_set_hashes={
-            incumbent.id: await db.get_memory_support_set_hash(incumbent.id)
-        },
-        observation_revision_ids=tuple(
-            revision.id for revision in changed.observation_revisions
-        ),
+        support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
+        observation_revision_ids=tuple(revision.id for revision in changed.observation_revisions),
         new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
@@ -1194,12 +1126,8 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
         incumbents={incumbent.id: incumbent},
         source_support_reference_ids={incumbent.id: old_support},
         all_active_support_reference_ids={incumbent.id: old_support},
-        support_set_hashes={
-            incumbent.id: await db.get_memory_support_set_hash(incumbent.id)
-        },
-        observation_revision_ids=tuple(
-            revision.id for revision in later.observation_revisions
-        ),
+        support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
+        observation_revision_ids=tuple(revision.id for revision in later.observation_revisions),
         new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
@@ -1216,9 +1144,7 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
 
     assert await db.get_lifecycle_plan_status(later_plan.id) == "applied"
     assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
-    review = await db.get_lifecycle_review(
-        str(review_plan.mutations[0].payload["review_id"])
-    )
+    review = await db.get_lifecycle_review(str(review_plan.mutations[0].payload["review_id"]))
     assert review is not None
     assert review.status is LifecycleReviewStatus.PENDING
 
@@ -1235,10 +1161,7 @@ async def test_review_does_not_exempt_support_from_another_source_unit(
         run_id="projection-review-unit-2",
         body="A7 is retained.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     await db.record_source_projection(changed)
     other = _projection(
@@ -1268,9 +1191,7 @@ async def test_review_does_not_exempt_support_from_another_source_unit(
                 },
             ),
         ),
-        coverage_proof=SimpleNamespace(
-            mandatory_incumbent_ids=(incumbent.id,)
-        ),
+        coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,)),
         scope=SimpleNamespace(
             source_id="src-1",
             source_unit_id=other.source_units[0].id,
@@ -1321,9 +1242,7 @@ async def test_review_does_not_exempt_mismatched_observation_revision_lineage(
                 },
             ),
         ),
-        coverage_proof=SimpleNamespace(
-            mandatory_incumbent_ids=(incumbent.id,)
-        ),
+        coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,)),
         scope=SimpleNamespace(
             source_id="src-1",
             source_unit_id=first.source_units[0].id,
@@ -1385,9 +1304,7 @@ async def test_projected_support_invariant_cannot_hide_a_missing_lineage_hop(
     await db.db.commit()
     plan = SimpleNamespace(
         mutations=(),
-        coverage_proof=SimpleNamespace(
-            mandatory_incumbent_ids=(incumbent.id,)
-        ),
+        coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,)),
         scope=SimpleNamespace(
             source_id="src-1",
             source_unit_id=projection.source_units[0].id,
@@ -1563,21 +1480,14 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
         run_id="projection-multi-unit-rebind",
         body="A7 is removed.\n\nThe page now names an owner.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     second = replace(
         second,
         observations=other.observations + second.observations,
-        observation_revisions=(
-            other.observation_revisions + second.observation_revisions
-        ),
+        observation_revisions=(other.observation_revisions + second.observation_revisions),
         source_units=other.source_units + second.source_units,
-        source_unit_revisions=(
-            other.source_unit_revisions + second.source_unit_revisions
-        ),
+        source_unit_revisions=(other.source_unit_revisions + second.source_unit_revisions),
         relations=other.relations + second.relations,
     )
     adapters = build_sqlite_adapters(db, object())
@@ -1596,18 +1506,14 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
             ),
         ),
         incumbents={incumbent.id: incumbent},
-        unit_support=await db.get_source_unit_support_reference_ids(
-            first.source_units[0].id
-        ),
+        unit_support=await db.get_source_unit_support_reference_ids(first.source_units[0].id),
         projection=second,
     )
 
     assert rebound.action is ReconcileAction.NOOP
     assert rebound.memory is not None
     assert rebound.memory.source_observation_id == first.observations[0].id
-    assert other_reference.id in (
-        await db.get_active_memory_support_reference_ids(incumbent.id)
-    )
+    assert other_reference.id in (await db.get_active_memory_support_reference_ids(incumbent.id))
 
 
 @pytest.mark.asyncio
@@ -1626,9 +1532,7 @@ async def test_incremental_noop_rebinds_exact_unchanged_claim_without_new_extrac
         run_id="projection-incremental-keep-2",
         body="A7 is removed.\nNew deployment note.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            first.observations[0].id: first.observation_revisions[0]
-        },
+        prior_observations={first.observations[0].id: first.observation_revisions[0]},
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -1681,9 +1585,7 @@ async def test_incremental_noop_revalidates_reworded_primary_evidence(
         run_id="projection-primary-reword-2",
         body=current_quote,
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            first.observations[0].id: first.observation_revisions[0]
-        },
+        prior_observations={first.observations[0].id: first.observation_revisions[0]},
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -1738,9 +1640,7 @@ async def test_incremental_noop_reworded_primary_requires_exact_current_quote(
         run_id="projection-primary-bad-quote-2",
         body="The A7 slot remains excluded.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            first.observations[0].id: first.observation_revisions[0]
-        },
+        prior_observations={first.observations[0].id: first.observation_revisions[0]},
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -1789,9 +1689,7 @@ async def test_incremental_noop_invalidated_primary_creates_review(
         run_id="projection-primary-invalid-2",
         body="A7 is now retained.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            first.observations[0].id: first.observation_revisions[0]
-        },
+        prior_observations={first.observations[0].id: first.observation_revisions[0]},
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -1840,9 +1738,7 @@ async def test_persistent_indexless_replacement_creates_review_without_mutating_
         run_id="projection-indexless-replacement-2",
         body="A7 is now retained.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            first.observations[0].id: first.observation_revisions[0]
-        },
+        prior_observations={first.observations[0].id: first.observation_revisions[0]},
     )
     client = _PersistentlyIndexlessReplacementClient(incumbent.id)
     adapters = build_sqlite_adapters(db, object())
@@ -1893,9 +1789,7 @@ async def test_explicit_empty_revision_deterministically_removes_incumbent_suppo
         run_id="projection-empty-2",
         body="",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            first.observations[0].id: first.observation_revisions[0]
-        },
+        prior_observations={first.observations[0].id: first.observation_revisions[0]},
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -1948,9 +1842,7 @@ async def _seed_jira_required_incumbent(
     )
     primary = first.observations[1]
     required = first.observations[0]
-    revisions = {
-        item.observation_id: item for item in first.observation_revisions
-    }
+    revisions = {item.observation_id: item for item in first.observation_revisions}
     unit = EvidenceUnit(
         id="eu-jira-required",
         source_id="src-1",
@@ -2031,10 +1923,7 @@ async def test_partial_jira_projection_skips_llm_for_proven_disjoint_incumbent(
         comment_body="Decision: retain A7",
         comments_truncated=True,
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     assert second.coverage.value == "partial_projection"
     adapters = build_sqlite_adapters(db, object())
@@ -2105,16 +1994,11 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
         description="Payroll validation requires approval before release.",
         comment_body="Decision: retain A7",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     description = second.observations[0]
     description_revision = next(
-        revision
-        for revision in second.observation_revisions
-        if revision.observation_id == description.id
+        revision for revision in second.observation_revisions if revision.observation_id == description.id
     )
     candidate = RawMemory(
         content="Payroll validation requires approval before release.",
@@ -2194,10 +2078,7 @@ async def test_partial_jira_projection_admits_directly_affected_incumbent_delete
         comment_body="Unrelated comment",
         comments_truncated=True,
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     assert second.coverage.value == "partial_projection"
     adapters = build_sqlite_adapters(db, object())
@@ -2238,9 +2119,7 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
     incumbent = await _seed_jira_required_incumbent(db, first)
     await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
-    revisions = {
-        item.observation_id: item for item in first.observation_revisions
-    }
+    revisions = {item.observation_id: item for item in first.observation_revisions}
     second = _jira_projection(
         run_id="projection-jira-required-2",
         description="A7 remains limited to regular payroll runs.",
@@ -2284,13 +2163,9 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
         EvidenceRole.PRIMARY,
         EvidenceRole.REQUIRED,
     }
-    current_revisions = {
-        item.observation_id: item.id for item in second.observation_revisions
-    }
+    current_revisions = {item.observation_id: item.id for item in second.observation_revisions}
     assert all(
-        item.anchor.observation_revision_id
-        == current_revisions[item.anchor.observation_id]
-        for item in evidence
+        item.anchor.observation_revision_id == current_revisions[item.anchor.observation_id] for item in evidence
     )
     current = await db.get_current_source_unit_revision(first.source_units[0].id)
     assert current is not None
@@ -2300,11 +2175,7 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
         ("src-1",),
     )
     plan_payload = json.loads(str(plan_row["payload_json"]))
-    attach = next(
-        mutation
-        for mutation in plan_payload["mutations"]
-        if mutation["mutation_type"] == "attach_support"
-    )
+    attach = next(mutation for mutation in plan_payload["mutations"] if mutation["mutation_type"] == "attach_support")
     assert attach["payload"]["support_validation"]["supported"] is True
 
 
@@ -2321,10 +2192,7 @@ async def test_noop_with_invalidated_required_evidence_creates_review(db: Databa
         run_id="projection-jira-invalid-required-2",
         description="A7 now applies only to off-cycle payroll.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -2470,9 +2338,7 @@ async def test_memory_store_rebaseline_drains_only_its_source_vector_tasks() -> 
         source_id: str | None = None,
     ) -> LifecycleVectorDeliveryResult:
         drained.append((lifecycle_plan_id, source_id))
-        return LifecycleVectorDeliveryResult(
-            state=LifecycleVectorDeliveryState.DELIVERED
-        )
+        return LifecycleVectorDeliveryResult(state=LifecycleVectorDeliveryState.DELIVERED)
 
     store.attempt_lifecycle_vector_delivery = record_delivery
 
@@ -2570,12 +2436,8 @@ async def test_cross_source_keep_persists_provenance_and_survives_other_source_r
         incumbents={incumbent.id: incumbent},
         source_support_reference_ids={incumbent.id: ()},
         all_active_support_reference_ids={incumbent.id: source_one_refs},
-        support_set_hashes={
-            incumbent.id: await db.get_memory_support_set_hash(incumbent.id)
-        },
-        observation_revision_ids=tuple(
-            revision.id for revision in second.observation_revisions
-        ),
+        support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
+        observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
         new_evidence_reference_ids=(),
         evidence_reference_ids_by_claim_hash=evidence.reference_ids_by_claim_hash,
         defaults=NewMemoryDefaults(
@@ -2662,11 +2524,12 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
         source_observation_id="obs-from-unrelated-source",
     )
     adapters = build_sqlite_adapters(db, object())
+    client = _SemanticEquivalentClient()
     engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_EquivalentMemoryStore(db, incumbent),
-        structured_llm_client=_SemanticEquivalentClient(),
+        structured_llm_client=client,
     )
 
     stats = await engine.apply_projected_lifecycle(
@@ -2694,15 +2557,11 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
     )
     assert len(plan_rows) == 1
     plan_payload = json.loads(str(plan_rows[0]["payload_json"]))
-    attach = next(
-        mutation
-        for mutation in plan_payload["mutations"]
-        if mutation["mutation_type"] == "attach_support"
-    )
+    attach = next(mutation for mutation in plan_payload["mutations"] if mutation["mutation_type"] == "attach_support")
     assert attach["payload"]["equivalence_proof"] == {
         "candidate_content_hash": content_hash("A7 remains excluded."),
         "incumbent_content_hash": content_hash("A7 is removed."),
-        "method": "structured_classifier",
+        "method": "structured_relation_classifier",
         "model": engine.llm_model,
         "reason": "Both claims state that A7 is excluded.",
     }
@@ -2712,6 +2571,7 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
     )
     assert len(support) == 1
     assert support[0].anchor.observation_revision_id == second.observation_revisions[0].id
+    assert client.relation_calls == 1
 
 
 @pytest.mark.asyncio
@@ -2783,10 +2643,7 @@ async def test_same_source_cross_unit_semantic_equivalent_claim_reuses_memory_id
     assert stats["added"] == 0
     assert stats["corroborated"] == 1
     assert len(await db.list_memories(source="src-1", status="active")) == 1
-    assert {
-        (source.source_id, source.doc_id)
-        for source in await db.get_memory_sources(incumbent.id)
-    } == {
+    assert {(source.source_id, source.doc_id) for source in await db.get_memory_sources(incumbent.id)} == {
         ("src-1", "confluence-123"),
         ("src-1", "confluence-456"),
     }
@@ -2914,11 +2771,7 @@ async def test_same_source_cross_unit_exact_claim_reuses_memory_id_and_preserves
     )
     assert len(plan_rows) == 1
     payload = json.loads(str(plan_rows[0]["payload_json"]))
-    attach = next(
-        mutation
-        for mutation in payload["mutations"]
-        if mutation["mutation_type"] == "attach_support"
-    )
+    attach = next(mutation for mutation in payload["mutations"] if mutation["mutation_type"] == "attach_support")
     assert attach["memory_id"] == memory.id
     assert attach["payload"]["equivalence_proof"]["method"] == "exact_content"
 
@@ -3007,9 +2860,7 @@ async def test_cross_source_exact_claim_reuses_memory_without_llm_and_preserves_
     assert [memory.id for memory in memories] == [incumbent.id]
     support = await db.get_active_memory_support_evidence(incumbent.id)
     assert {item.source_id for item in support} == {"src-1", "src-2"}
-    assert {
-        item.anchor.observation_revision_id for item in support
-    } == {
+    assert {item.anchor.observation_revision_id for item in support} == {
         first.observation_revisions[0].id,
         second.observation_revisions[0].id,
     }
@@ -3252,9 +3103,7 @@ async def test_stale_parallel_cross_unit_create_fails_closed_before_duplicate_wr
             source_support_reference_ids={},
             all_active_support_reference_ids={},
             support_set_hashes={},
-            observation_revision_ids=tuple(
-                revision.id for revision in projection.observation_revisions
-            ),
+            observation_revision_ids=tuple(revision.id for revision in projection.observation_revisions),
             new_evidence_reference_ids=(),
             evidence_reference_ids_by_claim_hash=evidence.reference_ids_by_claim_hash,
             defaults=NewMemoryDefaults(
@@ -3344,6 +3193,480 @@ async def test_new_projected_memory_persists_explicit_source_observation_support
     assert len(support) == 1
     assert support[0].anchor.observation_id == primary.id
     assert support[0].anchor.observation_revision_id == primary_revision.id
+    assert await db.has_ready_relation_discovery_work(max_attempts=5) is True
+    [work] = await db.lease_relation_discovery_work(
+        worker_id="relation-worker-a",
+        limit=10,
+        lease_seconds=60,
+        max_attempts=3,
+    )
+    assert work.request.memory_id == memory.id
+    assert work.request.expected_content_hash == memory.content_hash
+    assert work.request.source_id == "src-1"
+    assert work.request.source_unit_id == projection.source_units[0].id
+    assert work.request.source_unit_revision_id == projection.source_unit_revisions[0].id
+    assert work.attempts == 1
+    assert work.lease_token
+    assert await db.has_ready_relation_discovery_work(max_attempts=5) is False
+
+    with pytest.raises(ValueError, match="lease was lost"):
+        await db.obsolete_relation_discovery_work(
+            work.request.id,
+            worker_id="relation-worker-b",
+            lease_token=work.lease_token or "",
+            reason="wrong owner",
+        )
+
+    await db.fail_relation_discovery_work(
+        work.request.id,
+        worker_id="relation-worker-a",
+        lease_token=work.lease_token or "",
+        error="transient classifier failure",
+        next_attempt_at="2999-01-01T00:00:00+00:00",
+        exhausted=False,
+    )
+    assert await db.has_ready_relation_discovery_work(max_attempts=5) is False
+    assert (
+        await db.lease_relation_discovery_work(
+            worker_id="relation-worker-c",
+            limit=1,
+            lease_seconds=60,
+            max_attempts=3,
+        )
+        == []
+    )
+    await db.db.execute(
+        "UPDATE relation_discovery_work SET next_attempt_at = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", work.request.id),
+    )
+    await db.db.commit()
+    assert await db.has_ready_relation_discovery_work(max_attempts=5) is True
+    [retried] = await db.lease_relation_discovery_work(
+        worker_id="relation-worker-c",
+        limit=1,
+        lease_seconds=60,
+        max_attempts=3,
+    )
+    assert retried.attempts == 2
+    assert retried.error == "transient classifier failure"
+    await db.db.execute(
+        "UPDATE relation_discovery_work SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", retried.request.id),
+    )
+    await db.db.commit()
+    with pytest.raises(ValueError, match="lease was lost"):
+        await db.obsolete_relation_discovery_work(
+            retried.request.id,
+            worker_id="relation-worker-c",
+            lease_token=retried.lease_token or "",
+            reason="expired worker must not finish",
+        )
+
+
+class _DeterministicRefinementClassifier:
+    def plan(self, pairs):
+        return MemoryPairClassificationPlan(
+            pair_count=len(pairs),
+            llm_calls=1 if pairs else 0,
+            prompt_chars=123 if pairs else 0,
+        )
+
+    async def classify(self, pairs):
+        return MemoryPairClassification(
+            decisions=tuple(
+                MemoryPairDecision(
+                    pair=pair,
+                    relation_type=MemoryRelationType.REFINES,
+                    direction=RelationDirection.CHALLENGER_TO_CANDIDATE,
+                    reason="deterministic contract fixture",
+                )
+                for pair in pairs
+            ),
+            llm_calls=1 if pairs else 0,
+            prompt_chars=123 if pairs else 0,
+        )
+
+
+class _DeterministicContradictionClassifier:
+    def plan(self, pairs):
+        return MemoryPairClassificationPlan(
+            pair_count=len(pairs),
+            llm_calls=1 if pairs else 0,
+            prompt_chars=123 if pairs else 0,
+        )
+
+    async def classify(self, pairs):
+        return MemoryPairClassification(
+            decisions=tuple(
+                MemoryPairDecision(
+                    pair=pair,
+                    relation_type=MemoryRelationType.CONTRADICTS,
+                    direction=RelationDirection.SYMMETRIC,
+                    reason="deterministic contract fixture",
+                )
+                for pair in pairs
+            ),
+            llm_calls=1 if pairs else 0,
+            prompt_chars=123 if pairs else 0,
+        )
+
+
+class _DeterministicRelationCandidates:
+    def __init__(self, candidate: Memory) -> None:
+        self.candidate = candidate
+        self.candidate_row = CandidateMemory(
+            memory_id=candidate.id,
+            source_id="src-other",
+            doc_id="other-doc",
+            source_lineage_id="other-doc",
+            visibility=candidate.visibility,
+            owner_user_id=candidate.owner_user_id,
+            repo_identifier=candidate.repo_identifier,
+        )
+
+    async def retrieve(self, **_kwargs):
+        return CrossDocumentCandidateSelection(
+            discovery=(
+                RetrievedRelationCandidate(
+                    memory=self.candidate_row,
+                    score=1.0,
+                    channels=("lexical_bm25",),
+                ),
+            ),
+            audit={"candidate_count_kind": "windowed"},
+        )
+
+    async def load_selected_memories(self, selection, **_kwargs):
+        return selection, {self.candidate.id: self.candidate}
+
+    async def ensure_selection_current(self, *_args, **_kwargs):
+        return None
+
+
+class _MutatingRelationCandidates(_DeterministicRelationCandidates):
+    def __init__(self, candidate: Memory, after_current) -> None:
+        super().__init__(candidate)
+        self._after_current = after_current
+
+    async def ensure_selection_current(self, *_args, **_kwargs):
+        await self._after_current()
+
+
+class _EmptyRelationCandidates:
+    def __init__(self, after_current=None) -> None:
+        self._after_current = after_current
+
+    async def retrieve(self, **_kwargs):
+        return CrossDocumentCandidateSelection(
+            discovery=(),
+            audit={"candidate_count_kind": "windowed"},
+        )
+
+    async def load_selected_memories(self, selection, **_kwargs):
+        return selection, {}
+
+    async def ensure_selection_current(self, *_args, **_kwargs):
+        if self._after_current is not None:
+            await self._after_current()
+
+
+async def _create_relation_discovery_fixture(
+    db: Database,
+    *,
+    run_id: str,
+) -> tuple[SourceProjection, Memory]:
+    projection = _projection(run_id=run_id, body="A7 applies only to regular payroll.")
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_SemanticEquivalentClient(),
+    )
+    await engine.apply_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content="A7 applies only to regular payroll.",
+                memory_type="decision",
+                evidence_quote="A7 applies only to regular payroll.",
+                extraction_context="A7 applies only to regular payroll.",
+            )
+        ],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content=projection.observation_revisions[0].content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc),
+    )
+    [memory] = await db.list_memories(source="src-1", status="active")
+    return projection, memory
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_rejects_stale_source_unit_revision(
+    db: Database,
+) -> None:
+    projection, _memory = await _create_relation_discovery_fixture(
+        db,
+        run_id="projection-stale-relation-revision",
+    )
+    await db.db.execute(
+        "UPDATE source_units SET current_revision_id = NULL WHERE id = ?",
+        (projection.source_units[0].id,),
+    )
+    await db.db.commit()
+
+    result = await RelationDiscovery(
+        store=db,
+        candidate_retriever=_EmptyRelationCandidates(),
+        pair_classifier=_DeterministicRefinementClassifier(),
+    ).process_slice(worker_id="relation-worker")
+
+    assert result.failed_work == 1
+    row = await db.db.execute_fetchall("SELECT status, error FROM relation_discovery_work")
+    assert row[0]["status"] == "failed"
+    assert "Source Unit revision is stale" in row[0]["error"]
+    assert await db.db.execute_fetchall("SELECT id FROM relation_runs") == []
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_does_not_overwrite_changed_evidence_access(
+    db: Database,
+) -> None:
+    projection, memory = await _create_relation_discovery_fixture(
+        db,
+        run_id="projection-stale-relation-access",
+    )
+    unit = await db.get_current_relation_evidence_unit(
+        memory.id,
+        source_id="src-1",
+        source_unit_id=projection.source_units[0].id,
+    )
+    assert unit is not None
+
+    async def change_access() -> None:
+        await db.db.execute(
+            "UPDATE evidence_units SET access_context_hash = ? WHERE id = ?",
+            ("new-access-context", unit.id),
+        )
+        await db.db.commit()
+
+    result = await RelationDiscovery(
+        store=db,
+        candidate_retriever=_EmptyRelationCandidates(change_access),
+        pair_classifier=_DeterministicRefinementClassifier(),
+    ).process_slice(worker_id="relation-worker")
+
+    assert result.failed_work == 1
+    [row] = await db.db.execute_fetchall(
+        "SELECT access_context_hash FROM evidence_units WHERE id = ?",
+        (unit.id,),
+    )
+    assert row["access_context_hash"] == "new-access-context"
+    assert await db.db.execute_fetchall("SELECT id FROM relation_runs") == []
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_rejects_primary_evidence_demotion_before_commit(
+    db: Database,
+) -> None:
+    projection, memory = await _create_relation_discovery_fixture(
+        db,
+        run_id="projection-stale-primary-relation-evidence",
+    )
+    unit = await db.get_current_relation_evidence_unit(
+        memory.id,
+        source_id="src-1",
+        source_unit_id=projection.source_units[0].id,
+    )
+    assert unit is not None
+
+    async def demote_primary_evidence() -> None:
+        await db.db.execute(
+            "UPDATE evidence_references SET role = 'required' WHERE evidence_unit_id = ?",
+            (unit.id,),
+        )
+        await db.db.commit()
+
+    result = await RelationDiscovery(
+        store=db,
+        candidate_retriever=_EmptyRelationCandidates(demote_primary_evidence),
+        pair_classifier=_DeterministicRefinementClassifier(),
+    ).process_slice(worker_id="relation-worker")
+
+    assert result.failed_work == 1
+    [row] = await db.db.execute_fetchall("SELECT status, error FROM relation_discovery_work")
+    assert row["status"] == "failed"
+    assert "evidence is no longer current" in row["error"]
+    assert await db.db.execute_fetchall("SELECT id FROM relation_runs") == []
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_rejects_candidate_provenance_removed_before_commit(
+    db: Database,
+) -> None:
+    await _create_relation_discovery_fixture(
+        db,
+        run_id="projection-stale-candidate-provenance",
+    )
+    candidate = Memory(
+        id="mem-stale-relation-candidate",
+        memory_type="decision",
+        content="A7 applies to payroll.",
+        content_hash=content_hash("A7 applies to payroll."),
+        project_key="ENG",
+    )
+    await db.insert_memory(candidate)
+    now = datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="other-doc",
+            source="src-other",
+            source_url="https://example.test/other-doc",
+            title="Relation candidate",
+            space_or_project="ENG",
+            author=None,
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash="candidate-doc-hash",
+            token_count=4,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
+    await db.add_memory_source(
+        candidate.id,
+        "other-doc",
+        "confluence",
+        source_updated_at=now,
+    )
+
+    async def remove_provenance() -> None:
+        await db.db.execute(
+            "DELETE FROM memory_sources WHERE memory_id = ? AND doc_id = ?",
+            (candidate.id, "other-doc"),
+        )
+        await db.db.commit()
+
+    result = await RelationDiscovery(
+        store=db,
+        candidate_retriever=_MutatingRelationCandidates(candidate, remove_provenance),
+        pair_classifier=_DeterministicRefinementClassifier(),
+    ).process_slice(worker_id="relation-worker")
+
+    assert result.failed_work == 1
+    [row] = await db.db.execute_fetchall("SELECT status, error FROM relation_discovery_work")
+    assert row["status"] == "failed"
+    assert "candidate provenance is stale" in row["error"]
+    assert await db.db.execute_fetchall("SELECT id FROM relation_runs") == []
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_persists_direction_after_lifecycle_commit(
+    db: Database,
+) -> None:
+    projection = _projection(
+        run_id="projection-relation-discovery",
+        body="A7 applies only to regular payroll.",
+    )
+    raw = RawMemory(
+        content="A7 applies only to regular payroll.",
+        memory_type="decision",
+        evidence_quote="A7 applies only to regular payroll.",
+        extraction_context="A7 applies only to regular payroll.",
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_SemanticEquivalentClient(),
+    )
+    await engine.apply_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=[raw],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        entity_ids=[],
+        document_content=projection.observation_revisions[0].content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc),
+    )
+    [challenger] = await db.list_memories(source="src-1", status="active")
+    candidate = Memory(
+        id="mem-relation-candidate",
+        memory_type="decision",
+        content="A7 applies to payroll.",
+        content_hash=content_hash("A7 applies to payroll."),
+        project_key="ENG",
+    )
+    await db.insert_memory(candidate)
+    now = datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="other-doc",
+            source="src-other",
+            source_url="https://example.test/other-doc",
+            title="Relation candidate",
+            space_or_project="ENG",
+            author=None,
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash="candidate-doc-hash",
+            token_count=4,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
+    await db.add_memory_source(
+        candidate.id,
+        "other-doc",
+        "confluence",
+        source_updated_at=now,
+    )
+
+    result = await RelationDiscovery(
+        store=db,
+        candidate_retriever=_DeterministicRelationCandidates(candidate),
+        pair_classifier=_DeterministicRefinementClassifier(),
+    ).process_slice(worker_id="relation-worker")
+
+    assert result.completed_work == 1
+    assert result.checked_candidate_pairs == 1
+    assert result.llm_calls == 1
+    unit = await db.get_current_relation_evidence_unit(
+        challenger.id,
+        source_id="src-1",
+        source_unit_id=projection.source_units[0].id,
+    )
+    assert unit is not None
+    [relation] = await db.get_evidence_relations(unit.id)
+    assert relation.memory_id == candidate.id
+    assert relation.relation_type is RelationType.REFINES
+    assert relation.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
+    [relation_run] = await db.db.execute_fetchall(
+        "SELECT result_memory_id FROM relation_runs WHERE evidence_unit_id = ?",
+        (unit.id,),
+    )
+    assert relation_run["result_memory_id"] == challenger.id
 
 
 @pytest.mark.asyncio
@@ -3413,9 +3736,10 @@ async def test_generic_document_delete_rejects_active_projected_support(
     assert current is not None and current.status == "active"
     assert await db.get_document("confluence-123") is not None
     assert await db.get_active_memory_support_reference_ids(incumbent.id)
-    assert await db.get_evidence_unit(
-        (await db.get_active_memory_support_evidence(incumbent.id))[0].evidence_unit_id
-    ) is not None
+    assert (
+        await db.get_evidence_unit((await db.get_active_memory_support_evidence(incumbent.id))[0].evidence_unit_id)
+        is not None
+    )
 
 
 @pytest.mark.asyncio
@@ -3476,7 +3800,7 @@ async def test_rebaseline_replay_reuses_memory_with_explicit_observation_support
     assert replayed is not None and replayed.status == "active"
     assert second["reactivated"] == 1
     assert second["corroborated"] == 1
-    assert second["contradictions_found"] == 0
+    assert second["relation_discovery_enqueued"] == 1
     assert len(support) == 1
     assert support[0].anchor.observation_id == primary.id
     plan_rows = await db.db.execute_fetchall(
@@ -3938,7 +4262,14 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
     replacement = await db.get_memory(old.superseded_by)
     assert replacement is not None and replacement.status == "active"
     assert stats["superseded"] == 1
-    assert stats["contradictions_found"] == 1
+    assert stats["relation_discovery_enqueued"] == 1
+    discovery = await RelationDiscovery(
+        store=db,
+        candidate_retriever=_candidate_retriever(adapters),
+        pair_classifier=_DeterministicContradictionClassifier(),
+    ).process_slice(worker_id="relation-worker-cross-source")
+    assert discovery.completed_work == 1
+    assert discovery.checked_candidate_pairs >= 1
     cross_source_review = await db.get_pending_review_for_challenger(replacement.id)
     assert cross_source_review is not None
     assert cross_source_review.kind == "cross_source_conflict"
@@ -4099,9 +4430,7 @@ async def test_enabled_source_tombstone_retires_last_supported_incumbent(db: Dat
         run_id="projection-delete",
         source_unit=initial.source_units[0],
         prior_unit_revision=initial.source_unit_revisions[0],
-        prior_observation_revisions={
-            revision.observation_id: revision for revision in initial.observation_revisions
-        },
+        prior_observation_revisions={revision.observation_id: revision for revision in initial.observation_revisions},
         reason="not_returned_by_authoritative_snapshot",
     )
     adapters = build_sqlite_adapters(db, object())
@@ -4141,9 +4470,7 @@ async def test_gated_source_tombstone_only_opens_review(db: Database) -> None:
         run_id="projection-gated-delete",
         source_unit=initial.source_units[0],
         prior_unit_revision=initial.source_unit_revisions[0],
-        prior_observation_revisions={
-            revision.observation_id: revision for revision in initial.observation_revisions
-        },
+        prior_observation_revisions={revision.observation_id: revision for revision in initial.observation_revisions},
         reason="not_returned_by_authoritative_snapshot",
     )
     adapters = build_sqlite_adapters(db, object())

@@ -16,6 +16,7 @@ from memforge.memory.evidence import (
     EvidenceUnit,
     LifecycleAction,
     RelationCandidateRecord,
+    RelationDirection,
     RelationOutcomeBundle,
     RelationRunRecord,
     RelationType,
@@ -398,6 +399,11 @@ def _relation_outcome_bundle(
         evidence_unit_id=unit.id,
         memory_id=memory_id,
         relation_type=relation_type,
+        direction=(
+            RelationDirection.CHALLENGER_TO_CANDIDATE
+            if relation_type is RelationType.REFINES
+            else RelationDirection.SYMMETRIC
+        ),
         authority_case=AuthorityCase.SAME_SOURCE_LINEAGE,
         is_authoritative_support=True,
         source_lineage_id=unit.source_lineage_id,
