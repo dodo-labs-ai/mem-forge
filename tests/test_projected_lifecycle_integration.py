@@ -19,7 +19,11 @@ from memforge.llm.structured import (
     ReconciliationResponse,
 )
 from memforge.memory.audit import MemoryAuditLogger
-from memforge.memory.engine import MemoryEngine
+from memforge.memory.engine import (
+    MEMORY_EQUIVALENCE_PROMPT,
+    MemoryEngine,
+    _memory_equivalence_pair_json,
+)
 from memforge.memory.evidence import (
     EvidenceContentProvenance,
     EvidenceReference,
@@ -36,6 +40,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleMutation,
     LifecycleMutationType,
     LifecyclePlan,
+    LifecycleReviewStatus,
     LifecycleVectorDeliveryResult,
     LifecycleVectorDeliveryState,
     LifecycleVectorOperation,
@@ -584,8 +589,10 @@ class _SemanticEquivalentClient:
 
     async def classify_memory_equivalence(self, prompt: str, **kwargs):
         del kwargs
-        assert "A7 is removed." in prompt
-        assert "A7 remains excluded." in prompt
+        pair = prompt.split("<claim_pair>", 1)[1].split("</claim_pair>", 1)[0]
+        payload = json.loads(pair)
+        assert set(payload) == {"claim_a", "claim_b"}
+        assert set(payload.values()) == {"A7 is removed.", "A7 remains excluded."}
         return MemoryEquivalenceResponse(
             equivalent=True,
             reason="Both claims state that A7 is excluded.",
@@ -637,6 +644,23 @@ def test_lifecycle_access_identity_treats_project_as_relevance_only() -> None:
     )
 
     assert pay == risk
+
+
+def test_memory_equivalence_pair_payload_is_order_independent_and_neutral() -> None:
+    first = "The deployment policy permits at most three retry attempts."
+    second = "The maximum retry count permitted by the deployment policy is 3."
+
+    forward = _memory_equivalence_pair_json(first, second)
+    reverse = _memory_equivalence_pair_json(second, first)
+
+    assert forward == reverse
+    payload = json.loads(forward)
+    assert set(payload) == {"claim_a", "claim_b"}
+    assert set(payload.values()) == {first, second}
+    assert "document, case, or record states that P" in MEMORY_EQUIVALENCE_PROMPT
+    assert "neither claim is about the act, completeness, or authority of recording" in (
+        MEMORY_EQUIVALENCE_PROMPT
+    )
 
 
 async def _seed_incumbent_support(
@@ -869,6 +893,473 @@ async def test_noop_without_current_evidence_rolls_back_stale_support(db: Databa
     assert current_unit is not None
     assert current_unit.id == first.source_unit_revisions[0].id
     assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
+
+
+@pytest.mark.asyncio
+async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
+    db: Database,
+) -> None:
+    first = _projection(run_id="projection-review-scope-1", body="A7 is removed.")
+    await db.record_source_projection(first)
+    reviewed = await _seed_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-reviewed",
+        memory_content="A7 is removed.",
+    )
+    unrelated = await _seed_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-unrelated",
+        memory_content="A separate control remains enabled.",
+    )
+    reviewed = await db.get_memory(reviewed.id)
+    unrelated = await db.get_memory(unrelated.id)
+    assert reviewed is not None
+    assert unrelated is not None
+    reviewed_support = await db.get_active_memory_support_reference_ids(reviewed.id)
+    unrelated_support = await db.get_active_memory_support_reference_ids(unrelated.id)
+    await db.enable_lifecycle_gate("src-1")
+
+    second = _projection(
+        run_id="projection-review-scope-2",
+        body="A7 is retained.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    delta = second.deltas[0]
+    scope = ReconciliationScope(
+        id="scope-review-support-exemption",
+        source_id="src-1",
+        source_unit_id=delta.source_unit_id,
+        base_unit_revision_id=delta.previous_unit_revision_id,
+        target_unit_revision_id=delta.current_unit_revision_id,
+    )
+    plan = build_lifecycle_plan(
+        plan_id="plan-review-support-exemption",
+        scope=scope,
+        gate_state=LifecycleGateState.ENABLED,
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.DELETE,
+                memory_id=reviewed.id,
+                reason="the source now disputes this claim",
+                flag_for_review=True,
+            ),
+            ReconcileOperation(
+                action=ReconcileAction.NOOP,
+                memory_id=unrelated.id,
+                reason="incorrectly kept without current evidence",
+            ),
+        ),
+        incumbents={reviewed.id: reviewed, unrelated.id: unrelated},
+        source_support_reference_ids={
+            reviewed.id: reviewed_support,
+            unrelated.id: unrelated_support,
+        },
+        all_active_support_reference_ids={
+            reviewed.id: reviewed_support,
+            unrelated.id: unrelated_support,
+        },
+        support_set_hashes={
+            reviewed.id: await db.get_memory_support_set_hash(reviewed.id),
+            unrelated.id: await db.get_memory_support_set_hash(unrelated.id),
+        },
+        observation_revision_ids=tuple(
+            revision.id for revision in second.observation_revisions
+        ),
+        new_evidence_reference_ids=(),
+        defaults=NewMemoryDefaults(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key="ENG",
+            repo_identifier=None,
+            doc_id="confluence-123",
+            source_type="confluence",
+            access_context_hash="workspace-eng",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="stale or ambiguous source support"):
+        await db.apply_source_projection_lifecycle(second, plan)
+
+    current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
+    assert current_unit is not None
+    assert current_unit.id == first.source_unit_revisions[0].id
+    assert await db.get_lifecycle_review(
+        str(plan.mutations[0].payload["review_id"])
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_review_preserves_its_exact_contested_incumbent_support(
+    db: Database,
+) -> None:
+    first = _projection(run_id="projection-reviewed-support-1", body="A7 is removed.")
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    incumbent = await db.get_memory(incumbent.id)
+    assert incumbent is not None
+    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    await db.enable_lifecycle_gate("src-1")
+
+    second = _projection(
+        run_id="projection-reviewed-support-2",
+        body="A7 is retained.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    delta = second.deltas[0]
+    scope = ReconciliationScope(
+        id="scope-reviewed-support",
+        source_id="src-1",
+        source_unit_id=delta.source_unit_id,
+        base_unit_revision_id=delta.previous_unit_revision_id,
+        target_unit_revision_id=delta.current_unit_revision_id,
+    )
+    plan = build_lifecycle_plan(
+        plan_id="plan-reviewed-support",
+        scope=scope,
+        gate_state=LifecycleGateState.ENABLED,
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.DELETE,
+                memory_id=incumbent.id,
+                reason="the source now disputes this claim",
+                flag_for_review=True,
+            ),
+        ),
+        incumbents={incumbent.id: incumbent},
+        source_support_reference_ids={incumbent.id: old_support},
+        all_active_support_reference_ids={incumbent.id: old_support},
+        support_set_hashes={
+            incumbent.id: await db.get_memory_support_set_hash(incumbent.id)
+        },
+        observation_revision_ids=tuple(
+            revision.id for revision in second.observation_revisions
+        ),
+        new_evidence_reference_ids=(),
+        defaults=NewMemoryDefaults(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key="ENG",
+            repo_identifier=None,
+            doc_id="confluence-123",
+            source_type="confluence",
+            access_context_hash="workspace-eng",
+        ),
+    )
+
+    await db.apply_source_projection_lifecycle(second, plan)
+
+    current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
+    assert current_unit is not None
+    assert current_unit.id == second.source_unit_revisions[0].id
+    assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
+    review = await db.get_lifecycle_review(
+        str(plan.mutations[0].payload["review_id"])
+    )
+    assert review is not None
+    assert review.status is LifecycleReviewStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_later_unit_plan_preserves_exact_support_contested_by_durable_review(
+    db: Database,
+) -> None:
+    first = _projection(run_id="projection-durable-review-1", body="A7 is removed.")
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    incumbent = await db.get_memory(incumbent.id)
+    assert incumbent is not None
+    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    await db.enable_lifecycle_gate("src-1")
+
+    changed = _projection(
+        run_id="projection-durable-review-2",
+        body="A7 is retained.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    changed_delta = changed.deltas[0]
+    review_plan = build_lifecycle_plan(
+        plan_id="plan-durable-review",
+        scope=ReconciliationScope(
+            id="scope-durable-review",
+            source_id="src-1",
+            source_unit_id=changed_delta.source_unit_id,
+            base_unit_revision_id=changed_delta.previous_unit_revision_id,
+            target_unit_revision_id=changed_delta.current_unit_revision_id,
+        ),
+        gate_state=LifecycleGateState.ENABLED,
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.DELETE,
+                memory_id=incumbent.id,
+                reason="the source now disputes this claim",
+                flag_for_review=True,
+            ),
+        ),
+        incumbents={incumbent.id: incumbent},
+        source_support_reference_ids={incumbent.id: old_support},
+        all_active_support_reference_ids={incumbent.id: old_support},
+        support_set_hashes={
+            incumbent.id: await db.get_memory_support_set_hash(incumbent.id)
+        },
+        observation_revision_ids=tuple(
+            revision.id for revision in changed.observation_revisions
+        ),
+        new_evidence_reference_ids=(),
+        defaults=NewMemoryDefaults(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key="ENG",
+            repo_identifier=None,
+            doc_id="confluence-123",
+            source_type="confluence",
+            access_context_hash="workspace-eng",
+        ),
+    )
+    await db.apply_source_projection_lifecycle(changed, review_plan)
+
+    later = _projection(
+        run_id="projection-durable-review-later-unit",
+        body="A separate page changes.",
+        item_id="confluence-456",
+        page_id="456",
+    )
+    later_delta = later.deltas[0]
+    later_plan = build_lifecycle_plan(
+        plan_id="plan-after-durable-review",
+        scope=ReconciliationScope(
+            id="scope-after-durable-review",
+            source_id="src-1",
+            source_unit_id=later_delta.source_unit_id,
+            base_unit_revision_id=later_delta.previous_unit_revision_id,
+            target_unit_revision_id=later_delta.current_unit_revision_id,
+        ),
+        gate_state=LifecycleGateState.ENABLED,
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.NOOP,
+                memory_id=incumbent.id,
+                reason="the unrelated unit does not resolve the pending review",
+            ),
+        ),
+        incumbents={incumbent.id: incumbent},
+        source_support_reference_ids={incumbent.id: old_support},
+        all_active_support_reference_ids={incumbent.id: old_support},
+        support_set_hashes={
+            incumbent.id: await db.get_memory_support_set_hash(incumbent.id)
+        },
+        observation_revision_ids=tuple(
+            revision.id for revision in later.observation_revisions
+        ),
+        new_evidence_reference_ids=(),
+        defaults=NewMemoryDefaults(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key="ENG",
+            repo_identifier=None,
+            doc_id="confluence-456",
+            source_type="confluence",
+            access_context_hash="workspace-eng",
+        ),
+    )
+
+    await db.apply_source_projection_lifecycle(later, later_plan)
+
+    assert await db.get_lifecycle_plan_status(later_plan.id) == "applied"
+    assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
+    review = await db.get_lifecycle_review(
+        str(review_plan.mutations[0].payload["review_id"])
+    )
+    assert review is not None
+    assert review.status is LifecycleReviewStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_review_does_not_exempt_support_from_another_source_unit(
+    db: Database,
+) -> None:
+    first = _projection(run_id="projection-review-unit-1", body="A7 is removed.")
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    changed = _projection(
+        run_id="projection-review-unit-2",
+        body="A7 is retained.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    await db.record_source_projection(changed)
+    other = _projection(
+        run_id="projection-review-other-unit",
+        body="An unrelated page changes.",
+        item_id="confluence-456",
+        page_id="456",
+    )
+    await db.record_source_projection(other)
+    plan = SimpleNamespace(
+        mutations=(
+            LifecycleMutation(
+                mutation_type=LifecycleMutationType.CREATE_REVIEW,
+                memory_id=incumbent.id,
+                source_id="src-1",
+                payload={
+                    "staged_evidence": {
+                        "proposed_mutations": [
+                            {
+                                "mutation_type": "remove_support",
+                                "memory_id": incumbent.id,
+                                "source_id": "src-1",
+                                "evidence_reference_ids": list(old_support),
+                            }
+                        ]
+                    }
+                },
+            ),
+        ),
+        coverage_proof=SimpleNamespace(
+            mandatory_incumbent_ids=(incumbent.id,)
+        ),
+        scope=SimpleNamespace(
+            source_id="src-1",
+            source_unit_id=other.source_units[0].id,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="stale or ambiguous source support"):
+        await db._validate_projected_support_invariant_unlocked(plan)
+
+
+@pytest.mark.asyncio
+async def test_review_does_not_exempt_mismatched_observation_revision_lineage(
+    db: Database,
+) -> None:
+    first = _projection(run_id="projection-review-lineage-1", body="A7 is removed.")
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    other = _projection(
+        run_id="projection-review-lineage-other",
+        body="An unrelated page changes.",
+        item_id="confluence-456",
+        page_id="456",
+    )
+    await db.record_source_projection(other)
+    await db.db.execute(
+        "UPDATE evidence_references SET observation_revision_id = ? WHERE id = ?",
+        (other.observation_revisions[0].id, support[0]),
+    )
+    await db.db.commit()
+    plan = SimpleNamespace(
+        mutations=(
+            LifecycleMutation(
+                mutation_type=LifecycleMutationType.CREATE_REVIEW,
+                memory_id=incumbent.id,
+                source_id="src-1",
+                payload={
+                    "staged_evidence": {
+                        "proposed_mutations": [
+                            {
+                                "mutation_type": "remove_support",
+                                "memory_id": incumbent.id,
+                                "source_id": "src-1",
+                                "evidence_reference_ids": list(support),
+                            }
+                        ]
+                    }
+                },
+            ),
+        ),
+        coverage_proof=SimpleNamespace(
+            mandatory_incumbent_ids=(incumbent.id,)
+        ),
+        scope=SimpleNamespace(
+            source_id="src-1",
+            source_unit_id=first.source_units[0].id,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="stale or ambiguous source support"):
+        await db._validate_projected_support_invariant_unlocked(plan)
+
+
+@pytest.mark.parametrize(
+    ("broken_hop", "table", "id_column"),
+    (
+        ("evidence_reference", "evidence_references", "reference_id"),
+        ("evidence_unit", "evidence_units", "evidence_unit_id"),
+        ("observation", "source_observations", "observation_id"),
+        (
+            "observation_revision",
+            "source_observation_revisions",
+            "observation_revision_id",
+        ),
+        ("source_unit", "source_units", "source_unit_id"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_projected_support_invariant_cannot_hide_a_missing_lineage_hop(
+    db: Database,
+    broken_hop: str,
+    table: str,
+    id_column: str,
+) -> None:
+    projection = _projection(
+        run_id=f"projection-missing-{broken_hop}",
+        body="A7 is removed.",
+    )
+    await db.record_source_projection(projection)
+    incumbent = await _seed_incumbent_support(db, projection=projection)
+    [reference_id] = await db.get_active_memory_support_reference_ids(incumbent.id)
+    async with db.db.execute(
+        """SELECT er.evidence_unit_id, er.observation_id,
+                  er.observation_revision_id, so.source_unit_id
+             FROM evidence_references er
+             JOIN source_observations so ON so.id = er.observation_id
+            WHERE er.id = ?""",
+        (reference_id,),
+    ) as cursor:
+        lineage = await cursor.fetchone()
+    assert lineage is not None
+    ids = {
+        "reference_id": reference_id,
+        "evidence_unit_id": lineage["evidence_unit_id"],
+        "observation_id": lineage["observation_id"],
+        "observation_revision_id": lineage["observation_revision_id"],
+        "source_unit_id": lineage["source_unit_id"],
+    }
+    await db.db.commit()
+    await db.db.execute("PRAGMA foreign_keys = OFF")
+    await db.db.execute(f"DELETE FROM {table} WHERE id = ?", (ids[id_column],))
+    await db.db.commit()
+    plan = SimpleNamespace(
+        mutations=(),
+        coverage_proof=SimpleNamespace(
+            mandatory_incumbent_ids=(incumbent.id,)
+        ),
+        scope=SimpleNamespace(
+            source_id="src-1",
+            source_unit_id=projection.source_units[0].id,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="stale or ambiguous source support"):
+        await db._validate_projected_support_invariant_unlocked(plan)
 
 
 @pytest.mark.asyncio
@@ -2037,6 +2528,7 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
         confidence=0.9,
         evidence_quote="A7 remains excluded.",
         extraction_context="A7 remains excluded.",
+        source_observation_id="obs-from-unrelated-source",
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(

@@ -47,6 +47,7 @@ from memforge.models import (
     NormalizedContent,
     RawContent,
 )
+from memforge.repo_identity import normalize_repo_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +333,7 @@ class GitHubRepoGene(Gene):
             "source_type": GITHUB_REPO_SOURCE_TYPE,
             "connection_mode": raw.item.extra.get("connection_mode"),
             "repo_url": raw.item.extra.get("repo_url"),
+            "repo_identifier": _validated_repo_identifier(str(raw.item.extra.get("repo_url") or "")),
             "repo_host": raw.item.extra.get("repo_host"),
             "repo_owner": raw.item.extra.get("repo_owner"),
             "repo_name": raw.item.extra.get("repo_name"),
@@ -542,6 +544,7 @@ def _semantics_from_package(package: dict) -> dict:
         "source_type": GITHUB_REPO_SOURCE_TYPE,
         "connection_mode": CONNECTION_MODE_LOCAL_PUSH,
         "repo_url": package.get("repo_url"),
+        "repo_identifier": _validated_repo_identifier(str(package.get("repo_url") or "")),
         "repo_host": package.get("repo_host"),
         "repo_owner": package.get("repo_owner"),
         "repo_name": package.get("repo_name"),
@@ -551,3 +554,13 @@ def _semantics_from_package(package: dict) -> dict:
         "content_type": package.get("content_type"),
         "canonical_url": package.get("source_url"),
     }
+
+
+def _validated_repo_identifier(repo_url: str) -> str:
+    """Validate a GitHub URL and map it to the shared repository identity."""
+
+    repo = _parse_repo_url(repo_url)
+    identifier = normalize_repo_identifier(repo.repo_url)
+    if identifier is None:
+        raise ValueError("GitHub repository URL is required")
+    return identifier

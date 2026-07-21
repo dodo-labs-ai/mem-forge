@@ -452,6 +452,90 @@ class LifecyclePlan:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class ContestedSupportEdge:
+    """One exact Support edge intentionally retained by a pending Review."""
+
+    memory_id: str
+    source_id: str
+    source_unit_id: str
+    evidence_reference_id: str
+
+
+def contested_supports_from_staged_evidence(
+    *,
+    incumbent_memory_id: str,
+    source_id: str,
+    source_unit_id: str,
+    staged_evidence: Mapping[str, object],
+) -> frozenset[ContestedSupportEdge]:
+    """Parse exact incumbent Support edges intentionally held for Review.
+
+    A pending Review may keep an incumbent active on its previous revision
+    until approval or rejection. Only the Support edges explicitly staged for
+    removal by that incumbent's Review are contested; the Review must not
+    weaken validation for any other Memory or edge.
+    """
+
+    contested: set[ContestedSupportEdge] = set()
+    proposed = staged_evidence.get("proposed_mutations")
+    if not isinstance(proposed, Sequence) or isinstance(proposed, (str, bytes)):
+        raise ValueError("create_review mutation requires proposed_mutations")
+    for raw_mutation in proposed:
+        if not isinstance(raw_mutation, Mapping):
+            raise ValueError("create_review proposed mutation must be an object")
+        if raw_mutation.get("mutation_type") != LifecycleMutationType.REMOVE_SUPPORT.value:
+            continue
+        if (
+            raw_mutation.get("memory_id") != incumbent_memory_id
+            or raw_mutation.get("source_id") != source_id
+        ):
+            raise ValueError("create_review remove_support targets another incumbent")
+        reference_ids = raw_mutation.get("evidence_reference_ids")
+        if not isinstance(reference_ids, Sequence) or isinstance(
+            reference_ids, (str, bytes)
+        ):
+            raise ValueError("create_review remove_support requires evidence_reference_ids")
+        if not reference_ids or not all(
+            isinstance(reference_id, str) and reference_id
+            for reference_id in reference_ids
+        ):
+            raise ValueError("create_review remove_support requires stable evidence references")
+        contested.update(
+            ContestedSupportEdge(
+                memory_id=incumbent_memory_id,
+                source_id=source_id,
+                source_unit_id=source_unit_id,
+                evidence_reference_id=reference_id,
+            )
+            for reference_id in reference_ids
+        )
+    return frozenset(contested)
+
+
+def pending_review_contested_supports(
+    plan: LifecyclePlan,
+) -> frozenset[ContestedSupportEdge]:
+    """Return exact contested edges staged by Reviews in the current Plan."""
+
+    contested: set[ContestedSupportEdge] = set()
+    for review_mutation in plan.mutations:
+        if review_mutation.mutation_type is not LifecycleMutationType.CREATE_REVIEW:
+            continue
+        staged = review_mutation.payload.get("staged_evidence")
+        if not isinstance(staged, Mapping):
+            raise ValueError("create_review mutation requires staged_evidence")
+        contested.update(
+            contested_supports_from_staged_evidence(
+                incumbent_memory_id=review_mutation.memory_id,
+                source_id=review_mutation.source_id,
+                source_unit_id=plan.scope.source_unit_id,
+                staged_evidence=staged,
+            )
+        )
+    return frozenset(contested)
+
+
 @runtime_checkable
 class LifecyclePlanStore(Protocol):
     """Storage boundary that validates stale guards and commits atomically."""

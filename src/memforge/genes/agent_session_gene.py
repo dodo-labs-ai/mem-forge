@@ -13,7 +13,7 @@ from memforge.agent_session_contract import (
     AGENT_SESSION_CONTENT_ROLE,
     AGENT_SESSION_PACKAGE_KIND,
 )
-from memforge.agent_sessions import normalize_repo_identifier
+from memforge.repo_identity import normalize_repo_identifier
 from memforge.genes.base import Gene
 from memforge.models import (
     ConfigField,

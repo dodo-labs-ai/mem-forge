@@ -834,6 +834,7 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert (codex_root / "scripts" / "memforge_hook.py").exists()
     assert (codex_root / "scripts" / "memforge_hook_adapter.py").exists()
     assert (codex_root / "scripts" / "memforge_mcp.py").exists()
+    assert (codex_root / "scripts" / "memforge_repo_identity.py").exists()
     assert (codex_root / ".mcp.json").exists()
 
     assert (claude_root / ".claude-plugin" / "plugin.json").exists()
@@ -841,6 +842,7 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert (claude_root / "scripts" / "memforge_hook.py").exists()
     assert (claude_root / "scripts" / "memforge_hook_adapter.py").exists()
     assert (claude_root / "scripts" / "memforge_mcp.py").exists()
+    assert (claude_root / "scripts" / "memforge_repo_identity.py").exists()
     assert (claude_root / ".mcp.json").exists()
 
     codex_manifest = json.loads((codex_root / ".codex-plugin" / "plugin.json").read_text())
@@ -1020,6 +1022,17 @@ def test_plugin_adapters_match_canonical_adapter():
         root / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_hook_adapter.py",
     ):
         assert adapter.read_text() == canonical
+
+
+def test_packaged_repo_identity_matches_canonical_helper():
+    root = Path(__file__).resolve().parents[1]
+    canonical = (root / "src" / "memforge" / "repo_identity.py").read_text()
+
+    for helper in (
+        root / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_repo_identity.py",
+        root / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_repo_identity.py",
+    ):
+        assert helper.read_text() == canonical
 
 
 def test_packaged_plugin_config_matches_canonical_target_and_helpers():

@@ -4,7 +4,12 @@ import pytest
 
 from memforge.llm.structured import MemoryCandidate, MemoryExtractionResponse
 from memforge.pipeline.document_units import ExtractionContext, ExtractionUnit
-from memforge.pipeline.memory_extractor import MemoryExtractor
+from memforge.pipeline.memory_extractor import (
+    MEMORY_EXTRACTION_PROMPT,
+    PROJECTION_BATCH_EXTRACTION_PROMPT,
+    UNIT_MEMORY_EXTRACTION_PROMPT,
+    MemoryExtractor,
+)
 
 
 class RecordingStructuredMemoryClient:
@@ -85,3 +90,13 @@ async def test_extract_unit_memories_trusts_unit_anchor_as_boundary_contract():
     assert result.memories[0].evidence_anchor == "unit"
     assert result.memories[0].extraction_context == "Tracking uses UnifiedContextApi for explicit API calls."
     assert "glossary_appendix" in client.calls[0]["prompt"]
+
+
+def test_full_scope_extraction_prompts_treat_existing_memory_as_comparison_context():
+    for prompt in (
+        MEMORY_EXTRACTION_PROMPT,
+        UNIT_MEMORY_EXTRACTION_PROMPT,
+        PROJECTION_BATCH_EXTRACTION_PROMPT,
+    ):
+        assert "Existing memories are comparison context, not a novelty filter." in prompt
+        assert "attach another Support Assertion" in prompt

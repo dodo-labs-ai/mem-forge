@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -2230,6 +2231,110 @@ def _make_receipt(
         metadata=metadata,
         updated_at=updated_at,
     )
+
+
+@pytest.mark.asyncio
+async def test_successful_agent_session_receipt_advances_source_activity_monotonically(
+    tmp_path,
+):
+    database = Database(str(tmp_path / "agent-session-activity.db"))
+    source_id = "src-agent-sessions-codex"
+    await database.connect()
+    try:
+        await database.upsert_source(
+            id=source_id,
+            type="agent_session",
+            name="Codex Session",
+            config_json="{}",
+            access_policy="private",
+            owner_user_id="owner-user",
+        )
+
+        await database.upsert_agent_session_receipt(
+            _make_receipt(
+                doc_id="failed-window",
+                session_id="session-activity",
+                source_id=source_id,
+                outcome="failed",
+                updated_at="2026-07-21T10:00:00Z",
+            )
+        )
+        assert (await database.get_source(source_id))["last_sync"] is None
+
+        await database.upsert_agent_session_receipt(
+            _make_receipt(
+                doc_id="successful-explicit-document",
+                session_id="session-activity",
+                source_id=source_id,
+                source_kind="generated_agent_summary",
+                outcome="knowledge_patched",
+                updated_at="2026-07-21T10:30:00Z",
+            )
+        )
+        assert (await database.get_source(source_id))["last_sync"] is None
+
+        await database.upsert_agent_session_receipt(
+            _make_receipt(
+                doc_id="successful-window",
+                session_id="session-activity",
+                source_id=source_id,
+                outcome="knowledge_patched",
+                updated_at="2026-07-21T09:00:00Z",
+            )
+        )
+        assert (await database.get_source(source_id))["last_sync"] == "2026-07-21T09:00:00+00:00"
+
+        await database.upsert_agent_session_receipt(
+            _make_receipt(
+                doc_id="older-successful-window",
+                session_id="session-activity",
+                source_id=source_id,
+                outcome="no_output",
+                updated_at="2026-07-21T08:00:00Z",
+            )
+        )
+        assert (await database.get_source(source_id))["last_sync"] == "2026-07-21T09:00:00+00:00"
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_session_receipt_and_source_activity_rollback_together(tmp_path):
+    database = Database(str(tmp_path / "agent-session-activity-rollback.db"))
+    source_id = "src-agent-sessions-codex"
+    await database.connect()
+    try:
+        await database.upsert_source(
+            id=source_id,
+            type="agent_session",
+            name="Codex Session",
+            config_json="{}",
+            access_policy="private",
+            owner_user_id="owner-user",
+        )
+        await database.db.execute(
+            """CREATE TRIGGER reject_agent_session_activity
+               BEFORE UPDATE OF last_sync ON sources
+               BEGIN
+                   SELECT RAISE(ABORT, 'activity update rejected');
+               END"""
+        )
+        await database.db.commit()
+
+        receipt = _make_receipt(
+            doc_id="atomic-window",
+            session_id="session-activity",
+            source_id=source_id,
+            outcome="knowledge_patched",
+            updated_at="2026-07-21T09:00:00Z",
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="activity update rejected"):
+            await database.upsert_agent_session_receipt(receipt)
+
+        assert await database.get_agent_session_receipt(receipt.doc_id) is None
+        assert (await database.get_source(source_id))["last_sync"] is None
+    finally:
+        await database.close()
 
 
 def test_summarize_agent_session_outcomes_counts_and_fraction(tmp_path):

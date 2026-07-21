@@ -23,6 +23,24 @@ from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 try:
+    from .repo_identity import normalize_repo_identifier
+except ImportError:  # pragma: no cover - copied plugin package or direct file load
+    try:
+        from memforge_repo_identity import normalize_repo_identifier
+    except ImportError:
+        import importlib.util
+
+        _repo_identity_path = Path(__file__).with_name("memforge_repo_identity.py")
+        if not _repo_identity_path.exists():
+            _repo_identity_path = Path(__file__).with_name("repo_identity.py")
+        _repo_identity_spec = importlib.util.spec_from_file_location("memforge_repo_identity", _repo_identity_path)
+        if _repo_identity_spec is None or _repo_identity_spec.loader is None:
+            raise
+        _repo_identity_module = importlib.util.module_from_spec(_repo_identity_spec)
+        _repo_identity_spec.loader.exec_module(_repo_identity_module)
+        normalize_repo_identifier = _repo_identity_module.normalize_repo_identifier
+
+try:
     from .plugin_config import configured_api_token, configured_target
 except ImportError:  # pragma: no cover - copied plugin package or direct file load
     try:
@@ -830,7 +848,7 @@ def _env_workspace_root() -> str | None:
 
 def _repo_identifier_from_cwd(cwd: str | Path) -> str | None:
     remote = _git_value(["git", "remote", "get-url", "origin"], cwd=cwd)
-    return _normalize_repo_identifier(remote)
+    return normalize_repo_identifier(remote)
 
 
 def _mcp_client() -> str:
@@ -838,28 +856,6 @@ def _mcp_client() -> str:
     if value in AGENT_CLIENT_VALUES:
         return value
     return "codex"
-
-
-def _normalize_repo_identifier(repo: str | None) -> str | None:
-    if repo is None:
-        return None
-    value = repo.strip()
-    if not value:
-        return None
-
-    ssh_match = re.match(r"^[^/@]+@([^:/]+):(.+)$", value)
-    if ssh_match:
-        host, path = ssh_match.groups()
-        value = f"{host}/{path}"
-    else:
-        value = re.sub(r"^[a-z][a-z0-9+.-]*://", "", value, flags=re.IGNORECASE)
-        value = re.sub(r"^[^@/]+@", "", value)
-
-    value = value.split("?", 1)[0].split("#", 1)[0].rstrip("/")
-    if value.endswith(".git"):
-        value = value[:-4]
-    value = re.sub(r"/+", "/", value)
-    return value.lower() or None
 
 
 def _git_value(command: list[str], *, cwd: str | Path | None = None) -> str | None:
