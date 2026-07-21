@@ -152,19 +152,27 @@ async def test_more_than_thirty_incumbents_use_bounded_batches_and_close_one_led
             )
 
     client = CompleteBatchClient()
-    operations = await reconcile_memories(
+    result = await reconcile_memories(
         new_extractions=[],
         existing_memories=incumbents,
         doc_type="design",
         structured_llm_client=client,
         updated_document="# Current design",
+        include_metadata=True,
     )
 
     assert client.batch_sizes == [30, 30, 5]
-    assert {operation.memory_id for operation in operations} == {
+    assert result.metrics.model_batch_count == 3
+    assert result.metrics.structured_llm_calls == 3
+    assert result.metrics.structured_llm_elapsed_ms >= 0
+    assert result.metrics.reconciliation_elapsed_ms >= 0
+    assert {operation.memory_id for operation in result.operations} == {
         memory.id for memory in incumbents
     }
-    assert all(operation.action is ReconcileAction.NOOP for operation in operations)
+    assert all(
+        operation.action is ReconcileAction.NOOP
+        for operation in result.operations
+    )
 
 
 @pytest.mark.asyncio

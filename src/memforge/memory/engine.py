@@ -12,6 +12,7 @@ import json
 import logging
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 from memforge.memory.candidate_ledger import (
@@ -228,27 +229,28 @@ class MemoryEngine:
                 incumbents_by_id.setdefault(memory.id, memory)
         return [incumbents_by_id[key] for key in sorted(incumbents_by_id)], unit_support
 
-    async def _partial_projection_protected_incumbents(
+    async def _projected_incumbent_impacts(
         self,
         *,
         projection: SourceProjection,
         incumbent_ids: frozenset[str],
         unit_support: Mapping[str, tuple[str, ...]],
-    ) -> frozenset[str]:
-        """Return incumbents without deterministic affected-anchor proof.
+    ) -> dict[str, ImpactResult]:
+        """Resolve each incumbent against the current Revision Delta.
 
-        A partial projection cannot authorize destructive mutation merely
-        because a model saw an incomplete rendering of the Source Unit.
-        Legacy, disjoint, and unknown anchors are therefore protected; only an
-        anchor resolved as AFFECTED may admit UPDATE/SUPERSEDE/DELETE.
+        Missing legacy Support, ambiguous mappings, and mixed evidence stay
+        UNKNOWN. A single affected reference makes the incumbent AFFECTED;
+        only a complete set of disjoint references proves DISJOINT.
         """
 
-        if projection.coverage is not ProjectionCoverage.PARTIAL_PROJECTION:
-            return frozenset()
         delta = projection.deltas[0]
-        protected: set[str] = set(incumbent_ids.difference(unit_support))
-        for memory_id, reference_ids in unit_support.items():
-            scoped_reference_ids = set(reference_ids)
+        resolved: dict[str, ImpactResult] = {}
+        for memory_id in incumbent_ids:
+            reference_ids = unit_support.get(memory_id)
+            if not reference_ids:
+                resolved[memory_id] = ImpactResult.UNKNOWN
+                continue
+            scoped_reference_ids = frozenset(reference_ids)
             evidence = await self.db.get_active_memory_support_evidence(
                 memory_id,
                 source_id=projection.source_id,
@@ -258,9 +260,29 @@ class MemoryEngine:
                 for item in evidence
                 if item.reference_id in scoped_reference_ids
             }
-            if ImpactResult.AFFECTED not in impacts:
-                protected.add(memory_id)
-        return frozenset(protected)
+            if ImpactResult.AFFECTED in impacts:
+                resolved[memory_id] = ImpactResult.AFFECTED
+            elif not impacts or ImpactResult.UNKNOWN in impacts:
+                resolved[memory_id] = ImpactResult.UNKNOWN
+            else:
+                resolved[memory_id] = ImpactResult.DISJOINT
+        return resolved
+
+    @staticmethod
+    def _partial_projection_protected_incumbents(
+        *,
+        projection: SourceProjection,
+        incumbent_impacts: Mapping[str, ImpactResult],
+    ) -> frozenset[str]:
+        """Return partial-projection incumbents without affected-anchor proof."""
+
+        if projection.coverage is not ProjectionCoverage.PARTIAL_PROJECTION:
+            return frozenset()
+        return frozenset(
+            memory_id
+            for memory_id, impact in incumbent_impacts.items()
+            if impact is not ImpactResult.AFFECTED
+        )
 
     @staticmethod
     def _enforce_partial_projection_keep(
@@ -589,7 +611,10 @@ class MemoryEngine:
     ) -> dict[str, int]:
         """Reconcile a complete Source Unit ledger and atomically apply one plan."""
 
-        from memforge.pipeline.reconciler import reconcile_memories
+        from memforge.pipeline.reconciler import (
+            ReconciliationResult,
+            reconcile_memories,
+        )
         from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 
         if len(projection.deltas) != 1:
@@ -637,11 +662,28 @@ class MemoryEngine:
             candidates=filtered_memories,
         )
         stats["skipped"] += quality_candidate_count - len(filtered_memories)
-
+        reconciliation_started = perf_counter()
         incumbents, unit_support = await self._active_projected_incumbents(
             doc_id=doc_id,
             source_unit_id=scope.source_unit_id,
         )
+        incumbent_impacts: dict[str, ImpactResult] = {}
+        needs_incumbent_impacts = (
+            projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
+            or (not filtered_memories and bool(document_content.strip()))
+        )
+        if needs_incumbent_impacts:
+            incumbent_impacts = await self._projected_incumbent_impacts(
+                projection=projection,
+                incumbent_ids=frozenset(memory.id for memory in incumbents),
+                unit_support=unit_support,
+            )
+        model_incumbent_count = 0
+        deterministic_disjoint_keep_count = 0
+        model_batch_count = 0
+        structured_llm_call_count = 0
+        structured_llm_elapsed_ms = 0
+        bounded_reconciliation_elapsed_ms = 0
         if not document_content.strip() and not filtered_memories:
             operations = tuple(
                 ReconcileOperation(
@@ -652,13 +694,27 @@ class MemoryEngine:
                 for memory in sorted(incumbents, key=lambda item: item.id)
             )
         else:
-            if incumbents and not self.structured_llm_client:
+            deterministic_keep_ids = (
+                frozenset(
+                    memory_id
+                    for memory_id, impact in incumbent_impacts.items()
+                    if impact is ImpactResult.DISJOINT
+                )
+                if not filtered_memories
+                else frozenset()
+            )
+            model_incumbents = [
+                memory for memory in incumbents if memory.id not in deterministic_keep_ids
+            ]
+            model_incumbent_count = len(model_incumbents)
+            deterministic_disjoint_keep_count = len(deterministic_keep_ids)
+            if model_incumbents and not self.structured_llm_client:
                 raise RuntimeError(
                     "complete lifecycle reconciliation requires an LLM client"
                 )
             result = await reconcile_memories(
                 new_extractions=filtered_memories,
-                existing_memories=incumbents,
+                existing_memories=model_incumbents,
                 doc_type=doc_type,
                 structured_llm_client=self.structured_llm_client,
                 llm_model=self.llm_model,
@@ -668,21 +724,66 @@ class MemoryEngine:
                 update_plan_stats=update_plan_stats,
                 include_metadata=True,
             )
-            failure = getattr(result, "failure", None)
-            if failure is not None:
+            if not isinstance(result, ReconciliationResult):
+                raise TypeError(
+                    "metadata reconciliation must return ReconciliationResult"
+                )
+            reconciliation_metrics = result.metrics
+            model_batch_count = reconciliation_metrics.model_batch_count
+            structured_llm_call_count = reconciliation_metrics.structured_llm_calls
+            structured_llm_elapsed_ms = (
+                reconciliation_metrics.structured_llm_elapsed_ms
+            )
+            bounded_reconciliation_elapsed_ms = (
+                reconciliation_metrics.reconciliation_elapsed_ms
+            )
+            if result.failure is not None:
                 raise RuntimeError(
                     "complete lifecycle reconciliation failed: "
-                    f"{failure.error_type}: {failure.error}"
+                    f"{result.failure.error_type}: {result.failure.error}"
                 )
-            operations = tuple(getattr(result, "operations", result))
-        protected_memory_ids = await self._partial_projection_protected_incumbents(
+            operations = tuple(result.operations) + tuple(
+                ReconcileOperation(
+                    action=ReconcileAction.NOOP,
+                    memory_id=memory_id,
+                    reason="Revision Delta proves the incumbent evidence is disjoint",
+                )
+                for memory_id in sorted(deterministic_keep_ids)
+            )
+        protected_memory_ids = self._partial_projection_protected_incumbents(
             projection=projection,
-            incumbent_ids=frozenset(memory.id for memory in incumbents),
-            unit_support=unit_support,
+            incumbent_impacts=incumbent_impacts,
         )
         operations = self._enforce_partial_projection_keep(
             operations,
             protected_memory_ids,
+        )
+        logger.info(
+            json.dumps(
+                {
+                    "event": "projected_lifecycle_reconciliation",
+                    "source_id": projection.source_id,
+                    "source_unit_id": scope.source_unit_id,
+                    "reconciliation_new_candidate_count": len(filtered_memories),
+                    "reconciliation_incumbent_count": len(incumbents),
+                    "reconciliation_model_incumbent_count": model_incumbent_count,
+                    "reconciliation_disjoint_keep_count": (
+                        deterministic_disjoint_keep_count
+                    ),
+                    "reconciliation_llm_batch_count": model_batch_count,
+                    "reconciliation_llm_call_count": structured_llm_call_count,
+                    "reconciliation_llm_elapsed_ms": structured_llm_elapsed_ms,
+                    "reconciliation_bounded_elapsed_ms": (
+                        bounded_reconciliation_elapsed_ms
+                    ),
+                    "reconciliation_total_elapsed_ms": max(
+                        0,
+                        round((perf_counter() - reconciliation_started) * 1000),
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         )
         for operation in operations:
             if operation.action not in {

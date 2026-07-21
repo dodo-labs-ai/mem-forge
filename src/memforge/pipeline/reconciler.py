@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 from memforge.llm.structured import StructuredLlmError
@@ -19,7 +20,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ReconciliationFailure", "ReconciliationResult", "reconcile_memories"]
+__all__ = [
+    "ReconciliationFailure",
+    "ReconciliationMetrics",
+    "ReconciliationResult",
+    "reconcile_memories",
+]
 
 
 @dataclass(frozen=True)
@@ -31,11 +37,22 @@ class ReconciliationFailure:
 
 
 @dataclass(frozen=True)
+class ReconciliationMetrics:
+    """Transport and latency measurements for one bounded reconciliation."""
+
+    structured_llm_calls: int = 0
+    model_batch_count: int = 0
+    structured_llm_elapsed_ms: int = 0
+    reconciliation_elapsed_ms: int = 0
+
+
+@dataclass(frozen=True)
 class ReconciliationResult:
     """Reconciliation call result with operations and optional failure metadata."""
 
     operations: list[ReconcileOperation]
     failure: ReconciliationFailure | None = None
+    metrics: ReconciliationMetrics = ReconciliationMetrics()
 
 
 RECONCILIATION_PROMPT = """You are reconciling team knowledge. A document was updated and new facts
@@ -159,13 +176,33 @@ async def reconcile_memories(
     include_metadata: bool = False,
 ) -> list[ReconcileOperation] | ReconciliationResult:
     """Classify new candidates and every incumbent, failing closed on ambiguity."""
+    started = perf_counter()
+    structured_llm_calls = 0
+    structured_llm_elapsed_seconds = 0.0
+    model_batch_count = 0
+
+    def metrics() -> ReconciliationMetrics:
+        return ReconciliationMetrics(
+            structured_llm_calls=structured_llm_calls,
+            model_batch_count=model_batch_count,
+            structured_llm_elapsed_ms=max(
+                0,
+                round(structured_llm_elapsed_seconds * 1000),
+            ),
+            reconciliation_elapsed_ms=max(
+                0,
+                round((perf_counter() - started) * 1000),
+            ),
+        )
+
     if not new_extractions and not existing_memories:
-        return _return_result([], include_metadata=include_metadata)
+        return _return_result([], metrics=metrics(), include_metadata=include_metadata)
 
     # If no existing memories, everything is ADD (skip LLM call)
     if not existing_memories:
         return _return_result(
             [ReconcileOperation(action=ReconcileAction.ADD, memory=raw) for raw in new_extractions],
+            metrics=metrics(),
             include_metadata=include_metadata,
         )
 
@@ -190,6 +227,7 @@ async def reconcile_memories(
     try:
         decisions: list[dict] = []
         for offset in range(0, len(existing_memories), RECONCILIATION_INCUMBENT_BATCH_SIZE):
+            model_batch_count += 1
             batch = existing_memories[offset : offset + RECONCILIATION_INCUMBENT_BATCH_SIZE]
             existing_json = json.dumps(
                 [
@@ -215,11 +253,16 @@ async def reconcile_memories(
             )
             batch_decisions: list[dict] = []
             for validation_attempt in range(RECONCILIATION_BATCH_VALIDATION_ATTEMPTS):
-                response = await structured_llm_client.reconcile_memories(
-                    prompt,
-                    max_tokens=4096,
-                    model=llm_model,
-                )
+                structured_llm_calls += 1
+                llm_started = perf_counter()
+                try:
+                    response = await structured_llm_client.reconcile_memories(
+                        prompt,
+                        max_tokens=4096,
+                        model=llm_model,
+                    )
+                finally:
+                    structured_llm_elapsed_seconds += perf_counter() - llm_started
                 batch_decisions = [decision.model_dump() for decision in response.decisions]
                 try:
                     _validate_complete_reconciliation_batch(
@@ -263,6 +306,7 @@ async def reconcile_memories(
 
         return _return_result(
             _merge_complete_batch_decisions(decisions, new_extractions, existing_memories),
+            metrics=metrics(),
             include_metadata=include_metadata,
         )
 
@@ -272,6 +316,7 @@ async def reconcile_memories(
         return _return_result(
             operations,
             failure=ReconciliationFailure(error_type="structured_llm_error", error=str(e)),
+            metrics=metrics(),
             include_metadata=include_metadata,
         )
     except Exception as e:
@@ -280,6 +325,7 @@ async def reconcile_memories(
         return _return_result(
             operations,
             failure=ReconciliationFailure(error_type="unexpected_error", error=str(e)),
+            metrics=metrics(),
             include_metadata=include_metadata,
         )
 
@@ -288,10 +334,15 @@ def _return_result(
     operations: list[ReconcileOperation],
     *,
     failure: ReconciliationFailure | None = None,
+    metrics: ReconciliationMetrics,
     include_metadata: bool,
 ) -> list[ReconcileOperation] | ReconciliationResult:
     if include_metadata:
-        return ReconciliationResult(operations=operations, failure=failure)
+        return ReconciliationResult(
+            operations=operations,
+            failure=failure,
+            metrics=metrics,
+        )
     return operations
 
 
