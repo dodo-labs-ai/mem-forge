@@ -19,6 +19,7 @@ import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
 import { EmptyState } from "@/components/admin/EmptyState";
 import { PageHeader } from "@/components/admin/PageHeader";
+import { SearchInput } from "@/components/admin/SearchInput";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -593,60 +594,50 @@ export function SourcesPage() {
       </div>
 
       <DataSurface>
-        <div className="border-b p-4">
-          <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-            <div>
-              <h2 className="text-base font-semibold">Source List</h2>
-              <p className="mt-1 text-sm text-muted-foreground">
-                {hasOrganizationFilter
-                  ? `${visibleSourceCount.toLocaleString()} of ${sources.length.toLocaleString()} sources`
-                  : `${sources.length.toLocaleString()} configured ingestion sources.`}
-              </p>
-            </div>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-              <label className="relative min-w-0 sm:w-64">
-                <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                <input
-                  type="search"
-                  value={sourceSearch}
-                  onChange={(event) => setSourceSearch(event.target.value)}
-                  placeholder="Search sources"
-                  aria-label="Search sources"
-                  className="h-7 w-full rounded-[min(var(--radius-md),12px)] border bg-background pl-8 pr-2.5 text-[0.8rem] outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                />
-              </label>
-              <Select<SourceListSortMode>
-                value={sourceListPreferencesQuery.data?.sort_mode ?? "newest"}
-                disabled={sourceListPreferencesQuery.isLoading || setSourceListSort.isPending}
-                onValueChange={(value) => value && setSourceListSort.mutate(value)}
-              >
-                <SelectTrigger aria-label="Sort sources" className="h-7 w-full text-[0.8rem] sm:w-44">
-                  <SelectValue>
-                    {sourceListPreferencesQuery.data?.sort_mode === "name"
-                      ? "Name"
-                      : sourceListPreferencesQuery.data?.sort_mode === "recently_synced"
-                        ? "Recently synced"
-                        : "Newest added"}
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="newest">Newest added</SelectItem>
-                  <SelectItem value="name">Name</SelectItem>
-                  <SelectItem value="recently_synced">Recently synced</SelectItem>
-                </SelectContent>
-              </Select>
-              <Button
-                type="button"
-                variant={pinnedOnly ? "secondary" : "outline"}
-                size="sm"
-                aria-pressed={pinnedOnly}
-                onClick={() => setPinnedOnly((current) => !current)}
-              >
-                <Pin className="size-4" />
-                Pinned {pinnedSourceCount}
-              </Button>
-            </div>
-          </div>
+        <div className="flex flex-col gap-2 border-b p-3 sm:flex-row sm:items-center">
+          <SearchInput
+            value={sourceSearch}
+            onChange={setSourceSearch}
+            placeholder="Search sources"
+            ariaLabel="Search sources"
+            size="sm"
+            className="min-w-0 flex-1"
+          />
+          <Select<SourceListSortMode>
+            value={sourceListPreferencesQuery.data?.sort_mode ?? "newest"}
+            disabled={sourceListPreferencesQuery.isLoading || setSourceListSort.isPending}
+            onValueChange={(value) => value && setSourceListSort.mutate(value)}
+          >
+            <SelectTrigger aria-label="Sort sources" className="h-7 w-full text-[0.8rem] sm:w-44">
+              <SelectValue>
+                {sourceListPreferencesQuery.data?.sort_mode === "name"
+                  ? "Name"
+                  : sourceListPreferencesQuery.data?.sort_mode === "recently_synced"
+                    ? "Recently synced"
+                    : "Newest added"}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="newest">Newest added</SelectItem>
+              <SelectItem value="name">Name</SelectItem>
+              <SelectItem value="recently_synced">Recently synced</SelectItem>
+            </SelectContent>
+          </Select>
+          <Button
+            type="button"
+            variant={pinnedOnly ? "secondary" : "outline"}
+            size="sm"
+            aria-pressed={pinnedOnly}
+            onClick={() => setPinnedOnly((current) => !current)}
+          >
+            <Pin className="size-4" />
+            Pinned {pinnedSourceCount}
+          </Button>
+          {hasOrganizationFilter && (
+            <span className="whitespace-nowrap text-xs text-muted-foreground">
+              {visibleSourceCount.toLocaleString()} of {sources.length.toLocaleString()} sources
+            </span>
+          )}
         </div>
         {authorityMessage && (
           <div

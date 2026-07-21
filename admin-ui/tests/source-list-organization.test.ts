@@ -7,8 +7,23 @@ const sourcesPageSource = readFileSync("src/views/sources/SourcesPage.tsx", "utf
 
 assert.match(
   sourcesPageSource,
-  /aria-label="Search sources"[\s\S]*?className="h-7\b/,
+  /<SearchInput[\s\S]*?ariaLabel="Search sources"[\s\S]*?size="sm"[\s\S]*?className="min-w-0 flex-1"/,
   "Source search should use the same compact height as the pinned filter button",
+);
+assert.doesNotMatch(
+  sourcesPageSource,
+  />Source List</,
+  "the Sources data surface should not repeat the page title in a tall list header",
+);
+assert.doesNotMatch(
+  sourcesPageSource,
+  /configured ingestion sources\./,
+  "the Sources toolbar should not repeat the configured count already shown in the stats",
+);
+assert.match(
+  sourcesPageSource,
+  /className="flex flex-col gap-2 border-b p-3 sm:flex-row sm:items-center"/,
+  "the Sources data surface should use one compact command row",
 );
 assert.match(
   sourcesPageSource,
