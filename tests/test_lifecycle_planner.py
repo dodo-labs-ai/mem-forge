@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from memforge.memory.lifecycle_plan import (
@@ -59,7 +61,7 @@ def _defaults() -> NewMemoryDefaults:
     )
 
 
-def _build(*, gate: LifecycleGateState, all_support=("eref-old",), flagged=False):
+def _build(*, gate: LifecycleGateState, all_support=("eref-old",), flagged=False, defaults=None):
     old = _memory()
     return build_lifecycle_plan(
         plan_id="plan-1",
@@ -80,7 +82,7 @@ def _build(*, gate: LifecycleGateState, all_support=("eref-old",), flagged=False
         support_set_hashes={old.id: "support-hash"},
         observation_revision_ids=("obsrev-2",),
         new_evidence_reference_ids=("eref-new",),
-        defaults=_defaults(),
+        defaults=defaults or _defaults(),
     )
 
 
@@ -194,6 +196,21 @@ def test_enabled_local_replacement_is_create_attach_remove_supersede() -> None:
     assert decision.replacement_memory_id is not None
     assert set(plan.stale_guard.memory_versions) == {"mem-old"}
     assert plan.stale_guard.memory_versions["mem-old"].startswith("memory-version-")
+
+
+def test_private_lifecycle_plan_persists_owner_as_relation_discovery_actor() -> None:
+    plan = _build(
+        gate=LifecycleGateState.ENABLED,
+        defaults=replace(
+            _defaults(),
+            visibility="private",
+            owner_user_id="owner-1",
+            actor_user_id=None,
+        ),
+    )
+
+    [request] = plan.relation_discovery_requests
+    assert request.actor_user_id == "owner-1"
 
 
 def test_support_outside_current_scope_routes_replacement_to_review() -> None:

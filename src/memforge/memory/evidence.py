@@ -42,6 +42,7 @@ class AuthorityCase(str, Enum):
     SAME_PRIVATE_REPO_SCOPE = "same_private_repo_scope"
     INDEPENDENT_SUPPORT = "independent_support"
     INDEPENDENT_REFINEMENT = "independent_refinement"
+    INDEPENDENT_CONFLICT = "independent_conflict"
     CROSS_SOURCE_CONFLICT = "cross_source_conflict"
     CROSS_SCOPE_BLOCKED = "cross_scope_blocked"
 
@@ -756,6 +757,11 @@ def classify_authority_case(
     if unit.source_lineage_id and unit.source_lineage_id == candidate.source_lineage_id:
         return AuthorityCase.SAME_SOURCE_LINEAGE
 
+    if relation_type is RelationType.CONTRADICTS:
+        if unit.source_id and candidate.source_id and unit.source_id != candidate.source_id:
+            return AuthorityCase.CROSS_SOURCE_CONFLICT
+        return AuthorityCase.INDEPENDENT_CONFLICT
+
     if (
         unit.visibility == "private"
         and candidate.visibility == "private"
@@ -765,8 +771,6 @@ def classify_authority_case(
     ):
         return AuthorityCase.SAME_PRIVATE_REPO_SCOPE
 
-    if relation_type is RelationType.CONTRADICTS:
-        return AuthorityCase.CROSS_SOURCE_CONFLICT
     if relation_type is RelationType.REFINES:
         return AuthorityCase.INDEPENDENT_REFINEMENT
     if relation_type in (RelationType.SUPPORTS, RelationType.EQUIVALENT):

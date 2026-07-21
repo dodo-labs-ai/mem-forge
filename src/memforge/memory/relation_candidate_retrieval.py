@@ -14,6 +14,7 @@ from memforge.memory.evidence import (
     CandidateBucketResult,
     CandidateMemory,
 )
+from memforge.memory.relation_discovery_contract import resolve_relation_discovery_actor_user_id
 from memforge.models import Memory, MemoryStatus, Visibility
 from memforge.retrieval.rank_fusion import (
     FusedRankedItem,
@@ -136,6 +137,7 @@ class CrossDocumentCandidateSelection:
                 )
             )
         return tuple(results)
+
 
 class CrossDocumentCandidateRetriever:
     """Retrieve IDs in parallel, then resolve only lightweight provenance rows."""
@@ -382,7 +384,12 @@ def _bounded_any_term_fts_query(content: str, *, max_terms: int) -> str:
 def _candidate_scope(challenger: Memory, *, actor_user_id: str | None) -> AccessScope:
     private = challenger.visibility == Visibility.PRIVATE.value
     return AccessScope(
-        user_id=(challenger.owner_user_id if private else actor_user_id) or LOCAL_DEV_USER_ID,
+        user_id=resolve_relation_discovery_actor_user_id(
+            visibility=challenger.visibility,
+            owner_user_id=challenger.owner_user_id,
+            requested_actor_user_id=actor_user_id,
+        )
+        or LOCAL_DEV_USER_ID,
         include_private=private,
         allowed_statuses=(MemoryStatus.ACTIVE.value,),
         active_project=challenger.project_key,

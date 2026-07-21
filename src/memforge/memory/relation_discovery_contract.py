@@ -25,6 +25,21 @@ class RelationDiscoveryWorkStatus(str, Enum):
     OBSOLETE = "obsolete"
 
 
+def resolve_relation_discovery_actor_user_id(
+    *,
+    visibility: str,
+    owner_user_id: str | None,
+    requested_actor_user_id: str | None,
+) -> str | None:
+    """Resolve the principal that owns one durable relation-discovery decision."""
+
+    if visibility == "private":
+        if not owner_user_id:
+            raise ValueError("private relation discovery requires owner identity")
+        return owner_user_id
+    return requested_actor_user_id
+
+
 @dataclass(frozen=True, slots=True)
 class RelationDiscoveryRequest:
     """One bounded post-commit discovery request for an activated Memory."""

@@ -236,6 +236,63 @@ def test_same_private_repo_scope_is_visible_but_not_destructive_authority() -> N
     assert not is_destructive_authority(authority)
 
 
+def test_private_repo_contradiction_remains_a_cross_source_review_case() -> None:
+    candidate = _candidate(
+        visibility="private",
+        owner_user_id="andrew.sun01@sap.com",
+        repo_identifier="github.com/example/repo",
+        source_id="src-2",
+        doc_id="doc-2",
+        source_lineage_id="lineage-2",
+    )
+
+    authority = classify_authority_case(
+        _unit(
+            visibility="private",
+            owner_user_id="andrew.sun01@sap.com",
+            repo_identifier="github.com/example/repo",
+        ),
+        candidate,
+        CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS,
+        RelationType.CONTRADICTS,
+        _access(repo_identifier="github.com/example/repo"),
+    )
+
+    assert authority is AuthorityCase.CROSS_SOURCE_CONFLICT
+    assert not is_destructive_authority(authority)
+
+
+def test_same_source_cross_document_contradiction_is_independent_conflict() -> None:
+    candidate = _candidate(
+        source_id="src-1",
+        doc_id="doc-2",
+        source_lineage_id="lineage-2",
+    )
+
+    authority = classify_authority_case(
+        _unit(source_id="src-1", doc_id="doc-1", source_lineage_id="lineage-1"),
+        candidate,
+        CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS,
+        RelationType.CONTRADICTS,
+        _access(),
+    )
+
+    assert authority is AuthorityCase.INDEPENDENT_CONFLICT
+    assert not is_destructive_authority(authority)
+
+
+def test_contradiction_without_candidate_source_is_independent_conflict() -> None:
+    authority = classify_authority_case(
+        _unit(source_id="src-1", doc_id="doc-1", source_lineage_id="lineage-1"),
+        _candidate(source_id=None, doc_id="doc-2", source_lineage_id="lineage-2"),
+        CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS,
+        RelationType.CONTRADICTS,
+        _access(),
+    )
+
+    assert authority is AuthorityCase.INDEPENDENT_CONFLICT
+
+
 @pytest.mark.parametrize(
     "bucket",
     [
