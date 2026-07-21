@@ -758,6 +758,48 @@ def _retirement_plan(reference: EvidenceReference, support_hash: str) -> Lifecyc
     )
 
 
+def _gated_retirement_plan(
+    reference: EvidenceReference,
+    incumbent: Memory,
+    support_hash: str,
+    *,
+    plan_id: str,
+) -> LifecyclePlan:
+    return build_lifecycle_plan(
+        plan_id=plan_id,
+        scope=ReconciliationScope(
+            id=f"scope-{plan_id}",
+            source_id="src-1",
+            source_unit_id="unit-page-1",
+            base_unit_revision_id="unitrev-page-1-v1",
+            target_unit_revision_id="unitrev-page-1-v2",
+        ),
+        gate_state=LifecycleGateState.GATED,
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.DELETE,
+                memory_id=incumbent.id,
+                reason="source no longer supports claim",
+            ),
+        ),
+        incumbents={incumbent.id: incumbent},
+        source_support_reference_ids={incumbent.id: (reference.id or "",)},
+        all_active_support_reference_ids={incumbent.id: (reference.id or "",)},
+        support_set_hashes={incumbent.id: support_hash},
+        observation_revision_ids=("obsrev-page-1-v2",),
+        new_evidence_reference_ids=(),
+        defaults=NewMemoryDefaults(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key=None,
+            repo_identifier=None,
+            doc_id="legacy-doc",
+            source_type="confluence",
+            access_context_hash="workspace",
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_lifecycle_plan_applies_support_removal_and_retirement_atomically(db: Database) -> None:
     reference = await _persist_support_lineage(db)
@@ -789,7 +831,7 @@ async def test_lifecycle_plan_applies_support_removal_and_retirement_atomically(
 
 
 @pytest.mark.asyncio
-async def test_terminal_lifecycle_mutation_stales_pending_memory_reviews(
+async def test_terminal_lifecycle_mutation_stales_all_pending_reviews(
     db: Database,
 ) -> None:
     challenger = Memory(
@@ -809,10 +851,25 @@ async def test_terminal_lifecycle_mutation_stales_pending_memory_reviews(
         )
     )
     reference = await _persist_support_lineage(db)
-    await db.enable_lifecycle_gate("src-1")
-    plan = _retirement_plan(
+    incumbent = await db.get_memory("mem-legacy")
+    assert incumbent is not None
+    support_hash = await db.get_memory_support_set_hash(incumbent.id)
+    review_plan = _gated_retirement_plan(
         reference,
-        await db.get_memory_support_set_hash("mem-legacy"),
+        incumbent,
+        support_hash,
+        plan_id="plan-terminal-review",
+    )
+    await db.apply_lifecycle_plan(review_plan)
+    lifecycle_reviews = await db.list_lifecycle_reviews(
+        "src-1",
+        status=LifecycleReviewStatus.PENDING,
+    )
+    assert len(lifecycle_reviews) == 1
+    await db.enable_lifecycle_gate("src-1")
+    plan = replace(
+        _retirement_plan(reference, support_hash),
+        id="plan-terminal-retire",
     )
 
     await db.apply_lifecycle_plan(plan)
@@ -821,6 +878,10 @@ async def test_terminal_lifecycle_mutation_stales_pending_memory_reviews(
     assert review is not None
     assert review.status == ReviewStatus.STALE.value
     assert review.resolved_at is not None
+    lifecycle_review = await db.get_lifecycle_review(lifecycle_reviews[0].id)
+    assert lifecycle_review is not None
+    assert lifecycle_review.status is LifecycleReviewStatus.STALE
+    assert lifecycle_review.resolved_at is not None
 
 
 @pytest.mark.asyncio
@@ -831,38 +892,11 @@ async def test_gated_review_approval_applies_proposal_and_resolves_review_atomic
     incumbent = await db.get_memory("mem-legacy")
     assert incumbent is not None
     support_hash = await db.get_memory_support_set_hash(incumbent.id)
-    original = build_lifecycle_plan(
+    original = _gated_retirement_plan(
+        reference,
+        incumbent,
+        support_hash,
         plan_id="plan-gated-delete",
-        scope=ReconciliationScope(
-            id="scope-gated-delete",
-            source_id="src-1",
-            source_unit_id="unit-page-1",
-            base_unit_revision_id="unitrev-page-1-v1",
-            target_unit_revision_id="unitrev-page-1-v2",
-        ),
-        gate_state=LifecycleGateState.GATED,
-        operations=(
-            ReconcileOperation(
-                action=ReconcileAction.DELETE,
-                memory_id=incumbent.id,
-                reason="source no longer supports claim",
-            ),
-        ),
-        incumbents={incumbent.id: incumbent},
-        source_support_reference_ids={incumbent.id: (reference.id or "",)},
-        all_active_support_reference_ids={incumbent.id: (reference.id or "",)},
-        support_set_hashes={incumbent.id: support_hash},
-        observation_revision_ids=("obsrev-page-1-v2",),
-        new_evidence_reference_ids=(),
-        defaults=NewMemoryDefaults(
-            visibility="workspace",
-            owner_user_id=None,
-            project_key=None,
-            repo_identifier=None,
-            doc_id="legacy-doc",
-            source_type="confluence",
-            access_context_hash="workspace",
-        ),
     )
 
     await db.apply_lifecycle_plan(original)
