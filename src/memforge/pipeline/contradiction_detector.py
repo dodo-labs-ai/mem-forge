@@ -1,9 +1,9 @@
 """Cross-document relation classification.
 
 After Memories are inserted from a document sync, classifies their relationship
-to access-compatible Memories from other documents that reference the same
-entities. Entity overlap supplies candidates; structured classification may
-produce a conflict, refinement, clarification, or unrelated result.
+to access-compatible Memories from other documents. Bounded entity, semantic,
+and lexical channels supply candidates; structured classification may produce
+a conflict, refinement, clarification, or unrelated result.
 """
 
 from __future__ import annotations
@@ -23,13 +23,17 @@ from memforge.memory.evidence import (
     EvidenceRole,
     EvidenceUnit,
     LifecycleAction,
-    RelationCandidateRecord,
-    RelationDecision,
     RelationOutcomeBundle,
     RelationRunRecord,
     RelationType,
     ReviewCase,
+    build_candidate_universe,
     relation_run_id_for,
+)
+from memforge.memory.relation_candidate_retrieval import (
+    CrossDocumentCandidateRetriever,
+    CrossDocumentCandidateSelection,
+    StaleCandidateSelectionError,
 )
 from memforge.models import (
     Memory,
@@ -47,7 +51,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["detect_cross_doc_contradictions"]
 
-MAX_CONTRADICTION_PAIRS_PER_RUN = 200
 CONTRADICTION_LLM_BATCH_SIZE = 20
 MAX_CONTRADICTION_PROMPT_CHARS = 120_000
 MAX_CONTRADICTION_MEMORY_CONTENT_CHARS = 4_000
@@ -146,6 +149,7 @@ async def detect_cross_doc_contradictions(
     doc_id: str,
     db: Database,
     memory_store: MemoryStore,
+    candidate_retriever: CrossDocumentCandidateRetriever,
     structured_llm_client=None,
     llm_model: str = "claude-sonnet-4-20250514",
     audit_context=None,
@@ -163,65 +167,72 @@ async def detect_cross_doc_contradictions(
     if not new_memory_ids or not structured_llm_client:
         return stats
 
-    # Collect candidate pairs: new memory + cross-doc memory sharing entities.
-    # This is a memory boundary as well as a behavior boundary: large workspaces
-    # can produce many candidates for a single synced document.
+    # Retrieve lightweight IDs/provenance first. Full Memory rows are loaded in
+    # one bounded read only after hybrid fusion and exact access/source checks.
     pairs: list[tuple[Memory, Memory]] = []
-    candidate_bucket_complete_by_challenger: dict[str, bool] = {}
-
+    candidate_selection_by_challenger: dict[str, CrossDocumentCandidateSelection] = {}
+    challenger_by_id: dict[str, Memory] = {}
+    retrieval_selections: list[CrossDocumentCandidateSelection] = []
+    evidence_unit_by_challenger: dict[str, EvidenceUnit] = {}
+    had_preflight_failure = False
+    llm_call_count = 0
     for mem_id in new_memory_ids:
-        if len(pairs) >= MAX_CONTRADICTION_PAIRS_PER_RUN:
-            memory = await db.get_memory(mem_id)
-            if memory and memory.status == "active":
-                await _record_truncated_cross_doc_candidate_page(
-                    challenger=memory,
-                    candidates=(),
-                    doc_id=doc_id,
-                    db=db,
-                )
-                stats["truncated"] += 1
-            continue
-
-        cap_reached_for_memory = False
         memory = await db.get_memory(mem_id)
         if not memory or memory.status != "active":
             continue
 
         entity_ids = await db.get_memory_entity_ids(mem_id)
-        if not entity_ids:
-            continue
 
-        excluded_source_ids: list[str] = []
-        scope_user_id = memory.owner_user_id if memory.visibility == "private" else None
-        if scope_user_id:
-            excluded_source_ids = await db.list_disabled_source_ids_for_user(scope_user_id)
-        candidate_page = await db.get_cross_doc_candidates(
-            mem_id,
-            entity_ids,
-            doc_id,
+        excluded_source_ids = await _disabled_source_ids_for_candidate_scope(
+            db=db,
+            challenger=memory,
+            actor_user_id=actor_user_id,
+        )
+        selection = await candidate_retriever.retrieve(
+            challenger=memory,
+            entity_ids=entity_ids,
+            doc_id=doc_id,
+            actor_user_id=actor_user_id,
             excluded_source_ids=excluded_source_ids,
         )
-        candidate_bucket_complete_by_challenger[mem_id] = candidate_page.complete
-        if not candidate_page.complete:
-            await _record_truncated_cross_doc_candidate_page(
-                challenger=memory,
-                candidates=tuple(candidate_page.candidates),
+        selection, loaded_by_id = await candidate_retriever.load_selected_memories(
+            selection,
+            challenger=memory,
+            doc_id=doc_id,
+            excluded_source_ids=excluded_source_ids,
+        )
+        retrieval_selections.append(selection)
+        if not selection.candidate_ids:
+            continue
+        try:
+            unit = await _cross_doc_evidence_unit(db=db, challenger=memory, doc_id=doc_id)
+        except ValueError as error:
+            had_preflight_failure = True
+            await _record_detection_failed(
+                memory_store=memory_store,
+                audit_context=audit_context,
                 doc_id=doc_id,
-                db=db,
+                llm_model=llm_model,
+                new_memory_count=len(new_memory_ids),
+                candidate_pairs=len(selection.candidate_ids),
+                checked=0,
+                llm_calls=0,
+                retrieval_telemetry=_summarize_retrieval(retrieval_selections),
+                error=str(error),
+                reason="evidence_preflight_failure",
             )
-            stats["truncated"] += 1
             continue
-        for candidate in candidate_page.candidates:
-            if len(pairs) >= MAX_CONTRADICTION_PAIRS_PER_RUN:
-                cap_reached_for_memory = True
-                candidate_bucket_complete_by_challenger[mem_id] = False
-                break
-            pairs.append((memory, candidate))
-        if cap_reached_for_memory:
-            stats["truncated"] += 1
-            continue
+        candidate_selection_by_challenger[mem_id] = selection
+        challenger_by_id[mem_id] = memory
+        evidence_unit_by_challenger[mem_id] = unit
+        pairs.extend(
+            (memory, loaded_by_id[candidate_id])
+            for candidate_id in selection.candidate_ids
+        )
 
     if not pairs:
+        if had_preflight_failure:
+            return stats
         await _record_detection_completed(
             memory_store=memory_store,
             audit_context=audit_context,
@@ -231,6 +242,8 @@ async def detect_cross_doc_contradictions(
             candidate_pairs=0,
             stats=stats,
             classifications={},
+            llm_calls=0,
+            retrieval_telemetry=_summarize_retrieval(retrieval_selections),
             reason="no_cross_doc_candidates",
         )
         return stats
@@ -242,6 +255,7 @@ async def detect_cross_doc_contradictions(
         for batch_start, batch in _iter_prompt_sized_pair_batches(pairs):
             pairs_json = _pairs_json(batch, pair_index_offset=batch_start)
             prompt = CONTRADICTION_PROMPT.format(pairs_json=pairs_json)
+            llm_call_count += 1
             response = await structured_llm_client.detect_contradictions(
                 prompt,
                 max_tokens=DEFAULT_ENRICHMENT_MAX_TOKENS,
@@ -305,12 +319,27 @@ async def detect_cross_doc_contradictions(
                     reason,
                 )
 
+        for challenger_id, selection in candidate_selection_by_challenger.items():
+            challenger = challenger_by_id[challenger_id]
+            excluded_source_ids = await _disabled_source_ids_for_candidate_scope(
+                db=db,
+                challenger=challenger,
+                actor_user_id=actor_user_id,
+            )
+            await candidate_retriever.ensure_selection_current(
+                selection,
+                challenger=challenger,
+                doc_id=doc_id,
+                excluded_source_ids=excluded_source_ids,
+            )
+
         relation_outcomes = await _build_cross_doc_relation_outcome_bundles(
             pairs=pairs,
             decisions_by_pair=decisions_by_pair,
             doc_id=doc_id,
             db=db,
-            candidate_bucket_complete_by_challenger=candidate_bucket_complete_by_challenger,
+            candidate_selection_by_challenger=candidate_selection_by_challenger,
+            evidence_unit_by_challenger=evidence_unit_by_challenger,
         )
         for challenger_id, bundle in relation_outcomes.items():
             review_targets = review_targets_by_challenger.get(challenger_id, ())
@@ -352,8 +381,25 @@ async def detect_cross_doc_contradictions(
             candidate_pairs=len(pairs),
             stats=stats,
             classifications=classifications,
+            llm_calls=llm_call_count,
+            retrieval_telemetry=_summarize_retrieval(retrieval_selections),
         )
 
+    except StaleCandidateSelectionError as e:
+        logger.info("Cross-document candidate selection changed before write: %s", e)
+        await _record_detection_failed(
+            memory_store=memory_store,
+            audit_context=audit_context,
+            doc_id=doc_id,
+            llm_model=llm_model,
+            new_memory_count=len(new_memory_ids),
+            candidate_pairs=len(pairs),
+            checked=stats["checked"],
+            llm_calls=llm_call_count,
+            retrieval_telemetry=_summarize_retrieval(retrieval_selections),
+            error=str(e),
+            reason="candidate_selection_stale",
+        )
     except (StructuredLlmError, KeyError) as e:
         logger.warning("Structured contradiction detection failed: %s", e)
         await _record_detection_failed(
@@ -364,6 +410,8 @@ async def detect_cross_doc_contradictions(
             new_memory_count=len(new_memory_ids),
             candidate_pairs=len(pairs),
             checked=stats["checked"],
+            llm_calls=llm_call_count,
+            retrieval_telemetry=_summarize_retrieval(retrieval_selections),
             error=str(e),
             reason="structured_output_failure",
         )
@@ -377,6 +425,8 @@ async def detect_cross_doc_contradictions(
             new_memory_count=len(new_memory_ids),
             candidate_pairs=len(pairs),
             checked=stats["checked"],
+            llm_calls=llm_call_count,
+            retrieval_telemetry=_summarize_retrieval(retrieval_selections),
             error=str(e),
             reason="runtime_failure",
         )
@@ -392,6 +442,78 @@ async def detect_cross_doc_contradictions(
     return stats
 
 
+async def _disabled_source_ids_for_candidate_scope(
+    *,
+    db: Database,
+    challenger: Memory,
+    actor_user_id: str | None,
+) -> list[str]:
+    scope_user_id = (
+        challenger.owner_user_id
+        if challenger.visibility == "private"
+        else actor_user_id
+    )
+    if not scope_user_id:
+        return []
+    return await db.list_disabled_source_ids_for_user(scope_user_id)
+
+
+def _summarize_retrieval(
+    selections: list[CrossDocumentCandidateSelection],
+) -> dict[str, object]:
+    latencies = [
+        float(selection.telemetry.get("retrieval_latency_ms", 0.0))
+        for selection in selections
+    ]
+    channel_candidate_counts: Counter[str] = Counter()
+    for selection in selections:
+        channel_candidate_counts.update(
+            {
+                str(channel): int(count)
+                for channel, count in dict(
+                    selection.telemetry.get("channel_candidate_counts", {})
+                ).items()
+            }
+        )
+    return {
+        "challenger_count": len(selections),
+        "rank_window_size": max(
+            (
+                int(selection.audit.get("rank_window_size", 0))
+                for selection in selections
+            ),
+            default=0,
+        ),
+        "channel_candidate_counts": dict(sorted(channel_candidate_counts.items())),
+        "eligible_candidate_count": sum(
+            int(selection.telemetry.get("eligible_candidate_count", 0))
+            for selection in selections
+        ),
+        "fused_candidate_count": sum(
+            int(selection.telemetry.get("fused_candidate_count", 0))
+            for selection in selections
+        ),
+        "selected_candidate_count": sum(len(selection.discovery) for selection in selections),
+        "retrieval_latency_ms_total": round(sum(latencies), 3),
+        "retrieval_latency_ms_max": round(max(latencies, default=0.0), 3),
+        "provenance_rows_loaded": sum(
+            int(selection.telemetry.get("provenance_rows_loaded", 0))
+            for selection in selections
+        ),
+        "full_memory_rows_loaded": sum(
+            int(selection.telemetry.get("full_memory_rows_loaded", 0))
+            for selection in selections
+        ),
+        "channel_errors": sorted(
+            {
+                str(channel)
+                for selection in selections
+                for channel in selection.telemetry.get("channel_errors", ())
+            }
+        ),
+    }
+
+
 async def _record_detection_completed(
     *,
     memory_store: MemoryStore,
@@ -402,6 +524,8 @@ async def _record_detection_completed(
     candidate_pairs: int,
     stats: dict,
     classifications: dict[str, int],
+    llm_calls: int,
+    retrieval_telemetry: dict[str, object],
     reason: str | None = None,
 ) -> None:
     if not hasattr(memory_store, "record_audit_event"):
@@ -424,6 +548,8 @@ async def _record_detection_completed(
             "temporal": stats["temporal"],
             "truncated": stats.get("truncated", 0),
             "classifications": classifications,
+            "llm_calls": llm_calls,
+            "retrieval": retrieval_telemetry,
         },
     )
 
@@ -437,6 +563,8 @@ async def _record_detection_failed(
     new_memory_count: int,
     candidate_pairs: int,
     checked: int,
+    llm_calls: int,
+    retrieval_telemetry: dict[str, object],
     error: str,
     reason: str,
 ) -> None:
@@ -457,6 +585,8 @@ async def _record_detection_failed(
             "new_memory_count": new_memory_count,
             "candidate_pairs": candidate_pairs,
             "checked": checked,
+            "llm_calls": llm_calls,
+            "retrieval": retrieval_telemetry,
             "truncated": 0,
         },
     )
@@ -468,7 +598,8 @@ async def _build_cross_doc_relation_outcome_bundles(
     decisions_by_pair: dict[int, dict],
     doc_id: str,
     db: Database,
-    candidate_bucket_complete_by_challenger: dict[str, bool],
+    candidate_selection_by_challenger: dict[str, CrossDocumentCandidateSelection],
+    evidence_unit_by_challenger: dict[str, EvidenceUnit] | None = None,
 ) -> dict[str, RelationOutcomeBundle]:
     bundles: dict[str, RelationOutcomeBundle] = {}
     pairs_by_challenger: dict[str, list[tuple[int, Memory, Memory]]] = defaultdict(list)
@@ -476,13 +607,13 @@ async def _build_cross_doc_relation_outcome_bundles(
         pairs_by_challenger[challenger.id].append((index, challenger, incumbent))
 
     for challenger_id, challenger_pairs in pairs_by_challenger.items():
-        decisions: list[RelationDecision] = []
         relation_records: list[EvidenceRelationRecord] = []
-        candidate_records: list[RelationCandidateRecord] = []
 
         _, challenger, _ = challenger_pairs[0]
-        bucket_complete = candidate_bucket_complete_by_challenger.get(challenger.id, True)
-        unit = await _cross_doc_evidence_unit(db=db, challenger=challenger, doc_id=doc_id)
+        selection = candidate_selection_by_challenger[challenger.id]
+        unit = (evidence_unit_by_challenger or {}).get(challenger.id)
+        if unit is None:
+            unit = await _cross_doc_evidence_unit(db=db, challenger=challenger, doc_id=doc_id)
         classified_pairs = [
             (
                 pair_index,
@@ -500,10 +631,7 @@ async def _build_cross_doc_relation_outcome_bundles(
             classification in {"temporal", "clarification"}
             for _, _, classification, _ in classified_pairs
         )
-        if not bucket_complete:
-            lifecycle_action = LifecycleAction.CREATE_REVIEW
-            review_case = ReviewCase.MANDATORY_INCOMPLETE
-        elif has_contradiction:
+        if has_contradiction:
             lifecycle_action = LifecycleAction.CREATE_REVIEW
             review_case = ReviewCase.CROSS_SOURCE_CONFLICT
         else:
@@ -511,10 +639,10 @@ async def _build_cross_doc_relation_outcome_bundles(
             review_case = None
         identity_relation_type = None
         identity_authority_case = None
-        if bucket_complete and has_contradiction:
+        if has_contradiction:
             identity_relation_type = RelationType.CONTRADICTS
             identity_authority_case = AuthorityCase.CROSS_SOURCE_CONFLICT
-        elif bucket_complete and has_refinement:
+        elif has_refinement:
             identity_relation_type = RelationType.REFINES
             identity_authority_case = AuthorityCase.INDEPENDENT_REFINEMENT
         relation_run_id = _cross_doc_relation_run_id(
@@ -522,46 +650,30 @@ async def _build_cross_doc_relation_outcome_bundles(
             action=lifecycle_action,
             relation_type=identity_relation_type,
             authority_case=identity_authority_case,
+            candidate_snapshot_identity=selection.snapshot_identity,
         )
+        universe = build_candidate_universe(
+            relation_run_id=relation_run_id,
+            evidence_unit_id=unit.id,
+            bucket_results=selection.bucket_results(),
+            recall_candidate_cap=max(1, len(selection.discovery)),
+        )
+        candidate_records = list(universe.candidates)
+        candidate_record_by_id = {
+            candidate.memory_id: candidate for candidate in candidate_records
+        }
 
-        for candidate_rank, (_, incumbent, classification, reason) in enumerate(
-            classified_pairs
-        ):
-            candidate_records.append(
-                RelationCandidateRecord(
-                    relation_run_id=relation_run_id,
-                    evidence_unit_id=unit.id,
-                    memory_id=incumbent.id,
-                    bucket=CandidateBucket.SHARED_ENTITIES,
-                    bucket_rank=0,
-                    candidate_rank=candidate_rank,
-                    score=None,
-                    is_mandatory=False,
-                    bucket_complete=bucket_complete,
-                    was_checked=True,
-                    reason="cross_doc_entity_overlap",
-                )
-            )
+        for _, incumbent, classification, reason in classified_pairs:
             if classification not in {"contradiction", "temporal", "clarification"}:
                 continue
+            if incumbent.id not in candidate_record_by_id:
+                raise ValueError("classified candidate is absent from the candidate universe")
             relation_type = RelationType.CONTRADICTS if classification == "contradiction" else RelationType.REFINES
             authority_case = (
                 AuthorityCase.CROSS_SOURCE_CONFLICT
                 if classification == "contradiction"
                 else AuthorityCase.INDEPENDENT_REFINEMENT
             )
-            decision = RelationDecision(
-                candidate_memory_id=incumbent.id,
-                relation_type=relation_type,
-                authority_case=authority_case,
-                confidence=1.0,
-                reason=reason,
-                evidence_excerpt=None,
-                matched_bucket=CandidateBucket.SHARED_ENTITIES,
-                matched_bucket_complete=bucket_complete,
-                classifier_batch_key=relation_run_id,
-            )
-            decisions.append(decision)
             relation_records.append(
                 EvidenceRelationRecord(
                     evidence_unit_id=unit.id,
@@ -573,7 +685,7 @@ async def _build_cross_doc_relation_outcome_bundles(
                     confidence=1.0,
                     reason=reason,
                     excerpt=None,
-                    classifier_version="cross-doc-contradiction-v1",
+                    classifier_version="cross-doc-contradiction-v2",
                     relation_run_id=relation_run_id,
                     created_at=datetime.now(timezone.utc).isoformat(),
                 )
@@ -584,26 +696,22 @@ async def _build_cross_doc_relation_outcome_bundles(
             evidence_unit_id=unit.id,
             access_context_hash=unit.access_context_hash,
             candidate_count=len(candidate_records),
-            mandatory_candidate_count=sum(1 for candidate in candidate_records if candidate.is_mandatory),
-            checked_candidate_count=sum(1 for candidate in candidate_records if candidate.was_checked),
-            incomplete_mandatory_buckets=(),
-            classifier_version="cross-doc-contradiction-v1",
+            mandatory_candidate_count=universe.mandatory_candidate_count,
+            checked_candidate_count=universe.checked_candidate_count,
+            incomplete_mandatory_buckets=universe.incomplete_mandatory_buckets,
+            classifier_version="cross-doc-contradiction-v2",
             lifecycle_action=lifecycle_action,
             review_case=review_case,
             status=(
-                "checked"
-                if lifecycle_action is LifecycleAction.NONE
-                else "review_required"
-                if review_case is ReviewCase.MANDATORY_INCOMPLETE
-                else "review"
+                "review"
                 if lifecycle_action is LifecycleAction.CREATE_REVIEW
-                else "applied"
+                else "checked"
             ),
             audit={
                 "source": "detect_cross_doc_contradictions",
                 "challenger_memory_id": challenger_id,
                 "candidate_pair_count": len(candidate_records),
-                "candidate_bucket_complete": bucket_complete,
+                **selection.audit,
             },
         )
         bundles[challenger_id] = RelationOutcomeBundle(
@@ -613,63 +721,6 @@ async def _build_cross_doc_relation_outcome_bundles(
             relations=tuple(relation_records),
         )
     return bundles
-
-
-async def _record_truncated_cross_doc_candidate_page(
-    *,
-    challenger: Memory,
-    candidates: tuple[Memory, ...],
-    doc_id: str,
-    db: Database,
-) -> None:
-    unit = await _cross_doc_evidence_unit(db=db, challenger=challenger, doc_id=doc_id)
-    relation_run_id = _cross_doc_relation_run_id(
-        unit,
-        relation_type=None,
-        authority_case=None,
-    )
-    candidate_records = tuple(
-        RelationCandidateRecord(
-            relation_run_id=relation_run_id,
-            evidence_unit_id=unit.id,
-            memory_id=candidate.id,
-            bucket=CandidateBucket.SHARED_ENTITIES,
-            bucket_rank=0,
-            candidate_rank=index,
-            score=None,
-            is_mandatory=False,
-            bucket_complete=False,
-            was_checked=False,
-            reason="cross_doc_candidate_page_incomplete",
-        )
-        for index, candidate in enumerate(candidates)
-    )
-    await db.record_relation_outcome_bundle(
-        RelationOutcomeBundle(
-            evidence_unit=unit,
-            relation_run=RelationRunRecord(
-                id=relation_run_id,
-                evidence_unit_id=unit.id,
-                access_context_hash=unit.access_context_hash,
-                candidate_count=len(candidate_records),
-                mandatory_candidate_count=0,
-                checked_candidate_count=0,
-                incomplete_mandatory_buckets=(CandidateBucket.SHARED_ENTITIES.value,),
-                classifier_version="cross-doc-contradiction-v1",
-                lifecycle_action=LifecycleAction.CREATE_REVIEW,
-                review_case=ReviewCase.MANDATORY_INCOMPLETE,
-                status="review_required",
-                audit={
-                    "source": "detect_cross_doc_contradictions",
-                    "challenger_memory_id": challenger.id,
-                    "candidate_bucket_complete": False,
-                    "reason": "candidate_page_incomplete",
-                },
-            ),
-            candidates=candidate_records,
-            relations=(),
-        )
-    )
 
 
 async def _cross_doc_evidence_unit(*, db: Database, challenger: Memory, doc_id: str) -> EvidenceUnit:
@@ -719,15 +770,21 @@ def _cross_doc_relation_run_id(
     action: LifecycleAction = LifecycleAction.CREATE_REVIEW,
     relation_type: RelationType | None = RelationType.CONTRADICTS,
     authority_case: AuthorityCase | None = AuthorityCase.CROSS_SOURCE_CONFLICT,
+    candidate_snapshot_identity: str | None = None,
 ) -> str:
     return relation_run_id_for(
         prefix="contradiction",
         unit=unit,
         action=action,
-        classifier_version="cross-doc-contradiction-v1",
+        classifier_version="cross-doc-contradiction-v2",
+        candidate_memory_id=(
+            f"candidate-snapshot:{candidate_snapshot_identity}"
+            if candidate_snapshot_identity
+            else None
+        ),
         relation_type=relation_type,
         authority_case=authority_case,
-        bucket=CandidateBucket.SHARED_ENTITIES,
+        bucket=CandidateBucket.HYBRID_DISCOVERY,
     )
 
 

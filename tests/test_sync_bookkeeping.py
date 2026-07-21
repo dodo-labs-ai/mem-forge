@@ -9,6 +9,7 @@ import pytest
 
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
+from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.lifecycle_plan import (
     LifecycleBackfillJob,
     LifecycleBackfillJobStatus,
@@ -8246,8 +8247,11 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         enricher=InstantEnricher(),
         memory_extractor=extractor,
         memory_engine=MemoryEngine(
-            relational=adapters.relational,
-            vector=adapters.vector,
+            cross_document_candidates=CrossDocumentCandidateRetriever(
+                relational=adapters.relational,
+                keyword=adapters.keyword,
+                vector=adapters.vector,
+            ),
             db=db,
             memory_store=memory_store,
         ),

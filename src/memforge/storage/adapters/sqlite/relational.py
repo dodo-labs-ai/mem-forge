@@ -19,6 +19,7 @@ import aiosqlite
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.evidence import (
     ActiveSupportEvidence,
+    CandidateMemory,
     EvidenceReference,
     EvidenceUnit,
     MemorySupportAssertion,
@@ -354,6 +355,58 @@ class SqliteRelationalStore:
 
     async def get_memory(self, memory_id: str) -> Memory | None:
         return await self._db.get_memory(memory_id)
+
+    async def list_active_memories(
+        self,
+        memory_ids: Sequence[str],
+    ) -> list[Memory]:
+        return await self._db.list_active_memories(memory_ids)
+
+    async def list_active_candidate_memories(
+        self,
+        memory_ids: Sequence[str],
+    ) -> list[CandidateMemory]:
+        return await self._db.list_active_candidate_memories(memory_ids)
+
+    async def get_candidate_memories_by_source_doc(
+        self,
+        *,
+        doc_id: str,
+        support_kind: str | None = None,
+    ) -> list[CandidateMemory]:
+        return await self._db.get_candidate_memories_by_source_doc(
+            doc_id=doc_id,
+            support_kind=support_kind,
+        )
+
+    async def get_candidate_memories_by_source_anchor(
+        self,
+        *,
+        source_id: str,
+        source_anchor: str,
+    ) -> list[CandidateMemory]:
+        return await self._db.get_candidate_memories_by_source_anchor(
+            source_id=source_id,
+            source_anchor=source_anchor,
+        )
+
+    async def get_candidate_memories_by_agent_claim(
+        self,
+        *,
+        claim_anchor: str,
+    ) -> list[CandidateMemory]:
+        return await self._db.get_candidate_memories_by_agent_claim(
+            claim_anchor=claim_anchor,
+        )
+
+    async def get_candidate_memories_by_existing_relation_graph(
+        self,
+        *,
+        evidence_unit_id: str,
+    ) -> list[CandidateMemory]:
+        return await self._db.get_candidate_memories_by_existing_relation_graph(
+            evidence_unit_id=evidence_unit_id,
+        )
 
     async def find_active_exact_claim_candidate(
         self,

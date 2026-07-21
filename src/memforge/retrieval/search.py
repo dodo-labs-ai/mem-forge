@@ -26,6 +26,10 @@ from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.query_analyzer import QueryAnalysis
+from memforge.retrieval.rank_fusion import (
+    RankedChannelItem,
+    weighted_reciprocal_rank_fusion,
+)
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import (
     EntityLinkCandidate,
@@ -42,6 +46,7 @@ __all__ = [
     "SearchEngine",
     "W_RECENCY_DEFAULT",
     "W_RRF_DEFAULT",
+    "sanitize_fts_query",
 ]
 
 
@@ -365,25 +370,36 @@ def _weighted_rrf_fusion(
     k: int,
 ) -> list[_RankedCandidate]:
     weights = _PROFILE_WEIGHTS[profile]
-    scores: dict[str, float] = {}
-
-    def add_ranked(channel: str, results: list[tuple[str, float]]) -> None:
-        sorted_channel = sorted(results, key=lambda x: x[1], reverse=True)
-        for rank_0, (memory_id, _score) in enumerate(sorted_channel):
-            rank = rank_0 + 1
-            scores[memory_id] = scores.get(memory_id, 0.0) + weights[channel] / (k + rank)
-
-    add_ranked("vector", vector_results)
-    add_ranked("bm25_content", content_results)
-    add_ranked("metadata_lexical", metadata_results)
-    for memory_id, contribution in graph_contributions.items():
-        scores[memory_id] = scores.get(memory_id, 0.0) + (
-            weights["graph"] / (k + contribution.rank) * contribution.multiplier
-        )
-
+    fused = weighted_reciprocal_rank_fusion(
+        channels={
+            "vector": tuple(
+                RankedChannelItem(memory_id, score)
+                for memory_id, score in vector_results
+            ),
+            "bm25_content": tuple(
+                RankedChannelItem(memory_id, score)
+                for memory_id, score in content_results
+            ),
+            "metadata_lexical": tuple(
+                RankedChannelItem(memory_id, score)
+                for memory_id, score in metadata_results
+            ),
+            "graph": tuple(
+                RankedChannelItem(
+                    memory_id,
+                    score=0.0,
+                    rank=contribution.rank,
+                    multiplier=contribution.multiplier,
+                )
+                for memory_id, contribution in graph_contributions.items()
+            ),
+        },
+        weights=weights,
+        k=k,
+    )
     return [
-        _RankedCandidate(memory_id=mid, rrf_score=score)
-        for mid, score in sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        _RankedCandidate(memory_id=item.item_id, rrf_score=item.score)
+        for item in fused
     ]
 
 
@@ -416,14 +432,14 @@ def _search_follow_up_for_memory(
     return None
 
 
-def _sanitize_fts_query(text: str) -> str:
+def sanitize_fts_query(text: str) -> str:
     """Escape characters that are special in FTS5 MATCH syntax.
 
     FTS5 interprets ``*``, ``^``, ``(``, ``)``, ``:``, ``"`` as operators.
     Each whitespace-separated token is stripped of punctuation and re-quoted
     as an FTS5 phrase, so the result is always a flat AND of literal phrases.
 
-    This sanitizer is for USER input only. Engine-built FTS5 fragments
+    This sanitizer is for unstructured plain text only. Engine-built FTS5 fragments
     (parenthesized OR groups, quoted phrases produced by the alias expander,
     etc.) MUST NOT be passed through this function: it is structure-blind and
     will demote operators to literal tokens, destroying the query.
@@ -808,7 +824,7 @@ class SearchEngine:
         Source filtering is applied once on the fused set (Step 8), not per
         channel.
         """
-        sanitized_query = _sanitize_fts_query(query)
+        sanitized_query = sanitize_fts_query(query)
         if not sanitized_query:
             return []
         alias_clause = await self._build_alias_clause(
@@ -836,7 +852,7 @@ class SearchEngine:
         time_range: MemoryTimeRange | None,
     ) -> list[KeywordCandidate]:
         """Query the source-metadata keyword channel."""
-        sanitized_query = _sanitize_fts_query(_metadata_identifier_core_query(query))
+        sanitized_query = sanitize_fts_query(_metadata_identifier_core_query(query))
         if not sanitized_query:
             return []
         return await self._keyword.search_metadata(
@@ -884,21 +900,22 @@ class SearchEngine:
         each memory receives ``1 / (k + rank)`` where ``rank`` is 1-based.
         Scores are summed across channels.
         """
-        scores: dict[str, float] = {}
-
-        for channel in channel_results:
-            # Sort channel by score descending to determine per-channel rank
-            sorted_channel = sorted(channel, key=lambda x: x[1], reverse=True)
-            for rank_0, (memory_id, _score) in enumerate(sorted_channel):
-                rank = rank_0 + 1  # 1-based
-                scores[memory_id] = scores.get(memory_id, 0.0) + 1.0 / (k + rank)
-
-        # Sort by RRF score descending
-        candidates = [
-            _RankedCandidate(memory_id=mid, rrf_score=s)
-            for mid, s in sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        channels = {
+            f"channel_{index}": tuple(
+                RankedChannelItem(memory_id, score)
+                for memory_id, score in channel
+            )
+            for index, channel in enumerate(channel_results)
+        }
+        fused = weighted_reciprocal_rank_fusion(
+            channels=channels,
+            weights={channel: 1.0 for channel in channels},
+            k=k,
+        )
+        return [
+            _RankedCandidate(memory_id=item.item_id, rrf_score=item.score)
+            for item in fused
         ]
-        return candidates
 
     @staticmethod
     def _graph_contributions(
@@ -1203,7 +1220,7 @@ class SearchEngine:
 
         The returned fragment is already FTS5-valid: parens, the ``OR``
         operator, and double-quoted phrases are intentional and load-bearing.
-        It MUST NOT be passed through :func:`_sanitize_fts_query`, which is
+        It MUST NOT be passed through :func:`sanitize_fts_query`, which is
         structure-blind and would demote ``OR`` to a literal token and strip
         the grouping parens.
         """

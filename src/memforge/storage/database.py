@@ -72,7 +72,6 @@ from memforge.memory.evidence import (
     AuthorityCase,
     CandidateBucket,
     CandidateMemory,
-    CandidatePage,
     EvidenceContentProvenance,
     EvidenceReference,
     EvidenceRole,
@@ -8557,6 +8556,61 @@ class Database:
                 rows[memory.id] = memory
         return [rows[memory_id] for memory_id in ordered_ids if memory_id in rows]
 
+    async def list_active_memories(
+        self,
+        memory_ids: Sequence[str],
+    ) -> list[Memory]:
+        """Return active Memories in caller-provided order."""
+
+        ordered_ids = tuple(dict.fromkeys(memory_ids))
+        if not ordered_ids:
+            return []
+        placeholders = ", ".join("?" for _ in ordered_ids)
+        rows: dict[str, Memory] = {}
+        async with self.db.execute(
+            f"""SELECT m.* FROM memories AS m
+                WHERE m.id IN ({placeholders})
+                  AND m.status = 'active'""",
+            ordered_ids,
+        ) as cursor:
+            async for row in cursor:
+                memory = self._row_to_memory(row)
+                rows[memory.id] = memory
+        return [rows[memory_id] for memory_id in ordered_ids if memory_id in rows]
+
+    async def list_active_candidate_memories(
+        self,
+        memory_ids: Sequence[str],
+    ) -> list[CandidateMemory]:
+        """Return lightweight provenance rows for active candidate IDs."""
+
+        ordered_ids = tuple(dict.fromkeys(memory_ids))
+        if not ordered_ids:
+            return []
+        placeholders = ", ".join("?" for _ in ordered_ids)
+        candidates: list[CandidateMemory] = []
+        async with self.db.execute(
+            f"""SELECT m.id AS memory_id,
+                       m.visibility,
+                       m.owner_user_id,
+                       m.repo_identifier,
+                       ms.source_id,
+                       ms.doc_id,
+                       ms.doc_id AS source_lineage_id,
+                       NULL AS doc_revision_id,
+                       NULL AS source_anchor,
+                       NULL AS source_metadata_json
+                  FROM memories AS m
+                  LEFT JOIN memory_sources AS ms ON ms.memory_id = m.id
+                 WHERE m.id IN ({placeholders})
+                   AND m.status = 'active'
+                 ORDER BY m.id, ms.source_id, ms.doc_id""",
+            ordered_ids,
+        ) as cursor:
+            async for row in cursor:
+                candidates.append(self._row_to_candidate_memory(row))
+        return candidates
+
     async def find_rebaseline_reactivation_candidate(
         self,
         memory_content_hash: str,
@@ -14310,84 +14364,6 @@ class Database:
     # ==================================================================
     # Contradictions
     # ==================================================================
-
-    async def get_cross_doc_candidates(
-        self,
-        memory_id: str,
-        entity_ids: Sequence[int],
-        doc_id: str,
-        *,
-        excluded_source_ids: Sequence[str] = (),
-        limit: int = 200,
-    ) -> CandidatePage[Memory]:
-        """Find access-compatible active Memories sharing entities across documents.
-
-        Access identity is derived from the challenger row so callers cannot
-        accidentally widen or narrow the lifecycle boundary. Project remains a
-        relevance attribute and is not an access boundary.
-        """
-        if not entity_ids:
-            return CandidatePage(candidates=(), complete=True, requested_limit=limit)
-        if limit < 1:
-            return CandidatePage(candidates=(), complete=True, requested_limit=limit)
-
-        placeholders = ",".join("?" for _ in entity_ids)
-        scope_clause = ""
-        scope_params: list[Any] = []
-        if excluded_source_ids:
-            source_placeholders = ",".join("?" for _ in excluded_source_ids)
-            scope_clause += f"""
-              AND (
-                  NOT EXISTS (
-                      SELECT 1 FROM memory_sources ms_any
-                      WHERE ms_any.memory_id = m.id
-                  )
-                  OR EXISTS (
-                      SELECT 1 FROM memory_sources ms_enabled
-                      WHERE ms_enabled.memory_id = m.id
-                        AND (ms_enabled.source_id IS NULL OR ms_enabled.source_id NOT IN ({source_placeholders}))
-                  )
-              )"""
-            scope_params.extend(excluded_source_ids)
-        sql = f"""
-            SELECT DISTINCT m.* FROM memories m
-            JOIN memories challenger ON challenger.id = ?
-            JOIN memory_entities me ON m.id = me.memory_id
-            JOIN memory_sources ms ON m.id = ms.memory_id
-            WHERE me.entity_id IN ({placeholders})
-              AND ms.doc_id != ?
-              AND m.id != ?
-              AND m.status = 'active'
-              AND challenger.status = 'active'
-              AND m.visibility = challenger.visibility
-              AND m.owner_user_id IS challenger.owner_user_id
-              AND m.repo_identifier IS challenger.repo_identifier
-              {scope_clause}
-            ORDER BY CASE
-                         WHEN challenger.project_key IS NOT NULL
-                          AND m.project_key = challenger.project_key
-                         THEN 1 ELSE 0
-                     END DESC,
-                     m.updated_at DESC, m.id
-            LIMIT ?
-        """
-        params = [
-            memory_id,
-            *entity_ids,
-            doc_id,
-            memory_id,
-            *scope_params,
-            limit + 1,
-        ]
-        results: list[Memory] = []
-        async with self.db.execute(sql, params) as cursor:
-            async for row in cursor:
-                results.append(self._row_to_memory(row))
-        return CandidatePage(
-            candidates=tuple(results[:limit]),
-            complete=len(results) <= limit,
-            requested_limit=limit,
-        )
 
     async def record_contradiction(
         self,

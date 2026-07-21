@@ -29,6 +29,7 @@ from memforge.memory.evidence import (
     EvidenceUnit,
     MemorySupportAssertion,
 )
+from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.store import MemoryStore
 from memforge.models import (
     ContentItem,
@@ -284,6 +285,15 @@ def _test_memory_store(db: Database) -> MemoryStore:
     )
 
 
+def _test_candidate_retriever(db: Database) -> CrossDocumentCandidateRetriever:
+    store = _test_memory_store(db)
+    return CrossDocumentCandidateRetriever(
+        relational=store.relational,
+        keyword=store.keyword,
+        vector=store.vector,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Self-contained DB fixture (no prod dependency)
 # ---------------------------------------------------------------------------
@@ -472,6 +482,7 @@ class TestContradictionE2E:
             doc_id="doc-runbook",
             db=db,
             memory_store=_test_memory_store(db),
+            candidate_retriever=_test_candidate_retriever(db),
             structured_llm_client=structured_llm_client,
         )
 
@@ -525,6 +536,7 @@ class TestContradictionE2E:
             doc_id="doc-run-unrelated",
             db=db,
             memory_store=_test_memory_store(db),
+            candidate_retriever=_test_candidate_retriever(db),
             structured_llm_client=structured_llm_client,
         )
 
@@ -558,6 +570,7 @@ class TestContradictionE2E:
             doc_id="doc-run-temporal",
             db=db,
             memory_store=_test_memory_store(db),
+            candidate_retriever=_test_candidate_retriever(db),
             structured_llm_client=structured_llm_client,
         )
 
@@ -663,6 +676,7 @@ class TestContradictionE2E:
             doc_id="doc-ops",
             db=db,
             memory_store=_test_memory_store(db),
+            candidate_retriever=_test_candidate_retriever(db),
             structured_llm_client=structured_llm_client,
         )
 
@@ -707,6 +721,7 @@ class TestContradictionErrorResilience:
             doc_id="doc-runbook",
             db=db,
             memory_store=_test_memory_store(db),
+            candidate_retriever=_test_candidate_retriever(db),
             structured_llm_client=mock_client,
         )
 
@@ -735,6 +750,7 @@ class TestContradictionErrorResilience:
             doc_id="doc-runbook",
             db=db,
             memory_store=_test_memory_store(db),
+            candidate_retriever=_test_candidate_retriever(db),
             structured_llm_client=mock_client,
         )
 
@@ -770,6 +786,7 @@ class TestContradictionErrorResilience:
             doc_id="doc-runbook",
             db=db,
             memory_store=_test_memory_store(db),
+            candidate_retriever=_test_candidate_retriever(db),
             structured_llm_client=mock_client,
         )
 
@@ -819,6 +836,7 @@ class TestContradictionDBState:
             doc_id="doc-runbook",
             db=db,
             memory_store=_test_memory_store(db),
+            candidate_retriever=_test_candidate_retriever(db),
             structured_llm_client=structured_llm_client,
         )
 
