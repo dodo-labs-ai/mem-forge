@@ -117,11 +117,11 @@ def test_pending_review_builds_fresh_atomic_approval_plan() -> None:
     assert approval.gate_state is LifecycleGateState.ENABLED
     assert approval.coverage_proof.mandatory_incumbent_ids == ("mem-old",)
     assert [item.mutation_type for item in approval.mutations] == [
+        LifecycleMutationType.RESOLVE_REVIEW,
         LifecycleMutationType.CREATE_MEMORY,
         LifecycleMutationType.ATTACH_SUPPORT,
         LifecycleMutationType.REMOVE_SUPPORT,
         LifecycleMutationType.SUPERSEDE_MEMORY,
-        LifecycleMutationType.RESOLVE_REVIEW,
     ]
     assert approval.stale_guard.support_set_hashes == {"mem-old": "support-hash"}
     [request] = approval.relation_discovery_requests
