@@ -106,7 +106,9 @@ def build_lifecycle_review_approval_plan(
             support_set_hashes={incumbent_id: support_hashes[incumbent_id]},
             memory_versions={incumbent_id: memory_versions[incumbent_id]},
         ),
-        mutations=(*proposed, resolution),
+        # Resolve first inside the same transaction so terminal mutations stale
+        # only other pending review work. Any later failure rolls approval back.
+        mutations=(resolution, *proposed),
         relation_discovery_requests=relation_discovery_requests,
     )
     plan.validate()

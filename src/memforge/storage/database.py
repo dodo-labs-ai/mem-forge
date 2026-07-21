@@ -6106,7 +6106,7 @@ class Database:
                 )
                 if cursor.rowcount != 1:
                     raise ValueError("unprovable retirement Memory stale guard failed")
-                await self._stale_pending_memory_reviews_unlocked(
+                await self._stale_pending_reviews_unlocked(
                     (str(finding["memory_id"]),),
                     now=now,
                 )
@@ -7088,7 +7088,7 @@ class Database:
             )
             if cursor.rowcount != 1:
                 raise ValueError("supersede Memory stale guard failed")
-            await self._stale_pending_memory_reviews_unlocked(
+            await self._stale_pending_reviews_unlocked(
                 (mutation.memory_id,),
                 now=now,
             )
@@ -7125,7 +7125,7 @@ class Database:
             )
             if cursor.rowcount != 1:
                 raise ValueError("retire Memory stale guard failed")
-            await self._stale_pending_memory_reviews_unlocked(
+            await self._stale_pending_reviews_unlocked(
                 (mutation.memory_id,),
                 now=now,
             )
@@ -7188,13 +7188,13 @@ class Database:
             return
         raise ValueError(f"unsupported lifecycle mutation: {mutation_type.value}")
 
-    async def _stale_pending_memory_reviews_unlocked(
+    async def _stale_pending_reviews_unlocked(
         self,
         memory_ids: Sequence[str],
         *,
         now: str,
     ) -> None:
-        """Close review work whose decision target left an actionable lifecycle."""
+        """Close all review work whose decision target became terminal."""
         unique_ids = tuple(sorted(set(memory_ids)))
         if not unique_ids:
             return
@@ -7213,6 +7213,17 @@ class Database:
                        )
                    )""",
             (now, *unique_ids, *unique_ids, *unique_ids),
+        )
+        await self.db.execute(
+            f"""UPDATE lifecycle_reviews
+                   SET status = 'stale', resolved_at = COALESCE(resolved_at, ?)
+                 WHERE status = 'pending'
+                   AND incumbent_memory_id IN ({placeholders})
+                   AND incumbent_memory_id IN (
+                       SELECT id FROM memories
+                        WHERE status IN ('retired', 'superseded')
+                   )""",
+            (now, *unique_ids),
         )
 
     async def _enqueue_lifecycle_vector_task_unlocked(
@@ -9854,7 +9865,7 @@ class Database:
                 old_id,
             ),
         )
-        await self._stale_pending_memory_reviews_unlocked(
+        await self._stale_pending_reviews_unlocked(
             (old_id,),
             now=now,
         )
@@ -10256,7 +10267,7 @@ class Database:
                    AND valid_until < ?""",
                 (now, now, today),
             )
-            await self._stale_pending_memory_reviews_unlocked(
+            await self._stale_pending_reviews_unlocked(
                 expiring_ids,
                 now=now,
             )
@@ -10894,7 +10905,7 @@ class Database:
                    WHERE id = ?""",
                     (new_memory.id, now, now, replacement_reason, replacement_kind, now, old_id),
                 )
-                await self._stale_pending_memory_reviews_unlocked(
+                await self._stale_pending_reviews_unlocked(
                     (old_id,),
                     now=now,
                 )
@@ -11273,7 +11284,7 @@ class Database:
                    WHERE id = ?""",
                 (retire_reason, now, total_count, now, memory_id),
             )
-            await self._stale_pending_memory_reviews_unlocked(
+            await self._stale_pending_reviews_unlocked(
                 (memory_id,),
                 now=now,
             )
