@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from memforge.memory.evidence import (
+    AuthorityCase,
     CandidateMemory,
     EvidenceContentProvenance,
     EvidenceUnit,
@@ -65,8 +68,12 @@ class _Classifier:
 class _Candidates:
     def __init__(self, candidates: tuple[Memory, ...]) -> None:
         self._candidates = candidates
+        self.actor_user_id = None
+        self.excluded_source_ids = ()
 
-    async def retrieve(self, **_kwargs):
+    async def retrieve(self, **kwargs):
+        self.actor_user_id = kwargs["actor_user_id"]
+        self.excluded_source_ids = tuple(kwargs["excluded_source_ids"])
         return CrossDocumentCandidateSelection(
             discovery=tuple(
                 RetrievedRelationCandidate(
@@ -100,6 +107,8 @@ class _Store:
         self.candidates = candidates
         self.leased = False
         self.completed = None
+        self.reviews = ()
+        self.disabled_lookup_user_id = None
         self.work = RelationDiscoveryWork(
             request=RelationDiscoveryRequest(
                 id="work-1",
@@ -136,16 +145,17 @@ class _Store:
             source_type="github_repo",
             source_anchor=None,
             source_lineage_id="unit-1",
-            project_key=None,
-            visibility="workspace",
-            owner_user_id=None,
-            repo_identifier=None,
+            project_key=self.challenger.project_key,
+            visibility=self.challenger.visibility,
+            owner_user_id=self.challenger.owner_user_id,
+            repo_identifier=self.challenger.repo_identifier,
             content=self.challenger.content,
             excerpt=None,
             evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
         )
 
-    async def list_disabled_source_ids_for_user(self, _user_id):
+    async def list_disabled_source_ids_for_user(self, user_id):
+        self.disabled_lookup_user_id = user_id
         return []
 
     async def get_memory_entity_ids(self, _memory_id):
@@ -153,6 +163,7 @@ class _Store:
 
     async def complete_relation_discovery_work(self, _work_id, **kwargs):
         self.completed = kwargs["relation_outcome"]
+        self.reviews = kwargs["reviews"]
 
     async def fail_relation_discovery_work(self, *_args, **_kwargs):
         pytest.fail("work should not fail")
@@ -190,6 +201,23 @@ class _UsageReportingFailureClassifier(_Classifier):
             pair_count=len(pairs),
             llm_calls=2,
             prompt_chars=321,
+        )
+
+
+class _ConflictClassifier(_Classifier):
+    async def classify(self, pairs):
+        return MemoryPairClassification(
+            decisions=tuple(
+                MemoryPairDecision(
+                    pair=pair,
+                    relation_type=MemoryRelationType.CONTRADICTS,
+                    direction=RelationDirection.SYMMETRIC,
+                    reason="deterministic conflict",
+                )
+                for pair in pairs
+            ),
+            llm_calls=1 if pairs else 0,
+            prompt_chars=10 * len(pairs),
         )
 
 
@@ -262,3 +290,41 @@ async def test_completion_guard_failure_keeps_classification_usage_in_slice_budg
     assert result.prompt_chars == 30
     assert store.failure is not None
     assert store.lease_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_private_relation_discovery_without_explicit_actor_builds_valid_cross_source_review() -> None:
+    challenger = replace(
+        _memory("challenger", "Current claim"),
+        visibility="private",
+        owner_user_id="user-1",
+        repo_identifier="repo-1",
+        project_key="PROJECT",
+    )
+    incumbent = replace(
+        _memory("incumbent", "Conflicting claim"),
+        visibility="private",
+        owner_user_id="user-1",
+        repo_identifier="repo-1",
+        project_key="PROJECT",
+    )
+    store = _Store(challenger, (incumbent,))
+    candidates = _Candidates((incumbent,))
+
+    result = await RelationDiscovery(
+        store=store,  # type: ignore[arg-type]
+        candidate_retriever=candidates,  # type: ignore[arg-type]
+        pair_classifier=_ConflictClassifier(),
+    ).process_slice(
+        worker_id="worker-1",
+        budget=RelationDiscoveryBudget(max_candidate_pairs=1, max_llm_calls=1),
+    )
+
+    assert result.completed_work == 1
+    assert result.failed_work == 0
+    assert store.disabled_lookup_user_id == "user-1"
+    assert candidates.actor_user_id == "user-1"
+    assert store.completed is not None
+    assert store.completed.relations[0].authority_case is AuthorityCase.CROSS_SOURCE_CONFLICT
+    assert len(store.reviews) == 1
+    assert store.reviews[0].status == "pending"

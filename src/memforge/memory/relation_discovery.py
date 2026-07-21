@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from memforge.memory.evidence import (
     AccessContext,
+    AuthorityCase,
     EvidenceRelationRecord,
     LifecycleAction,
     RelationOutcomeBundle,
@@ -29,7 +30,10 @@ from memforge.memory.relation_classifier import (
     MemoryPairDecision,
     MemoryRelationType,
 )
-from memforge.memory.relation_discovery_contract import RelationDiscoveryWork
+from memforge.memory.relation_discovery_contract import (
+    RelationDiscoveryWork,
+    resolve_relation_discovery_actor_user_id,
+)
 from memforge.models import (
     Memory,
     MemoryReview,
@@ -215,15 +219,20 @@ class RelationDiscovery:
         if evidence_unit is None:
             return None
 
+        actor_user_id = resolve_relation_discovery_actor_user_id(
+            visibility=challenger.visibility,
+            owner_user_id=challenger.owner_user_id,
+            requested_actor_user_id=request.actor_user_id,
+        )
         disabled_source_ids = (
-            await self._store.list_disabled_source_ids_for_user(request.actor_user_id) if request.actor_user_id else []
+            await self._store.list_disabled_source_ids_for_user(actor_user_id) if actor_user_id else []
         )
         entity_ids = request.entity_ids or tuple(await self._store.get_memory_entity_ids(challenger.id))
         selection = await self._candidate_retriever.retrieve(
             challenger=challenger,
             entity_ids=entity_ids,
             doc_id=evidence_unit.doc_id or request.doc_id,
-            actor_user_id=request.actor_user_id,
+            actor_user_id=actor_user_id,
             source_id=request.source_id,
             excluded_source_ids=disabled_source_ids,
         )
@@ -258,6 +267,7 @@ class RelationDiscovery:
             bundle, reviews = await self._build_outcome(
                 work=work,
                 challenger=challenger,
+                actor_user_id=actor_user_id,
                 evidence_unit=evidence_unit,
                 selection=selection,
                 decisions=classification.decisions,
@@ -287,6 +297,7 @@ class RelationDiscovery:
         *,
         work: RelationDiscoveryWork,
         challenger: Memory,
+        actor_user_id: str | None,
         evidence_unit,
         selection: CrossDocumentCandidateSelection,
         decisions: tuple[MemoryPairDecision, ...],
@@ -313,7 +324,7 @@ class RelationDiscovery:
             )
         )
         access_context = AccessContext(
-            actor_user_id=work.request.actor_user_id,
+            actor_user_id=actor_user_id,
             source_subscriptions=source_subscriptions,
             repo_identifier=challenger.repo_identifier,
             operation_type="relation_discovery",
@@ -357,6 +368,7 @@ class RelationDiscovery:
             )
             if (
                 relation_type is RelationType.CONTRADICTS
+                and authority is AuthorityCase.CROSS_SOURCE_CONFLICT
                 and candidate_row.source_id
                 and candidate_row.source_id != evidence_unit.source_id
             ):

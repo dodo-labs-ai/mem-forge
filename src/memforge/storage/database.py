@@ -122,6 +122,7 @@ from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryRequest,
     RelationDiscoveryWork,
     RelationDiscoveryWorkStatus,
+    resolve_relation_discovery_actor_user_id,
 )
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
@@ -7834,7 +7835,11 @@ class Database:
         }
         if not selected_provenance.issubset(current_provenance):
             raise ValueError("relation discovery candidate provenance is stale")
-        actor_user_id = work_row["actor_user_id"]
+        actor_user_id = resolve_relation_discovery_actor_user_id(
+            visibility=str(challenger["visibility"]),
+            owner_user_id=challenger["owner_user_id"],
+            requested_actor_user_id=work_row["actor_user_id"],
+        )
         if actor_user_id:
             disabled_rows = await self.db.execute_fetchall(
                 "SELECT source_id FROM source_subscriptions WHERE user_id = ? AND enabled = 0",

@@ -22,6 +22,7 @@ from memforge.memory.lifecycle_plan import (
 from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryRequest,
     relation_discovery_request_id,
+    resolve_relation_discovery_actor_user_id,
 )
 from memforge.models import (
     Memory,
@@ -93,6 +94,11 @@ def build_lifecycle_plan(
     decisions: list[IncumbentDecision] = []
     created_ids: set[str] = set()
     relation_discovery_requests: list[RelationDiscoveryRequest] = []
+    relation_discovery_actor_user_id = resolve_relation_discovery_actor_user_id(
+        visibility=defaults.visibility,
+        owner_user_id=defaults.owner_user_id,
+        requested_actor_user_id=defaults.actor_user_id,
+    )
 
     def request_relation_discovery(memory_id: str, expected_content_hash: str) -> None:
         relation_discovery_requests.append(
@@ -108,7 +114,7 @@ def build_lifecycle_plan(
                 source_unit_id=scope.source_unit_id,
                 source_unit_revision_id=scope.target_unit_revision_id,
                 doc_id=defaults.doc_id,
-                actor_user_id=defaults.actor_user_id,
+                actor_user_id=relation_discovery_actor_user_id,
                 entity_ids=defaults.entity_ids,
             )
         )
@@ -379,7 +385,7 @@ def build_lifecycle_plan(
                             "source_unit_id": scope.source_unit_id,
                             "source_unit_revision_id": scope.target_unit_revision_id,
                             "doc_id": defaults.doc_id,
-                            "actor_user_id": defaults.actor_user_id,
+                            "actor_user_id": relation_discovery_actor_user_id,
                             "entity_ids": list(defaults.entity_ids),
                         },
                     )

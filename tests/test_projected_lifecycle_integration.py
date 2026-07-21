@@ -3572,6 +3572,88 @@ async def test_relation_discovery_rejects_candidate_provenance_removed_before_co
 
 
 @pytest.mark.asyncio
+async def test_private_relation_completion_rechecks_access_as_current_owner(
+    db: Database,
+) -> None:
+    _projection_row, challenger = await _create_relation_discovery_fixture(
+        db,
+        run_id="projection-private-relation-access",
+    )
+    await db.db.execute(
+        "UPDATE memories SET visibility = 'private', owner_user_id = ?, repo_identifier = ? WHERE id = ?",
+        ("owner-1", "repo-1", challenger.id),
+    )
+    await db.db.execute(
+        "UPDATE evidence_units SET visibility = 'private', owner_user_id = ?, repo_identifier = ? WHERE source_id = ?",
+        ("owner-1", "repo-1", "src-1"),
+    )
+    await db.db.execute("UPDATE relation_discovery_work SET actor_user_id = NULL")
+    await db.db.commit()
+
+    candidate = Memory(
+        id="mem-private-relation-candidate",
+        memory_type="decision",
+        content="A7 applies to payroll.",
+        content_hash=content_hash("A7 applies to payroll."),
+        project_key="ENG",
+        visibility="private",
+        owner_user_id="owner-1",
+        repo_identifier="repo-1",
+    )
+    await db.insert_memory(candidate)
+    now = datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-other",
+        type="confluence",
+        name="Private relation candidate",
+        config_json="{}",
+        access_policy="private",
+        owner_user_id="owner-1",
+    )
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="other-doc",
+            source="src-other",
+            source_url="https://example.test/other-doc",
+            title="Relation candidate",
+            space_or_project="ENG",
+            author=None,
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash="candidate-doc-hash",
+            token_count=4,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
+    await db.add_memory_source(
+        candidate.id,
+        "other-doc",
+        "confluence",
+        source_updated_at=now,
+    )
+
+    async def disable_candidate_source() -> None:
+        await db.set_source_subscription("src-other", "owner-1", False)
+
+    result = await RelationDiscovery(
+        store=db,
+        candidate_retriever=_MutatingRelationCandidates(candidate, disable_candidate_source),
+        pair_classifier=_DeterministicRefinementClassifier(),
+    ).process_slice(worker_id="relation-worker")
+
+    assert result.failed_work == 1
+    [row] = await db.db.execute_fetchall("SELECT status, error FROM relation_discovery_work")
+    assert row["status"] == "failed"
+    assert "candidate source access is stale" in row["error"]
+    assert await db.db.execute_fetchall("SELECT id FROM relation_runs") == []
+
+
+@pytest.mark.asyncio
 async def test_relation_discovery_persists_direction_after_lifecycle_commit(
     db: Database,
 ) -> None:
