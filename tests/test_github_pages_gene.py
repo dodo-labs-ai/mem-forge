@@ -311,6 +311,7 @@ async def test_github_pat_discovers_and_fetches_repository_markdown_for_page_url
     assert raw.content_type == "text/markdown"
     assert "# Process Tracking" in normalized.markdown_body
     assert "Repository Path: docs/cloud-native-platform/process-tracking.md" in normalized.markdown_body
+    assert normalized.source_semantics["repo_identifier"] == "github-pages.example.test/org/repo"
 
 
 @pytest.mark.asyncio
@@ -737,3 +738,41 @@ async def test_authoritative_empty_github_page_stays_empty_after_normalization()
 
     assert normalized.markdown_body == ""
     assert normalized.source_semantics["source_type"] == "github_pages"
+    assert "repo_identifier" not in normalized.source_semantics
+
+
+@pytest.mark.asyncio
+async def test_authoritative_empty_repository_backed_page_preserves_repo_identifier():
+    gene = GitHubPagesGene(
+        config={
+            "base_url": "https://github-pages.example.test/pages/org/repo/",
+            "auth_mode": "github_pat",
+            "pat": "github-secret",
+            "sync_mode": "single_page",
+            "page_url": "https://github-pages.example.test/pages/org/repo/empty/",
+        },
+        source_id="src-pages",
+    )
+    gene._base_url = "https://github-pages.example.test/pages/org/repo"
+    item = ContentItem(
+        item_id="github-pages-empty-repo",
+        title="Empty repository page",
+        source_url="https://github-pages.example.test/pages/org/repo/empty",
+        last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        extra={
+            "repo_api_url": "https://github-pages.example.test/api/v3/repos/org/repo/contents/docs/empty.md?ref=main",
+            "repo_path": "docs/empty.md",
+        },
+    )
+    raw = RawContent(
+        item=item,
+        content_type="text/markdown",
+        body=b"",
+        authoritative_empty=True,
+        empty_evidence="github_contents_api_successful_empty_blob",
+    )
+
+    normalized = await gene.normalize(raw)
+
+    assert normalized.markdown_body == ""
+    assert normalized.source_semantics["repo_identifier"] == "github-pages.example.test/org/repo"

@@ -22,6 +22,10 @@ from typing import Any, Mapping, Sequence
 
 import aiosqlite
 
+from memforge.agent_session_contract import (
+    AGENT_SESSION_WINDOW_SOURCE_KIND,
+    successful_agent_session_activity_at,
+)
 from memforge.local_agent.source_contract import (
     local_agent_completion_status,
     local_agent_source_config_revision,
@@ -90,6 +94,8 @@ from memforge.memory.evidence import (
 from memforge.memory.lifecycle_plan import (
     build_unprovable_cutover_resolution,
     ClaimIdentityPolicy,
+    ContestedSupportEdge,
+    contested_supports_from_staged_evidence,
     CutoverFindingReason,
     CutoverFindingStatus,
     LifecycleCutoverFinding,
@@ -106,6 +112,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleVectorTask,
     LifecycleVectorTaskStatus,
     lifecycle_plan_to_payload,
+    pending_review_contested_supports,
     unprovable_cutover_retirement_plan_id,
     validate_unprovable_cutover_evidence,
 )
@@ -224,7 +231,6 @@ AGENT_SESSION_OUTCOMES = (
     AGENT_SESSION_OUTCOME_NO_OUTPUT,
     AGENT_SESSION_OUTCOME_FAILED,
 )
-AGENT_SESSION_WINDOW_SOURCE_KIND = "generated_agent_window_summary"
 _PERSISTED_RELATION_TYPES = {
     RelationType.SUPPORTS,
     RelationType.EQUIVALENT,
@@ -6603,16 +6609,14 @@ class Database:
     ) -> None:
         """Fail closed when committed source support is not current, stable lineage.
 
-        Review-only plans intentionally preserve the incumbent while a human
-        decides; their contested support is represented by the durable review.
-        Every applied non-review plan must leave each surviving same-source
-        assertion pinned to an Observation current in its own stable Source
-        Unit. A newly activated Memory must additionally gain support in the
-        plan's current Unit.
+        A pending Review intentionally preserves only its exact incumbent edge
+        while a human decides. The current Plan's staged Reviews and prior
+        applied Reviews whose own Source Unit revision remains current share
+        that contract. Every other surviving same-source assertion must point
+        to an Observation current in its own stable Source Unit. A newly
+        activated Memory must additionally gain support in the Plan's Unit.
         """
 
-        if any(mutation.mutation_type is LifecycleMutationType.CREATE_REVIEW for mutation in plan.mutations):
-            return
         created_ids = {
             mutation.memory_id
             for mutation in plan.mutations
@@ -6633,6 +6637,13 @@ class Database:
                 if mutation.mutation_type is LifecycleMutationType.ATTACH_SUPPORT
             }
         )
+        contested_supports = set(pending_review_contested_supports(plan))
+        contested_supports.update(
+            await self._durable_pending_review_contested_supports_unlocked(
+                source_id=plan.scope.source_id,
+                memory_ids=candidate_ids,
+            )
+        )
         for memory_id in sorted(candidate_ids):
             async with self.db.execute(
                 "SELECT status FROM memories WHERE id = ?",
@@ -6642,40 +6653,104 @@ class Database:
             if memory is None or memory["status"] != "active":
                 continue
             async with self.db.execute(
-                """SELECT SUM(CASE
-                              WHEN so.source_unit_id = ?
-                               AND eu.source_lineage_id = so.source_unit_id
-                               AND eu.source_id = msa.source_id
-                               AND so.source_id = msa.source_id
-                               AND su.source_id = msa.source_id
-                               AND er.observation_revision_id = so.current_revision_id
-                              THEN 1 ELSE 0 END) AS current_scope_total,
-                          SUM(CASE
-                              WHEN eu.source_lineage_id = so.source_unit_id
-                               AND eu.source_id = msa.source_id
-                               AND so.source_id = msa.source_id
-                               AND su.source_id = msa.source_id
-                               AND er.observation_revision_id = so.current_revision_id
-                              THEN 0 ELSE 1 END) AS invalid
+                """SELECT msa.evidence_reference_id,
+                          er.observation_id,
+                          eu.source_id AS evidence_source_id,
+                          so.source_id AS observation_source_id,
+                          su.source_id AS unit_source_id,
+                          eu.source_lineage_id,
+                          so.source_unit_id,
+                          er.observation_revision_id,
+                          sor.observation_id AS revision_observation_id,
+                          so.current_revision_id
                    FROM memory_support_assertions msa
-                   JOIN evidence_references er ON er.id = msa.evidence_reference_id
-                   JOIN evidence_units eu ON eu.id = er.evidence_unit_id
-                   JOIN source_observations so ON so.id = er.observation_id
-                   JOIN source_units su ON su.id = so.source_unit_id
+                   LEFT JOIN evidence_references er ON er.id = msa.evidence_reference_id
+                   LEFT JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                   LEFT JOIN source_observations so ON so.id = er.observation_id
+                   LEFT JOIN source_observation_revisions sor
+                     ON sor.id = er.observation_revision_id
+                   LEFT JOIN source_units su ON su.id = so.source_unit_id
                    WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1""",
-                (
-                    plan.scope.source_unit_id,
-                    memory_id,
-                    plan.scope.source_id,
-                ),
+                (memory_id, plan.scope.source_id),
             ) as cursor:
-                support = await cursor.fetchone()
-            current_scope_total = int(support["current_scope_total"] or 0)
-            invalid = int(support["invalid"] or 0)
+                supports = await cursor.fetchall()
+            structurally_valid = [
+                support
+                for support in supports
+                if support["evidence_source_id"] == plan.scope.source_id
+                and support["observation_source_id"] == plan.scope.source_id
+                and support["unit_source_id"] == plan.scope.source_id
+                and support["source_lineage_id"] == support["source_unit_id"]
+                and support["revision_observation_id"] == support["observation_id"]
+            ]
+            current_supports = [
+                support
+                for support in structurally_valid
+                if support["observation_revision_id"] == support["current_revision_id"]
+            ]
+            current_scope_total = sum(
+                support["source_unit_id"] == plan.scope.source_unit_id
+                for support in current_supports
+            )
             if memory_id in created_ids | reactivated_ids and current_scope_total == 0:
                 raise ValueError(f"projected lifecycle activated Memory without source support: {memory_id}")
-            if invalid:
+            accepted_supports = [
+                support
+                for support in structurally_valid
+                if support["observation_revision_id"] == support["current_revision_id"]
+                or ContestedSupportEdge(
+                    memory_id=memory_id,
+                    source_id=plan.scope.source_id,
+                    source_unit_id=support["source_unit_id"],
+                    evidence_reference_id=support["evidence_reference_id"],
+                )
+                in contested_supports
+            ]
+            if len(accepted_supports) != len(supports):
                 raise ValueError(f"projected lifecycle left stale or ambiguous source support: {memory_id}")
+
+    async def _durable_pending_review_contested_supports_unlocked(
+        self,
+        *,
+        source_id: str,
+        memory_ids: set[str],
+    ) -> frozenset[ContestedSupportEdge]:
+        """Load exact contested edges from previously applied pending Reviews."""
+
+        ordered_memory_ids = sorted(memory_ids)
+        if not ordered_memory_ids:
+            return frozenset()
+        placeholders = ", ".join("?" for _ in ordered_memory_ids)
+        rows = await self.db.execute_fetchall(
+            f"""SELECT lr.incumbent_memory_id,
+                       lp.source_id AS plan_source_id,
+                       lp.source_unit_id AS plan_source_unit_id,
+                       lr.staged_evidence_json
+                  FROM lifecycle_reviews lr
+                  JOIN lifecycle_plans lp ON lp.id = lr.lifecycle_plan_id
+                  JOIN source_units su ON su.id = lp.source_unit_id
+                 WHERE lr.status = 'pending'
+                   AND lp.status = 'applied'
+                   AND lp.source_id = ?
+                   AND su.source_id = lp.source_id
+                   AND lp.target_unit_revision_id = su.current_revision_id
+                   AND lr.incumbent_memory_id IN ({placeholders})""",
+            (source_id, *ordered_memory_ids),
+        )
+        contested: set[ContestedSupportEdge] = set()
+        for row in rows:
+            staged = json.loads(row["staged_evidence_json"] or "{}")
+            if not isinstance(staged, Mapping):
+                raise ValueError("pending lifecycle review requires staged_evidence")
+            contested.update(
+                contested_supports_from_staged_evidence(
+                    incumbent_memory_id=row["incumbent_memory_id"],
+                    source_id=row["plan_source_id"],
+                    source_unit_id=row["plan_source_unit_id"],
+                    staged_evidence=staged,
+                )
+            )
+        return frozenset(contested)
 
     async def _stage_lifecycle_evidence_unlocked(
         self,
@@ -12865,54 +12940,70 @@ class Database:
 
     async def upsert_agent_session_receipt(self, receipt: AgentSessionReceipt) -> None:
         """Insert or update lineage for a generated agent session document."""
+        activity_at = successful_agent_session_activity_at(receipt)
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO agent_session_receipts (
-                    doc_id, source_id, client, session_id, trigger, workspace,
-                    repo, branch, commit_sha, history_window_kind,
-                    history_window_start, history_window_end, submitted_at,
-                    document_hash, source_kind, document_uri, metadata, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(doc_id) DO UPDATE SET
-                    source_id=excluded.source_id,
-                    client=excluded.client,
-                    session_id=excluded.session_id,
-                    trigger=excluded.trigger,
-                    workspace=excluded.workspace,
-                    repo=excluded.repo,
-                    branch=excluded.branch,
-                    commit_sha=excluded.commit_sha,
-                    history_window_kind=excluded.history_window_kind,
-                    history_window_start=excluded.history_window_start,
-                    history_window_end=excluded.history_window_end,
-                    submitted_at=excluded.submitted_at,
-                    document_hash=excluded.document_hash,
-                    source_kind=excluded.source_kind,
-                    document_uri=excluded.document_uri,
-                    metadata=excluded.metadata,
-                    updated_at=excluded.updated_at""",
-                (
-                    receipt.doc_id,
-                    receipt.source_id,
-                    receipt.client,
-                    receipt.session_id,
-                    receipt.trigger,
-                    receipt.workspace,
-                    receipt.repo,
-                    receipt.branch,
-                    receipt.commit_sha,
-                    receipt.history_window_kind,
-                    receipt.history_window_start,
-                    receipt.history_window_end,
-                    receipt.submitted_at,
-                    receipt.document_hash,
-                    receipt.source_kind,
-                    receipt.document_uri,
-                    json.dumps(receipt.metadata),
-                    receipt.updated_at or _now_iso(),
-                ),
-            )
-            await self.db.commit()
+            try:
+                await self.db.execute(
+                    """INSERT INTO agent_session_receipts (
+                        doc_id, source_id, client, session_id, trigger, workspace,
+                        repo, branch, commit_sha, history_window_kind,
+                        history_window_start, history_window_end, submitted_at,
+                        document_hash, source_kind, document_uri, metadata, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(doc_id) DO UPDATE SET
+                        source_id=excluded.source_id,
+                        client=excluded.client,
+                        session_id=excluded.session_id,
+                        trigger=excluded.trigger,
+                        workspace=excluded.workspace,
+                        repo=excluded.repo,
+                        branch=excluded.branch,
+                        commit_sha=excluded.commit_sha,
+                        history_window_kind=excluded.history_window_kind,
+                        history_window_start=excluded.history_window_start,
+                        history_window_end=excluded.history_window_end,
+                        submitted_at=excluded.submitted_at,
+                        document_hash=excluded.document_hash,
+                        source_kind=excluded.source_kind,
+                        document_uri=excluded.document_uri,
+                        metadata=excluded.metadata,
+                        updated_at=excluded.updated_at""",
+                    (
+                        receipt.doc_id,
+                        receipt.source_id,
+                        receipt.client,
+                        receipt.session_id,
+                        receipt.trigger,
+                        receipt.workspace,
+                        receipt.repo,
+                        receipt.branch,
+                        receipt.commit_sha,
+                        receipt.history_window_kind,
+                        receipt.history_window_start,
+                        receipt.history_window_end,
+                        receipt.submitted_at,
+                        receipt.document_hash,
+                        receipt.source_kind,
+                        receipt.document_uri,
+                        json.dumps(receipt.metadata),
+                        receipt.updated_at or _now_iso(),
+                    ),
+                )
+                if activity_at is not None:
+                    await self.db.execute(
+                        """UPDATE sources
+                           SET last_sync = CASE
+                               WHEN last_sync IS NULL OR last_sync < ? THEN ?
+                               ELSE last_sync
+                           END
+                           WHERE id = ?""",
+                        (activity_at, activity_at, receipt.source_id),
+                    )
+                await self.db.commit()
+            except BaseException:
+                rollback_task = asyncio.create_task(self.db.rollback())
+                await _drain_task_despite_cancellation(rollback_task)
+                raise
 
     async def get_agent_session_receipt(self, doc_id: str) -> dict | None:
         """Return receipt metadata for one generated agent session document."""
@@ -14223,32 +14314,26 @@ class Database:
     async def get_cross_doc_candidates(
         self,
         memory_id: str,
-        entity_ids: list[int],
+        entity_ids: Sequence[int],
         doc_id: str,
         *,
-        owner_user_id: str | None = None,
-        visibility: str | None = None,
-        project_key: str | None = None,
         excluded_source_ids: Sequence[str] = (),
         limit: int = 200,
     ) -> CandidatePage[Memory]:
-        """Find active memories sharing entities with this memory but from different documents."""
+        """Find access-compatible active Memories sharing entities across documents.
+
+        Access identity is derived from the challenger row so callers cannot
+        accidentally widen or narrow the lifecycle boundary. Project remains a
+        relevance attribute and is not an access boundary.
+        """
         if not entity_ids:
             return CandidatePage(candidates=(), complete=True, requested_limit=limit)
         if limit < 1:
             return CandidatePage(candidates=(), complete=True, requested_limit=limit)
 
         placeholders = ",".join("?" for _ in entity_ids)
-        visibility_clause = "AND m.visibility != 'private'"
-        visibility_params: list[str] = []
-        if visibility == "private" and owner_user_id:
-            visibility_clause = "AND (m.visibility != 'private' OR m.owner_user_id = ?)"
-            visibility_params.append(owner_user_id)
         scope_clause = ""
         scope_params: list[Any] = []
-        if project_key:
-            scope_clause += " AND m.project_key = ?"
-            scope_params.append(project_key)
         if excluded_source_ids:
             source_placeholders = ",".join("?" for _ in excluded_source_ids)
             scope_clause += f"""
@@ -14266,22 +14351,31 @@ class Database:
             scope_params.extend(excluded_source_ids)
         sql = f"""
             SELECT DISTINCT m.* FROM memories m
+            JOIN memories challenger ON challenger.id = ?
             JOIN memory_entities me ON m.id = me.memory_id
             JOIN memory_sources ms ON m.id = ms.memory_id
             WHERE me.entity_id IN ({placeholders})
               AND ms.doc_id != ?
               AND m.id != ?
               AND m.status = 'active'
-              {visibility_clause}
+              AND challenger.status = 'active'
+              AND m.visibility = challenger.visibility
+              AND m.owner_user_id IS challenger.owner_user_id
+              AND m.repo_identifier IS challenger.repo_identifier
               {scope_clause}
-            ORDER BY m.updated_at DESC, m.id
+            ORDER BY CASE
+                         WHEN challenger.project_key IS NOT NULL
+                          AND m.project_key = challenger.project_key
+                         THEN 1 ELSE 0
+                     END DESC,
+                     m.updated_at DESC, m.id
             LIMIT ?
         """
         params = [
+            memory_id,
             *entity_ids,
             doc_id,
             memory_id,
-            *visibility_params,
             *scope_params,
             limit + 1,
         ]

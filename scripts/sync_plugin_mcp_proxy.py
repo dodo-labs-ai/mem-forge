@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate packaged MCP proxy copies from the canonical source file."""
+"""Generate packaged plugin runtime copies from canonical source files."""
 
 from __future__ import annotations
 
@@ -15,6 +15,21 @@ CANONICAL = ROOT / "src" / "memforge" / "plugin_mcp_proxy.py"
 GENERATED_COPIES = (
     ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_mcp.py",
     ROOT / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_mcp.py",
+)
+HOOK_CANONICAL = ROOT / "src" / "memforge" / "hook_adapter.py"
+HOOK_GENERATED_COPIES = (
+    ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_hook_adapter.py",
+    ROOT / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_hook_adapter.py",
+)
+REPO_IDENTITY_CANONICAL = ROOT / "src" / "memforge" / "repo_identity.py"
+REPO_IDENTITY_GENERATED_COPIES = (
+    ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_repo_identity.py",
+    ROOT / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_repo_identity.py",
+)
+PLUGIN_RUNTIME_FILES = (
+    (CANONICAL, GENERATED_COPIES),
+    (HOOK_CANONICAL, HOOK_GENERATED_COPIES),
+    (REPO_IDENTITY_CANONICAL, REPO_IDENTITY_GENERATED_COPIES),
 )
 
 
@@ -50,7 +65,7 @@ def _display_path(path: Path) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Generate packaged MCP proxy copies from src/memforge/plugin_mcp_proxy.py.",
+        description="Generate packaged plugin runtime copies from canonical MemForge sources.",
     )
     parser.add_argument(
         "--check",
@@ -59,16 +74,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    stale = synchronize_plugin_copies(
-        CANONICAL,
-        GENERATED_COPIES,
-        check=args.check,
+    stale = tuple(
+        path
+        for canonical, generated_copies in PLUGIN_RUNTIME_FILES
+        for path in synchronize_plugin_copies(canonical, generated_copies, check=args.check)
     )
     if not stale:
-        print("Packaged MCP proxy copies are already in sync.")
+        print("Packaged plugin runtime copies are already in sync.")
         return 0
     if args.check:
-        print("Packaged MCP proxy copies are stale:", file=sys.stderr)
+        print("Packaged plugin runtime copies are stale:", file=sys.stderr)
         for path in stale:
             print(f"- {_display_path(path)}", file=sys.stderr)
         print("Run: uv run python scripts/sync_plugin_mcp_proxy.py", file=sys.stderr)

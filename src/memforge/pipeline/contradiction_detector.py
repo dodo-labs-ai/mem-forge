@@ -1,9 +1,9 @@
-"""Cross-document contradiction detection.
+"""Cross-document relation classification.
 
-After memories are inserted from a document sync, checks whether any newly
-inserted memories contradict existing memories from OTHER documents that
-reference the same entities. Uses entity overlap as the candidate signal
-and LLM classification for the actual judgment.
+After Memories are inserted from a document sync, classifies their relationship
+to access-compatible Memories from other documents that reference the same
+entities. Entity overlap supplies candidates; structured classification may
+produce a conflict, refinement, clarification, or unrelated result.
 """
 
 from __future__ import annotations
@@ -53,14 +53,17 @@ MAX_CONTRADICTION_PROMPT_CHARS = 120_000
 MAX_CONTRADICTION_MEMORY_CONTENT_CHARS = 4_000
 
 
-CONTRADICTION_PROMPT = """You are checking whether pairs of team knowledge memories contradict each other.
+CONTRADICTION_PROMPT = """You are classifying how pairs of team knowledge memories relate.
 These memories come from different source documents about the same entities.
 
 For each pair, classify the relationship:
 - CONTRADICTION: they make mutually incompatible claims about the same thing
-- TEMPORAL: they describe the same fact at different time points (the newer one supersedes)
-- CLARIFICATION: one adds detail to the other without conflicting
+- TEMPORAL: they describe the same subject or property at different time points
+- CLARIFICATION: one adds compatible detail to the other without conflicting
 - UNRELATED: they happen to share an entity but discuss different aspects
+
+TEMPORAL and CLARIFICATION identify non-authoritative refinements. Classification
+does not decide which source is authoritative and does not supersede either Memory.
 
 <pairs>
 {pairs_json}
@@ -148,10 +151,10 @@ async def detect_cross_doc_contradictions(
     audit_context=None,
     actor_user_id: str | None = None,
 ) -> dict:
-    """Check newly inserted memories for contradictions with other documents.
+    """Classify cross-document relations for newly inserted Memories.
 
-    Finds existing memories sharing entities with the new ones but from
-    different source documents, then asks the LLM to classify each pair.
+    Finds access-compatible Memories sharing entities with the new ones but
+    from different source documents, then asks the LLM to classify each pair.
 
     Returns stats: {"contradictions": N, "temporal": N, "checked": N}
     """
@@ -196,9 +199,6 @@ async def detect_cross_doc_contradictions(
             mem_id,
             entity_ids,
             doc_id,
-            owner_user_id=memory.owner_user_id,
-            visibility=memory.visibility,
-            project_key=memory.project_key,
             excluded_source_ids=excluded_source_ids,
         )
         candidate_bucket_complete_by_challenger[mem_id] = candidate_page.complete
@@ -496,8 +496,8 @@ async def _build_cross_doc_relation_outcome_bundles(
             classification == "contradiction"
             for _, _, classification, _ in classified_pairs
         )
-        has_temporal = any(
-            classification == "temporal"
+        has_refinement = any(
+            classification in {"temporal", "clarification"}
             for _, _, classification, _ in classified_pairs
         )
         if not bucket_complete:
@@ -514,7 +514,7 @@ async def _build_cross_doc_relation_outcome_bundles(
         if bucket_complete and has_contradiction:
             identity_relation_type = RelationType.CONTRADICTS
             identity_authority_case = AuthorityCase.CROSS_SOURCE_CONFLICT
-        elif bucket_complete and has_temporal:
+        elif bucket_complete and has_refinement:
             identity_relation_type = RelationType.REFINES
             identity_authority_case = AuthorityCase.INDEPENDENT_REFINEMENT
         relation_run_id = _cross_doc_relation_run_id(
@@ -542,7 +542,7 @@ async def _build_cross_doc_relation_outcome_bundles(
                     reason="cross_doc_entity_overlap",
                 )
             )
-            if classification not in {"contradiction", "temporal"}:
+            if classification not in {"contradiction", "temporal", "clarification"}:
                 continue
             relation_type = RelationType.CONTRADICTS if classification == "contradiction" else RelationType.REFINES
             authority_case = (

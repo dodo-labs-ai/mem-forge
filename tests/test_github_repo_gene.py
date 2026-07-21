@@ -158,6 +158,7 @@ async def test_cloud_pull_discovers_scoped_markdown_and_fetches_content(monkeypa
         "source_type": "github_repo",
         "connection_mode": "cloud_pull",
         "repo_url": "https://github.example.test/payroll/architecture",
+        "repo_identifier": "github.example.test/payroll/architecture",
         "repo_host": "github.example.test",
         "repo_owner": "payroll",
         "repo_name": "architecture",
@@ -469,6 +470,7 @@ async def test_local_push_discovers_and_normalizes_pushed_package(tmp_path):
     assert normalized.markdown_body == "# Architecture\n\nMemory source design."
     assert normalized.source_semantics["source_type"] == "github_repo"
     assert normalized.source_semantics["connection_mode"] == "local_push"
+    assert normalized.source_semantics["repo_identifier"] == "github.example.test/payroll/architecture"
     assert normalized.source_semantics["relative_path"] == "README.md"
 
 

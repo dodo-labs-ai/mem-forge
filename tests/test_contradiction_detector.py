@@ -35,7 +35,11 @@ from memforge.models import (
     content_hash,
     generate_deterministic_review_id,
 )
-from memforge.pipeline.contradiction_detector import detect_cross_doc_contradictions
+from memforge.pipeline.contradiction_detector import (
+    CONTRADICTION_PROMPT,
+    _build_cross_doc_relation_outcome_bundles,
+    detect_cross_doc_contradictions,
+)
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.storage.database import Database
@@ -497,14 +501,12 @@ class TestGetCrossDocCandidates:
             memory_id=mem_a.id,
             entity_ids=[entity_id],
             doc_id="doc-aaa",
-            visibility=mem_a.visibility,
-            owner_user_id=mem_a.owner_user_id,
         )
 
         assert private_candidate.id not in {candidate.id for candidate in candidate_page.candidates}
 
     @pytest.mark.asyncio
-    async def test_private_candidate_search_includes_same_owner_private_memories(self, seeded_db):
+    async def test_private_candidate_search_includes_only_same_owner_private_memories(self, seeded_db):
         db, entity_id, _, _, _ = seeded_db
         challenger = _make_memory(
             "mem-private10",
@@ -545,16 +547,16 @@ class TestGetCrossDocCandidates:
             memory_id=challenger.id,
             entity_ids=[entity_id],
             doc_id="doc-private-challenger",
-            visibility=challenger.visibility,
-            owner_user_id=challenger.owner_user_id,
         )
 
         candidate_ids = {candidate.id for candidate in candidate_page.candidates}
         assert same_owner_candidate.id in candidate_ids
         assert other_owner_candidate.id not in candidate_ids
+        assert "mem-aaaa0001" not in candidate_ids
+        assert "mem-bbbb0001" not in candidate_ids
 
     @pytest.mark.asyncio
-    async def test_cross_doc_candidates_respect_project_boundary(self, seeded_db):
+    async def test_cross_doc_candidates_cross_project_relevance_boundary(self, seeded_db):
         db, entity_id, mem_a, _, _ = seeded_db
         mem_a.project_key = "PAY"
         await db.db.execute(
@@ -592,12 +594,58 @@ class TestGetCrossDocCandidates:
             memory_id=mem_a.id,
             entity_ids=[entity_id],
             doc_id="doc-aaa",
-            project_key=mem_a.project_key,
         )
 
         candidate_ids = {candidate.id for candidate in candidate_page.candidates}
         assert same_project_candidate.id in candidate_ids
-        assert other_project_candidate.id not in candidate_ids
+        assert other_project_candidate.id in candidate_ids
+        ordered_ids = [candidate.id for candidate in candidate_page.candidates]
+        assert ordered_ids.index(same_project_candidate.id) < ordered_ids.index(
+            other_project_candidate.id
+        )
+
+    @pytest.mark.asyncio
+    async def test_cross_doc_candidates_require_exact_repository_access_identity(self, seeded_db):
+        db, entity_id, mem_a, _, _ = seeded_db
+        mem_a.repo_identifier = "repo-a"
+        await db.db.execute(
+            "UPDATE memories SET repo_identifier = ? WHERE id = ?",
+            (mem_a.repo_identifier, mem_a.id),
+        )
+        same_repo = _make_memory(
+            "mem-repo-same",
+            "Same repository memory about PostgreSQL rollout.",
+        )
+        same_repo.repo_identifier = "repo-a"
+        other_repo = _make_memory(
+            "mem-repo-other",
+            "Other repository memory about PostgreSQL rollout.",
+        )
+        other_repo.repo_identifier = "repo-b"
+        for memory, doc_id in (
+            (same_repo, "doc-repo-same"),
+            (other_repo, "doc-repo-other"),
+        ):
+            await _insert_document(db, doc_id)
+            await db.insert_memory(memory)
+            await db.add_memory_source(
+                memory.id,
+                doc_id,
+                "confluence",
+                source_updated_at=None,
+            )
+            await db.link_memory_entity(memory.id, entity_id)
+        await db.db.commit()
+
+        candidate_page = await db.get_cross_doc_candidates(
+            memory_id=mem_a.id,
+            entity_ids=[entity_id],
+            doc_id="doc-aaa",
+        )
+
+        candidate_ids = {candidate.id for candidate in candidate_page.candidates}
+        assert same_repo.id in candidate_ids
+        assert other_repo.id not in candidate_ids
 
     @pytest.mark.asyncio
     async def test_cross_doc_candidates_exclude_user_disabled_sources(self, seeded_db):
@@ -1209,9 +1257,6 @@ class TestDetectCrossDocContradictions:
             entity_ids,
             doc_id,
             *,
-            owner_user_id=None,
-            visibility=None,
-            project_key=None,
             excluded_source_ids=(),
             limit=20,
         ):
@@ -1219,9 +1264,6 @@ class TestDetectCrossDocContradictions:
                 memory_id,
                 entity_ids,
                 doc_id,
-                owner_user_id,
-                visibility,
-                project_key,
                 excluded_source_ids,
                 limit,
             )
@@ -1318,9 +1360,6 @@ class TestDetectCrossDocContradictions:
             entity_ids,
             doc_id,
             *,
-            owner_user_id=None,
-            visibility=None,
-            project_key=None,
             excluded_source_ids=(),
             limit=200,
         ):
@@ -1328,9 +1367,6 @@ class TestDetectCrossDocContradictions:
                 memory_id,
                 entity_ids,
                 doc_id,
-                owner_user_id,
-                visibility,
-                project_key,
                 excluded_source_ids,
             )
             return CandidatePage(candidates=candidates[:limit], complete=True, requested_limit=limit)
@@ -1476,6 +1512,91 @@ class TestDetectCrossDocContradictions:
                 AuthorityCase.INDEPENDENT_REFINEMENT,
             )
         ]
+
+    @pytest.mark.asyncio
+    async def test_clarification_deterministically_maps_to_independent_refinement(
+        self,
+        seeded_db,
+    ):
+        db, _, mem_a, mem_b, _ = seeded_db
+
+        bundles = await _build_cross_doc_relation_outcome_bundles(
+            pairs=[(mem_b, mem_a)],
+            decisions_by_pair={
+                0: {
+                    "classification": "clarification",
+                    "reason": "The challenger adds a compatible operational detail.",
+                }
+            },
+            doc_id="doc-bbb",
+            db=db,
+            candidate_bucket_complete_by_challenger={mem_b.id: True},
+        )
+
+        bundle = bundles[mem_b.id]
+        assert bundle.relation_run.lifecycle_action is LifecycleAction.NONE
+        assert bundle.relation_run.review_case is None
+        assert [
+            (relation.memory_id, relation.relation_type, relation.authority_case)
+            for relation in bundle.relations
+        ] == [
+            (
+                mem_a.id,
+                RelationType.REFINES,
+                AuthorityCase.INDEPENDENT_REFINEMENT,
+            )
+        ]
+
+    def test_relation_prompt_does_not_assign_temporal_authority(self):
+        assert "newer one supersedes" not in CONTRADICTION_PROMPT
+        assert "does not decide which source is authoritative" in CONTRADICTION_PROMPT
+        assert "does not supersede either Memory" in CONTRADICTION_PROMPT
+
+    @pytest.mark.asyncio
+    async def test_repository_incompatible_candidates_are_filtered_before_llm(
+        self,
+        seeded_db,
+        memory_store,
+    ):
+        db, _, mem_a, mem_b, _ = seeded_db
+        mem_a.repo_identifier = "repo-a"
+        mem_b.repo_identifier = "repo-b"
+        await db.db.executemany(
+            "UPDATE memories SET repo_identifier = ? WHERE id = ?",
+            (
+                (mem_a.repo_identifier, mem_a.id),
+                (mem_b.repo_identifier, mem_b.id),
+            ),
+        )
+        await db.db.commit()
+        client = AsyncMock()
+        client.detect_contradictions = AsyncMock(
+            return_value=_mock_contradiction_response(
+                [
+                    {
+                        "pair_index": 0,
+                        "classification": "unrelated",
+                        "reason": "must not be reached",
+                    }
+                ]
+            )
+        )
+
+        stats = await detect_cross_doc_contradictions(
+            new_memory_ids=[mem_b.id],
+            doc_id="doc-bbb",
+            db=db,
+            memory_store=memory_store,
+            structured_llm_client=client,
+        )
+
+        assert stats == {
+            "contradictions": 0,
+            "temporal": 0,
+            "checked": 0,
+            "truncated": 0,
+        }
+        client.detect_contradictions.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_stale_primary_support_fails_closed_before_relation_write(

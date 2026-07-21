@@ -34,6 +34,7 @@ from memforge.models import (
     RawContent,
 )
 from memforge.pipeline.normalizer_utils import annotate_code_blocks, html_to_markdown, strip_boilerplate
+from memforge.repo_identity import normalize_repo_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -307,17 +308,21 @@ class GitHubPagesGene(Gene):
     async def normalize(self, raw: RawContent) -> NormalizedContent:
         raw_text = raw.body.decode("utf-8", errors="replace")
         page_url = _canonicalize_url(raw.item.source_url)
+        repo_identifier = _repo_identifier_for_item(raw.item)
         if raw.authoritative_empty:
+            source_semantics = {
+                "source_type": "github_pages",
+                "site_url": self._base_url,
+                "page_url": page_url,
+                "canonical_url": page_url,
+                "title": raw.item.title.strip() or "GitHub Pages Document",
+            }
+            if repo_identifier is not None:
+                source_semantics["repo_identifier"] = repo_identifier
             return NormalizedContent(
                 item=raw.item,
                 markdown_body="",
-                source_semantics={
-                    "source_type": "github_pages",
-                    "site_url": self._base_url,
-                    "page_url": page_url,
-                    "canonical_url": page_url,
-                    "title": raw.item.title.strip() or "GitHub Pages Document",
-                },
+                source_semantics=source_semantics,
             )
         if raw.content_type in {"text/markdown", "text/x-markdown"} or raw.item.extra.get("repo_api_url"):
             body = strip_boilerplate(raw_text)
@@ -343,17 +348,16 @@ class GitHubPagesGene(Gene):
             "## Document",
             body,
         ]).strip()
-        return NormalizedContent(
-            item=raw.item,
-            markdown_body=markdown,
-            source_semantics={
-                "source_type": "github_pages",
-                "site_url": self._base_url,
-                "page_url": page_url,
-                "canonical_url": page_url,
-                "title": title,
-            },
-        )
+        source_semantics = {
+            "source_type": "github_pages",
+            "site_url": self._base_url,
+            "page_url": page_url,
+            "canonical_url": page_url,
+            "title": title,
+        }
+        if repo_identifier is not None:
+            source_semantics["repo_identifier"] = repo_identifier
+        return NormalizedContent(item=raw.item, markdown_body=markdown, source_semantics=source_semantics)
 
     async def health_check(self) -> dict:
         try:
@@ -736,6 +740,20 @@ def _repo_ref_from_pages_url(url: str) -> _RepoRef | None:
         repo=path_parts[2],
         page_path="/".join(path_parts[3:]).strip("/"),
     )
+
+
+def _repo_identifier_for_item(item: ContentItem) -> str | None:
+    """Return repository identity only for repository-backed Pages content."""
+
+    if not item.extra.get("repo_api_url"):
+        return None
+    ref = _repo_ref_from_pages_url(item.source_url)
+    if ref is None:
+        raise ValueError("Repository-backed GitHub Pages content requires /pages/<owner>/<repo>/...")
+    identifier = normalize_repo_identifier(f"{ref.origin}/{ref.owner}/{ref.repo}")
+    if identifier is None:
+        raise ValueError("Repository-backed GitHub Pages content is missing repository identity")
+    return identifier
 
 
 def _repo_api_url(ref: _RepoRef) -> str:

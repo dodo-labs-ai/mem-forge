@@ -84,7 +84,10 @@ Top rules (apply these first; reject candidates that fail any of them):
 
 Standard rules:
 - Each memory must be SELF-CONTAINED (understandable without the source document).
-- Do NOT re-extract facts already listed in <existing_memories_for_these_entities>; focus on NEW or UPDATED information.
+- Existing memories are comparison context, not a novelty filter. If this document
+  directly states the same durable claim, still emit one candidate with exact
+  evidence from this document. Reconciliation, not extraction, decides whether
+  to reuse the Memory ID and attach another Support Assertion.
 - Use entity names from <entities_found>, not your own variations.
 - Prefer specifics ("PostgreSQL 15" not "a database").
 - For tickets: extract the decision/outcome, not the discussion.
@@ -216,6 +219,10 @@ Top rules (apply these first; reject candidates that fail any of them):
 
 Standard rules:
 - Extract only durable team knowledge grounded in <unit_markdown>.
+- Existing memories are comparison context, not a novelty filter. If this unit
+  directly states the same durable claim, still emit one candidate with exact
+  evidence from this unit. Reconciliation, not extraction, decides whether to
+  reuse the Memory ID and attach another Support Assertion.
 - Do not extract document outline, glossary, title, URL, or source metadata as memories.
 - For agent_session sources, extract only durable project decisions, conventions, procedures, and architectural rules that are NOT visible by reading the current code. Skip receipt/session metadata, validation commands/results, runtime notes, service start/stop state, local paths, working-tree state, and facts about the agent session itself.
 - Do not extract passwords, credentials, tokens, API keys, or secrets.
@@ -246,6 +253,11 @@ The following observations are CONTEXT only. Use them to resolve references and 
 
 Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required.
 
+Existing memories are comparison context, not a novelty filter. If a PRIMARY
+observation directly states the same durable claim, still emit one candidate
+with exact evidence from that observation. Reconciliation, not extraction,
+decides whether to reuse the Memory ID and attach another Support Assertion.
+
 Prefer an empty memories array over weak or transient claims. Do not emit records that only say an item was created, updated, uploaded, attached, assigned, labeled, ranked, moved, reprioritized, or passed through a routine workflow status. Do not emit revision history, source metadata, routing fields, questions, or secrets. An attachment-upload event is provenance, not authority about the attachment's contents; only separately supplied attachment-content evidence may support a claim. Preserve durable resolution rationale and settled outcomes, conditions, and source language.
 
 Return ONLY a JSON object with a "memories" array."""
@@ -259,8 +271,9 @@ Return ONLY a JSON object with a "memories" array."""
 class MemoryExtractor:
     """Memory extraction via LLM (Call 2 of the two-call extraction pipeline).
 
-    Receives enrichment output (entities, doc_type) and existing memories as context,
-    so it can focus on NEW or UPDATED information and use canonical entity names.
+    Receives enrichment output (entities, doc_type) and existing memories as
+    comparison context while preserving every durable claim directly supported
+    by the current Primary Evidence.
     """
 
     def __init__(
@@ -300,8 +313,9 @@ class MemoryExtractor:
             source_type: Type of the source gene (confluence, jira, etc.)
             doc_type: Document type from Call 1 (design-doc, runbook, etc.)
             entities: Canonical entity names found by Call 1.
-            existing_memories: Memories already in DB for these entities
-                (so the LLM can skip re-extracting known facts).
+            existing_memories: Memories already in DB for these entities.
+                They provide comparison context but do not suppress a candidate
+                directly supported by this document.
 
         Returns:
             MemoryExtractionResult with list of RawMemory candidates.

@@ -54,13 +54,20 @@ logger = logging.getLogger(__name__)
 __all__ = ["MemoryEngine"]
 
 
-MEMORY_EQUIVALENCE_PROMPT = """Decide whether two durable Memory claims have exactly the same truth conditions.
-Equivalent wording, language, or abbreviation is allowed. Return equivalent=false if either claim contradicts,
-narrows, broadens, conditions, updates, or adds any material fact relative to the other.
+MEMORY_EQUIVALENCE_PROMPT = """Decide whether claim_a and claim_b identify one canonical durable proposition with exactly the same truth conditions.
+Equivalence is symmetric: the labels do not imply recency, authority, direction, or preference. Compare the proposition
+rather than its speech act or presentation. Attribution, document framing, labels, examples, and stylistic modality are
+non-material unless they change authority, subject, action or value, scope, polarity, conditions, or time. A rule described
+as a requirement and the same rule described as a configured state may be equivalent when all material dimensions match.
+Treat "a document, case, or record states that P" and a direct statement of P as the same durable proposition when P is
+the knowledge being preserved and neither claim is about the act, completeness, or authority of recording itself.
 
-<candidate_pair>
+Return equivalent=false if either claim contradicts, narrows, broadens, conditions, updates, or adds any material fact.
+Equivalent wording, language, abbreviation, or presentation alone is not a material difference.
+
+<claim_pair>
 {pair_json}
-</candidate_pair>
+</claim_pair>
 """
 
 MEMORY_SUPPORT_VALIDATION_PROMPT = """Determine whether the current evidence still supports the exact Memory claim.
@@ -75,6 +82,20 @@ that directly supports the claim. Never paraphrase evidence_quote.
 {case_json}
 </case_json>
 """
+
+
+def _memory_equivalence_pair_json(first: str, second: str) -> str:
+    """Return one order-independent payload for the symmetric proof contract."""
+
+    claims = sorted(
+        (first, second),
+        key=lambda claim: (content_hash(claim), claim),
+    )
+    return json.dumps(
+        {"claim_a": claims[0], "claim_b": claims[1]},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 class MemoryEngine:
@@ -476,13 +497,9 @@ class MemoryEngine:
         if classifier is None:
             return None
         prompt = MEMORY_EQUIVALENCE_PROMPT.format(
-            pair_json=json.dumps(
-                {
-                    "candidate": candidate.content,
-                    "incumbent": incumbent.content,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
+            pair_json=_memory_equivalence_pair_json(
+                candidate.content,
+                incumbent.content,
             )
         )
         try:
