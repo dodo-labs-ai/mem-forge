@@ -8,7 +8,8 @@ concept claims and then into searchable memories.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Literal
@@ -23,7 +24,6 @@ from memforge.agent_knowledge_markdown import (
 from memforge.memory.evidence import (
     AccessContext,
     AuthorityCase,
-    EvidenceContentProvenance,
     EvidenceRelationRecord,
     EvidenceUnit,
     LifecycleAction,
@@ -37,7 +37,7 @@ from memforge.memory.evidence import (
     build_mandatory_candidate_bucket_results,
     relation_bundle_snapshot_audit,
 )
-from memforge.memory.lifecycle_plan import LifecycleMutationType, ReconciliationScope
+from memforge.memory.lifecycle_plan import LifecycleMutationType, LifecyclePlan, ReconciliationScope
 from memforge.memory.lifecycle_planner import (
     NewMemoryDefaults,
     build_lifecycle_plan,
@@ -148,6 +148,12 @@ class AgentKnowledgePatchResult:
     covered_concept_id: str | None = None
     covered_claim_id: str | None = None
     reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _AgentRelationIntent:
+    client: str
+    source_metadata: Mapping[str, object]
 
 
 class AgentKnowledgeBundleService:
@@ -720,9 +726,8 @@ class AgentKnowledgeBundleService:
         concept_projection: dict[str, object] | None = None,
         concept_markdown_body: str | None = None,
     ) -> str:
-        unit = _agent_evidence_unit(
+        intent = _agent_relation_intent(
             proposal=proposal,
-            source_id=source_id,
             client=client,
             session_id=session_id,
             workspace=workspace,
@@ -730,12 +735,7 @@ class AgentKnowledgeBundleService:
             claim_id=claim_id,
             owner_user_id=owner_user_id,
             repo_identifier=repo_identifier,
-            project_key=project_key,
-            submitted_at=submitted_at,
         )
-        lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [])
-        if lifecycle.action is not LifecycleAction.CREATE_MEMORY or not lifecycle.created_memory_id:
-            raise RuntimeError(f"unexpected agent claim create lifecycle action: {lifecycle.action}")
         projection, plan, memory_id = await self._build_agent_claim_lifecycle(
             concept_id=concept_id,
             source_id=source_id,
@@ -758,6 +758,14 @@ class AgentKnowledgeBundleService:
             reconcile_action=ReconcileAction.ADD,
             reconciliation_reason=proposal.reason or "agent claim created",
         )
+        plan, unit = self._bind_relation_evidence_to_plan(
+            plan=plan,
+            target_memory_id=memory_id,
+            intent=intent,
+        )
+        lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [])
+        if lifecycle.action is not LifecycleAction.CREATE_MEMORY or not lifecycle.created_memory_id:
+            raise RuntimeError(f"unexpected agent claim create lifecycle action: {lifecycle.action}")
         memory = self._build_claim_memory(
             memory_id=memory_id,
             claim_text=claim_text,
@@ -1048,6 +1056,59 @@ class AgentKnowledgeBundleService:
             raise ValueError("agent claim lifecycle produced no target Memory")
         return projection, plan, memory_id
 
+    @staticmethod
+    def _bind_relation_evidence_to_plan(
+        *,
+        plan: LifecyclePlan,
+        target_memory_id: str,
+        intent: _AgentRelationIntent,
+    ) -> tuple[LifecyclePlan, EvidenceUnit]:
+        """Persist one canonical Evidence Unit for relation and Support.
+
+        Agent patch intent is transient authority metadata. The projected
+        Evidence Unit is the durable identity because it owns the exact,
+        revision-pinned Evidence References used by Support Assertions.
+        """
+
+        support_reference_ids = {
+            reference_id
+            for mutation in plan.mutations
+            if mutation.mutation_type is LifecycleMutationType.ATTACH_SUPPORT
+            and mutation.memory_id == target_memory_id
+            for reference_id in mutation.evidence_reference_ids
+        }
+        evidence_unit_ids = {
+            reference.evidence_unit_id
+            for reference in plan.evidence_references
+            if reference.id in support_reference_ids
+        }
+        if len(evidence_unit_ids) != 1:
+            raise ValueError("agent relation requires one revision-pinned projected Evidence Unit")
+        evidence_unit_id = next(iter(evidence_unit_ids))
+        projected_unit = next(
+            (unit for unit in plan.evidence_units if unit.id == evidence_unit_id),
+            None,
+        )
+        if projected_unit is None:
+            raise ValueError("agent relation Evidence Unit is missing from the lifecycle plan")
+        relation_unit = replace(
+            projected_unit,
+            client=intent.client,
+            source_metadata={
+                **dict(projected_unit.source_metadata),
+                **dict(intent.source_metadata),
+            },
+        )
+        rebound_plan = replace(
+            plan,
+            evidence_units=tuple(
+                relation_unit if unit.id == evidence_unit_id else unit
+                for unit in plan.evidence_units
+            ),
+        )
+        rebound_plan.validate()
+        return rebound_plan, relation_unit
+
     async def _supersede_claim_memory(
         self,
         *,
@@ -1078,9 +1139,8 @@ class AgentKnowledgeBundleService:
         citations: list[str] | None = None,
         concept_markdown_body: str | None = None,
     ) -> str:
-        unit = _agent_evidence_unit(
+        intent = _agent_relation_intent(
             proposal=proposal,
-            source_id=source_id,
             client=client,
             session_id=session_id,
             workspace=workspace,
@@ -1088,8 +1148,38 @@ class AgentKnowledgeBundleService:
             claim_id=claim_id,
             owner_user_id=owner_user_id,
             repo_identifier=repo_identifier,
+        )
+        projection, plan, new_memory_id = await self._build_agent_claim_lifecycle(
+            concept_id=concept_id,
+            source_id=source_id,
+            client=client,
+            session_id=session_id,
+            workspace=workspace,
+            claim_text=claim_text,
+            memory_content=memory_content,
+            memory_type=memory_type,
+            tags=tags,
+            confidence=confidence,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
             project_key=project_key,
             submitted_at=submitted_at,
+            source_updated_at=source_updated_at,
+            concept_projection=None,
+            concept_markdown_body=concept_markdown_body,
+            incumbent_memory_id=old_memory_id,
+            reconcile_action=(
+                ReconcileAction.UPDATE
+                if replacement_kind == "revision"
+                else ReconcileAction.SUPERSEDE
+            ),
+            reconciliation_reason=replacement_reason,
+            memory_extraction_context=memory_extraction_context,
+        )
+        plan, unit = self._bind_relation_evidence_to_plan(
+            plan=plan,
+            target_memory_id=new_memory_id,
+            intent=intent,
         )
         relation_run_id = _relation_run_id(unit.id, session_id, proposal.action)
         existing_run = await self.db.get_relation_run(relation_run_id)
@@ -1150,33 +1240,6 @@ class AgentKnowledgeBundleService:
         lifecycle = MemoryRelationApplyService().derive_lifecycle(unit, [decision])
         if lifecycle.action is not LifecycleAction.SUPERSEDE_MEMORY:
             raise RuntimeError(f"unexpected agent claim replace lifecycle action: {lifecycle.action}")
-        projection, plan, new_memory_id = await self._build_agent_claim_lifecycle(
-            concept_id=concept_id,
-            source_id=source_id,
-            client=client,
-            session_id=session_id,
-            workspace=workspace,
-            claim_text=claim_text,
-            memory_content=memory_content,
-            memory_type=memory_type,
-            tags=tags,
-            confidence=confidence,
-            owner_user_id=owner_user_id,
-            repo_identifier=repo_identifier,
-            project_key=project_key,
-            submitted_at=submitted_at,
-            source_updated_at=source_updated_at,
-            concept_projection=None,
-            concept_markdown_body=concept_markdown_body,
-            incumbent_memory_id=old_memory_id,
-            reconcile_action=(
-                ReconcileAction.UPDATE
-                if replacement_kind == "revision"
-                else ReconcileAction.SUPERSEDE
-            ),
-            reconciliation_reason=replacement_reason,
-            memory_extraction_context=memory_extraction_context,
-        )
         memory = self._build_claim_memory(
             memory_id=new_memory_id,
             claim_text=claim_text,
@@ -1619,10 +1682,9 @@ def _utc(value: datetime | None) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _agent_evidence_unit(
+def _agent_relation_intent(
     *,
     proposal: AgentKnowledgePatchProposal,
-    source_id: str,
     client: str,
     session_id: str,
     workspace: str,
@@ -1630,49 +1692,20 @@ def _agent_evidence_unit(
     claim_id: str,
     owner_user_id: str,
     repo_identifier: str | None,
-    project_key: str | None,
-    submitted_at: datetime,
-) -> EvidenceUnit:
+) -> _AgentRelationIntent:
     claim_anchor = _claim_anchor(owner_user_id, repo_identifier, concept_id, claim_id)
-    source_metadata = {
-        "concept_id": concept_id,
-        "claim_id": claim_id,
-        "claim_anchor": claim_anchor,
-        "source_patch_intent": proposal.action,
-        "session_id": session_id,
-        "workspace": workspace,
-        "reason": proposal.reason,
-        "citations": [citation for citation in proposal.citations if citation.strip()],
-    }
-    content = _memory_content_for(proposal)
-    unit_id = _stable_id(
-        "eunit",
-        source_id,
-        session_id,
-        proposal.action,
-        claim_anchor,
-        content_hash(content),
-    )
-    return EvidenceUnit(
-        id=unit_id,
-        source_id=source_id,
-        doc_id=concept_id,
-        doc_revision_id=content_hash(proposal.claim_text.strip()),
-        source_type="agent_session",
+    return _AgentRelationIntent(
         client=client,
-        repo_identifier=repo_identifier,
-        source_anchor=claim_anchor,
-        source_lineage_id=claim_anchor,
-        source_metadata=source_metadata,
-        project_key=project_key,
-        visibility=Visibility.PRIVATE.value,
-        owner_user_id=owner_user_id,
-        observed_at=submitted_at.isoformat(),
-        extractor_run_id=session_id,
-        access_context_hash=_stable_id("access", owner_user_id, repo_identifier or "", source_id),
-        content=content,
-        excerpt=proposal.claim_text.strip(),
-        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        source_metadata={
+            "concept_id": concept_id,
+            "claim_id": claim_id,
+            "claim_anchor": claim_anchor,
+            "source_patch_intent": proposal.action,
+            "session_id": session_id,
+            "workspace": workspace,
+            "reason": proposal.reason,
+            "citations": [citation for citation in proposal.citations if citation.strip()],
+        },
     )
 
 
