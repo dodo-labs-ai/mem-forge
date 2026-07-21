@@ -132,6 +132,32 @@ async def _relation_runs_for_memory(db: Database, memory_id: str) -> list[dict]:
     return rows
 
 
+async def _support_evidence_unit_ids(db: Database, memory_id: str) -> set[str]:
+    async with db.db.execute(
+        """SELECT DISTINCT er.evidence_unit_id
+             FROM memory_support_assertions msa
+             JOIN evidence_references er ON er.id = msa.evidence_reference_id
+            WHERE msa.memory_id = ? AND msa.active = 1""",
+        (memory_id,),
+    ) as cursor:
+        return {str(row[0]) async for row in cursor}
+
+
+async def _stale_support_reference_count(db: Database, memory_id: str) -> int:
+    async with db.db.execute(
+        """SELECT COUNT(*)
+             FROM memory_support_assertions msa
+             JOIN evidence_references er ON er.id = msa.evidence_reference_id
+             JOIN source_observations so ON so.id = er.observation_id
+            WHERE msa.memory_id = ?
+              AND msa.active = 1
+              AND er.observation_revision_id <> so.current_revision_id""",
+        (memory_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return int(row[0])
+
+
 @pytest.mark.asyncio
 async def test_upsert_agent_concept_rolls_back_after_cancellation(bundle_stack, monkeypatch):
     db, _store, _collection = bundle_stack
@@ -251,6 +277,8 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
     assert [(relation.memory_id, relation.relation_type) for relation in relations] == [
         (result.memory_id, RelationType.SUPPORTS)
     ]
+    assert await _support_evidence_unit_ids(db, result.memory_id) == {evidence_unit.id}
+    assert await _stale_support_reference_count(db, result.memory_id) == 0
 
 
 @pytest.mark.asyncio
@@ -995,6 +1023,9 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
     assert [(relation.memory_id, relation.relation_type) for relation in relations] == [
         (updated.memory_id, RelationType.SUPPORTS)
     ]
+    assert evidence_unit.client == "codex"
+    assert await _support_evidence_unit_ids(db, updated.memory_id) == {evidence_unit.id}
+    assert await _stale_support_reference_count(db, updated.memory_id) == 0
 
 
 @pytest.mark.asyncio
