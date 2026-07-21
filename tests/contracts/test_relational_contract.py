@@ -189,6 +189,98 @@ class RelationalStoreContract:
 
         assert [memory.id for memory in candidates] == [first.id, second.id]
 
+    async def test_active_memory_batch_reads_separate_full_rows_from_candidate_provenance(
+        self,
+        adapters: ContractAdapters,
+    ) -> None:
+        store = adapters.relational
+        first = make_memory("batch-first", repo_identifier="repo-a")
+        second = make_memory(
+            "batch-second",
+            visibility=Visibility.PRIVATE.value,
+            owner_user_id="owner-a",
+            repo_identifier="repo-a",
+        )
+        retired = make_memory("batch-retired", status="retired")
+        for memory in (second, retired, first):
+            await store.insert_memory(memory)
+        for document in (
+            make_document("doc-first-a", source="src-a"),
+            make_document("doc-first-b", source="src-b"),
+            make_document("doc-second", source="src-private"),
+        ):
+            await store.upsert_document(document)
+        await store.add_memory_source(
+            first.id,
+            "doc-first-a",
+            "github",
+            None,
+            source_updated_at=None,
+        )
+        await store.add_memory_source(
+            first.id,
+            "doc-first-b",
+            "github",
+            None,
+            source_updated_at=None,
+        )
+        await store.add_memory_source(
+            second.id,
+            "doc-second",
+            "jira",
+            None,
+            source_updated_at=None,
+        )
+
+        memories = await store.list_active_memories(
+            (first.id, retired.id, "missing", second.id, first.id),
+        )
+        candidates = await store.list_active_candidate_memories(
+            (first.id, retired.id, "missing", second.id, first.id),
+        )
+
+        assert [memory.id for memory in memories] == [first.id, second.id]
+        assert {
+            (
+                candidate.memory_id,
+                candidate.source_id,
+                candidate.doc_id,
+                candidate.source_lineage_id,
+                candidate.visibility,
+                candidate.owner_user_id,
+                candidate.repo_identifier,
+            )
+            for candidate in candidates
+        } == {
+            (
+                first.id,
+                "src-a",
+                "doc-first-a",
+                "doc-first-a",
+                Visibility.WORKSPACE.value,
+                None,
+                "repo-a",
+            ),
+            (
+                first.id,
+                "src-b",
+                "doc-first-b",
+                "doc-first-b",
+                Visibility.WORKSPACE.value,
+                None,
+                "repo-a",
+            ),
+            (
+                second.id,
+                "src-private",
+                "doc-second",
+                "doc-second",
+                Visibility.PRIVATE.value,
+                "owner-a",
+                "repo-a",
+            ),
+        }
+
     async def test_rebaseline_reactivation_candidate_is_exact_and_access_scoped(
         self,
         adapters: ContractAdapters,

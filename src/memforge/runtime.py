@@ -26,6 +26,7 @@ from memforge.local_agent.source_contract import (
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.health import MemoryIndexHealthChecker, MemoryIndexHealthReport
+from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.store import MemoryStore
 from memforge.models import SourceSyncRun, SyncState
 from memforge.pipeline.enricher import Enricher
@@ -599,8 +600,11 @@ async def build_sync_runtime(
         document_index=DocumentVectorIndex(doc_collection),
     )
     memory_engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=CrossDocumentCandidateRetriever(
+            relational=adapters.relational,
+            keyword=adapters.keyword,
+            vector=adapters.vector,
+        ),
         db=db,
         memory_store=memory_store,
         embed_cfg=embed_cfg,

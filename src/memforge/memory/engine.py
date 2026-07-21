@@ -30,6 +30,7 @@ from memforge.memory.lifecycle_planner import (
     lifecycle_plan_id,
 )
 from memforge.memory.quality import classify_memory_candidate
+from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.source_access import memory_visibility_for_document
 from memforge.source_projection import ImpactResult, ProjectionCoverage, resolve_anchor_impact
 from memforge.models import (
@@ -41,8 +42,6 @@ from memforge.models import (
     generate_memory_id,
     parse_memory_validity_date,
 )
-
-from memforge.storage.adapters.protocols import RelationalStore, VectorStore
 
 if TYPE_CHECKING:
     from memforge.memory.store import MemoryStore
@@ -110,18 +109,14 @@ class MemoryEngine:
 
     def __init__(
         self,
-        relational: RelationalStore,
-        vector: VectorStore,
+        cross_document_candidates: CrossDocumentCandidateRetriever,
         db: Database,
         memory_store: MemoryStore,
         embed_cfg: dict | None = None,
         structured_llm_client: Any = None,
         llm_model: str = "claude-sonnet-4-20250514",
     ) -> None:
-        # Held so a later phase can stamp visibility through them without
-        # re-plumbing this constructor; the orchestration here reads neither yet.
-        self.relational = relational
-        self.vector = vector
+        self.cross_document_candidates = cross_document_candidates
         self.db = db
         self.memory_store = memory_store
         self.structured_llm_client = structured_llm_client
@@ -924,6 +919,7 @@ class MemoryEngine:
                 doc_id=doc_id,
                 db=self.db,
                 memory_store=self.memory_store,
+                candidate_retriever=self.cross_document_candidates,
                 structured_llm_client=self.structured_llm_client,
                 llm_model=self.llm_model,
                 actor_user_id=user_id,

@@ -44,6 +44,7 @@ class CandidateBucket(str, Enum):
     LEXICAL_BM25 = "lexical_bm25"
     SAME_PROJECT = "same_project"
     SOURCE_TITLE_OR_TAG_OVERLAP = "source_title_or_tag_overlap"
+    HYBRID_DISCOVERY = "hybrid_discovery"
 
 
 class EvidenceContentProvenance(str, Enum):
@@ -380,6 +381,7 @@ class CandidateBucketResult:
     complete: bool
     candidates: tuple[CandidateMemory, ...]
     scores: Mapping[str, float] = field(default_factory=dict)
+    candidate_reasons: Mapping[str, str] = field(default_factory=dict)
     reason: str | None = None
 
 
@@ -628,7 +630,10 @@ def build_candidate_universe(
                 is_mandatory=mandatory,
                 bucket_complete=bucket_result.complete,
                 was_checked=True,
-                reason=bucket_result.reason,
+                reason=bucket_result.candidate_reasons.get(
+                    candidate.memory_id,
+                    bucket_result.reason,
+                ),
             )
             existing = best_by_memory.get(candidate.memory_id)
             if existing is None or (

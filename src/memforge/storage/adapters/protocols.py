@@ -22,6 +22,7 @@ from memforge.models import (
 )
 from memforge.memory.evidence import (
     ActiveSupportEvidence,
+    CandidateMemory,
     EvidenceReference,
     EvidenceUnit,
     MemorySupportAssertion,
@@ -138,6 +139,11 @@ class RelationalStore(Protocol):
 
     async def insert_memory(self, memory: Memory) -> str: ...
     async def get_memory(self, memory_id: str) -> Memory | None: ...
+    async def list_active_memories(self, memory_ids: Sequence[str]) -> list[Memory]: ...
+    async def list_active_candidate_memories(
+        self,
+        memory_ids: Sequence[str],
+    ) -> list[CandidateMemory]: ...
     async def find_active_exact_claim_candidate(
         self,
         content_hash: str,

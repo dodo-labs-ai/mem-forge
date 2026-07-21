@@ -6,6 +6,7 @@ import pytest
 
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
+from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.store import MemoryStore
 from memforge.models import RawMemory
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -36,8 +37,11 @@ async def engine_fixture(tmp_path):
         audit_logger=MemoryAuditLogger(database),
     )
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=CrossDocumentCandidateRetriever(
+            relational=adapters.relational,
+            keyword=adapters.keyword,
+            vector=adapters.vector,
+        ),
         db=database,
         memory_store=store,
         structured_llm_client=object(),

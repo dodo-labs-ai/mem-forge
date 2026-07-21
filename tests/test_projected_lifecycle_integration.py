@@ -55,6 +55,7 @@ from memforge.memory.lifecycle_planner import (
     lifecycle_plan_id,
 )
 from memforge.memory.store import MemoryStore
+from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.models import (
     ContentItem,
     DocumentRecord,
@@ -75,6 +76,14 @@ from memforge.pipeline.source_projection_adapters import (
 from memforge.source_projection import AnchorKind, SourceAnchor, SourceProjection
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
+
+
+def _candidate_retriever(adapters):
+    return CrossDocumentCandidateRetriever(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+    )
 
 
 @pytest_asyncio.fixture
@@ -437,8 +446,7 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
     adapters = build_sqlite_adapters(db, object())
     store = _AuditedOutboxDrainer(db)
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=store,
         structured_llm_client=None,
@@ -505,8 +513,7 @@ async def test_projected_create_persists_validity_as_dates(db: Database) -> None
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=None,
@@ -549,8 +556,7 @@ async def test_incomplete_candidate_ledger_is_audited_and_writes_no_memory(
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_AuditedOutboxDrainer(db),
         structured_llm_client=client,
@@ -1576,8 +1582,7 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
     )
@@ -1627,8 +1632,7 @@ async def test_incremental_noop_rebinds_exact_unchanged_claim_without_new_extrac
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_NoopClient(incumbent.id),
@@ -1683,8 +1687,7 @@ async def test_incremental_noop_revalidates_reworded_primary_evidence(
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_SupportValidatingNoopClient(
@@ -1741,8 +1744,7 @@ async def test_incremental_noop_reworded_primary_requires_exact_current_quote(
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_SupportValidatingNoopClient(
@@ -1793,8 +1795,7 @@ async def test_incremental_noop_invalidated_primary_creates_review(
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_SupportValidatingNoopClient(
@@ -1846,8 +1847,7 @@ async def test_persistent_indexless_replacement_creates_review_without_mutating_
     client = _PersistentlyIndexlessReplacementClient(incumbent.id)
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=client,
@@ -1899,8 +1899,7 @@ async def test_explicit_empty_revision_deterministically_removes_incumbent_suppo
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=None,
@@ -2040,8 +2039,7 @@ async def test_partial_jira_projection_skips_llm_for_proven_disjoint_incumbent(
     assert second.coverage.value == "partial_projection"
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_UnexpectedReconciliationClient(),
@@ -2127,8 +2125,7 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
     client = _RecordingAddClient(incumbent.id)
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=client,
@@ -2205,8 +2202,7 @@ async def test_partial_jira_projection_admits_directly_affected_incumbent_delete
     assert second.coverage.value == "partial_projection"
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_DeleteClient(incumbent.id),
@@ -2253,8 +2249,7 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_SupportValidatingNoopClient(
@@ -2333,8 +2328,7 @@ async def test_noop_with_invalidated_required_evidence_creates_review(db: Databa
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_SupportValidatingNoopClient(
@@ -2669,8 +2663,7 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_EquivalentMemoryStore(db, incumbent),
         structured_llm_client=_SemanticEquivalentClient(),
@@ -2758,8 +2751,7 @@ async def test_same_source_cross_unit_semantic_equivalent_claim_reuses_memory_id
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_EquivalentMemoryStore(db, incumbent),
         structured_llm_client=_SemanticEquivalentClient(),
@@ -2820,8 +2812,7 @@ async def test_same_source_cross_unit_exact_claim_reuses_memory_id_and_preserves
 ) -> None:
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=None,
@@ -2989,8 +2980,7 @@ async def test_cross_source_exact_claim_reuses_memory_without_llm_and_preserves_
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=None,
@@ -3126,8 +3116,7 @@ async def test_ordinary_exact_admission_preserves_agent_claim_identity(
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=None,
@@ -3328,8 +3317,7 @@ async def test_new_projected_memory_persists_explicit_source_observation_support
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_SemanticEquivalentClient(),
@@ -3375,8 +3363,7 @@ async def test_new_projected_memory_commit_survives_vector_outbox_delivery_failu
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_FailingOutboxDrainer(db),
         structured_llm_client=_SemanticEquivalentClient(),
@@ -3452,8 +3439,7 @@ async def test_rebaseline_replay_reuses_memory_with_explicit_observation_support
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_SemanticEquivalentClient(),
@@ -3926,8 +3912,7 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_ReplacementClient(incumbent.id),
@@ -3995,8 +3980,7 @@ async def test_projected_quality_consumes_typed_observation_semantics(
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
     )
@@ -4067,8 +4051,7 @@ async def test_projected_lifecycle_enforces_candidate_quality_before_persistence
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
     )
@@ -4121,9 +4104,9 @@ async def test_enabled_source_tombstone_retires_last_supported_incumbent(db: Dat
         },
         reason="not_returned_by_authoritative_snapshot",
     )
+    adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=build_sqlite_adapters(db, object()).relational,
-        vector=build_sqlite_adapters(db, object()).vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
     )
@@ -4165,8 +4148,7 @@ async def test_gated_source_tombstone_only_opens_review(db: Database) -> None:
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        relational=adapters.relational,
-        vector=adapters.vector,
+        cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
     )
