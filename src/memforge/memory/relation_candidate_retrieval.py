@@ -116,9 +116,7 @@ class CrossDocumentCandidateSelection:
                 for candidate in self.discovery
             ]
         }
-        return sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()[:16]
+        return sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
 
     def bucket_results(self) -> tuple[CandidateBucketResult, ...]:
         results: list[CandidateBucketResult] = []
@@ -129,46 +127,15 @@ class CrossDocumentCandidateSelection:
                     bucket_rank=10,
                     complete=True,
                     candidates=tuple(candidate.memory for candidate in self.discovery),
-                    scores={
-                        candidate.memory.memory_id: candidate.score
-                        for candidate in self.discovery
-                    },
+                    scores={candidate.memory.memory_id: candidate.score for candidate in self.discovery},
                     candidate_reasons={
-                        candidate.memory.memory_id: (
-                            "hybrid_discovery:" + ",".join(candidate.channels)
-                        )
+                        candidate.memory.memory_id: ("hybrid_discovery:" + ",".join(candidate.channels))
                         for candidate in self.discovery
                     },
                     reason="bounded hybrid cross-document discovery",
                 )
             )
         return tuple(results)
-
-    def restrict_to_ids(
-        self,
-        memory_ids: Sequence[str],
-    ) -> CrossDocumentCandidateSelection:
-        """Drop candidates that ceased to be active before full-row loading."""
-
-        allowed = frozenset(memory_ids)
-        return CrossDocumentCandidateSelection(
-            discovery=tuple(
-                candidate
-                for candidate in self.discovery
-                if candidate.memory.memory_id in allowed
-            ),
-            audit={
-                **self.audit,
-                "selected_discovery_count": sum(
-                    1 for memory_id in self.candidate_ids if memory_id in allowed
-                ),
-            },
-            telemetry={
-                **self.telemetry,
-                "full_memory_rows_loaded": len(allowed),
-            },
-        )
-
 
 class CrossDocumentCandidateRetriever:
     """Retrieve IDs in parallel, then resolve only lightweight provenance rows."""
@@ -193,6 +160,7 @@ class CrossDocumentCandidateRetriever:
         entity_ids: Sequence[int],
         doc_id: str,
         actor_user_id: str | None,
+        source_id: str,
         excluded_source_ids: Sequence[str] = (),
     ) -> CrossDocumentCandidateSelection:
         started_at = time.perf_counter()
@@ -202,27 +170,17 @@ class CrossDocumentCandidateRetriever:
             entity_ids=entity_ids,
             scope=scope,
         )
-        all_ids = tuple(
-            dict.fromkeys(
-                item.item_id
-                for items in channels.values()
-                for item in items
-            )
-        )
+        all_ids = tuple(dict.fromkeys(item.item_id for items in channels.values() for item in items))
         provenance_rows = await self._relational.list_active_candidate_memories(all_ids)
         eligible = _eligible_candidate_rows(
             provenance_rows,
             challenger=challenger,
             doc_id=doc_id,
+            source_id=source_id,
             excluded_source_ids=frozenset(excluded_source_ids),
         )
         eligible_channels = {
-            channel: tuple(
-                item
-                for item in items
-                if item.item_id in eligible
-            )
-            for channel, items in channels.items()
+            channel: tuple(item for item in items if item.item_id in eligible) for channel, items in channels.items()
         }
         fused = weighted_reciprocal_rank_fusion(
             channels=eligible_channels,
@@ -248,9 +206,7 @@ class CrossDocumentCandidateRetriever:
                 "mandatory_candidate_count": 0,
             },
             telemetry={
-                "channel_candidate_counts": {
-                    channel: len(items) for channel, items in channels.items()
-                },
+                "channel_candidate_counts": {channel: len(items) for channel, items in channels.items()},
                 "eligible_candidate_count": len(eligible),
                 "fused_candidate_count": len(fused),
                 "discovery_budget": discovery_budget,
@@ -269,33 +225,35 @@ class CrossDocumentCandidateRetriever:
         *,
         challenger: Memory,
         doc_id: str,
+        source_id: str,
         excluded_source_ids: Sequence[str] = (),
     ) -> tuple[CrossDocumentCandidateSelection, Mapping[str, Memory]]:
         """Materialize full rows, then recheck current provenance before use."""
 
         loaded = await self._relational.list_active_memories(selection.candidate_ids)
-        by_id = {
-            memory.id: memory
-            for memory in loaded
-            if _memory_access_compatible(memory, challenger)
-        }
-        provenance_rows = await self._relational.list_active_candidate_memories(
-            tuple(by_id)
-        )
+        by_id = {memory.id: memory for memory in loaded if _memory_access_compatible(memory, challenger)}
+        provenance_rows = await self._relational.list_active_candidate_memories(tuple(by_id))
         eligible = _eligible_candidate_rows(
             provenance_rows,
             challenger=challenger,
             doc_id=doc_id,
+            source_id=source_id,
             excluded_source_ids=frozenset(excluded_source_ids),
         )
-        current_ids = tuple(
-            memory_id
-            for memory_id in selection.candidate_ids
-            if memory_id in by_id and memory_id in eligible
+        missing_ids = tuple(
+            memory_id for memory_id in selection.candidate_ids if memory_id not in by_id or memory_id not in eligible
         )
-        current_selection = selection.restrict_to_ids(current_ids)
-        by_id = {memory_id: by_id[memory_id] for memory_id in current_ids}
-        return current_selection, by_id
+        if missing_ids:
+            raise StaleCandidateSelectionError("selected candidate could not be materialized with current access")
+        materialized_selection = CrossDocumentCandidateSelection(
+            discovery=selection.discovery,
+            audit=selection.audit,
+            telemetry={
+                **selection.telemetry,
+                "full_memory_rows_loaded": len(selection.candidate_ids),
+            },
+        )
+        return materialized_selection, {memory_id: by_id[memory_id] for memory_id in selection.candidate_ids}
 
     async def ensure_selection_current(
         self,
@@ -303,6 +261,7 @@ class CrossDocumentCandidateRetriever:
         *,
         challenger: Memory,
         doc_id: str,
+        source_id: str,
         excluded_source_ids: Sequence[str] = (),
     ) -> None:
         """Fail closed if access or provenance changed before relation writes."""
@@ -314,20 +273,15 @@ class CrossDocumentCandidateRetriever:
             or not _memory_access_compatible(current_challenger, challenger)
         ):
             raise StaleCandidateSelectionError("challenger access changed")
-        provenance_rows = await self._relational.list_active_candidate_memories(
-            selection.candidate_ids
-        )
+        provenance_rows = await self._relational.list_active_candidate_memories(selection.candidate_ids)
         eligible = _eligible_candidate_rows(
             provenance_rows,
             challenger=current_challenger,
             doc_id=doc_id,
+            source_id=source_id,
             excluded_source_ids=frozenset(excluded_source_ids),
         )
-        current_ids = tuple(
-            memory_id
-            for memory_id in selection.candidate_ids
-            if memory_id in eligible
-        )
+        current_ids = tuple(memory_id for memory_id in selection.candidate_ids if memory_id in eligible)
         if current_ids != selection.candidate_ids:
             raise StaleCandidateSelectionError("candidate access or provenance changed")
 
@@ -359,16 +313,10 @@ class CrossDocumentCandidateRetriever:
                 errors.append(channel)
             else:
                 ranked_items = sorted(
-                    (
-                        RankedChannelItem(memory_id, score)
-                        for memory_id, score in result
-                        if memory_id != challenger.id
-                    ),
+                    (RankedChannelItem(memory_id, score) for memory_id, score in result if memory_id != challenger.id),
                     key=lambda item: (-item.score, item.item_id),
                 )
-                channels[channel] = tuple(
-                    ranked_items[: self._policy.rank_window_size]
-                )
+                channels[channel] = tuple(ranked_items[: self._policy.rank_window_size])
         return channels, tuple(errors)
 
     async def _entity_channel(
@@ -426,11 +374,7 @@ def _bounded_any_term_fts_query(content: str, *, max_terms: int) -> str:
     sanitized = sanitize_fts_query(content)
     if not sanitized:
         return ""
-    terms = (
-        term
-        for term in sanitized.split()
-        if term.strip('"').casefold() not in _LEXICAL_DISCOVERY_STOP_WORDS
-    )
+    terms = (term for term in sanitized.split() if term.strip('"').casefold() not in _LEXICAL_DISCOVERY_STOP_WORDS)
     unique_terms = tuple(dict.fromkeys(terms))[:max_terms]
     return " OR ".join(unique_terms)
 
@@ -451,6 +395,7 @@ def _eligible_candidate_rows(
     *,
     challenger: Memory,
     doc_id: str,
+    source_id: str,
     excluded_source_ids: frozenset[str],
 ) -> dict[str, CandidateMemory]:
     eligible: dict[str, CandidateMemory] = {}
@@ -467,8 +412,27 @@ def _eligible_candidate_rows(
             continue
         if candidate.source_id is not None and candidate.source_id in excluded_source_ids:
             continue
-        eligible.setdefault(candidate.memory_id, candidate)
+        existing = eligible.get(candidate.memory_id)
+        if existing is None or _candidate_provenance_key(
+            candidate,
+            challenger_source_id=source_id,
+        ) < _candidate_provenance_key(existing, challenger_source_id=source_id):
+            eligible[candidate.memory_id] = candidate
     return eligible
+
+
+def _candidate_provenance_key(
+    candidate: CandidateMemory,
+    *,
+    challenger_source_id: str,
+) -> tuple[bool, str, str]:
+    """Prefer an independent source while keeping deterministic selection."""
+
+    return (
+        candidate.source_id == challenger_source_id,
+        candidate.source_id or "",
+        candidate.doc_id or "",
+    )
 
 
 def _memory_access_compatible(candidate: Memory, challenger: Memory) -> bool:

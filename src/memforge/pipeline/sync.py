@@ -19,7 +19,7 @@ import math
 import threading
 import uuid
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -441,6 +441,7 @@ class GeneSyncOrchestrator:
         memory_observer: SyncMemoryObserver | None = None,
         memory_reclaimer: ProcessMemoryReclaimer | None = None,
         source_projection_adapter: SourceProjectionAdapter | None = None,
+        retry_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.db = db
         self.doc_store = doc_store
@@ -458,6 +459,7 @@ class GeneSyncOrchestrator:
         self.memory_observer = memory_observer
         self.memory_reclaimer = memory_reclaimer or ProcessMemoryReclaimer()
         self.source_projection_adapter = source_projection_adapter or DEFAULT_SOURCE_PROJECTION_ADAPTER
+        self._retry_sleep = retry_sleep
 
         self._llm_semaphore = asyncio.Semaphore(self.max_concurrent)
         self._db_lock = asyncio.Lock()
@@ -878,7 +880,7 @@ class GeneSyncOrchestrator:
                                     item.item_id,
                                     e,
                                 )
-                                await asyncio.sleep(delay)
+                                await self._retry_sleep(delay)
                             else:
                                 logger.error(
                                     "Failed to process %s after %d attempts: %s",

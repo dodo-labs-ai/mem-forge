@@ -35,6 +35,7 @@ def client(tmp_path, monkeypatch):
 
     cfg = AppConfig(base_dir=tmp_path / "mem")
     cfg.server.jwt_secret = "test-secret"
+    cfg.sync.worker_enabled = False
     app = create_admin_app(config=cfg)
     with TestClient(app) as c:
         yield c

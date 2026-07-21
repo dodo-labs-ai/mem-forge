@@ -22,6 +22,10 @@ from memforge.memory.candidate_ledger import (
 )
 from memforge.memory.entity_resolver import EntityResolver, insert_llm_alias, resolve_entity
 from memforge.memory.evidence import EvidenceRole
+from memforge.memory.identity_resolver import (
+    IdentityResolutionRequest,
+    IdentityResolver,
+)
 from memforge.memory.lifecycle_plan import ReconciliationScope
 from memforge.memory.lifecycle_planner import (
     NewMemoryDefaults,
@@ -31,6 +35,7 @@ from memforge.memory.lifecycle_planner import (
 )
 from memforge.memory.quality import classify_memory_candidate
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
+from memforge.memory.relation_classifier import StructuredMemoryPairClassifier
 from memforge.source_access import memory_visibility_for_document
 from memforge.source_projection import ImpactResult, ProjectionCoverage, resolve_anchor_impact
 from memforge.models import (
@@ -54,22 +59,6 @@ logger = logging.getLogger(__name__)
 __all__ = ["MemoryEngine"]
 
 
-MEMORY_EQUIVALENCE_PROMPT = """Decide whether claim_a and claim_b identify one canonical durable proposition with exactly the same truth conditions.
-Equivalence is symmetric: the labels do not imply recency, authority, direction, or preference. Compare the proposition
-rather than its speech act or presentation. Attribution, document framing, labels, examples, and stylistic modality are
-non-material unless they change authority, subject, action or value, scope, polarity, conditions, or time. A rule described
-as a requirement and the same rule described as a configured state may be equivalent when all material dimensions match.
-Treat "a document, case, or record states that P" and a direct statement of P as the same durable proposition when P is
-the knowledge being preserved and neither claim is about the act, completeness, or authority of recording itself.
-
-Return equivalent=false if either claim contradicts, narrows, broadens, conditions, updates, or adds any material fact.
-Equivalent wording, language, abbreviation, or presentation alone is not a material difference.
-
-<claim_pair>
-{pair_json}
-</claim_pair>
-"""
-
 MEMORY_SUPPORT_VALIDATION_PROMPT = """Determine whether the current evidence still supports the exact Memory claim.
 Return supported=true only when the claim's truth conditions remain entailed by the current
 Primary and every current Required observation. A change in scope, subject, condition,
@@ -82,20 +71,6 @@ that directly supports the claim. Never paraphrase evidence_quote.
 {case_json}
 </case_json>
 """
-
-
-def _memory_equivalence_pair_json(first: str, second: str) -> str:
-    """Return one order-independent payload for the symmetric proof contract."""
-
-    claims = sorted(
-        (first, second),
-        key=lambda claim: (content_hash(claim), claim),
-    )
-    return json.dumps(
-        {"claim_a": claims[0], "claim_b": claims[1]},
-        ensure_ascii=False,
-        sort_keys=True,
-    )
 
 
 class MemoryEngine:
@@ -121,6 +96,19 @@ class MemoryEngine:
         self.memory_store = memory_store
         self.structured_llm_client = structured_llm_client
         self.llm_model = llm_model
+        self.pair_classifier = (
+            StructuredMemoryPairClassifier(
+                client=structured_llm_client,
+                model=llm_model,
+            )
+            if callable(getattr(structured_llm_client, "classify_memory_relations", None))
+            else None
+        )
+        self.identity_resolver = IdentityResolver(
+            memory_store=memory_store,
+            pair_classifier=self.pair_classifier,
+            llm_model=llm_model,
+        )
         # Entity resolver with embedding + LLM capabilities
         self.entity_resolver = EntityResolver(
             db=db,
@@ -274,9 +262,7 @@ class MemoryEngine:
         if projection.coverage is not ProjectionCoverage.PARTIAL_PROJECTION:
             return frozenset()
         return frozenset(
-            memory_id
-            for memory_id, impact in incumbent_impacts.items()
-            if impact is not ImpactResult.AFFECTED
+            memory_id for memory_id, impact in incumbent_impacts.items() if impact is not ImpactResult.AFFECTED
         )
 
     @staticmethod
@@ -317,10 +303,7 @@ class MemoryEngine:
         reference. Missing or ambiguous evidence fails closed.
         """
 
-        current_revisions = {
-            revision.observation_id: revision
-            for revision in projection.observation_revisions
-        }
+        current_revisions = {revision.observation_id: revision for revision in projection.observation_revisions}
         rebound: list[ReconcileOperation] = []
         for operation in operations:
             if (
@@ -334,64 +317,33 @@ class MemoryEngine:
                 operation.memory_id,
                 source_id=projection.source_id,
             )
-            scoped_reference_ids = frozenset(
-                unit_support.get(operation.memory_id, ())
-            )
-            support = tuple(
-                item
-                for item in source_support
-                if item.reference_id in scoped_reference_ids
-            )
+            scoped_reference_ids = frozenset(unit_support.get(operation.memory_id, ()))
+            support = tuple(item for item in source_support if item.reference_id in scoped_reference_ids)
             stale = [
                 item
                 for item in support
                 if item.anchor.observation_id in current_revisions
-                and current_revisions[item.anchor.observation_id].id
-                != item.anchor.observation_revision_id
+                and current_revisions[item.anchor.observation_id].id != item.anchor.observation_revision_id
             ]
             if not stale:
                 rebound.append(operation)
                 continue
-            missing_dependencies = [
-                item
-                for item in support
-                if item.anchor.observation_id not in current_revisions
-            ]
+            missing_dependencies = [item for item in support if item.anchor.observation_id not in current_revisions]
             if missing_dependencies and projection.coverage.proves_absence:
-                raise RuntimeError(
-                    "NOOP incumbent has a removed evidence dependency: "
-                    f"{operation.memory_id}"
-                )
-            primary = [
-                item
-                for item in support
-                if item.role is EvidenceRole.PRIMARY
-            ]
+                raise RuntimeError(f"NOOP incumbent has a removed evidence dependency: {operation.memory_id}")
+            primary = [item for item in support if item.role is EvidenceRole.PRIMARY]
             if len(primary) != 1:
-                raise RuntimeError(
-                    "NOOP incumbent lacks exactly one PRIMARY dependency: "
-                    f"{operation.memory_id}"
-                )
+                raise RuntimeError(f"NOOP incumbent lacks exactly one PRIMARY dependency: {operation.memory_id}")
             selected = primary[0]
-            primary_needs_validation = (
-                selected in stale
-                and (
-                    not selected.excerpt
-                    or selected.excerpt
-                    not in current_revisions[selected.anchor.observation_id].content
-                )
+            primary_needs_validation = selected in stale and (
+                not selected.excerpt
+                or selected.excerpt not in current_revisions[selected.anchor.observation_id].content
             )
             required_observation_ids = sorted(
-                {
-                    item.anchor.observation_id
-                    for item in support
-                    if item.role is EvidenceRole.REQUIRED
-                }
+                {item.anchor.observation_id for item in support if item.role is EvidenceRole.REQUIRED}
             )
             incumbent = incumbents[operation.memory_id]
-            stale_required = [
-                item for item in stale if item.role is EvidenceRole.REQUIRED
-            ]
+            stale_required = [item for item in stale if item.role is EvidenceRole.REQUIRED]
             support_validation: dict[str, object] = {}
             current_primary_quote = selected.excerpt or ""
             if primary_needs_validation or stale_required:
@@ -401,17 +353,11 @@ class MemoryEngine:
                     None,
                 )
                 if validator is None:
-                    raise RuntimeError(
-                        "revised evidence needs structured semantic validation: "
-                        f"{operation.memory_id}"
-                    )
-                current_primary = current_revisions.get(
-                    selected.anchor.observation_id
-                )
+                    raise RuntimeError(f"revised evidence needs structured semantic validation: {operation.memory_id}")
+                current_primary = current_revisions.get(selected.anchor.observation_id)
                 if current_primary is None:
                     raise RuntimeError(
-                        "NOOP incumbent current PRIMARY observation is unavailable: "
-                        f"{operation.memory_id}"
+                        f"NOOP incumbent current PRIMARY observation is unavailable: {operation.memory_id}"
                     )
                 validation = await validator(
                     MEMORY_SUPPORT_VALIDATION_PROMPT.format(
@@ -421,8 +367,7 @@ class MemoryEngine:
                                 "previous_primary_quote": selected.excerpt,
                                 "primary": current_primary.content,
                                 "required": [
-                                    current_revisions[item.anchor.observation_id].content
-                                    for item in stale_required
+                                    current_revisions[item.anchor.observation_id].content for item in stale_required
                                 ],
                             },
                             ensure_ascii=False,
@@ -438,31 +383,21 @@ class MemoryEngine:
                     "supported": bool(validation.supported),
                     "reason": validation.reason,
                     "primary_observation_id": selected.anchor.observation_id,
-                    "required_observation_ids": sorted(
-                        item.anchor.observation_id for item in stale_required
-                    ),
+                    "required_observation_ids": sorted(item.anchor.observation_id for item in stale_required),
                 }
                 if not validation.supported:
                     rebound.append(
                         ReconcileOperation(
                             action=ReconcileAction.DELETE,
                             memory_id=operation.memory_id,
-                            reason=(
-                                "revised REQUIRED evidence no longer validates claim: "
-                                f"{validation.reason}"
-                            ),
+                            reason=(f"revised REQUIRED evidence no longer validates claim: {validation.reason}"),
                             flag_for_review=True,
                         )
                     )
                     continue
                 if primary_needs_validation:
-                    current_primary_quote = str(
-                        getattr(validation, "evidence_quote", "") or ""
-                    ).strip()
-                    if (
-                        not current_primary_quote
-                        or current_primary_quote not in current_primary.content
-                    ):
+                    current_primary_quote = str(getattr(validation, "evidence_quote", "") or "").strip()
+                    if not current_primary_quote or current_primary_quote not in current_primary.content:
                         raise RuntimeError(
                             "NOOP incumbent support validation lacks exact current "
                             "PRIMARY evidence: "
@@ -489,102 +424,6 @@ class MemoryEngine:
                 )
             )
         return tuple(rebound)
-
-    async def _claims_semantically_equivalent(
-        self,
-        candidate: Memory,
-        incumbent: Memory,
-    ) -> dict[str, object] | None:
-        """Return an auditable semantic proof for canonical Memory identity reuse."""
-
-        if (
-            candidate.content_hash == incumbent.content_hash
-            and candidate.content.strip() == incumbent.content.strip()
-        ):
-            return {
-                "method": "exact_content",
-                "candidate_content_hash": candidate.content_hash,
-                "incumbent_content_hash": incumbent.content_hash,
-            }
-        classifier = getattr(
-            self.structured_llm_client,
-            "classify_memory_equivalence",
-            None,
-        )
-        if classifier is None:
-            return None
-        prompt = MEMORY_EQUIVALENCE_PROMPT.format(
-            pair_json=_memory_equivalence_pair_json(
-                candidate.content,
-                incumbent.content,
-            )
-        )
-        try:
-            result = await classifier(
-                prompt,
-                max_tokens=512,
-                model=self.llm_model,
-            )
-        except Exception:
-            logger.warning(
-                "Semantic Memory equivalence classification failed; preserving separate identities",
-                exc_info=True,
-            )
-            return None
-        if not result.equivalent:
-            return None
-        return {
-            "method": "structured_classifier",
-            "model": self.llm_model or "default",
-            "reason": result.reason,
-            "candidate_content_hash": candidate.content_hash,
-            "incumbent_content_hash": incumbent.content_hash,
-        }
-
-    async def _find_canonical_equivalence_target(
-        self,
-        candidate: Memory,
-        *,
-        excluded_memory_ids: frozenset[str],
-        doc_id: str,
-        entity_ids: tuple[int, ...],
-    ) -> tuple[Memory | None, dict[str, object] | None]:
-        """Resolve exact identity, then bounded multi-channel semantic candidates."""
-
-        target = await self.memory_store.find_access_compatible_exact_candidate(
-            candidate,
-            excluded_memory_ids=excluded_memory_ids,
-        )
-        if target is not None:
-            proof = await self._claims_semantically_equivalent(candidate, target)
-            if proof is not None:
-                return target, proof
-
-        targets = await self.memory_store.find_access_compatible_equivalence_candidates(
-            candidate,
-            excluded_memory_ids=excluded_memory_ids,
-            doc_id=doc_id,
-            entity_ids=entity_ids,
-        )
-        candidate_access = lifecycle_access_context_hash(
-            visibility=candidate.visibility,
-            owner_user_id=candidate.owner_user_id,
-            project_key=candidate.project_key,
-            repo_identifier=candidate.repo_identifier,
-        )
-        for target in targets:
-            target_access = lifecycle_access_context_hash(
-                visibility=target.visibility,
-                owner_user_id=target.owner_user_id,
-                project_key=target.project_key,
-                repo_identifier=target.repo_identifier,
-            )
-            if target_access != candidate_access:
-                continue
-            proof = await self._claims_semantically_equivalent(candidate, target)
-            if proof is not None:
-                return target, proof
-        return None, None
 
     async def apply_projected_lifecycle(
         self,
@@ -622,9 +461,7 @@ class MemoryEngine:
             base_unit_revision_id=delta.previous_unit_revision_id,
             target_unit_revision_id=delta.current_unit_revision_id,
         )
-        observation_revision_ids = tuple(
-            revision.id for revision in projection.observation_revisions
-        )
+        observation_revision_ids = tuple(revision.id for revision in projection.observation_revisions)
         source_type = projection.source_type
 
         stats = {
@@ -638,6 +475,7 @@ class MemoryEngine:
             "pending_review": 0,
             "skipped": 0,
             "vector_delivery_pending": 0,
+            "relation_discovery_enqueued": 0,
         }
         filtered_memories: list[RawMemory] = []
         for raw in raw_memories:
@@ -663,9 +501,8 @@ class MemoryEngine:
             source_unit_id=scope.source_unit_id,
         )
         incumbent_impacts: dict[str, ImpactResult] = {}
-        needs_incumbent_impacts = (
-            projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
-            or (not filtered_memories and bool(document_content.strip()))
+        needs_incumbent_impacts = projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION or (
+            not filtered_memories and bool(document_content.strip())
         )
         if needs_incumbent_impacts:
             incumbent_impacts = await self._projected_incumbent_impacts(
@@ -691,22 +528,16 @@ class MemoryEngine:
         else:
             deterministic_keep_ids = (
                 frozenset(
-                    memory_id
-                    for memory_id, impact in incumbent_impacts.items()
-                    if impact is ImpactResult.DISJOINT
+                    memory_id for memory_id, impact in incumbent_impacts.items() if impact is ImpactResult.DISJOINT
                 )
                 if not filtered_memories
                 else frozenset()
             )
-            model_incumbents = [
-                memory for memory in incumbents if memory.id not in deterministic_keep_ids
-            ]
+            model_incumbents = [memory for memory in incumbents if memory.id not in deterministic_keep_ids]
             model_incumbent_count = len(model_incumbents)
             deterministic_disjoint_keep_count = len(deterministic_keep_ids)
             if model_incumbents and not self.structured_llm_client:
-                raise RuntimeError(
-                    "complete lifecycle reconciliation requires an LLM client"
-                )
+                raise RuntimeError("complete lifecycle reconciliation requires an LLM client")
             result = await reconcile_memories(
                 new_extractions=filtered_memories,
                 existing_memories=model_incumbents,
@@ -720,22 +551,15 @@ class MemoryEngine:
                 include_metadata=True,
             )
             if not isinstance(result, ReconciliationResult):
-                raise TypeError(
-                    "metadata reconciliation must return ReconciliationResult"
-                )
+                raise TypeError("metadata reconciliation must return ReconciliationResult")
             reconciliation_metrics = result.metrics
             model_batch_count = reconciliation_metrics.model_batch_count
             structured_llm_call_count = reconciliation_metrics.structured_llm_calls
-            structured_llm_elapsed_ms = (
-                reconciliation_metrics.structured_llm_elapsed_ms
-            )
-            bounded_reconciliation_elapsed_ms = (
-                reconciliation_metrics.reconciliation_elapsed_ms
-            )
+            structured_llm_elapsed_ms = reconciliation_metrics.structured_llm_elapsed_ms
+            bounded_reconciliation_elapsed_ms = reconciliation_metrics.reconciliation_elapsed_ms
             if result.failure is not None:
                 raise RuntimeError(
-                    "complete lifecycle reconciliation failed: "
-                    f"{result.failure.error_type}: {result.failure.error}"
+                    f"complete lifecycle reconciliation failed: {result.failure.error_type}: {result.failure.error}"
                 )
             operations = tuple(result.operations) + tuple(
                 ReconcileOperation(
@@ -762,15 +586,11 @@ class MemoryEngine:
                     "reconciliation_new_candidate_count": len(filtered_memories),
                     "reconciliation_incumbent_count": len(incumbents),
                     "reconciliation_model_incumbent_count": model_incumbent_count,
-                    "reconciliation_disjoint_keep_count": (
-                        deterministic_disjoint_keep_count
-                    ),
+                    "reconciliation_disjoint_keep_count": (deterministic_disjoint_keep_count),
                     "reconciliation_llm_batch_count": model_batch_count,
                     "reconciliation_llm_call_count": structured_llm_call_count,
                     "reconciliation_llm_elapsed_ms": structured_llm_elapsed_ms,
-                    "reconciliation_bounded_elapsed_ms": (
-                        bounded_reconciliation_elapsed_ms
-                    ),
+                    "reconciliation_bounded_elapsed_ms": (bounded_reconciliation_elapsed_ms),
                     "reconciliation_total_elapsed_ms": max(
                         0,
                         round((perf_counter() - reconciliation_started) * 1000),
@@ -781,11 +601,15 @@ class MemoryEngine:
             )
         )
         for operation in operations:
-            if operation.action not in {
-                ReconcileAction.ADD,
-                ReconcileAction.UPDATE,
-                ReconcileAction.SUPERSEDE,
-            } or operation.memory is None:
+            if (
+                operation.action
+                not in {
+                    ReconcileAction.ADD,
+                    ReconcileAction.UPDATE,
+                    ReconcileAction.SUPERSEDE,
+                }
+                or operation.memory is None
+            ):
                 continue
             quality = classify_memory_candidate(operation.memory)
             if not quality.keep:
@@ -806,8 +630,7 @@ class MemoryEngine:
             for memory_id in incumbents_by_id
         }
         support_hashes = {
-            memory_id: await self.db.get_memory_support_set_hash(memory_id)
-            for memory_id in incumbents_by_id
+            memory_id: await self.db.get_memory_support_set_hash(memory_id) for memory_id in incumbents_by_id
         }
         visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
         if visibility == "private" and user_id is not None and user_id != owner_user_id:
@@ -820,6 +643,8 @@ class MemoryEngine:
         )
         corroboration_targets: dict[str, Memory] = {}
         corroboration_proofs: dict[str, dict[str, object]] = {}
+        identity_claim_hashes: list[str] = []
+        identity_requests: list[IdentityResolutionRequest] = []
         for operation in operations:
             if operation.action is not ReconcileAction.ADD or operation.memory is None:
                 continue
@@ -830,26 +655,30 @@ class MemoryEngine:
                 owner_user_id=owner_user_id,
                 repo_identifier=repo_identifier,
             )
-            target, equivalence_proof = await self._find_canonical_equivalence_target(
-                candidate,
-                excluded_memory_ids=frozenset(incumbents_by_id),
-                doc_id=doc_id,
-                entity_ids=tuple(entity_ids),
+            identity_claim_hashes.append(content_hash(operation.memory.content.strip()))
+            identity_requests.append(
+                IdentityResolutionRequest(
+                    challenger=candidate,
+                    doc_id=doc_id,
+                    entity_ids=tuple(entity_ids),
+                    excluded_memory_ids=frozenset(incumbents_by_id),
+                )
             )
+        identity_resolutions = await self.identity_resolver.resolve(tuple(identity_requests))
+        for claim_hash, resolution in zip(
+            identity_claim_hashes,
+            identity_resolutions,
+            strict=True,
+        ):
+            target = resolution.target
+            equivalence_proof = resolution.equivalence_proof
             if target is None or equivalence_proof is None:
                 continue
-            claim_hash = content_hash(operation.memory.content.strip())
             corroboration_targets[claim_hash] = target
-            corroboration_proofs[claim_hash] = equivalence_proof
-            all_support[target.id] = await self.db.get_active_memory_support_reference_ids(
-                target.id
-            )
+            corroboration_proofs[claim_hash] = dict(equivalence_proof)
+            all_support[target.id] = await self.db.get_active_memory_support_reference_ids(target.id)
             support_hashes[target.id] = await self.db.get_memory_support_set_hash(target.id)
-        evidence_memories = [
-            operation.memory
-            for operation in operations
-            if operation.memory is not None
-        ]
+        evidence_memories = [operation.memory for operation in operations if operation.memory is not None]
         projected_evidence = build_projected_claim_evidence(
             projection=projection,
             raw_memories=evidence_memories,
@@ -861,9 +690,7 @@ class MemoryEngine:
             repo_identifier=repo_identifier,
             access_context_hash=access_context_hash,
             extractor_run_id=projection.run_id,
-            observed_at=(
-                source_updated_at.isoformat() if source_updated_at is not None else None
-            ),
+            observed_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
         )
         plan_id = lifecycle_plan_id(scope)
         plan = build_lifecycle_plan(
@@ -877,9 +704,7 @@ class MemoryEngine:
             support_set_hashes=support_hashes,
             observation_revision_ids=observation_revision_ids,
             new_evidence_reference_ids=(),
-            evidence_reference_ids_by_claim_hash=(
-                projected_evidence.reference_ids_by_claim_hash
-            ),
+            evidence_reference_ids_by_claim_hash=(projected_evidence.reference_ids_by_claim_hash),
             corroboration_targets_by_claim_hash=corroboration_targets,
             corroboration_proofs_by_claim_hash=corroboration_proofs,
             defaults=NewMemoryDefaults(
@@ -890,10 +715,9 @@ class MemoryEngine:
                 doc_id=doc_id,
                 source_type=source_type,
                 access_context_hash=access_context_hash,
+                actor_user_id=user_id,
                 entity_ids=tuple(entity_ids),
-                source_updated_at=(
-                    source_updated_at.isoformat() if source_updated_at is not None else None
-                ),
+                source_updated_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
             ),
             evidence_units=projected_evidence.units,
             evidence_references=projected_evidence.references,
@@ -906,25 +730,7 @@ class MemoryEngine:
         delivery = await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)
         stats["vector_delivery_pending"] = int(delivery.pending)
 
-        activated_memory_ids = [
-            mutation.memory_id
-            for mutation in plan.mutations
-            if mutation.mutation_type.value in {"create_memory", "reactivate_memory"}
-        ]
-        if activated_memory_ids and self.structured_llm_client:
-            from memforge.pipeline.contradiction_detector import detect_cross_doc_contradictions
-
-            contradiction_stats = await detect_cross_doc_contradictions(
-                new_memory_ids=activated_memory_ids,
-                doc_id=doc_id,
-                db=self.db,
-                memory_store=self.memory_store,
-                candidate_retriever=self.cross_document_candidates,
-                structured_llm_client=self.structured_llm_client,
-                llm_model=self.llm_model,
-                actor_user_id=user_id,
-            )
-            stats["contradictions_found"] = contradiction_stats.get("contradictions", 0)
+        stats["relation_discovery_enqueued"] = len(plan.relation_discovery_requests)
 
         for mutation in plan.mutations:
             if mutation.mutation_type.value == "create_memory":
@@ -942,13 +748,11 @@ class MemoryEngine:
                 mutation.memory_id
                 for mutation in plan.mutations
                 if mutation.mutation_type.value == "attach_support"
-                and mutation.memory_id
-                in {target.id for target in corroboration_targets.values()}
+                and mutation.memory_id in {target.id for target in corroboration_targets.values()}
             }
         )
         stats["noop"] = sum(
-            decision.disposition.value == "keep"
-            for decision in plan.coverage_proof.incumbent_decisions
+            decision.disposition.value == "keep" for decision in plan.coverage_proof.incumbent_decisions
         )
         return stats
 
@@ -982,9 +786,7 @@ class MemoryEngine:
                 },
                 error=str(exc),
             )
-            raise RuntimeError(
-                f"candidate ledger failed closed: {exc.error_type}: {exc}"
-            ) from exc
+            raise RuntimeError(f"candidate ledger failed closed: {exc.error_type}: {exc}") from exc
 
         if result.semantic_input_count > 1 or result.dropped_exact_count:
             await self._record_candidate_ledger_audit(
@@ -1046,10 +848,7 @@ class MemoryEngine:
             raise ValueError("projected tombstone requires lifecycle cycle identity")
         delta = projection.deltas[0]
         scope = ReconciliationScope(
-            id=(
-                f"tombstone:{lifecycle_cycle_id}:{delta.source_unit_id}:"
-                f"{delta.current_unit_revision_id or 'removed'}"
-            ),
+            id=(f"tombstone:{lifecycle_cycle_id}:{delta.source_unit_id}:{delta.current_unit_revision_id or 'removed'}"),
             source_id=projection.source_id,
             source_unit_id=delta.source_unit_id,
             base_unit_revision_id=delta.previous_unit_revision_id,
@@ -1065,16 +864,11 @@ class MemoryEngine:
                 or stored_scope.get("id") != scope.id
                 or stored_scope.get("source_id") != scope.source_id
                 or stored_scope.get("source_unit_id") != scope.source_unit_id
-                or stored_scope.get("target_unit_revision_id")
-                != scope.target_unit_revision_id
+                or stored_scope.get("target_unit_revision_id") != scope.target_unit_revision_id
                 or not isinstance(mutations, list)
             ):
                 raise ValueError("applied tombstone lifecycle ledger is malformed")
-            mutation_types = [
-                mutation.get("mutation_type")
-                for mutation in mutations
-                if isinstance(mutation, Mapping)
-            ]
+            mutation_types = [mutation.get("mutation_type") for mutation in mutations if isinstance(mutation, Mapping)]
             if len(mutation_types) != len(mutations):
                 raise ValueError("applied tombstone lifecycle mutation ledger is malformed")
             await self.memory_store.attempt_lifecycle_vector_delivery(plan_id)
@@ -1104,8 +898,7 @@ class MemoryEngine:
             for memory_id in incumbents_by_id
         }
         support_hashes = {
-            memory_id: await self.db.get_memory_support_set_hash(memory_id)
-            for memory_id in incumbents_by_id
+            memory_id: await self.db.get_memory_support_set_hash(memory_id) for memory_id in incumbents_by_id
         }
         visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
         plan = build_lifecycle_plan(
@@ -1140,12 +933,8 @@ class MemoryEngine:
             expected_source_activity_epoch=expected_source_activity_epoch,
         )
         await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)
-        pending_review = sum(
-            mutation.mutation_type.value == "create_review" for mutation in plan.mutations
-        )
-        retired = sum(
-            mutation.mutation_type.value == "retire_memory" for mutation in plan.mutations
-        )
+        pending_review = sum(mutation.mutation_type.value == "create_review" for mutation in plan.mutations)
+        retired = sum(mutation.mutation_type.value == "retire_memory" for mutation in plan.mutations)
         return {
             "retired": retired,
             "pending_review": pending_review,
@@ -1220,6 +1009,7 @@ class MemoryEngine:
                 logger.warning("Failed to resolve entity %r: %s", name, e)
         return ids
 
+
 def _observation_semantic_class(
     projection: SourceProjection,
     observation_id: str | None,
@@ -1246,9 +1036,7 @@ def _candidate_ledger_audit_payload(result: CandidateLedgerResult) -> dict[str, 
                 "candidate_content_hash": content_hash(drop.candidate.content),
                 "candidate_source_observation_id": drop.candidate.source_observation_id,
                 "canonical_content_hash": content_hash(drop.canonical_candidate.content),
-                "canonical_source_observation_id": (
-                    drop.canonical_candidate.source_observation_id
-                ),
+                "canonical_source_observation_id": (drop.canonical_candidate.source_observation_id),
                 "method": drop.method,
                 "reason": drop.reason[:240],
             }

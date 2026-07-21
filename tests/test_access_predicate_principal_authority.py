@@ -32,6 +32,7 @@ def _config(tmp_path: Path) -> AppConfig:
     cfg.server.jwt_secret = "test-secret"
     cfg.llm.enrichment_api_key = ""
     cfg.llm.embedding_api_key = ""
+    cfg.sync.worker_enabled = False
     return cfg
 
 

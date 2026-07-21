@@ -26,6 +26,7 @@ async def db(tmp_path):
 def _config(tmp_path: Path) -> AppConfig:
     cfg = AppConfig(base_dir=tmp_path / "mem")
     cfg.server.jwt_secret = "test-secret"
+    cfg.sync.worker_enabled = False
     return cfg
 
 

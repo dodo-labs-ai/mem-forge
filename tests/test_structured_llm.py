@@ -8,13 +8,12 @@ from pydantic import ValidationError
 from memforge.llm.structured import (
     AgentSessionAuthorityResponse,
     CandidateLedgerResponse,
-    ContradictionResponse,
     EntityValidationResponse,
     EnrichmentResponse,
     LiteLlmStructuredClient,
     MemoryCandidate,
-    MemoryEquivalenceResponse,
     MemoryExtractionResponse,
+    MemoryRelationResponse,
     MemorySupportValidationResponse,
     ReconciliationResponse,
     RerankResponse,
@@ -453,19 +452,13 @@ async def test_litellm_structured_client_accepts_one_schema_valid_json_object_wi
     assert response.decisions[0].action == "DELETE"
     assert response.decisions[0].memory_id == "mem-1"
     assert len(calls) == 1
-    assert any(
-        "recovered exactly one schema-valid JSON object" in record.message
-        for record in caplog.records
-    )
+    assert any("recovered exactly one schema-valid JSON object" in record.message for record in caplog.records)
 
 
 @pytest.mark.asyncio
 async def test_litellm_structured_client_rejects_ambiguous_schema_valid_json_objects(monkeypatch):
     calls = []
-    decision = (
-        '{"decisions":[{"action":"DELETE","memory_id":"mem-1",'
-        '"reason":"unsupported","flag_for_review":false}]}'
-    )
+    decision = '{"decisions":[{"action":"DELETE","memory_id":"mem-1","reason":"unsupported","flag_for_review":false}]}'
 
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
@@ -502,12 +495,11 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
             return CompletionResponse('{"decisions":[{"action":"ADD","index":0,"reason":"new"}]}')
         if schema is CandidateLedgerResponse:
             return CompletionResponse('{"decisions":[{"index":0,"action":"KEEP"}]}')
-        if schema is ContradictionResponse:
+        if schema is MemoryRelationResponse:
             return CompletionResponse(
-                '{"decisions":[{"pair_index":0,"classification":"unrelated","reason":"different topic"}]}'
+                '{"decisions":[{"pair_index":0,"classification":"refines",'
+                '"direction":"challenger_to_candidate","reason":"adds a condition"}]}'
             )
-        if schema is MemoryEquivalenceResponse:
-            return CompletionResponse('{"equivalent":true,"reason":"same claim"}')
         if schema is MemorySupportValidationResponse:
             return CompletionResponse('{"supported":true,"reason":"still entailed"}')
         if schema is EntityValidationResponse:
@@ -530,8 +522,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     assert (await client.enrich_document("prompt", max_tokens=64000)).summary == "Summary"
     assert (await client.select_memory_candidates("prompt")).decisions[0].action == "KEEP"
     assert (await client.reconcile_memories("prompt")).decisions[0].action == "ADD"
-    assert (await client.detect_contradictions("prompt")).decisions[0].classification == "unrelated"
-    assert (await client.classify_memory_equivalence("prompt")).equivalent is True
+    assert (await client.classify_memory_relations("prompt")).decisions[0].direction == "challenger_to_candidate"
     assert (await client.validate_memory_support("prompt")).supported is True
     assert (await client.validate_entity_match("prompt")).matched_id == 7
     assert (await client.rerank_memories("prompt")).ranking == [2, 0, 1]
@@ -540,8 +531,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         EnrichmentResponse,
         CandidateLedgerResponse,
         ReconciliationResponse,
-        ContradictionResponse,
-        MemoryEquivalenceResponse,
+        MemoryRelationResponse,
         MemorySupportValidationResponse,
         EntityValidationResponse,
         RerankResponse,

@@ -3,6 +3,11 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
+from memforge.memory.evidence import (
+    AuthorityCase,
+    EvidenceRelationRecord,
+    RelationType,
+)
 from memforge.storage.database import Database
 
 
@@ -77,6 +82,7 @@ async def test_evidence_relations_schema_has_current_pair_key_and_no_lifecycle_r
         "evidence_unit_id",
         "memory_id",
         "relation_type",
+        "relation_direction",
         "authority_case",
         "is_authoritative_support",
         "source_lineage_id",
@@ -88,6 +94,23 @@ async def test_evidence_relations_schema_has_current_pair_key_and_no_lifecycle_r
         "relation_run_id",
         "created_at",
     }
+
+
+@pytest.mark.asyncio
+async def test_sqlite_rejects_new_directionless_refinement(db: Database) -> None:
+    relation = EvidenceRelationRecord(
+        evidence_unit_id="eu-1",
+        memory_id="mem-1",
+        relation_type=RelationType.REFINES,
+        direction=None,
+        authority_case=AuthorityCase.INDEPENDENT_REFINEMENT,
+        is_authoritative_support=False,
+        source_lineage_id="unit-1",
+        confidence=1.0,
+    )
+
+    with pytest.raises(ValueError, match="require a direction"):
+        await db.replace_evidence_relations("eu-1", (relation,))
 
 
 @pytest.mark.asyncio
@@ -134,4 +157,32 @@ async def test_relation_candidates_schema_audits_checked_candidate_universe(
         "was_checked",
         "reason",
         "created_at",
+    }
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_work_schema_has_lease_and_revision_fences(
+    db: Database,
+) -> None:
+    assert await _primary_key(db, "relation_discovery_work") == ("id",)
+    assert await _columns(db, "relation_discovery_work") >= {
+        "lifecycle_plan_id",
+        "memory_id",
+        "expected_content_hash",
+        "source_id",
+        "source_unit_id",
+        "source_unit_revision_id",
+        "doc_id",
+        "actor_user_id",
+        "entity_ids_json",
+        "status",
+        "attempts",
+        "lease_owner",
+        "lease_token",
+        "lease_until",
+        "next_attempt_at",
+        "error",
+        "created_at",
+        "updated_at",
+        "completed_at",
     }

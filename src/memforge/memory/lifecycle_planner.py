@@ -19,6 +19,10 @@ from memforge.memory.lifecycle_plan import (
     ReconciliationScope,
     StaleGuard,
 )
+from memforge.memory.relation_discovery_contract import (
+    RelationDiscoveryRequest,
+    relation_discovery_request_id,
+)
 from memforge.models import (
     Memory,
     RawMemory,
@@ -38,6 +42,7 @@ class NewMemoryDefaults:
     doc_id: str
     source_type: str
     access_context_hash: str
+    actor_user_id: str | None = None
     entity_ids: tuple[int, ...] = ()
     source_updated_at: str | None = None
 
@@ -87,6 +92,26 @@ def build_lifecycle_plan(
     mutations: list[LifecycleMutation] = []
     decisions: list[IncumbentDecision] = []
     created_ids: set[str] = set()
+    relation_discovery_requests: list[RelationDiscoveryRequest] = []
+
+    def request_relation_discovery(memory_id: str, expected_content_hash: str) -> None:
+        relation_discovery_requests.append(
+            RelationDiscoveryRequest(
+                id=relation_discovery_request_id(
+                    lifecycle_plan_id=plan_id,
+                    memory_id=memory_id,
+                    expected_content_hash=expected_content_hash,
+                ),
+                memory_id=memory_id,
+                expected_content_hash=expected_content_hash,
+                source_id=scope.source_id,
+                source_unit_id=scope.source_unit_id,
+                source_unit_revision_id=scope.target_unit_revision_id,
+                doc_id=defaults.doc_id,
+                actor_user_id=defaults.actor_user_id,
+                entity_ids=defaults.entity_ids,
+            )
+        )
 
     def references_for(raw: RawMemory) -> tuple[str, ...]:
         if evidence_reference_ids_by_claim_hash is not None:
@@ -127,13 +152,12 @@ def build_lifecycle_plan(
         if memory_id not in created_ids:
             mutations.extend(creation_mutations)
             created_ids.add(memory_id)
+            request_relation_discovery(memory_id, content_hash(raw.content.strip()))
         return memory_id
 
     corroboration_targets = corroboration_targets_by_claim_hash or {}
     corroboration_proofs = corroboration_proofs_by_claim_hash or {}
-    corroboration_targets_by_id = {
-        target.id: target for target in corroboration_targets.values()
-    }
+    corroboration_targets_by_id = {target.id: target for target in corroboration_targets.values()}
     attached_target_ids: set[str] = set()
     for operation in add_operations:
         assert operation.memory is not None
@@ -160,6 +184,7 @@ def build_lifecycle_plan(
                     },
                 ),
             )
+            request_relation_discovery(target.id, target.content_hash)
         mutations.extend(
             (
                 *reactivation_mutations,
@@ -190,12 +215,8 @@ def build_lifecycle_plan(
         external_support = set(all_support).difference(current_source_support)
 
         if operation.action is ReconcileAction.NOOP:
-            decisions.append(
-                IncumbentDecision(memory_id, IncumbentDisposition.KEEP, operation.reason or "kept")
-            )
-            evidence_reference_ids = (
-                references_for(operation.memory) if operation.memory is not None else ()
-            )
+            decisions.append(IncumbentDecision(memory_id, IncumbentDisposition.KEEP, operation.reason or "kept"))
+            evidence_reference_ids = references_for(operation.memory) if operation.memory is not None else ()
             if evidence_reference_ids:
                 if current_source_support and set(evidence_reference_ids) != set(current_source_support):
                     mutations.append(
@@ -207,16 +228,16 @@ def build_lifecycle_plan(
                         )
                     )
                 mutations.append(
-                        LifecycleMutation(
-                            LifecycleMutationType.ATTACH_SUPPORT,
-                            memory_id=memory_id,
-                            source_id=scope.source_id,
-                            evidence_reference_ids=evidence_reference_ids,
-                            payload={
-                                "access_context_hash": defaults.access_context_hash,
-                                "source_updated_at": defaults.source_updated_at,
-                                "support_validation": dict(operation.memory.support_validation),
-                            },
+                    LifecycleMutation(
+                        LifecycleMutationType.ATTACH_SUPPORT,
+                        memory_id=memory_id,
+                        source_id=scope.source_id,
+                        evidence_reference_ids=evidence_reference_ids,
+                        payload={
+                            "access_context_hash": defaults.access_context_hash,
+                            "source_updated_at": defaults.source_updated_at,
+                            "support_validation": dict(operation.memory.support_validation),
+                        },
                     )
                 )
             continue
@@ -251,9 +272,7 @@ def build_lifecycle_plan(
                             source_id=scope.source_id,
                         )
                     )
-                decisions.append(
-                    IncumbentDecision(memory_id, IncumbentDisposition.REVIEW, operation.reason or "gate")
-                )
+                decisions.append(IncumbentDecision(memory_id, IncumbentDisposition.REVIEW, operation.reason or "gate"))
                 mutations.append(
                     _review_mutation(
                         scope,
@@ -327,9 +346,7 @@ def build_lifecycle_plan(
                             payload={
                                 "reason": operation.reason or "authoritative replacement",
                                 "replacement_kind": (
-                                    "revision"
-                                    if operation.action is ReconcileAction.UPDATE
-                                    else "supersession"
+                                    "revision" if operation.action is ReconcileAction.UPDATE else "supersession"
                                 ),
                             },
                         )
@@ -352,11 +369,19 @@ def build_lifecycle_plan(
                         memory_id,
                         proposed_mutations=tuple(proposed_mutations),
                         disposition=(
-                            IncumbentDisposition.REMOVE_SUPPORT
-                            if external_support
-                            else IncumbentDisposition.SUPERSEDE
+                            IncumbentDisposition.REMOVE_SUPPORT if external_support else IncumbentDisposition.SUPERSEDE
                         ),
                         replacement_memory_id=replacement_id,
+                        relation_discovery_seed={
+                            "memory_id": replacement_id,
+                            "expected_content_hash": content_hash(operation.memory.content.strip()),
+                            "source_id": scope.source_id,
+                            "source_unit_id": scope.source_unit_id,
+                            "source_unit_revision_id": scope.target_unit_revision_id,
+                            "doc_id": defaults.doc_id,
+                            "actor_user_id": defaults.actor_user_id,
+                            "entity_ids": list(defaults.entity_ids),
+                        },
                     )
                 )
                 continue
@@ -386,9 +411,7 @@ def build_lifecycle_plan(
                         payload={
                             "reason": operation.reason or "authoritative replacement",
                             "replacement_kind": (
-                                "revision"
-                                if operation.action is ReconcileAction.UPDATE
-                                else "supersession"
+                                "revision" if operation.action is ReconcileAction.UPDATE else "supersession"
                             ),
                         },
                     ),
@@ -412,20 +435,17 @@ def build_lifecycle_plan(
         stale_guard=StaleGuard(
             observation_revision_ids=observation_revision_ids,
             support_set_hashes={
-                memory_id: support_set_hashes[memory_id]
-                for memory_id in (*incumbent_ids, *sorted(attached_target_ids))
+                memory_id: support_set_hashes[memory_id] for memory_id in (*incumbent_ids, *sorted(attached_target_ids))
             },
             memory_versions={
-                memory_id: _memory_version(
-                    incumbents.get(memory_id)
-                    or corroboration_targets_by_id[memory_id]
-                )
+                memory_id: _memory_version(incumbents.get(memory_id) or corroboration_targets_by_id[memory_id])
                 for memory_id in (*incumbent_ids, *sorted(attached_target_ids))
             },
         ),
         mutations=tuple(mutations),
         evidence_units=tuple(evidence_units),
         evidence_references=tuple(evidence_references),
+        relation_discovery_requests=tuple(relation_discovery_requests),
     )
     plan.validate()
     return plan
@@ -483,6 +503,7 @@ def _review_mutation(
     proposed_mutations: tuple[LifecycleMutation, ...],
     disposition: IncumbentDisposition,
     replacement_memory_id: str | None = None,
+    relation_discovery_seed: Mapping[str, object] | None = None,
 ) -> LifecycleMutation:
     staged = {"action": operation.action.value}
     if operation.memory is not None:
@@ -495,6 +516,8 @@ def _review_mutation(
     staged["proposed_disposition"] = disposition.value
     staged["replacement_memory_id"] = replacement_memory_id
     staged["proposed_mutations"] = [_serialize_mutation(item) for item in proposed_mutations]
+    if relation_discovery_seed is not None:
+        staged["relation_discovery_seed"] = dict(relation_discovery_seed)
     return LifecycleMutation(
         LifecycleMutationType.CREATE_REVIEW,
         memory_id=memory_id,

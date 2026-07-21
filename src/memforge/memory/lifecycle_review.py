@@ -17,6 +17,10 @@ from memforge.memory.lifecycle_plan import (
     ReconciliationScope,
     StaleGuard,
 )
+from memforge.memory.relation_discovery_contract import (
+    RelationDiscoveryRequest,
+    relation_discovery_request_id,
+)
 
 
 def build_lifecycle_review_approval_plan(
@@ -54,6 +58,16 @@ def build_lifecycle_review_approval_plan(
     if not proposed:
         raise ValueError("lifecycle review has no proposed mutations")
 
+    plan_id = f"lifecycle-review-approval-{review.id}"
+    relation_discovery_requests = _relation_discovery_requests(
+        review,
+        proposed=proposed,
+        plan_id=plan_id,
+        source_id=source_id,
+        source_unit_id=_text(scope_payload.get("source_unit_id"), "scope.source_unit_id"),
+        source_unit_revision_id=_optional_text(scope_payload.get("target_unit_revision_id")),
+    )
+
     resolution = LifecycleMutation(
         mutation_type=LifecycleMutationType.RESOLVE_REVIEW,
         memory_id=incumbent_id,
@@ -66,12 +80,10 @@ def build_lifecycle_review_approval_plan(
         source_unit_id=_text(scope_payload.get("source_unit_id"), "scope.source_unit_id"),
         base_unit_revision_id=_optional_text(scope_payload.get("base_unit_revision_id")),
         target_unit_revision_id=_optional_text(scope_payload.get("target_unit_revision_id")),
-        dependency_unit_ids=tuple(
-            str(value) for value in _sequence(scope_payload.get("dependency_unit_ids", ()))
-        ),
+        dependency_unit_ids=tuple(str(value) for value in _sequence(scope_payload.get("dependency_unit_ids", ()))),
     )
     plan = LifecyclePlan(
-        id=f"lifecycle-review-approval-{review.id}",
+        id=plan_id,
         scope=scope,
         gate_state=LifecycleGateState.ENABLED,
         coverage_proof=CoverageProof(
@@ -81,9 +93,7 @@ def build_lifecycle_review_approval_plan(
                     memory_id=incumbent_id,
                     disposition=disposition,
                     reason=review.reason or "approved lifecycle review",
-                    replacement_memory_id=(
-                        replacement_id if disposition is IncumbentDisposition.SUPERSEDE else None
-                    ),
+                    replacement_memory_id=(replacement_id if disposition is IncumbentDisposition.SUPERSEDE else None),
                 ),
             ),
             batch_ids=(f"{scope.id}:batch:0",),
@@ -97,9 +107,83 @@ def build_lifecycle_review_approval_plan(
             memory_versions={incumbent_id: memory_versions[incumbent_id]},
         ),
         mutations=(*proposed, resolution),
+        relation_discovery_requests=relation_discovery_requests,
     )
     plan.validate()
     return plan
+
+
+def _relation_discovery_requests(
+    review: LifecycleReview,
+    *,
+    proposed: tuple[LifecycleMutation, ...],
+    plan_id: str,
+    source_id: str,
+    source_unit_id: str,
+    source_unit_revision_id: str | None,
+) -> tuple[RelationDiscoveryRequest, ...]:
+    activations = {
+        mutation.memory_id: mutation
+        for mutation in proposed
+        if mutation.mutation_type
+        in {
+            LifecycleMutationType.CREATE_MEMORY,
+            LifecycleMutationType.REACTIVATE_MEMORY,
+        }
+    }
+    if not activations:
+        return ()
+    if len(activations) != 1:
+        raise ValueError("lifecycle review relation discovery requires one activated Memory")
+
+    seed = _mapping(
+        review.staged_evidence.get("relation_discovery_seed"),
+        "relation_discovery_seed",
+    )
+    memory_id = _text(seed.get("memory_id"), "relation_discovery_seed.memory_id")
+    expected_content_hash = _text(
+        seed.get("expected_content_hash"),
+        "relation_discovery_seed.expected_content_hash",
+    )
+    activation = activations.get(memory_id)
+    if activation is None:
+        raise ValueError("relation discovery seed does not identify the activated Memory")
+    if activation.mutation_type is LifecycleMutationType.CREATE_MEMORY:
+        memory_payload = _mapping(activation.payload.get("memory"), "create_memory.payload.memory")
+        activation_content_hash = _text(memory_payload.get("content_hash"), "memory.content_hash")
+    else:
+        activation_content_hash = _text(
+            activation.payload.get("expected_content_hash"),
+            "reactivate_memory.expected_content_hash",
+        )
+    if activation_content_hash != expected_content_hash:
+        raise ValueError("relation discovery seed content hash does not match activation")
+    if (
+        _text(seed.get("source_id"), "relation_discovery_seed.source_id") != source_id
+        or _text(seed.get("source_unit_id"), "relation_discovery_seed.source_unit_id") != source_unit_id
+        or _optional_text(seed.get("source_unit_revision_id")) != source_unit_revision_id
+    ):
+        raise ValueError("relation discovery seed belongs to another reconciliation scope")
+    entity_ids = tuple(_integer_sequence(seed.get("entity_ids", ()), "relation_discovery_seed.entity_ids"))
+    actor_user_id = _optional_text(seed.get("actor_user_id"))
+    doc_id = _text(seed.get("doc_id"), "relation_discovery_seed.doc_id")
+    return (
+        RelationDiscoveryRequest(
+            id=relation_discovery_request_id(
+                lifecycle_plan_id=plan_id,
+                memory_id=memory_id,
+                expected_content_hash=expected_content_hash,
+            ),
+            memory_id=memory_id,
+            expected_content_hash=expected_content_hash,
+            source_id=source_id,
+            source_unit_id=source_unit_id,
+            source_unit_revision_id=source_unit_revision_id,
+            doc_id=doc_id,
+            actor_user_id=actor_user_id,
+            entity_ids=entity_ids,
+        ),
+    )
 
 
 def _deserialize_mutation(
@@ -126,12 +210,16 @@ def _deserialize_mutation(
         replacement_memory_id=replacement_memory_id,
         payload=dict(payload),
     )
-    if mutation_type in {
-        LifecycleMutationType.REMOVE_SUPPORT,
-        LifecycleMutationType.SUPERSEDE_MEMORY,
-        LifecycleMutationType.RETIRE_MEMORY,
-        LifecycleMutationType.REFRESH_MEMORY_INDEX,
-    } and memory_id != incumbent_id:
+    if (
+        mutation_type
+        in {
+            LifecycleMutationType.REMOVE_SUPPORT,
+            LifecycleMutationType.SUPERSEDE_MEMORY,
+            LifecycleMutationType.RETIRE_MEMORY,
+            LifecycleMutationType.REFRESH_MEMORY_INDEX,
+        }
+        and memory_id != incumbent_id
+    ):
         raise ValueError("review proposal destructively targets another incumbent")
     return mutation
 
@@ -146,6 +234,13 @@ def _sequence(value: object) -> Sequence[object]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise ValueError("expected a sequence")
     return value
+
+
+def _integer_sequence(value: object, name: str) -> tuple[int, ...]:
+    raw = _sequence(value)
+    if any(not isinstance(item, int) or isinstance(item, bool) for item in raw):
+        raise ValueError(f"{name} must contain integers")
+    return tuple(raw)
 
 
 def _string_mapping(value: object, name: str) -> dict[str, str]:

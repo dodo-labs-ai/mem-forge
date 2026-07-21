@@ -155,10 +155,10 @@ async def test_transition_splits_only_the_changing_sources_support(db: Database)
     )
     await db.db.execute(
         """INSERT INTO evidence_relations (
-               evidence_unit_id, memory_id, relation_type, authority_case,
+               evidence_unit_id, memory_id, relation_type, relation_direction, authority_case,
                is_authoritative_support, classifier_version, relation_run_id
-           ) VALUES ('eu-a', 'mem-shared', 'supports', 'authoritative', 1,
-                     'test-v1', 'run-a')"""
+           ) VALUES ('eu-a', 'mem-shared', 'refines', 'challenger_to_candidate',
+                     'same_source_lineage', 1, 'test-v1', 'run-a')"""
     )
     await db.db.commit()
     service = SourceAccessTransitionService(db=db, memory_store=RecordingMemoryStore())
@@ -181,10 +181,12 @@ async def test_transition_splits_only_the_changing_sources_support(db: Database)
     assert moved.owner_user_id == "alice"
     assert {support.source_id for support in await db.get_memory_sources(moved_id)} == {"src-a"}
     async with db.db.execute(
-        "SELECT memory_id, classifier_version, relation_run_id FROM evidence_relations WHERE evidence_unit_id = 'eu-a'"
+        "SELECT memory_id, relation_direction, classifier_version, relation_run_id "
+        "FROM evidence_relations WHERE evidence_unit_id = 'eu-a'"
     ) as cursor:
         evidence_relation = await cursor.fetchone()
     assert evidence_relation["memory_id"] == moved_id
+    assert evidence_relation["relation_direction"] == "challenger_to_candidate"
     assert evidence_relation["classifier_version"] == "test-v1"
     assert evidence_relation["relation_run_id"] == "run-a"
 
@@ -281,6 +283,21 @@ async def test_failed_split_revert_merges_source_support_without_duplicate(db: D
     await _memory(db, "mem-shared", visibility="workspace", owner_user_id=None)
     await db.add_memory_source("mem-shared", "doc-a", "confluence", source_updated_at=None)
     await db.add_memory_source("mem-shared", "doc-b", "confluence", source_updated_at=None)
+    await db.db.execute(
+        """INSERT INTO evidence_units (
+               id, source_id, doc_id, source_type, source_metadata_json,
+               project_key, visibility, content, evidence_provenance
+           ) VALUES ('eu-a', 'src-a', 'doc-a', 'confluence', '{}',
+                     'TEST', 'workspace', 'evidence a', 'source_content')"""
+    )
+    await db.db.execute(
+        """INSERT INTO evidence_relations (
+               evidence_unit_id, memory_id, relation_type, relation_direction, authority_case,
+               is_authoritative_support, classifier_version, relation_run_id
+           ) VALUES ('eu-a', 'mem-shared', 'refines', 'challenger_to_candidate',
+                     'same_source_lineage', 1, 'test-v1', 'run-a')"""
+    )
+    await db.db.commit()
     store = RecordingMemoryStore(fail_once=True)
     service = SourceAccessTransitionService(db=db, memory_store=store)
     transition = await service.start(
@@ -311,6 +328,12 @@ async def test_failed_split_revert_merges_source_support_without_duplicate(db: D
     original = await db.get_memory("mem-shared")
     assert original is not None and original.status == "active"
     assert original.visibility == "workspace"
+    async with db.db.execute(
+        "SELECT memory_id, relation_direction FROM evidence_relations WHERE evidence_unit_id = 'eu-a'"
+    ) as cursor:
+        restored_relation = await cursor.fetchone()
+    assert restored_relation["memory_id"] == "mem-shared"
+    assert restored_relation["relation_direction"] == "challenger_to_candidate"
 
 
 @pytest.mark.asyncio

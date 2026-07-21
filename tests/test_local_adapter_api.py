@@ -26,6 +26,12 @@ def _config(tmp_path: Path) -> AppConfig:
     cfg.server.jwt_secret = "test-secret"
     cfg.llm.enrichment_api_key = ""
     cfg.llm.embedding_api_key = ""
+    # These tests exercise the adapter HTTP/package boundary. Background
+    # scheduling and durable-worker behavior have dedicated contract suites;
+    # starting them here adds unrelated concurrent database activity and makes
+    # TestClient shutdown nondeterministic on Linux runners.
+    cfg.sync.scheduler_enabled = False
+    cfg.sync.worker_enabled = False
     return cfg
 
 

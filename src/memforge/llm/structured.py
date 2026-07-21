@@ -236,31 +236,34 @@ class ReconciliationResponse(StructuredResponseModel):
     decisions: list[ReconciliationDecision]
 
 
-class ContradictionDecision(StructuredResponseModel):
-    """One cross-document memory relationship classification."""
+class MemoryRelationDecision(StructuredResponseModel):
+    """One exact pair classification with explicit refinement direction."""
 
     model_config = ConfigDict(extra="ignore")
 
-    pair_index: int
-    classification: Literal["contradiction", "temporal", "clarification", "unrelated"]
-    reason: str = ""
-
-
-class ContradictionResponse(StructuredResponseModel):
-    """Schema returned by cross-document contradiction detection."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    decisions: list[ContradictionDecision]
-
-
-class MemoryEquivalenceResponse(StructuredResponseModel):
-    """Schema for the semantic proof required before Memory ID reuse."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    equivalent: bool
+    pair_index: int = Field(ge=0)
+    classification: Literal["equivalent", "refines", "contradicts", "unrelated"]
+    direction: Literal[
+        "symmetric",
+        "challenger_to_candidate",
+        "candidate_to_challenger",
+    ]
     reason: str = Field(default="", max_length=1000)
+
+    @model_validator(mode="after")
+    def _validate_direction(self) -> MemoryRelationDecision:
+        directional = self.classification == "refines"
+        if directional == (self.direction == "symmetric"):
+            raise ValueError("REFINES must be directional and other relations symmetric")
+        return self
+
+
+class MemoryRelationResponse(StructuredResponseModel):
+    """Schema for a complete batch of exact Memory-pair decisions."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    decisions: list[MemoryRelationDecision]
 
 
 class MemorySupportValidationResponse(StructuredResponseModel):
@@ -358,23 +361,14 @@ class SourceSupportStructuredClient(Protocol):
     ) -> ReconciliationResponse:
         """Return schema-validated same-document reconciliation decisions."""
 
-    async def detect_contradictions(
+    async def classify_memory_relations(
         self,
         prompt: str,
         *,
-        max_tokens: int = 2048,
+        max_tokens: int = 32_768,
         model: str | None = None,
-    ) -> ContradictionResponse:
-        """Return schema-validated cross-document contradiction decisions."""
-
-    async def classify_memory_equivalence(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 512,
-        model: str | None = None,
-    ) -> MemoryEquivalenceResponse:
-        """Prove whether two claims have identical semantic truth conditions."""
+    ) -> MemoryRelationResponse:
+        """Return exact, directed relationship decisions for Memory pairs."""
 
     async def validate_memory_support(
         self,
@@ -621,30 +615,16 @@ class LiteLlmStructuredClient:
             model=model,
         )
 
-    async def detect_contradictions(
+    async def classify_memory_relations(
         self,
         prompt: str,
         *,
-        max_tokens: int = 2048,
+        max_tokens: int = 32_768,
         model: str | None = None,
-    ) -> ContradictionResponse:
+    ) -> MemoryRelationResponse:
         return await self._call_schema(
             prompt=prompt,
-            response_format=ContradictionResponse,
-            max_tokens=max_tokens,
-            model=model,
-        )
-
-    async def classify_memory_equivalence(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 512,
-        model: str | None = None,
-    ) -> MemoryEquivalenceResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=MemoryEquivalenceResponse,
+            response_format=MemoryRelationResponse,
             max_tokens=max_tokens,
             model=model,
         )
@@ -791,9 +771,7 @@ class LiteLlmStructuredClient:
                     native_schema=False,
                 )
             except Exception as exc:
-                raise StructuredLlmError(
-                    f"{exc} (response_schema attempt failed first: {schema_exc})"
-                ) from exc
+                raise StructuredLlmError(f"{exc} (response_schema attempt failed first: {schema_exc})") from exc
 
     async def _attempt_schema(
         self,

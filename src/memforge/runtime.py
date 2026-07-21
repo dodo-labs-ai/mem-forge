@@ -145,6 +145,7 @@ class SyncRuntime:
     structured_llm_client: LiteLlmStructuredClient | None
     llm_model: str
     source_support_detector: SourceSupportDetector | None
+    relation_discovery: Any | None = None
     extraction_pool: ExtractionWorkPool | None = None
     document_lifecycle_admission: DocumentLifecycleAdmission | None = None
     memory_observer: SyncMemoryObserver | None = None
@@ -611,6 +612,15 @@ async def build_sync_runtime(
         structured_llm_client=structured_llm_client,
         llm_model=llm.enrichment_model,
     )
+    relation_discovery = None
+    if memory_engine.pair_classifier is not None:
+        from memforge.memory.relation_discovery import RelationDiscovery
+
+        relation_discovery = RelationDiscovery(
+            store=adapters.relational,
+            candidate_retriever=memory_engine.cross_document_candidates,
+            pair_classifier=memory_engine.pair_classifier,
+        )
     source_support_kwargs = {
         "structured_llm_client": structured_llm_client,
         "llm_model": llm.enrichment_model,
@@ -630,6 +640,7 @@ async def build_sync_runtime(
         structured_llm_client=structured_llm_client,
         llm_model=llm.enrichment_model,
         source_support_detector=source_support_detector,
+        relation_discovery=relation_discovery,
         extraction_pool=extraction_pool,
         document_lifecycle_admission=document_lifecycle_admission,
         memory_observer=SyncMemoryObserver(),
@@ -764,6 +775,45 @@ class SourceSyncWorker:
         self._extraction_pool = ExtractionWorkPool(max_extraction_workers) if max_extraction_workers else None
         max_document_lifecycles = max(0, int(config.sync.max_document_lifecycles))
         self._document_lifecycle_admission = get_process_document_lifecycle_admission(max_document_lifecycles)
+        self._relation_runtime: SyncRuntime | None = None
+
+    async def _process_relation_discovery_once(self) -> bool:
+        try:
+            if self._relation_runtime is None:
+                from memforge.memory.relation_discovery import DEFAULT_RELATION_DISCOVERY_BUDGET
+
+                if not await self.db.has_ready_relation_discovery_work(
+                    max_attempts=DEFAULT_RELATION_DISCOVERY_BUDGET.max_attempts,
+                ):
+                    return False
+                self._relation_runtime = await self.runtime_provider.build_sync_runtime(
+                    self.db,
+                    self.config,
+                    extraction_pool=self._extraction_pool,
+                    document_lifecycle_admission=self._document_lifecycle_admission,
+                )
+            processor = self._relation_runtime.relation_discovery
+            if processor is None:
+                return False
+            result = await processor.process_slice(
+                worker_id=f"{self.worker_id}:relation",
+            )
+            if result.attempted_work:
+                logger.info(
+                    "Relation discovery slice attempted=%d completed=%d failed=%d "
+                    "obsolete=%d pairs=%d llm_calls=%d elapsed_ms=%d",
+                    result.attempted_work,
+                    result.completed_work,
+                    result.failed_work,
+                    result.obsolete_work,
+                    result.checked_candidate_pairs,
+                    result.llm_calls,
+                    result.elapsed_ms,
+                )
+            return bool(result.attempted_work)
+        except Exception:
+            logger.exception("Relation discovery worker slice failed")
+            return False
 
     async def _heartbeat_until_stopped(
         self,
@@ -904,6 +954,7 @@ class SourceSyncWorker:
             lease_seconds=self.lease_seconds,
         )
         if run is None:
+            await self._process_relation_discovery_once()
             return None
 
         source: dict | None = None
@@ -937,9 +988,7 @@ class SourceSyncWorker:
                 return run
 
             if not source_type_supports_sync(str(source.get("type") or "")):
-                raise SourceSyncUnsupportedError(
-                    f"Source type {source.get('type')!r} does not support ordinary sync"
-                )
+                raise SourceSyncUnsupportedError(f"Source type {source.get('type')!r} does not support ordinary sync")
 
             if (
                 run.source_config_revision is not None
@@ -975,6 +1024,7 @@ class SourceSyncWorker:
                 extraction_pool=self._extraction_pool,
                 document_lifecycle_admission=self._document_lifecycle_admission,
             )
+            self._relation_runtime = runtime
             final_state = await self._run_source_sync_with_heartbeat(
                 run,
                 db=self.db,
@@ -984,9 +1034,7 @@ class SourceSyncWorker:
                 progress_callback=None,
                 force_full_sync=run.force_full_sync,
                 authoritative_snapshot=authoritative_collection,
-                lifecycle_cycle_id=(
-                    f"{run.run_id}:attempt:{run.lease_attempt_count}"
-                ),
+                lifecycle_cycle_id=(f"{run.run_id}:attempt:{run.lease_attempt_count}"),
                 scope_transition_run_id=run.run_id,
             )
             if final_state is None:
@@ -1014,16 +1062,13 @@ class SourceSyncWorker:
                     raise SourceSyncLeaseLost(f"source sync lease lost before failure update for run {run.run_id}")
                 return run
             try:
-                await runtime.memory_store.attempt_lifecycle_vector_delivery(
-                    source_id=run.source_id
-                )
+                await runtime.memory_store.attempt_lifecycle_vector_delivery(source_id=run.source_id)
             except Exception:
                 # The relational lifecycle graph is already authoritative.
                 # Delivery stays durable in the outbox and must never turn a
                 # successful source run into a failed extraction transaction.
                 logger.exception(
-                    "Source sync completed with lifecycle vector delivery still pending "
-                    "for source %s",
+                    "Source sync completed with lifecycle vector delivery still pending for source %s",
                     run.source_id,
                 )
             completed = await self.db.complete_source_sync_run(
@@ -1075,6 +1120,10 @@ class SourceSyncWorker:
         interval = max(0.1, poll_seconds if poll_seconds is not None else self.config.sync.worker_poll_seconds)
         while True:
             run = await self.run_once()
+            if run is not None:
+                # Fairly interleave one bounded non-destructive slice even while
+                # source-sync work remains continuously available.
+                await self._process_relation_discovery_once()
             await asyncio.sleep(0 if run is not None else interval)
 
 
@@ -1115,9 +1164,7 @@ class SyncService:
         if source.get("status") != "active":
             raise SourceNotActiveError(f"Source is not active: {source_id} ({source.get('status')})")
         if not source_type_supports_sync(str(source.get("type") or "")):
-            raise SourceSyncUnsupportedError(
-                f"Source type {source.get('type')!r} does not support ordinary sync"
-            )
+            raise SourceSyncUnsupportedError(f"Source type {source.get('type')!r} does not support ordinary sync")
         await authorize_source_sync_maintenance(self.db, source_id)
         return source
 
