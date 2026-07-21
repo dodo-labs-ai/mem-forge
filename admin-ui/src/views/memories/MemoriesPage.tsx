@@ -14,14 +14,12 @@ import type {
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
 import { EmptyState } from "@/components/admin/EmptyState";
-import { FilterSelect } from "@/components/admin/FilterSelect";
 import { PageHeader } from "@/components/admin/PageHeader";
 import { Pagination } from "@/components/admin/Pagination";
 import { SearchInput } from "@/components/admin/SearchInput";
 import { ConfidenceBadge, MemoryTypeBadge, StatusDot } from "@/components/admin/StatusBadge";
 import { MemoryTypeIcon } from "@/components/memories/MemoryTypeIcon";
 import { SourceIcon } from "@/components/sources/SourceIcon";
-import { Toolbar } from "@/components/admin/Toolbar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -40,6 +38,7 @@ import {
   UNSORTED_PROJECT_KEY,
   isReservedProjectKey,
 } from "@/api/projectKeys";
+import { MemoryFiltersPopover } from "./MemoryFiltersPopover";
 
 const PAGE_PROJECT_ALL = "all";
 const SHARED_PROJECT_LABEL = "Shared";
@@ -219,6 +218,14 @@ export function MemoriesPage() {
   };
   const changeNarrow = (value: boolean) => {
     setNarrowToggle(value);
+    setPage(0);
+  };
+  const clearFilters = () => {
+    setType("all");
+    setStatus("all");
+    setSource("all");
+    setPageProject(PAGE_PROJECT_ALL);
+    setNarrowToggle(NARROW_TOGGLE_DEFAULT);
     setPage(0);
   };
 
@@ -409,75 +416,39 @@ export function MemoriesPage() {
       </div>
 
       <DataSurface>
-        <div className="flex flex-col gap-3 border-b p-4 xl:flex-row xl:items-center xl:justify-between">
-          <div>
-            <h2 className="text-base font-semibold">Memory List</h2>
-            <p className="mt-1 text-sm text-muted-foreground">
-              {headerCount} in the current result set.
-            </p>
-          </div>
-          <Toolbar className="xl:justify-end">
-            <SearchInput value={search} onChange={changeSearch} placeholder="Filter memories..." />
-            <FilterSelect value={type} onChange={changeType} options={TYPE_OPTIONS} label="Filter by type" />
-            <FilterSelect
-              value={status}
-              onChange={changeStatus}
-              options={STATUS_OPTIONS}
-              label="Filter by status"
-              className="w-full sm:w-44"
-            />
-            <FilterSelect
-              value={source}
-              onChange={changeSource}
-              label="Filter by source"
-              className="w-full sm:w-56"
-              options={[
-                { value: "all", label: "All sources" },
-                ...sourceList.map((item) => ({ value: item.id, label: item.name })),
-              ]}
-            />
-            <FilterSelect
-              value={pageProject}
-              onChange={changeProject}
-              label="Filter by project"
-              className="w-full sm:w-56"
-              options={projectOptions}
-            />
-            {effectiveProjectKey !== null && (
-              <div
-                role="group"
-                aria-label="Project scope"
-                className="inline-flex items-center rounded-md border bg-background p-0.5 text-sm"
-              >
-                <button
-                  type="button"
-                  onClick={() => changeNarrow(false)}
-                  aria-pressed={!narrowToggle}
-                  className={
-                    "rounded px-3 py-1.5 transition-colors " +
-                    (!narrowToggle
-                      ? "bg-foreground text-background"
-                      : "text-muted-foreground hover:text-foreground")
-                  }
-                >
-                  {effectiveProjectLabel} on top
-                </button>
-                <button
-                  type="button"
-                  onClick={() => changeNarrow(true)}
-                  aria-pressed={narrowToggle}
-                  className={
-                    "rounded px-3 py-1.5 transition-colors " +
-                    (narrowToggle
-                      ? "bg-foreground text-background"
-                      : "text-muted-foreground hover:text-foreground")
-                  }
-                >
-                  Only this project
-                </button>
-              </div>
-            )}
-          </Toolbar>
+        <div className="flex flex-col gap-2 border-b p-3 sm:flex-row sm:items-center">
+          <SearchInput
+            value={search}
+            onChange={changeSearch}
+            placeholder="Search memories"
+            ariaLabel="Search memories"
+            size="sm"
+            className="min-w-0 flex-1"
+          />
+          <MemoryFiltersPopover
+            type={type}
+            status={status}
+            source={source}
+            project={pageProject}
+            projectLabel={effectiveProjectLabel}
+            narrowProject={narrowToggle}
+            typeOptions={TYPE_OPTIONS}
+            statusOptions={STATUS_OPTIONS}
+            sourceOptions={[
+              { value: "all", label: "All sources" },
+              ...sourceList.map((item) => ({ value: item.id, label: item.name })),
+            ]}
+            projectOptions={projectOptions}
+            onTypeChange={changeType}
+            onStatusChange={changeStatus}
+            onSourceChange={changeSource}
+            onProjectChange={changeProject}
+            onNarrowProjectChange={changeNarrow}
+            onClear={clearFilters}
+          />
+          <span className="whitespace-nowrap text-xs text-muted-foreground">
+            {headerCount}
+          </span>
         </div>
         <>
             <AsyncBoundary
