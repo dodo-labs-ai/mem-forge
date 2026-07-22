@@ -12,6 +12,7 @@ the corresponding source gene.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -171,6 +172,39 @@ def _write_inbox_package(
     return str(package_path)
 
 
+async def _persist_package(
+    *,
+    config: AppConfig,
+    document_store: DocumentStore | None,
+    source: dict[str, Any],
+    source_id: str,
+    doc_id: str,
+    payload_text: str,
+    extension: str,
+) -> tuple[str | None, str, str | None]:
+    """Persist one raw package without blocking the async request loop."""
+
+    def persist() -> tuple[str | None, str, str | None]:
+        package_uri, package_sha256 = _store_package_artifact(
+            document_store=document_store,
+            source=source,
+            source_id=source_id,
+            doc_id=doc_id,
+            payload_text=payload_text,
+            extension=extension,
+        )
+        package_path = _write_inbox_package(
+            config=config,
+            source_id=source_id,
+            doc_id=doc_id,
+            payload_text=payload_text,
+            document_store=document_store,
+        )
+        return package_uri, package_sha256, package_path
+
+    return await asyncio.to_thread(persist)
+
+
 def _package_manifest_entry(
     *,
     doc_id: str,
@@ -292,20 +326,14 @@ async def submit_local_markdown_document(
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
-    package_uri, package_sha256 = _store_package_artifact(
+    package_uri, package_sha256, package_path = await _persist_package(
+        config=config,
         document_store=document_store,
         source=source,
         source_id=source_id,
         doc_id=doc_id,
         payload_text=payload_text,
         extension=".local-package.json",
-    )
-    package_path = _write_inbox_package(
-        config=config,
-        source_id=source_id,
-        doc_id=doc_id,
-        payload_text=payload_text,
-        document_store=document_store,
     )
 
     manifest_entry = None
@@ -449,20 +477,14 @@ async def submit_github_repo_document(
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
-    package_uri, package_sha256 = _store_package_artifact(
+    package_uri, package_sha256, package_path = await _persist_package(
+        config=config,
         document_store=document_store,
         source=source,
         source_id=source_id,
         doc_id=doc_id,
         payload_text=payload_text,
         extension=".github-repo-package.json",
-    )
-    package_path = _write_inbox_package(
-        config=config,
-        source_id=source_id,
-        doc_id=doc_id,
-        payload_text=payload_text,
-        document_store=document_store,
     )
 
     manifest_entry = None
@@ -569,20 +591,14 @@ async def submit_jira_package(
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
-    package_uri, package_sha256 = _store_package_artifact(
+    package_uri, package_sha256, package_path = await _persist_package(
+        config=config,
         document_store=document_store,
         source=source,
         source_id=source_id,
         doc_id=doc_id,
         payload_text=payload_text,
         extension=".jira-package.json",
-    )
-    package_path = _write_inbox_package(
-        config=config,
-        source_id=source_id,
-        doc_id=doc_id,
-        payload_text=payload_text,
-        document_store=document_store,
     )
 
     manifest_entry = None
@@ -707,20 +723,14 @@ async def submit_teams_window_package(
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
-    package_uri, package_sha256 = _store_package_artifact(
+    package_uri, package_sha256, package_path = await _persist_package(
+        config=config,
         document_store=document_store,
         source=source,
         source_id=source_id,
         doc_id=doc_id,
         payload_text=payload_text,
         extension=".teams-package.json",
-    )
-    package_path = _write_inbox_package(
-        config=config,
-        source_id=source_id,
-        doc_id=doc_id,
-        payload_text=payload_text,
-        document_store=document_store,
     )
 
     manifest_entry = None
