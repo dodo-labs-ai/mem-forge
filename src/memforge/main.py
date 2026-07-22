@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import metadata
-from itertools import chain, islice
+from itertools import chain
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from typing import Any, Callable
@@ -35,6 +35,7 @@ from memforge.auth import browser_session
 from memforge.config import AppConfig, load_config
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSION_LIST,
+    build_github_repo_doc_id,
     decode_github_base64_content,
     github_content_type,
     github_exclude_paths,
@@ -45,6 +46,11 @@ from memforge.github_repo_utils import (
     parse_github_repo_url,
 )
 from memforge.local_agent.folder_picker import FolderPickerCancelled, FolderPickerUnavailable, pick_folder
+from memforge.local_agent.document_identity import (
+    build_jira_doc_id,
+    build_local_markdown_doc_id,
+    build_teams_doc_id,
+)
 from memforge.local_agent.source_contract import (
     TEAMS_TOMBSTONE_REASONS,
     local_agent_sync_snapshot_id,
@@ -434,24 +440,58 @@ def _gh_api_json(repo: dict[str, str], endpoint: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _github_tree(repo: dict[str, str], ref: str) -> list[dict[str, Any]]:
+@dataclass(frozen=True)
+class _GitHubCollectionSnapshot:
+    commit_sha: str
+    root_tree_sha: str
+
+
+def _resolve_github_collection_snapshot(
+    repo: dict[str, str],
+    ref: str,
+) -> _GitHubCollectionSnapshot:
     payload = _gh_api_json(
         repo,
-        f"repos/{repo['owner']}/{repo['repo']}/git/trees/{quote(ref, safe='')}?recursive=1",
+        f"repos/{repo['owner']}/{repo['repo']}/commits/{quote(ref, safe='')}",
     )
-    if payload.get("truncated") is True:
+    commit_sha = str(payload.get("sha") or "").strip()
+    commit = payload.get("commit") if isinstance(payload.get("commit"), dict) else {}
+    tree = commit.get("tree") if isinstance(commit.get("tree"), dict) else {}
+    root_tree_sha = str(tree.get("sha") or "").strip()
+    if not commit_sha or not root_tree_sha:
         raise click.ClickException(
-            "GitHub tree response was truncated; use Internal network / VPN access for this large repository."
+            "GitHub did not return an immutable commit and root tree for this collection."
+        )
+    return _GitHubCollectionSnapshot(
+        commit_sha=commit_sha,
+        root_tree_sha=root_tree_sha,
+    )
+
+
+def _github_tree(repo: dict[str, str], tree_sha: str) -> list[dict[str, Any]]:
+    payload = _gh_api_json(
+        repo,
+        f"repos/{repo['owner']}/{repo['repo']}/git/trees/{quote(tree_sha, safe='')}?recursive=1",
+    )
+    if payload.get("truncated") is not False:
+        raise click.ClickException(
+            "GitHub tree response did not prove complete; retry when the provider can return a complete tree."
         )
     tree = payload.get("tree")
-    return tree if isinstance(tree, list) else []
+    if not isinstance(tree, list):
+        raise click.ClickException("GitHub tree response did not contain a tree collection.")
+    return tree
 
 
-def _github_content(repo: dict[str, str], ref: str, relative_path: str) -> bytes:
+def _github_blob(repo: dict[str, str], blob_sha: str, relative_path: str) -> bytes:
     payload = _gh_api_json(
         repo,
-        f"repos/{repo['owner']}/{repo['repo']}/contents/{quote(relative_path, safe='/')}?ref={quote(ref, safe='')}",
+        f"repos/{repo['owner']}/{repo['repo']}/git/blobs/{quote(blob_sha, safe='')}",
     )
+    if str(payload.get("sha") or "").strip() != blob_sha:
+        raise click.ClickException(
+            f"GitHub returned a different blob revision for {relative_path}."
+        )
     try:
         return decode_github_base64_content(
             content=payload.get("content"),
@@ -490,10 +530,11 @@ def _github_title(markdown_body: str, fallback: str) -> str:
 
 def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | None) -> dict[str, Any]:
     repo, ref, include_paths, exclude_paths, include_extensions = _resolve_github_profile(name, profile)
+    snapshot = _resolve_github_collection_snapshot(repo, ref)
     counts = {"included": 0, "ignored": 0}
     extension_counts: dict[str, int] = {}
     items: list[dict[str, Any]] = []
-    tree = _github_tree(repo, ref)
+    tree = _github_tree(repo, snapshot.root_tree_sha)
     for entry in tree:
         if entry.get("type") != "blob":
             continue
@@ -521,6 +562,8 @@ def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | 
         "profile": name,
         "repo_url": repo["repo_url"],
         "ref": ref,
+        "commit_sha": snapshot.commit_sha,
+        "root_tree_sha": snapshot.root_tree_sha,
         "include_paths": include_paths,
         "exclude_paths": exclude_paths,
         "include_extensions": include_extensions,
@@ -1805,9 +1848,12 @@ def _push_github_profile_to_source(
     local_agent_attempt_count: int | None = None,
     report_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
     source_id = source_id.strip()
     if not source_id:
         raise click.ClickException("source_id is required")
+    if limit and sync_snapshot_id:
+        raise ValueError("limited collection cannot finalize a fenced source snapshot")
 
     repo, ref, _include_paths, _exclude_paths, _include_extensions = _resolve_github_profile(name, profile)
     preview = _preview_github_profile(name, profile, limit=None if limit == 0 else max(limit, 0))
@@ -1821,6 +1867,74 @@ def _push_github_profile_to_source(
         ),
     )
 
+    manifest_items: list[dict[str, str]] = []
+    entries_by_doc_id: dict[str, dict[str, Any]] = {}
+    revisions_complete = True
+    for entry in selected_entries:
+        relative_path = str(entry["relative_path"])
+        revision = str(entry.get("blob_sha") or "").strip()
+        if not revision:
+            revisions_complete = False
+        doc_id = build_github_repo_doc_id(
+            source_id=source_id,
+            repo_url=repo["repo_url"],
+            repo_ref=ref,
+            relative_path=relative_path,
+        )
+        manifest_items.append(
+            {"doc_id": doc_id, "revision": revision, "change_kind": "upsert"}
+        )
+        entries_by_doc_id[doc_id] = entry
+
+    required_doc_ids = set(entries_by_doc_id)
+    comparison_started_at = time.perf_counter()
+    fallback_reason: str | None = None
+    if (
+        not limit
+        and revisions_complete
+        and sync_snapshot_id
+        and local_agent_job_id
+        and local_agent_attempt_count is not None
+    ):
+        try:
+            required_doc_ids = _required_local_source_doc_ids(
+                client,
+                source_id=source_id,
+                items=manifest_items,
+                coverage="complete_snapshot",
+                known_doc_ids=set(entries_by_doc_id),
+                sync_snapshot_id=sync_snapshot_id,
+                local_agent_job_id=local_agent_job_id,
+                local_agent_attempt_count=local_agent_attempt_count,
+            )
+        except RuntimeError as exc:
+            return {
+                "profile": name,
+                "repo_url": repo["repo_url"],
+                "ref": ref,
+                "source_id": source_id,
+                "counts": {
+                    "selected": len(selected_entries),
+                    "reused": 0,
+                    "fetched": 0,
+                    "pushed": 0,
+                    "failed": 0,
+                },
+                "error": str(exc),
+                "retryable": True,
+            }
+    elif not revisions_complete:
+        fallback_reason = "missing_provider_revision"
+    comparison_latency_ms = round(
+        (time.perf_counter() - comparison_started_at) * 1000,
+        3,
+    )
+
+    entries_to_fetch = [
+        entry
+        for doc_id, entry in entries_by_doc_id.items()
+        if doc_id in required_doc_ids
+    ]
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     prepared: list[dict[str, Any]] = []
@@ -1829,14 +1943,18 @@ def _push_github_profile_to_source(
         _sync_progress_snapshot(
             phase="fetching",
             completed=0,
-            total=len(selected_entries),
+            total=len(entries_to_fetch),
             unit="file",
         ),
     )
-    for index, entry in enumerate(selected_entries, start=1):
+    for index, entry in enumerate(entries_to_fetch, start=1):
         relative_path = str(entry["relative_path"])
         try:
-            raw = _github_content(repo, ref, relative_path)
+            raw = _github_blob(
+                repo,
+                str(entry.get("blob_sha") or ""),
+                relative_path,
+            )
             text_body = raw.decode("utf-8")
         except UnicodeDecodeError:
             failed.append({"relative_path": relative_path, "error": "invalid utf-8"})
@@ -1852,6 +1970,7 @@ def _push_github_profile_to_source(
                     "title": _github_title(text_body, relative_path),
                     "raw_hash": raw_hash,
                     "blob_sha": str(entry.get("blob_sha") or ""),
+                    "body_bytes": len(raw),
                 }
             )
         finally:
@@ -1860,7 +1979,7 @@ def _push_github_profile_to_source(
                 _sync_progress_snapshot(
                     phase="fetching",
                     completed=index,
-                    total=len(selected_entries),
+                    total=len(entries_to_fetch),
                     unit="file",
                     failed=len(failed),
                 ),
@@ -1877,7 +1996,9 @@ def _push_github_profile_to_source(
         ),
     )
 
+    uploaded_body_bytes = 0
     for index, doc in enumerate(prepared, start=1):
+        uploaded_body_bytes += int(doc["body_bytes"])
         response = client.push_github_repo_document(
             source_id=source_id,
             repo_url=repo["repo_url"],
@@ -1927,9 +2048,28 @@ def _push_github_profile_to_source(
         "repo_url": repo["repo_url"],
         "ref": ref,
         "source_id": source_id,
-        "counts": {"selected": len(selected_entries), "pushed": len(pushed), "failed": len(failed)},
+        "counts": {
+            "selected": len(selected_entries),
+            "reused": len(selected_entries) - len(entries_to_fetch),
+            "fetched": len(prepared),
+            "pushed": len(pushed),
+            "failed": len(failed),
+        },
         "pushed": pushed,
         "failed": failed,
+        "metrics": {
+            "manifest_items": len(manifest_items),
+            "full_bodies_read": len(prepared),
+            "full_bodies_uploaded": len(prepared),
+            "bytes_read": sum(int(doc["body_bytes"]) for doc in prepared),
+            "bytes_uploaded": uploaded_body_bytes,
+            "comparison_latency_ms": comparison_latency_ms,
+            "end_to_end_latency_ms": round(
+                (time.perf_counter() - started_at) * 1000,
+                3,
+            ),
+            "fallback_reason": fallback_reason,
+        },
     }
     if failed:
         examples = "; ".join(f"{item.get('relative_path')}: {item.get('error')}" for item in failed[:3])
@@ -2005,6 +2145,39 @@ def _raise_if_local_agent_lease_not_current(response: object) -> None:
     from memforge.local_agent.runner import CloudJobLeaseLost
 
     raise CloudJobLeaseLost("local_agent_lease_not_current")
+
+
+def _required_local_source_doc_ids(
+    client: ToolClient,
+    *,
+    source_id: str,
+    items: list[dict[str, str]],
+    coverage: str,
+    known_doc_ids: set[str],
+    sync_snapshot_id: str,
+    local_agent_job_id: str,
+    local_agent_attempt_count: int,
+) -> set[str]:
+    """Plan one fenced collection and validate the returned materialization set."""
+    plan = client.prepare_local_source_snapshot(
+        source_id=source_id,
+        items=items,
+        coverage=coverage,
+        sync_snapshot_id=sync_snapshot_id,
+        local_agent_job_id=local_agent_job_id,
+        local_agent_attempt_count=local_agent_attempt_count,
+    )
+    _raise_if_local_agent_lease_not_current(plan)
+    if plan.get("error"):
+        raise RuntimeError("source manifest comparison failed")
+    required_doc_ids = {
+        str(doc_id)
+        for doc_id in plan.get("required_doc_ids", [])
+        if str(doc_id)
+    }
+    if required_doc_ids - known_doc_ids:
+        raise RuntimeError("source manifest comparison returned unknown document identities")
+    return required_doc_ids
 
 
 def _run_cloud_github_preview_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -2155,11 +2328,16 @@ def _run_cloud_jira_sync_job(
                 "error_type": "JiraSessionUploadError",
                 "retryable": True,
             }
-        documents = asyncio.run(
+        sync_snapshot_id = local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count"))
+        collection = asyncio.run(
             _collect_jira_documents_from_cloud_job(
                 job,
                 source_id=source_id,
                 jira_cookie=captured.cookie_header,
+                client=client,
+                sync_snapshot_id=sync_snapshot_id,
+                local_agent_job_id=str(job["job_id"]),
+                local_agent_attempt_count=int(job["attempt_count"]),
                 limit=0,
                 report_progress=report_progress,
             )
@@ -2178,7 +2356,7 @@ def _run_cloud_jira_sync_job(
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     scoped_client = client
-    sync_snapshot_id = local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count"))
+    documents = collection["documents"]
     sync_result: dict[str, Any] | None = None
     _report_local_agent_progress(
         report_progress,
@@ -2198,6 +2376,7 @@ def _run_cloud_jira_sync_job(
             raw_payload=doc.get("raw_payload") if isinstance(doc.get("raw_payload"), dict) else {},
             title=str(doc["title"]),
             raw_hash=str(doc["raw_hash"]),
+            provider_revision=str(doc["provider_revision"]),
             submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
             sync_snapshot_id=sync_snapshot_id,
             local_agent_job_id=str(job["job_id"]),
@@ -2243,7 +2422,12 @@ def _run_cloud_jira_sync_job(
         "operation": operation,
         "source_id": source_id,
         "base_url": str(payload.get("base_url") or ""),
-        "counts": {"selected": len(documents), "pushed": len(pushed), "failed": len(failed)},
+        "counts": {
+            "selected": int(collection["inventory_count"]),
+            "reused": int(collection["reused_count"]),
+            "pushed": len(pushed),
+            "failed": len(failed),
+        },
         "pushed": pushed,
         "failed": failed,
         "sync_started": bool(sync_result and not sync_result.get("error")),
@@ -2415,6 +2599,7 @@ def _run_cloud_teams_sync_job(
     client = client.for_workspace(workspace_id)
 
     run_id = str(job.get("job_id") or f"teams-sync-{int(time.time())}")
+    sync_snapshot_id = local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count"))
     audit_path = Path(str(payload.get("audit_log_path") or DEFAULT_TEAMS_AUDIT_LOG_PATH))
     limit = _cloud_job_limit(payload.get("limit"), default=0)
     _report_local_agent_progress(
@@ -2532,8 +2717,54 @@ def _run_cloud_teams_sync_job(
     lease_lost = False
 
     processed_messages = 0
-    selected_count = 0
-    document_iterator = iter(chain(inventory_documents, documents, scope_attestation_documents))
+    candidate_documents: list[dict[str, Any]] = []
+    documents_to_push: list[dict[str, Any]] = []
+    if inventory_error is None:
+        try:
+            candidate_documents = list(chain(inventory_documents, documents, scope_attestation_documents))
+            documents_by_doc_id: dict[str, dict[str, Any]] = {}
+            manifest_items: list[dict[str, str]] = []
+            for doc in candidate_documents:
+                window_id = str(doc["window_id"])
+                doc_id = build_teams_doc_id(source_id=source_id, window_id=window_id)
+                if doc_id in documents_by_doc_id:
+                    raise ValueError(f"Teams collection contains duplicate window identity: {window_id}")
+                documents_by_doc_id[doc_id] = doc
+                raw_payload = doc.get("raw_payload") if isinstance(doc.get("raw_payload"), dict) else {}
+                manifest_items.append(
+                    {
+                        "doc_id": doc_id,
+                        "revision": str(doc["revision_hash"]),
+                        "change_kind": "tombstone" if raw_payload.get("_tombstone") is True else "upsert",
+                    }
+                )
+            required_doc_ids = _required_local_source_doc_ids(
+                scoped_client,
+                source_id=source_id,
+                items=manifest_items,
+                coverage="bounded_delta",
+                known_doc_ids=set(documents_by_doc_id),
+                sync_snapshot_id=sync_snapshot_id,
+                local_agent_job_id=str(job["job_id"]),
+                local_agent_attempt_count=int(job["attempt_count"]),
+            )
+            documents_to_push = [
+                doc
+                for doc_id, doc in documents_by_doc_id.items()
+                if doc_id in required_doc_ids
+            ]
+            skipped_existing.extend(
+                {
+                    "window_id": str(doc["window_id"]),
+                    "revision_hash": str(doc["revision_hash"]),
+                }
+                for doc_id, doc in documents_by_doc_id.items()
+                if doc_id not in required_doc_ids
+            )
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            inventory_error = str(exc)
+    selected_count = len(skipped_existing)
+    document_iterator = iter(documents_to_push)
     while inventory_error is None:
         try:
             doc = next(document_iterator)
@@ -2587,6 +2818,7 @@ def _run_cloud_teams_sync_job(
             source_url=str(doc.get("source_url") or ""),
             raw_hash=str(doc["raw_hash"]),
             submitted_by=submitted_by,
+            sync_snapshot_id=sync_snapshot_id,
             local_agent_job_id=str(job["job_id"]),
             local_agent_attempt_count=int(job["attempt_count"]),
         )
@@ -2673,13 +2905,14 @@ def _run_cloud_teams_sync_job(
     )
 
     sync_result = None
-    if pushed and inventory_error is None and not lease_lost:
+    if selected_count and not failed and inventory_error is None and not lease_lost:
         # Teams is incremental by stable window id and revision. Processing the
         # historical input set lets the server collapse each window to its
         # latest revision; document-style authoritative snapshots do not apply.
         sync_result = scoped_client.start_source_processing(
             source_id=source_id,
             force_full_sync=bool(payload.get("force_full_sync", False)),
+            sync_snapshot_id=sync_snapshot_id,
             local_agent_job_id=str(job["job_id"]),
             local_agent_attempt_count=int(job["attempt_count"]),
         )
@@ -3265,11 +3498,17 @@ async def _collect_jira_documents_from_cloud_job(
     source_id: str,
     limit: int,
     jira_cookie: str,
+    client: ToolClient,
+    sync_snapshot_id: str,
+    local_agent_job_id: str,
+    local_agent_attempt_count: int,
     report_progress: Callable[[dict[str, Any]], None] | None = None,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     from memforge.genes.jira_gene import JiraGene
 
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    if limit:
+        raise ValueError("limited Jira collection cannot finalize a fenced source snapshot")
     config = _jira_cloud_config_from_job_payload(payload)
     base_url = str(config["base_url"])
     config["jira_cookie"] = jira_cookie
@@ -3282,12 +3521,79 @@ async def _collect_jira_documents_from_cloud_job(
         _sync_progress_snapshot(phase="discovering", completed=0, unit="issue"),
     )
     try:
-        async for item in gene.discover(None):
-            if limit and len(documents) >= limit:
+        inventory_items = []
+        async for item in gene.discover_inventory():
+            if limit and len(inventory_items) >= limit:
                 break
+            issue_key = str(item.extra.get("issue_key") or item.item_id.replace("jira-", "")).strip()
+            revision = str(item.version or "").strip()
+            if not issue_key or not revision:
+                raise RuntimeError("Jira inventory item is missing issue identity or provider revision")
+            inventory_items.append(item)
+            _report_local_agent_progress(
+                report_progress,
+                _sync_progress_snapshot(
+                    phase="discovering",
+                    completed=len(inventory_items),
+                    unit="issue",
+                ),
+            )
+
+        items_by_doc_id = {
+            build_jira_doc_id(
+                source_id=source_id,
+                issue_key=str(item.extra.get("issue_key") or item.item_id.replace("jira-", "")),
+            ): item
+            for item in inventory_items
+        }
+        required_doc_ids = set(items_by_doc_id)
+        if not limit:
+            required_doc_ids = _required_local_source_doc_ids(
+                client,
+                source_id=source_id,
+                items=[
+                    {
+                        "doc_id": doc_id,
+                        "revision": str(item.version),
+                        "change_kind": "upsert",
+                    }
+                    for doc_id, item in items_by_doc_id.items()
+                ],
+                coverage="complete_snapshot",
+                known_doc_ids=set(items_by_doc_id),
+                sync_snapshot_id=sync_snapshot_id,
+                local_agent_job_id=local_agent_job_id,
+                local_agent_attempt_count=local_agent_attempt_count,
+            )
+        items_to_fetch = [
+            item
+            for doc_id, item in items_by_doc_id.items()
+            if doc_id in required_doc_ids
+        ]
+        _report_local_agent_progress(
+            report_progress,
+            _sync_progress_snapshot(
+                phase="fetching",
+                completed=0,
+                total=len(items_to_fetch),
+                unit="issue",
+            ),
+        )
+        for index, item in enumerate(items_to_fetch, start=1):
             raw = await gene.fetch(item)
             issue_key = str(item.extra.get("issue_key") or item.item_id.replace("jira-", "")).strip()
             raw_payload = json.loads(raw.body.decode("utf-8"))
+            hydrated_fields = raw_payload.get("fields")
+            hydrated_revision = (
+                str(hydrated_fields.get("updated") or "").strip()
+                if isinstance(hydrated_fields, dict)
+                else ""
+            )
+            inventory_revision = str(item.version or "").strip()
+            if not hydrated_revision or hydrated_revision != inventory_revision:
+                raise RuntimeError(
+                    f"Jira issue {issue_key} changed during materialization; retry inventory"
+                )
             raw_hash = hashlib.sha256(raw.body).hexdigest()
             documents.append(
                 {
@@ -3295,6 +3601,7 @@ async def _collect_jira_documents_from_cloud_job(
                     "issue_key": issue_key,
                     "source_url": item.source_url,
                     "title": item.title,
+                    "provider_revision": str(item.version),
                     "raw_payload": raw_payload,
                     "raw_hash": raw_hash,
                 }
@@ -3302,8 +3609,9 @@ async def _collect_jira_documents_from_cloud_job(
             _report_local_agent_progress(
                 report_progress,
                 _sync_progress_snapshot(
-                    phase="discovering",
-                    completed=len(documents),
+                    phase="fetching",
+                    completed=index,
+                    total=len(items_to_fetch),
                     unit="issue",
                 ),
             )
@@ -3311,7 +3619,11 @@ async def _collect_jira_documents_from_cloud_job(
         client = getattr(gene, "_client", None)
         if client is not None:
             await client.aclose()
-    return documents
+    return {
+        "documents": documents,
+        "inventory_count": len(inventory_items),
+        "reused_count": len(inventory_items) - len(items_to_fetch),
+    }
 
 
 def _jira_cloud_config_from_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3684,13 +3996,16 @@ def _push_kb_profile_to_source(
     local_agent_attempt_count: int | None = None,
     report_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    if limit and sync_snapshot_id:
+        raise ValueError("limited collection cannot finalize a fenced source snapshot")
     root, include, exclude, vault_id = _resolve_kb_profile(name, profile)
     counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
 
-    entries = _scan_kb_profile(root, include=include, exclude=exclude, counts=counts)
-    selected_entries = list(islice(entries, limit)) if limit else list(entries)
+    entries = list(_scan_kb_profile(root, include=include, exclude=exclude, counts=counts))
+    selected_entries = entries[:limit] if limit else entries
     _report_local_agent_progress(
         report_progress,
         _sync_progress_snapshot(
@@ -3700,17 +4015,104 @@ def _push_kb_profile_to_source(
         ),
     )
 
+    incomplete_reasons = {
+        key: counts[key]
+        for key in ("too_large", "invalid_utf8", "unreadable")
+        if counts[key]
+    }
+    if incomplete_reasons:
+        return {
+            "profile": name,
+            "root": str(root),
+            "vault_id": vault_id,
+            "source_id": source_id,
+            "counts": {**counts, "pushed": 0, "failed": sum(incomplete_reasons.values())},
+            "error": "local collection was incomplete",
+            "retryable": True,
+        }
+    try:
+        _attest_kb_scan_stable(
+            root,
+            include=include,
+            exclude=exclude,
+            entries=entries,
+        )
+    except ValueError as exc:
+        return {
+            "profile": name,
+            "root": str(root),
+            "vault_id": vault_id,
+            "source_id": source_id,
+            "counts": {**counts, "pushed": 0, "failed": 1},
+            "error": "local collection was incomplete",
+            "detail": str(exc),
+            "retryable": True,
+        }
+
+    entries_by_doc_id: dict[str, dict[str, Any]] = {}
+    manifest_items: list[dict[str, str]] = []
+    for entry in selected_entries:
+        doc_id = build_local_markdown_doc_id(
+            source_id=source_id,
+            vault_id=vault_id,
+            relative_path=str(entry["relative_path"]),
+        )
+        entries_by_doc_id[doc_id] = entry
+        manifest_items.append(
+            {
+                "doc_id": doc_id,
+                "revision": str(entry["raw_hash"]),
+                "change_kind": "upsert",
+            }
+        )
+
+    required_doc_ids = set(entries_by_doc_id)
+    comparison_started_at = time.perf_counter()
+    fallback_reason: str | None = None
+    if not limit and sync_snapshot_id and local_agent_job_id and local_agent_attempt_count is not None:
+        try:
+            required_doc_ids = _required_local_source_doc_ids(
+                client,
+                source_id=source_id,
+                items=manifest_items,
+                coverage="complete_snapshot",
+                known_doc_ids=set(entries_by_doc_id),
+                sync_snapshot_id=sync_snapshot_id,
+                local_agent_job_id=local_agent_job_id,
+                local_agent_attempt_count=local_agent_attempt_count,
+            )
+        except RuntimeError as exc:
+            return {
+                "profile": name,
+                "root": str(root),
+                "vault_id": vault_id,
+                "source_id": source_id,
+                "counts": {**counts, "pushed": 0, "failed": 0},
+                "error": str(exc),
+                "retryable": True,
+            }
+    else:
+        fallback_reason = "missing_fenced_snapshot"
+    comparison_latency_ms = round((time.perf_counter() - comparison_started_at) * 1000, 3)
+    entries_to_upload = [
+        entry
+        for doc_id, entry in entries_by_doc_id.items()
+        if doc_id in required_doc_ids
+    ]
+
     _report_local_agent_progress(
         report_progress,
         _sync_progress_snapshot(
             phase="uploading",
             completed=0,
-            total=len(selected_entries),
+            total=len(entries_to_upload),
             unit="file",
         ),
     )
 
-    for index, entry in enumerate(selected_entries, start=1):
+    uploaded_body_bytes = 0
+    for index, entry in enumerate(entries_to_upload, start=1):
+        uploaded_body_bytes += int(entry["bytes"])
         response = client.push_local_markdown_document(
             source_id=source_id,
             vault_id=vault_id,
@@ -3747,7 +4149,7 @@ def _push_kb_profile_to_source(
             _sync_progress_snapshot(
                 phase="uploading",
                 completed=index,
-                total=len(selected_entries),
+                total=len(entries_to_upload),
                 unit="file",
                 failed=len(failed),
             ),
@@ -3758,9 +4160,23 @@ def _push_kb_profile_to_source(
         "root": str(root),
         "vault_id": vault_id,
         "source_id": source_id,
-        "counts": {**counts, "pushed": len(pushed), "failed": len(failed)},
+        "counts": {
+            **counts,
+            "reused": len(selected_entries) - len(entries_to_upload),
+            "pushed": len(pushed),
+            "failed": len(failed),
+        },
         "pushed": pushed,
         "failed": failed,
+        "metrics": {
+            "manifest_items": len(manifest_items),
+            "full_bodies_read": len(selected_entries),
+            "full_bodies_uploaded": len(pushed),
+            "bytes_uploaded": uploaded_body_bytes,
+            "comparison_latency_ms": comparison_latency_ms,
+            "end_to_end_latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+            "fallback_reason": fallback_reason,
+        },
     }
     if failed:
         payload["error"] = "one or more documents failed to push"
@@ -3844,7 +4260,8 @@ def _scan_kb_profile(
             counts["ignored"] += 1
             continue
         try:
-            size = path.stat().st_size
+            stat_before = path.stat()
+            size = stat_before.st_size
         except OSError:
             counts["unreadable"] += 1
             continue
@@ -3854,10 +4271,26 @@ def _scan_kb_profile(
         try:
             raw = path.read_bytes()
             text = raw.decode("utf-8")
+            stat_after = path.stat()
         except UnicodeDecodeError:
             counts["invalid_utf8"] += 1
             continue
         except OSError:
+            counts["unreadable"] += 1
+            continue
+        fingerprint_before = (
+            stat_before.st_dev,
+            stat_before.st_ino,
+            stat_before.st_size,
+            stat_before.st_mtime_ns,
+        )
+        fingerprint_after = (
+            stat_after.st_dev,
+            stat_after.st_ino,
+            stat_after.st_size,
+            stat_after.st_mtime_ns,
+        )
+        if fingerprint_before != fingerprint_after or len(raw) != stat_after.st_size:
             counts["unreadable"] += 1
             continue
         content_type = _content_type_for_path(path)
@@ -3871,7 +4304,49 @@ def _scan_kb_profile(
             "raw_hash": raw_hash,
             "text": text,
             "bytes": size,
+            "stat_fingerprint": fingerprint_after,
         }
+
+
+def _attest_kb_scan_stable(
+    root: Path,
+    *,
+    include: list[str],
+    exclude: list[str],
+    entries: list[dict[str, Any]],
+) -> None:
+    """Prove that one body scan still describes the current configured scope."""
+    expected = {
+        str(entry["relative_path"]): tuple(entry["stat_fingerprint"])
+        for entry in entries
+    }
+    observed: dict[str, tuple[int, int, int, int]] = {}
+    try:
+        paths = sorted(root.rglob("*"))
+        for path in paths:
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative_path = path.relative_to(root).as_posix()
+            if _glob_match(relative_path, exclude) or not _glob_match(relative_path, include):
+                continue
+            stat = path.stat()
+            observed[relative_path] = (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+            )
+    except OSError as exc:
+        raise ValueError("local collection could not be revalidated") from exc
+    if set(observed) != set(expected):
+        raise ValueError("local collection membership changed during collection")
+    changed = sorted(
+        relative_path
+        for relative_path, fingerprint in observed.items()
+        if fingerprint != expected[relative_path]
+    )
+    if changed:
+        raise ValueError(f"local file changed during collection: {changed[0]}")
 
 
 def _glob_match(relative_path: str, patterns: list[str]) -> bool:

@@ -290,6 +290,32 @@ class ToolClient:
             body,
         )
 
+    def prepare_local_source_snapshot(
+        self,
+        *,
+        source_id: str,
+        items: list[dict[str, str]],
+        coverage: str,
+        sync_snapshot_id: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+    ) -> dict[str, Any]:
+        """Declare covered membership and request only missing content bodies."""
+        source_id = source_id.strip()
+        if not source_id:
+            return {"error": "source_id is required"}
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id, safe='')}/adapter/manifest",
+            {
+                "items": items,
+                "coverage": coverage,
+                "sync_snapshot_id": sync_snapshot_id,
+                "local_agent_job_id": local_agent_job_id,
+                "local_agent_attempt_count": local_agent_attempt_count,
+            },
+        )
+
     def push_jira_package(
         self,
         *,
@@ -300,6 +326,7 @@ class ToolClient:
         source_url: str | None = None,
         title: str | None = None,
         raw_hash: str | None = None,
+        provider_revision: str | None = None,
         sync_snapshot_id: str | None = None,
         local_agent_job_id: str | None = None,
         local_agent_attempt_count: int | None = None,
@@ -321,6 +348,8 @@ class ToolClient:
             body["title"] = title
         if raw_hash is not None:
             body["raw_hash"] = raw_hash
+        if provider_revision is not None:
+            body["provider_revision"] = provider_revision
         if sync_snapshot_id is not None:
             body["sync_snapshot_id"] = sync_snapshot_id
         if local_agent_job_id is not None:
@@ -350,6 +379,7 @@ class ToolClient:
         window_type: str | None = None,
         source_url: str | None = None,
         raw_hash: str | None = None,
+        sync_snapshot_id: str | None = None,
         local_agent_job_id: str | None = None,
         local_agent_attempt_count: int | None = None,
         submitted_by: str | None = None,
@@ -375,6 +405,8 @@ class ToolClient:
             body["source_url"] = source_url
         if raw_hash is not None:
             body["raw_hash"] = raw_hash
+        if sync_snapshot_id is not None:
+            body["sync_snapshot_id"] = sync_snapshot_id
         if local_agent_job_id is not None:
             body["local_agent_job_id"] = local_agent_job_id
         if local_agent_attempt_count is not None:

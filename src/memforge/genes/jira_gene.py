@@ -57,6 +57,8 @@ COMMENT_MAX_RESULTS = 100
 HYDRATED_SEARCH_MAX_RESULTS = 25
 JIRA_SEARCH_FIELDS = ["*all"]
 JIRA_SEARCH_EXPAND = ["changelog", "renderedFields"]
+JIRA_INVENTORY_FIELDS = ["summary", "updated", "project"]
+JIRA_INVENTORY_MAX_RESULTS = 100
 LOCAL_AGENT_JIRA_PACKAGE_KIND = "jira_document"
 
 JIRA_QUERY_MODE_SIMPLE = "simple"
@@ -449,27 +451,59 @@ class JiraGene(Gene):
                 yield item
             return
 
-        jql = _build_jql(self.config, since)
-
         self._hydrated_issues = {}
+        async for item in self._discover_remote_search(
+            since,
+            fields=JIRA_SEARCH_FIELDS,
+            expand=JIRA_SEARCH_EXPAND,
+            max_results=HYDRATED_SEARCH_MAX_RESULTS,
+            cache_hydrated=True,
+        ):
+            yield item
+
+    async def discover_inventory(self) -> AsyncIterator[ContentItem]:
+        """Discover a complete lightweight issue inventory for daemon planning."""
+        if str(self.config.get("sync_mode") or "cloud").strip().lower() == "local_agent":
+            raise ValueError("Jira inventory discovery requires direct provider access")
+        self._hydrated_issues = {}
+        async for item in self._discover_remote_search(
+            None,
+            fields=JIRA_INVENTORY_FIELDS,
+            expand=None,
+            max_results=JIRA_INVENTORY_MAX_RESULTS,
+            cache_hydrated=False,
+        ):
+            yield item
+
+    async def _discover_remote_search(
+        self,
+        since: datetime | None,
+        *,
+        fields: list[str],
+        expand: list[str] | None,
+        max_results: int,
+        cache_hydrated: bool,
+    ) -> AsyncIterator[ContentItem]:
+        jql = _build_jql(self.config, since)
         seen_issue_ids: set[str] = set()
         seen_issue_keys: set[str] = set()
         expected_total: int | None = None
         start_at = 0
-        max_results = HYDRATED_SEARCH_MAX_RESULTS
 
         while True:
             try:
+                request_body: dict[str, Any] = {
+                    "jql": jql,
+                    "startAt": start_at,
+                    "maxResults": max_results,
+                    "fields": fields,
+                }
+                if expand:
+                    request_body["expand"] = expand
                 resp = await self._request(
                     "POST",
                     "/rest/api/2/search",
-                    json_body={
-                        "jql": jql,
-                        "startAt": start_at,
-                        "maxResults": max_results,
-                        "fields": JIRA_SEARCH_FIELDS,
-                        "expand": JIRA_SEARCH_EXPAND,
-                    },
+                    json_body=request_body,
                 )
                 data = resp.json()
             except Exception as e:
@@ -499,15 +533,19 @@ class JiraGene(Gene):
             for issue in issues:
                 issue_id = str(issue.get("id") or "").strip()
                 key = str(issue.get("key") or "").strip()
-                fields = issue.get("fields")
-                if not issue_id.isdigit() or not key or not isinstance(fields, dict):
+                issue_fields = issue.get("fields")
+                if not issue_id.isdigit() or not key or not isinstance(issue_fields, dict):
                     raise RuntimeError("Jira search issue is missing a stable id, key, or fields")
                 if issue_id in seen_issue_ids or key in seen_issue_keys:
                     raise RuntimeError("Jira search returned duplicate issue identity")
                 seen_issue_ids.add(issue_id)
                 seen_issue_keys.add(key)
-                self._hydrated_issues[key] = issue
-                yield _issue_content_item(issue, self._base_url)
+                item = _issue_content_item(issue, self._base_url)
+                if cache_hydrated:
+                    self._hydrated_issues[key] = issue
+                else:
+                    item.extra["attest_materialized_revision"] = True
+                yield item
 
             # Pagination
             if start_at + len(issues) >= total:
@@ -600,6 +638,8 @@ class JiraGene(Gene):
             data["_comments"] = []
             data["_comments_total"] = 0
             data["_comments_included"] = False
+        if item.extra.get("attest_materialized_revision") is True:
+            await self._attest_materialized_revision(key, str(item.version or ""))
         validate_jira_observation_identities(data)
 
         return RawContent(
@@ -607,6 +647,29 @@ class JiraGene(Gene):
             body=json.dumps(data).encode("utf-8"),
             content_type="application/json",
         )
+
+    async def _attest_materialized_revision(self, key: str, expected_revision: str) -> None:
+        response = await self._request(
+            "GET",
+            f"/rest/api/2/issue/{key}",
+            params={"fields": "updated"},
+        )
+        payload = response.json()
+        fields = payload.get("fields") if isinstance(payload, dict) else None
+        current_revision = (
+            str(fields.get("updated") or "").strip()
+            if isinstance(fields, dict)
+            else ""
+        )
+        if (
+            not isinstance(payload, dict)
+            or str(payload.get("key") or "").strip() != key
+            or not current_revision
+            or current_revision != expected_revision
+        ):
+            raise RuntimeError(
+                f"Jira issue {key} changed during materialization; retry inventory"
+            )
 
     async def _top_up_truncated_comments(self, key: str, payload: dict) -> None:
         comments_resp = await self._request(

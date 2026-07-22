@@ -252,6 +252,11 @@ def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
             assert source_id == "src-teams"
             return {"units": []}
 
+        def prepare_local_source_snapshot(self, **kwargs):
+            assert kwargs["coverage"] == "bounded_delta"
+            assert kwargs["items"] == []
+            return {"required_doc_ids": [], "reused_count": 0}
+
     monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect)
     monkeypatch.setattr(main, "_run_cloud_teams_auth_job", fake_auth)
     monkeypatch.setattr(main, "_current_teams_chat_token_hashes", lambda: set())

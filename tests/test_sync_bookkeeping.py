@@ -58,6 +58,7 @@ from memforge.config import AppConfig, SyncConfig
 from memforge.storage.database import Database
 from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from memforge.storage.source_sync_manifest import SourceSyncManifestStore
 from memforge.scheduler import SyncScheduler
 
 
@@ -2023,6 +2024,91 @@ async def test_source_sync_inputs_filter_by_current_snapshot_membership(db: Data
     assert repeated.input_id == new.input_id
     assert [item.input_id for item in repeat_snapshot] == [new.input_id]
     assert empty_snapshot == []
+
+
+@pytest.mark.asyncio
+async def test_source_sync_input_attestation_lookup_is_exact_and_history_bounded(
+    db: Database,
+):
+    source_id = "src-manifest-attestations"
+    workspace_id = "workspace-a"
+    await db.upsert_source(
+        id=source_id,
+        type="github_repo",
+        name="Repository",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    inputs = []
+    for revision in ("v1", "v2", "unrelated"):
+        inputs.append(
+            await db.create_source_sync_input(
+                source_id=source_id,
+                workspace_id=workspace_id,
+                raw_uri=f"object://{revision}.json",
+                raw_sha256=f"semantic-{revision}",
+                raw_content_type="application/json",
+                metadata={
+                    "package_sha256": f"package-{revision}",
+                    "manifest_entry": {
+                        "doc_id": "doc-a" if revision != "unrelated" else "doc-other",
+                        "provider_revision": revision,
+                        "change_kind": "upsert",
+                        "package_sha256": f"package-{revision}",
+                    },
+                },
+            )
+        )
+    for index, (revision, item) in enumerate(zip(("v1", "v2", "unrelated"), inputs)):
+        doc_id = "doc-a" if revision != "unrelated" else "doc-other"
+        snapshot_id = f"snapshot-{index}"
+        await db.db.execute(
+            """INSERT INTO source_sync_snapshot_manifests (
+                   workspace_id, source_id, snapshot_id, coverage, item_count,
+                   manifest_sha256, local_agent_job_id, local_agent_attempt_count,
+                   source_activity_epoch, source_config_revision, created_at
+               ) VALUES (?, ?, ?, 'complete_snapshot', 1, ?, 'job', 1, 0, 'cfg', ?)""",
+            (workspace_id, source_id, snapshot_id, "a" * 64, "2026-07-22T00:00:00+00:00"),
+        )
+        await db.db.execute(
+            """INSERT INTO source_sync_snapshot_manifest_items (
+                   workspace_id, source_id, snapshot_id, doc_id, revision, change_kind
+               ) VALUES (?, ?, ?, ?, ?, 'upsert')""",
+            (workspace_id, source_id, snapshot_id, doc_id, revision),
+        )
+        await db.db.execute(
+            """INSERT INTO source_sync_snapshot_items (
+                   workspace_id, source_id, snapshot_id, doc_id, input_id, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                workspace_id,
+                source_id,
+                snapshot_id,
+                doc_id,
+                item.input_id,
+                "2026-07-22T00:00:00+00:00",
+            ),
+        )
+    await db.db.commit()
+
+    matched = await db.find_source_sync_input_attestations(
+        source_id=source_id,
+        workspace_id=workspace_id,
+        manifest_items=[
+            ("doc-a", "v1", "upsert"),
+            ("doc-missing", "v1", "upsert"),
+        ],
+    )
+
+    indexes = await db.db.execute_fetchall(
+        "PRAGMA index_list(source_sync_snapshot_manifest_items)"
+    )
+    assert isinstance(db, SourceSyncManifestStore)
+    assert "idx_source_sync_manifest_item_attestation" in {
+        str(row["name"]) for row in indexes
+    }
+    assert [item.input_id for item in matched] == [inputs[0].input_id]
 
 
 class EmptyGene:

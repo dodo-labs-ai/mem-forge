@@ -136,6 +136,34 @@ def test_push_github_repo_document_posts_adapter_payload():
     ]
 
 
+def test_prepare_local_source_snapshot_posts_complete_fenced_manifest():
+    client = _RecordingClient({"required_doc_ids": []})
+
+    result = client.prepare_local_source_snapshot(
+        source_id="src-github",
+        items=[{"doc_id": "doc-1", "revision": "blob-1", "change_kind": "upsert"}],
+        coverage="complete_snapshot",
+        sync_snapshot_id="job-1:attempt:2",
+        local_agent_job_id="job-1",
+        local_agent_attempt_count=2,
+    )
+
+    assert result == {"required_doc_ids": []}
+    assert client.calls == [
+        (
+            "POST",
+            "/api/sources/src-github/adapter/manifest",
+            {
+                "items": [{"doc_id": "doc-1", "revision": "blob-1", "change_kind": "upsert"}],
+                "coverage": "complete_snapshot",
+                "sync_snapshot_id": "job-1:attempt:2",
+                "local_agent_job_id": "job-1",
+                "local_agent_attempt_count": 2,
+            },
+        )
+    ]
+
+
 def test_push_jira_package_posts_raw_payload_without_markdown_body():
     client = _RecordingClient({"doc_id": "jira-doc"})
 
@@ -147,6 +175,7 @@ def test_push_jira_package_posts_raw_payload_without_markdown_body():
         raw_payload={"key": "PAY-1", "fields": {"summary": "Payroll task"}},
         title="Payroll task",
         raw_hash="raw-1",
+        provider_revision="2026-07-07T07:59:00Z",
         sync_snapshot_id="laj-sync-2",
         submitted_by="codex",
         submitted_at="2026-07-07T08:00:00Z",
@@ -164,6 +193,7 @@ def test_push_jira_package_posts_raw_payload_without_markdown_body():
                 "raw_payload": {"key": "PAY-1", "fields": {"summary": "Payroll task"}},
                 "title": "Payroll task",
                 "raw_hash": "raw-1",
+                "provider_revision": "2026-07-07T07:59:00Z",
                 "sync_snapshot_id": "laj-sync-2",
                 "submitted_by": "codex",
                 "submitted_at": "2026-07-07T08:00:00Z",
@@ -186,6 +216,7 @@ def test_push_teams_window_package_posts_raw_payload_without_markdown_body():
         window_type="thread",
         source_url="teams-window://src-teams/conv/window/rev-1",
         raw_hash="raw-1",
+        sync_snapshot_id="laj-teams:attempt:1",
         submitted_by="codex",
         submitted_at="2026-07-08T08:00:00Z",
     )
@@ -205,6 +236,7 @@ def test_push_teams_window_package_posts_raw_payload_without_markdown_body():
                 "window_type": "thread",
                 "source_url": "teams-window://src-teams/conv/window/rev-1",
                 "raw_hash": "raw-1",
+                "sync_snapshot_id": "laj-teams:attempt:1",
                 "submitted_by": "codex",
                 "submitted_at": "2026-07-08T08:00:00Z",
             },
