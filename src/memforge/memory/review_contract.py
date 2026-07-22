@@ -196,7 +196,10 @@ def validate_cross_source_review_write(
         }
         if None in private_owners or len(private_owners) != 1:
             raise ValueError("cross-source review access scope is incompatible")
-        if None in private_repositories or len(private_repositories) != 1:
+        # Repository scope is optional for private source types.  All records
+        # must still agree exactly: all-unscoped is compatible, while a mix of
+        # scoped and unscoped (or different repositories) remains forbidden.
+        if len(private_repositories) != 1:
             raise ValueError("cross-source review access scope is incompatible")
     if not unit.project_key:
         raise ValueError("cross-source review requires project attribution")

@@ -282,6 +282,72 @@ def test_cross_source_review_contract_rejects_cross_visibility_pair() -> None:
         raise AssertionError("cross-visibility review was accepted")
 
 
+def _private_review_inputs(
+    *,
+    repo_identifier: str | None,
+) -> tuple[
+    RelationOutcomeBundle,
+    tuple[CrossSourceReviewMemorySnapshot, ...],
+    tuple[CrossSourceReviewSupportSnapshot, ...],
+]:
+    bundle = _bundle()
+    return (
+        replace(
+            bundle,
+            evidence_unit=replace(
+                bundle.evidence_unit,
+                visibility="private",
+                owner_user_id="owner-private",
+                repo_identifier=repo_identifier,
+            ),
+        ),
+        tuple(
+            replace(
+                memory,
+                visibility="private",
+                owner_user_id="owner-private",
+                repo_identifier=repo_identifier,
+            )
+            for memory in _memories()
+        ),
+        tuple(
+            replace(
+                support,
+                evidence_visibility="private",
+                evidence_owner_user_id="owner-private",
+                evidence_repo_identifier=repo_identifier,
+                source_access_policy="private",
+                source_owner_user_id="owner-private",
+            )
+            for support in _supports()
+        ),
+    )
+
+
+def test_cross_source_review_contract_accepts_same_owner_private_unscoped_lineages() -> None:
+    bundle, memories, supports = _private_review_inputs(repo_identifier=None)
+
+    validate_cross_source_review_write(
+        _review(),
+        bundle,
+        memories=memories,
+        supports=supports,
+    )
+
+
+def test_cross_source_review_contract_rejects_mixed_private_repository_scope() -> None:
+    bundle, memories, supports = _private_review_inputs(repo_identifier=None)
+    memories = (memories[0], replace(memories[1], repo_identifier="repo-private"))
+
+    with pytest.raises(ValueError, match="access scope is incompatible"):
+        validate_cross_source_review_write(
+            _review(),
+            bundle,
+            memories=memories,
+            supports=supports,
+        )
+
+
 def test_cross_source_review_contract_binds_challenger_evidence_and_access_context() -> None:
     supports = (
         _supports()[0],
