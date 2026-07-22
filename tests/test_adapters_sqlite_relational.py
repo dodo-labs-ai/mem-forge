@@ -19,6 +19,7 @@ from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import RelationalStore
 from memforge.storage.adapters.sqlite.relational import SqliteRelationalStore
+from memforge.storage.admin_memory import MemoryAdminListFilters
 
 
 def _scope(statuses=("active",)) -> AccessScope:
@@ -76,6 +77,38 @@ async def _document(db: Database, doc_id: str, *, source: str = "src-confluence"
             last_synced=now,
         )
     )
+
+
+async def _restore_legacy_memory_sources_table(db: Database) -> None:
+    """Recreate the pre-v66 projection shape for migration contract tests."""
+
+    await db.db.execute(
+        """CREATE TABLE memory_sources_legacy (
+            memory_id        TEXT NOT NULL REFERENCES memories(id),
+            doc_id           TEXT NOT NULL REFERENCES documents(doc_id),
+            source_id        TEXT,
+            source_type      TEXT NOT NULL,
+            excerpt          TEXT,
+            support_kind     TEXT NOT NULL DEFAULT 'extracted',
+            added_at         TEXT NOT NULL DEFAULT (datetime('now')),
+            source_updated_at TEXT,
+            PRIMARY KEY (memory_id, doc_id)
+        )"""
+    )
+    await db.db.execute(
+        """INSERT INTO memory_sources_legacy (
+               memory_id, doc_id, source_id, source_type, excerpt,
+               support_kind, added_at, source_updated_at
+           )
+           SELECT memory_id, doc_id, source_id, source_type, excerpt,
+                  support_kind, added_at, source_updated_at
+             FROM memory_sources"""
+    )
+    await db.db.execute("DROP TABLE memory_sources")
+    await db.db.execute("ALTER TABLE memory_sources_legacy RENAME TO memory_sources")
+    await db.db.execute("CREATE INDEX idx_memory_sources_doc ON memory_sources(doc_id)")
+    await db.db.execute("CREATE INDEX idx_memory_sources_doc_kind ON memory_sources(doc_id, support_kind)")
+    await db.db.execute("CREATE INDEX idx_memory_sources_source ON memory_sources(source_id)")
 
 
 @pytest.fixture
@@ -443,9 +476,7 @@ async def test_upsert_entity_rolls_back_after_cancellation(db, monkeypatch):
         await asyncio.Future()
 
     monkeypatch.setattr(db, "_refresh_entity_alias_search_unlocked", refresh_then_block)
-    upsert = asyncio.create_task(
-        db.upsert_entity("cancelled entity", "Cancelled Entity", ["product"])
-    )
+    upsert = asyncio.create_task(db.upsert_entity("cancelled entity", "Cancelled Entity", ["product"]))
     await refresh_started.wait()
     upsert.cancel()
 
@@ -495,9 +526,7 @@ async def test_remove_entity_alias_rolls_back_after_cancellation(db, monkeypatch
         await asyncio.Future()
 
     monkeypatch.setattr(db, "_refresh_entity_alias_search_unlocked", refresh_then_block)
-    removal = asyncio.create_task(
-        db.remove_entity_alias(entity_id=entity_id, alias_normalized="pcc engine")
-    )
+    removal = asyncio.create_task(db.remove_entity_alias(entity_id=entity_id, alias_normalized="pcc engine"))
     await refresh_started.wait()
     removal.cancel()
 
@@ -508,9 +537,7 @@ async def test_remove_entity_alias_rolls_back_after_cancellation(db, monkeypatch
     alias = await db.get_entity_by_alias("pcc engine")
     assert alias is not None
     assert alias.canonical_id == entity_id
-    assert (
-        await store.link_query_entities("pcc engine validation", scope=_scope(), limit=5)
-    ).candidates
+    assert (await store.link_query_entities("pcc engine validation", scope=_scope(), limit=5)).candidates
 
     assert await db.remove_entity_alias(
         entity_id=entity_id,
@@ -828,10 +855,41 @@ async def test_count_source_memories_uses_canonical_memory_source_id(db):
 
 
 @pytest.mark.asyncio
+async def test_source_scoped_reads_use_the_exact_projection_source(db):
+    memory = _memory("m-overlapping-source")
+    memory.project_key = "PAY"
+    await db.insert_memory(memory)
+    await _document(db, "doc-overlap", source="src-confluence")
+    await db.restore_memory_source_snapshot(
+        MemorySource(
+            memory_id=memory.id,
+            doc_id="doc-overlap",
+            source_id="src-other",
+            source_type="confluence",
+            excerpt="independent support",
+            source_updated_at=None,
+        )
+    )
+
+    assert [item.id for item in await db.list_memories(source="src-other")] == [memory.id]
+    for search in (None, "m-overlapping-source"):
+        page = await db.query_memory_admin_page(
+            scope=_scope(),
+            filters=MemoryAdminListFilters(source="src-other", search=search),
+            limit=10,
+            offset=0,
+        )
+        assert [item.id for item in page.memories] == [memory.id]
+        assert page.total == 1
+    assert await db.list_resolved_projects_for_source("src-other") == [("PAY", 1)]
+
+
+@pytest.mark.asyncio
 async def test_source_id_backfill_migration_repairs_legacy_memory_sources(db):
     await db.insert_memory(_memory("m1"))
     await _document(db, "doc1", source="src-backfill")
     await db.add_memory_source("m1", "doc1", "confluence", None, source_updated_at=None)
+    await _restore_legacy_memory_sources_table(db)
     await db.db.execute("UPDATE memory_sources SET source_id = NULL WHERE memory_id = ?", ("m1",))
     await db.db.execute("DELETE FROM schema_migrations WHERE version = 28")
     await db.db.commit()
@@ -839,6 +897,49 @@ async def test_source_id_backfill_migration_repairs_legacy_memory_sources(db):
     await db._run_migrations()
 
     assert await db.count_source_memories("src-backfill") == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_source_identity_migration_preserves_existing_projection(db):
+    await db.insert_memory(_memory("m-source-identity"))
+    await _document(db, "doc-source-identity", source="src-exact")
+    await db.add_memory_source(
+        "m-source-identity",
+        "doc-source-identity",
+        "jira",
+        None,
+        source_updated_at=None,
+    )
+    await _restore_legacy_memory_sources_table(db)
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 66")
+    await db.db.commit()
+
+    await db._run_migrations()
+
+    primary_key = await db.db.execute_fetchall("PRAGMA table_info(memory_sources)")
+    assert [
+        row["name"]
+        for row in sorted(
+            (row for row in primary_key if row["pk"]),
+            key=lambda row: row["pk"],
+        )
+    ] == [
+        "memory_id",
+        "source_id",
+        "doc_id",
+    ]
+    rows = await db.db.execute_fetchall(
+        """SELECT memory_id, source_id, doc_id FROM memory_sources
+             WHERE memory_id = ?""",
+        ("m-source-identity",),
+    )
+    assert [tuple(row) for row in rows] == [("m-source-identity", "src-exact", "doc-source-identity")]
+    metadata = await db.db.execute_fetchall(
+        """SELECT source_id FROM memory_search_metadata_trigram
+             WHERE memory_id = ? AND doc_id = ?""",
+        ("m-source-identity", "doc-source-identity"),
+    )
+    assert [row["source_id"] for row in metadata] == ["src-exact"]
 
 
 @pytest.mark.asyncio

@@ -74,6 +74,7 @@ from memforge.models import (
     ContentItem,
     DocumentRecord,
     Memory,
+    MemorySource,
     NormalizedContent,
     RawContent,
     RawMemory,
@@ -4081,14 +4082,14 @@ async def test_reactivation_without_new_source_support_rolls_back(
 
 
 @pytest.mark.asyncio
-async def test_rebaseline_reset_retires_legacy_edge_identified_by_document_source(
+async def test_rebaseline_reset_preserves_an_overlapping_source_projection(
     db: Database,
 ) -> None:
     memory = Memory(
-        id="mem-legacy-null-source-edge",
+        id="mem-overlapping-source-edge",
         memory_type="fact",
-        content="Legacy Jira fact without canonical source identity.",
-        content_hash=content_hash("Legacy Jira fact without canonical source identity."),
+        content="A fact projected by two Configured Sources.",
+        content_hash=content_hash("A fact projected by two Configured Sources."),
         project_key="ENG",
     )
     await db.insert_memory(memory)
@@ -4099,18 +4100,99 @@ async def test_rebaseline_reset_retires_legacy_edge_identified_by_document_sourc
         memory.content,
         source_updated_at=None,
     )
-    await db.db.execute(
-        "UPDATE memory_sources SET source_id = NULL WHERE memory_id = ?",
-        (memory.id,),
+    await db.upsert_source(
+        id="src-overlap",
+        type="confluence",
+        name="Overlapping source",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
     )
-    await db.db.commit()
+    await db.restore_memory_source_snapshot(
+        MemorySource(
+            memory_id=memory.id,
+            doc_id="confluence-123",
+            source_id="src-overlap",
+            source_type="confluence",
+            excerpt=memory.content,
+            source_updated_at=None,
+        )
+    )
+    overlap_projection = _projection(
+        run_id="projection-overlapping-source-edge",
+        body=memory.content,
+        source_id="src-overlap",
+    )
+    await db.record_source_projection(overlap_projection)
+    overlap_observation = overlap_projection.observations[0]
+    overlap_revision = next(
+        revision
+        for revision in overlap_projection.observation_revisions
+        if revision.observation_id == overlap_observation.id
+    )
+    overlap_unit = EvidenceUnit(
+        id="eu-overlapping-source-edge",
+        source_id="src-overlap",
+        doc_id="confluence-123",
+        doc_revision_id=overlap_projection.source_unit_revisions[0].id,
+        source_type="confluence",
+        source_anchor=overlap_observation.id,
+        source_lineage_id=overlap_projection.source_units[0].id,
+        project_key="ENG",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        content=overlap_revision.content,
+        excerpt=memory.content,
+        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        access_context_hash="workspace-eng",
+    )
+    await db.upsert_evidence_unit(overlap_unit)
+    overlap_reference = (
+        await db.record_evidence_references(
+            overlap_unit.id,
+            (
+                EvidenceReference(
+                    role=EvidenceRole.PRIMARY,
+                    anchor=SourceAnchor(
+                        kind=AnchorKind.WHOLE_OBSERVATION,
+                        observation_id=overlap_observation.id,
+                        observation_revision_id=overlap_revision.id,
+                    ),
+                ),
+            ),
+        )
+    )[0]
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id="support-overlapping-source-edge",
+            memory_id=memory.id,
+            evidence_reference_id=overlap_reference.id or "",
+            source_id="src-overlap",
+            access_context_hash="workspace-eng",
+        )
+    )
 
     result = await db.rebaseline_source_lifecycle("src-1")
 
-    retired = await db.get_memory(memory.id)
-    assert result.retired_memory_ids == (memory.id,)
-    assert retired is not None and retired.status == "retired"
-    assert await db.get_memory_sources(memory.id) == []
+    persisted = await db.get_memory(memory.id)
+    assert result.retired_memory_ids == ()
+    assert persisted is not None and persisted.status == "active"
+    remaining_sources = await db.get_memory_sources(memory.id)
+    assert [(source.source_id, source.doc_id) for source in remaining_sources] == [
+        ("src-overlap", "confluence-123")
+    ]
+    metadata = await db.db.execute_fetchall(
+        """SELECT source_id FROM memory_search_metadata_trigram
+             WHERE memory_id = ? AND doc_id = ?""",
+        (memory.id, "confluence-123"),
+    )
+    assert [row["source_id"] for row in metadata] == ["src-overlap"]
+    supports = await db.db.execute_fetchall(
+        "SELECT source_id FROM memory_support_assertions WHERE memory_id = ? AND active = 1",
+        (memory.id,),
+    )
+    assert [row["source_id"] for row in supports] == ["src-overlap"]
 
 
 @pytest.mark.asyncio

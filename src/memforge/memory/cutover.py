@@ -67,6 +67,7 @@ class AgentSessionLifecycleMigrationCandidate:
     gate_state: LifecycleGateState
     active_memory_count: int
     missing_support_count: int
+    missing_source_provenance_count: int
 
 
 class HistoricalProjectionUnavailable(ValueError):
@@ -199,11 +200,18 @@ async def list_agent_session_lifecycle_migration_candidates(
             continue
         source_id = str(source["id"])
         active_memory_count = await db.count_active_source_memories(source_id)
-        if active_memory_count == 0:
+        missing_source_provenance_count = (
+            await db.count_active_supported_memories_without_source_provenance(source_id)
+        )
+        if active_memory_count == 0 and missing_source_provenance_count == 0:
             continue
         gate = await db.get_lifecycle_gate(source_id)
         missing_support_count = await db.count_active_source_memories_without_support(source_id)
-        if gate.state is LifecycleGateState.ENABLED and missing_support_count == 0:
+        if (
+            gate.state is LifecycleGateState.ENABLED
+            and missing_support_count == 0
+            and missing_source_provenance_count == 0
+        ):
             continue
         candidates.append(
             AgentSessionLifecycleMigrationCandidate(
@@ -211,6 +219,7 @@ async def list_agent_session_lifecycle_migration_candidates(
                 gate_state=gate.state,
                 active_memory_count=active_memory_count,
                 missing_support_count=missing_support_count,
+                missing_source_provenance_count=missing_source_provenance_count,
             )
         )
     return tuple(sorted(candidates, key=lambda candidate: candidate.source_id))
@@ -223,13 +232,17 @@ async def _gate_active_support_invariant_violation(
     lifecycle_job_id: str | None = None,
 ) -> None:
     missing_support_count = await db.count_active_source_memories_without_support(source_id)
-    if missing_support_count:
+    missing_source_provenance_count = (
+        await db.count_active_supported_memories_without_source_provenance(source_id)
+    )
+    if missing_support_count or missing_source_provenance_count:
         activity = await _renew_lifecycle_authority(db, lifecycle_job_id)
         await db.gate_destructive_lifecycle(
             source_id,
             reason=(
-                "lifecycle recovery detected "
-                f"{missing_support_count} active Memory support invariant violation(s)"
+                "lifecycle recovery detected support invariant violation: "
+                f"{missing_support_count} missing support and "
+                f"{missing_source_provenance_count} missing source provenance violation(s)"
             ),
             source_activity=activity,
         )

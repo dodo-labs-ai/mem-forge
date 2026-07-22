@@ -1480,23 +1480,27 @@ async def test_delete_document_restores_document_vector_when_db_delete_fails(db:
 
 
 @pytest.mark.asyncio
-async def test_remove_source_support_restores_provenance_when_index_delete_fails(db: Database):
+async def test_remove_source_support_keeps_retirement_committed_when_vector_delivery_fails(db: Database):
     await _insert_doc(db)
     memory = _memory("mem-source-rollback", "Last sourced fact")
     await db.insert_memory(memory)
     await db.add_memory_source(memory.id, "doc-1", "confluence", "source excerpt", source_updated_at=None)
     store = _store(db, FailingDeleteCollection())
 
-    with pytest.raises(RuntimeError, match="delete failed"):
-        await store.remove_source_support(memory.id, "doc-1", reason="no_support")
+    retired = await store.remove_source_support(memory.id, "doc-1", source_id="src-1", reason="no_support")
 
     stored = await db.get_memory(memory.id)
     sources = await db.get_memory_sources(memory.id)
     async with db.db.execute("SELECT COUNT(*) FROM memories_fts WHERE memory_id = ?", (memory.id,)) as cursor:
         fts_count = (await cursor.fetchone())[0]
-    assert stored.status == "active"
-    assert [(source.doc_id, source.excerpt) for source in sources] == [("doc-1", "source excerpt")]
-    assert fts_count == 1
+    tasks = await db.list_lifecycle_vector_tasks(source_id="src-1", limit=10)
+    assert retired is True
+    assert stored.status == "retired"
+    assert sources == []
+    assert fts_count == 0
+    assert [(task.memory_id, task.operation.value, task.status) for task in tasks] == [
+        (memory.id, "delete", "failed")
+    ]
 
 
 @pytest.mark.asyncio

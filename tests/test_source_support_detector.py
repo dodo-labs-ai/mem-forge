@@ -51,12 +51,22 @@ def _memory(
 
 
 async def _insert_doc(db: Database, doc_id: str, *, project: str = "PAY") -> None:
+    source_id = f"src-{project}"
+    if await db.get_source(source_id) is None:
+        await db.upsert_source(
+            id=source_id,
+            type="confluence",
+            name=source_id,
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="owner-1",
+        )
     now = datetime.now(timezone.utc).isoformat()
     await db.db.execute(
         """INSERT INTO documents
            (doc_id, source, source_url, title, space_or_project, last_modified, version, content_hash, last_synced)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (doc_id, f"src-{project}", f"http://test/{doc_id}", doc_id, project, now, "1", f"hash-{doc_id}", now),
+        (doc_id, source_id, f"http://test/{doc_id}", doc_id, project, now, "1", f"hash-{doc_id}", now),
     )
     await db.db.commit()
 
@@ -193,7 +203,14 @@ async def test_detect_and_persist_routes_corroborated_support_through_store(db: 
             self.calls.append((memory_id, doc_id, source_type, excerpt, support_kind, source_updated_at))
             return "inserted"
 
-        async def remove_source_support(self, memory_id: str, doc_id: str, reason: str = "no_support") -> bool:
+        async def remove_source_support(
+            self,
+            memory_id: str,
+            doc_id: str,
+            *,
+            source_id: str,
+            reason: str = "no_support",
+        ) -> bool:
             return False
 
     excerpt = "The assignment transitions to ASSIGNED."
@@ -251,9 +268,11 @@ async def test_detect_and_persist_routes_corroborated_support_through_store(db: 
     ]
 
     run_id = relation_runs[0]["id"]
-    assert await db.remove_memory_source(memory.id, "doc-support") is False
-    assert await db.get_relation_run(run_id) is None
-    assert await db.get_evidence_unit(evidence_unit.id) is None
+    assert await db.remove_memory_source(memory.id, "doc-support", source_id="src-PAY") is False
+    assert await db.get_relation_run(run_id) is not None
+    assert await db.get_evidence_unit(evidence_unit.id) is not None
+    assert await db.get_evidence_relations(evidence_unit.id) == []
+    assert len(await db.get_relation_candidates(run_id)) == 1
 
     retry_client = FakeStructuredSupportClient(
         [
@@ -494,7 +513,14 @@ async def test_rejected_source_support_does_not_record_support_relation(db: Data
         async def add_source_support(self, *args, **kwargs) -> str:
             return "rejected"
 
-        async def remove_source_support(self, memory_id: str, doc_id: str, reason: str = "no_support") -> bool:
+        async def remove_source_support(
+            self,
+            memory_id: str,
+            doc_id: str,
+            *,
+            source_id: str,
+            reason: str = "no_support",
+        ) -> bool:
             return False
 
     excerpt = "The assignment transitions to ASSIGNED."
@@ -577,7 +603,14 @@ async def test_existing_support_refresh_routes_through_store(db: Database):
             self.calls.append((memory_id, doc_id, source_type, excerpt, support_kind, source_updated_at))
             return "updated"
 
-        async def remove_source_support(self, memory_id: str, doc_id: str, reason: str = "no_support") -> bool:
+        async def remove_source_support(
+            self,
+            memory_id: str,
+            doc_id: str,
+            *,
+            source_id: str,
+            reason: str = "no_support",
+        ) -> bool:
             return False
 
     excerpt = "Existing support refresh stays audited."
@@ -969,7 +1002,7 @@ async def test_stale_support_removal_reuses_source_support_operation_context(db:
     class RecordingStore:
         def __init__(self) -> None:
             self.context = RecordingContext(operation_id="op-source-support")
-            self.removals: list[tuple[str, str, object | None]] = []
+            self.removals: list[tuple[str, str, str, object | None]] = []
 
         def operation_context(self, **fields):
             return self.context
@@ -984,11 +1017,12 @@ async def test_stale_support_removal_reuses_source_support_operation_context(db:
             self,
             memory_id: str,
             doc_id: str,
-            reason: str = "no_support",
             *,
+            source_id: str,
+            reason: str = "no_support",
             context=None,
         ) -> bool:
-            self.removals.append((memory_id, doc_id, context))
+            self.removals.append((memory_id, source_id, doc_id, context))
             return True
 
     store = RecordingStore()
@@ -1005,7 +1039,7 @@ async def test_stale_support_removal_reuses_source_support_operation_context(db:
         source_updated_at=None,
     )
 
-    assert store.removals == [(memory.id, "doc-support", store.context)]
+    assert store.removals == [(memory.id, "src-PAY", "doc-support", store.context)]
 
 
 @pytest.mark.asyncio
