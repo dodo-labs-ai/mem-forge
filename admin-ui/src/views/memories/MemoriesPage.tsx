@@ -360,7 +360,11 @@ export function MemoriesPage() {
       })),
   ];
   const stats = statsQuery.data;
-  const activeCount = bucketCount(stats?.memories_by_status, "active");
+  const activeCount = stats ? (bucketCount(stats.memories_by_status, "active") ?? 0) : undefined;
+  const historicalCount = stats
+    ? (bucketCount(stats.memories_by_status, "retired") ?? 0) +
+      (bucketCount(stats.memories_by_status, "superseded") ?? 0)
+    : undefined;
   const openReviewCount = reviewsQuery.data?.total;
   return (
     <div className="space-y-4">
@@ -387,9 +391,9 @@ export function MemoriesPage() {
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <OverviewCard
-          title="Total Memories"
-          value={formatCount(stats?.total_memories)}
-          helper={`${formatCount(activeCount)} active memories`}
+          title="Active Memories"
+          value={formatCount(activeCount)}
+          helper={`${formatCount(historicalCount)} historical records`}
           icon={Brain}
         />
         <OverviewCard
